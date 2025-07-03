@@ -40,7 +40,6 @@ build-frontend = "build[uv]"
 skip = [
     "*-manylinux_i686",  # 不编 32 位 Linux
     "*-musllinux*",      # 不编 musl 版
-    "cp36-* cp37-* pp*",
 ]
 environment = { BUILD_TIME = "$(date)" }
 
