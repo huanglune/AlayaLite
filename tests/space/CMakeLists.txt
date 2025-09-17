@@ -1,22 +1,14 @@
-set(SPACE_TEST_SRC
-    ${CMAKE_CURRENT_SOURCE_DIR}/quant/sq4_test.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/quant/sq8_test.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/raw_space_test.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/sq4_space_test.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/sq8_space_test.cpp
-)
+add_executable(quant_test ${CMAKE_CURRENT_SOURCE_DIR}/quant/sq4_test.cpp)
+add_executable(raw_space_test ${CMAKE_CURRENT_SOURCE_DIR}/raw_space_test.cpp)
+add_executable(sq4_space_test ${CMAKE_CURRENT_SOURCE_DIR}/sq4_space_test.cpp)
+add_executable(sq8_space_test ${CMAKE_CURRENT_SOURCE_DIR}/sq8_space_test.cpp)
 
-add_executable(space_test ${SPACE_TEST_SRC})
+target_link_libraries(quant_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
+target_link_libraries(raw_space_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
+target_link_libraries(sq4_space_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
+target_link_libraries(sq8_space_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
 
-if(ENABLE_COVERAGE)
-  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    target_compile_options(space_test PRIVATE --coverage -O0 -g)
-    target_link_libraries(space_test PRIVATE gcov ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
-  elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    target_compile_options(space_test PRIVATE -fprofile-instr-generate -fcoverage-mapping)
-    target_link_options(space_test PRIVATE -fprofile-instr-generate)
-    target_link_libraries(space_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
-  endif()
-else()
-  target_link_libraries(space_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
-endif()
+add_test(NAME space_test_quant COMMAND $<TARGET_FILE:quant_test>)
+add_test(NAME space_test_raw_space COMMAND $<TARGET_FILE:raw_space_test>)
+add_test(NAME space_test_sq4_space COMMAND $<TARGET_FILE:sq4_space_test>)
+add_test(NAME space_test_sq8_space COMMAND $<TARGET_FILE:sq8_space_test>)

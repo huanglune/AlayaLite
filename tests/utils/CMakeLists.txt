@@ -1,22 +1,20 @@
-set(UTILS_TEST_SRC
-    ${CMAKE_CURRENT_SOURCE_DIR}/query_utils_test.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/log_test.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/evaluate_test.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/metric_type_test.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/data_utils_test.cpp
-)
+add_executable(query_utils_test ${CMAKE_CURRENT_SOURCE_DIR}/query_utils_test.cpp)
+add_executable(log_test ${CMAKE_CURRENT_SOURCE_DIR}/log_test.cpp)
+add_executable(evaluate_test ${CMAKE_CURRENT_SOURCE_DIR}/evaluate_test.cpp)
+add_executable(metric_type_test ${CMAKE_CURRENT_SOURCE_DIR}/metric_type_test.cpp)
+add_executable(data_utils_test ${CMAKE_CURRENT_SOURCE_DIR}/data_utils_test.cpp)
+add_executable(dataset_utils_test ${CMAKE_CURRENT_SOURCE_DIR}/dataset_utils_test.cpp)
 
-add_executable(utils_test ${UTILS_TEST_SRC})
+target_link_libraries(query_utils_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
+target_link_libraries(log_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
+target_link_libraries(evaluate_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
+target_link_libraries(metric_type_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
+target_link_libraries(data_utils_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
+target_link_libraries(dataset_utils_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
 
-if(ENABLE_COVERAGE)
-  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    target_compile_options(utils_test PRIVATE --coverage -O0 -g)
-    target_link_libraries(utils_test PRIVATE gcov ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
-  elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-    target_compile_options(utils_test PRIVATE -fprofile-instr-generate -fcoverage-mapping)
-    target_link_options(utils_test PRIVATE -fprofile-instr-generate)
-    target_link_libraries(utils_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
-  endif()
-else()
-  target_link_libraries(utils_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
-endif()
+add_test(NAME utils_test_query_utils COMMAND $<TARGET_FILE:query_utils_test>)
+add_test(NAME utils_test_log COMMAND $<TARGET_FILE:log_test>)
+add_test(NAME utils_test_evaluate COMMAND $<TARGET_FILE:evaluate_test>)
+add_test(NAME utils_test_metric_type COMMAND $<TARGET_FILE:metric_type_test>)
+add_test(NAME utils_test_data_utils COMMAND $<TARGET_FILE:data_utils_test>)
+add_test(NAME utils_test_dataset_utils COMMAND $<TARGET_FILE:dataset_utils_test>)
