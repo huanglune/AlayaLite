@@ -182,7 +182,7 @@ class FhtKacRotator : public Rotator<float> {
  public:
   explicit FhtKacRotator(size_t dim, size_t padded_dim)
       : Rotator<float>(dim, padded_dim), flip_(4 * padded_dim / kByteLen) {
-    std::random_device rd;  // Seed
+    std::random_device rd;   // Seed
     std::mt19937 gen(rd());  // Mersenne Twister RNG
     // std::mt19937 gen(123456);
 
@@ -325,35 +325,35 @@ template <typename T>
 std::unique_ptr<Rotator<T>> choose_rotator(size_t dim,
                                            RotatorType type = RotatorType::FhtKacRotator,
                                            size_t padded_dim = 0) {
-  if (padded_dim == 0) {
-    padded_dim = rotator_impl::padding_requirement(dim, type);
-    if (padded_dim != dim) {
-      std::cerr << "vectors are padded to " << padded_dim
-                << " dimensions for aligned computation\n";
+  if constexpr (std::is_same_v<T, float>) {
+    if (padded_dim == 0) {
+      padded_dim = rotator_impl::padding_requirement(dim, type);
+      if (padded_dim != dim) {
+        std::cerr << "vectors are padded to " << padded_dim
+                  << " dimensions for aligned computation\n";
+      }
     }
-  }
 
-  if (padded_dim != rotator_impl::padding_requirement(padded_dim, type)) {
-    std::cerr << "Invalid padded dim for the given rotator type\n" << std::flush;
-    exit(1);
-  }
-
-  if (type == RotatorType::FhtKacRotator) {
-    if (!std::is_same_v<T, float>) {
-      std::cerr << "FhtKacRotator is only for float type currently\n";
+    if (padded_dim != rotator_impl::padding_requirement(padded_dim, type)) {
+      std::cerr << "Invalid padded dim for the given rotator type\n" << std::flush;
       exit(1);
     }
-    std::cerr << "FhtKacRotator is selected\n";
-    return std::make_unique<rotator_impl::FhtKacRotator>(dim, padded_dim);
-  }
 
-  if (type == RotatorType::MatrixRotator) {
-    std::cerr << "MatrixRotator is selected\n";
-    return std::make_unique<rotator_impl::MatrixRotator<T>>(dim, padded_dim);
-  }
+    if (type == RotatorType::FhtKacRotator) {
+      std::cerr << "FhtKacRotator is selected\n";
+      return std::make_unique<rotator_impl::FhtKacRotator>(dim, padded_dim);
+    }
 
-  std::cerr << "Invalid rotator type in choose_rotator()\n";
-  exit(1);
+    if (type == RotatorType::MatrixRotator) {
+      std::cerr << "MatrixRotator is selected\n";
+      return std::make_unique<rotator_impl::MatrixRotator<T>>(dim, padded_dim);
+    }
+
+    std::cerr << "Invalid rotator type in choose_rotator()\n";
+    exit(1);
+  } else {
+    throw std::invalid_argument("Rotator only support float type!");
+  }
 }
 // NOLINTEND
 }  // namespace alaya

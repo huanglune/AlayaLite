@@ -42,6 +42,7 @@ if(MSVC)
   # Windows MSVC specific flags
   message(STATUS "Configuring for MSVC compiler")
   # Exception handling and UTF-8 support
+  set(CMAKE_CXX_FLAGS "/openmp ${CMAKE_CXX_FLAGS}") # OpenMP support
   set(CMAKE_CXX_FLAGS "/EHsc /utf-8 ${CMAKE_CXX_FLAGS}")
   set(CMAKE_CXX_FLAGS_RELEASE "/O2 /DNDEBUG")
   set(CMAKE_CXX_FLAGS_DEBUG "/Zi /Od")
@@ -55,6 +56,7 @@ if(MSVC)
 else()
   # GCC/Clang flags
   message(STATUS "Configuring for GCC/Clang compiler")
+  set(CMAKE_CXX_FLAGS "-fopenmp ${CMAKE_CXX_FLAGS}") # OpenMP support
   set(CMAKE_CXX_FLAGS "-Wall -Wextra ${CMAKE_CXX_FLAGS}") # Enable common
   set(CMAKE_CXX_FLAGS_RELEASE "-Ofast -DNDEBUG")
   set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
