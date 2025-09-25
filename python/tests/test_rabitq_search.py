@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import tempfile
 import unittest
 
+from alayalite.index import Index
 import numpy as np
 from alayalite import Client
 from alayalite.utils import calc_gt, calc_recall
@@ -42,6 +44,27 @@ class TestAlayaLiteRaBitQSearch(unittest.TestCase):
         gt = calc_gt(vectors, queries, 10)
         recall = calc_recall(result, gt)
         self.assertGreaterEqual(recall, 0.95)
+
+    def test_rabitq_save_load(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.client = Client(url=temp_dir)
+
+            index = self.client.create_index(name="rabitq_index", metric="l2", quantization_type="rabitq")
+            vectors = np.random.rand(1000, 128).astype(np.float32)
+            queries = np.random.rand(10, 128).astype(np.float32)
+            index.fit(vectors)
+
+            result = index.batch_search(queries, 10, 400)
+            gt = calc_gt(vectors, queries, 10)
+            recall = calc_recall(result, gt)
+            self.assertGreaterEqual(recall, 0.95)
+
+            self.client.save_index("rabitq_index")
+            index = Index.load(temp_dir, "rabitq_index")
+            result_load = index.batch_search(queries, 10, 400)
+            self.assertEqual(result_load.shape, result.shape)
+            # result_load equals result
+            self.assertTrue(np.allclose(result_load, result))
 
 
 if __name__ == "__main__":
