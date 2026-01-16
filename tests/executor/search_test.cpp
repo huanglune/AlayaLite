@@ -15,7 +15,6 @@
  */
 
 #include <gtest/gtest.h>
-#include <bitset>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -24,14 +23,10 @@
 #include <thread>
 #include <vector>
 #include "executor/jobs/graph_search_job.hpp"
-#include "executor/scheduler.hpp"
-#include "fmt/format.h"
 #include "index/graph/graph.hpp"
 #include "index/graph/hnsw/hnsw_builder.hpp"
 #include "space/raw_space.hpp"
-#include "space/sq4_space.hpp"
 #include "utils/dataset_utils.hpp"
-#include "utils/io_utils.hpp"
 #include "utils/log.hpp"
 #include "utils/timer.hpp"
 
@@ -103,10 +98,10 @@ TEST_F(SearchTest, FullGraphTest) {
   std::vector<uint32_t> inpoint_num(points_num_);
   std::vector<uint32_t> outpoint_num(points_num_);
 
-  for (int i = 0; i < points_num_; i++) {
-    for (int j = 0; j < load_graph.max_nbrs_; j++) {
+  for (uint32_t i = 0; i < points_num_; i++) {
+    for (uint32_t j = 0; j < load_graph.max_nbrs_; j++) {
       auto id = load_graph.at(i, j);
-      if (id == -1) {
+      if (id == alaya::Graph<uint32_t>::kEmptyId) {
         break;
       }
       outpoint_num[i]++;
@@ -118,7 +113,7 @@ TEST_F(SearchTest, FullGraphTest) {
   uint64_t zero_inpoint_cnt = 0;
 
   // Check if edge exists on each node
-  for (int i = 0; i < points_num_; i++) {
+  for (uint32_t i = 0; i < points_num_; i++) {
     if (outpoint_num[i] != 0) {
       zero_outpoint_cnt++;
     }
@@ -171,7 +166,7 @@ TEST_F(SearchTest, SearchHNSWTest) {
   const size_t kSearchThreadNum = 16;
   std::vector<std::thread> tasks(kSearchThreadNum);
 
-  auto search_knn = [&](int i) {
+  auto search_knn = [&](uint32_t i) {
     for (; i < query_num_; i += kSearchThreadNum) {
       std::vector<uint32_t> ids(topk);
       auto cur_query = queries_.data() + i * dim_;
@@ -187,11 +182,11 @@ TEST_F(SearchTest, SearchHNSWTest) {
     }
   };
 
-  for (int i = 0; i < kSearchThreadNum; i++) {
+  for (size_t i = 0; i < kSearchThreadNum; i++) {
     tasks[i] = std::thread(search_knn, i);
   }
 
-  for (int i = 0; i < kSearchThreadNum; i++) {
+  for (size_t i = 0; i < kSearchThreadNum; i++) {
     if (tasks[i].joinable()) {
       tasks[i].join();
     }
@@ -201,9 +196,9 @@ TEST_F(SearchTest, SearchHNSWTest) {
 
   // Computing recall;
   size_t cnt = 0;
-  for (int i = 0; i < query_num_; i++) {
-    for (int j = 0; j < topk; j++) {
-      for (int k = 0; k < topk; k++) {
+  for (uint32_t i = 0; i < query_num_; i++) {
+    for (size_t j = 0; j < topk; j++) {
+      for (size_t k = 0; k < topk; k++) {
         if (res_pool[i][j] == answers_[i * gt_col_ + k]) {
           cnt++;
           break;
@@ -219,8 +214,6 @@ TEST_F(SearchTest, SearchHNSWTest) {
 
 TEST_F(SearchTest, SearchHNSWTestSQSpace) {
   const size_t kM = 64;
-  size_t topk = 10;
-  size_t ef = 100;
   std::string index_type = "HNSW";
 
   std::filesystem::path index_file =

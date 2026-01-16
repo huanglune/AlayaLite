@@ -40,11 +40,11 @@ namespace alaya {
 template <typename DataType = float, typename DistanceType = float, typename IDType = uint32_t>
 class RaBitQSpace {
  private:
-  MetricType metric_{MetricType::L2};  ///< Metric type
-  uint32_t dim_{0};                    ///< Dimensionality of the data points
-  IDType item_cnt_{0};                 ///< Number of data points (nodes)
   IDType capacity_{0};                 ///< The maximum number of data points (nodes)
+  uint32_t dim_{0};                    ///< Dimensionality of the data points
+  MetricType metric_{MetricType::L2};  ///< Metric type
   RotatorType type_;                   ///< Rotator type
+  IDType item_cnt_{0};                 ///< Number of data points (nodes)
 
   size_t quant_codes_offset_{0};
   size_t f_add_offset_{0};
@@ -54,9 +54,9 @@ class RaBitQSpace {
 
   DistFuncRaBitQ<DataType, DistanceType> distance_cal_func_;  ///< Distance calculation function
 
-  StaticStorage<> storage_;                            ///< Data Storage
+  StaticStorage<> storage_;                               ///< Data Storage
   std::unique_ptr<RaBitQQuantizer<DataType>> quantizer_;  ///< Data Quantizer
-  std::unique_ptr<Rotator<DataType>> rotator_;         ///< Data rotator
+  std::unique_ptr<Rotator<DataType>> rotator_;            ///< Data rotator
 
   IDType ep_;  ///< search entry point
 
@@ -113,8 +113,10 @@ class RaBitQSpace {
 
   auto get_ep() const -> IDType { return ep_; }
 
-  RaBitQSpace(IDType capacity, size_t dim, MetricType metric,
-           RotatorType type = RotatorType::FhtKacRotator)
+  RaBitQSpace(IDType capacity,
+              size_t dim,
+              MetricType metric,
+              RotatorType type = RotatorType::FhtKacRotator)
       : capacity_(capacity), dim_(dim), metric_(metric), type_(type) {
     rotator_ = choose_rotator<DataType>(dim_, type_, round_up_to_multiple_of<size_t>(dim_, 64));
     quantizer_ = std::make_unique<RaBitQQuantizer<DataType>>(dim_, rotator_->size());
@@ -153,8 +155,12 @@ class RaBitQSpace {
     this->rotator_->rotate(get_data_by_id(c), rotated_centroid.data());
 
     // quantize data and update batch data
-    quantizer_->batch_quantize(rotated_neighbors.data(), rotated_centroid.data(), kDegreeBound,
-                               get_nei_qc_ptr(c), get_f_add_ptr(c), get_f_rescale_ptr(c));
+    quantizer_->batch_quantize(rotated_neighbors.data(),
+                               rotated_centroid.data(),
+                               kDegreeBound,
+                               get_nei_qc_ptr(c),
+                               get_f_add_ptr(c),
+                               get_f_rescale_ptr(c));
   }
 
   void fit(DataType *data, IDType item_cnt) {
@@ -260,7 +266,9 @@ class RaBitQSpace {
 
   auto get_dim() const -> uint32_t { return dim_; }
 
-  auto get_dist_func() const -> DistFuncRaBitQ<DataType, DistanceType> { return distance_cal_func_; }
+  auto get_dist_func() const -> DistFuncRaBitQ<DataType, DistanceType> {
+    return distance_cal_func_;
+  }
 
   auto get_data_num() const -> IDType { return item_cnt_; }
 
@@ -284,8 +292,8 @@ class RaBitQSpace {
     DataType g_add_ = 0;
     DataType g_k1xsumq_ = 0;
 
-    std::vector<DataType> est_dists_;
     std::vector<uint16_t> accu_res_;
+    std::vector<DataType> est_dists_;
 
     void batch_est_dist() {
       size_t padded_dim = distance_space_.get_padded_dim();
@@ -295,20 +303,17 @@ class RaBitQSpace {
       DataType *__restrict__ est_ptr = est_dists_.data();
 
       // look up, get sum(nth_segment)
-      fastscan::accumulate(qc_ptr, lookup_table_.lut(),
-                           accu_res_.data(), padded_dim);
+      fastscan::accumulate(qc_ptr, lookup_table_.lut(), accu_res_.data(), padded_dim);
 
       ConstRowMajorArrayMap<u_int16_t> n_th_segment_arr(accu_res_.data(), 1, fastscan::kBatchSize);
-      ConstRowMajorArrayMap<DataType> f_add_arr(f_add_ptr, 1,
-                                                fastscan::kBatchSize);
-      ConstRowMajorArrayMap<DataType> f_rescale_arr(f_rescale_ptr, 1,
-                                                    fastscan::kBatchSize);
+      ConstRowMajorArrayMap<DataType> f_add_arr(f_add_ptr, 1, fastscan::kBatchSize);
+      ConstRowMajorArrayMap<DataType> f_rescale_arr(f_rescale_ptr, 1, fastscan::kBatchSize);
 
       RowMajorArrayMap<DistDataType> est_dist_arr(est_ptr, 1, fastscan::kBatchSize);
       est_dist_arr =
           f_add_arr + g_add_ +
-          f_rescale_arr * (lookup_table_.delta() * (n_th_segment_arr.template cast<DataType>()) +
-                           lookup_table_.sum_vl() + g_k1xsumq_);
+          (f_rescale_arr * (lookup_table_.delta() * (n_th_segment_arr.template cast<DataType>()) +
+                            lookup_table_.sum_vl() + g_k1xsumq_));
     }
 
    public:
@@ -336,7 +341,8 @@ class RaBitQSpace {
 
       float c_1 = -((1 << 1) - 1) / 2.F;  // -0.5F
 
-      auto sumq = std::accumulate(rotated_query.begin(), rotated_query.begin() + padded_dim,
+      auto sumq = std::accumulate(rotated_query.begin(),
+                                  rotated_query.begin() + padded_dim,
                                   static_cast<DataType>(0));
 
       g_k1xsumq_ = sumq * c_1;
@@ -363,7 +369,7 @@ class RaBitQSpace {
     auto operator()(size_t i_th) const -> DistanceType { return est_dists_[i_th]; }
   };
 
-  auto save(std::string_view &filename) -> void {
+  auto save(std::string_view filename) -> void {
     std::ofstream writer(std::string(filename), std::ios::binary);
     if (!writer.is_open()) {
       throw std::runtime_error("Cannot open file " + std::string(filename));
@@ -386,8 +392,8 @@ class RaBitQSpace {
     LOG_INFO("RaBitQSpace is successfully saved to {}.", filename);
   }
 
-  auto load(std::string_view &filename) -> void {
-    std::ifstream reader(filename.data(), std::ios::binary);  // NOLINT
+  auto load(std::string_view filename) -> void {
+    std::ifstream reader(std::string(filename), std::ios::binary);  // NOLINT
 
     if (!reader.is_open()) {
       throw std::runtime_error("Cannot open file " + std::string(filename));

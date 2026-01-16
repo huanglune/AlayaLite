@@ -14,10 +14,9 @@
  * limitations under the License.
  */
 
-
 #pragma once
 
-#include <filesystem>
+#include <filesystem>  // NOLINT(build/c++17)
 #include <string>
 #include "utils/io_utils.hpp"
 namespace alaya {
@@ -38,8 +37,8 @@ class TestDatasetBase {
       if (!std::filesystem::exists(dataset_dir_)) {
         std::filesystem::create_directories(dataset_dir_);
       }
-      std::system(get_download_command().c_str());
-      std::system(get_extract_command().c_str());
+      [[maybe_unused]] int ret1 = std::system(get_download_command().c_str());
+      [[maybe_unused]] int ret2 = std::system(get_extract_command().c_str());
     }
 
     uint32_t data_dim;
@@ -48,7 +47,13 @@ class TestDatasetBase {
     alaya::load_fvecs(query_file_, queries_, query_num_, query_dim);
     alaya::load_ivecs(gt_file_, answers_, ans_num_, ans_dim_);
     if (data_dim != query_dim || query_num_ != ans_num_) {
-      LOG_CRITICAL("The dimension of data, query and ground truth is not the same. data_dim: {}, query_dim: {}, query_num: {}, ans_num: {}", data_dim, query_dim, query_num_, ans_num_);
+      LOG_CRITICAL(
+          "The dimension of data, query and ground truth is not the same. data_dim: {}, query_dim: "
+          "{}, query_num: {}, ans_num: {}",
+          data_dim,
+          query_dim,
+          query_num_,
+          ans_num_);
       exit(-1);
     }
     dim_ = data_dim;
@@ -70,7 +75,6 @@ class TestDatasetBase {
   uint32_t get_ans_num() const noexcept { return ans_num_; }
   uint32_t get_dim() const noexcept { return dim_; }
   uint32_t get_ans_dim() const noexcept { return ans_dim_; }
-
 
  protected:
   virtual std::string get_download_command() const = 0;
@@ -96,7 +100,7 @@ class TestDatasetBase {
 
 class SIFTTestData : public TestDatasetBase {
  public:
-  SIFTTestData(std::string data_dir) {
+  explicit SIFTTestData(const std::string &data_dir) {
     dataset_name_ = "siftsmall";
     dataset_dir_ = std::filesystem::path(data_dir) / "siftsmall";
     data_file_ = dataset_dir_ / "siftsmall_base.fvecs";

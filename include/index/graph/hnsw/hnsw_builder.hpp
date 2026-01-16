@@ -39,7 +39,8 @@ namespace alaya {
  vectors that need to be indexed, with the default type being uint32_t.
  */
 template <typename DistanceSpaceType>
-  requires Space<DistanceSpaceType, typename DistanceSpaceType::DataTypeAlias,
+  requires Space<DistanceSpaceType,
+                 typename DistanceSpaceType::DataTypeAlias,
                  typename DistanceSpaceType::DistanceTypeAlias,
                  typename DistanceSpaceType::IDTypeAlias>
 struct HNSWBuilder {
@@ -67,7 +68,8 @@ struct HNSWBuilder {
    * out-degree of the overlay graph.
    * @param L      The size of the dynamic candidate list for the construction phase.
    */
-  explicit HNSWBuilder(const std::shared_ptr<DistanceSpaceType> &space, uint32_t R = 32,
+  explicit HNSWBuilder(const std::shared_ptr<DistanceSpaceType> &space,
+                       uint32_t R = 32,
                        uint32_t L = 200)
       : dim_(space->get_dim()), ef_construction_(L), max_nbrs_underlay_(R) {
     max_nbrs_overlay_ = R / 2;
@@ -102,7 +104,9 @@ struct HNSWBuilder {
     auto graph =
         std::make_unique<Graph<DataType, IDType>>(space_->get_capacity(), max_nbrs_underlay_);
 
-    hnsw_ = std::make_shared<HNSWImpl<DistanceSpaceType>>(space_, vec_num, max_nbrs_overlay_,
+    hnsw_ = std::make_shared<HNSWImpl<DistanceSpaceType>>(space_,
+                                                          vec_num,
+                                                          max_nbrs_overlay_,
                                                           ef_construction_);
     std::atomic<int> cnt{0};
 
@@ -112,8 +116,8 @@ struct HNSWBuilder {
 
     LOG_INFO("graph->max_nodes_: {}", graph->max_nodes_);
     ThreadPool thread_pool(thread_num);
-    for (int i = 1; i < vec_num; ++i) {
-      thread_pool.enqueue([i, &cnt, &vec_num, this]() {  // Capture 'i' by value
+    for (IDType i = 1; i < vec_num; ++i) {
+      thread_pool.enqueue([i, &cnt, &vec_num, this]() -> auto {  // Capture 'i' by value
         hnsw_->add_point(i);
 
         // Increment the counter and log progress outside the lambda
@@ -141,12 +145,12 @@ struct HNSWBuilder {
     // this->init(this->node_num_, 2 * this->max_nbrs_);
     thread_pool.reset_task();
     // Copy the graph from hnsw to unified graph at level 0.
-    for (int i = 0; i < vec_num; ++i) {
+    for (IDType i = 0; i < vec_num; ++i) {
       // thread_pool.enqueue([i, this, &graph] {
       std::vector<IDType> ids(max_nbrs_underlay_, -1);
       auto internal_id = hnsw_->label_lookup_[i];
       auto edges = reinterpret_cast<uint32_t *>(hnsw_->get_linklist0(internal_id));
-      for (int j = 1; j <= edges[0]; ++j) {
+      for (uint32_t j = 1; j <= edges[0]; ++j) {
         auto external_id = hnsw_->get_external_label(edges[j]);
         ids[j - 1] = external_id;
         // graph->at(i, j - 1) = external_id;
@@ -164,8 +168,8 @@ struct HNSWBuilder {
     thread_pool.reset_task();
 
     // Copy the overlay graph's data for unified graph.
-    for (int i = 0; i < vec_num; ++i) {
-      thread_pool.enqueue([this, i, &overlay_graph, &graph] {
+    for (IDType i = 0; i < vec_num; ++i) {
+      thread_pool.enqueue([this, i, &overlay_graph, &graph]() -> auto {
         auto internal_id = hnsw_->label_lookup_[i];
         int level = hnsw_->element_levels_[internal_id];
         overlay_graph->levels_[i] = level;
@@ -179,7 +183,7 @@ struct HNSWBuilder {
           // overlay_graph->lists_[i].assign(level * graph->max_nbrs_, -1);
           for (int j = 1; j <= level; ++j) {
             auto *edges = reinterpret_cast<IDType *>(hnsw_->get_linklist(internal_id, j));
-            for (int k = 1; k <= edges[0]; ++k) {
+            for (IDType k = 1; k <= edges[0]; ++k) {
               overlay_graph->at(j, i, k - 1) = hnsw_->get_external_label(edges[k]);
             }
           }
@@ -189,7 +193,7 @@ struct HNSWBuilder {
     thread_pool.wait_until_all_tasks_completed(vec_num);
 
     graph->overlay_graph_ = std::move(overlay_graph);
-    return std::move(graph);
+    return graph;
   }
 };
 

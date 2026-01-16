@@ -41,7 +41,8 @@ constexpr static int kEmptyId = -1;  ///< The id of empty node.
  * @tparam NodeIDType The data type for storing IDs of nodes.
  * @tparam EdgeIDType The data type for storing IDs of edges.
  */
-template <typename DataType = float, typename NodeIDType = uint32_t,
+template <typename DataType = float,
+          typename NodeIDType = uint32_t,
           typename DataStorage = SequentialStorage<NodeIDType, NodeIDType>>
 struct Graph {
   using EdgeIDType = uint32_t;
@@ -159,8 +160,8 @@ struct Graph {
    *
    * @param filename File path.
    */
-  void save(std::string_view &filename) const {
-    static_assert(std::is_trivial<NodeIDType>::value && std::is_standard_layout<NodeIDType>::value,
+  void save(std::string_view filename) const {
+    static_assert(std::is_trivial_v<NodeIDType> && std::is_standard_layout_v<NodeIDType>,
                   "IDType must be a POD type");
     std::ofstream writer(std::string(filename), std::ios::binary);
     if (!writer.is_open()) {
@@ -201,10 +202,10 @@ struct Graph {
    *
    * @param filename File path.
    */
-  void load(std::string_view &filename) {
-    static_assert(std::is_trivial<NodeIDType>::value && std::is_standard_layout<NodeIDType>::value,
+  void load(std::string_view filename) {
+    static_assert(std::is_trivial_v<NodeIDType> && std::is_standard_layout_v<NodeIDType>,
                   "IDType must be a POD type");
-    std::ifstream reader(filename.data(), std::ios::binary);
+    std::ifstream reader(std::string(filename), std::ios::binary);
     if (!reader.is_open()) {
       throw std::runtime_error("Cannot open file " + std::string(filename));
     }
