@@ -16,41 +16,58 @@
 
 #include <gtest/gtest.h>
 #include <filesystem>
-#include <string>
 
 #include "utils/dataset_utils.hpp"
 
 namespace alaya {
 
-class SIFTTestDataTest : public ::testing::Test {
+class DatasetTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    std::filesystem::path data_dir = std::filesystem::current_path().parent_path() / "data";
-    sift_data = std::make_unique<SIFTTestData>(data_dir.string());
-
-    auto dataset_dir = sift_data->get_dataset_dir();
-    if (std::filesystem::exists(dataset_dir)) {
-      std::filesystem::remove_all(dataset_dir);
-    }
-    printf("dataset_dir: %s\n", dataset_dir.string().c_str());
-    EXPECT_FALSE(sift_data->ensure_dataset());
+    data_dir_ = std::filesystem::current_path().parent_path() / "data";
   }
 
-  std::unique_ptr<SIFTTestData> sift_data;
+  std::filesystem::path data_dir_;
 };
 
-TEST_F(SIFTTestDataTest, ConstructorInitializesCorrectly) {
-  EXPECT_NE(sift_data, nullptr);
-  EXPECT_TRUE(sift_data->ensure_dataset());
+TEST_F(DatasetTest, LoadSiftSmall) {
+  auto config = sift_small(data_dir_);
+  if (std::filesystem::exists(config.dir_)) {
+    std::filesystem::remove_all(config.dir_);
+  }
 
-  // Test that dataset name is set correctly
-  auto dataset_name = sift_data->get_dataset_name();
-  EXPECT_EQ(dataset_name, "siftsmall");
+  auto ds = load_dataset(config);
 
-  // check file is exist
-  EXPECT_TRUE(std::filesystem::exists(sift_data->get_data_file()));
-  EXPECT_TRUE(std::filesystem::exists(sift_data->get_query_file()));
-  EXPECT_TRUE(std::filesystem::exists(sift_data->get_gt_file()));
+  EXPECT_EQ(ds.name_, "siftsmall");
+  EXPECT_GT(ds.data_num_, 0);
+  EXPECT_GT(ds.query_num_, 0);
+  EXPECT_GT(ds.dim_, 0);
+  EXPECT_EQ(ds.data_.size(), ds.data_num_ * ds.dim_);
+  EXPECT_EQ(ds.queries_.size(), ds.query_num_ * ds.dim_);
+
+  EXPECT_TRUE(std::filesystem::exists(config.data_file_));
+  EXPECT_TRUE(std::filesystem::exists(config.query_file_));
+  EXPECT_TRUE(std::filesystem::exists(config.gt_file_));
+}
+
+TEST_F(DatasetTest, LoadDeep1M) {
+  auto config = deep1m(data_dir_);
+  if (std::filesystem::exists(config.dir_)) {
+    std::filesystem::remove_all(config.dir_);
+  }
+
+  auto ds = load_dataset(config);
+
+  EXPECT_EQ(ds.name_, "deep1M");
+  EXPECT_GT(ds.data_num_, 0);
+  EXPECT_GT(ds.query_num_, 0);
+  EXPECT_GT(ds.dim_, 0);
+  EXPECT_EQ(ds.data_.size(), ds.data_num_ * ds.dim_);
+  EXPECT_EQ(ds.queries_.size(), ds.query_num_ * ds.dim_);
+
+  EXPECT_TRUE(std::filesystem::exists(config.data_file_));
+  EXPECT_TRUE(std::filesystem::exists(config.query_file_));
+  EXPECT_TRUE(std::filesystem::exists(config.gt_file_));
 }
 
 }  // namespace alaya
