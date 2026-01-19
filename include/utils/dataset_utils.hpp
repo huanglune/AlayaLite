@@ -120,4 +120,26 @@ class SIFTTestData : public TestDatasetBase {
   }
 };
 
+class DEEP1MTestData : public TestDatasetBase {
+ public:
+  explicit DEEP1MTestData(std::string data_dir) {
+    dataset_name_ = "deep1M";
+    dataset_dir_ = std::filesystem::path(data_dir) / dataset_name_;
+    data_file_ = dataset_dir_ / "deep1M_base.fvecs";
+    query_file_ = dataset_dir_ / "deep1M_query.fvecs";
+    gt_file_ = dataset_dir_ / "deep1M_groundtruth.ivecs";
+  }
+
+ private:
+  std::string get_download_command() const override {
+    return "wget -P " + dataset_dir_.string() +
+           " http://www.cse.cuhk.edu.hk/systems/hash/gqr/dataset/deep1M.tar.gz";
+  }
+
+  std::string get_extract_command() const override {
+    return "tar -zxvf " + dataset_dir_.string() + "/deep1M.tar.gz" + " --strip-components=1 -C " +
+           dataset_dir_.string();
+  }
+};
+
 }  // namespace alaya
