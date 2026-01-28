@@ -22,17 +22,16 @@
 #include <fstream>
 #include <iostream>
 #include <string>
-#include "distance/dist_ip.hpp"
-#include "distance/dist_l2.hpp"
+#include "simd/distance_ip.hpp"
+#include "simd/distance_l2.hpp"
 #include "space/quant/sq8.hpp"
 #include "space_concepts.hpp"
 #include "storage/sequential_storage.hpp"
+#include "utils/log.hpp"
+#include "utils/math.hpp"
 #include "utils/metric_type.hpp"
+#include "utils/platform.hpp"
 #include "utils/prefetch.hpp"
-
-#ifdef _MSC_VER
-  #include <malloc.h>
-#endif
 
 namespace alaya {
 
@@ -92,11 +91,11 @@ class SQ8Space {
   void set_metric_function() {
     switch (metric_) {
       case MetricType::L2:
-        distance_calu_func_ = l2_sqr_sq8;
+        distance_calu_func_ = simd::l2_sqr_sq8<DataType, DistanceType>;
         break;
       case MetricType::COS:
       case MetricType::IP:
-        distance_calu_func_ = ip_sqr_sq8;
+        distance_calu_func_ = simd::ip_sqr_sq8<DataType, DistanceType>;
         break;
       default:
         break;
@@ -264,34 +263,24 @@ class SQ8Space {
      */
     QueryComputer(const SQ8Space &distance_space, const DataType *query)
         : distance_space_(distance_space) {
-      size_t aligned_size = do_align(distance_space_.get_data_size(), 64);
-#ifdef _MSC_VER
-      query_ = static_cast<uint8_t *>(_aligned_malloc(aligned_size, 64));
-#else
-      query_ = static_cast<uint8_t *>(std::aligned_alloc(64, aligned_size));
-#endif
+      size_t aligned_size = math::round_up_pow2(distance_space_.get_data_size(), 64);
+      query_ = static_cast<uint8_t *>(alaya_aligned_alloc_impl(aligned_size, 64));
       distance_space.get_quantizer().encode(query, query_);
     }
 
     QueryComputer(const SQ8Space &distance_space, const IDType id)
         : distance_space_(distance_space) {
-      size_t aligned_size = do_align(distance_space_.get_data_size(), 64);
-#ifdef _MSC_VER
-      query_ = static_cast<uint8_t *>(_aligned_malloc(aligned_size, 64));
-#else
-      query_ = static_cast<uint8_t *>(std::aligned_alloc(64, aligned_size));
-#endif
+      size_t aligned_size = math::round_up_pow2(distance_space_.get_data_size(), 64);
+      query_ = static_cast<uint8_t *>(alaya_aligned_alloc_impl(aligned_size, 64));
       std::memcpy(query_, distance_space_.get_data_by_id(id), distance_space_.get_data_size());
     }
     /**
      * @brief Destructor
      */
     ~QueryComputer() {
-#ifdef _MSC_VER
-      _aligned_free(query_);
-#else
-      std::free(query_);
-#endif
+      if (query_ != nullptr) {
+        alaya_aligned_free_impl(query_);
+      }
     }
 
     /**

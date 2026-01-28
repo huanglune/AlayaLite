@@ -22,14 +22,13 @@
 #include <cstdlib>
 #include <fstream>
 #include <functional>
-#include <iostream>
 #include <memory>
 #include <random>
 
 #include "defines.hpp"
-#include "fht_avx.hpp"
-#include "roundup.hpp"
+#include "simd/fht.hpp"
 #include "utils/log.hpp"
+#include "utils/math.hpp"
 
 namespace alaya {
 // NOLINTBEGIN
@@ -60,7 +59,7 @@ inline size_t padding_requirement(size_t dim, RotatorType type) {
     return dim;
   }
   if (type == RotatorType::FhtKacRotator) {
-    return round_up_to_multiple_of<size_t>(dim, 64);
+    return alaya::math::round_up_pow2(dim, 64);
   }
   ALAYA_UNREACHABLE;
   // throw std::invalid_argument("Invalid rotator type in padding_requirement()\n");
@@ -175,7 +174,7 @@ static inline void vec_rescale(T *data, size_t dim, T val) {
 class FhtKacRotator : public Rotator<float> {
  private:
   std::vector<uint8_t> flip_;
-  std::function<void(float *)> fht_float_ = helper_float_6;
+  std::function<void(float *)> fht_float_ = simd::helper_float_6;
   size_t trunc_dim_ = 0;
   float fac_ = 0;
 
@@ -196,28 +195,28 @@ class FhtKacRotator : public Rotator<float> {
     }
 
     // TODO(lib): is it portable?
-    size_t bottom_log_dim = floor_log2(dim);
+    size_t bottom_log_dim = alaya::math::floor_log2(dim);
     trunc_dim_ = 1 << bottom_log_dim;
     fac_ = 1.0F / std::sqrt(static_cast<float>(trunc_dim_));
 
     switch (bottom_log_dim) {
       case 6:
-        this->fht_float_ = helper_float_6;
+        this->fht_float_ = simd::helper_float_6;
         break;
       case 7:
-        this->fht_float_ = helper_float_7;
+        this->fht_float_ = simd::helper_float_7;
         break;
       case 8:
-        this->fht_float_ = helper_float_8;
+        this->fht_float_ = simd::helper_float_8;
         break;
       case 9:
-        this->fht_float_ = helper_float_9;
+        this->fht_float_ = simd::helper_float_9;
         break;
       case 10:
-        this->fht_float_ = helper_float_10;
+        this->fht_float_ = simd::helper_float_10;
         break;
       case 11:
-        this->fht_float_ = helper_float_11;
+        this->fht_float_ = simd::helper_float_11;
         break;
       default:
         throw std::invalid_argument("dimension of vector is too big or too small\n");

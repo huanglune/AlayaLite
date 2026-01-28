@@ -152,11 +152,12 @@ struct GraphSearchJob {
 #endif
   }
 
+#if defined(__linux__)
   auto rabitq_search([[maybe_unused]] const DataType *query,
                      [[maybe_unused]] uint32_t k,
                      [[maybe_unused]] IDType *ids,
                      [[maybe_unused]] uint32_t ef) -> coro::task<> {
-#if defined(__AVX512F__)
+  #if defined(__AVX512F__)
     if constexpr (!is_rabitq_space_v<DistanceSpaceType>) {
       throw std::invalid_argument("Only support RaBitQSpace instance!");
     }
@@ -213,12 +214,10 @@ struct GraphSearchJob {
     // return result
     res_pool.copy_results_to(reinterpret_cast<uint32_t *>(ids));
     co_return;
-#else
+  #else
     throw std::runtime_error("Avx512 instruction is not supported!");
-#endif
+  #endif
   }
-
-#if defined(__linux__)
   auto search(DataType *query, uint32_t k, IDType *ids, uint32_t ef) -> coro::task<> {
     auto query_computer = space_->get_query_computer(query);
     LinearPool<DistanceType, IDType> pool(space_->get_data_num(), ef);

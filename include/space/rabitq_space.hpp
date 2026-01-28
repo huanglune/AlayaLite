@@ -24,17 +24,17 @@
 #include <vector>
 
 #include "index/neighbor.hpp"
-#include "space/distance/dist_l2.hpp"
+#include "simd/distance_l2.hpp"
 #include "space/quant/rabitq.hpp"
 #include "space/space_concepts.hpp"
 #include "storage/static_storage.hpp"
 #include "utils/log.hpp"
+#include "utils/math.hpp"
 #include "utils/metric_type.hpp"
 #include "utils/prefetch.hpp"
 #include "utils/rabitq_utils/fastscan.hpp"
 #include "utils/rabitq_utils/lut.hpp"
 #include "utils/rabitq_utils/rotator.hpp"
-#include "utils/rabitq_utils/roundup.hpp"
 
 namespace alaya {
 template <typename DataType = float, typename DistanceType = float, typename IDType = uint32_t>
@@ -103,7 +103,7 @@ class RaBitQSpace {
               MetricType metric,
               RotatorType type = RotatorType::FhtKacRotator)
       : capacity_(capacity), dim_(dim), metric_(metric), type_(type) {
-    rotator_ = choose_rotator<DataType>(dim_, type_, round_up_to_multiple_of<size_t>(dim_, 64));
+    rotator_ = choose_rotator<DataType>(dim_, type_, alaya::math::round_up_pow2<size_t>(dim_, 64));
     quantizer_ = std::make_unique<RaBitQQuantizer<DataType>>(dim_, rotator_->size());
     initialize_offsets();
   }
@@ -123,7 +123,7 @@ class RaBitQSpace {
   void set_metric_function() {
     switch (metric_) {
       case MetricType::L2:
-        distance_cal_func_ = l2_sqr_rabitq;
+        distance_cal_func_ = simd::l2_sqr<DataType, DistanceType>;
         break;
       case MetricType::COS:
       case MetricType::IP:
@@ -178,7 +178,7 @@ class RaBitQSpace {
     storage_ = StaticStorage<>(std::vector<size_t>{item_cnt_, data_chunk_size_});
 
 #pragma omp parallel for schedule(dynamic)
-    for (size_t i = 0; i < item_cnt; i++) {
+    for (int64_t i = 0; i < static_cast<int64_t>(item_cnt); i++) {
       const auto *src = data + (dim_ * i);
       auto *dst = get_data_by_id(i);
       std::copy(src, src + dim_, dst);
@@ -293,15 +293,15 @@ class RaBitQSpace {
 
     void batch_est_dist() {
       size_t padded_dim = distance_space_.get_padded_dim();
-      const uint8_t *__restrict__ qc_ptr = distance_space_.get_nei_qc_ptr(c_);
-      const DataType *__restrict__ f_add_ptr = distance_space_.get_f_add_ptr(c_);
-      const DataType *__restrict__ f_rescale_ptr = distance_space_.get_f_rescale_ptr(c_);
-      DataType *__restrict__ est_ptr = est_dists_.data();
+      const uint8_t *ALAYA_RESTRICT qc_ptr = distance_space_.get_nei_qc_ptr(c_);
+      const DataType *ALAYA_RESTRICT f_add_ptr = distance_space_.get_f_add_ptr(c_);
+      const DataType *ALAYA_RESTRICT f_rescale_ptr = distance_space_.get_f_rescale_ptr(c_);
+      DataType *ALAYA_RESTRICT est_ptr = est_dists_.data();
 
       // look up, get sum(nth_segment)
       fastscan::accumulate(qc_ptr, lookup_table_.lut(), accu_res_.data(), padded_dim);
 
-      ConstRowMajorArrayMap<u_int16_t> n_th_segment_arr(accu_res_.data(), 1, fastscan::kBatchSize);
+      ConstRowMajorArrayMap<uint16_t> n_th_segment_arr(accu_res_.data(), 1, fastscan::kBatchSize);
       ConstRowMajorArrayMap<DataType> f_add_arr(f_add_ptr, 1, fastscan::kBatchSize);
       ConstRowMajorArrayMap<DataType> f_rescale_arr(f_rescale_ptr, 1, fastscan::kBatchSize);
 
@@ -402,7 +402,7 @@ class RaBitQSpace {
     reader.read(reinterpret_cast<char *>(&type_), sizeof(type_));
     reader.read(reinterpret_cast<char *>(&ep_), sizeof(ep_));
 
-    rotator_ = choose_rotator<DataType>(dim_, type_, round_up_to_multiple_of<size_t>(dim_, 64));
+    rotator_ = choose_rotator<DataType>(dim_, type_, alaya::math::round_up_pow2<size_t>(dim_, 64));
     rotator_->load(reader);
 
     this->initialize_offsets();
