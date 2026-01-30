@@ -7,6 +7,7 @@ add_executable(dataset_utils_test ${CMAKE_CURRENT_SOURCE_DIR}/dataset_utils_test
 add_executable(rotator_utils_test ${CMAKE_CURRENT_SOURCE_DIR}/rabitq_utils/rotator_test.cpp)
 add_executable(lut_utils_test ${CMAKE_CURRENT_SOURCE_DIR}/rabitq_utils/lut_test.cpp)
 add_executable(math_test ${CMAKE_CURRENT_SOURCE_DIR}/math_test.cpp)
+add_executable(memory_test ${CMAKE_CURRENT_SOURCE_DIR}/memory_test.cpp)
 
 target_link_libraries(query_utils_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
 target_link_libraries(log_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
@@ -17,6 +18,7 @@ target_link_libraries(dataset_utils_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIB
 target_link_libraries(rotator_utils_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
 target_link_libraries(lut_utils_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
 target_link_libraries(math_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
+target_link_libraries(memory_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
 add_coverage_to_target(query_utils_test)
 add_coverage_to_target(log_test)
 add_coverage_to_target(evaluate_test)
@@ -26,6 +28,7 @@ add_coverage_to_target(dataset_utils_test)
 add_coverage_to_target(rotator_utils_test)
 add_coverage_to_target(lut_utils_test)
 add_coverage_to_target(math_test)
+add_coverage_to_target(memory_test)
 
 add_test(NAME utils_test_query_utils COMMAND $<TARGET_FILE:query_utils_test>)
 add_test(NAME utils_test_log COMMAND $<TARGET_FILE:log_test>)
@@ -36,3 +39,4 @@ add_test(NAME utils_test_dataset_utils COMMAND $<TARGET_FILE:dataset_utils_test>
 add_test(NAME utils_test_rotator_utils COMMAND $<TARGET_FILE:rotator_utils_test>)
 add_test(NAME utils_test_lut_utils COMMAND $<TARGET_FILE:lut_utils_test>)
 add_test(NAME utils_test_math COMMAND $<TARGET_FILE:math_test>)
+add_test(NAME utils_test_memory COMMAND $<TARGET_FILE:memory_test>)
