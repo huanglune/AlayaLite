@@ -124,8 +124,8 @@ TEST_F(NnDescentSearchTest, SimpleSearchTest) {
       auto id_set = std::set(ids.begin(), ids.end());
 
       if (id_set.size() < topk) {
-        fmt::println("i id: {}", i);
-        fmt::println("ids size: {}", id_set.size());
+        fmt::print("i id: {}\n", i);
+        fmt::print("ids size: {}\n", id_set.size());
       }
       res_pool[i] = ids;
     }

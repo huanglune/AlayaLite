@@ -24,7 +24,7 @@ class AlayaLiteConan(ConanFile):
         self.requires("gtest/1.16.0")
         self.requires("concurrentqueue/1.0.4")
         self.requires("pybind11/2.13.6")
-        self.requires("spdlog/1.14.0")
+        self.requires("spdlog/1.9.2")
         self.requires("eigen/3.4.0")
 
         # OpenMP support

@@ -147,7 +147,7 @@ TEST_F(SearchTest, SearchHNSWTest) {
   const size_t kSearchThreadNum = 16;
   std::vector<std::thread> tasks(kSearchThreadNum);
 
-  auto search_knn = [&](uint32_t i) {
+  auto search_knn = [&](uint32_t i) -> void {
     for (; i < ds_.query_num_; i += kSearchThreadNum) {
       std::vector<uint32_t> ids(topk);
       auto cur_query = ds_.queries_.data() + i * ds_.dim_;
@@ -156,8 +156,8 @@ TEST_F(SearchTest, SearchHNSWTest) {
       auto id_set = std::set(ids.begin(), ids.end());
 
       if (id_set.size() < topk) {
-        fmt::println("i id: {}", i);
-        fmt::println("ids size: {}", id_set.size());
+        fmt::print("i id: {}\n", i);
+        fmt::print("ids size: {}\n", id_set.size());
       }
       res_pool[i] = ids;
     }
