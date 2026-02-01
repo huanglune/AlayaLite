@@ -1,0 +1,9 @@
+---
+blank_issues_enabled: false
+contact_links       :
+- name: Question / Discussion
+  url: https://github.com/AlayaDB-AI/AlayaLite/discussions
+  about: For questions and discussions, please use GitHub Discussions
+- name: Documentation
+  url: https://github.com/AlayaDB-AI/AlayaLite/blob/main/README.md
+  about: Check the documentation before opening an issue
