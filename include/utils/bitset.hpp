@@ -16,43 +16,16 @@
 
 #pragma once
 
-#include <sys/types.h>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <ranges>
 #include <unordered_set>
 #include <vector>
-#include "../index/neighbor.hpp"
+#include "math.hpp"
 #include "memory.hpp"
 
-#if defined(_MSC_VER)
-  #include <intrin.h>
-#endif
-
 namespace alaya {
-
-/**
- * @brief Portable function to count trailing zero bits in a 64-bit integer.
- *
- * @param x The 64-bit integer. Assumed to be non-zero.
- * @return The number of trailing zero bits.
- */
-inline auto count_trailing_zeros(uint64_t x) -> int {
-#if defined(_MSC_VER)
-  unsigned long index;  // NOLINT(runtime/int)
-  _BitScanForward64(&index, x);
-  return static_cast<int>(index);
-#elif defined(__GNUC__) || defined(__clang__)
-  return __builtin_ctzll(x);
-#else
-  // Fallback for other compilers
-  int count = 0;
-  while ((x & 1) == 0) {
-    x >>= 1;
-    count++;
-  }
-  return count;
-#endif
-}
 
 /**
  * @brief A dynamic bitset implementation using a vector of uint64_t.
@@ -69,16 +42,31 @@ inline auto count_trailing_zeros(uint64_t x) -> int {
 class DynamicBitset {
  private:
   std::vector<uint64_t, AlignedAlloc<uint64_t>> data_;
-  size_t size_;
+  size_t size_{0};
 
  public:
+  /**
+   * @brief Default constructor creates an empty bitset
+   */
+  DynamicBitset() = default;
+
   /**
    * @brief Construct a new Dynamic Bitset object
    *
    * @param num_bits The number of bits in the bitset
    */
   explicit DynamicBitset(size_t num_bits) : size_(num_bits) {
-    data_.resize((num_bits + 63) / 64, 0);
+    data_.resize(math::round_up_pow2(num_bits, 64), 0);
+  }
+
+  /**
+   * @brief Resize the bitset to a new size
+   *
+   * @param num_bits The new number of bits
+   */
+  void resize(size_t num_bits) {
+    size_ = num_bits;
+    data_.resize(math::round_up_pow2(num_bits, 64), 0);
   }
 
   /**
@@ -112,6 +100,11 @@ class DynamicBitset {
    * @param pos The position of the bit to reset
    */
   void reset(size_t pos) { data_[pos / 64] &= ~(1ULL << (pos % 64)); }
+
+  /**
+   * @brief Reset all bits to zero
+   */
+  void reset() { std::ranges::fill(data_, 0ULL); }
 };
 
 /**
@@ -219,96 +212,19 @@ class HierarchicalBitset {
       if (summary_[i] == 0) {
         continue;
       }
-      size_t block = (i * kSummaryBlockSize) + count_trailing_zeros(summary_[i]);
+      size_t block = (i * kSummaryBlockSize) + math::count_trailing_zeros(summary_[i]);
       for (size_t j = 0; j < 8; ++j) {
         if (data_[(block * 8) + j] == 0) {
           continue;
         }
         return static_cast<int>((block * kBitsPerBlock) + (j * 64) +
-                                count_trailing_zeros(data_[block * 8 + j]));
+                                math::count_trailing_zeros(data_[block * 8 + j]));
       }
     }
     return -1;
   }
 };
 
-// todo test this class.
-template <typename DistanceType, typename IDType>
-struct LinearPool {
-  LinearPool(IDType n, int capacity) : nb_(n), capacity_(capacity), data_(capacity_ + 1), vis_(n) {}
-
-  auto find_bsearch(DistanceType dist) -> int {
-    int l = 0;
-    int r = size_;
-    while (l < r) {
-      int mid = (l + r) / 2;
-      if (data_[mid].distance_ > dist) {
-        r = mid;
-      } else {
-        l = mid + 1;
-      }
-    }
-    return l;
-  }
-
-  auto insert(IDType u, DistanceType dist) -> bool {
-    if (size_ == capacity_ && dist >= data_[size_ - 1].distance_) {
-      return false;
-    }
-    int lo = find_bsearch(dist);
-    std::memmove(&data_[lo + 1], &data_[lo], (size_ - lo) * sizeof(Neighbor<IDType, DistanceType>));
-    data_[lo] = {u, dist};
-    if (size_ < capacity_) {
-      size_++;
-    }
-    if (static_cast<size_t>(lo) < cur_) {
-      cur_ = lo;
-    }
-    for (size_t i = 0; i < size_; i++) {
-      // LOG_INFO("i {} ,dist is {}", data_[i].id_, data_[i].distance_);
-    }
-    // LOG_INFO("cur is {} , size {}", cur_, size_);
-    return true;
-  }
-
-  void emplace_insert(IDType u, DistanceType dist) {
-    if (dist >= data_[size_ - 1].distance) {
-      return;
-    }
-    int lo = find_bsearch(dist);
-    std::memmove(&data_[lo + 1], &data_[lo], (size_ - lo) * sizeof(Neighbor<IDType, DistanceType>));
-    data_[lo] = {u, dist};
-  }
-
-  auto top() -> IDType { return data_[cur_].id_; }
-  auto pop() -> IDType {
-    set_checked(data_[cur_].id_);
-    int pre = cur_;
-    while (cur_ < size_ && is_checked(data_[cur_].id_)) {
-      cur_++;
-    }
-
-    // LOG_INFO("pop idx is {} , {}",data_[pre].id_, get_id(data_[pre].id_));
-    return get_id(data_[pre].id_);
-  }
-
-  auto has_next() const -> bool { return cur_ < size_; }
-  auto next_id() const -> IDType { return get_id(data_[cur_].id_); }
-  auto id(IDType i) const -> IDType { return get_id(data_[i].id_); }
-  auto dist(IDType i) const -> DistanceType { return data_[i].distance_; }
-  auto size() const -> size_t { return size_; }
-  auto capacity() const -> size_t { return capacity_; }
-
-  constexpr static int kMask = 2147483647;
-  auto get_id(IDType id) const -> IDType { return id & kMask; }
-  // Need to assert IDType is uint32_t instead of uint64_t
-  void set_checked(IDType &id) { id |= 1 << 31; }
-  auto is_checked(IDType id) -> bool { return (id >> 31 & 1) != 0; }
-  auto is_full() -> bool { return size_ == capacity_; }
-
-  size_t nb_, size_ = 0, cur_ = 0, capacity_;
-  std::vector<Neighbor<IDType, DistanceType>, AlignedAlloc<Neighbor<IDType, DistanceType>>> data_;
-  DynamicBitset vis_;
-};
+using Bitset = DynamicBitset;  // Change to SparseBitset or HierarchicalBitset as needed
 
 }  // namespace alaya

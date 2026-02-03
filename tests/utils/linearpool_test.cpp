@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "utils/query_utils.hpp"
+#include "utils/linearpool.hpp"
 #include "utils/thread_pool.hpp"
 #include <gtest/gtest.h>
 

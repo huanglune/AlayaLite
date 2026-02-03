@@ -113,6 +113,32 @@ template <typename T>
   return floor_log2(x - 1) + 1;
 }
 
+/**
+ * @brief Portable function to count trailing zero bits in a 64-bit integer.
+ *
+ * @param x The 64-bit integer. Assumed to be non-zero.
+ * @return The number of trailing zero bits.
+ */
+inline auto count_trailing_zeros(uint64_t x) -> int {
+#if __cplusplus >= 202002L
+  return std::countr_zero(x);
+#elif defined(_MSC_VER)
+  unsigned long index;  // NOLINT(runtime/int)
+  _BitScanForward64(&index, x);
+  return static_cast<int>(index);
+#elif defined(__GNUC__) || defined(__clang__)
+  return __builtin_ctzll(x);
+#else
+  // Fallback for other compilers
+  int count = 0;
+  while ((x & 1) == 0) {
+    x >>= 1;
+    count++;
+  }
+  return count;
+#endif
+}
+
 // ============================================================================
 // 2. Alignment Utilities
 // ============================================================================

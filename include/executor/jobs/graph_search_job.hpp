@@ -24,8 +24,8 @@
 
 #include "../../index/graph/graph.hpp"
 #include "../../space/space_concepts.hpp"
+#include "../../utils/linearpool.hpp"
 #include "../../utils/prefetch.hpp"
-#include "../../utils/query_utils.hpp"
 #include "job_context.hpp"
 #include "space/rabitq_space.hpp"
 #include "utils/log.hpp"
@@ -105,7 +105,7 @@ struct GraphSearchJob {
     SearchBuffer<DistanceType> search_pool(ef);
     search_pool.insert(entry, std::numeric_limits<DistanceType>::max());
     auto vis = HashBasedBooleanSet(space_->get_data_num() / 10);
-    // auto vis = DynamicBitset(space_->get_data_num());
+    // auto vis = Bitset(space_->get_data_num());
 
     // sorted by exact distance (implicit rerank)
     SearchBuffer<DistanceType> res_pool(k);
