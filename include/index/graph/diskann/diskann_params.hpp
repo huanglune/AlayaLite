@@ -29,14 +29,17 @@ namespace alaya {
  * Key parameters:
  * - R (max_degree_): Maximum out-degree of each node. Higher values improve
  *   recall but increase memory and search time. Typical: 32-128.
- * - α (alpha_): Distance threshold multiplier for pruning. Controls the
- *   trade-off between graph connectivity and search efficiency. Typical: 1.2.
+ * - α (alpha_): Distance threshold multiplier for pruning in pass 2+. Controls
+ *   the trade-off between graph connectivity and search efficiency. Typical: 1.2.
+ * - α_first (alpha_first_pass_): Alpha for first pass. Strict pruning (1.0)
+ *   builds k-NN like graph for basic connectivity.
  * - L (ef_construction_): Search list size during construction. Higher values
  *   improve graph quality but increase build time. Typical: 100-200.
  */
 struct DiskANNBuildParams {
   uint32_t max_degree_{64};        ///< R: Maximum out-degree of each node
-  float alpha_{1.2F};              ///< Alpha parameter for Vamana pruning (typically 1.2)
+  float alpha_{1.2F};              ///< Alpha for pass 2+ (relaxed pruning, adds long-range edges)
+  float alpha_first_pass_{1.0F};   ///< Alpha for pass 1 (strict pruning, builds k-NN connectivity)
   uint32_t ef_construction_{128};  ///< L: Search list size during construction
   uint32_t num_threads_{0};        ///< Number of threads (0 = hardware concurrency)
   uint32_t num_iterations_{2};     ///< Number of Vamana iterations (typically 2)
@@ -66,6 +69,11 @@ struct DiskANNBuildParams {
 
   auto set_alpha(float a) -> DiskANNBuildParams & {
     alpha_ = a;
+    return *this;
+  }
+
+  auto set_alpha_first_pass(float a) -> DiskANNBuildParams & {
+    alpha_first_pass_ = a;
     return *this;
   }
 

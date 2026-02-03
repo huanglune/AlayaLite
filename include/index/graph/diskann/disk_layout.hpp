@@ -24,7 +24,7 @@
 #include <type_traits>
 
 #include "utils/math.hpp"
-#include "utils/platform.hpp"
+#include "utils/memory.hpp"
 
 namespace alaya {
 
@@ -34,7 +34,7 @@ namespace alaya {
 
 constexpr size_t kDiskSectorSize = 4096;              ///< 4KB sector size for Direct IO alignment
 constexpr uint32_t kDiskANNMagicNumber = 0x444B414E;  ///< "DKAN" in hex (DiskANN magic)
-constexpr uint32_t kDiskANNVersion = 1;               ///< Current version of the disk format
+constexpr uint32_t kDiskANNVersion = 2;               ///< Current version (2 = PQ support)
 
 // ============================================================================
 // DiskIndexHeader - Metadata for the DiskANN index file
@@ -47,7 +47,7 @@ constexpr uint32_t kDiskANNVersion = 1;               ///< Current version of th
  * all necessary metadata to interpret the rest of the file. The header is
  * padded to be exactly 4KB (one sector) for Direct IO compatibility.
  *
- * File Layout:
+ * File Layout (without PQ):
  * +------------------+
  * | DiskIndexHeader  | <- 4KB (sector 0)
  * +------------------+
@@ -55,6 +55,19 @@ constexpr uint32_t kDiskANNVersion = 1;               ///< Current version of th
  * | DiskNode[1]      |
  * | ...              |
  * | DiskNode[n-1]    |
+ * +------------------+
+ *
+ * File Layout (with PQ enabled):
+ * +------------------+
+ * | DiskIndexHeader  | <- 4KB (sector 0)
+ * +------------------+
+ * | PQ Codebook      | <- M × 256 × (D/M) × sizeof(float), aligned to 4KB
+ * +------------------+
+ * | PQ Codes         | <- N × M bytes, aligned to 4KB
+ * +------------------+
+ * | DiskNode[0]      | <- Full vectors + graph for reranking
+ * | DiskNode[1]      |
+ * | ...              |
  * +------------------+
  */
 struct alignas(kDiskSectorSize) DiskIndexHeader {
@@ -84,6 +97,15 @@ struct alignas(kDiskSectorSize) DiskIndexHeader {
     uint64_t index_build_time_;  ///< Unix timestamp when index was built
     uint32_t data_type_;         ///< Data type identifier (0=float, 1=int8, 2=uint8)
 
+    // PQ (Product Quantization) parameters for in-memory navigation
+    uint32_t pq_enabled_;          ///< Whether PQ is enabled (0=no, 1=yes)
+    uint32_t pq_num_subspaces_;    ///< M: Number of PQ subspaces
+    uint64_t pq_codebook_offset_;  ///< Byte offset to PQ codebook section
+    uint64_t pq_codebook_size_;    ///< Size of PQ codebook in bytes
+    uint64_t pq_codes_offset_;     ///< Byte offset to PQ codes section
+    uint64_t pq_codes_size_;       ///< Size of PQ codes section in bytes
+    uint64_t nodes_offset_;        ///< Byte offset to DiskNode array (for reranking)
+
     // Add new fields here - no need to manually adjust padding
   };
 
@@ -93,7 +115,7 @@ struct alignas(kDiskSectorSize) DiskIndexHeader {
     uint8_t padding_[kDiskSectorSize];  ///< Force 4KB size
   };
 
-  DiskIndexHeader() { std::memset(this, 0, sizeof(DiskIndexHeader)); }
+  DiskIndexHeader() : padding_{} {}
 
   /**
    * @brief Initialize header with given parameters.
@@ -120,6 +142,61 @@ struct alignas(kDiskSectorSize) DiskIndexHeader {
     meta_.medoid_id_ = 0;
     meta_.index_build_time_ = 0;
     meta_.data_type_ = 0;  // Default to float
+
+    // Initialize PQ fields to disabled
+    meta_.pq_enabled_ = 0;
+    meta_.pq_num_subspaces_ = 0;
+    meta_.pq_codebook_offset_ = 0;
+    meta_.pq_codebook_size_ = 0;
+    meta_.pq_codes_offset_ = 0;
+    meta_.pq_codes_size_ = 0;
+    meta_.nodes_offset_ = kDiskSectorSize;  // Without PQ, nodes start right after header
+  }
+
+  /**
+   * @brief Initialize PQ parameters and compute section offsets.
+   *
+   * Call this after init() to enable PQ-based in-memory navigation.
+   * This sets up the file layout with codebook and PQ codes sections.
+   *
+   * @param num_subspaces Number of PQ subspaces (M)
+   */
+  void init_pq(uint32_t num_subspaces) {
+    meta_.pq_enabled_ = 1;
+    meta_.pq_num_subspaces_ = num_subspaces;
+
+    // Calculate codebook size: M subspaces × 256 centroids × (D/M) dims × sizeof(float)
+    uint32_t subspace_dim = meta_.dimension_ / num_subspaces;
+    size_t codebook_raw_size =
+        static_cast<size_t>(num_subspaces) * 256 * subspace_dim * sizeof(float);
+    meta_.pq_codebook_size_ = math::round_up_pow2(codebook_raw_size, kDiskSectorSize);
+
+    // Calculate PQ codes size: N points × M bytes
+    size_t codes_raw_size = meta_.num_points_ * num_subspaces;
+    meta_.pq_codes_size_ = math::round_up_pow2(codes_raw_size, kDiskSectorSize);
+
+    // Set offsets: Header -> Codebook -> PQ Codes -> Nodes
+    meta_.pq_codebook_offset_ = kDiskSectorSize;
+    meta_.pq_codes_offset_ = meta_.pq_codebook_offset_ + meta_.pq_codebook_size_;
+    meta_.nodes_offset_ = meta_.pq_codes_offset_ + meta_.pq_codes_size_;
+
+    // Update data_offset for backward compatibility
+    meta_.data_offset_ = meta_.nodes_offset_;
+  }
+
+  /**
+   * @brief Check if PQ is enabled.
+   */
+  [[nodiscard]] auto is_pq_enabled() const -> bool { return meta_.pq_enabled_ != 0; }
+
+  /**
+   * @brief Get the byte offset for a specific node.
+   *
+   * @param node_id Node ID
+   * @return Byte offset to the node data
+   */
+  [[nodiscard]] auto get_node_offset(uint64_t node_id) const -> uint64_t {
+    return meta_.nodes_offset_ + node_id * meta_.node_sector_size_;
   }
 
   /**
@@ -131,7 +208,8 @@ struct alignas(kDiskSectorSize) DiskIndexHeader {
     if (meta_.magic_ != kDiskANNMagicNumber) {
       return false;
     }
-    if (meta_.version_ != kDiskANNVersion) {
+    // Support version 1 (no PQ) and version 2 (with PQ support)
+    if (meta_.version_ != kDiskANNVersion && meta_.version_ != 1) {
       return false;
     }
     if (meta_.dimension_ == 0 || meta_.num_points_ == 0) {
@@ -139,6 +217,15 @@ struct alignas(kDiskSectorSize) DiskIndexHeader {
     }
     if (meta_.node_sector_size_ == 0 || meta_.node_sector_size_ % kDiskSectorSize != 0) {
       return false;
+    }
+    // Validate PQ fields if enabled
+    if (meta_.pq_enabled_ != 0) {
+      if (meta_.pq_num_subspaces_ == 0 || meta_.dimension_ % meta_.pq_num_subspaces_ != 0) {
+        return false;
+      }
+      if (meta_.pq_codebook_offset_ < kDiskSectorSize) {
+        return false;
+      }
     }
     return true;
   }
@@ -412,8 +499,7 @@ class DiskNodeBuffer {
   using AccessorType = typename NodeType::Accessor;
 
  private:
-  uint8_t *data_{nullptr};  ///< Pointer to aligned buffer
-  size_t buffer_size_{0};   ///< Total buffer size in bytes
+  AlignedBuffer data_;      ///< 4KB-aligned buffer for Direct IO
   uint32_t dimension_{0};   ///< Vector dimension
   uint32_t max_degree_{0};  ///< Maximum number of neighbors
   size_t node_size_{0};     ///< Size of each node in bytes
@@ -421,37 +507,13 @@ class DiskNodeBuffer {
 
  public:
   DiskNodeBuffer() = default;
-
-  ~DiskNodeBuffer() { release(); }
+  ~DiskNodeBuffer() = default;
 
   DiskNodeBuffer(const DiskNodeBuffer &) = delete;
   auto operator=(const DiskNodeBuffer &) -> DiskNodeBuffer & = delete;
 
-  DiskNodeBuffer(DiskNodeBuffer &&other) noexcept
-      : data_(other.data_),
-        buffer_size_(other.buffer_size_),
-        dimension_(other.dimension_),
-        max_degree_(other.max_degree_),
-        node_size_(other.node_size_),
-        num_nodes_(other.num_nodes_) {
-    other.data_ = nullptr;
-    other.buffer_size_ = 0;
-  }
-
-  auto operator=(DiskNodeBuffer &&other) noexcept -> DiskNodeBuffer & {
-    if (this != &other) {
-      release();
-      data_ = other.data_;
-      buffer_size_ = other.buffer_size_;
-      dimension_ = other.dimension_;
-      max_degree_ = other.max_degree_;
-      node_size_ = other.node_size_;
-      num_nodes_ = other.num_nodes_;
-      other.data_ = nullptr;
-      other.buffer_size_ = 0;
-    }
-    return *this;
-  }
+  DiskNodeBuffer(DiskNodeBuffer &&) noexcept = default;
+  auto operator=(DiskNodeBuffer &&) noexcept -> DiskNodeBuffer & = default;
 
   /**
    * @brief Allocate aligned buffer for specified number of nodes.
@@ -461,29 +523,13 @@ class DiskNodeBuffer {
    * @param num_nodes Number of nodes to allocate space for (default: 1)
    */
   void allocate(uint32_t dimension, uint32_t max_degree, size_t num_nodes = 1) {
-    release();
     dimension_ = dimension;
     max_degree_ = max_degree;
     node_size_ = NodeType::calc_node_sector_size(dimension, max_degree);
     num_nodes_ = num_nodes;
-    buffer_size_ = node_size_ * num_nodes;
 
-    data_ = static_cast<uint8_t *>(alaya_aligned_alloc_impl(buffer_size_, kDiskSectorSize));
-    if (data_ == nullptr) {
-      throw std::runtime_error("Failed to allocate aligned buffer for DiskNodeBuffer");
-    }
-    std::memset(data_, 0, buffer_size_);
-  }
-
-  /**
-   * @brief Release the allocated buffer.
-   */
-  void release() {
-    if (data_ != nullptr) {
-      alaya_aligned_free_impl(data_);
-      data_ = nullptr;
-      buffer_size_ = 0;
-    }
+    data_.resize(node_size_ * num_nodes);
+    std::memset(data_.data(), 0, data_.size());
   }
 
   /**
@@ -496,44 +542,26 @@ class DiskNodeBuffer {
     if (index >= num_nodes_) {
       throw std::out_of_range("Node index out of range");
     }
-    return AccessorType(data_ + index * node_size_, dimension_, max_degree_);
+    return AccessorType(data_.data() + index * node_size_, dimension_, max_degree_);
   }
 
-  /**
-   * @brief Get raw data pointer.
-   * @return Pointer to aligned buffer
-   */
-  [[nodiscard]] auto data() -> uint8_t * { return data_; }
+  /// @brief Get raw data pointer.
+  [[nodiscard]] auto data() -> uint8_t * { return data_.data(); }
 
-  /**
-   * @brief Get const raw data pointer.
-   * @return Const pointer to aligned buffer
-   */
-  [[nodiscard]] auto data() const -> const uint8_t * { return data_; }
+  /// @brief Get const raw data pointer.
+  [[nodiscard]] auto data() const -> const uint8_t * { return data_.data(); }
 
-  /**
-   * @brief Get total buffer size.
-   * @return Buffer size in bytes
-   */
-  [[nodiscard]] auto size() const -> size_t { return buffer_size_; }
+  /// @brief Get total buffer size.
+  [[nodiscard]] auto size() const -> size_t { return data_.size(); }
 
-  /**
-   * @brief Get single node size.
-   * @return Node size in bytes
-   */
+  /// @brief Get single node size.
   [[nodiscard]] auto node_size() const -> size_t { return node_size_; }
 
-  /**
-   * @brief Get number of nodes in buffer.
-   * @return Number of nodes
-   */
+  /// @brief Get number of nodes in buffer.
   [[nodiscard]] auto num_nodes() const -> size_t { return num_nodes_; }
 
-  /**
-   * @brief Check if buffer is allocated.
-   * @return true if buffer is valid
-   */
-  [[nodiscard]] auto is_valid() const -> bool { return data_ != nullptr; }
+  /// @brief Check if buffer is allocated.
+  [[nodiscard]] auto is_valid() const -> bool { return !data_.empty(); }
 };
 
 }  // namespace alaya

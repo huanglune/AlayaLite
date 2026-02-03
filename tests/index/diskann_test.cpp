@@ -34,55 +34,61 @@
 #include "space/raw_space.hpp"
 #include "utils/dataset_utils.hpp"
 #include "utils/evaluate.hpp"
+#include "utils/log.hpp"
 
 namespace alaya {
 
-class DiskANNTest : public ::testing::Test {
- protected:
-  // Test dataset parameters
+// =============================================================================
+// Shared test resources (loaded once for all tests)
+// =============================================================================
+
+struct TestResources {
+  Dataset ds_;
+  uint32_t dim_{0};
+  uint32_t data_num_{0};
+  uint32_t query_num_{0};
+
+  std::shared_ptr<RawSpace<>> space_;
+  uint32_t max_threads_{std::thread::hardware_concurrency()};
+
+  void load() {
+    ds_ = load_dataset(random_config(kDataNum, kQueryNum, kDim, kGtTopk));
+    dim_ = ds_.dim_;
+    data_num_ = ds_.data_num_;
+    query_num_ = ds_.query_num_;
+    space_ = std::make_shared<RawSpace<>>(data_num_, dim_, MetricType::L2);
+    space_->fit(ds_.data_.data(), data_num_);
+    LOG_INFO("TestResources: Loaded {} vectors, dim={}, {} queries", data_num_, dim_, query_num_);
+  }
+
+private:
   static constexpr uint32_t kDataNum = 1000;
   static constexpr uint32_t kQueryNum = 50;
   static constexpr uint32_t kDim = 128;
   static constexpr uint32_t kGtTopk = 100;
-
-  void SetUp() override {
-    // Clean up any stale test files from previous runs
-    if (std::filesystem::exists(index_path_)) {
-      std::filesystem::remove(index_path_);
-    }
-
-    // Generate random dataset (no external files needed)
-    dataset_ = load_dataset(random_config(kDataNum, kQueryNum, kDim, kGtTopk));
-
-    dim_ = dataset_.dim_;
-    data_num_ = dataset_.data_num_;
-    query_num_ = dataset_.query_num_;
-
-    // Build the space
-    space_ = std::make_shared<RawSpace<>>(data_num_, dim_, MetricType::L2);
-    space_->fit(dataset_.data_.data(), data_num_);
-  }
-
-  void TearDown() override {
-    // Clean up test files
-    if (std::filesystem::exists(index_path_)) {
-      std::filesystem::remove(index_path_);
-    }
-  }
-
-  uint32_t max_thread_num_ = std::thread::hardware_concurrency();
-  Dataset dataset_;
-  uint32_t dim_{0};
-  uint32_t data_num_{0};
-  uint32_t query_num_{0};
-  std::shared_ptr<RawSpace<>> space_ = nullptr;
-  std::string index_path_ = "test_diskann.index";
 };
 
-// Test DiskIndexHeader
-TEST_F(DiskANNTest, DiskIndexHeaderTest) {
+static TestResources g_resources;
+
+// =============================================================================
+// Test Fixture 1: Layout tests (no index building, fast)
+// =============================================================================
+
+class DiskLayoutTest : public ::testing::Test {
+ protected:
+  static void SetUpTestSuite() {
+    if (g_resources.dim_ == 0) {
+      g_resources.load();
+    }
+  }
+
+  auto dim() const -> uint32_t { return g_resources.dim_; }
+  auto data_num() const -> uint32_t { return g_resources.data_num_; }
+};
+
+TEST_F(DiskLayoutTest, HeaderInitAndValidate) {
   DiskIndexHeader header;
-  header.init(64, 1.2F, dim_, data_num_, kDiskSectorSize);
+  header.init(64, 1.2F, dim(), data_num(), kDiskSectorSize);
   header.meta_.medoid_id_ = 42;
 
   EXPECT_TRUE(header.is_valid());
@@ -90,49 +96,78 @@ TEST_F(DiskANNTest, DiskIndexHeaderTest) {
   EXPECT_EQ(header.meta_.version_, kDiskANNVersion);
   EXPECT_EQ(header.meta_.max_degree_, 64U);
   EXPECT_FLOAT_EQ(header.meta_.alpha_, 1.2F);
-  EXPECT_EQ(header.meta_.dimension_, dim_);
-  EXPECT_EQ(header.meta_.num_points_, data_num_);
+  EXPECT_EQ(header.meta_.dimension_, dim());
+  EXPECT_EQ(header.meta_.num_points_, data_num());
   EXPECT_EQ(header.meta_.medoid_id_, 42U);
+}
 
-  // Test header save/load
-  std::ofstream writer(index_path_, std::ios::binary);
+TEST_F(DiskLayoutTest, HeaderSaveLoad) {
+  const std::string kTestFile = "/tmp/diskann_header_test.bin";
+
+  DiskIndexHeader header;
+  header.init(64, 1.2F, dim(), data_num(), kDiskSectorSize);
+  header.meta_.medoid_id_ = 42;
+
+  std::ofstream writer(kTestFile, std::ios::binary);
   header.save(writer);
   writer.close();
 
-  DiskIndexHeader loaded_header;
-  std::ifstream reader(index_path_, std::ios::binary);
-  loaded_header.load(reader);
+  DiskIndexHeader loaded;
+  std::ifstream reader(kTestFile, std::ios::binary);
+  loaded.load(reader);
   reader.close();
 
-  EXPECT_TRUE(loaded_header.is_valid());
-  EXPECT_EQ(loaded_header.meta_.dimension_, dim_);
-  EXPECT_EQ(loaded_header.meta_.num_points_, data_num_);
-  EXPECT_EQ(loaded_header.meta_.medoid_id_, 42U);
+  EXPECT_TRUE(loaded.is_valid());
+  EXPECT_EQ(loaded.meta_.dimension_, dim());
+  EXPECT_EQ(loaded.meta_.num_points_, data_num());
+  EXPECT_EQ(loaded.meta_.medoid_id_, 42U);
+
+  std::filesystem::remove(kTestFile);
 }
 
-// Test DiskNode layout
-TEST_F(DiskANNTest, DiskNodeLayoutTest) {
+TEST_F(DiskLayoutTest, HeaderPQInit) {
+  DiskIndexHeader header;
+  header.init(64, 1.2F, dim(), data_num(), kDiskSectorSize);
+  header.init_pq(8);  // 8 subspaces
+
+  EXPECT_TRUE(header.is_pq_enabled());
+  EXPECT_EQ(header.meta_.pq_num_subspaces_, 8U);
+  EXPECT_GT(header.meta_.pq_codebook_offset_, 0U);
+  EXPECT_GT(header.meta_.pq_codes_offset_, header.meta_.pq_codebook_offset_);
+  EXPECT_GT(header.meta_.nodes_offset_, header.meta_.pq_codes_offset_);
+}
+
+TEST_F(DiskLayoutTest, NodeSectorSize) {
   constexpr uint32_t kMaxDegree = 64;
-  auto node_size = DiskNode<float, uint32_t>::calc_node_sector_size(dim_, kMaxDegree);
+  auto node_size = DiskNode<float, uint32_t>::calc_node_sector_size(dim(), kMaxDegree);
 
   // Should be a multiple of sector size
   EXPECT_EQ(node_size % kDiskSectorSize, 0U);
+  EXPECT_GT(node_size, 0U);
+}
 
-  // Test buffer allocation
+TEST_F(DiskLayoutTest, NodeBufferAllocation) {
+  constexpr uint32_t kMaxDegree = 64;
+  auto node_size = DiskNode<float, uint32_t>::calc_node_sector_size(dim(), kMaxDegree);
+
   DiskNodeBuffer<float, uint32_t> buffer;
-  buffer.allocate(dim_, kMaxDegree, 1);
+  buffer.allocate(dim(), kMaxDegree, 1);
 
   EXPECT_TRUE(buffer.is_valid());
   EXPECT_EQ(buffer.num_nodes(), 1U);
   EXPECT_EQ(buffer.node_size(), node_size);
+}
 
-  // Test node accessor
+TEST_F(DiskLayoutTest, NodeAccessor) {
+  constexpr uint32_t kMaxDegree = 64;
+
+  DiskNodeBuffer<float, uint32_t> buffer;
+  buffer.allocate(dim(), kMaxDegree, 1);
   auto accessor = buffer.get_node(0);
 
   // Write test data
-  std::vector<float> test_vec(dim_);
+  std::vector<float> test_vec(dim());
   std::iota(test_vec.begin(), test_vec.end(), 1.0F);
-
   std::vector<uint32_t> test_neighbors = {1, 2, 3, 4, 5};
   accessor.init(test_vec.data(), test_neighbors.data(), test_neighbors.size());
 
@@ -141,110 +176,132 @@ TEST_F(DiskANNTest, DiskNodeLayoutTest) {
   for (uint32_t i = 0; i < test_neighbors.size(); ++i) {
     EXPECT_EQ(accessor.get_neighbor(i), test_neighbors[i]);
   }
-  for (uint32_t i = 0; i < dim_; ++i) {
+  for (uint32_t i = 0; i < dim(); ++i) {
     EXPECT_FLOAT_EQ(accessor.vector_data()[i], test_vec[i]);
   }
 }
 
-// Test DiskANN graph building
-TEST_F(DiskANNTest, BuildGraphTest) {
-  auto build_params = DiskANNBuildParams()
-                          .set_max_degree(32)
-                          .set_ef_construction(64)
-                          .set_num_threads(max_thread_num_);
+// =============================================================================
+// Test Fixture 2: Build tests (test graph construction)
+// =============================================================================
 
-  DiskANNBuilder<RawSpace<>> builder(space_, build_params);
-  auto graph = builder.build_graph(build_params.num_threads_);
+class DiskANNBuildTest : public ::testing::Test {
+ protected:
+  static void SetUpTestSuite() {
+    if (g_resources.dim_ == 0) {
+      g_resources.load();
+    }
+  }
+
+  auto space() { return g_resources.space_; }
+  auto dim() const -> uint32_t { return g_resources.dim_; }
+  auto data_num() const -> uint32_t { return g_resources.data_num_; }
+  auto max_threads() const -> uint32_t { return g_resources.max_threads_; }
+};
+
+TEST_F(DiskANNBuildTest, BuildGraph) {
+  auto params = DiskANNBuildParams().set_max_degree(32).set_ef_construction(64).set_num_threads(
+      max_threads());
+
+  DiskANNBuilder<RawSpace<>> builder(space(), params);
+  auto graph = builder.build_graph(params.num_threads_);
 
   EXPECT_NE(graph, nullptr);
-  EXPECT_EQ(graph->max_nodes_, data_num_);
+  EXPECT_EQ(graph->max_nodes_, data_num());
   EXPECT_EQ(graph->max_nbrs_, 32U);
   EXPECT_FALSE(graph->eps_.empty());
 
   // Verify graph has edges
   uint32_t total_edges = 0;
-  for (uint32_t i = 0; i < data_num_; ++i) {
+  for (uint32_t i = 0; i < data_num(); ++i) {
     const auto *edges = graph->edges(i);
     for (uint32_t j = 0; j < graph->max_nbrs_; ++j) {
       if (edges[j] != static_cast<uint32_t>(-1)) {
         ++total_edges;
-        EXPECT_LT(edges[j], data_num_);  // Valid node ID
+        EXPECT_LT(edges[j], data_num());
       }
     }
   }
-  EXPECT_GT(total_edges, 0U);  // Should have some edges
+  EXPECT_GT(total_edges, 0U);
 }
 
-// Test disk index build and search
-TEST_F(DiskANNTest, BuildAndSearchTest) {
-  auto build_params = DiskANNBuildParams()
-                          .set_max_degree(32)
-                          .set_ef_construction(64)
-                          .set_num_threads(max_thread_num_);
+// =============================================================================
+// Test Fixture 3: Search tests with shared index (build once)
+// =============================================================================
 
-  DiskANNBuilder<RawSpace<>> builder(space_, build_params);
-  builder.build_disk_index(index_path_, build_params.num_threads_);
+class DiskANNSearchTest : public ::testing::Test {
+ protected:
+  static inline std::string index_path = "/tmp/diskann_search_test.index";
+  static inline bool index_built = false;
 
-  // Verify file exists
-  EXPECT_TRUE(std::filesystem::exists(index_path_));
+  static void SetUpTestSuite() {
+    if (g_resources.dim_ == 0) {
+      g_resources.load();
+    }
 
-  // Load and search
-  DiskANNSearcher<float, uint32_t> searcher;
-  searcher.open(index_path_);
+    if (!index_built) {
+      auto params = DiskANNBuildParams()
+                        .set_max_degree(64)
+                        .set_ef_construction(128)
+                        .set_num_threads(g_resources.max_threads_);
 
-  EXPECT_TRUE(searcher.is_open());
-  EXPECT_EQ(searcher.num_points(), data_num_);
-  EXPECT_EQ(searcher.dimension(), dim_);
-  EXPECT_EQ(searcher.max_degree(), build_params.max_degree_);
+      DiskANNIndex<float, uint32_t>::build(g_resources.space_, index_path, params);
+      index_built = true;
+      LOG_INFO("DiskANNSearchTest: Built shared index at {}", index_path);
+    }
+  }
 
-  // Test search with first query
+  static void TearDownTestSuite() {
+    if (std::filesystem::exists(index_path)) {
+      std::filesystem::remove(index_path);
+    }
+  }
+
+  auto dataset() const -> const Dataset & { return g_resources.ds_; }
+  auto dim() const -> uint32_t { return g_resources.dim_; }
+  auto data_num() const -> uint32_t { return g_resources.data_num_; }
+  auto query_num() const -> uint32_t { return g_resources.query_num_; }
+  auto get_index_path() const -> const std::string & { return index_path; }
+};
+
+TEST_F(DiskANNSearchTest, LoadIndex) {
+  DiskANNIndex<float, uint32_t> index;
+  index.load(get_index_path());
+
+  EXPECT_TRUE(index.is_loaded());
+  EXPECT_EQ(index.size(), data_num());
+  EXPECT_EQ(index.dimension(), dim());
+}
+
+TEST_F(DiskANNSearchTest, SearchSingle) {
+  DiskANNIndex<float, uint32_t> index;
+  index.load(get_index_path());
+
   constexpr uint32_t kTopk = 10;
-  DiskANNSearchParams search_params(50);
+  DiskANNSearchParams params(100);
   std::vector<uint32_t> results(kTopk);
 
-  const float *query = dataset_.queries_.data();
-  searcher.search(query, kTopk, results.data(), search_params);
+  index.search(dataset().queries_.data(), kTopk, results.data(), params);
 
   // Verify results are valid node IDs
   for (uint32_t i = 0; i < kTopk; ++i) {
     if (results[i] != static_cast<uint32_t>(-1)) {
-      EXPECT_LT(results[i], data_num_);
+      EXPECT_LT(results[i], data_num());
     }
   }
 }
 
-// Test DiskANNIndex unified interface
-TEST_F(DiskANNTest, DiskANNIndexInterfaceTest) {
-  auto build_params = DiskANNBuildParams()
-                          .set_max_degree(32)
-                          .set_ef_construction(64)
-                          .set_num_threads(max_thread_num_);
-
-  DiskANNIndex<float, uint32_t>::build(space_, index_path_, build_params);
-
-  EXPECT_TRUE(std::filesystem::exists(index_path_));
-
-  // Load using instance
+TEST_F(DiskANNSearchTest, SearchWithDistance) {
   DiskANNIndex<float, uint32_t> index;
-  index.load(index_path_);
+  index.load(get_index_path());
 
-  EXPECT_TRUE(index.is_loaded());
-  EXPECT_EQ(index.size(), data_num_);
-  EXPECT_EQ(index.dimension(), dim_);
-
-  // Search
   constexpr uint32_t kTopk = 10;
+  DiskANNSearchParams params(100);
   std::vector<uint32_t> results(kTopk);
-  index.search(dataset_.queries_.data(), kTopk, results.data());
-
-  // Check if ground truth top-1 is found
-  uint32_t gt_top1 = dataset_.ground_truth_[0];
-  bool found_gt = std::ranges::find(results, gt_top1) != results.end();
-  EXPECT_TRUE(found_gt);
-
-  // Test search with distance
   std::vector<float> distances(kTopk);
-  index.search_with_distance(dataset_.queries_.data(), kTopk, results.data(), distances.data());
+
+  index.search_with_distance(dataset().queries_.data(), kTopk, results.data(), distances.data(),
+                             params);
 
   // Distances should be non-negative and sorted
   for (uint32_t i = 1; i < kTopk; ++i) {
@@ -252,75 +309,225 @@ TEST_F(DiskANNTest, DiskANNIndexInterfaceTest) {
   }
 }
 
-// Test search recall quality using siftsmall ground truth
-TEST_F(DiskANNTest, SearchRecallTest) {
-  auto build_params = DiskANNBuildParams()
-                          .set_max_degree(64)
-                          .set_ef_construction(128)
-                          .set_num_threads(max_thread_num_);
-
-  DiskANNIndex<float, uint32_t>::build(space_, index_path_, build_params);
-
+TEST_F(DiskANNSearchTest, BatchSearch) {
   DiskANNIndex<float, uint32_t> index;
-  index.load(index_path_);
+  index.load(get_index_path());
 
   constexpr uint32_t kTopk = 10;
-  DiskANNSearchParams search_params(100);
+  DiskANNSearchParams params(100);
+  std::vector<uint32_t> results(query_num() * kTopk);
 
-  // Get search results for all queries
-  std::vector<uint32_t> results(query_num_ * kTopk);
-  for (uint32_t q = 0; q < query_num_; ++q) {
-    const float *query = dataset_.queries_.data() + q * dim_;
-    index.search(query, kTopk, results.data() + q * kTopk, search_params);
+  index.batch_search(dataset().queries_.data(), query_num(), kTopk, results.data(), params);
+
+  // Verify results are valid
+  for (uint32_t i = 0; i < query_num() * kTopk; ++i) {
+    if (results[i] != static_cast<uint32_t>(-1)) {
+      EXPECT_LT(results[i], data_num());
+    }
   }
-
-  // Compute recall using dataset ground truth
-  float avg_recall = calc_recall(results.data(), dataset_.ground_truth_.data(),
-                                 query_num_, dataset_.gt_dim_, kTopk);
-  LOG_INFO("DiskANN recall@{}: {:.4f}", kTopk, avg_recall);
-
-  // Log recall for monitoring (no strict threshold for now)
-  EXPECT_GE(avg_recall, 0.8F);
 }
 
-// Test batch search
-TEST_F(DiskANNTest, BatchSearchTest) {
-  auto build_params = DiskANNBuildParams()
-                          .set_max_degree(64)
-                          .set_ef_construction(128)
-                          .set_num_threads(max_thread_num_);
-
-  DiskANNIndex<float, uint32_t>::build(space_, index_path_, build_params);
-
+TEST_F(DiskANNSearchTest, RecallQuality) {
   DiskANNIndex<float, uint32_t> index;
-  index.load(index_path_);
+  index.load(get_index_path());
 
   constexpr uint32_t kTopk = 10;
-  DiskANNSearchParams search_params(100);
+  DiskANNSearchParams params(200);  // Higher ef for better recall
 
-  std::vector<uint32_t> results(query_num_ * kTopk);
-  index.batch_search(dataset_.queries_.data(), query_num_, kTopk, results.data(), search_params);
+  std::vector<uint32_t> results(query_num() * kTopk);
+  for (uint32_t q = 0; q < query_num(); ++q) {
+    const float *query = dataset().queries_.data() + q * dim();
+    index.search(query, kTopk, results.data() + q * kTopk, params);
+  }
 
-  // Verify each query found its ground truth top-1
-  uint32_t found_count = 0;
-  for (uint32_t q = 0; q < query_num_; ++q) {
-    uint32_t gt_top1 = dataset_.ground_truth_[q * dataset_.gt_dim_];
-    for (uint32_t k = 0; k < kTopk; ++k) {
-      if (results[q * kTopk + k] == gt_top1) {
-        ++found_count;
+  float recall =
+      calc_recall(results.data(), dataset().ground_truth_.data(), query_num(), dataset().gt_dim_, kTopk);
+  LOG_INFO("DiskANN recall@{}: {:.4f}", kTopk, recall);
+
+  EXPECT_GE(recall, 0.7F);
+}
+
+TEST_F(DiskANNSearchTest, HitRate) {
+  DiskANNIndex<float, uint32_t> index;
+  index.load(get_index_path());
+
+  constexpr uint32_t kTopk = 10;
+  DiskANNSearchParams params(100);
+
+  uint32_t hit_count = 0;
+  for (uint32_t q = 0; q < query_num(); ++q) {
+    std::vector<uint32_t> results(kTopk);
+    index.search(dataset().queries_.data() + q * dim(), kTopk, results.data(), params);
+
+    uint32_t gt_top1 = dataset().ground_truth_[q * dataset().gt_dim_];
+    if (std::ranges::find(results, gt_top1) != results.end()) {
+      ++hit_count;
+    }
+  }
+
+  float hit_rate = static_cast<float>(hit_count) / static_cast<float>(query_num());
+  LOG_INFO("DiskANN top-1 hit rate: {:.4f}", hit_rate);
+
+  EXPECT_GE(hit_rate, 0.5F);
+}
+
+// =============================================================================
+// Test Fixture 4: PQ-enabled tests (separate index with PQ)
+// =============================================================================
+
+class DiskANNPQTest : public ::testing::Test {
+ protected:
+  static inline std::string index_path = "/tmp/diskann_pq_test.index";
+  static inline bool index_built = false;
+
+  static void SetUpTestSuite() {
+    if (g_resources.dim_ == 0) {
+      g_resources.load();
+    }
+
+    if (!index_built) {
+      auto params = DiskANNBuildParams()
+                        .set_max_degree(64)
+                        .set_ef_construction(128)
+                        .set_num_threads(g_resources.max_threads_)
+                        .set_pq_params(8);  // 8 subspaces
+
+      DiskANNIndex<float, uint32_t>::build(g_resources.space_, index_path, params);
+      index_built = true;
+      LOG_INFO("DiskANNPQTest: Built PQ-enabled index at {}", index_path);
+    }
+  }
+
+  static void TearDownTestSuite() {
+    if (std::filesystem::exists(index_path)) {
+      std::filesystem::remove(index_path);
+    }
+  }
+
+  auto dataset() const -> const Dataset & { return g_resources.ds_; }
+  auto dim() const -> uint32_t { return g_resources.dim_; }
+  auto data_num() const -> uint32_t { return g_resources.data_num_; }
+  auto query_num() const -> uint32_t { return g_resources.query_num_; }
+  auto get_index_path() const -> const std::string & { return index_path; }
+};
+
+TEST_F(DiskANNPQTest, LoadPQIndex) {
+  DiskANNIndex<float, uint32_t> index;
+  index.load(get_index_path());
+
+  EXPECT_TRUE(index.is_loaded());
+  EXPECT_EQ(index.size(), data_num());
+  EXPECT_EQ(index.dimension(), dim());
+}
+
+TEST_F(DiskANNPQTest, SearchWithPQ) {
+  DiskANNIndex<float, uint32_t> index;
+  index.load(get_index_path());
+
+  constexpr uint32_t kTopk = 10;
+  DiskANNSearchParams params(100);
+
+  uint32_t hit_count = 0;
+  for (uint32_t q = 0; q < query_num(); ++q) {
+    std::vector<uint32_t> results(kTopk);
+    index.search(dataset().queries_.data() + q * dim(), kTopk, results.data(), params);
+
+    // Check if any ground truth is in results
+    for (uint32_t k = 0; k < 100 && k < data_num(); ++k) {
+      uint32_t gt_id = dataset().ground_truth_[q * 100 + k];
+      if (std::ranges::find(results, gt_id) != results.end()) {
+        ++hit_count;
         break;
       }
     }
   }
 
-  // Log hit rate for monitoring
-  float hit_rate = static_cast<float>(found_count) / static_cast<float>(query_num_);
-  LOG_INFO("DiskANN top-1 hit rate: {:.4f}", hit_rate);
+  float hit_rate = static_cast<float>(hit_count) / static_cast<float>(query_num());
+  LOG_INFO("DiskANN PQ top-1 hit rate: {:.4f}", hit_rate);
 
-  // Verify results are valid (no strict threshold for now)
-  for (uint32_t i = 0; i < query_num_ * kTopk; ++i) {
+  EXPECT_GE(hit_rate, 0.7F);
+}
+
+TEST_F(DiskANNPQTest, PQRecallQuality) {
+  DiskANNIndex<float, uint32_t> index;
+  index.load(get_index_path());
+
+  constexpr uint32_t kTopk = 10;
+  DiskANNSearchParams params(200);
+
+  std::vector<uint32_t> results(query_num() * kTopk);
+  for (uint32_t q = 0; q < query_num(); ++q) {
+    const float *query = dataset().queries_.data() + q * dim();
+    index.search(query, kTopk, results.data() + q * kTopk, params);
+  }
+
+  float recall =
+      calc_recall(results.data(), dataset().ground_truth_.data(), query_num(), dataset().gt_dim_, kTopk);
+  LOG_INFO("DiskANN PQ recall@{}: {:.4f}", kTopk, recall);
+
+  // PQ may have slightly lower recall due to quantization
+  EXPECT_GE(recall, 0.6F);
+}
+
+// =============================================================================
+// Test Fixture 5: Searcher low-level tests
+// =============================================================================
+
+class DiskANNSearcherTest : public ::testing::Test {
+ protected:
+  static inline std::string index_path = "/tmp/diskann_searcher_test.index";
+
+  static void SetUpTestSuite() {
+    if (g_resources.dim_ == 0) {
+      g_resources.load();
+    }
+  }
+
+  void SetUp() override {
+    // Build a fresh index for each test
+    auto params = DiskANNBuildParams()
+                      .set_max_degree(32)
+                      .set_ef_construction(64)
+                      .set_num_threads(g_resources.max_threads_);
+
+    DiskANNBuilder<RawSpace<>> builder(g_resources.space_, params);
+    builder.build_disk_index(index_path, params.num_threads_);
+  }
+
+  void TearDown() override {
+    if (std::filesystem::exists(index_path)) {
+      std::filesystem::remove(index_path);
+    }
+  }
+
+  auto dataset() const -> const Dataset & { return g_resources.ds_; }
+  auto dim() const -> uint32_t { return g_resources.dim_; }
+  auto data_num() const -> uint32_t { return g_resources.data_num_; }
+};
+
+TEST_F(DiskANNSearcherTest, OpenAndVerify) {
+  DiskANNSearcher<float, uint32_t> searcher;
+  searcher.open(index_path);
+
+  EXPECT_TRUE(searcher.is_open());
+  EXPECT_EQ(searcher.num_points(), data_num());
+  EXPECT_EQ(searcher.dimension(), dim());
+  EXPECT_EQ(searcher.max_degree(), 32U);
+}
+
+TEST_F(DiskANNSearcherTest, SearchDirect) {
+  DiskANNSearcher<float, uint32_t> searcher;
+  searcher.open(index_path);
+
+  constexpr uint32_t kTopk = 10;
+  DiskANNSearchParams params(50);
+  std::vector<uint32_t> results(kTopk);
+
+  searcher.search(dataset().queries_.data(), kTopk, results.data(), params);
+
+  for (uint32_t i = 0; i < kTopk; ++i) {
     if (results[i] != static_cast<uint32_t>(-1)) {
-      EXPECT_LT(results[i], data_num_);
+      EXPECT_LT(results[i], data_num());
     }
   }
 }

@@ -5,3 +5,4 @@ extend-exclude = []
 [default.extend-words]
 secon = "secon" # keep don't change it
 countr = "countr" # C++20 std::countr_zero function
+ba = "ba" # abbreviation for "b to a" in distance calculations

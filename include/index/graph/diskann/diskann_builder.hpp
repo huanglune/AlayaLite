@@ -32,6 +32,7 @@
 #include "diskann_params.hpp"
 #include "index/graph/graph.hpp"
 #include "index/neighbor.hpp"
+#include "space/quant/pq.hpp"
 #include "space/space_concepts.hpp"
 #include "utils/log.hpp"
 #include "utils/thread_pool.hpp"
@@ -61,6 +62,10 @@ struct DiskANNBuilder {
 
   std::shared_ptr<DistanceSpaceType> space_;  ///< Data space
   IDType medoid_id_{0};                       ///< Entry point for search
+
+  // PQ-related members
+  PQQuantizer<DataType> pq_quantizer_;  ///< PQ codebook (trained if enable_pq_ is true)
+  std::vector<uint8_t> pq_codes_;       ///< PQ codes for all vectors
 
   /**
    * @brief Construct a new DiskANN Builder.
@@ -103,11 +108,17 @@ struct DiskANNBuilder {
     medoid_id_ = compute_medoid();
     LOG_INFO("DiskANN: Medoid ID = {}", medoid_id_);
 
-    // Build graph with multiple passes
+    // Build graph with multiple passes (2-pass strategy from DiskANN paper)
+    // Pass 1: alpha = alpha_first_pass_ (strict pruning, builds k-NN like graph for connectivity)
+    // Pass 2+: alpha = alpha_ (relaxed pruning, adds long-range edges as "highways")
     Timer timer;
     for (uint32_t pass = 0; pass < params_.num_iterations_; ++pass) {
-      LOG_INFO("DiskANN: Building pass {}/{}", pass + 1, params_.num_iterations_);
-      build_pass(graph.get(), thread_num);
+      float current_alpha = (pass == 0) ? params_.alpha_first_pass_ : params_.alpha_;
+      LOG_INFO("DiskANN: Building pass {}/{}, alpha={:.2f}",
+               pass + 1,
+               params_.num_iterations_,
+               current_alpha);
+      build_pass(graph.get(), thread_num, current_alpha);
     }
     LOG_INFO("DiskANN: Graph building cost: {:.2f}s", timer.elapsed() / 1e6);
 
@@ -131,8 +142,93 @@ struct DiskANNBuilder {
     // Build graph in memory
     auto graph = build_graph(thread_num);
 
+    // Train PQ if enabled
+    if (params_.enable_pq_) {
+      train_pq();
+    }
+
     // Write to disk
     write_disk_index(output_path, *graph);
+  }
+
+  /**
+   * @brief Train PQ quantizer and encode all vectors.
+   *
+   * Call this after graph construction but before writing to disk.
+   */
+  void train_pq() {
+    auto vec_num = space_->get_data_num();
+    uint32_t num_subspaces = params_.num_pq_chunks_;
+
+    if (num_subspaces == 0) {
+      // Default: use dimension/8 subspaces (16 dims per subspace)
+      num_subspaces = std::max(1U, static_cast<uint32_t>(dim_) / 16);
+    }
+
+    // Ensure dimension is divisible by num_subspaces
+    if (dim_ % num_subspaces != 0) {
+      // Adjust to nearest valid value
+      while (num_subspaces > 1 && dim_ % num_subspaces != 0) {
+        --num_subspaces;
+      }
+      LOG_WARN("DiskANN: Adjusted PQ subspaces to {} (dim={} must be divisible)",
+               num_subspaces,
+               dim_);
+    }
+
+    LOG_INFO("DiskANN: Training PQ with {} subspaces on {} vectors", num_subspaces, vec_num);
+
+    // Initialize quantizer
+    pq_quantizer_ = PQQuantizer<DataType>(dim_, num_subspaces);
+
+    // Collect training data (optionally sample for large datasets)
+    size_t sample_size = vec_num;
+    if (params_.pq_sample_rate_ < 100 && vec_num > 10000) {
+      sample_size = vec_num * params_.pq_sample_rate_ / 100;
+      sample_size = std::max(sample_size, size_t{10000});  // Min 10k samples
+    }
+
+    std::vector<DataType> training_data;
+    if (sample_size < vec_num) {
+      // Sample training data
+      LOG_INFO("DiskANN: Sampling {} vectors for PQ training ({}%)",
+               sample_size,
+               params_.pq_sample_rate_);
+      training_data.resize(sample_size * dim_);
+
+      std::mt19937 rng(42);
+      std::vector<IDType> indices(vec_num);
+      std::iota(indices.begin(), indices.end(), 0);
+      std::shuffle(indices.begin(), indices.end(), rng);
+
+      for (size_t i = 0; i < sample_size; ++i) {
+        const auto *vec = space_->get_data_by_id(indices[i]);
+        std::memcpy(training_data.data() + i * dim_, vec, dim_ * sizeof(DataType));
+      }
+
+      pq_quantizer_.fit(training_data.data(), sample_size);
+    } else {
+      // Use all vectors for training
+      training_data.resize(static_cast<size_t>(vec_num) * dim_);
+      for (IDType i = 0; i < vec_num; ++i) {
+        const auto *vec = space_->get_data_by_id(i);
+        std::memcpy(training_data.data() + static_cast<size_t>(i) * dim_,
+                    vec,
+                    dim_ * sizeof(DataType));
+      }
+      pq_quantizer_.fit(training_data.data(), vec_num);
+    }
+
+    // Encode all vectors
+    LOG_INFO("DiskANN: Encoding {} vectors with PQ", vec_num);
+    pq_codes_.resize(static_cast<size_t>(vec_num) * num_subspaces);
+
+    for (IDType i = 0; i < vec_num; ++i) {
+      const auto *vec = space_->get_data_by_id(i);
+      pq_quantizer_.encode(vec, pq_codes_.data() + static_cast<size_t>(i) * num_subspaces);
+    }
+
+    LOG_INFO("DiskANN: PQ training completed, code size = {} bytes/vector", num_subspaces);
   }
 
  private:
@@ -248,8 +344,9 @@ struct DiskANNBuilder {
    *
    * @param graph Pointer to the graph
    * @param thread_num Number of threads
+   * @param alpha Alpha parameter for RobustPrune (1.0 for pass 1, higher for pass 2+)
    */
-  void build_pass(Graph<DataType, IDType> *graph, uint32_t thread_num) {
+  void build_pass(Graph<DataType, IDType> *graph, uint32_t thread_num, float alpha) {
     auto vec_num = space_->get_data_num();
 
     // Create random permutation
@@ -264,12 +361,12 @@ struct DiskANNBuilder {
     std::atomic<uint32_t> progress{0};
 
     for (auto node_id : perm) {
-      pool.enqueue([this, node_id, &graph, &node_locks, &progress, vec_num]() -> auto {
+      pool.enqueue([this, node_id, &graph, &node_locks, &progress, vec_num, alpha]() -> auto {
         // Greedy search from medoid to find candidates
         auto candidates = greedy_search(graph, node_id, params_.ef_construction_);
 
         // RobustPrune to select final neighbors
-        auto pruned = robust_prune(node_id, candidates);
+        auto pruned = robust_prune(node_id, candidates, alpha);
 
         // Update edges with locking
         {
@@ -284,7 +381,7 @@ struct DiskANNBuilder {
         // Add reverse edges
         for (auto neighbor : pruned) {
           std::lock_guard<std::mutex> lock(node_locks[neighbor]);
-          add_reverse_edge(graph, neighbor, node_id);
+          add_reverse_edge(graph, neighbor, node_id, alpha);
         }
 
         uint32_t cur = progress.fetch_add(1) + 1;
@@ -367,12 +464,16 @@ struct DiskANNBuilder {
    * @brief RobustPrune algorithm from DiskANN paper.
    *
    * Selects neighbors that are not α-dominated by already selected neighbors.
+   * When α = 1.0, strict pruning keeps only the closest neighbors (k-NN like).
+   * When α > 1.0, relaxed pruning allows diverse neighbors (long-range edges).
    *
    * @param node_id ID of the node being pruned
    * @param candidates Candidate neighbors sorted by distance
+   * @param alpha Distance threshold multiplier for pruning
    * @return Vector of selected neighbor IDs
    */
-  auto robust_prune(IDType node_id, std::vector<NeighborType> &candidates) -> std::vector<IDType> {
+  auto robust_prune(IDType node_id, std::vector<NeighborType> &candidates, float alpha)
+      -> std::vector<IDType> {
     std::vector<IDType> result;
     result.reserve(params_.max_degree_);
 
@@ -392,7 +493,7 @@ struct DiskANNBuilder {
       for (auto selected_id : result) {
         auto dist_cand_selected = space_->get_distance(cand.id_, selected_id);
         // If dist(cand, selected) * α < dist(cand, node), cand is dominated
-        if (dist_cand_selected * params_.alpha_ < cand.distance_) {
+        if (dist_cand_selected * alpha < cand.distance_) {
           dominated = true;
           break;
         }
@@ -412,8 +513,9 @@ struct DiskANNBuilder {
    * @param graph Pointer to the graph
    * @param src Source node
    * @param dst Destination node
+   * @param alpha Alpha parameter for RobustPrune if edge list is full
    */
-  void add_reverse_edge(Graph<DataType, IDType> *graph, IDType src, IDType dst) {
+  void add_reverse_edge(Graph<DataType, IDType> *graph, IDType src, IDType dst, float alpha) {
     auto *edges = graph->edges(src);
 
     // Check if edge already exists
@@ -446,7 +548,7 @@ struct DiskANNBuilder {
     candidates.emplace_back(dst, new_dist);
 
     // Prune
-    auto pruned = robust_prune(src, candidates);
+    auto pruned = robust_prune(src, candidates, alpha);
 
     // Update edges
     std::fill_n(edges, params_.max_degree_, static_cast<IDType>(-1));
@@ -474,12 +576,28 @@ struct DiskANNBuilder {
       throw std::runtime_error("Cannot open file " + std::string(path));
     }
 
-    // Write header
+    // Prepare header
     DiskIndexHeader header;
     header.init(params_.max_degree_, params_.alpha_, dim_, vec_num, node_size);
     header.meta_.medoid_id_ = medoid_id_;
     header.meta_.index_build_time_ = std::chrono::system_clock::now().time_since_epoch().count();
+
+    // Initialize PQ fields if enabled
+    if (params_.enable_pq_ && !pq_codes_.empty()) {
+      header.init_pq(pq_quantizer_.num_subspaces());
+      LOG_INFO("DiskANN: PQ enabled, codebook_offset={}, codes_offset={}, nodes_offset={}",
+               header.meta_.pq_codebook_offset_,
+               header.meta_.pq_codes_offset_,
+               header.meta_.nodes_offset_);
+    }
+
+    // Write header
     header.save(writer);
+
+    // Write PQ data if enabled
+    if (params_.enable_pq_ && !pq_codes_.empty()) {
+      write_pq_data(writer, header);
+    }
 
     // Allocate aligned buffer
     DiskNodeBuffer<DataType, IDType> node_buffer;
@@ -511,6 +629,50 @@ struct DiskANNBuilder {
 
     writer.close();
     LOG_INFO("DiskANN: Disk index written successfully");
+  }
+
+  /**
+   * @brief Write PQ codebook and codes to the file.
+   *
+   * @param writer Output file stream (positioned after header)
+   * @param header Index header with PQ offsets
+   */
+  void write_pq_data(std::ofstream &writer, const DiskIndexHeader &header) {
+    uint32_t num_subspaces = pq_quantizer_.num_subspaces();
+    uint32_t subspace_dim = pq_quantizer_.subspace_dim();
+
+    // Write codebook
+    // Format: just the raw codebook data (dim, num_subspaces, subspace_dim are in header)
+    size_t codebook_raw_size =
+        static_cast<size_t>(num_subspaces) * 256 * subspace_dim * sizeof(DataType);
+    writer.write(reinterpret_cast<const char *>(pq_quantizer_.codebook_data()), codebook_raw_size);
+
+    // Pad to sector alignment
+    size_t codebook_padding = header.meta_.pq_codebook_size_ - codebook_raw_size;
+    if (codebook_padding > 0) {
+      std::vector<uint8_t> padding(codebook_padding, 0);
+      writer.write(reinterpret_cast<const char *>(padding.data()), codebook_padding);
+    }
+
+    LOG_INFO("DiskANN: Wrote PQ codebook ({} bytes, padded to {} bytes)",
+             codebook_raw_size,
+             header.meta_.pq_codebook_size_);
+
+    // Write PQ codes
+    auto vec_num = space_->get_data_num();
+    size_t codes_raw_size = static_cast<size_t>(vec_num) * num_subspaces;
+    writer.write(reinterpret_cast<const char *>(pq_codes_.data()), codes_raw_size);
+
+    // Pad to sector alignment
+    size_t codes_padding = header.meta_.pq_codes_size_ - codes_raw_size;
+    if (codes_padding > 0) {
+      std::vector<uint8_t> padding(codes_padding, 0);
+      writer.write(reinterpret_cast<const char *>(padding.data()), codes_padding);
+    }
+
+    LOG_INFO("DiskANN: Wrote PQ codes ({} bytes, padded to {} bytes)",
+             codes_raw_size,
+             header.meta_.pq_codes_size_);
   }
 };
 
