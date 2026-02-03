@@ -16,8 +16,11 @@
 
 #pragma once
 
+#include <cstdint>
 #include <filesystem>  // NOLINT(build/c++17)
+#include <random>
 #include <string>
+#include <vector>
 #include "utils/evaluate.hpp"
 #include "utils/io_utils.hpp"
 #include "utils/locks.hpp"
@@ -43,10 +46,12 @@ struct Dataset {
 };
 
 /**
- * @brief Configuration for loading a dataset.
+ * @brief Configuration for loading or generating a dataset.
  */
 struct DatasetConfig {
   std::string name_;
+
+  // File-based dataset parameters
   std::filesystem::path dir_;
   std::filesystem::path data_file_;
   std::filesystem::path query_file_;
@@ -54,9 +59,41 @@ struct DatasetConfig {
   std::string download_url_;
   std::string archive_name_ = "data.tar.gz";
   int strip_components_ = 1;
-  uint32_t max_data_num_ = 0;   ///< Max vectors to load (0 = all)
-  uint32_t max_query_num_ = 0;  ///< Max queries to load (0 = all)
+
+  // Random generation parameters (used when is_random_ is true)
+  bool is_random_ = false;
+  uint32_t random_data_num_ = 0;
+  uint32_t random_query_num_ = 0;
+  uint32_t random_dim_ = 0;
+  uint32_t random_gt_topk_ = 100;
+  uint32_t random_seed_ = 42;
 };
+
+/**
+ * @brief Create config for a random dataset (no external files needed).
+ *
+ * @param data_num Number of data vectors to generate
+ * @param query_num Number of query vectors to generate
+ * @param dim Vector dimension
+ * @param gt_topk Number of ground truth neighbors per query (default: 100)
+ * @param seed Random seed for reproducibility (default: 42)
+ * @return DatasetConfig for random generation
+ */
+inline auto random_config(uint32_t data_num,
+                          uint32_t query_num,
+                          uint32_t dim,
+                          uint32_t gt_topk = 100,
+                          uint32_t seed = 42) -> DatasetConfig {
+  return DatasetConfig{
+      .name_ = "random",
+      .is_random_ = true,
+      .random_data_num_ = data_num,
+      .random_query_num_ = query_num,
+      .random_dim_ = dim,
+      .random_gt_topk_ = gt_topk,
+      .random_seed_ = seed,
+  };
+}
 
 /**
  * @brief Create config for SIFT small dataset (10K vectors, 128 dim).
@@ -70,26 +107,6 @@ inline auto sift_small(const std::filesystem::path &data_dir) -> DatasetConfig {
       .query_file_ = dir / "siftsmall_query.fvecs",
       .gt_file_ = dir / "siftsmall_groundtruth.ivecs",
       .download_url_ = "ftp://ftp.irisa.fr/local/texmex/corpus/siftsmall.tar.gz",
-  };
-}
-
-/**
- * @brief Create config for SIFT micro dataset (subset of siftsmall: 1K vectors, 128 dim).
- *
- * This is a smaller subset for fast CI testing. Uses the same files as siftsmall
- * but limits the number of vectors loaded.
- */
-inline auto sift_micro(const std::filesystem::path &data_dir) -> DatasetConfig {
-  auto dir = data_dir / "siftsmall";
-  return DatasetConfig{
-      .name_ = "siftmicro",
-      .dir_ = dir,
-      .data_file_ = dir / "siftsmall_base.fvecs",
-      .query_file_ = dir / "siftsmall_query.fvecs",
-      .gt_file_ = dir / "siftsmall_groundtruth.ivecs",
-      .download_url_ = "ftp://ftp.irisa.fr/local/texmex/corpus/siftsmall.tar.gz",
-      .max_data_num_ = 1000,
-      .max_query_num_ = 50,
   };
 }
 
@@ -109,16 +126,38 @@ inline auto deep1m(const std::filesystem::path &data_dir) -> DatasetConfig {
   };
 }
 
-/**
- * @brief Load dataset from config. Downloads if needed.
- *
- * Uses file locking to prevent concurrent downloads when multiple tests run in parallel.
- *
- * Usage:
- *   auto ds = load_dataset(sift_small("/data"));
- *   // Use ds.data_, ds.queries_, ds.ground_truth_ directly
- */
+namespace detail {
+inline auto generate_random_dataset(const DatasetConfig &config) -> Dataset {
+  Dataset ds;
+  ds.name_ = config.name_;
+  ds.data_num_ = config.random_data_num_;
+  ds.query_num_ = config.random_query_num_;
+  ds.dim_ = config.random_dim_;
+  ds.gt_dim_ = config.random_gt_topk_;
+
+  std::mt19937 rng(config.random_seed_);
+  std::uniform_real_distribution<float> dist(0.0F, 1.0F);
+
+  ds.data_.resize(static_cast<size_t>(ds.data_num_) * ds.dim_);
+  for (auto &val : ds.data_) {
+    val = dist(rng);
+  }
+
+  ds.queries_.resize(static_cast<size_t>(ds.query_num_) * ds.dim_);
+  for (auto &val : ds.queries_) {
+    val = dist(rng);
+  }
+
+  ds.ground_truth_ = find_exact_gt(ds.queries_, ds.data_, ds.dim_, ds.gt_dim_);
+
+  return ds;
+}
+
 inline auto load_dataset(const DatasetConfig &config) -> Dataset {
+  Dataset ds;
+  ds.name_ = config.name_;
+
+  // File-based dataset loading
   // Ensure lock directory exists before creating lock file
   auto lock_dir = config.dir_.parent_path();
   if (!std::filesystem::exists(lock_dir)) {
@@ -147,9 +186,6 @@ inline auto load_dataset(const DatasetConfig &config) -> Dataset {
     [[maybe_unused]] int ret2 = std::system(extract_cmd.c_str());
   }
 
-  Dataset ds;
-  ds.name_ = config.name_;
-
   uint32_t data_dim = 0;
   uint32_t query_dim = 0;
   load_fvecs(config.data_file_, ds.data_, ds.data_num_, data_dim);
@@ -162,31 +198,28 @@ inline auto load_dataset(const DatasetConfig &config) -> Dataset {
   }
   ds.dim_ = data_dim;
 
-  // Check if we need to truncate data
-  bool data_truncated = config.max_data_num_ > 0 && ds.data_num_ > config.max_data_num_;
-  bool query_truncated = config.max_query_num_ > 0 && ds.query_num_ > config.max_query_num_;
-
-  // Apply data limit
-  if (data_truncated) {
-    ds.data_num_ = config.max_data_num_;
-    ds.data_.resize(ds.data_num_ * ds.dim_);
-  }
-
-  // Apply query limit
-  if (query_truncated) {
-    ds.query_num_ = config.max_query_num_;
-    ds.queries_.resize(ds.query_num_ * ds.dim_);
-  }
-
-  // Recompute ground truth if data was truncated (original GT IDs may be invalid)
-  if (data_truncated) {
-    ds.ground_truth_ = find_exact_gt(ds.queries_, ds.data_, ds.dim_, ds.gt_dim_);
-  } else if (query_truncated) {
-    // Only query truncated, just resize GT
-    ds.ground_truth_.resize(ds.query_num_ * ds.gt_dim_);
-  }
-
   return ds;
+}
+}  // namespace detail
+
+/**
+ * @brief Load dataset from config. Downloads if needed, or generates random data.
+ *
+ * Uses file locking to prevent concurrent downloads when multiple tests run in parallel.
+ *
+ * Usage:
+ *   // Load from file
+ *   auto ds = load_dataset(sift_small("/data"));
+ *
+ *   // Generate random data
+ *   auto ds = load_dataset(random_config(1000, 50, 128));
+ */
+inline auto load_dataset(const DatasetConfig &config) -> Dataset {
+  // Handle random dataset generation
+  if (config.is_random_) {
+    return detail::generate_random_dataset(config);
+  }
+  return detail::load_dataset(config);
 }
 
 }  // namespace alaya

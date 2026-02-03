@@ -67,51 +67,60 @@ TEST_F(DatasetTest, DISABLED_LoadDeep1M) {
   EXPECT_TRUE(std::filesystem::exists(config.gt_file_));
 }
 
-TEST_F(DatasetTest, SiftMicroConfig) {
-  auto config = sift_micro(data_dir_);
+TEST_F(DatasetTest, RandomDataset) {
+  constexpr uint32_t kDataNum = 500;
+  constexpr uint32_t kQueryNum = 20;
+  constexpr uint32_t kDim = 64;
+  constexpr uint32_t kGtTopk = 10;
 
-  EXPECT_EQ(config.name_, "siftmicro");
-  EXPECT_EQ(config.max_data_num_, 1000);
-  EXPECT_EQ(config.max_query_num_, 50);
-  // sift_micro uses siftsmall files
-  EXPECT_TRUE(config.data_file_.string().find("siftsmall") != std::string::npos);
-}
+  auto ds = load_dataset(random_config(kDataNum, kQueryNum, kDim, kGtTopk));
 
-TEST_F(DatasetTest, LoadSiftMicro) {
-  auto config = sift_micro(data_dir_);
-  auto ds = load_dataset(config);
+  EXPECT_EQ(ds.name_, "random");
+  EXPECT_EQ(ds.data_num_, kDataNum);
+  EXPECT_EQ(ds.query_num_, kQueryNum);
+  EXPECT_EQ(ds.dim_, kDim);
+  EXPECT_EQ(ds.gt_dim_, kGtTopk);
+  EXPECT_EQ(ds.data_.size(), static_cast<size_t>(kDataNum) * kDim);
+  EXPECT_EQ(ds.queries_.size(), static_cast<size_t>(kQueryNum) * kDim);
+  EXPECT_EQ(ds.ground_truth_.size(), static_cast<size_t>(kQueryNum) * kGtTopk);
 
-  EXPECT_EQ(ds.name_, "siftmicro");
-  // Verify data is truncated to max limits
-  EXPECT_EQ(ds.data_num_, config.max_data_num_);
-  EXPECT_EQ(ds.query_num_, config.max_query_num_);
-  EXPECT_EQ(ds.dim_, 128);  // SIFT dimension
-  EXPECT_EQ(ds.data_.size(), ds.data_num_ * ds.dim_);
-  EXPECT_EQ(ds.queries_.size(), ds.query_num_ * ds.dim_);
-  // Ground truth should be recomputed for truncated data
-  EXPECT_EQ(ds.ground_truth_.size(), ds.query_num_ * ds.gt_dim_);
-}
-
-TEST_F(DatasetTest, DataTruncation) {
-  // First load full siftsmall
-  auto full_config = sift_small(data_dir_);
-  auto full_ds = load_dataset(full_config);
-
-  // Then load truncated version
-  auto micro_config = sift_micro(data_dir_);
-  auto micro_ds = load_dataset(micro_config);
-
-  // Verify truncation
-  EXPECT_LT(micro_ds.data_num_, full_ds.data_num_);
-  EXPECT_LT(micro_ds.query_num_, full_ds.query_num_);
-
-  // Verify ground truth IDs are valid (within truncated data range)
-  for (uint32_t i = 0; i < micro_ds.query_num_; ++i) {
-    for (uint32_t j = 0; j < micro_ds.gt_dim_; ++j) {
-      uint32_t gt_id = micro_ds.ground_truth_[i * micro_ds.gt_dim_ + j];
-      EXPECT_LT(gt_id, micro_ds.data_num_) << "GT ID " << gt_id << " exceeds data_num " << micro_ds.data_num_;
+  // Verify ground truth IDs are valid
+  for (uint32_t i = 0; i < kQueryNum; ++i) {
+    for (uint32_t j = 0; j < kGtTopk; ++j) {
+      uint32_t gt_id = ds.ground_truth_[i * kGtTopk + j];
+      EXPECT_LT(gt_id, kDataNum) << "GT ID " << gt_id << " exceeds data_num " << kDataNum;
     }
   }
+}
+
+TEST_F(DatasetTest, RandomDatasetReproducibility) {
+  constexpr uint32_t kDataNum = 100;
+  constexpr uint32_t kQueryNum = 10;
+  constexpr uint32_t kDim = 32;
+  constexpr uint32_t kSeed = 123;
+
+  // Generate two datasets with the same seed
+  auto ds1 = load_dataset(random_config(kDataNum, kQueryNum, kDim, 10, kSeed));
+  auto ds2 = load_dataset(random_config(kDataNum, kQueryNum, kDim, 10, kSeed));
+
+  // They should be identical
+  EXPECT_EQ(ds1.data_, ds2.data_);
+  EXPECT_EQ(ds1.queries_, ds2.queries_);
+  EXPECT_EQ(ds1.ground_truth_, ds2.ground_truth_);
+}
+
+TEST_F(DatasetTest, RandomDatasetDifferentSeeds) {
+  constexpr uint32_t kDataNum = 100;
+  constexpr uint32_t kQueryNum = 10;
+  constexpr uint32_t kDim = 32;
+
+  // Generate two datasets with different seeds
+  auto ds1 = load_dataset(random_config(kDataNum, kQueryNum, kDim, 10, 42));
+  auto ds2 = load_dataset(random_config(kDataNum, kQueryNum, kDim, 10, 99));
+
+  // They should be different
+  EXPECT_NE(ds1.data_, ds2.data_);
+  EXPECT_NE(ds1.queries_, ds2.queries_);
 }
 
 }  // namespace alaya
