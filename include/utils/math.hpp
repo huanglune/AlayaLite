@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -208,6 +209,29 @@ template <typename T>
   requires std::is_integral_v<T>
 [[nodiscard]] constexpr auto is_power_of_two(T x) noexcept -> bool {
   return x > 0 && (x & (x - 1)) == 0;
+}
+
+// ============================================================================
+// 3. Vector Operations
+// ============================================================================
+
+/**
+ * @brief Normalize a vector in-place (L2 normalization)
+ *
+ * @tparam DataType The data type of the vector elements (default: float)
+ * @param data Pointer to the vector data
+ * @param dim Dimension of the vector
+ */
+template <typename DataType = float>
+inline void normalize(DataType *data, size_t dim) {
+  float sum = 0;
+  for (size_t i = 0; i < dim; ++i) {
+    sum += data[i] * data[i];
+  }
+  sum = 1.0F / std::sqrt(sum);
+  for (size_t i = 0; i < dim; ++i) {
+    data[i] *= sum;
+  }
 }
 
 }  // namespace alaya::math

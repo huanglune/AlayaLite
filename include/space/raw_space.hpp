@@ -28,7 +28,6 @@
 #include "simd/distance_l2.hpp"
 #include "space_concepts.hpp"
 #include "storage/sequential_storage.hpp"
-#include "utils/data_utils.hpp"
 #include "utils/log.hpp"
 #include "utils/math.hpp"
 #include "utils/metric_type.hpp"
@@ -133,7 +132,7 @@ class RawSpace {
     for (IDType i = 0; i < item_cnt_; ++i) {
       // if the metric is cosine, normalize the query
       if (metric_ == MetricType::COS) {
-        normalize(const_cast<DataType *>(data + (i * dim_)), dim_);
+        math::normalize(const_cast<DataType *>(data + (i * dim_)), dim_);
       }
       data_storage_.insert(data + (i * dim_));
     }
@@ -146,7 +145,7 @@ class RawSpace {
   auto insert(const DataType *data) -> IDType {
     // if the metric is cosine, normalize the query
     if (metric_ == MetricType::COS) {
-      normalize(const_cast<DataType *>(data), dim_);
+      math::normalize(const_cast<DataType *>(data), dim_);
     }
     item_cnt_++;
     return data_storage_.insert(data);
@@ -265,7 +264,7 @@ class RawSpace {
         : distance_space_(distance_space) {
       // if the metric is cosine, normalize the query
       if (distance_space_.metric_ == MetricType::COS) {
-        normalize(const_cast<DataType *>(query), distance_space_.dim_);
+        math::normalize(const_cast<DataType *>(query), distance_space_.dim_);
       }
 
       auto aligned_size = math::round_up_pow2(distance_space_.data_size_, kAlignment);
