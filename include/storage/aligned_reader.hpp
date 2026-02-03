@@ -317,16 +317,16 @@ class AlignedFileReader {
   /**
    * @brief File open mode flags.
    */
-  enum class OpenMode : uint32_t { // NOLINT
-    kReadOnly = 1 << 0,   ///< Open for reading only
-    kWriteOnly = 1 << 1,  ///< Open for writing only
-    kReadWrite = 1 << 2,  ///< Open for reading and writing
-    kCreate = 1 << 3,     ///< Create file if it doesn't exist
-    kTruncate = 1 << 4,   ///< Truncate file to zero length
-    kAppend = 1 << 5,     ///< Append to file
-    kDirectIO = 1 << 6,   ///< Enable Direct IO (bypass page cache)
+  enum class OpenMode : uint32_t {  // NOLINT
+    kReadOnly = 1 << 0,             ///< Open for reading only
+    kWriteOnly = 1 << 1,            ///< Open for writing only
+    kReadWrite = 1 << 2,            ///< Open for reading and writing
+    kCreate = 1 << 3,               ///< Create file if it doesn't exist
+    kTruncate = 1 << 4,             ///< Truncate file to zero length
+    kAppend = 1 << 5,               ///< Append to file
+    kDirectIO = 1 << 6,             ///< Enable Direct IO (bypass page cache)
   };
-  using OpenModeType = std::underlying_type_t<OpenMode>; // get OpenMode type(uint32_t)
+  using OpenModeType = std::underlying_type_t<OpenMode>;  // get OpenMode type(uint32_t)
 
   /**
    * @brief Combine OpenMode flags using bitwise OR.

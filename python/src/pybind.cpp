@@ -50,6 +50,7 @@ PYBIND11_MODULE(_alayalitepy, m) {
       .value("HNSW", alaya::IndexType::HNSW)
       .value("NSG", alaya::IndexType::NSG)
       .value("FUSION", alaya::IndexType::FUSION)
+      .value("DISKANN", alaya::IndexType::DISKANN)
       .export_values();
 
   py::enum_<alaya::MetricType>(m, "MetricType")

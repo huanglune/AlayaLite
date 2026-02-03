@@ -1,0 +1,125 @@
+/*
+ * Copyright 2025 AlayaDB.AI
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <cstdint>
+
+namespace alaya {
+
+/**
+ * @brief Parameters for DiskANN index construction.
+ *
+ * These parameters control the behavior of the Vamana graph construction
+ * algorithm and optional PQ quantization.
+ *
+ * Key parameters:
+ * - R (max_degree_): Maximum out-degree of each node. Higher values improve
+ *   recall but increase memory and search time. Typical: 32-128.
+ * - α (alpha_): Distance threshold multiplier for pruning. Controls the
+ *   trade-off between graph connectivity and search efficiency. Typical: 1.2.
+ * - L (ef_construction_): Search list size during construction. Higher values
+ *   improve graph quality but increase build time. Typical: 100-200.
+ */
+struct DiskANNBuildParams {
+  uint32_t max_degree_{64};        ///< R: Maximum out-degree of each node
+  float alpha_{1.2F};              ///< Alpha parameter for Vamana pruning (typically 1.2)
+  uint32_t ef_construction_{128};  ///< L: Search list size during construction
+  uint32_t num_threads_{0};        ///< Number of threads (0 = hardware concurrency)
+  uint32_t num_iterations_{2};     ///< Number of Vamana iterations (typically 2)
+  uint32_t num_pq_chunks_{0};      ///< Number of PQ chunks (0 = disable PQ)
+  uint32_t pq_sample_rate_{100};   ///< Sampling rate for PQ training (percentage)
+  bool enable_pq_{false};          ///< Enable Product Quantization for memory acceleration
+
+  DiskANNBuildParams() = default;
+
+  /**
+   * @brief Construct with essential parameters.
+   *
+   * @param r Maximum out-degree (R)
+   * @param a Alpha parameter for pruning
+   * @param l Search list size during construction (L)
+   */
+  DiskANNBuildParams(uint32_t r, float a, uint32_t l)
+      : max_degree_(r), alpha_(a), ef_construction_(l) {}
+
+  /**
+   * @brief Builder pattern for fluent configuration.
+   */
+  auto set_max_degree(uint32_t r) -> DiskANNBuildParams & {
+    max_degree_ = r;
+    return *this;
+  }
+
+  auto set_alpha(float a) -> DiskANNBuildParams & {
+    alpha_ = a;
+    return *this;
+  }
+
+  auto set_ef_construction(uint32_t l) -> DiskANNBuildParams & {
+    ef_construction_ = l;
+    return *this;
+  }
+
+  auto set_num_threads(uint32_t n) -> DiskANNBuildParams & {
+    num_threads_ = n;
+    return *this;
+  }
+
+  auto set_num_iterations(uint32_t n) -> DiskANNBuildParams & {
+    num_iterations_ = n;
+    return *this;
+  }
+
+  auto set_pq_params(uint32_t num_chunks, uint32_t sample_rate = 100) -> DiskANNBuildParams & {
+    enable_pq_ = true;
+    num_pq_chunks_ = num_chunks;
+    pq_sample_rate_ = sample_rate;
+    return *this;
+  }
+};
+
+/**
+ * @brief Parameters for DiskANN search operations.
+ */
+struct DiskANNSearchParams {
+  uint32_t ef_search_{64};        ///< Search list size (beam width)
+  uint32_t num_threads_{1};       ///< Number of threads for batch search
+  bool use_pq_rerank_{true};      ///< Use PQ for initial ranking, then rerank with exact distances
+  uint32_t pq_rerank_factor_{4};  ///< Fetch pq_rerank_factor_ * k candidates for reranking
+
+  DiskANNSearchParams() = default;
+
+  explicit DiskANNSearchParams(uint32_t ef) : ef_search_(ef) {}
+
+  auto set_ef_search(uint32_t ef) -> DiskANNSearchParams & {
+    ef_search_ = ef;
+    return *this;
+  }
+
+  auto set_num_threads(uint32_t n) -> DiskANNSearchParams & {
+    num_threads_ = n;
+    return *this;
+  }
+
+  auto set_pq_rerank(bool enable, uint32_t factor = 4) -> DiskANNSearchParams & {
+    use_pq_rerank_ = enable;
+    pq_rerank_factor_ = factor;
+    return *this;
+  }
+};
+
+}  // namespace alaya
