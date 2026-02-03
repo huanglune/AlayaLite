@@ -19,10 +19,10 @@
 #include <cmath>
 #include <fstream>
 #include <numeric>
-#include <random>
 #include <vector>
 
 #include "space/quant/pq.hpp"
+#include "utils/random.hpp"
 
 namespace alaya {
 namespace {
@@ -31,18 +31,6 @@ constexpr uint32_t kTestDim = 128;
 constexpr uint32_t kTestNumSubspaces = 8;
 constexpr size_t kTestNumVectors = 1000;
 constexpr size_t kTestNumQueries = 10;
-
-// Generate random float vectors
-auto generate_random_vectors(size_t num_vectors, uint32_t dim, uint32_t seed = 42)
-    -> std::vector<float> {
-  std::mt19937 rng(seed);
-  std::uniform_real_distribution<float> dist(-1.0F, 1.0F);
-  std::vector<float> data(num_vectors * dim);
-  for (auto &v : data) {
-    v = dist(rng);
-  }
-  return data;
-}
 
 // Compute exact L2 squared distance
 auto compute_exact_l2_sqr(const float *a, const float *b, uint32_t dim) -> float {
@@ -105,7 +93,8 @@ TEST(PQQuantizerTest, EncodeDecodeReconstruction) {
 
   // Reconstruction error should be bounded
   float error = compute_exact_l2_sqr(data.data(), reconstructed.data(), kTestDim);
-  float norm = compute_exact_l2_sqr(data.data(), std::vector<float>(kTestDim, 0.0F).data(), kTestDim);
+  float norm =
+      compute_exact_l2_sqr(data.data(), std::vector<float>(kTestDim, 0.0F).data(), kTestDim);
 
   // Relative error should be reasonable (< 50% for random data with M=8)
   EXPECT_LT(error / norm, 0.5F);
@@ -151,8 +140,8 @@ TEST(PQQuantizerTest, ADCDistanceAccuracy) {
     float total_exact_dist = 0.0F;
 
     for (size_t i = 0; i < 100; ++i) {
-      float adc_dist = pq.compute_distance_with_table(
-          adc_table.data(), all_codes.data() + i * pq.code_size());
+      float adc_dist =
+          pq.compute_distance_with_table(adc_table.data(), all_codes.data() + i * pq.code_size());
       float exact_dist = compute_exact_l2_sqr(query, data.data() + i * kTestDim, kTestDim);
 
       total_adc_dist += adc_dist;

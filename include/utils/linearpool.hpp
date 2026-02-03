@@ -25,7 +25,6 @@
 
 namespace alaya {
 
-// todo test this class.
 template <typename DistanceType, typename IDType>
 struct LinearPool {
   LinearPool(IDType n, int capacity) : nb_(n), capacity_(capacity), data_(capacity_ + 1), vis_(n) {}
@@ -65,7 +64,7 @@ struct LinearPool {
   }
 
   void emplace_insert(IDType u, DistanceType dist) {
-    if (dist >= data_[size_ - 1].distance) {
+    if (dist >= data_[size_ - 1].distance_) {
       return;
     }
     int lo = find_bsearch(dist);

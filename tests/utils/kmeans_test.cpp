@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "utils/kmeans.hpp"
+#include "utils/random.hpp"
 
 namespace alaya {
 namespace {
@@ -31,18 +32,6 @@ namespace {
 constexpr uint32_t kTestDim = 32;
 constexpr uint32_t kTestNumClusters = 16;
 constexpr size_t kTestNumPoints = 500;
-
-// Generate random float vectors
-auto generate_random_vectors(size_t num_vectors, uint32_t dim, uint32_t seed = 42)
-    -> std::vector<float> {
-  std::mt19937 rng(seed);
-  std::uniform_real_distribution<float> dist(-1.0F, 1.0F);
-  std::vector<float> data(num_vectors * dim);
-  for (auto &v : data) {
-    v = dist(rng);
-  }
-  return data;
-}
 
 // Generate clustered data with known cluster centers
 auto generate_clustered_data(size_t num_points_per_cluster,
@@ -97,7 +86,7 @@ TEST(KMeansTest, DefaultConfig) {
 }
 
 TEST(KMeansTest, CustomConfig) {
-  KMeans<float>::Config config{.num_clusters_=32, .max_iter_=50, .num_trials_=5};
+  KMeans<float>::Config config{.num_clusters_ = 32, .max_iter_ = 50, .num_trials_ = 5};
   EXPECT_EQ(config.num_clusters_, 32U);
   EXPECT_EQ(config.max_iter_, 50U);
   EXPECT_EQ(config.num_trials_, 5U);
@@ -113,7 +102,7 @@ TEST(KMeansTest, DefaultConstructor) {
 }
 
 TEST(KMeansTest, ConfigConstructor) {
-  KMeans<float>::Config config{.num_clusters_=64, .max_iter_=30, .num_trials_=2};
+  KMeans<float>::Config config{.num_clusters_ = 64, .max_iter_ = 30, .num_trials_ = 2};
   KMeans<float> kmeans(config);
   EXPECT_EQ(kmeans.config().num_clusters_, 64U);
   EXPECT_EQ(kmeans.config().max_iter_, 30U);
@@ -129,7 +118,7 @@ TEST(KMeansTest, ParameterConstructor) {
 
 TEST(KMeansTest, SetConfig) {
   KMeans<float> kmeans;
-  KMeans<float>::Config new_config{.num_clusters_=16, .max_iter_=10, .num_trials_=1};
+  KMeans<float>::Config new_config{.num_clusters_ = 16, .max_iter_ = 10, .num_trials_ = 1};
   kmeans.set_config(new_config);
   EXPECT_EQ(kmeans.config().num_clusters_, 16U);
   EXPECT_EQ(kmeans.config().max_iter_, 10U);
@@ -184,9 +173,12 @@ TEST(KMeansTest, FindNearest_MultipleCentroids) {
   KMeans<float> kmeans(3);
   // 3 centroids in 2D
   std::vector<float> centroids = {
-      0.0F, 0.0F,   // Centroid 0 at origin
-      10.0F, 0.0F,  // Centroid 1 at (10, 0)
-      0.0F, 10.0F   // Centroid 2 at (0, 10)
+      0.0F,
+      0.0F,  // Centroid 0 at origin
+      10.0F,
+      0.0F,  // Centroid 1 at (10, 0)
+      0.0F,
+      10.0F  // Centroid 2 at (0, 10)
   };
 
   // Point closest to centroid 0
@@ -376,26 +368,7 @@ TEST(KMeansTest, CopyConstructor) {
   EXPECT_EQ(kmeans2.config().num_trials_, 4U);
 }
 
-TEST(KMeansTest, MoveConstructor) {
-  KMeans<float> kmeans1(32, 25, 4);
-  KMeans<float> kmeans2(kmeans1);
-
-  EXPECT_EQ(kmeans2.config().num_clusters_, 32U);
-  EXPECT_EQ(kmeans2.config().max_iter_, 25U);
-  EXPECT_EQ(kmeans2.config().num_trials_, 4U);
-}
-
 TEST(KMeansTest, CopyAssignment) {
-  KMeans<float> kmeans1(32, 25, 4);
-  KMeans<float> kmeans2;
-  kmeans2 = kmeans1;
-
-  EXPECT_EQ(kmeans2.config().num_clusters_, 32U);
-  EXPECT_EQ(kmeans2.config().max_iter_, 25U);
-  EXPECT_EQ(kmeans2.config().num_trials_, 4U);
-}
-
-TEST(KMeansTest, MoveAssignment) {
   KMeans<float> kmeans1(32, 25, 4);
   KMeans<float> kmeans2;
   kmeans2 = kmeans1;

@@ -19,10 +19,10 @@
 #include <algorithm>
 #include <cmath>
 #include <numeric>
-#include <random>
 #include <vector>
 
 #include "space/pq_space.hpp"
+#include "utils/random.hpp"
 
 namespace alaya {
 namespace {
@@ -32,18 +32,6 @@ constexpr uint32_t kTestNumSubspaces = 8;
 constexpr uint32_t kTestCapacity = 2000;
 constexpr size_t kTestNumVectors = 1000;
 constexpr size_t kTestNumQueries = 10;
-
-// Generate random float vectors
-auto generate_random_vectors(size_t num_vectors, uint32_t dim, uint32_t seed = 42)
-    -> std::vector<float> {
-  std::mt19937 rng(seed);
-  std::uniform_real_distribution<float> dist(-1.0F, 1.0F);
-  std::vector<float> data(num_vectors * dim);
-  for (auto &v : data) {
-    v = dist(rng);
-  }
-  return data;
-}
 
 // Compute exact L2 squared distance
 auto compute_exact_l2_sqr(const float *a, const float *b, uint32_t dim) -> float {
@@ -122,10 +110,18 @@ TEST(PQSpaceTest, QueryContextDistanceComputation) {
     std::iota(adc_order.begin(), adc_order.end(), 0);
     std::iota(exact_order.begin(), exact_order.end(), 0);
 
-    std::partial_sort(adc_order.begin(), adc_order.begin() + 10, adc_order.end(),
-                      [&](size_t a, size_t b) -> bool { return adc_dists[a] < adc_dists[b]; });
-    std::partial_sort(exact_order.begin(), exact_order.begin() + 10, exact_order.end(),
-                      [&](size_t a, size_t b) -> bool { return exact_dists[a] < exact_dists[b]; });
+    std::partial_sort(adc_order.begin(),
+                      adc_order.begin() + 10,
+                      adc_order.end(),
+                      [&](size_t a, size_t b) -> bool {
+                        return adc_dists[a] < adc_dists[b];
+                      });
+    std::partial_sort(exact_order.begin(),
+                      exact_order.begin() + 10,
+                      exact_order.end(),
+                      [&](size_t a, size_t b) -> bool {
+                        return exact_dists[a] < exact_dists[b];
+                      });
 
     // Count overlap in top-10
     std::vector<size_t> adc_top10(adc_order.begin(), adc_order.begin() + 10);
@@ -134,8 +130,7 @@ TEST(PQSpaceTest, QueryContextDistanceComputation) {
     std::ranges::sort(exact_top10);
 
     std::vector<size_t> intersection;
-    std::ranges::set_intersection(adc_top10, exact_top10,
-                         std::back_inserter(intersection));
+    std::ranges::set_intersection(adc_top10, exact_top10, std::back_inserter(intersection));
 
     // With M=8 on random data, recall can vary. Check for at least 20% overlap in top-10
     EXPECT_GE(intersection.size(), 2) << "Query " << q << " has poor recall";

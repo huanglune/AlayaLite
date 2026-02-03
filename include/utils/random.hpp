@@ -16,6 +16,8 @@
 
 #pragma once
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <random>
 #include <thread>
 #include <vector>
@@ -70,5 +72,31 @@ struct RandomGenerator {
 
   auto rand_double() -> double { return mt_() / static_cast<double>(std::mt19937::max()); }
 };
+
+/**
+ * @brief Generate random float vectors for testing purposes.
+ *
+ * @tparam T The data type of the vectors (default: float)
+ * @param num_vectors Number of vectors to generate
+ * @param dim Dimension of each vector
+ * @param seed Random seed for reproducibility (default: 42)
+ * @param min_val Minimum value for random distribution (default: -1.0)
+ * @param max_val Maximum value for random distribution (default: 1.0)
+ * @return std::vector<T> Flattened vector containing all generated vectors
+ */
+template <typename T = float>
+inline auto generate_random_vectors(size_t num_vectors,
+                                    uint32_t dim,
+                                    uint32_t seed = 42,
+                                    T min_val = static_cast<T>(-1.0),
+                                    T max_val = static_cast<T>(1.0)) -> std::vector<T> {
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<T> dist(min_val, max_val);
+  std::vector<T> data(num_vectors * dim);
+  for (auto &v : data) {
+    v = dist(rng);
+  }
+  return data;
+}
 
 }  // namespace alaya
