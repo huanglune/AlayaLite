@@ -31,7 +31,8 @@
 #include "index/neighbor.hpp"
 #include "simd/distance_l2.hpp"
 #include "space/quant/pq.hpp"
-#include "storage/aligned_reader.hpp"
+#include "storage/buffer/buffer_pool.hpp"
+#include "storage/io/direct_file_io.hpp"
 #include "utils/bitset.hpp"
 #include "utils/log.hpp"
 #include "utils/memory.hpp"
@@ -67,7 +68,7 @@ class DiskANNSearcher {
   using NodeAccessor = typename NodeType::Accessor;
 
  private:
-  std::unique_ptr<AlignedFileReader> reader_;     ///< File reader for disk access
+  std::unique_ptr<DirectFileIO> reader_;          ///< File reader for disk access
   DiskIndexHeader header_;                        ///< Index header metadata
   DiskNodeBuffer<DataType, IDType> node_buffer_;  ///< Buffer for reading nodes
   Bitset visited_;                                ///< Visited node tracking
@@ -85,6 +86,10 @@ class DiskANNSearcher {
   std::vector<uint8_t> pq_codes_;        ///< In-memory PQ codes: N × M bytes
   std::vector<IDType> graph_;            ///< In-memory graph: N × R neighbor IDs
   std::vector<uint32_t> graph_degrees_;  ///< Actual degree of each node
+
+  // Buffer pool for caching disk nodes (optional)
+  std::unique_ptr<BufferPool<IDType>> buffer_pool_;  ///< LRU cache for disk nodes
+  bool caching_enabled_{false};                      ///< Whether caching is active
 
  public:
   DiskANNSearcher() = default;
@@ -106,19 +111,10 @@ class DiskANNSearcher {
    * @param index_path Path to the index file
    */
   auto open(std::string_view index_path) -> void {
-    // Open file with Direct IO if possible
-    reader_ = std::make_unique<AlignedFileReader>();
-    auto status = reader_->open(index_path,
-                                AlignedFileReader::OpenMode::kReadOnly |
-                                    AlignedFileReader::OpenMode::kDirectIO);
-
-    if (status != IOStatus::kSuccess) {
-      // Try without Direct IO
-      status = reader_->open(index_path, AlignedFileReader::OpenMode::kReadOnly);
-      if (status != IOStatus::kSuccess) {
-        throw std::runtime_error("Failed to open index file: " + std::string(index_path));
-      }
-      LOG_WARN("DiskANNSearcher: Opened {} without Direct IO", index_path);
+    // Open file with Direct IO if possible (DirectFileIO handles fallback internally)
+    reader_ = std::make_unique<DirectFileIO>();
+    if (!reader_->open(index_path, DirectFileIO::Mode::kRead)) {
+      throw std::runtime_error("Failed to open index file: " + std::string(index_path));
     }
 
     // Read header
@@ -196,6 +192,70 @@ class DiskANNSearcher {
    * @brief Get the index header.
    */
   [[nodiscard]] auto header() const -> const DiskIndexHeader & { return header_; }
+
+  /**
+   * @brief Enable node caching with specified capacity.
+   *
+   * Creates a buffer pool to cache recently accessed disk nodes,
+   * reducing disk I/O for repeated accesses.
+   *
+   * @param cache_capacity Number of nodes to cache (0 = disable)
+   */
+  void enable_caching(size_t cache_capacity) {
+    if (cache_capacity > 0 && node_size_ > 0) {
+      buffer_pool_ = std::make_unique<BufferPool<IDType>>(cache_capacity, node_size_);
+      caching_enabled_ = true;
+      LOG_INFO("DiskANNSearcher: Enabled caching with {} frames ({} MB)",
+               cache_capacity,
+               (cache_capacity * node_size_) / (1024 * 1024));
+    } else {
+      disable_caching();
+    }
+  }
+
+  /**
+   * @brief Disable caching and release buffer pool memory.
+   */
+  void disable_caching() {
+    buffer_pool_.reset();
+    caching_enabled_ = false;
+  }
+
+  /**
+   * @brief Check if caching is enabled.
+   */
+  [[nodiscard]] auto is_caching_enabled() const -> bool { return caching_enabled_; }
+
+  /**
+   * @brief Get cache statistics.
+   *
+   * Returns statistics about cache hits, misses, and evictions.
+   * Returns empty stats if caching is disabled.
+   */
+  [[nodiscard]] auto cache_stats() const -> BufferPoolStats {
+    if (buffer_pool_) {
+      return buffer_pool_->stats();
+    }
+    return BufferPoolStats{};
+  }
+
+  /**
+   * @brief Reset cache statistics counters.
+   */
+  void reset_cache_stats() {
+    if (buffer_pool_) {
+      buffer_pool_->reset_stats();
+    }
+  }
+
+  /**
+   * @brief Clear all cached data.
+   */
+  void clear_cache() {
+    if (buffer_pool_) {
+      buffer_pool_->clear();
+    }
+  }
 
   /**
    * @brief Search for k nearest neighbors of a query vector.
@@ -419,10 +479,27 @@ class DiskANNSearcher {
   }
 
   /**
-   * @brief Read a node from disk.
+   * @brief Read a node from disk (with optional caching).
+   *
+   * If caching is enabled, checks the buffer pool first. On cache miss,
+   * reads from disk and caches the result for future accesses.
    */
   auto read_node(IDType node_id) -> NodeAccessor {
     uint64_t offset = header_.get_node_offset(node_id);
+
+    if (caching_enabled_ && buffer_pool_) {
+      // Use buffer pool with caching
+      const uint8_t *cached_data =
+          buffer_pool_->get_or_read(node_id, *reader_, offset, node_buffer_.data());
+
+      if (cached_data != nullptr) {
+        // Return accessor pointing to cached data (or node_buffer_ if just read)
+        return NodeAccessor(const_cast<uint8_t *>(cached_data), dimension_, max_degree_);
+      }
+      // Fall through to direct read on error
+    }
+
+    // Direct read without caching
     auto bytes = reader_->read(node_buffer_.data(), node_size_, offset);
 
     if (bytes != static_cast<ssize_t>(node_size_)) {

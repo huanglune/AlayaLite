@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "storage/sequential_storage.hpp"
+#include "storage/data/sequential_storage.hpp"
 #include <gtest/gtest.h>
 #include <cstdint>
 #include <cstring>  // for memset

@@ -163,7 +163,7 @@ class HierarchicalBitset {
  private:
   std::vector<uint64_t> data_;
   std::vector<uint64_t> summary_;
-  size_t size_;
+  size_t size_;  // NOLINT
   static const size_t kBitsPerBlock = 512;
   static const size_t kSummaryBlockSize = 64;
 

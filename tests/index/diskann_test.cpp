@@ -32,6 +32,7 @@
 #include "index/graph/diskann/diskann_searcher.hpp"
 #include "index/graph/graph.hpp"
 #include "space/raw_space.hpp"
+#include "storage/buffer/buffer_pool.hpp"
 #include "utils/dataset_utils.hpp"
 #include "utils/evaluate.hpp"
 #include "utils/log.hpp"
@@ -530,6 +531,190 @@ TEST_F(DiskANNSearcherTest, SearchDirect) {
       EXPECT_LT(results[i], data_num());
     }
   }
+}
+
+TEST_F(DiskANNSearcherTest, CachingEnabled) {
+  DiskANNSearcher<float, uint32_t> searcher;
+  searcher.open(index_path);
+
+  // Enable caching with 100 frames
+  searcher.enable_caching(100);
+  EXPECT_TRUE(searcher.is_caching_enabled());
+
+  // Perform searches
+  constexpr uint32_t kTopk = 10;
+  DiskANNSearchParams params(50);
+  std::vector<uint32_t> results(kTopk);
+
+  // First search - should be cache misses
+  searcher.search(dataset().queries_.data(), kTopk, results.data(), params);
+
+  auto stats = searcher.cache_stats();
+  EXPECT_GT(stats.total_accesses(), 0U);
+
+  // Disable caching
+  searcher.disable_caching();
+  EXPECT_FALSE(searcher.is_caching_enabled());
+}
+
+TEST_F(DiskANNSearcherTest, CacheHitRate) {
+  DiskANNSearcher<float, uint32_t> searcher;
+  searcher.open(index_path);
+
+  // Enable caching
+  searcher.enable_caching(50);
+
+  constexpr uint32_t kTopk = 10;
+  DiskANNSearchParams params(50);
+  std::vector<uint32_t> results(kTopk);
+
+  // Run same query multiple times - should get cache hits
+  for (int i = 0; i < 5; ++i) {
+    searcher.search(dataset().queries_.data(), kTopk, results.data(), params);
+  }
+
+  auto stats = searcher.cache_stats();
+  LOG_INFO("Cache stats: hits={}, misses={}, hit_rate={:.4f}",
+           stats.hits_.load(), stats.misses_.load(), stats.hit_rate());
+
+  // With repeated queries, we should have some cache hits
+  EXPECT_GT(stats.hits_.load(), 0U);
+}
+
+// =============================================================================
+// Test Fixture 6: BufferPool unit tests
+// =============================================================================
+
+class BufferPoolTest : public ::testing::Test {
+ protected:
+  static constexpr size_t kFrameSize = 4096;  // 4KB frames
+  static constexpr size_t kCapacity = 10;
+};
+
+TEST_F(BufferPoolTest, Construction) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
+
+  EXPECT_EQ(pool.capacity(), kCapacity);
+  EXPECT_EQ(pool.frame_size(), kFrameSize);
+  EXPECT_EQ(pool.size(), 0U);
+  EXPECT_TRUE(pool.is_enabled());
+}
+
+TEST_F(BufferPoolTest, EmptyPoolDisabled) {
+  BufferPool<uint32_t> pool(0, kFrameSize);
+  EXPECT_FALSE(pool.is_enabled());
+  EXPECT_EQ(pool.capacity(), 0U);
+}
+
+TEST_F(BufferPoolTest, PutAndGet) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
+
+  // Create test data
+  std::vector<uint8_t> test_data(kFrameSize);
+  for (size_t i = 0; i < kFrameSize; ++i) {
+    test_data[i] = static_cast<uint8_t>(i % 256);
+  }
+
+  // Put data into cache
+  const uint8_t* cached = pool.put(42, test_data.data());
+  EXPECT_NE(cached, nullptr);
+  EXPECT_EQ(pool.size(), 1U);
+
+  // Get data back
+  const uint8_t* retrieved = pool.get(42);
+  EXPECT_NE(retrieved, nullptr);
+
+  // Verify data matches
+  for (size_t i = 0; i < kFrameSize; ++i) {
+    EXPECT_EQ(retrieved[i], test_data[i]);
+  }
+}
+
+TEST_F(BufferPoolTest, CacheMiss) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
+
+  // Try to get non-existent item
+  const uint8_t* result = pool.get(999);
+  EXPECT_EQ(result, nullptr);
+
+  auto stats = pool.stats();
+  EXPECT_EQ(stats.misses_.load(), 1U);
+  EXPECT_EQ(stats.hits_.load(), 0U);
+}
+
+TEST_F(BufferPoolTest, LRUEviction) {
+  BufferPool<uint32_t> pool(3, kFrameSize);  // Small capacity for testing eviction
+
+  std::vector<uint8_t> data(kFrameSize, 0);
+
+  // Fill the cache
+  for (uint32_t i = 0; i < 3; ++i) {
+    data[0] = static_cast<uint8_t>(i);
+    pool.put(i, data.data());
+  }
+  EXPECT_EQ(pool.size(), 3U);
+
+  // Access item 0 to make it recently used
+  (void)pool.get(0);
+
+  // Insert new item - should evict item 1 (LRU)
+  data[0] = 100;
+  pool.put(100, data.data());
+
+  // Item 0 should still be there (was accessed recently)
+  EXPECT_TRUE(pool.contains(0));
+  // Item 1 should be evicted (LRU)
+  EXPECT_FALSE(pool.contains(1));
+  // Item 2 should still be there
+  EXPECT_TRUE(pool.contains(2));
+  // New item should be there
+  EXPECT_TRUE(pool.contains(100));
+
+  auto stats = pool.stats();
+  EXPECT_GT(stats.evictions_.load(), 0U);
+}
+
+TEST_F(BufferPoolTest, Clear) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
+
+  std::vector<uint8_t> data(kFrameSize, 0);
+  for (uint32_t i = 0; i < 5; ++i) {
+    pool.put(i, data.data());
+  }
+  EXPECT_EQ(pool.size(), 5U);
+
+  pool.clear();
+  EXPECT_EQ(pool.size(), 0U);
+
+  // Items should no longer be found
+  for (uint32_t i = 0; i < 5; ++i) {
+    EXPECT_FALSE(pool.contains(i));
+  }
+}
+
+TEST_F(BufferPoolTest, Statistics) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
+
+  std::vector<uint8_t> data(kFrameSize, 0);
+  pool.put(1, data.data());
+
+  // Miss
+  (void)pool.get(999);
+  // Hit
+  (void)pool.get(1);
+  // Another hit
+  (void)pool.get(1);
+
+  auto stats = pool.stats();
+  EXPECT_EQ(stats.hits_.load(), 2U);
+  EXPECT_EQ(stats.misses_.load(), 1U);
+  EXPECT_DOUBLE_EQ(stats.hit_rate(), 2.0 / 3.0);
+
+  // Reset stats
+  pool.reset_stats();
+  stats = pool.stats();
+  EXPECT_EQ(stats.hits_.load(), 0U);
+  EXPECT_EQ(stats.misses_.load(), 0U);
 }
 
 }  // namespace alaya

@@ -54,7 +54,8 @@ set(THIRD_PARTY_LIBS spdlog::spdlog_header_only concurrentqueue::concurrentqueue
 
 if(UNIX AND NOT APPLE)
   find_package(libcoro REQUIRED)
-  list(APPEND THIRD_PARTY_LIBS libcoro::libcoro)
+  find_package(liburing REQUIRED)
+  list(APPEND THIRD_PARTY_LIBS libcoro::libcoro liburing::liburing)
 endif()
 
 # ============================================================================

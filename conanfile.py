@@ -27,9 +27,10 @@ class AlayaLiteConan(ConanFile):
         self.requires("spdlog/1.9.2")
         self.requires("eigen/3.4.0")
 
-        # OpenMP support
+        # Linux-specific async I/O support
         if self.settings.os == "Linux":
             self.requires("libcoro/0.14.1")
+            self.requires("liburing/2.5")
 
     def configure(self):
         # Static link all dependencies

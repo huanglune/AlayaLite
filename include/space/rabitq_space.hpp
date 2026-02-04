@@ -27,7 +27,7 @@
 #include "simd/distance_l2.hpp"
 #include "space/quant/rabitq.hpp"
 #include "space/space_concepts.hpp"
-#include "storage/static_storage.hpp"
+#include "storage/data/static_storage.hpp"
 #include "utils/log.hpp"
 #include "utils/math.hpp"
 #include "utils/metric_type.hpp"

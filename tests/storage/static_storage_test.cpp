@@ -20,7 +20,7 @@
 #include <random>
 #include <vector>
 
-#include "storage/static_storage.hpp"
+#include "storage/data/static_storage.hpp"
 
 namespace alaya {
 // NOLINTBEGIN

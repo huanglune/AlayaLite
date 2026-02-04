@@ -26,7 +26,7 @@
 #include "simd/distance_l2.hpp"
 #include "space/quant/sq8.hpp"
 #include "space_concepts.hpp"
-#include "storage/sequential_storage.hpp"
+#include "storage/data/sequential_storage.hpp"
 #include "utils/log.hpp"
 #include "utils/math.hpp"
 #include "utils/metric_type.hpp"
