@@ -26,8 +26,9 @@
 namespace alaya {
 
 template <typename DistanceType, typename IDType>
-struct LinearPool {
-  LinearPool(IDType n, int capacity) : nb_(n), capacity_(capacity), data_(capacity_ + 1), vis_(n) {}
+struct CandidateList {
+  CandidateList(IDType n, int capacity)
+      : nb_(n), capacity_(capacity), data_(capacity_ + 1), vis_(n) {}
 
   auto find_bsearch(DistanceType dist) -> int {
     int l = 0;

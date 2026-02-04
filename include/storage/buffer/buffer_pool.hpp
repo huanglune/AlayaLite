@@ -14,6 +14,63 @@
  * limitations under the License.
  */
 
+/**
+ * @file buffer_pool.hpp
+ * @brief Buffer pool for caching disk pages with pluggable replacement policies.
+ *
+ * @section Usage
+ *
+ * Basic usage:
+ * @code
+ *   #include "storage/buffer/buffer_pool.hpp"
+ *
+ *   // Create a buffer pool with 1000 frames, each 4KB
+ *   // Default uses LRU replacement policy
+ *   BufferPool<uint32_t> pool(1000, 4096);
+ *
+ *   // Or use CLOCK for better read performance (lock-free unpin)
+ *   BufferPool<uint32_t, ClockReplacer> clock_pool(1000, 4096);
+ *
+ *   // Or use CLOCK-Pro for adaptive hot/cold page management
+ *   BufferPool<uint32_t, ClockProReplacer> clockpro_pool(1000, 4096);
+ *
+ *   // Method 1: Manual get/put
+ *   const uint8_t* data = pool.get(node_id);  // Returns nullptr on miss
+ *   if (data == nullptr) {
+ *       // Read from disk manually, then cache it
+ *       pool.put(node_id, disk_data);
+ *   }
+ *
+ *   // Method 2: Automatic get or read from disk (recommended)
+ *   DirectFileIO reader;
+ *   reader.open("data.bin", DirectFileIO::Mode::kRead);
+ *   AlignedBuffer temp(4096);
+ *   const uint8_t* result = pool.get_or_read(node_id, reader, offset, temp.data());
+ *
+ *   // Check statistics
+ *   auto& stats = pool.stats();
+ *   printf("Hit rate: %.2f%%\n", stats.hit_rate() * 100);
+ *   printf("Hits: %lu, Misses: %lu, Evictions: %lu\n",
+ *          stats.hits_.load(), stats.misses_.load(), stats.evictions_.load());
+ * @endcode
+ *
+ * @section ReplacementPolicies Replacement Policies
+ *
+ * | Policy       | Read Perf | Scan Resist | Memory | Use Case                    |
+ * |--------------|-----------|-------------|--------|-----------------------------|
+ * | LRUReplacer  | Medium    | Poor        | O(n)   | General purpose             |
+ * | ClockReplacer| High      | Medium      | O(n)   | Read-heavy, low contention  |
+ * | ClockProReplacer | High  | Good        | O(n)   | Mixed workloads, adaptive   |
+ *
+ * Integration with DiskANNSearcher:
+ * @code
+ *   DiskANNSearcher<float> searcher;
+ *   searcher.open("index.bin");
+ *   searcher.enable_caching(1000);  // Enable buffer pool with 1000 node capacity
+ *   // Searches now benefit from node caching
+ * @endcode
+ */
+
 #pragma once
 
 #include <atomic>
@@ -21,11 +78,13 @@
 #include <cstdint>
 #include <cstring>
 #include <queue>
-#include <unordered_map>
 #include <vector>
 
+#include "replacer/clock.hpp"
+#include "replacer/clock_pro.hpp"
 #include "replacer/lru.hpp"
 #include "storage/io/direct_file_io.hpp"
+#include "utils/hash_map.hpp"
 #include "utils/locks.hpp"
 #include "utils/memory.hpp"
 
@@ -122,8 +181,8 @@ class BufferPool {
   // Frame metadata array
   std::vector<Frame> frames_;
 
-  // Hash map: node_id -> frame_index
-  std::unordered_map<IDType, size_t> page_table_;
+  // Hash map: node_id -> frame_index (using high-performance hash map if available)
+  fast::map<IDType, size_t> page_table_;
 
   // Free list: frames that have not been used yet
   std::queue<size_t> free_list_;

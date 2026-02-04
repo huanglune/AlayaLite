@@ -23,6 +23,7 @@
 
 #include "../../index/graph/graph.hpp"
 #include "../../space/space_concepts.hpp"
+#include "../../utils/candidate_list.hpp"
 #include "./graph_search_job.hpp"
 #include "./job_context.hpp"
 
@@ -123,7 +124,7 @@ class GraphUpdateJob {
       }
     }
     auto handler = space_->get_query_computer(node_id);
-    LinearPool<DistanceType, IDType> pool(space_->get_data_num(), graph_->max_nbrs_);
+    CandidateList<DistanceType, IDType> pool(space_->get_data_num(), graph_->max_nbrs_);
     for (auto &nbr : candidate_nbrs) {
       auto dist = handler(nbr);
       pool.insert(nbr, dist);

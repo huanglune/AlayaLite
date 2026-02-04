@@ -15,11 +15,12 @@
  */
 
 #include "storage/buffer/buffer_pool.hpp"
+#include "storage/buffer/replacer/clock.hpp"
+#include "storage/buffer/replacer/clock_pro.hpp"
 #include "storage/buffer/replacer/lru.hpp"
 
 #include <gtest/gtest.h>
 
-#include <algorithm>
 #include <cstdint>
 #include <thread>
 #include <vector>
@@ -657,6 +658,390 @@ TEST_F(BufferPoolThreadTest, ConcurrentClear) {
 
   // Should complete without crash
   EXPECT_LE(pool.size(), kCapacity);
+}
+
+// =============================================================================
+// ClockReplacer Unit Tests
+// =============================================================================
+
+class ClockReplacerTest : public ::testing::Test {
+ protected:
+  static constexpr size_t kCapacity = 10;
+};
+
+TEST_F(ClockReplacerTest, Construction) {
+  ClockReplacer replacer(kCapacity);
+  EXPECT_EQ(replacer.size(), 0U);
+}
+
+TEST_F(ClockReplacerTest, DefaultConstruction) {
+  ClockReplacer replacer;
+  EXPECT_EQ(replacer.size(), 0U);
+}
+
+TEST_F(ClockReplacerTest, UnpinAddsToEvictable) {
+  ClockReplacer replacer(kCapacity);
+
+  EXPECT_EQ(replacer.size(), 0U);
+
+  replacer.unpin(0);
+  EXPECT_EQ(replacer.size(), 1U);
+
+  replacer.unpin(1);
+  EXPECT_EQ(replacer.size(), 2U);
+
+  // Unpin same frame again - should not duplicate
+  replacer.unpin(0);
+  EXPECT_EQ(replacer.size(), 2U);
+}
+
+TEST_F(ClockReplacerTest, PinRemovesFromEvictable) {
+  ClockReplacer replacer(kCapacity);
+
+  replacer.unpin(0);
+  replacer.unpin(1);
+  replacer.unpin(2);
+  EXPECT_EQ(replacer.size(), 3U);
+
+  replacer.pin(1);
+  EXPECT_EQ(replacer.size(), 2U);
+
+  // Pin non-existent frame - should be no-op
+  replacer.pin(999);
+  EXPECT_EQ(replacer.size(), 2U);
+}
+
+TEST_F(ClockReplacerTest, EvictWithSecondChance) {
+  ClockReplacer replacer(kCapacity);
+
+  // Add frames
+  replacer.unpin(0);
+  replacer.unpin(1);
+  replacer.unpin(2);
+
+  // All have ref_bit=true initially, first evict gives second chance
+  auto victim = replacer.evict();
+  ASSERT_TRUE(victim.has_value());
+  EXPECT_EQ(replacer.size(), 2U);
+
+  // Continue evicting
+  victim = replacer.evict();
+  ASSERT_TRUE(victim.has_value());
+
+  victim = replacer.evict();
+  ASSERT_TRUE(victim.has_value());
+
+  // No more to evict
+  victim = replacer.evict();
+  EXPECT_FALSE(victim.has_value());
+}
+
+TEST_F(ClockReplacerTest, UnpinSetsRefBit) {
+  ClockReplacer replacer(kCapacity);
+
+  replacer.unpin(0);
+  replacer.unpin(1);
+
+  // Evict once to clear ref bits via second chance
+  auto victim = replacer.evict();
+  ASSERT_TRUE(victim.has_value());
+
+  // Access remaining frame - sets ref bit again
+  size_t remaining = (victim.value() == 0) ? 1 : 0;
+  replacer.unpin(remaining);
+
+  // Should still be evictable (but with ref bit set)
+  EXPECT_EQ(replacer.size(), 1U);
+}
+
+TEST_F(ClockReplacerTest, Remove) {
+  ClockReplacer replacer(kCapacity);
+
+  replacer.unpin(0);
+  replacer.unpin(1);
+  replacer.unpin(2);
+
+  replacer.remove(1);
+  EXPECT_EQ(replacer.size(), 2U);
+
+  // Remove non-existent - no-op
+  replacer.remove(999);
+  EXPECT_EQ(replacer.size(), 2U);
+}
+
+TEST_F(ClockReplacerTest, Reset) {
+  ClockReplacer replacer(kCapacity);
+
+  replacer.unpin(0);
+  replacer.unpin(1);
+  EXPECT_EQ(replacer.size(), 2U);
+
+  replacer.reset();
+  EXPECT_EQ(replacer.size(), 0U);
+
+  auto victim = replacer.evict();
+  EXPECT_FALSE(victim.has_value());
+}
+
+TEST_F(ClockReplacerTest, MoveConstruction) {
+  ClockReplacer replacer1(kCapacity);
+  replacer1.unpin(0);
+  replacer1.unpin(1);
+
+  ClockReplacer replacer2(std::move(replacer1));
+  EXPECT_EQ(replacer2.size(), 2U);
+}
+
+TEST_F(ClockReplacerTest, MoveAssignment) {
+  ClockReplacer replacer1(kCapacity);
+  replacer1.unpin(0);
+  replacer1.unpin(1);
+
+  ClockReplacer replacer2;
+  replacer2 = std::move(replacer1);
+  EXPECT_EQ(replacer2.size(), 2U);
+}
+
+TEST_F(ClockReplacerTest, SetCapacity) {
+  ClockReplacer replacer;
+  replacer.set_capacity(5);
+  replacer.unpin(0);
+  replacer.unpin(1);
+  EXPECT_EQ(replacer.size(), 2U);
+}
+
+// =============================================================================
+// ClockProReplacer Unit Tests
+// =============================================================================
+
+class ClockProReplacerTest : public ::testing::Test {
+ protected:
+  static constexpr size_t kCapacity = 10;
+};
+
+TEST_F(ClockProReplacerTest, Construction) {
+  ClockProReplacer replacer(kCapacity);
+  EXPECT_EQ(replacer.size(), 0U);
+  EXPECT_EQ(replacer.hot_size(), 0U);
+  EXPECT_EQ(replacer.cold_size(), 0U);
+}
+
+TEST_F(ClockProReplacerTest, DefaultConstruction) {
+  ClockProReplacer replacer;
+  EXPECT_EQ(replacer.size(), 0U);
+}
+
+TEST_F(ClockProReplacerTest, UnpinAddsToCold) {
+  ClockProReplacer replacer(kCapacity);
+
+  replacer.unpin(0);
+  EXPECT_EQ(replacer.size(), 1U);
+  EXPECT_EQ(replacer.cold_size(), 1U);
+  EXPECT_EQ(replacer.hot_size(), 0U);
+
+  replacer.unpin(1);
+  EXPECT_EQ(replacer.size(), 2U);
+  EXPECT_EQ(replacer.cold_size(), 2U);
+}
+
+TEST_F(ClockProReplacerTest, PinRemoves) {
+  ClockProReplacer replacer(kCapacity);
+
+  replacer.unpin(0);
+  replacer.unpin(1);
+  EXPECT_EQ(replacer.size(), 2U);
+
+  replacer.pin(0);
+  EXPECT_EQ(replacer.size(), 1U);
+}
+
+TEST_F(ClockProReplacerTest, EvictFromCold) {
+  ClockProReplacer replacer(kCapacity);
+
+  replacer.unpin(0);
+  replacer.unpin(1);
+  replacer.unpin(2);
+
+  auto victim = replacer.evict();
+  ASSERT_TRUE(victim.has_value());
+  EXPECT_EQ(replacer.size(), 2U);
+
+  // Should be able to continue evicting
+  victim = replacer.evict();
+  ASSERT_TRUE(victim.has_value());
+
+  victim = replacer.evict();
+  ASSERT_TRUE(victim.has_value());
+
+  victim = replacer.evict();
+  EXPECT_FALSE(victim.has_value());
+}
+
+TEST_F(ClockProReplacerTest, TestSetPromotion) {
+  ClockProReplacer replacer(kCapacity);
+
+  // Add and evict a page
+  replacer.unpin(0);
+  auto victim = replacer.evict();
+  ASSERT_TRUE(victim.has_value());
+  size_t evicted_id = victim.value();
+
+  // The evicted page is now in test set
+  EXPECT_EQ(replacer.test_size(), 1U);
+
+  // Access the evicted page again - should promote to hot
+  replacer.unpin(evicted_id);
+  EXPECT_EQ(replacer.hot_size(), 1U);
+  EXPECT_EQ(replacer.test_size(), 0U);
+}
+
+TEST_F(ClockProReplacerTest, Remove) {
+  ClockProReplacer replacer(kCapacity);
+
+  replacer.unpin(0);
+  replacer.unpin(1);
+
+  replacer.remove(0);
+  EXPECT_EQ(replacer.size(), 1U);
+}
+
+TEST_F(ClockProReplacerTest, Reset) {
+  ClockProReplacer replacer(kCapacity);
+
+  replacer.unpin(0);
+  replacer.unpin(1);
+
+  replacer.reset();
+  EXPECT_EQ(replacer.size(), 0U);
+  EXPECT_EQ(replacer.cold_size(), 0U);
+  EXPECT_EQ(replacer.hot_size(), 0U);
+  EXPECT_EQ(replacer.test_size(), 0U);
+}
+
+TEST_F(ClockProReplacerTest, MoveConstruction) {
+  ClockProReplacer replacer1(kCapacity);
+  replacer1.unpin(0);
+  replacer1.unpin(1);
+
+  ClockProReplacer replacer2(std::move(replacer1));
+  EXPECT_EQ(replacer2.size(), 2U);
+}
+
+TEST_F(ClockProReplacerTest, SetCapacity) {
+  ClockProReplacer replacer;
+  replacer.set_capacity(5);
+  replacer.unpin(0);
+  replacer.unpin(1);
+  EXPECT_EQ(replacer.size(), 2U);
+}
+
+// =============================================================================
+// BufferPool with Different Replacers Tests
+// =============================================================================
+
+class BufferPoolWithClockTest : public ::testing::Test {
+ protected:
+  static constexpr size_t kFrameSize = 4096;
+  static constexpr size_t kCapacity = 10;
+};
+
+TEST_F(BufferPoolWithClockTest, BasicOperations) {
+  BufferPool<uint32_t, ClockReplacer> pool(kCapacity, kFrameSize);
+
+  std::vector<uint8_t> data(kFrameSize, 0xAB);
+
+  pool.put(1, data.data());
+  EXPECT_EQ(pool.size(), 1U);
+
+  const uint8_t* result = pool.get(1);
+  EXPECT_NE(result, nullptr);
+  EXPECT_EQ(result[0], 0xAB);
+}
+
+TEST_F(BufferPoolWithClockTest, Eviction) {
+  BufferPool<uint32_t, ClockReplacer> pool(3, kFrameSize);
+
+  std::vector<uint8_t> data(kFrameSize, 0);
+
+  for (uint32_t i = 0; i < 3; ++i) {
+    data[0] = static_cast<uint8_t>(i);
+    pool.put(i, data.data());
+  }
+  EXPECT_EQ(pool.size(), 3U);
+
+  // Insert new item - should trigger eviction
+  data[0] = 100;
+  pool.put(100, data.data());
+
+  EXPECT_EQ(pool.size(), 3U);
+  EXPECT_TRUE(pool.contains(100));
+}
+
+class BufferPoolWithClockProTest : public ::testing::Test {
+ protected:
+  static constexpr size_t kFrameSize = 4096;
+  static constexpr size_t kCapacity = 10;
+};
+
+TEST_F(BufferPoolWithClockProTest, BasicOperations) {
+  BufferPool<uint32_t, ClockProReplacer> pool(kCapacity, kFrameSize);
+
+  std::vector<uint8_t> data(kFrameSize, 0xCD);
+
+  pool.put(1, data.data());
+  EXPECT_EQ(pool.size(), 1U);
+
+  const uint8_t* result = pool.get(1);
+  EXPECT_NE(result, nullptr);
+  EXPECT_EQ(result[0], 0xCD);
+}
+
+TEST_F(BufferPoolWithClockProTest, Eviction) {
+  BufferPool<uint32_t, ClockProReplacer> pool(3, kFrameSize);
+
+  std::vector<uint8_t> data(kFrameSize, 0);
+
+  for (uint32_t i = 0; i < 3; ++i) {
+    data[0] = static_cast<uint8_t>(i);
+    pool.put(i, data.data());
+  }
+  EXPECT_EQ(pool.size(), 3U);
+
+  // Insert new item - should trigger eviction
+  data[0] = 100;
+  pool.put(100, data.data());
+
+  EXPECT_EQ(pool.size(), 3U);
+  EXPECT_TRUE(pool.contains(100));
+}
+
+TEST_F(BufferPoolWithClockProTest, ConcurrentAccess) {
+  BufferPool<uint32_t, ClockProReplacer> pool(100, kFrameSize);
+
+  constexpr int kNumThreads = 4;
+  constexpr int kOpsPerThread = 50;
+
+  std::vector<std::thread> threads;
+  threads.reserve(kNumThreads);
+
+  for (int t = 0; t < kNumThreads; ++t) {
+    threads.emplace_back([&pool, t]() -> void {
+      std::vector<uint8_t> data(kFrameSize);
+      for (int i = 0; i < kOpsPerThread; ++i) {
+        auto id = static_cast<uint32_t>(t * kOpsPerThread + i);
+        data[0] = static_cast<uint8_t>(id % 256);
+        pool.put(id, data.data());
+        (void)pool.get(id);
+      }
+    });
+  }
+
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  EXPECT_GT(pool.size(), 0U);
+  EXPECT_LE(pool.size(), 100U);
 }
 
 }  // namespace alaya

@@ -168,7 +168,7 @@ class RaBitQSpace {
     if constexpr (!(std::is_integral_v<IDType> && std::is_unsigned_v<IDType> &&
                     sizeof(IDType) == 4)) {
       throw std::invalid_argument("IDType must be a 32-bit unsigned integer!");
-      // otherwise SearchBuffer and LinearPool won't function correctly.
+      // otherwise SearchBuffer and CandidateList won't function correctly.
     }
 
     if (item_cnt > capacity_) {

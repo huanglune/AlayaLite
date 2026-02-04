@@ -26,6 +26,7 @@ class AlayaLiteConan(ConanFile):
         self.requires("pybind11/2.13.6")
         self.requires("spdlog/1.9.2")
         self.requires("eigen/3.4.0")
+        self.requires("unordered_dense/4.8.1")  # High-performance hash map
 
         # Linux-specific async I/O support
         if self.settings.os == "Linux":

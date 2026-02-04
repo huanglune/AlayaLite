@@ -14,22 +14,22 @@
  * limitations under the License.
  */
 
-#include "utils/linearpool.hpp"
+#include "utils/candidate_list.hpp"
 #include <gtest/gtest.h>
 #include "utils/thread_pool.hpp"
 
 namespace alaya {
 
-class LinearPoolTest : public ::testing::Test {
+class CandidateListTest : public ::testing::Test {
  protected:
-  void SetUp() override { pool_ = new LinearPool<float, int>(10, 5); }
+  void SetUp() override { pool_ = new CandidateList<float, int>(10, 5); }
 
   void TearDown() override { delete pool_; }
 
-  LinearPool<float, int> *pool_;
+  CandidateList<float, int> *pool_;
 };
 
-TEST_F(LinearPoolTest, InsertBoundaryTest) {
+TEST_F(CandidateListTest, InsertBoundaryTest) {
   pool_->insert(1, 2.5);
   pool_->insert(2, 1.5);
   pool_->insert(3, 3.0);
@@ -40,7 +40,7 @@ TEST_F(LinearPoolTest, InsertBoundaryTest) {
   EXPECT_EQ(pool_->size(), 5);
 }
 
-TEST_F(LinearPoolTest, PopTest) {
+TEST_F(CandidateListTest, PopTest) {
   pool_->insert(1, 2.5);
   pool_->insert(2, 1.5);
   pool_->insert(3, 3.0);
@@ -52,7 +52,7 @@ TEST_F(LinearPoolTest, PopTest) {
 }
 
 // Test for multiple insertions and pops
-TEST_F(LinearPoolTest, MultipleInsertAndPopTest) {
+TEST_F(CandidateListTest, MultipleInsertAndPopTest) {
   pool_->insert(1, 2.5);
   pool_->insert(2, 1.5);
   pool_->insert(3, 3.0);
@@ -75,7 +75,7 @@ TEST_F(LinearPoolTest, MultipleInsertAndPopTest) {
   EXPECT_EQ(pool_->has_next(), false);  // Finally should be empty
 }
 
-TEST_F(LinearPoolTest, BoundaryConditionsTest) {
+TEST_F(CandidateListTest, BoundaryConditionsTest) {
   // Fill the pool
   pool_->insert(1, 2.5);
   pool_->insert(2, 1.5);
@@ -93,7 +93,7 @@ TEST_F(LinearPoolTest, BoundaryConditionsTest) {
 }
 
 // Performance test
-TEST_F(LinearPoolTest, PerformanceTest) {
+TEST_F(CandidateListTest, PerformanceTest) {
   const int kNumElements = 10000;
   for (int i = 0; i < kNumElements; ++i) {
     pool_->insert(i, static_cast<float>(kNumElements - i));  // Insert elements
@@ -102,7 +102,7 @@ TEST_F(LinearPoolTest, PerformanceTest) {
 }
 
 // Concurrent test
-TEST_F(LinearPoolTest, ConcurrentInsertTest) {
+TEST_F(CandidateListTest, ConcurrentInsertTest) {
   const int kNumThreads = 10;
   const int kInsertsPerThread = 100;
 
@@ -128,7 +128,7 @@ TEST_F(LinearPoolTest, ConcurrentInsertTest) {
 }
 
 // Test find_bsearch function
-TEST_F(LinearPoolTest, FindBsearchTest) {
+TEST_F(CandidateListTest, FindBsearchTest) {
   pool_->insert(1, 1.0);
   pool_->insert(2, 2.0);
   pool_->insert(3, 3.0);
@@ -144,15 +144,15 @@ TEST_F(LinearPoolTest, FindBsearchTest) {
 }
 
 // Test capacity function
-TEST_F(LinearPoolTest, CapacityTest) {
+TEST_F(CandidateListTest, CapacityTest) {
   EXPECT_EQ(pool_->capacity(), 5);
 
-  LinearPool<float, int> large_pool(100, 50);
+  CandidateList<float, int> large_pool(100, 50);
   EXPECT_EQ(large_pool.capacity(), 50);
 }
 
 // Test is_full function
-TEST_F(LinearPoolTest, IsFullTest) {
+TEST_F(CandidateListTest, IsFullTest) {
   EXPECT_FALSE(pool_->is_full());
 
   pool_->insert(1, 1.0);
@@ -168,7 +168,7 @@ TEST_F(LinearPoolTest, IsFullTest) {
 }
 
 // Test id and dist accessors
-TEST_F(LinearPoolTest, AccessorsTest) {
+TEST_F(CandidateListTest, AccessorsTest) {
   pool_->insert(10, 1.0);
   pool_->insert(20, 2.0);
   pool_->insert(30, 3.0);
@@ -184,7 +184,7 @@ TEST_F(LinearPoolTest, AccessorsTest) {
 }
 
 // Test has_next and next_id functions
-TEST_F(LinearPoolTest, HasNextAndNextIdTest) {
+TEST_F(CandidateListTest, HasNextAndNextIdTest) {
   EXPECT_FALSE(pool_->has_next());  // Empty pool
 
   pool_->insert(1, 1.0);
@@ -204,7 +204,7 @@ TEST_F(LinearPoolTest, HasNextAndNextIdTest) {
 }
 
 // Test get_id, set_checked, is_checked functions
-TEST_F(LinearPoolTest, CheckedFlagTest) {
+TEST_F(CandidateListTest, CheckedFlagTest) {
   int id = 42;
 
   // Initially not checked
@@ -225,7 +225,7 @@ TEST_F(LinearPoolTest, CheckedFlagTest) {
 }
 
 // Test empty pool behavior
-TEST_F(LinearPoolTest, EmptyPoolTest) {
+TEST_F(CandidateListTest, EmptyPoolTest) {
   EXPECT_EQ(pool_->size(), 0);
   EXPECT_FALSE(pool_->is_full());
   EXPECT_FALSE(pool_->has_next());
@@ -233,7 +233,7 @@ TEST_F(LinearPoolTest, EmptyPoolTest) {
 }
 
 // Test single element pool
-TEST_F(LinearPoolTest, SingleElementTest) {
+TEST_F(CandidateListTest, SingleElementTest) {
   pool_->insert(42, 3.14);
 
   EXPECT_EQ(pool_->size(), 1);
@@ -248,7 +248,7 @@ TEST_F(LinearPoolTest, SingleElementTest) {
 }
 
 // Test insertion with same distance
-TEST_F(LinearPoolTest, SameDistanceInsertTest) {
+TEST_F(CandidateListTest, SameDistanceInsertTest) {
   pool_->insert(1, 2.0);
   pool_->insert(2, 2.0);
   pool_->insert(3, 2.0);
@@ -270,7 +270,7 @@ TEST_F(LinearPoolTest, SameDistanceInsertTest) {
 }
 
 // Test insert replaces worst element when full
-TEST_F(LinearPoolTest, InsertReplacesWorstTest) {
+TEST_F(CandidateListTest, InsertReplacesWorstTest) {
   pool_->insert(1, 1.0);
   pool_->insert(2, 2.0);
   pool_->insert(3, 3.0);
@@ -291,8 +291,8 @@ TEST_F(LinearPoolTest, InsertReplacesWorstTest) {
 }
 
 // Test with different data types
-TEST(LinearPoolTypesTest, DoubleDistanceTest) {
-  LinearPool<double, uint32_t> pool(100, 10);
+TEST(CandidateListTypesTest, DoubleDistanceTest) {
+  CandidateList<double, uint32_t> pool(100, 10);
 
   pool.insert(1, 1.111111);
   pool.insert(2, 2.222222);
@@ -304,7 +304,7 @@ TEST(LinearPoolTypesTest, DoubleDistanceTest) {
 }
 
 // Test cursor behavior after multiple operations
-TEST_F(LinearPoolTest, CursorBehaviorTest) {
+TEST_F(CandidateListTest, CursorBehaviorTest) {
   pool_->insert(1, 3.0);
   pool_->insert(2, 1.0);
   pool_->insert(3, 2.0);
@@ -322,15 +322,15 @@ TEST_F(LinearPoolTest, CursorBehaviorTest) {
 }
 
 // Test kMask constant
-TEST_F(LinearPoolTest, MaskConstantTest) {
-  EXPECT_EQ((LinearPool<float, int>::kMask), 2147483647);
-  EXPECT_EQ((LinearPool<float, int>::kMask), 0x7FFFFFFF);
+TEST_F(CandidateListTest, MaskConstantTest) {
+  EXPECT_EQ((CandidateList<float, int>::kMask), 2147483647);
+  EXPECT_EQ((CandidateList<float, int>::kMask), 0x7FFFFFFF);
 }
 
 // Test large capacity pool
-TEST(LinearPoolLargeTest, LargeCapacityTest) {
+TEST(CandidateListLargeTest, LargeCapacityTest) {
   const int kCapacity = 1000;
-  LinearPool<float, int> pool(10000, kCapacity);
+  CandidateList<float, int> pool(10000, kCapacity);
 
   for (int i = 0; i < 2000; ++i) {
     pool.insert(i, static_cast<float>(i % 500));
@@ -346,7 +346,7 @@ TEST(LinearPoolLargeTest, LargeCapacityTest) {
 }
 
 // Test reverse order insertion
-TEST_F(LinearPoolTest, ReverseOrderInsertTest) {
+TEST_F(CandidateListTest, ReverseOrderInsertTest) {
   pool_->insert(5, 5.0);
   pool_->insert(4, 4.0);
   pool_->insert(3, 3.0);
@@ -362,7 +362,7 @@ TEST_F(LinearPoolTest, ReverseOrderInsertTest) {
 }
 
 // Test emplace_insert function
-TEST_F(LinearPoolTest, EmplaceInsertTest) {
+TEST_F(CandidateListTest, EmplaceInsertTest) {
   // First fill the pool with insert
   pool_->insert(1, 1.0);
   pool_->insert(2, 2.0);
@@ -388,7 +388,7 @@ TEST_F(LinearPoolTest, EmplaceInsertTest) {
 }
 
 // Test emplace_insert maintains sorted order
-TEST_F(LinearPoolTest, EmplaceInsertSortedOrderTest) {
+TEST_F(CandidateListTest, EmplaceInsertSortedOrderTest) {
   pool_->insert(1, 1.0);
   pool_->insert(2, 3.0);
   pool_->insert(3, 5.0);

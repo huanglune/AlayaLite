@@ -24,7 +24,7 @@
 
 #include "../../index/graph/graph.hpp"
 #include "../../space/space_concepts.hpp"
-#include "../../utils/linearpool.hpp"
+#include "../../utils/candidate_list.hpp"
 #include "../../utils/prefetch.hpp"
 #include "job_context.hpp"
 #include "space/rabitq_space.hpp"
@@ -220,7 +220,7 @@ struct GraphSearchJob {
   }
   auto search(DataType *query, uint32_t k, IDType *ids, uint32_t ef) -> coro::task<> {
     auto query_computer = space_->get_query_computer(query);
-    LinearPool<DistanceType, IDType> pool(space_->get_data_num(), ef);
+    CandidateList<DistanceType, IDType> pool(space_->get_data_num(), ef);
     graph_->initialize_search(pool, query_computer);
 
     space_->prefetch_by_address(query);
@@ -260,7 +260,7 @@ struct GraphSearchJob {
   auto search(DataType *query, uint32_t k, IDType *ids, DistanceType *distances, uint32_t ef)
       -> coro::task<> {
     auto query_computer = space_->get_query_computer(query);
-    LinearPool<DistanceType, IDType> pool(space_->get_data_num(), ef);
+    CandidateList<DistanceType, IDType> pool(space_->get_data_num(), ef);
     graph_->initialize_search(pool, query_computer);
 
     space_->prefetch_by_address(query);
@@ -301,7 +301,7 @@ struct GraphSearchJob {
 
   void search_solo(DataType *query, uint32_t k, IDType *ids, uint32_t ef) {
     auto query_computer = space_->get_query_computer(query);
-    LinearPool<DistanceType, IDType> pool(space_->get_data_num(), ef);
+    CandidateList<DistanceType, IDType> pool(space_->get_data_num(), ef);
     graph_->initialize_search(pool, query_computer);
 
     while (pool.has_next()) {
@@ -336,7 +336,7 @@ struct GraphSearchJob {
 
   void search_solo(DataType *query, uint32_t k, IDType *ids, DistanceType *distances, uint32_t ef) {
     auto query_computer = space_->get_query_computer(query);
-    LinearPool<DistanceType, IDType> pool(space_->get_data_num(), ef);
+    CandidateList<DistanceType, IDType> pool(space_->get_data_num(), ef);
     graph_->initialize_search(pool, query_computer);
 
     while (pool.has_next()) {
@@ -372,7 +372,7 @@ struct GraphSearchJob {
 
   void search_solo_updated(DataType *query, uint32_t k, IDType *ids, uint32_t ef) {
     auto query_computer = space_->get_query_computer(query);
-    LinearPool<DistanceType, IDType> pool(space_->get_data_num(), ef);
+    CandidateList<DistanceType, IDType> pool(space_->get_data_num(), ef);
     graph_->initialize_search(pool, query_computer);
 
     while (pool.has_next()) {
