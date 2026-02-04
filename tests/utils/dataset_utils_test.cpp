@@ -48,6 +48,25 @@ TEST_F(DatasetTest, LoadSiftSmall) {
   EXPECT_TRUE(std::filesystem::exists(config.gt_file_));
 }
 
+TEST_F(DatasetTest, DISABLED_LoadSift1M) {
+  // Disabled: too slow due to large dataset download
+
+  auto config = sift1m(data_dir_);
+
+  auto ds = load_dataset(config);
+
+  EXPECT_EQ(ds.name_, "sift1M");
+  EXPECT_EQ(ds.dim_, 128);
+  EXPECT_GT(ds.data_num_, 0);
+  EXPECT_GT(ds.query_num_, 0);
+  EXPECT_EQ(ds.data_.size(), ds.data_num_ * ds.dim_);
+  EXPECT_EQ(ds.queries_.size(), ds.query_num_ * ds.dim_);
+
+  EXPECT_TRUE(std::filesystem::exists(config.data_file_));
+  EXPECT_TRUE(std::filesystem::exists(config.query_file_));
+  EXPECT_TRUE(std::filesystem::exists(config.gt_file_));
+}
+
 TEST_F(DatasetTest, DISABLED_LoadDeep1M) {
   // Disabled: too slow due to large dataset download
 

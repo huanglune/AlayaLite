@@ -111,6 +111,22 @@ inline auto sift_small(const std::filesystem::path &data_dir) -> DatasetConfig {
 }
 
 /**
+ * @brief Create config for SIFT1M dataset (1M vectors, 128 dim).
+ */
+inline auto sift1m(const std::filesystem::path &data_dir) -> DatasetConfig {
+  auto dir = data_dir / "sift";
+  return DatasetConfig{
+      .name_ = "sift1M",
+      .dir_ = dir,
+      .data_file_ = dir / "sift_base.fvecs",
+      .query_file_ = dir / "sift_query.fvecs",
+      .gt_file_ = dir / "sift_groundtruth.ivecs",
+      .download_url_ = "ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz",
+      .archive_name_ = "sift.tar.gz",
+  };
+}
+
+/**
  * @brief Create config for DEEP1M dataset (1M vectors, 96 dim).
  */
 inline auto deep1m(const std::filesystem::path &data_dir) -> DatasetConfig {
