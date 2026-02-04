@@ -21,13 +21,14 @@
 #include <memory>
 #include <utility>
 #include <vector>
-#include "../../../space/space_concepts.hpp"
-#include "../../../utils/log.hpp"
-#include "../../../utils/thread_pool.hpp"
-#include "../../../utils/timer.hpp"
 #include "../graph.hpp"
 #include "hnswlib.hpp"
 #include "space/raw_space.hpp"
+#include "space/space_concepts.hpp"
+#include "utils/log.hpp"
+#include "utils/macros.hpp"
+#include "utils/thread_pool.hpp"
+#include "utils/timer.hpp"
 
 namespace alaya {
 /**
@@ -73,10 +74,7 @@ struct HNSWBuilder {
     space_ = space;
   }
 
-  HNSWBuilder(const HNSWBuilder &) = delete;
-  auto operator=(const HNSWBuilder &) -> HNSWBuilder & = delete;
-  HNSWBuilder(HNSWBuilder &&) = delete;
-  auto operator=(HNSWBuilder &&) -> HNSWBuilder & = delete;
+  ALAYA_NON_COPYABLE_NON_MOVABLE(HNSWBuilder);
 
   /**
    * @brief Constructs a graph representation from the provided vector data.

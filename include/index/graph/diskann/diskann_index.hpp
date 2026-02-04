@@ -21,11 +21,12 @@
 #include <string>
 #include <string_view>
 
-#include "../../../space/space_concepts.hpp"
-#include "../../../utils/log.hpp"
 #include "diskann_builder.hpp"
 #include "diskann_params.hpp"
 #include "diskann_searcher.hpp"
+#include "space/space_concepts.hpp"
+#include "utils/log.hpp"
+#include "utils/macros.hpp"
 
 namespace alaya {
 
@@ -65,11 +66,7 @@ class DiskANNIndex {
 
  public:
   DiskANNIndex() = default;
-
-  DiskANNIndex(const DiskANNIndex &) = delete;
-  auto operator=(const DiskANNIndex &) -> DiskANNIndex & = delete;
-  DiskANNIndex(DiskANNIndex &&) = default;
-  auto operator=(DiskANNIndex &&) -> DiskANNIndex & = default;
+  ALAYA_NON_COPYABLE_BUT_MOVABLE(DiskANNIndex);
   ~DiskANNIndex() = default;
 
   // ==========================================================================
@@ -178,28 +175,16 @@ class DiskANNIndex {
    * @param query Query vector
    * @param topk Number of neighbors to return
    * @param results Output array for result IDs
-   * @param ef Search list size (0 = auto)
-   */
-  auto search(const DataType *query, uint32_t topk, IDType *results, uint32_t ef = 0) -> void {
-    if (!is_loaded()) {
-      throw std::runtime_error("DiskANNIndex: No index loaded");
-    }
-    searcher_->search(query, topk, results, ef);
-  }
-
-  /**
-   * @brief Search for k nearest neighbors with search params.
-   *
-   * @param query Query vector
-   * @param topk Number of neighbors to return
-   * @param results Output array for result IDs
-   * @param params Search parameters
+   * @param params Search parameters (default values if not specified)
    */
   auto search(const DataType *query,
               uint32_t topk,
               IDType *results,
-              const DiskANNSearchParams &params) -> void {
-    search(query, topk, results, params.ef_search_);
+              const DiskANNSearchParams &params = DiskANNSearchParams{}) -> void {
+    if (!is_loaded()) {
+      throw std::runtime_error("DiskANNIndex: No index loaded");
+    }
+    searcher_->search(query, topk, results, params.ef_search_);
   }
 
   /**
@@ -209,34 +194,17 @@ class DiskANNIndex {
    * @param topk Number of neighbors to return
    * @param results Output array for result IDs
    * @param distances Output array for distances
-   * @param ef Search list size (0 = auto)
+   * @param params Search parameters (default values if not specified)
    */
   auto search_with_distance(const DataType *query,
                             uint32_t topk,
                             IDType *results,
                             DistanceType *distances,
-                            uint32_t ef = 0) -> void {
+                            const DiskANNSearchParams &params = DiskANNSearchParams{}) -> void {
     if (!is_loaded()) {
       throw std::runtime_error("DiskANNIndex: No index loaded");
     }
-    searcher_->search_with_distance(query, topk, results, distances, ef);
-  }
-
-  /**
-   * @brief Search with distances using search params.
-   *
-   * @param query Query vector
-   * @param topk Number of neighbors to return
-   * @param results Output array for result IDs
-   * @param distances Output array for distances
-   * @param params Search parameters
-   */
-  auto search_with_distance(const DataType *query,
-                            uint32_t topk,
-                            IDType *results,
-                            DistanceType *distances,
-                            const DiskANNSearchParams &params) -> void {
-    search_with_distance(query, topk, results, distances, params.ef_search_);
+    searcher_->search_with_distance(query, topk, results, distances, params.ef_search_);
   }
 
   /**
@@ -246,34 +214,17 @@ class DiskANNIndex {
    * @param num_queries Number of queries
    * @param topk Number of neighbors per query
    * @param results Output array (num_queries * topk)
-   * @param ef Search list size (0 = auto)
+   * @param params Search parameters (default values if not specified)
    */
   auto batch_search(const DataType *queries,
                     uint32_t num_queries,
                     uint32_t topk,
                     IDType *results,
-                    uint32_t ef = 0) -> void {
+                    const DiskANNSearchParams &params = DiskANNSearchParams{}) -> void {
     if (!is_loaded()) {
       throw std::runtime_error("DiskANNIndex: No index loaded");
     }
-    searcher_->batch_search(queries, num_queries, topk, results, ef);
-  }
-
-  /**
-   * @brief Batch search for multiple queries with search params.
-   *
-   * @param queries Query vectors (num_queries * dimension)
-   * @param num_queries Number of queries
-   * @param topk Number of neighbors per query
-   * @param results Output array (num_queries * topk)
-   * @param params Search parameters
-   */
-  auto batch_search(const DataType *queries,
-                    uint32_t num_queries,
-                    uint32_t topk,
-                    IDType *results,
-                    const DiskANNSearchParams &params) -> void {
-    batch_search(queries, num_queries, topk, results, params.ef_search_);
+    searcher_->batch_search(queries, num_queries, topk, results, params.ef_search_);
   }
 
   /**
@@ -290,7 +241,6 @@ class DiskANNIndex {
    * @return Pointer to the searcher (nullptr if not loaded)
    */
   [[nodiscard]] auto searcher() -> SearcherType * { return searcher_.get(); }
-
   [[nodiscard]] auto searcher() const -> const SearcherType * { return searcher_.get(); }
 };
 

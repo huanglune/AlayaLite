@@ -31,6 +31,8 @@
 #include <cassert>
 #include <filesystem>  // NOLINT(build/c++17)
 
+#include "macros.hpp"
+
 namespace alaya {
 /**
  * @brief RAII file lock for cross-process synchronization.
@@ -76,8 +78,7 @@ class FileLock {
 #endif
   }
 
-  FileLock(const FileLock &) = delete;
-  auto operator=(const FileLock &) -> FileLock & = delete;
+  ALAYA_NON_COPYABLE(FileLock);
 
  private:
   std::filesystem::path lock_file_;

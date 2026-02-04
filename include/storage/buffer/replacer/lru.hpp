@@ -22,6 +22,7 @@
 #include <unordered_map>
 
 #include "concept.hpp"
+#include "utils/macros.hpp"
 
 namespace alaya {
 
@@ -49,14 +50,7 @@ class LRUReplacer {
   LRUReplacer() : capacity_(0) {}
 
   ~LRUReplacer() = default;
-
-  // Non-copyable
-  LRUReplacer(const LRUReplacer &) = delete;
-  auto operator=(const LRUReplacer &) -> LRUReplacer & = delete;
-
-  // Movable
-  LRUReplacer(LRUReplacer &&) noexcept = default;
-  auto operator=(LRUReplacer &&) noexcept -> LRUReplacer & = default;
+  ALAYA_NON_COPYABLE_BUT_MOVABLE(LRUReplacer);
 
   /**
    * @brief Record that a frame has been accessed (pinned).

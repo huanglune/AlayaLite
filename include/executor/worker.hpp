@@ -25,10 +25,11 @@
 #include <tuple>
 #include <vector>
 
-#include "../utils/locks.hpp"
-#include "../utils/log.hpp"
-#include "../utils/types.hpp"
 #include "task_queue.hpp"
+#include "utils/locks.hpp"
+#include "utils/log.hpp"
+#include "utils/macros.hpp"
+#include "utils/types.hpp"
 
 namespace alaya {
 
@@ -89,10 +90,7 @@ class Worker : public std::enable_shared_from_this<Worker> {
     thread_.join();
   }
 
-  auto operator=(const Worker &) -> Worker & = delete;
-  auto operator=(Worker &&) -> Worker & = delete;
-  Worker(const Worker &) = delete;
-  Worker(Worker &&) = delete;
+  ALAYA_NON_COPYABLE_NON_MOVABLE(Worker);
   ~Worker() = default;
 
  protected:

@@ -30,6 +30,7 @@
 #include "space/space_concepts.hpp"
 #include "storage/data/sequential_storage.hpp"
 #include "utils/log.hpp"
+#include "utils/macros.hpp"
 #include "utils/math.hpp"
 #include "utils/metric_type.hpp"
 #include "utils/platform.hpp"
@@ -77,11 +78,7 @@ class PQSpace {
  public:
   PQSpace() = default;
   ~PQSpace() = default;
-
-  PQSpace(const PQSpace &) = delete;
-  auto operator=(const PQSpace &) -> PQSpace & = delete;
-  PQSpace(PQSpace &&) = default;
-  auto operator=(PQSpace &&) -> PQSpace & = default;
+  ALAYA_NON_COPYABLE_BUT_MOVABLE(PQSpace);
 
   /**
    * @brief Construct PQSpace with parameters.

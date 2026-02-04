@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include "utils/macros.hpp"
 #include "utils/math.hpp"
 #include "utils/platform.hpp"
 
@@ -41,8 +42,7 @@ struct SequentialStorage {
   DataType *data_{nullptr};
   uint8_t *bitmap_{nullptr};
 
-  SequentialStorage(const SequentialStorage &) = delete;
-  auto operator=(const SequentialStorage &) -> SequentialStorage & = delete;
+  ALAYA_NON_COPYABLE(SequentialStorage);
 
   SequentialStorage() = default;
   ~SequentialStorage() {

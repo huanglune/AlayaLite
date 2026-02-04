@@ -27,9 +27,10 @@
 #include <string_view>
 #include <type_traits>
 #include <vector>
-#include "../../utils/log.hpp"
 #include "overlay_graph.hpp"
 #include "storage/data/sequential_storage.hpp"
+#include "utils/log.hpp"
+#include "utils/macros.hpp"
 namespace alaya {
 
 constexpr static int kEmptyId = -1;  ///< The id of empty node.
@@ -67,11 +68,7 @@ struct Graph {
     data_storage_.init(item_size, max_nodes, -1);
   }
 
-  Graph(const Graph &) = delete;
-  auto operator=(const Graph &) -> Graph & = delete;
-  Graph(Graph &&) = delete;
-  auto operator=(Graph &&) -> Graph & = delete;
-
+  ALAYA_NON_COPYABLE_NON_MOVABLE(Graph);
   ~Graph() = default;
 
   /**

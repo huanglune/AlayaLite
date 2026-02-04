@@ -21,9 +21,10 @@
 #include <memory>
 #include <vector>
 
-#include "../utils/locks.hpp"
-#include "../utils/types.hpp"
 #include "task_queue.hpp"
+#include "utils/locks.hpp"
+#include "utils/macros.hpp"
+#include "utils/types.hpp"
 #include "worker.hpp"
 namespace alaya {
 
@@ -99,10 +100,7 @@ class Scheduler {
   };
 
   Scheduler() = delete;
-  Scheduler(const Scheduler &) = delete;
-  Scheduler(Scheduler &&) = delete;
-  auto operator=(const Scheduler &) -> Scheduler & = delete;
-  auto operator=(Scheduler &&) -> Scheduler & = delete;
+  ALAYA_NON_COPYABLE_NON_MOVABLE(Scheduler);
 
   /**
    * @brief Constructs the Scheduler instance and initializes the task queue.

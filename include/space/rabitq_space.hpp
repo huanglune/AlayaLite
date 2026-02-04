@@ -29,6 +29,7 @@
 #include "space/space_concepts.hpp"
 #include "storage/data/static_storage.hpp"
 #include "utils/log.hpp"
+#include "utils/macros.hpp"
 #include "utils/math.hpp"
 #include "utils/metric_type.hpp"
 #include "utils/prefetch.hpp"
@@ -95,9 +96,8 @@ class RaBitQSpace {
 
   RaBitQSpace() = default;
   ~RaBitQSpace() = default;
+  ALAYA_NON_COPYABLE_NON_MOVABLE(RaBitQSpace);
 
-  RaBitQSpace(RaBitQSpace &&other) = delete;
-  RaBitQSpace(const RaBitQSpace &other) = delete;
   RaBitQSpace(IDType capacity,
               size_t dim,
               MetricType metric,
@@ -107,8 +107,6 @@ class RaBitQSpace {
     quantizer_ = std::make_unique<RaBitQQuantizer<DataType>>(dim_, rotator_->size());
     initialize_offsets();
   }
-  auto operator=(const RaBitQSpace &) -> RaBitQSpace & = delete;
-  auto operator=(RaBitQSpace &&) -> RaBitQSpace & = delete;
 
   auto insert(DataType *data) -> IDType {
     throw std::runtime_error("Insert operation is not supported yet!");

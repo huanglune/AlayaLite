@@ -21,6 +21,7 @@
 #include <fstream>
 
 #include "utils/log.hpp"
+#include "utils/macros.hpp"
 #include "utils/rabitq_utils/defines.hpp"
 #include "utils/rabitq_utils/fastscan.hpp"
 
@@ -99,12 +100,7 @@ struct RaBitQQuantizer {
  public:
   RaBitQQuantizer() = default;
   ~RaBitQQuantizer() = default;
-
-  RaBitQQuantizer(const RaBitQQuantizer &) = delete;
-  auto operator=(const RaBitQQuantizer &) -> RaBitQQuantizer & = delete;
-
-  RaBitQQuantizer(const RaBitQQuantizer &&) = delete;
-  auto operator=(const RaBitQQuantizer &&) -> RaBitQQuantizer & = delete;
+  ALAYA_NON_COPYABLE_NON_MOVABLE(RaBitQQuantizer);
 
   explicit RaBitQQuantizer(const uint32_t &dim, const uint32_t &padded_dim)
       : dim_(dim), padded_dim_(padded_dim) {}

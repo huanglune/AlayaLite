@@ -35,6 +35,7 @@
 #include "space/quant/pq.hpp"
 #include "space/space_concepts.hpp"
 #include "utils/log.hpp"
+#include "utils/macros.hpp"
 #include "utils/thread_pool.hpp"
 #include "utils/timer.hpp"
 
@@ -77,10 +78,7 @@ struct DiskANNBuilder {
                           const DiskANNBuildParams &params = DiskANNBuildParams{})
       : params_(params), dim_(space->get_dim()), space_(std::move(space)) {}
 
-  DiskANNBuilder(const DiskANNBuilder &) = delete;
-  auto operator=(const DiskANNBuilder &) -> DiskANNBuilder & = delete;
-  DiskANNBuilder(DiskANNBuilder &&) = delete;
-  auto operator=(DiskANNBuilder &&) -> DiskANNBuilder & = delete;
+  ALAYA_NON_COPYABLE_NON_MOVABLE(DiskANNBuilder);
   ~DiskANNBuilder() = default;
 
   /**

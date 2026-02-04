@@ -22,6 +22,7 @@
 #include <span>
 #include <string_view>
 
+#include "utils/macros.hpp"
 #include "utils/platform.hpp"
 
 #ifdef ALAYA_OS_LINUX
@@ -71,13 +72,8 @@ struct IORequest {
 class IOEngine {
  public:
   virtual ~IOEngine() = default;
-
-  // Non-copyable, non-movable
   IOEngine() = default;
-  IOEngine(const IOEngine &) = delete;
-  auto operator=(const IOEngine &) -> IOEngine & = delete;
-  IOEngine(IOEngine &&) = delete;
-  auto operator=(IOEngine &&) -> IOEngine & = delete;
+  ALAYA_NON_COPYABLE_NON_MOVABLE(IOEngine);
 
   /**
    * @brief Synchronous positioned read.

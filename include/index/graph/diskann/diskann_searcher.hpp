@@ -35,6 +35,7 @@
 #include "storage/io/direct_file_io.hpp"
 #include "utils/bitset.hpp"
 #include "utils/log.hpp"
+#include "utils/macros.hpp"
 #include "utils/memory.hpp"
 
 namespace alaya {
@@ -93,11 +94,7 @@ class DiskANNSearcher {
 
  public:
   DiskANNSearcher() = default;
-
-  DiskANNSearcher(const DiskANNSearcher &) = delete;
-  auto operator=(const DiskANNSearcher &) -> DiskANNSearcher & = delete;
-  DiskANNSearcher(DiskANNSearcher &&) = default;
-  auto operator=(DiskANNSearcher &&) -> DiskANNSearcher & = default;
+  ALAYA_NON_COPYABLE_BUT_MOVABLE(DiskANNSearcher);
   ~DiskANNSearcher() = default;
 
   /**
@@ -163,35 +160,13 @@ class DiskANNSearcher {
     }
   }
 
-  /**
-   * @brief Check if the searcher is ready.
-   */
   [[nodiscard]] auto is_open() const -> bool { return reader_ != nullptr && reader_->is_open(); }
-
-  /**
-   * @brief Check if PQ is enabled for this index.
-   */
   [[nodiscard]] auto is_pq_enabled() const -> bool { return pq_enabled_; }
-
-  /**
-   * @brief Get the number of points in the index.
-   */
   [[nodiscard]] auto num_points() const -> uint64_t { return num_points_; }
-
-  /**
-   * @brief Get the vector dimension.
-   */
   [[nodiscard]] auto dimension() const -> uint32_t { return dimension_; }
-
-  /**
-   * @brief Get the maximum out-degree.
-   */
   [[nodiscard]] auto max_degree() const -> uint32_t { return max_degree_; }
-
-  /**
-   * @brief Get the index header.
-   */
   [[nodiscard]] auto header() const -> const DiskIndexHeader & { return header_; }
+  [[nodiscard]] auto is_caching_enabled() const -> bool { return caching_enabled_; }
 
   /**
    * @brief Enable node caching with specified capacity.
@@ -220,11 +195,6 @@ class DiskANNSearcher {
     buffer_pool_.reset();
     caching_enabled_ = false;
   }
-
-  /**
-   * @brief Check if caching is enabled.
-   */
-  [[nodiscard]] auto is_caching_enabled() const -> bool { return caching_enabled_; }
 
   /**
    * @brief Get cache statistics.
@@ -267,23 +237,22 @@ class DiskANNSearcher {
    * @param query Pointer to the query vector
    * @param topk Number of nearest neighbors to return
    * @param results Output array for result IDs
-   * @param ef Search list size (0 = use default)
+   * @param params Search parameters (default values if not specified)
    */
-  auto search(const DataType *query, uint32_t topk, IDType *results, uint32_t ef = 0) -> void {
+  auto search(const DataType *query,
+              uint32_t topk,
+              IDType *results,
+              const DiskANNSearchParams &params = DiskANNSearchParams{}) -> void {
     if (!is_open()) {
       throw std::runtime_error("DiskANNSearcher: Index not loaded");
     }
 
-    if (ef == 0) {
+    uint32_t ef = params.ef_search_;
+    if (ef == 0 || ef < topk) {
       ef = std::max(topk, 50U);
     }
 
-    std::vector<NeighborType> neighbors;
-    if (pq_enabled_) {
-      neighbors = beam_search_pq(query, ef, topk);
-    } else {
-      neighbors = beam_search_disk(query, ef);
-    }
+    auto neighbors = pq_enabled_ ? beam_search_pq(query, ef, topk) : beam_search_disk(query, ef);
 
     // Extract top-k results
     size_t result_count = std::min(static_cast<size_t>(topk), neighbors.size());
@@ -298,27 +267,24 @@ class DiskANNSearcher {
   }
 
   /**
-   * @brief Search for k nearest neighbors with search params.
-   */
-  auto search(const DataType *query,
-              uint32_t topk,
-              IDType *results,
-              const DiskANNSearchParams &params) -> void {
-    search(query, topk, results, params.ef_search_);
-  }
-
-  /**
    * @brief Search for k nearest neighbors with distances.
+   *
+   * @param query Pointer to the query vector
+   * @param topk Number of nearest neighbors to return
+   * @param results Output array for result IDs
+   * @param distances Output array for distances
+   * @param params Search parameters (default values if not specified)
    */
   auto search_with_distance(const DataType *query,
                             uint32_t topk,
                             IDType *results,
                             DistanceType *distances,
-                            uint32_t ef = 0) -> void {
+                            const DiskANNSearchParams &params = DiskANNSearchParams{}) -> void {
     if (!is_open()) {
       throw std::runtime_error("DiskANNSearcher: Index not loaded");
     }
 
+    uint32_t ef = params.ef_search_;
     if (ef == 0) {
       ef = std::max(topk, 50U);
     }
@@ -343,38 +309,22 @@ class DiskANNSearcher {
   }
 
   /**
-   * @brief Search for k nearest neighbors with distances using search params.
-   */
-  auto search_with_distance(const DataType *query,
-                            uint32_t topk,
-                            IDType *results,
-                            DistanceType *distances,
-                            const DiskANNSearchParams &params) -> void {
-    search_with_distance(query, topk, results, distances, params.ef_search_);
-  }
-
-  /**
    * @brief Batch search for multiple queries.
+   *
+   * @param queries Query vectors (num_queries * dimension)
+   * @param num_queries Number of queries
+   * @param topk Number of neighbors per query
+   * @param results Output array (num_queries * topk)
+   * @param params Search parameters (default values if not specified)
    */
   auto batch_search(const DataType *queries,
                     uint32_t num_queries,
                     uint32_t topk,
                     IDType *results,
-                    uint32_t ef = 0) -> void {
+                    const DiskANNSearchParams &params = DiskANNSearchParams{}) -> void {
     for (uint32_t i = 0; i < num_queries; ++i) {
-      search(queries + i * dimension_, topk, results + i * topk, ef);
+      search(queries + i * dimension_, topk, results + i * topk, params);
     }
-  }
-
-  /**
-   * @brief Batch search for multiple queries with search params.
-   */
-  auto batch_search(const DataType *queries,
-                    uint32_t num_queries,
-                    uint32_t topk,
-                    IDType *results,
-                    const DiskANNSearchParams &params) -> void {
-    batch_search(queries, num_queries, topk, results, params.ef_search_);
   }
 
  private:
@@ -625,7 +575,7 @@ class DiskANNSearcher {
     // Sort by exact distance
     std::sort(reranked.begin(), reranked.end());
 
-    return reranked;
+    return std::move(reranked);
   }
 
   /**
@@ -698,7 +648,7 @@ class DiskANNSearcher {
     }
 
     std::sort(pool.begin(), pool.end());
-    return pool;
+    return std::move(pool);
   }
 };
 
