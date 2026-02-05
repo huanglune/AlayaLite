@@ -19,7 +19,6 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <ranges>
 #include <unordered_set>
 #include <vector>
 #include "math.hpp"
@@ -105,6 +104,24 @@ class DynamicBitset {
    * @brief Reset all bits to zero
    */
   void reset() { std::ranges::fill(data_, 0ULL); }
+
+  /**
+   * @brief Find the position of the first zero (unset) bit
+   *
+   * Uses CPU instructions (TZCNT/BSF) for O(1) lookup within each 64-bit block.
+   * Overall complexity is O(n/64) where n is the number of bits.
+   *
+   * @return int The position of the first zero bit, or -1 if all bits are set
+   */
+  [[nodiscard]] auto find_first_zero() const -> int {
+    for (size_t i = 0; i < data_.size(); ++i) {
+      if (data_[i] != ~0ULL) {  // Block has at least one zero bit
+        size_t pos = (i * 64) + math::count_trailing_zeros(~data_[i]);
+        return (pos < size_) ? static_cast<int>(pos) : -1;
+      }
+    }
+    return -1;
+  }
 };
 
 /**
@@ -225,6 +242,89 @@ class HierarchicalBitset {
   }
 };
 
+/**
+ * @brief A fixed-size bitset for very small sizes (8, 16, 32, 64 bits).
+ *
+ * Uses a single integer for O(1) all operations with single CPU instructions.
+ * Ideal for managing small resource pools (e.g., buffer slots, connection pools).
+ *
+ * @tparam N Number of bits (must be 8, 16, 32, or 64)
+ */
+template <size_t N>
+  requires(N == 8 || N == 16 || N == 32 || N == 64)
+class FixedBitset {
+ private:
+  using StorageType = std::conditional_t<
+      N == 8,
+      uint8_t,
+      std::conditional_t<N == 16, uint16_t, std::conditional_t<N == 32, uint32_t, uint64_t>>>;
+
+  StorageType data_{0};
+
+  static constexpr StorageType kAllOnes = static_cast<StorageType>(~StorageType{0});
+
+ public:
+  FixedBitset() = default;
+
+  void set(size_t pos) noexcept { data_ |= (StorageType{1} << pos); }
+  void reset(size_t pos) noexcept { data_ &= ~(StorageType{1} << pos); }
+  void reset() noexcept { data_ = 0; }
+
+  [[nodiscard]] auto get(size_t pos) const noexcept -> bool {
+    return (data_ >> pos) & StorageType{1};
+  }
+
+  /**
+   * @brief Find first zero bit in O(1) using TZCNT/BSF instruction
+   * @return Position of first zero bit, or -1 if all bits are set
+   */
+  [[nodiscard]] auto find_first_zero() const noexcept -> int {
+    if (data_ == kAllOnes) {
+      return -1;
+    }
+    auto inverted = static_cast<StorageType>(~data_);
+    if constexpr (N <= 32) {
+      return __builtin_ctz(static_cast<unsigned int>(inverted));
+    } else {
+      return __builtin_ctzll(inverted);
+    }
+  }
+
+  /**
+   * @brief Find first set bit in O(1) using TZCNT/BSF instruction
+   * @return Position of first set bit, or -1 if all bits are zero
+   */
+  [[nodiscard]] auto find_first_set() const noexcept -> int {
+    if (data_ == 0) {
+      return -1;
+    }
+    if constexpr (N <= 32) {
+      return __builtin_ctz(static_cast<unsigned int>(data_));
+    } else {
+      return __builtin_ctzll(data_);
+    }
+  }
+
+  [[nodiscard]] auto count() const noexcept -> int {
+    if constexpr (N <= 32) {
+      return __builtin_popcount(static_cast<unsigned int>(data_));
+    } else {
+      return __builtin_popcountll(data_);
+    }
+  }
+
+  [[nodiscard]] auto empty() const noexcept -> bool { return data_ == 0; }
+
+  [[nodiscard]] auto full() const noexcept -> bool { return data_ == kAllOnes; }
+
+  [[nodiscard]] static constexpr auto capacity() noexcept -> size_t { return N; }
+};
+
+// Convenient type aliases
 using Bitset = DynamicBitset;  // Change to SparseBitset or HierarchicalBitset as needed
+using Bitset8 = FixedBitset<8>;
+using Bitset16 = FixedBitset<16>;
+using Bitset32 = FixedBitset<32>;
+using Bitset64 = FixedBitset<64>;
 
 }  // namespace alaya
