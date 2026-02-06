@@ -31,11 +31,11 @@
 #include "utils/log.hpp"
 #include "utils/macros.hpp"
 #include "utils/math.hpp"
-#include "utils/metric_type.hpp"
 #include "utils/prefetch.hpp"
 #include "utils/rabitq_utils/fastscan.hpp"
 #include "utils/rabitq_utils/lut.hpp"
 #include "utils/rabitq_utils/rotator.hpp"
+#include "utils/types.hpp"
 
 namespace alaya {
 template <typename DataType = float, typename DistanceType = float, typename IDType = uint32_t>

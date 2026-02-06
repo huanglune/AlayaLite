@@ -32,9 +32,9 @@
 #include "utils/log.hpp"
 #include "utils/macros.hpp"
 #include "utils/math.hpp"
-#include "utils/metric_type.hpp"
 #include "utils/platform.hpp"
 #include "utils/prefetch.hpp"
+#include "utils/types.hpp"
 
 namespace alaya {
 

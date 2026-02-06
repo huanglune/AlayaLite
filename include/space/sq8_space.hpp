@@ -29,9 +29,9 @@
 #include "storage/data/sequential_storage.hpp"
 #include "utils/log.hpp"
 #include "utils/math.hpp"
-#include "utils/metric_type.hpp"
 #include "utils/platform.hpp"
 #include "utils/prefetch.hpp"
+#include "utils/types.hpp"
 
 namespace alaya {
 

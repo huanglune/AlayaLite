@@ -23,7 +23,7 @@
 #include <limits>
 #include <sys/types.h>
 
-#include "utils/metric_type.hpp"
+#include "utils/types.hpp"
 namespace alaya {
 
 using IDType = uint32_t;

@@ -20,8 +20,8 @@
 #include <cstdint>
 
 #include "index/index_type.hpp"
-#include "utils/metric_type.hpp"
 #include "utils/quantization_type.hpp"
+#include "utils/types.hpp"
 
 namespace py = pybind11;
 namespace alaya {

@@ -27,7 +27,7 @@
 #include "params.hpp"
 #include "space/raw_space.hpp"
 #include "space/sq8_space.hpp"
-#include "utils/metric_type.hpp"
+#include "utils/types.hpp"
 
 #include "client.hpp"
 #include "index.hpp"

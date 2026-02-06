@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "utils/metric_type.hpp"
+#include "utils/types.hpp"
 #include <gtest/gtest.h>
 #include <string_view>
 

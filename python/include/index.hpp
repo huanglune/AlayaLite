@@ -50,7 +50,6 @@
 #include "space/sq4_space.hpp"
 #include "space/sq8_space.hpp"
 #include "utils/log.hpp"
-#include "utils/metric_type.hpp"
 #include "utils/types.hpp"
 
 namespace py = pybind11;
