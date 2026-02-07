@@ -27,6 +27,7 @@ namespace alaya {
 
 template <typename DistanceType, typename IDType>
 struct CandidateList {
+  using SearchResultType = ::alaya::SearchResult<IDType, DistanceType>;
   CandidateList(IDType n, int capacity)
       : nb_(n), capacity_(capacity), data_(capacity_ + 1), vis_(n) {}
 
@@ -98,6 +99,24 @@ struct CandidateList {
   void set_checked(IDType &id) { id |= 1 << 31; }
   auto is_checked(IDType id) -> bool { return (id >> 31 & 1) != 0; }
   auto is_full() -> bool { return size_ == capacity_; }
+  auto to_search_result(size_t topk = static_cast<size_t>(-1)) -> SearchResultType {
+    size_t effective_topk = (topk == static_cast<size_t>(-1)) ? size_ : topk;
+    SearchResultType result(effective_topk);
+
+    size_t actual = std::min(size_, effective_topk);
+    for (size_t i = 0; i < actual; ++i) {
+      result.ids_.emplace_back(get_id(data_[i].id_));
+      result.distances_.emplace_back(data_[i].distance_);
+    }
+
+    if (actual < effective_topk) {
+      result.ids_.insert(result.ids_.end(), effective_topk - actual, static_cast<IDType>(-1));
+      result.distances_.insert(result.distances_.end(),
+                               effective_topk - actual,
+                               std::numeric_limits<DistanceType>::max());
+    }
+    return result;
+  }
 
   size_t nb_, size_ = 0, cur_ = 0, capacity_;
   std::vector<Neighbor<IDType, DistanceType>, AlignedAlloc<Neighbor<IDType, DistanceType>>> data_;

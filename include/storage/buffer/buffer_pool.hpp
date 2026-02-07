@@ -77,6 +77,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <queue>
 #include <vector>
 
@@ -86,461 +87,352 @@
 #include "storage/io/direct_file_io.hpp"
 #include "utils/hash_map.hpp"
 #include "utils/locks.hpp"
+#include "utils/macros.hpp"
 #include "utils/memory.hpp"
 
 namespace alaya {
-
-/**
- * @brief Statistics for buffer pool monitoring.
- */
 struct BufferPoolStats {
-  std::atomic<uint64_t> hits_{0};       ///< Cache hits
-  std::atomic<uint64_t> misses_{0};     ///< Cache misses
-  std::atomic<uint64_t> evictions_{0};  ///< Pages evicted
+  std::atomic<uint64_t> hits_{0};
+  std::atomic<uint64_t> misses_{0};
+  std::atomic<uint64_t> evictions_{0};
+  std::atomic<uint64_t> pins_{0};
 
-  BufferPoolStats() = default;
-
-  // Copy constructor - manually copy atomic values
-  BufferPoolStats(const BufferPoolStats &other)
-      : hits_(other.hits_.load(std::memory_order_relaxed)),
-        misses_(other.misses_.load(std::memory_order_relaxed)),
-        evictions_(other.evictions_.load(std::memory_order_relaxed)) {}
-
-  // Copy assignment - manually copy atomic values
-  auto operator=(const BufferPoolStats &other) -> BufferPoolStats & {
-    if (this != &other) {
-      hits_.store(other.hits_.load(std::memory_order_relaxed), std::memory_order_relaxed);
-      misses_.store(other.misses_.load(std::memory_order_relaxed), std::memory_order_relaxed);
-      evictions_.store(other.evictions_.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    }
-    return *this;
-  }
-
-  /**
-   * @brief Calculate cache hit rate.
-   * @return Hit rate as a value between 0.0 and 1.0
-   */
-  [[nodiscard]] auto hit_rate() const -> double {
-    uint64_t total =
-        hits_.load(std::memory_order_relaxed) + misses_.load(std::memory_order_relaxed);
-    return total > 0 ? static_cast<double>(hits_.load(std::memory_order_relaxed)) /
-                           static_cast<double>(total)
-                     : 0.0;
-  }
-
-  /**
-   * @brief Reset all statistics counters.
-   */
   void reset() {
-    hits_.store(0, std::memory_order_relaxed);
-    misses_.store(0, std::memory_order_relaxed);
-    evictions_.store(0, std::memory_order_relaxed);
-  }
-
-  /**
-   * @brief Get total number of accesses.
-   */
-  [[nodiscard]] auto total_accesses() const -> uint64_t {
-    return hits_.load(std::memory_order_relaxed) + misses_.load(std::memory_order_relaxed);
+    hits_ = 0;
+    misses_ = 0;
+    evictions_ = 0;
+    pins_ = 0;
   }
 };
 
-/**
- * @brief A buffer pool for caching disk nodes with pluggable replacement policy.
- *
- * This buffer pool caches aligned disk pages identified by node ID.
- * It uses a pluggable Replacer (via C++20 concepts) for eviction policy.
- *
- * Key Features:
- * - Aligned buffers for Direct I/O compatibility
- * - Pluggable replacement policy (LRU, CLOCK, etc.) via concepts
- * - Thread-safe with shared/exclusive locking
- * - Configurable capacity
- * - Hit/miss statistics for tuning
- *
- * @tparam IDType The node ID type (default: uint32_t)
- * @tparam ReplacerType The replacement policy type (must satisfy Replacer concept, default:
- * LRUReplacer)
- */
-template <typename IDType = uint32_t, Replacer ReplacerType = LRUReplacer>
+template <typename IDType = uint32_t, ReplacerStrategy ReplacerType = LRUReplacer>
 class BufferPool {
+ private:
+  class Shard;
+
  public:
   /**
-   * @brief Internal frame structure holding a cached page.
+   * @brief PageHandle (RAII Smart Pointer)
+   * * User-held handles.
+   * - Constructed: represents a pinned page (ref count +1), ensuring it won't be evicted.
+   * - Destructed: automatically unpins (ref count -1), allowing eviction.
+   * - Move semantics: supports move, copy is disabled.
    */
-  struct Frame {
-    IDType node_id_{static_cast<IDType>(-1)};  ///< Node ID (or -1 if empty)
-    bool is_valid_{false};                     ///< Whether frame contains valid data
-    uint8_t *data_{nullptr};                   ///< Pointer to aligned buffer data
+  class PageHandle {
+    friend class Shard;
+
+   public:
+    PageHandle() = default;
+
+    PageHandle(PageHandle &&other) noexcept
+        : shard_(other.shard_),
+          frame_idx_(other.frame_idx_),
+          data_ptr_(other.data_ptr_),
+          size_(other.size_) {
+      other.shard_ = nullptr;
+      other.data_ptr_ = nullptr;
+    }
+
+    auto operator=(PageHandle &&other) noexcept -> PageHandle & {
+      if (this != &other) {
+        reset();
+        shard_ = other.shard_;
+        frame_idx_ = other.frame_idx_;
+        data_ptr_ = other.data_ptr_;
+        size_ = other.size_;
+
+        other.shard_ = nullptr;
+        other.data_ptr_ = nullptr;
+      }
+      return *this;
+    }
+
+    ALAYA_NON_COPYABLE(PageHandle);
+    ~PageHandle() { reset(); }
+
+    // Accessors
+    [[nodiscard]] auto data() const -> const uint8_t * { return data_ptr_; }
+    [[nodiscard]] auto mutable_data() -> uint8_t * { return data_ptr_; }
+    [[nodiscard]] auto size() const -> size_t { return size_; }
+    [[nodiscard]] auto empty() const -> bool { return data_ptr_ == nullptr; }
+
+    //  View
+    [[nodiscard]] auto view() const -> std::span<const uint8_t> { return {data_ptr_, size_}; }
+
+   private:
+    // only Shard can construct PageHandles
+    PageHandle(Shard *shard, size_t frame_idx, uint8_t *data, size_t size)
+        : shard_(shard), frame_idx_(frame_idx), data_ptr_(data), size_(size) {}
+
+    void reset();  // defined after Shard
+
+    Shard *shard_{nullptr};
+    size_t frame_idx_{0};
+    uint8_t *data_ptr_{nullptr};
+    size_t size_{0};
   };
 
- private:
-  // Memory pool: pre-allocated aligned buffer for all frames
-  AlignedBuffer buffer_pool_;
+  // -----------------------------------------------------------------------
 
-  // Frame metadata array
-  std::vector<Frame> frames_;
-
-  // Hash map: node_id -> frame_index (using high-performance hash map if available)
-  fast::map<IDType, size_t> page_table_;
-
-  // Free list: frames that have not been used yet
-  std::queue<size_t> free_list_;
-
-  // Configuration
-  size_t capacity_{0};      ///< Maximum number of frames
-  size_t frame_size_{0};    ///< Size of each frame in bytes
-  size_t current_size_{0};  ///< Current number of valid frames
-
-  // Replacement policy (compile-time polymorphism via concepts)
-  ReplacerType replacer_;
-
-  // Thread safety using existing SharedLock
-  mutable SharedLock lock_;
-
-  // Statistics (atomic for lock-free access)
-  BufferPoolStats stats_;
-
- public:
-  /**
-   * @brief Construct a buffer pool.
-   *
-   * @param capacity Maximum number of nodes to cache
-   * @param frame_size Size of each frame in bytes (should be aligned)
-   */
-  BufferPool(size_t capacity, size_t frame_size)
-      : capacity_(capacity), frame_size_(frame_size), current_size_(0), replacer_(capacity) {
-    if (capacity_ == 0 || frame_size_ == 0) {
+  BufferPool(size_t capacity, size_t frame_size, size_t num_shards = 16)
+      : total_capacity_(capacity), frame_size_(frame_size), num_shards_(num_shards) {
+    if (num_shards_ == 0) {
+      num_shards_ = 1;
+    }
+    if (total_capacity_ == 0) {
       return;
     }
 
-    // Pre-allocate aligned buffer for all frames
-    buffer_pool_.resize(capacity_ * frame_size_);
+    // 1. Allocate a large contiguous memory block (Huge Page Friendly)
+    size_t total_bytes = total_capacity_ * frame_size_;
+    memory_blob_.resize(total_bytes);
 
-    // Initialize frames array
-    frames_.resize(capacity_);
-    for (size_t i = 0; i < capacity_; ++i) {
-      frames_[i].data_ = buffer_pool_.data() + i * frame_size_;
-      frames_[i].is_valid_ = false;
-      frames_[i].node_id_ = static_cast<IDType>(-1);
-      // Add to free list
-      free_list_.push(i);
+    // 2. Initialize shards
+    size_t cap_per_shard = (total_capacity_ + num_shards_ - 1) / num_shards_;
+    shards_.reserve(num_shards_);
+
+    for (size_t i = 0; i < num_shards_; ++i) {
+      size_t actual_cap = cap_per_shard;
+      // Adjust the size of the last shard
+      if (i == num_shards_ - 1) {
+        actual_cap = total_capacity_ - (cap_per_shard * (num_shards_ - 1));
+      }
+
+      uint8_t *shard_base = memory_blob_.data() + (i * cap_per_shard * frame_size_);
+      shards_.emplace_back(std::make_unique<Shard>(i, actual_cap, frame_size_, shard_base, stats_));
     }
-
-    page_table_.reserve(capacity_);
   }
 
-  /// Default constructor creates an empty, unusable pool
-  BufferPool() = default;
+  // Once created, the address must be fixed.
+  ALAYA_NON_COPYABLE(BufferPool);
 
-  /// Destructor
-  ~BufferPool() = default;
+  /**
+   * @brief Get a page. Returns an empty Handle if not cached.
+   */
+  auto get(IDType node_id) -> PageHandle { return get_shard(node_id).get_page(node_id); }
 
-  // Non-copyable
-  BufferPool(const BufferPool &) = delete;
-  auto operator=(const BufferPool &) -> BufferPool & = delete;
+  /**
+   * @brief Insert a pre-read page into the cache (no disk I/O).
+   *
+   * Used by batch prefetch: data is already read via io_uring batch submission,
+   * so we only need to copy it into a cache frame.
+   *
+   * @param node_id Cache key (e.g., block_id)
+   * @param data Source buffer (frame_size_ bytes, already read from disk)
+   * @return PageHandle pinning the inserted page
+   */
+  auto put(IDType node_id, const uint8_t *data) -> PageHandle {
+    return get_shard(node_id).insert_page(node_id, data);
+  }
 
-  // Movable
-  BufferPool(BufferPool &&other) noexcept
-      : buffer_pool_(std::move(other.buffer_pool_)),
-        frames_(std::move(other.frames_)),
-        page_table_(std::move(other.page_table_)),
-        free_list_(std::move(other.free_list_)),
-        capacity_(other.capacity_),
-        frame_size_(other.frame_size_),
-        current_size_(other.current_size_),
-        replacer_(std::move(other.replacer_)) {
-    // Fix data pointers after move
-    if (capacity_ > 0) {
-      for (size_t i = 0; i < capacity_; ++i) {
-        frames_[i].data_ = buffer_pool_.data() + i * frame_size_;
+  /**
+   * @brief Core interface: get or read a page.
+   * 1. Try to get from cache.
+   * 2. If Miss, read from disk into temp_buffer.
+   * 3. Insert temp_buffer into cache and return Handle.
+   */
+  auto get_or_read(IDType node_id, DirectFileIO &io, uint64_t offset, uint8_t *temp_buffer)
+      -> PageHandle {
+    Shard &shard = get_shard(node_id);
+
+    // 1. Fast Path: Cache Hit
+    {
+      auto handle = shard.get_page(node_id);
+      if (!handle.empty()) {
+        return handle;
       }
     }
-    other.capacity_ = 0;
-    other.current_size_ = 0;
+
+    // 2. Cache Miss: Read IO (lock-free IO)
+    // Note: temp_buffer must be an externally provided thread-local buffer to avoid allocation
+    stats_.misses_.fetch_add(1, std::memory_order_relaxed);
+    auto bytes = io.read(reinterpret_cast<char *>(temp_buffer), frame_size_, offset);
+    if (bytes != static_cast<ssize_t>(frame_size_)) {
+      return {};  // Read failed
+    }
+
+    // 3. Insert into Cache
+    // Race condition may occur: two threads read, whoever inserts later wins, or shard does
+    // deduplication internally
+    return shard.insert_page(node_id, temp_buffer);
   }
 
-  auto operator=(BufferPool &&other) noexcept -> BufferPool & {
-    if (this != &other) {
-      buffer_pool_ = std::move(other.buffer_pool_);
-      frames_ = std::move(other.frames_);
-      page_table_ = std::move(other.page_table_);
-      free_list_ = std::move(other.free_list_);
-      replacer_ = std::move(other.replacer_);
-      capacity_ = other.capacity_;
-      frame_size_ = other.frame_size_;
-      current_size_ = other.current_size_;
+  void clear() {
+    for (auto &s : shards_) {
+      s->clear();
+    }
+    stats_.reset();
+  }
 
-      // Fix data pointers after move
-      if (capacity_ > 0) {
-        for (size_t i = 0; i < capacity_; ++i) {
-          frames_[i].data_ = buffer_pool_.data() + i * frame_size_;
+  auto stats() const -> const BufferPoolStats & { return stats_; }
+
+ private:
+  // -----------------------------------------------------------------------
+  // Shard Implementation
+  // -----------------------------------------------------------------------
+  class Shard {
+   public:
+    struct Frame {
+      IDType node_id_{static_cast<IDType>(-1)};
+      uint8_t *data_{nullptr};
+      bool is_valid_{false};
+      uint32_t pin_count_{0};
+    };
+
+    Shard(size_t id, size_t cap, size_t fsize, const uint8_t *base, BufferPoolStats &stats)
+        : shard_id_(id), capacity_(cap), frame_size_(fsize), stats_ref_(stats) {
+      frames_.resize(capacity_);
+      for (size_t i = 0; i < capacity_; ++i) {
+        frames_[i].data_ = const_cast<uint8_t *>(base + (i * frame_size_));
+        free_list_.push(i);
+      }
+      page_table_.reserve(capacity_);
+    }
+
+    // try to get page and pin it
+    auto get_page(IDType node_id) -> PageHandle {
+      std::lock_guard<SpinLock> guard(lock_);
+
+      auto it = page_table_.find(node_id);
+      if (it == page_table_.end()) {
+        return {};
+      }
+
+      size_t frame_idx = it->second;
+      Frame &frame = frames_[frame_idx];
+
+      if (frame.pin_count_ == 0) {
+        replacer_.pin(frame_idx);
+      }
+      frame.pin_count_++;
+
+      stats_ref_.hits_.fetch_add(1, std::memory_order_relaxed);
+      return PageHandle(this, frame_idx, frame.data_, frame_size_);
+    }
+
+    auto insert_page(IDType node_id, const uint8_t *source_data) -> PageHandle {
+      std::lock_guard<SpinLock> guard(lock_);
+
+      // check again if another thread inserted it during IO
+      if (auto it = page_table_.find(node_id); it != page_table_.end()) {
+        size_t idx = it->second;
+        Frame &frame = frames_[idx];
+
+        if (frame.pin_count_ == 0) {
+          replacer_.pin(idx);
+        }
+        frame.pin_count_++;
+
+        // Optional: overwrite data? Usually not needed, assuming disk data is immutable or version
+        // control is handled by upper layers
+        return PageHandle(this, idx, frame.data_, frame_size_);
+      }
+
+      // mallocate new frame or evict existing one
+      size_t frame_idx;
+      if (!free_list_.empty()) {
+        frame_idx = free_list_.front();
+        free_list_.pop();
+      } else {
+        auto victim = replacer_.evict();
+        if (!victim) {
+          // Cache is full and all pages are pinned! This is an edge case of system overload.
+          return {};
+        }
+        frame_idx = *victim;
+
+        // Clean up victim
+        Frame &vic_frame = frames_[frame_idx];
+        if (vic_frame.is_valid_) {
+          page_table_.erase(vic_frame.node_id_);
+          stats_ref_.evictions_.fetch_add(1, std::memory_order_relaxed);
         }
       }
-      other.capacity_ = 0;
-      other.current_size_ = 0;
-    }
-    return *this;
-  }
 
-  /**
-   * @brief Try to get a cached node.
-   *
-   * If the node is in the cache, returns pointer to the data and updates
-   * the replacement policy (e.g., moves to front for LRU).
-   *
-   * @param node_id The node ID to look up
-   * @return Pointer to cached data, or nullptr if not cached
-   */
-  [[nodiscard]] auto get(IDType node_id) -> const uint8_t * {
-    lock_.lock_shared();
+      // 3. fill frame
+      Frame &frame = frames_[frame_idx];
+      frame.node_id_ = node_id;
+      frame.is_valid_ = true;
+      frame.pin_count_ = 1;
+      std::memcpy(frame.data_, source_data, frame_size_);
 
-    auto it = page_table_.find(node_id);
-    if (it == page_table_.end()) {
-      lock_.unlock_shared();
-      stats_.misses_.fetch_add(1, std::memory_order_relaxed);
-      return nullptr;
+      page_table_[node_id] = frame_idx;
+      replacer_.pin(frame_idx);
+
+      return PageHandle(this, frame_idx, frame.data_, frame_size_);
     }
 
-    size_t frame_idx = it->second;
-    Frame *frame = &frames_[frame_idx];
-    if (!frame->is_valid_) {
-      lock_.unlock_shared();
-      stats_.misses_.fetch_add(1, std::memory_order_relaxed);
-      return nullptr;
-    }
+    // only called by PageHandle destructor
+    void unpin_page(size_t frame_idx) {
+      std::lock_guard<SpinLock> guard(lock_);
+      Frame &frame = frames_[frame_idx];
 
-    // Found in cache - need to update replacement policy
-    // Upgrade to exclusive lock
-    lock_.unlock_shared();
-    lock_.lock();
-
-    // Re-verify after lock upgrade (another thread might have evicted)
-    it = page_table_.find(node_id);
-    if (it == page_table_.end() || !frames_[it->second].is_valid_) {
-      lock_.unlock();
-      stats_.misses_.fetch_add(1, std::memory_order_relaxed);
-      return nullptr;
-    }
-
-    frame_idx = it->second;
-    frame = &frames_[frame_idx];
-
-    // Update replacement policy: unpin to mark as accessed (moves to front for LRU)
-    replacer_.unpin(frame_idx);
-
-    const uint8_t *data = frame->data_;
-    lock_.unlock();
-    stats_.hits_.fetch_add(1, std::memory_order_relaxed);
-    return data;
-  }
-
-  /**
-   * @brief Put a node into the cache.
-   *
-   * If the cache is full, evicts a frame using the replacement policy.
-   * The caller must provide a pre-read buffer; this method copies
-   * the data into the cache.
-   *
-   * @param node_id The node ID
-   * @param data Pointer to the node data to cache (must be frame_size bytes)
-   * @return Pointer to the cached copy
-   */
-  auto put(IDType node_id, const uint8_t *data) -> const uint8_t * {
-    if (capacity_ == 0 || data == nullptr) {
-      return nullptr;
-    }
-
-    lock_.lock();
-
-    // Check if already cached
-    auto it = page_table_.find(node_id);
-    if (it != page_table_.end() && frames_[it->second].is_valid_) {
-      size_t frame_idx = it->second;
-      // Update replacement policy
-      replacer_.unpin(frame_idx);
-      const uint8_t *cached_data = frames_[frame_idx].data_;
-      lock_.unlock();
-      return cached_data;
-    }
-
-    // Get a frame: prefer free list, then evict
-    size_t frame_idx;
-    if (!free_list_.empty()) {
-      frame_idx = free_list_.front();
-      free_list_.pop();
-    } else {
-      // Evict using replacement policy
-      auto victim_opt = replacer_.evict();
-      if (!victim_opt.has_value()) {
-        // No evictable frame available
-        lock_.unlock();
-        return nullptr;
-      }
-      frame_idx = victim_opt.value();
-
-      // Remove victim from page table
-      Frame *victim = &frames_[frame_idx];
-      if (victim->is_valid_) {
-        page_table_.erase(victim->node_id_);
-        stats_.evictions_.fetch_add(1, std::memory_order_relaxed);
-        current_size_--;
+      if (frame.pin_count_ > 0) {
+        frame.pin_count_--;
+        if (frame.pin_count_ == 0) {
+          replacer_.unpin(frame_idx);
+        }
       }
     }
 
-    // Update frame with new data
-    Frame *frame = &frames_[frame_idx];
-    frame->node_id_ = node_id;
-    frame->is_valid_ = true;
-    std::memcpy(frame->data_, data, frame_size_);
-
-    // Update page table
-    page_table_[node_id] = frame_idx;
-    current_size_++;
-
-    // Mark as evictable in replacement policy
-    replacer_.unpin(frame_idx);
-
-    const uint8_t *cached_data = frame->data_;
-    lock_.unlock();
-    return cached_data;
-  }
-
-  /**
-   * @brief Get a node from cache, or read from disk if not cached.
-   *
-   * This is the primary method for integration with DiskANNSearcher.
-   * It combines get() and put() in one operation, minimizing lock overhead.
-   *
-   * @param node_id The node ID
-   * @param reader The file reader for disk I/O
-   * @param node_offset The byte offset of the node in the file
-   * @param temp_buffer A temporary buffer for disk reads (must be aligned and >= frame_size)
-   * @return Pointer to the node data (either cached or freshly read)
-   */
-  auto get_or_read(IDType node_id, DirectFileIO &reader, uint64_t node_offset, uint8_t *temp_buffer)
-      -> const uint8_t * {
-    if (capacity_ == 0) {
-      // No caching - read directly into temp buffer
-      auto bytes = reader.read(temp_buffer, frame_size_, node_offset);
-      if (bytes != static_cast<ssize_t>(frame_size_)) {
-        return nullptr;
+    void clear() {
+      std::lock_guard<SpinLock> guard(lock_);
+      page_table_.clear();
+      replacer_.reset();
+      while (!free_list_.empty()) {
+        free_list_.pop();
       }
-      return temp_buffer;
-    }
-
-    // Fast path: check cache with shared lock
-    lock_.lock_shared();
-    auto it = page_table_.find(node_id);
-    if (it != page_table_.end() && frames_[it->second].is_valid_) {
-      size_t frame_idx = it->second;
-      lock_.unlock_shared();
-
-      // Update replacement policy with exclusive lock
-      lock_.lock();
-      // Re-verify
-      it = page_table_.find(node_id);
-      if (it != page_table_.end() && frames_[it->second].is_valid_) {
-        frame_idx = it->second;
-        replacer_.unpin(frame_idx);
-        const uint8_t *data = frames_[frame_idx].data_;
-        lock_.unlock();
-        stats_.hits_.fetch_add(1, std::memory_order_relaxed);
-        return data;
+      for (size_t i = 0; i < capacity_; ++i) {
+        frames_[i].is_valid_ = false;
+        frames_[i].pin_count_ = 0;
+        free_list_.push(i);
       }
-      lock_.unlock();
-      // Fall through to cache miss path
-    } else {
-      lock_.unlock_shared();
     }
 
-    // Cache miss - read from disk (outside lock to avoid blocking)
-    stats_.misses_.fetch_add(1, std::memory_order_relaxed);
-    auto bytes = reader.read(temp_buffer, frame_size_, node_offset);
-    if (bytes != static_cast<ssize_t>(frame_size_)) {
-      return nullptr;
-    }
+   private:
+    const size_t shard_id_;    // NOLINT
+    const size_t capacity_;    // NOLINT
+    const size_t frame_size_;  // NOLINT
 
-    // Insert into cache
-    return put(node_id, temp_buffer);
+    // aliasing to avoid False Sharing
+    alignas(64) SpinLock lock_;
+
+    std::vector<Frame> frames_;
+    fast::map<IDType, size_t> page_table_;
+    std::queue<size_t> free_list_;
+    ReplacerType replacer_{capacity_};
+
+    BufferPoolStats &stats_ref_;
+  };
+
+  auto get_shard(IDType node_id) -> Shard & {
+    size_t h = std::hash<IDType>{}(node_id);
+    return *shards_[h % num_shards_];
   }
 
-  /**
-   * @brief Clear all cached data.
-   */
-  void clear() {
-    lock_.lock();
+  // -----------------------------------------------------------------------
+  // Members
+  // -----------------------------------------------------------------------
+  size_t total_capacity_;
+  size_t frame_size_;
+  size_t num_shards_;
 
-    page_table_.clear();
-    current_size_ = 0;
-
-    // Reset replacer
-    replacer_.reset();
-
-    // Clear and rebuild free list
-    std::queue<size_t> empty_queue;
-    free_list_.swap(empty_queue);
-
-    // Invalidate all frames and add back to free list
-    for (size_t i = 0; i < capacity_; ++i) {
-      frames_[i].is_valid_ = false;
-      frames_[i].node_id_ = static_cast<IDType>(-1);
-      free_list_.push(i);
-    }
-
-    lock_.unlock();
-  }
-
-  /**
-   * @brief Get current number of cached frames.
-   */
-  [[nodiscard]] auto size() const -> size_t {
-    lock_.lock_shared();
-    size_t s = current_size_;
-    lock_.unlock_shared();
-    return s;
-  }
-
-  /**
-   * @brief Get maximum capacity.
-   */
-  [[nodiscard]] auto capacity() const -> size_t { return capacity_; }
-
-  /**
-   * @brief Get frame size in bytes.
-   */
-  [[nodiscard]] auto frame_size() const -> size_t { return frame_size_; }
-
-  /**
-   * @brief Get cache statistics.
-   */
-  [[nodiscard]] auto stats() const -> const BufferPoolStats & { return stats_; }
-
-  /**
-   * @brief Reset statistics counters.
-   */
-  void reset_stats() { stats_.reset(); }
-
-  /**
-   * @brief Check if a node is cached.
-   */
-  [[nodiscard]] auto contains(IDType node_id) const -> bool {
-    lock_.lock_shared();
-    auto it = page_table_.find(node_id);
-    bool found = (it != page_table_.end() && frames_[it->second].is_valid_);
-    lock_.unlock_shared();
-    return found;
-  }
-
-  /**
-   * @brief Check if the buffer pool is enabled (has capacity > 0).
-   */
-  [[nodiscard]] auto is_enabled() const -> bool { return capacity_ > 0; }
-
-  /**
-   * @brief Get the replacer for testing/introspection.
-   */
-  [[nodiscard]] auto get_replacer() const -> const ReplacerType & { return replacer_; }
+  AlignedBuffer memory_blob_;  // unified memory management
+  std::vector<std::unique_ptr<Shard>> shards_;
+  mutable BufferPoolStats stats_;
 };
+
+// -------------------------------------------------------------------------
+// PageHandle implementation
+// -------------------------------------------------------------------------
+template <typename IDType, ReplacerStrategy R>
+void BufferPool<IDType, R>::PageHandle::reset() {
+  if (shard_ && data_ptr_) {
+    shard_->unpin_page(frame_idx_);
+  }
+  shard_ = nullptr;
+  data_ptr_ = nullptr;
+  size_ = 0;
+}
 
 }  // namespace alaya

@@ -21,9 +21,15 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <thread>
 #include <vector>
+
+#include "utils/memory.hpp"
 
 namespace alaya {
 
@@ -49,14 +55,11 @@ TEST_F(LRUReplacerTest, DefaultConstruction) {
 TEST_F(LRUReplacerTest, UnpinAddsToEvictable) {
   LRUReplacer replacer(kCapacity);
 
-  // Initially empty
   EXPECT_EQ(replacer.size(), 0U);
 
-  // Unpin frame 0
   replacer.unpin(0);
   EXPECT_EQ(replacer.size(), 1U);
 
-  // Unpin frame 1
   replacer.unpin(1);
   EXPECT_EQ(replacer.size(), 2U);
 
@@ -168,7 +171,6 @@ TEST_F(LRUReplacerTest, Reset) {
   replacer.reset();
   EXPECT_EQ(replacer.size(), 0U);
 
-  // Evict should return nullopt
   auto victim = replacer.evict();
   EXPECT_FALSE(victim.has_value());
 }
@@ -216,448 +218,6 @@ TEST_F(LRUReplacerTest, SetCapacity) {
   replacer.unpin(0);
   replacer.unpin(1);
   EXPECT_EQ(replacer.size(), 2U);
-}
-
-// =============================================================================
-// BufferPool Unit Tests
-// =============================================================================
-
-class BufferPoolTest : public ::testing::Test {
- protected:
-  static constexpr size_t kFrameSize = 4096;  // 4KB frames
-  static constexpr size_t kCapacity = 10;
-};
-
-TEST_F(BufferPoolTest, Construction) {
-  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
-
-  EXPECT_EQ(pool.capacity(), kCapacity);
-  EXPECT_EQ(pool.frame_size(), kFrameSize);
-  EXPECT_EQ(pool.size(), 0U);
-  EXPECT_TRUE(pool.is_enabled());
-}
-
-TEST_F(BufferPoolTest, DefaultConstruction) {
-  BufferPool<uint32_t> pool;
-  EXPECT_EQ(pool.capacity(), 0U);
-  EXPECT_FALSE(pool.is_enabled());
-}
-
-TEST_F(BufferPoolTest, ZeroCapacity) {
-  BufferPool<uint32_t> pool(0, kFrameSize);
-  EXPECT_FALSE(pool.is_enabled());
-  EXPECT_EQ(pool.capacity(), 0U);
-}
-
-TEST_F(BufferPoolTest, ZeroFrameSize) {
-  BufferPool<uint32_t> pool(kCapacity, 0);
-  // Should be effectively disabled
-  EXPECT_EQ(pool.frame_size(), 0U);
-}
-
-TEST_F(BufferPoolTest, PutAndGet) {
-  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
-
-  // Create test data
-  std::vector<uint8_t> test_data(kFrameSize);
-  for (size_t i = 0; i < kFrameSize; ++i) {
-    test_data[i] = static_cast<uint8_t>(i % 256);
-  }
-
-  // Put data into cache
-  const uint8_t* cached = pool.put(42, test_data.data());
-  EXPECT_NE(cached, nullptr);
-  EXPECT_EQ(pool.size(), 1U);
-
-  // Get data back
-  const uint8_t* retrieved = pool.get(42);
-  EXPECT_NE(retrieved, nullptr);
-
-  // Verify data matches
-  for (size_t i = 0; i < kFrameSize; ++i) {
-    EXPECT_EQ(retrieved[i], test_data[i]);
-  }
-}
-
-TEST_F(BufferPoolTest, CacheMiss) {
-  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
-
-  // Try to get non-existent item
-  const uint8_t* result = pool.get(999);
-  EXPECT_EQ(result, nullptr);
-
-  auto stats = pool.stats();
-  EXPECT_EQ(stats.misses_.load(), 1U);
-  EXPECT_EQ(stats.hits_.load(), 0U);
-}
-
-TEST_F(BufferPoolTest, CacheHit) {
-  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
-
-  std::vector<uint8_t> data(kFrameSize, 0xAB);
-  pool.put(1, data.data());
-
-  // Should be a cache hit
-  const uint8_t* result = pool.get(1);
-  EXPECT_NE(result, nullptr);
-
-  auto stats = pool.stats();
-  EXPECT_EQ(stats.hits_.load(), 1U);
-  EXPECT_EQ(stats.misses_.load(), 0U);
-}
-
-TEST_F(BufferPoolTest, LRUEviction) {
-  BufferPool<uint32_t> pool(3, kFrameSize);  // Small capacity
-
-  std::vector<uint8_t> data(kFrameSize, 0);
-
-  // Fill the cache
-  for (uint32_t i = 0; i < 3; ++i) {
-    data[0] = static_cast<uint8_t>(i);
-    pool.put(i, data.data());
-  }
-  EXPECT_EQ(pool.size(), 3U);
-
-  // Access item 0 to make it recently used
-  (void)pool.get(0);
-
-  // Insert new item - should evict item 1 (LRU)
-  data[0] = 100;
-  pool.put(100, data.data());
-
-  // Item 0 should still be there (was accessed recently)
-  EXPECT_TRUE(pool.contains(0));
-  // Item 1 should be evicted (LRU)
-  EXPECT_FALSE(pool.contains(1));
-  // Item 2 should still be there
-  EXPECT_TRUE(pool.contains(2));
-  // New item should be there
-  EXPECT_TRUE(pool.contains(100));
-
-  auto stats = pool.stats();
-  EXPECT_GT(stats.evictions_.load(), 0U);
-}
-
-TEST_F(BufferPoolTest, PutDuplicate) {
-  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
-
-  std::vector<uint8_t> data1(kFrameSize, 0xAA);
-  std::vector<uint8_t> data2(kFrameSize, 0xBB);
-
-  // Put first data
-  pool.put(1, data1.data());
-  EXPECT_EQ(pool.size(), 1U);
-
-  // Put with same key - should update, not add
-  const uint8_t* cached = pool.put(1, data2.data());
-  EXPECT_NE(cached, nullptr);
-  EXPECT_EQ(pool.size(), 1U);
-
-  // Data should still be original (no overwrite on duplicate put)
-  const uint8_t* retrieved = pool.get(1);
-  EXPECT_EQ(retrieved[0], 0xAA);
-}
-
-TEST_F(BufferPoolTest, Contains) {
-  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
-
-  std::vector<uint8_t> data(kFrameSize, 0);
-
-  EXPECT_FALSE(pool.contains(1));
-
-  pool.put(1, data.data());
-  EXPECT_TRUE(pool.contains(1));
-  EXPECT_FALSE(pool.contains(2));
-}
-
-TEST_F(BufferPoolTest, Clear) {
-  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
-
-  std::vector<uint8_t> data(kFrameSize, 0);
-  for (uint32_t i = 0; i < 5; ++i) {
-    pool.put(i, data.data());
-  }
-  EXPECT_EQ(pool.size(), 5U);
-
-  pool.clear();
-  EXPECT_EQ(pool.size(), 0U);
-
-  // Items should no longer be found
-  for (uint32_t i = 0; i < 5; ++i) {
-    EXPECT_FALSE(pool.contains(i));
-  }
-}
-
-TEST_F(BufferPoolTest, Statistics) {
-  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
-
-  std::vector<uint8_t> data(kFrameSize, 0);
-  pool.put(1, data.data());
-
-  // Miss
-  (void)pool.get(999);
-  // Hit
-  (void)pool.get(1);
-  // Another hit
-  (void)pool.get(1);
-
-  auto stats = pool.stats();
-  EXPECT_EQ(stats.hits_.load(), 2U);
-  EXPECT_EQ(stats.misses_.load(), 1U);
-  EXPECT_DOUBLE_EQ(stats.hit_rate(), 2.0 / 3.0);
-
-  // Reset stats
-  pool.reset_stats();
-  stats = pool.stats();
-  EXPECT_EQ(stats.hits_.load(), 0U);
-  EXPECT_EQ(stats.misses_.load(), 0U);
-}
-
-TEST_F(BufferPoolTest, MoveConstruction) {
-  BufferPool<uint32_t> pool1(kCapacity, kFrameSize);
-
-  std::vector<uint8_t> data(kFrameSize);
-  for (size_t i = 0; i < kFrameSize; ++i) {
-    data[i] = static_cast<uint8_t>(i % 256);
-  }
-  pool1.put(42, data.data());
-  pool1.put(43, data.data());
-
-  BufferPool<uint32_t> pool2(std::move(pool1));
-  EXPECT_EQ(pool2.size(), 2U);
-  EXPECT_TRUE(pool2.contains(42));
-  EXPECT_TRUE(pool2.contains(43));
-
-  // Verify data integrity after move
-  const uint8_t* retrieved = pool2.get(42);
-  EXPECT_NE(retrieved, nullptr);
-  for (size_t i = 0; i < kFrameSize; ++i) {
-    EXPECT_EQ(retrieved[i], data[i]);
-  }
-}
-
-TEST_F(BufferPoolTest, MoveAssignment) {
-  BufferPool<uint32_t> pool1(kCapacity, kFrameSize);
-
-  std::vector<uint8_t> data(kFrameSize, 0xCD);
-  pool1.put(1, data.data());
-
-  BufferPool<uint32_t> pool2;
-  pool2 = std::move(pool1);
-
-  EXPECT_EQ(pool2.size(), 1U);
-  EXPECT_TRUE(pool2.contains(1));
-}
-
-TEST_F(BufferPoolTest, PutNullData) {
-  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
-
-  const uint8_t* result = pool.put(1, nullptr);
-  EXPECT_EQ(result, nullptr);
-  EXPECT_EQ(pool.size(), 0U);
-}
-
-TEST_F(BufferPoolTest, GetReplacer) {
-  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
-
-  std::vector<uint8_t> data(kFrameSize, 0);
-  pool.put(1, data.data());
-  pool.put(2, data.data());
-
-  const auto& replacer = pool.get_replacer();
-  // Replacer should track evictable frames
-  EXPECT_GE(replacer.size(), 0U);
-}
-
-// =============================================================================
-// BufferPoolStats Unit Tests
-// =============================================================================
-
-class BufferPoolStatsTest : public ::testing::Test {};
-
-TEST_F(BufferPoolStatsTest, DefaultConstruction) {
-  BufferPoolStats stats;
-  EXPECT_EQ(stats.hits_.load(), 0U);
-  EXPECT_EQ(stats.misses_.load(), 0U);
-  EXPECT_EQ(stats.evictions_.load(), 0U);
-}
-
-TEST_F(BufferPoolStatsTest, HitRate) {
-  BufferPoolStats stats;
-
-  // No accesses - hit rate should be 0
-  EXPECT_DOUBLE_EQ(stats.hit_rate(), 0.0);
-
-  stats.hits_.store(3);
-  stats.misses_.store(1);
-  EXPECT_DOUBLE_EQ(stats.hit_rate(), 0.75);
-}
-
-TEST_F(BufferPoolStatsTest, TotalAccesses) {
-  BufferPoolStats stats;
-  stats.hits_.store(10);
-  stats.misses_.store(5);
-
-  EXPECT_EQ(stats.total_accesses(), 15U);
-}
-
-TEST_F(BufferPoolStatsTest, Reset) {
-  BufferPoolStats stats;
-  stats.hits_.store(10);
-  stats.misses_.store(5);
-  stats.evictions_.store(2);
-
-  stats.reset();
-
-  EXPECT_EQ(stats.hits_.load(), 0U);
-  EXPECT_EQ(stats.misses_.load(), 0U);
-  EXPECT_EQ(stats.evictions_.load(), 0U);
-}
-
-TEST_F(BufferPoolStatsTest, CopyConstruction) {
-  BufferPoolStats stats1;
-  stats1.hits_.store(10);
-  stats1.misses_.store(5);
-  stats1.evictions_.store(2);
-
-  BufferPoolStats stats2(stats1);
-
-  EXPECT_EQ(stats2.hits_.load(), 10U);
-  EXPECT_EQ(stats2.misses_.load(), 5U);
-  EXPECT_EQ(stats2.evictions_.load(), 2U);
-}
-
-TEST_F(BufferPoolStatsTest, CopyAssignment) {
-  BufferPoolStats stats1;
-  stats1.hits_.store(10);
-  stats1.misses_.store(5);
-
-  BufferPoolStats stats2;
-  stats2 = stats1;
-
-  EXPECT_EQ(stats2.hits_.load(), 10U);
-  EXPECT_EQ(stats2.misses_.load(), 5U);
-}
-
-// =============================================================================
-// Thread Safety Tests
-// =============================================================================
-
-class BufferPoolThreadTest : public ::testing::Test {
- protected:
-  static constexpr size_t kFrameSize = 1024;
-  static constexpr size_t kCapacity = 100;
-};
-
-TEST_F(BufferPoolThreadTest, ConcurrentPut) {
-  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
-
-  constexpr int kNumThreads = 4;
-  constexpr int kOpsPerThread = 50;
-
-  std::vector<std::thread> threads;
-
-  threads.reserve(kNumThreads);
-for (int t = 0; t < kNumThreads; ++t) {
-    threads.emplace_back([&pool, t]() -> void {
-      std::vector<uint8_t> data(kFrameSize);
-      for (int i = 0; i < kOpsPerThread; ++i) {
-        auto id = static_cast<uint32_t>(t * kOpsPerThread + i);
-        data[0] = static_cast<uint8_t>(id % 256);
-        pool.put(id, data.data());
-      }
-    });
-  }
-
-  for (auto& thread : threads) {
-    thread.join();
-  }
-
-  // Pool should have some items (may be less than total due to evictions)
-  EXPECT_GT(pool.size(), 0U);
-  EXPECT_LE(pool.size(), kCapacity);
-}
-
-TEST_F(BufferPoolThreadTest, ConcurrentGetPut) {
-  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
-
-  // Pre-populate
-  std::vector<uint8_t> init_data(kFrameSize, 0xFF);
-  for (uint32_t i = 0; i < 50; ++i) {
-    pool.put(i, init_data.data());
-  }
-
-  constexpr int kNumThreads = 4;
-  constexpr int kOpsPerThread = 100;
-
-  std::atomic<int> hit_count{0};
-  std::atomic<int> miss_count{0};
-
-  std::vector<std::thread> threads;
-
-  threads.reserve(kNumThreads);
-for (int t = 0; t < kNumThreads; ++t) {
-    threads.emplace_back([&pool, &hit_count, &miss_count, t]() -> void {
-      std::vector<uint8_t> data(kFrameSize);
-      for (int i = 0; i < kOpsPerThread; ++i) {
-        auto id = static_cast<uint32_t>((t * kOpsPerThread + i) % 200);
-
-        if (i % 2 == 0) {
-          // Get operation
-          const uint8_t* result = pool.get(id);
-          if (result != nullptr) {
-            hit_count.fetch_add(1);
-          } else {
-            miss_count.fetch_add(1);
-          }
-        } else {
-          // Put operation
-          data[0] = static_cast<uint8_t>(id % 256);
-          pool.put(id, data.data());
-        }
-      }
-    });
-  }
-
-  for (auto& thread : threads) {
-    thread.join();
-  }
-
-  // Should have had some operations
-  EXPECT_GT(hit_count.load() + miss_count.load(), 0);
-}
-
-TEST_F(BufferPoolThreadTest, ConcurrentClear) {
-  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
-
-  std::atomic<bool> done{false};
-
-  // Writer thread
-  std::thread writer([&pool, &done]() -> void {
-    std::vector<uint8_t> data(kFrameSize, 0xAB);
-    uint32_t id = 0;
-    while (!done.load()) {
-      pool.put(id++, data.data());
-      if (id >= 1000) {
-        id = 0;
-      }
-    }
-  });
-
-  // Clear thread
-  std::thread clearer([&pool, &done]() -> void {
-    for (int i = 0; i < 10; ++i) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      pool.clear();
-    }
-    done.store(true);
-  });
-
-  writer.join();
-  clearer.join();
-
-  // Should complete without crash
-  EXPECT_LE(pool.size(), kCapacity);
 }
 
 // =============================================================================
@@ -936,87 +496,593 @@ TEST_F(ClockProReplacerTest, SetCapacity) {
 }
 
 // =============================================================================
-// BufferPool with Different Replacers Tests
+// BufferPoolStats Unit Tests
 // =============================================================================
 
-class BufferPoolWithClockTest : public ::testing::Test {
+class BufferPoolStatsTest : public ::testing::Test {};
+
+TEST_F(BufferPoolStatsTest, DefaultConstruction) {
+  BufferPoolStats stats;
+  EXPECT_EQ(stats.hits_.load(), 0U);
+  EXPECT_EQ(stats.misses_.load(), 0U);
+  EXPECT_EQ(stats.evictions_.load(), 0U);
+  EXPECT_EQ(stats.pins_.load(), 0U);
+}
+
+TEST_F(BufferPoolStatsTest, Reset) {
+  BufferPoolStats stats;
+  stats.hits_.store(10);
+  stats.misses_.store(5);
+  stats.evictions_.store(2);
+  stats.pins_.store(3);
+
+  stats.reset();
+
+  EXPECT_EQ(stats.hits_.load(), 0U);
+  EXPECT_EQ(stats.misses_.load(), 0U);
+  EXPECT_EQ(stats.evictions_.load(), 0U);
+  EXPECT_EQ(stats.pins_.load(), 0U);
+}
+
+// =============================================================================
+// BufferPool Unit Tests (with LRU replacer, default)
+// =============================================================================
+
+class BufferPoolTest : public ::testing::Test {
  protected:
   static constexpr size_t kFrameSize = 4096;
+  static constexpr size_t kNumPages = 20;
   static constexpr size_t kCapacity = 10;
+
+  std::string test_file_;
+
+  void SetUp() override {
+    test_file_ = "/tmp/buffer_pool_test_" +
+                 std::to_string(::testing::UnitTest::GetInstance()->random_seed()) + ".bin";
+    create_test_file();
+  }
+
+  void TearDown() override {
+    if (std::filesystem::exists(test_file_)) {
+      std::filesystem::remove(test_file_);
+    }
+  }
+
+  // Create a test file with kNumPages pages.
+  // Each page is filled with its page index (page 0 -> all 0x00, page 3 -> all 0x03, etc.)
+  void create_test_file() {
+    size_t total_size = kFrameSize * kNumPages;
+    AlignedBuffer buf(total_size);
+    for (size_t i = 0; i < kNumPages; ++i) {
+      std::memset(buf.data() + i * kFrameSize, static_cast<int>(i & 0xFF), kFrameSize);
+    }
+    std::ofstream ofs(test_file_, std::ios::binary);
+    ofs.write(reinterpret_cast<const char *>(buf.data()),
+              static_cast<std::streamsize>(total_size));
+    ofs.close();
+  }
 };
 
-TEST_F(BufferPoolWithClockTest, BasicOperations) {
-  BufferPool<uint32_t, ClockReplacer> pool(kCapacity, kFrameSize);
+TEST_F(BufferPoolTest, Construction) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 2);
 
-  std::vector<uint8_t> data(kFrameSize, 0xAB);
-
-  pool.put(1, data.data());
-  EXPECT_EQ(pool.size(), 1U);
-
-  const uint8_t* result = pool.get(1);
-  EXPECT_NE(result, nullptr);
-  EXPECT_EQ(result[0], 0xAB);
+  EXPECT_EQ(pool.stats().hits_.load(), 0U);
+  EXPECT_EQ(pool.stats().misses_.load(), 0U);
+  EXPECT_EQ(pool.stats().evictions_.load(), 0U);
 }
 
-TEST_F(BufferPoolWithClockTest, Eviction) {
-  BufferPool<uint32_t, ClockReplacer> pool(3, kFrameSize);
+TEST_F(BufferPoolTest, ZeroCapacity) {
+  BufferPool<uint32_t> pool(0, kFrameSize);
+  // Should construct without crash
+  EXPECT_EQ(pool.stats().hits_.load(), 0U);
+}
 
-  std::vector<uint8_t> data(kFrameSize, 0);
+TEST_F(BufferPoolTest, SingleShard) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 1);
+  EXPECT_EQ(pool.stats().hits_.load(), 0U);
+}
+
+TEST_F(BufferPoolTest, GetOnEmptyPoolReturnsEmptyHandle) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 2);
+
+  auto handle = pool.get(42);
+  EXPECT_TRUE(handle.empty());
+  EXPECT_EQ(handle.data(), nullptr);
+  EXPECT_EQ(handle.size(), 0U);
+}
+
+TEST_F(BufferPoolTest, GetOrReadCacheMiss) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  // Read page 0 - should be a cache miss then load from disk
+  auto handle = pool.get_or_read(0, io, 0, temp.data());
+  EXPECT_FALSE(handle.empty());
+  EXPECT_NE(handle.data(), nullptr);
+  EXPECT_EQ(handle.size(), kFrameSize);
+
+  // Page 0 is filled with 0x00
+  for (size_t i = 0; i < kFrameSize; ++i) {
+    EXPECT_EQ(handle.data()[i], 0x00);
+  }
+
+  EXPECT_EQ(pool.stats().misses_.load(), 1U);
+  EXPECT_EQ(pool.stats().hits_.load(), 0U);
+}
+
+TEST_F(BufferPoolTest, GetOrReadCacheHit) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  // First read - cache miss
+  {
+    auto handle = pool.get_or_read(0, io, 0, temp.data());
+    EXPECT_FALSE(handle.empty());
+  }  // handle released, page unpinned
+
+  // Second read - should be a cache hit (fast path in get_or_read)
+  auto handle = pool.get_or_read(0, io, 0, temp.data());
+  EXPECT_FALSE(handle.empty());
+  EXPECT_EQ(handle.data()[0], 0x00);
+
+  EXPECT_EQ(pool.stats().hits_.load(), 1U);
+  EXPECT_EQ(pool.stats().misses_.load(), 1U);
+}
+
+TEST_F(BufferPoolTest, GetAfterGetOrRead) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  // Load page 5 via get_or_read
+  {
+    auto handle = pool.get_or_read(5, io, 5 * kFrameSize, temp.data());
+    EXPECT_FALSE(handle.empty());
+  }
+
+  // get() should now find the cached page
+  auto handle = pool.get(5);
+  EXPECT_FALSE(handle.empty());
+  EXPECT_EQ(handle.data()[0], 5);
+
+  EXPECT_EQ(pool.stats().hits_.load(), 1U);
+}
+
+TEST_F(BufferPoolTest, MultiplePages) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  for (uint32_t i = 0; i < 5; ++i) {
+    auto handle = pool.get_or_read(i, io, i * kFrameSize, temp.data());
+    EXPECT_FALSE(handle.empty());
+    EXPECT_EQ(handle.data()[0], static_cast<uint8_t>(i));
+  }
+
+  EXPECT_EQ(pool.stats().misses_.load(), 5U);
+}
+
+TEST_F(BufferPoolTest, PageHandleDataIntegrity) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  auto handle = pool.get_or_read(7, io, 7 * kFrameSize, temp.data());
+  EXPECT_FALSE(handle.empty());
+
+  // Check via view()
+  auto span = handle.view();
+  EXPECT_EQ(span.size(), kFrameSize);
+  for (auto byte : span) {
+    EXPECT_EQ(byte, 7);
+  }
+}
+
+TEST_F(BufferPoolTest, PageHandleMutableData) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  auto handle = pool.get_or_read(1, io, kFrameSize, temp.data());
+  EXPECT_FALSE(handle.empty());
+
+  // Modify data through mutable_data
+  handle.mutable_data()[0] = 0xFF;
+  EXPECT_EQ(handle.data()[0], 0xFF);
+
+  // Re-fetch from cache - should see the modification
+  // First release current handle
+  auto *modified_ptr = handle.data();
+  {
+    // get() should return the same cached frame
+    auto handle2 = pool.get(1);
+    EXPECT_FALSE(handle2.empty());
+    EXPECT_EQ(handle2.data()[0], 0xFF);
+    // Should point to same underlying frame data
+    EXPECT_EQ(handle2.data(), modified_ptr);
+  }
+}
+
+TEST_F(BufferPoolTest, PageHandleDefaultEmpty) {
+  BufferPool<uint32_t>::PageHandle handle;
+  EXPECT_TRUE(handle.empty());
+  EXPECT_EQ(handle.data(), nullptr);
+  EXPECT_EQ(handle.size(), 0U);
+}
+
+TEST_F(BufferPoolTest, PageHandleMoveConstruction) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  auto handle1 = pool.get_or_read(2, io, 2 * kFrameSize, temp.data());
+  EXPECT_FALSE(handle1.empty());
+
+  auto handle2 = std::move(handle1);
+  EXPECT_TRUE(handle1.empty());   // NOLINT(bugprone-use-after-move)
+  EXPECT_FALSE(handle2.empty());
+  EXPECT_EQ(handle2.data()[0], 2);
+}
+
+TEST_F(BufferPoolTest, PageHandleMoveAssignment) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  auto handle1 = pool.get_or_read(3, io, 3 * kFrameSize, temp.data());
+  decltype(handle1) handle2;
+  EXPECT_TRUE(handle2.empty());
+
+  handle2 = std::move(handle1);
+  EXPECT_TRUE(handle1.empty());  // NOLINT(bugprone-use-after-move)
+  EXPECT_FALSE(handle2.empty());
+  EXPECT_EQ(handle2.data()[0], 3);
+}
+
+TEST_F(BufferPoolTest, PageHandleSelfMoveAssignment) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  auto handle = pool.get_or_read(4, io, 4 * kFrameSize, temp.data());
+  EXPECT_FALSE(handle.empty());
+
+  auto *self = &handle;
+  handle = std::move(*self);  // NOLINT(clang-diagnostic-self-move)
+  // Should survive self-move without crash
+  EXPECT_FALSE(handle.empty());
+}
+
+TEST_F(BufferPoolTest, Eviction) {
+  // Small pool: 3 frames, single shard for deterministic behavior
+  BufferPool<uint32_t> pool(3, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  // Fill the cache with pages 0, 1, 2
+  for (uint32_t i = 0; i < 3; ++i) {
+    auto handle = pool.get_or_read(i, io, i * kFrameSize, temp.data());
+    EXPECT_FALSE(handle.empty());
+  }
+
+  // Load page 3 - should trigger eviction of the LRU page
+  {
+    auto handle = pool.get_or_read(3, io, 3 * kFrameSize, temp.data());
+    EXPECT_FALSE(handle.empty());
+    EXPECT_EQ(handle.data()[0], 3);
+  }
+
+  EXPECT_GT(pool.stats().evictions_.load(), 0U);
+}
+
+TEST_F(BufferPoolTest, EvictionRespectsAccessOrder) {
+  // 3 frames, single shard, LRU policy
+  BufferPool<uint32_t> pool(3, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  // Load pages 0, 1, 2
+  for (uint32_t i = 0; i < 3; ++i) {
+    auto handle = pool.get_or_read(i, io, i * kFrameSize, temp.data());
+    EXPECT_FALSE(handle.empty());
+  }
+
+  // Access page 0 again to make it recently used
+  {
+    auto handle = pool.get_or_read(0, io, 0, temp.data());
+    EXPECT_FALSE(handle.empty());
+  }
+
+  // Insert page 3 - should evict page 1 (LRU among 0,1,2 after accessing 0)
+  {
+    auto handle = pool.get_or_read(3, io, 3 * kFrameSize, temp.data());
+    EXPECT_FALSE(handle.empty());
+  }
+
+  // Page 0 should still be cached (was recently accessed)
+  {
+    auto handle = pool.get(0);
+    EXPECT_FALSE(handle.empty());
+    EXPECT_EQ(handle.data()[0], 0);
+  }
+
+  // Page 3 should be cached
+  {
+    auto handle = pool.get(3);
+    EXPECT_FALSE(handle.empty());
+    EXPECT_EQ(handle.data()[0], 3);
+  }
+}
+
+TEST_F(BufferPoolTest, PinnedPageNotEvicted) {
+  // Pool with 2 frames, 1 shard
+  BufferPool<uint32_t> pool(2, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  // Load and keep page 0 pinned (hold the handle)
+  auto pinned = pool.get_or_read(0, io, 0, temp.data());
+  EXPECT_FALSE(pinned.empty());
+
+  // Load page 1 (fills cache)
+  {
+    auto handle = pool.get_or_read(1, io, kFrameSize, temp.data());
+    EXPECT_FALSE(handle.empty());
+  }
+
+  // Load page 2 - should evict page 1 (not page 0, which is pinned)
+  {
+    auto handle = pool.get_or_read(2, io, 2 * kFrameSize, temp.data());
+    EXPECT_FALSE(handle.empty());
+    EXPECT_EQ(handle.data()[0], 2);
+  }
+
+  // Page 0 should still be valid and accessible
+  EXPECT_EQ(pinned.data()[0], 0);
+}
+
+TEST_F(BufferPoolTest, AllPagesPinnedEvictionFails) {
+  // Pool with 2 frames, 1 shard
+  BufferPool<uint32_t> pool(2, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  // Pin both frames
+  auto h0 = pool.get_or_read(0, io, 0, temp.data());
+  auto h1 = pool.get_or_read(1, io, kFrameSize, temp.data());
+  EXPECT_FALSE(h0.empty());
+  EXPECT_FALSE(h1.empty());
+
+  // Try to load page 2 - should fail because no frames are evictable
+  auto h2 = pool.get_or_read(2, io, 2 * kFrameSize, temp.data());
+  EXPECT_TRUE(h2.empty());
+}
+
+TEST_F(BufferPoolTest, DuplicateInsertDeduplication) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  // Load page 5
+  {
+    auto handle = pool.get_or_read(5, io, 5 * kFrameSize, temp.data());
+    EXPECT_FALSE(handle.empty());
+  }
+
+  // Load page 5 again - should be a cache hit, not duplicate insertion
+  {
+    auto handle = pool.get_or_read(5, io, 5 * kFrameSize, temp.data());
+    EXPECT_FALSE(handle.empty());
+    EXPECT_EQ(handle.data()[0], 5);
+  }
+
+  EXPECT_EQ(pool.stats().hits_.load(), 1U);
+  EXPECT_EQ(pool.stats().misses_.load(), 1U);
+}
+
+TEST_F(BufferPoolTest, MultipleHandlesToSamePage) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  // Load page 1
+  auto handle1 = pool.get_or_read(1, io, kFrameSize, temp.data());
+  EXPECT_FALSE(handle1.empty());
+
+  // Get another handle to the same page
+  auto handle2 = pool.get(1);
+  EXPECT_FALSE(handle2.empty());
+
+  // Both should point to the same data
+  EXPECT_EQ(handle1.data(), handle2.data());
+}
+
+TEST_F(BufferPoolTest, Clear) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  // Load several pages (release handles so they can be cleared)
+  for (uint32_t i = 0; i < 5; ++i) {
+    auto handle = pool.get_or_read(i, io, i * kFrameSize, temp.data());
+    EXPECT_FALSE(handle.empty());
+  }
+
+  pool.clear();
+
+  // Stats should be reset
+  EXPECT_EQ(pool.stats().hits_.load(), 0U);
+  EXPECT_EQ(pool.stats().misses_.load(), 0U);
+  EXPECT_EQ(pool.stats().evictions_.load(), 0U);
+
+  // Previously cached pages should no longer be found
+  auto handle = pool.get(0);
+  EXPECT_TRUE(handle.empty());
+
+  handle = pool.get(4);
+  EXPECT_TRUE(handle.empty());
+}
+
+TEST_F(BufferPoolTest, StatsTracking) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  // Miss: load page 0
+  {
+    auto handle = pool.get_or_read(0, io, 0, temp.data());
+    EXPECT_FALSE(handle.empty());
+  }
+
+  // Hit: re-read page 0
+  {
+    auto handle = pool.get_or_read(0, io, 0, temp.data());
+    EXPECT_FALSE(handle.empty());
+  }
+
+  // Hit: get page 0
+  {
+    auto handle = pool.get(0);
+    EXPECT_FALSE(handle.empty());
+  }
+
+  // get() on non-existent page does NOT record a miss
+  {
+    auto handle = pool.get(999);
+    EXPECT_TRUE(handle.empty());
+  }
+
+  EXPECT_EQ(pool.stats().misses_.load(), 1U);
+  EXPECT_EQ(pool.stats().hits_.load(), 2U);
+}
+
+TEST_F(BufferPoolTest, ReadFailureReturnsEmptyHandle) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  // Read at an offset beyond the file size - should fail
+  uint64_t bad_offset = kNumPages * kFrameSize + kFrameSize;
+  auto handle = pool.get_or_read(99, io, bad_offset, temp.data());
+  EXPECT_TRUE(handle.empty());
+}
+
+TEST_F(BufferPoolTest, MultipleShardsDistributePages) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 2);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  // Load several pages - they should be distributed across shards
+  for (uint32_t i = 0; i < 8; ++i) {
+    auto handle = pool.get_or_read(i, io, i * kFrameSize, temp.data());
+    EXPECT_FALSE(handle.empty());
+    EXPECT_EQ(handle.data()[0], static_cast<uint8_t>(i));
+  }
+
+  // All pages should be retrievable
+  for (uint32_t i = 0; i < 8; ++i) {
+    auto handle = pool.get(i);
+    EXPECT_FALSE(handle.empty());
+    EXPECT_EQ(handle.data()[0], static_cast<uint8_t>(i));
+  }
+}
+
+// =============================================================================
+// BufferPool with ClockReplacer Tests
+// =============================================================================
+
+class BufferPoolClockTest : public BufferPoolTest {};
+
+TEST_F(BufferPoolClockTest, BasicOperations) {
+  BufferPool<uint32_t, ClockReplacer> pool(kCapacity, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  // Cache miss then hit
+  {
+    auto handle = pool.get_or_read(1, io, kFrameSize, temp.data());
+    EXPECT_FALSE(handle.empty());
+    EXPECT_EQ(handle.data()[0], 1);
+  }
+
+  auto handle = pool.get(1);
+  EXPECT_FALSE(handle.empty());
+  EXPECT_EQ(handle.data()[0], 1);
+}
+
+TEST_F(BufferPoolClockTest, Eviction) {
+  BufferPool<uint32_t, ClockReplacer> pool(3, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  // Fill the cache
+  for (uint32_t i = 0; i < 3; ++i) {
+    auto handle = pool.get_or_read(i, io, i * kFrameSize, temp.data());
+    EXPECT_FALSE(handle.empty());
+  }
+
+  // Trigger eviction
+  {
+    auto handle = pool.get_or_read(10, io, 10 * kFrameSize, temp.data());
+    EXPECT_FALSE(handle.empty());
+    EXPECT_EQ(handle.data()[0], 10);
+  }
+
+  EXPECT_GT(pool.stats().evictions_.load(), 0U);
+}
+
+// =============================================================================
+// BufferPool with ClockProReplacer Tests
+// =============================================================================
+
+class BufferPoolClockProTest : public BufferPoolTest {};
+
+TEST_F(BufferPoolClockProTest, BasicOperations) {
+  BufferPool<uint32_t, ClockProReplacer> pool(kCapacity, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  {
+    auto handle = pool.get_or_read(2, io, 2 * kFrameSize, temp.data());
+    EXPECT_FALSE(handle.empty());
+    EXPECT_EQ(handle.data()[0], 2);
+  }
+
+  auto handle = pool.get(2);
+  EXPECT_FALSE(handle.empty());
+  EXPECT_EQ(handle.data()[0], 2);
+}
+
+TEST_F(BufferPoolClockProTest, Eviction) {
+  BufferPool<uint32_t, ClockProReplacer> pool(3, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
 
   for (uint32_t i = 0; i < 3; ++i) {
-    data[0] = static_cast<uint8_t>(i);
-    pool.put(i, data.data());
+    auto handle = pool.get_or_read(i, io, i * kFrameSize, temp.data());
+    EXPECT_FALSE(handle.empty());
   }
-  EXPECT_EQ(pool.size(), 3U);
 
-  // Insert new item - should trigger eviction
-  data[0] = 100;
-  pool.put(100, data.data());
-
-  EXPECT_EQ(pool.size(), 3U);
-  EXPECT_TRUE(pool.contains(100));
-}
-
-class BufferPoolWithClockProTest : public ::testing::Test {
- protected:
-  static constexpr size_t kFrameSize = 4096;
-  static constexpr size_t kCapacity = 10;
-};
-
-TEST_F(BufferPoolWithClockProTest, BasicOperations) {
-  BufferPool<uint32_t, ClockProReplacer> pool(kCapacity, kFrameSize);
-
-  std::vector<uint8_t> data(kFrameSize, 0xCD);
-
-  pool.put(1, data.data());
-  EXPECT_EQ(pool.size(), 1U);
-
-  const uint8_t* result = pool.get(1);
-  EXPECT_NE(result, nullptr);
-  EXPECT_EQ(result[0], 0xCD);
-}
-
-TEST_F(BufferPoolWithClockProTest, Eviction) {
-  BufferPool<uint32_t, ClockProReplacer> pool(3, kFrameSize);
-
-  std::vector<uint8_t> data(kFrameSize, 0);
-
-  for (uint32_t i = 0; i < 3; ++i) {
-    data[0] = static_cast<uint8_t>(i);
-    pool.put(i, data.data());
+  {
+    auto handle = pool.get_or_read(10, io, 10 * kFrameSize, temp.data());
+    EXPECT_FALSE(handle.empty());
+    EXPECT_EQ(handle.data()[0], 10);
   }
-  EXPECT_EQ(pool.size(), 3U);
 
-  // Insert new item - should trigger eviction
-  data[0] = 100;
-  pool.put(100, data.data());
-
-  EXPECT_EQ(pool.size(), 3U);
-  EXPECT_TRUE(pool.contains(100));
+  EXPECT_GT(pool.stats().evictions_.load(), 0U);
 }
 
-TEST_F(BufferPoolWithClockProTest, ConcurrentAccess) {
-  BufferPool<uint32_t, ClockProReplacer> pool(100, kFrameSize);
+// =============================================================================
+// Thread Safety Tests
+// =============================================================================
+
+class BufferPoolThreadTest : public BufferPoolTest {};
+
+TEST_F(BufferPoolThreadTest, ConcurrentGetOrRead) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 2);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
 
   constexpr int kNumThreads = 4;
   constexpr int kOpsPerThread = 50;
@@ -1025,23 +1091,167 @@ TEST_F(BufferPoolWithClockProTest, ConcurrentAccess) {
   threads.reserve(kNumThreads);
 
   for (int t = 0; t < kNumThreads; ++t) {
-    threads.emplace_back([&pool, t]() -> void {
-      std::vector<uint8_t> data(kFrameSize);
+    threads.emplace_back([&pool, &io, t]() -> void {
+      AlignedBuffer temp(kFrameSize);
       for (int i = 0; i < kOpsPerThread; ++i) {
-        auto id = static_cast<uint32_t>(t * kOpsPerThread + i);
-        data[0] = static_cast<uint8_t>(id % 256);
-        pool.put(id, data.data());
-        (void)pool.get(id);
+        auto id = static_cast<uint32_t>((t * kOpsPerThread + i) % kNumPages);
+        auto handle = pool.get_or_read(id, io, id * kFrameSize, temp.data());
+        if (!handle.empty()) {
+          EXPECT_EQ(handle.data()[0], static_cast<uint8_t>(id));
+        }
       }
     });
   }
 
-  for (auto& thread : threads) {
+  for (auto &thread : threads) {
     thread.join();
   }
 
-  EXPECT_GT(pool.size(), 0U);
-  EXPECT_LE(pool.size(), 100U);
+  // Should complete without crash and have recorded operations
+  auto &stats = pool.stats();
+  EXPECT_GT(stats.hits_.load() + stats.misses_.load(), 0U);
+}
+
+TEST_F(BufferPoolThreadTest, ConcurrentMixedOperations) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 2);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+
+  constexpr int kNumThreads = 4;
+  constexpr int kOpsPerThread = 100;
+
+  std::atomic<int> hit_count{0};
+  std::atomic<int> miss_count{0};
+
+  std::vector<std::thread> threads;
+  threads.reserve(kNumThreads);
+
+  for (int t = 0; t < kNumThreads; ++t) {
+    threads.emplace_back([&pool, &io, &hit_count, &miss_count, t]() -> void {
+      AlignedBuffer temp(kFrameSize);
+      for (int i = 0; i < kOpsPerThread; ++i) {
+        auto id = static_cast<uint32_t>((t * kOpsPerThread + i) % kNumPages);
+
+        if (i % 3 == 0) {
+          // get-only (may miss, but no miss counter)
+          auto handle = pool.get(id);
+          if (!handle.empty()) {
+            hit_count.fetch_add(1);
+          } else {
+            miss_count.fetch_add(1);
+          }
+        } else {
+          // get_or_read (always succeeds for valid pages)
+          auto handle = pool.get_or_read(id, io, id * kFrameSize, temp.data());
+          if (!handle.empty()) {
+            EXPECT_EQ(handle.data()[0], static_cast<uint8_t>(id));
+          }
+        }
+      }
+    });
+  }
+
+  for (auto &thread : threads) {
+    thread.join();
+  }
+
+  EXPECT_GT(hit_count.load() + miss_count.load(), 0);
+}
+
+TEST_F(BufferPoolThreadTest, ConcurrentWithEviction) {
+  // Small pool to force frequent evictions under contention
+  BufferPool<uint32_t> pool(5, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+
+  constexpr int kNumThreads = 4;
+  constexpr int kOpsPerThread = 100;
+
+  std::vector<std::thread> threads;
+  threads.reserve(kNumThreads);
+
+  for (int t = 0; t < kNumThreads; ++t) {
+    threads.emplace_back([&pool, &io, t]() -> void {
+      AlignedBuffer temp(kFrameSize);
+      for (int i = 0; i < kOpsPerThread; ++i) {
+        // Access all 20 pages through a 5-frame pool
+        auto id = static_cast<uint32_t>((t * 7 + i) % kNumPages);
+        auto handle = pool.get_or_read(id, io, id * kFrameSize, temp.data());
+        // May fail if all frames pinned, but should not crash
+        if (!handle.empty()) {
+          EXPECT_EQ(handle.data()[0], static_cast<uint8_t>(id));
+        }
+      }
+    });
+  }
+
+  for (auto &thread : threads) {
+    thread.join();
+  }
+
+  // Should have many evictions given the small pool
+  EXPECT_GT(pool.stats().evictions_.load(), 0U);
+}
+
+TEST_F(BufferPoolThreadTest, ConcurrentClearAndAccess) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 2);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+
+  std::atomic<bool> done{false};
+
+  // Writer thread: continuously load pages
+  std::thread writer([&pool, &io, &done]() -> void {
+    AlignedBuffer temp(kFrameSize);
+    uint32_t id = 0;
+    while (!done.load(std::memory_order_relaxed)) {
+      auto handle = pool.get_or_read(id, io, id * kFrameSize, temp.data());
+      // Don't check result - clear may invalidate state
+      (void)handle;
+      id = (id + 1) % kNumPages;
+    }
+  });
+
+  // Clear thread: periodically clear the pool
+  std::thread clearer([&pool, &done]() -> void {
+    for (int i = 0; i < 10; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      pool.clear();
+    }
+    done.store(true, std::memory_order_relaxed);
+  });
+
+  writer.join();
+  clearer.join();
+
+  // Should complete without crash
+}
+
+TEST_F(BufferPoolThreadTest, ConcurrentClockProReplacer) {
+  BufferPool<uint32_t, ClockProReplacer> pool(kCapacity, kFrameSize, 2);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+
+  constexpr int kNumThreads = 4;
+  constexpr int kOpsPerThread = 50;
+
+  std::vector<std::thread> threads;
+  threads.reserve(kNumThreads);
+
+  for (int t = 0; t < kNumThreads; ++t) {
+    threads.emplace_back([&pool, &io, t]() -> void {
+      AlignedBuffer temp(kFrameSize);
+      for (int i = 0; i < kOpsPerThread; ++i) {
+        auto id = static_cast<uint32_t>((t * kOpsPerThread + i) % kNumPages);
+        auto handle = pool.get_or_read(id, io, id * kFrameSize, temp.data());
+        if (!handle.empty()) {
+          EXPECT_EQ(handle.data()[0], static_cast<uint8_t>(id));
+        }
+      }
+    });
+  }
+
+  for (auto &thread : threads) {
+    thread.join();
+  }
+
+  EXPECT_GT(pool.stats().hits_.load() + pool.stats().misses_.load(), 0U);
 }
 
 }  // namespace alaya

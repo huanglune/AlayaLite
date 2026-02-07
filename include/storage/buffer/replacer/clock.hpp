@@ -247,6 +247,6 @@ class ClockReplacer {
 };
 
 // Static assertion to verify ClockReplacer satisfies the Replacer concept
-static_assert(Replacer<ClockReplacer>, "ClockReplacer must satisfy the Replacer concept");
+static_assert(ReplacerStrategy<ClockReplacer>, "ClockReplacer must satisfy the Replacer concept");
 
 }  // namespace alaya

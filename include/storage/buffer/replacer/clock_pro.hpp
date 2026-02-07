@@ -135,7 +135,7 @@ class ClockProReplacer {
     }
 
     // Check if this was a recently evicted page (in test set)
-    if (test_set_.count(frame_id) > 0) {
+    if (test_set_.contains(frame_id)) {
       // Promote to hot - this page was evicted but accessed again
       test_set_.erase(frame_id);
       add_hot(frame_id);
@@ -248,11 +248,11 @@ class ClockProReplacer {
       }
     }
 
-    PageEntry entry{frame_id, true};
+    PageEntry entry{.frame_id_ = frame_id, .ref_bit_ = true};
     cold_list_.push_back(entry);
     auto iter = std::prev(cold_list_.end());
 
-    frame_map_[frame_id] = FrameInfo{iter, false, true};
+    frame_map_[frame_id] = FrameInfo{.iter_ = iter, .is_hot_ = false, .ref_bit_ = true};
 
     if (cold_hand_ == cold_list_.end()) {
       cold_hand_ = cold_list_.begin();
@@ -268,11 +268,11 @@ class ClockProReplacer {
       demote_one_hot();
     }
 
-    PageEntry entry{frame_id, true};
+    PageEntry entry{.frame_id_ = frame_id, .ref_bit_ = true};
     hot_list_.push_back(entry);
     auto iter = std::prev(hot_list_.end());
 
-    frame_map_[frame_id] = FrameInfo{iter, true, true};
+    frame_map_[frame_id] = FrameInfo{.iter_ = iter, .is_hot_ = true, .ref_bit_ = true};
 
     if (hot_hand_ == hot_list_.end()) {
       hot_hand_ = hot_list_.begin();
@@ -457,6 +457,7 @@ class ClockProReplacer {
 };
 
 // Static assertion to verify ClockProReplacer satisfies the Replacer concept
-static_assert(Replacer<ClockProReplacer>, "ClockProReplacer must satisfy the Replacer concept");
+static_assert(ReplacerStrategy<ClockProReplacer>,
+              "ClockProReplacer must satisfy the Replacer concept");
 
 }  // namespace alaya

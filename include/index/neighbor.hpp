@@ -19,8 +19,27 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 namespace alaya {
+
+/**
+ * @brief Search Result
+ *
+ * layout
+ */
+template <typename IDType, typename DistanceType>
+struct SearchResult {
+  std::vector<IDType> ids_;
+  std::vector<DistanceType> distances_;
+
+  explicit SearchResult(size_t capacity = 0) {
+    if (capacity > 0) {
+      ids_.reserve(capacity);
+      distances_.reserve(capacity);
+    }
+  }
+};
 
 /**
  * @brief The unified structure for a neighbor.

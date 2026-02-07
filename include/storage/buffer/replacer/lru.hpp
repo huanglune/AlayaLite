@@ -148,6 +148,6 @@ class LRUReplacer {
 };
 
 // Static assertion to verify LRUReplacer satisfies the Replacer concept
-static_assert(Replacer<LRUReplacer>, "LRUReplacer must satisfy the Replacer concept");
+static_assert(ReplacerStrategy<LRUReplacer>, "LRUReplacer must satisfy the Replacer concept");
 
 }  // namespace alaya

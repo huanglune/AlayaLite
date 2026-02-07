@@ -45,7 +45,6 @@ struct DiskANNBuildParams {
   uint32_t num_iterations_{2};     ///< Number of Vamana iterations (typically 2)
   uint32_t num_pq_chunks_{0};      ///< Number of PQ chunks (0 = disable PQ)
   uint32_t pq_sample_rate_{100};   ///< Sampling rate for PQ training (percentage)
-  bool enable_pq_{false};          ///< Enable Product Quantization for memory acceleration
 
   DiskANNBuildParams() = default;
 
@@ -93,21 +92,24 @@ struct DiskANNBuildParams {
   }
 
   auto set_pq_params(uint32_t num_chunks, uint32_t sample_rate = 100) -> DiskANNBuildParams & {
-    enable_pq_ = true;
     num_pq_chunks_ = num_chunks;
     pq_sample_rate_ = sample_rate;
     return *this;
   }
+
+  [[nodiscard]] auto is_pq_enabled() const -> bool { return num_pq_chunks_ > 0; }
 };
 
 /**
  * @brief Parameters for DiskANN search operations.
  */
 struct DiskANNSearchParams {
-  uint32_t ef_search_{64};        ///< Search list size (beam width)
-  uint32_t num_threads_{1};       ///< Number of threads for batch search
-  bool use_pq_rerank_{true};      ///< Use PQ for initial ranking, then rerank with exact distances
-  uint32_t pq_rerank_factor_{4};  ///< Fetch pq_rerank_factor_ * k candidates for reranking
+  uint32_t ef_search_{64};         ///< Search list size (L)
+  uint32_t num_threads_{1};        ///< Number of threads for batch search
+  bool use_pq_rerank_{true};       ///< Use PQ for navigation, then rerank with exact distances
+  uint32_t pq_rerank_factor_{4};   ///< Rerank top pq_rerank_factor_ * k candidates
+  uint32_t cache_capacity_{4096};  ///< Buffer pool capacity (number of 4KB pages)
+  uint32_t beam_width_{4};         ///< Beam width for batched candidate expansion
 
   DiskANNSearchParams() = default;
 
@@ -126,6 +128,16 @@ struct DiskANNSearchParams {
   auto set_pq_rerank(bool enable, uint32_t factor = 4) -> DiskANNSearchParams & {
     use_pq_rerank_ = enable;
     pq_rerank_factor_ = factor;
+    return *this;
+  }
+
+  auto set_cache_capacity(uint32_t cap) -> DiskANNSearchParams & {
+    cache_capacity_ = cap;
+    return *this;
+  }
+
+  auto set_beam_width(uint32_t bw) -> DiskANNSearchParams & {
+    beam_width_ = bw;
     return *this;
   }
 };

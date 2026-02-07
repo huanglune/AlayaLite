@@ -46,3 +46,4 @@ perf.data
 perf.data.old
 flamegraph.svg
 CLAUDE.md
+*.svg

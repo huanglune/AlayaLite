@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -53,12 +54,15 @@ namespace alaya {
  *
  * @tparam DataType The data type of vector elements (default: float)
  * @tparam IDType The data type for node IDs (default: uint32_t)
+ * @tparam ReplacerType Buffer pool replacement policy (default: ClockReplacer)
  */
-template <typename DataType = float, typename IDType = uint32_t>
+template <typename DataType = float,
+          typename IDType = uint32_t,
+          ReplacerStrategy ReplacerType = ClockReplacer>
 class DiskANNIndex {
  public:
   using DistanceType = float;
-  using SearcherType = DiskANNSearcher<DataType, IDType>;
+  using SearcherType = DiskANNSearcher<DataType, IDType, ReplacerType>;
 
  private:
   std::unique_ptr<SearcherType> searcher_;  ///< Searcher for query operations
@@ -130,9 +134,9 @@ class DiskANNIndex {
    *
    * @param index_path Path to the index file
    */
-  auto load(std::string_view index_path) -> void {
+  auto load(std::string_view index_path, size_t cache_capacity = 4096) -> void {
     searcher_ = std::make_unique<SearcherType>();
-    searcher_->open(index_path);
+    searcher_->open(index_path, cache_capacity);
     index_path_ = std::string(index_path);
     LOG_INFO("DiskANNIndex: Loaded index from {}", index_path_);
   }
@@ -184,7 +188,10 @@ class DiskANNIndex {
     if (!is_loaded()) {
       throw std::runtime_error("DiskANNIndex: No index loaded");
     }
-    searcher_->search(query, topk, results, params.ef_search_);
+    auto result = searcher_->search(query, topk, params);
+    std::copy_n(result.ids_.begin(),
+                std::min(static_cast<size_t>(topk), result.ids_.size()),
+                results);
   }
 
   /**
@@ -204,7 +211,10 @@ class DiskANNIndex {
     if (!is_loaded()) {
       throw std::runtime_error("DiskANNIndex: No index loaded");
     }
-    searcher_->search_with_distance(query, topk, results, distances, params.ef_search_);
+    auto result = searcher_->search(query, topk, params);
+    auto count = std::min(static_cast<size_t>(topk), result.ids_.size());
+    std::copy_n(result.ids_.begin(), count, results);
+    std::copy_n(result.distances_.begin(), std::min(count, result.distances_.size()), distances);
   }
 
   /**
@@ -224,7 +234,12 @@ class DiskANNIndex {
     if (!is_loaded()) {
       throw std::runtime_error("DiskANNIndex: No index loaded");
     }
-    searcher_->batch_search(queries, num_queries, topk, results, params.ef_search_);
+    auto batch_results = searcher_->batch_search(queries, num_queries, topk, params);
+    for (uint32_t i = 0; i < num_queries; ++i) {
+      auto &result = batch_results[i];
+      auto count = std::min(static_cast<size_t>(topk), result.ids_.size());
+      std::copy_n(result.ids_.begin(), count, results + static_cast<size_t>(i) * topk);
+    }
   }
 
   /**

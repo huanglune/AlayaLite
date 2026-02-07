@@ -22,8 +22,10 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include "simd/distance_ip.hpp"
 #include "simd/distance_l2.hpp"
 #include "utils/log.hpp"
+#include "utils/types.hpp"
 namespace alaya {
 
 template <typename DataType = float, typename DistanceType = float, typename IDType = uint32_t>
@@ -31,13 +33,19 @@ auto find_exact_gt(const std::vector<DataType> &queries,
                    const std::vector<DataType> &data_view,
                    uint32_t dim,
                    uint32_t topk,
-                   std::unordered_set<IDType> *deleted = nullptr) -> std::vector<IDType> {
+                   std::unordered_set<IDType> *deleted = nullptr,
+                   MetricType metric = MetricType::L2) -> std::vector<IDType> {
   if (queries.empty() || data_view.empty() || queries.size() % dim != 0 ||
       data_view.size() % dim != 0) {
     LOG_ERROR("The input data to find ground truth is invalid.");
     return {};
   }
   auto query_num = queries.size() / dim;
+
+  // Select distance function based on metric type
+  auto dist_fn = (metric == MetricType::IP || metric == MetricType::COS)
+                     ? simd::ip_sqr<DataType, DistanceType>
+                     : simd::l2_sqr<DataType, DistanceType>;
 
   std::vector<IDType> res(topk * query_num, 0);
   for (IDType i = 0; i < query_num; i++) {
@@ -46,9 +54,7 @@ auto find_exact_gt(const std::vector<DataType> &queries,
       if (deleted && deleted->find(j) != deleted->end()) {
         continue;
       }
-      float dist = simd::l2_sqr<DataType, DistanceType>(queries.data() + (i * dim),
-                                                        data_view.data() + (j * dim),
-                                                        dim);
+      float dist = dist_fn(queries.data() + (i * dim), data_view.data() + (j * dim), dim);
       dists.emplace_back(j, dist);
     }
     std::sort(dists.begin(), dists.end(), [](const auto &lhs, const auto &rhs) -> auto {

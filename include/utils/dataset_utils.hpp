@@ -24,6 +24,7 @@
 #include "utils/evaluate.hpp"
 #include "utils/io_utils.hpp"
 #include "utils/locks.hpp"
+#include "utils/types.hpp"
 
 namespace alaya {
 
@@ -67,6 +68,7 @@ struct DatasetConfig {
   uint32_t random_dim_ = 0;
   uint32_t random_gt_topk_ = 100;
   uint32_t random_seed_ = 42;
+  MetricType metric_ = MetricType::L2;
 };
 
 /**
@@ -83,7 +85,8 @@ inline auto random_config(uint32_t data_num,
                           uint32_t query_num,
                           uint32_t dim,
                           uint32_t gt_topk = 100,
-                          uint32_t seed = 42) -> DatasetConfig {
+                          uint32_t seed = 42,
+                          MetricType metric = MetricType::L2) -> DatasetConfig {
   return DatasetConfig{
       .name_ = "random",
       .is_random_ = true,
@@ -92,6 +95,7 @@ inline auto random_config(uint32_t data_num,
       .random_dim_ = dim,
       .random_gt_topk_ = gt_topk,
       .random_seed_ = seed,
+      .metric_ = metric,
   };
 }
 
@@ -164,7 +168,12 @@ inline auto generate_random_dataset(const DatasetConfig &config) -> Dataset {
     val = dist(rng);
   }
 
-  ds.ground_truth_ = find_exact_gt(ds.queries_, ds.data_, ds.dim_, ds.gt_dim_);
+  ds.ground_truth_ = find_exact_gt<float, float, uint32_t>(ds.queries_,
+                                                           ds.data_,
+                                                           ds.dim_,
+                                                           ds.gt_dim_,
+                                                           nullptr,
+                                                           config.metric_);
 
   return ds;
 }

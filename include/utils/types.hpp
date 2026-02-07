@@ -21,6 +21,7 @@
 #include <string_view>
 #include <tuple>
 
+using byte = std::byte;
 using WorkerID = uint32_t;
 using CpuID = uint32_t;
 

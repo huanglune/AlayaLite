@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <unordered_set>
 #include <vector>
 #include "math.hpp"
@@ -55,7 +56,7 @@ class DynamicBitset {
    * @param num_bits The number of bits in the bitset
    */
   explicit DynamicBitset(size_t num_bits) : size_(num_bits) {
-    data_.resize(math::round_up_pow2(num_bits, 64), 0);
+    data_.resize(math::round_up_pow2(num_bits, 64) / 64, 0);
   }
 
   /**
@@ -65,7 +66,7 @@ class DynamicBitset {
    */
   void resize(size_t num_bits) {
     size_ = num_bits;
-    data_.resize(math::round_up_pow2(num_bits, 64), 0);
+    data_.resize(math::round_up_pow2(num_bits, 64) / 64, 0);
   }
 
   /**
@@ -106,6 +107,21 @@ class DynamicBitset {
   void reset() { std::ranges::fill(data_, 0ULL); }
 
   /**
+   * @brief Get pointer to internal data for direct I/O operations.
+   * @return Pointer to internal uint64_t array
+   */
+  [[nodiscard]] auto data() noexcept -> uint64_t * { return data_.data(); }
+  [[nodiscard]] auto data() const noexcept -> const uint64_t * { return data_.data(); }
+
+  /**
+   * @brief Get size of internal storage in bytes.
+   * @return Size in bytes
+   */
+  [[nodiscard]] auto size_in_bytes() const noexcept -> size_t {
+    return data_.size() * sizeof(uint64_t);
+  }
+
+  /**
    * @brief Find the position of the first zero (unset) bit
    *
    * Uses CPU instructions (TZCNT/BSF) for O(1) lookup within each 64-bit block.
@@ -114,6 +130,7 @@ class DynamicBitset {
    * @return int The position of the first zero bit, or -1 if all bits are set
    */
   [[nodiscard]] auto find_first_zero() const -> int {
+    // TODO(hl): Optimize with SIMD if needed
     for (size_t i = 0; i < data_.size(); ++i) {
       if (data_[i] != ~0ULL) {  // Block has at least one zero bit
         size_t pos = (i * 64) + math::count_trailing_zeros(~data_[i]);
@@ -251,16 +268,16 @@ class HierarchicalBitset {
  * @tparam N Number of bits (must be 8, 16, 32, or 64)
  */
 template <size_t N>
-  requires(N == 8 || N == 16 || N == 32 || N == 64)
 class FixedBitset {
+  static_assert(N == 8 || N == 16 || N == 32 || N == 64 || N == 128, "Unsupported size");
+
  private:
-  using StorageType = std::conditional_t<
-      N == 8,
-      uint8_t,
-      std::conditional_t<N == 16, uint16_t, std::conditional_t<N == 32, uint32_t, uint64_t>>>;
-
+  // clang-format off
+  using StorageType = std::conditional_t<N <= 8, uint8_t,      // NOLINT(whitespace/operators)
+                      std::conditional_t<N <= 16, uint16_t,   // NOLINT(whitespace/operators)
+                      std::conditional_t<N <= 32, uint32_t, uint64_t>>>;
+  // clang-format on
   StorageType data_{0};
-
   static constexpr StorageType kAllOnes = static_cast<StorageType>(~StorageType{0});
 
  public:
@@ -278,46 +295,96 @@ class FixedBitset {
    * @brief Find first zero bit in O(1) using TZCNT/BSF instruction
    * @return Position of first zero bit, or -1 if all bits are set
    */
-  [[nodiscard]] auto find_first_zero() const noexcept -> int {
-    if (data_ == kAllOnes) {
-      return -1;
-    }
-    auto inverted = static_cast<StorageType>(~data_);
-    if constexpr (N <= 32) {
-      return __builtin_ctz(static_cast<unsigned int>(inverted));
-    } else {
-      return __builtin_ctzll(inverted);
-    }
-  }
+  [[nodiscard]] auto find_first_zero() const noexcept -> int { return std::countr_one(data_); }
 
   /**
    * @brief Find first set bit in O(1) using TZCNT/BSF instruction
    * @return Position of first set bit, or -1 if all bits are zero
    */
-  [[nodiscard]] auto find_first_set() const noexcept -> int {
-    if (data_ == 0) {
-      return -1;
-    }
-    if constexpr (N <= 32) {
-      return __builtin_ctz(static_cast<unsigned int>(data_));
+  [[nodiscard]] auto find_first_set() const noexcept -> int { return std::countr_zero(data_); }
+
+  [[nodiscard]] auto count() const noexcept -> int { return std::popcount(data_); }
+
+  [[nodiscard]] auto empty() const noexcept -> bool { return data_ == 0; }
+  [[nodiscard]] auto full() const noexcept -> bool { return data_ == kAllOnes; }
+  [[nodiscard]] static constexpr auto capacity() noexcept -> size_t { return N; }
+  [[nodiscard]] auto data() const noexcept -> StorageType { return data_; }
+};
+/**
+ * @brief Specialization of FixedBitset for 128 bits using two uint64_t.
+ */
+template <>
+class alignas(16) FixedBitset<128> {
+ private:
+  uint64_t low_{0};   // bits 0-63
+  uint64_t high_{0};  // bits 64-127
+
+ public:
+  FixedBitset() = default;
+
+  void set(size_t pos) noexcept {
+    if (pos < 64) {
+      low_ |= (1ULL << pos);
     } else {
-      return __builtin_ctzll(data_);
+      high_ |= (1ULL << (pos - 64));
     }
+  }
+
+  void reset(size_t pos) noexcept {
+    if (pos < 64) {
+      low_ &= ~(1ULL << pos);
+    } else {
+      high_ &= ~(1ULL << (pos - 64));
+    }
+  }
+
+  void reset() noexcept {
+    low_ = 0;
+    high_ = 0;
+  }
+
+  [[nodiscard]] auto get(size_t pos) const noexcept -> bool {
+    if (pos < 64) {
+      return ((low_ >> pos) & 1ULL) != 0U;
+    }
+    return ((high_ >> (pos - 64)) & 1ULL) != 0U;
+  }
+
+  /**
+   * @brief Find the first zero bit (first free slot).
+   * @return 0-127 for position, 128 if full.
+   */
+  [[nodiscard]] auto find_first_zero() const noexcept -> int {
+    if (low_ != ~0ULL) {
+      return std::countr_one(low_);
+    }
+    return 64 + std::countr_one(high_);
+  }
+
+  /**
+   * @brief Find the first set bit (first occupied slot).
+   * @return 0-127 for position, 128 if empty.
+   */
+  [[nodiscard]] auto find_first_set() const noexcept -> int {
+    if (low_ != 0) {
+      return std::countr_zero(low_);
+    }
+    return 64 + std::countr_zero(high_);
   }
 
   [[nodiscard]] auto count() const noexcept -> int {
-    if constexpr (N <= 32) {
-      return __builtin_popcount(static_cast<unsigned int>(data_));
-    } else {
-      return __builtin_popcountll(data_);
-    }
+    return std::popcount(low_) + std::popcount(high_);
   }
 
-  [[nodiscard]] auto empty() const noexcept -> bool { return data_ == 0; }
+  [[nodiscard]] auto empty() const noexcept -> bool { return (low_ | high_) == 0; }
 
-  [[nodiscard]] auto full() const noexcept -> bool { return data_ == kAllOnes; }
+  [[nodiscard]] auto full() const noexcept -> bool { return (low_ == ~0ULL) && (high_ == ~0ULL); }
 
-  [[nodiscard]] static constexpr auto capacity() noexcept -> size_t { return N; }
+  [[nodiscard]] static constexpr auto capacity() noexcept -> size_t { return 128; }
+
+  [[nodiscard]] auto raw_data() const noexcept -> std::pair<uint64_t, uint64_t> {
+    return {low_, high_};
+  }
 };
 
 // Convenient type aliases
@@ -326,5 +393,12 @@ using Bitset8 = FixedBitset<8>;
 using Bitset16 = FixedBitset<16>;
 using Bitset32 = FixedBitset<32>;
 using Bitset64 = FixedBitset<64>;
+using Bitset128 = FixedBitset<128>;
+
+static_assert(sizeof(Bitset8) == 1, "Bitset8 size mismatch");
+static_assert(sizeof(Bitset16) == 2, "Bitset16 size mismatch");
+static_assert(sizeof(Bitset32) == 4, "Bitset32 size mismatch");
+static_assert(sizeof(Bitset64) == 8, "Bitset64 size mismatch");
+static_assert(sizeof(Bitset128) == 16, "Bitset128 size mismatch");
 
 }  // namespace alaya

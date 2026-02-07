@@ -25,14 +25,13 @@
 #include <thread>
 #include <vector>
 
-#include "index/graph/diskann/disk_layout.hpp"
 #include "index/graph/diskann/diskann_builder.hpp"
 #include "index/graph/diskann/diskann_index.hpp"
 #include "index/graph/diskann/diskann_params.hpp"
 #include "index/graph/diskann/diskann_searcher.hpp"
+#include "storage/diskann/diskann_storage.hpp"
 #include "index/graph/graph.hpp"
 #include "space/raw_space.hpp"
-#include "storage/buffer/buffer_pool.hpp"
 #include "utils/dataset_utils.hpp"
 #include "utils/evaluate.hpp"
 #include "utils/log.hpp"
@@ -71,119 +70,15 @@ private:
 
 static TestResources g_resources;
 
-// =============================================================================
-// Test Fixture 1: Layout tests (no index building, fast)
-// =============================================================================
-
-class DiskLayoutTest : public ::testing::Test {
- protected:
-  static void SetUpTestSuite() {
-    if (g_resources.dim_ == 0) {
-      g_resources.load();
-    }
-  }
-
-  auto dim() const -> uint32_t { return g_resources.dim_; }
-  auto data_num() const -> uint32_t { return g_resources.data_num_; }
-};
-
-TEST_F(DiskLayoutTest, HeaderInitAndValidate) {
-  DiskIndexHeader header;
-  header.init(64, 1.2F, dim(), data_num(), kDiskSectorSize);
-  header.meta_.medoid_id_ = 42;
-
-  EXPECT_TRUE(header.is_valid());
-  EXPECT_EQ(header.meta_.magic_, kDiskANNMagicNumber);
-  EXPECT_EQ(header.meta_.version_, kDiskANNVersion);
-  EXPECT_EQ(header.meta_.max_degree_, 64U);
-  EXPECT_FLOAT_EQ(header.meta_.alpha_, 1.2F);
-  EXPECT_EQ(header.meta_.dimension_, dim());
-  EXPECT_EQ(header.meta_.num_points_, data_num());
-  EXPECT_EQ(header.meta_.medoid_id_, 42U);
-}
-
-TEST_F(DiskLayoutTest, HeaderSaveLoad) {
-  const std::string kTestFile = "/tmp/diskann_header_test.bin";
-
-  DiskIndexHeader header;
-  header.init(64, 1.2F, dim(), data_num(), kDiskSectorSize);
-  header.meta_.medoid_id_ = 42;
-
-  std::ofstream writer(kTestFile, std::ios::binary);
-  header.save(writer);
-  writer.close();
-
-  DiskIndexHeader loaded;
-  std::ifstream reader(kTestFile, std::ios::binary);
-  loaded.load(reader);
-  reader.close();
-
-  EXPECT_TRUE(loaded.is_valid());
-  EXPECT_EQ(loaded.meta_.dimension_, dim());
-  EXPECT_EQ(loaded.meta_.num_points_, data_num());
-  EXPECT_EQ(loaded.meta_.medoid_id_, 42U);
-
-  std::filesystem::remove(kTestFile);
-}
-
-TEST_F(DiskLayoutTest, HeaderPQInit) {
-  DiskIndexHeader header;
-  header.init(64, 1.2F, dim(), data_num(), kDiskSectorSize);
-  header.init_pq(8);  // 8 subspaces
-
-  EXPECT_TRUE(header.is_pq_enabled());
-  EXPECT_EQ(header.meta_.pq_num_subspaces_, 8U);
-  EXPECT_GT(header.meta_.pq_codebook_offset_, 0U);
-  EXPECT_GT(header.meta_.pq_codes_offset_, header.meta_.pq_codebook_offset_);
-  EXPECT_GT(header.meta_.nodes_offset_, header.meta_.pq_codes_offset_);
-}
-
-TEST_F(DiskLayoutTest, NodeSectorSize) {
-  constexpr uint32_t kMaxDegree = 64;
-  auto node_size = DiskNode<float, uint32_t>::calc_node_sector_size(dim(), kMaxDegree);
-
-  // Should be a multiple of sector size
-  EXPECT_EQ(node_size % kDiskSectorSize, 0U);
-  EXPECT_GT(node_size, 0U);
-}
-
-TEST_F(DiskLayoutTest, NodeBufferAllocation) {
-  constexpr uint32_t kMaxDegree = 64;
-  auto node_size = DiskNode<float, uint32_t>::calc_node_sector_size(dim(), kMaxDegree);
-
-  DiskNodeBuffer<float, uint32_t> buffer;
-  buffer.allocate(dim(), kMaxDegree, 1);
-
-  EXPECT_TRUE(buffer.is_valid());
-  EXPECT_EQ(buffer.num_nodes(), 1U);
-  EXPECT_EQ(buffer.node_size(), node_size);
-}
-
-TEST_F(DiskLayoutTest, NodeAccessor) {
-  constexpr uint32_t kMaxDegree = 64;
-
-  DiskNodeBuffer<float, uint32_t> buffer;
-  buffer.allocate(dim(), kMaxDegree, 1);
-  auto accessor = buffer.get_node(0);
-
-  // Write test data
-  std::vector<float> test_vec(dim());
-  std::iota(test_vec.begin(), test_vec.end(), 1.0F);
-  std::vector<uint32_t> test_neighbors = {1, 2, 3, 4, 5};
-  accessor.init(test_vec.data(), test_neighbors.data(), test_neighbors.size());
-
-  // Verify
-  EXPECT_EQ(accessor.num_neighbors(), test_neighbors.size());
-  for (uint32_t i = 0; i < test_neighbors.size(); ++i) {
-    EXPECT_EQ(accessor.get_neighbor(i), test_neighbors[i]);
-  }
-  for (uint32_t i = 0; i < dim(); ++i) {
-    EXPECT_FLOAT_EQ(accessor.vector_data()[i], test_vec[i]);
-  }
+// Helper to remove three-file index
+static void remove_index_files(const std::string &base_path) {
+  std::filesystem::remove(base_path + ".meta");
+  std::filesystem::remove(base_path + ".data");
+  std::filesystem::remove(base_path + ".pq");
 }
 
 // =============================================================================
-// Test Fixture 2: Build tests (test graph construction)
+// Test Fixture 1: Build tests (test graph construction)
 // =============================================================================
 
 class DiskANNBuildTest : public ::testing::Test {
@@ -227,7 +122,7 @@ TEST_F(DiskANNBuildTest, BuildGraph) {
 }
 
 // =============================================================================
-// Test Fixture 3: Search tests with shared index (build once)
+// Test Fixture 2: Search tests with shared index (build once)
 // =============================================================================
 
 class DiskANNSearchTest : public ::testing::Test {
@@ -252,11 +147,7 @@ class DiskANNSearchTest : public ::testing::Test {
     }
   }
 
-  static void TearDownTestSuite() {
-    if (std::filesystem::exists(index_path)) {
-      std::filesystem::remove(index_path);
-    }
-  }
+  static void TearDownTestSuite() { remove_index_files(index_path); }
 
   auto dataset() const -> const Dataset & { return g_resources.ds_; }
   auto dim() const -> uint32_t { return g_resources.dim_; }
@@ -373,7 +264,7 @@ TEST_F(DiskANNSearchTest, HitRate) {
 }
 
 // =============================================================================
-// Test Fixture 4: PQ-enabled tests (separate index with PQ)
+// Test Fixture 3: PQ-enabled tests (separate index with PQ)
 // =============================================================================
 
 class DiskANNPQTest : public ::testing::Test {
@@ -399,11 +290,7 @@ class DiskANNPQTest : public ::testing::Test {
     }
   }
 
-  static void TearDownTestSuite() {
-    if (std::filesystem::exists(index_path)) {
-      std::filesystem::remove(index_path);
-    }
-  }
+  static void TearDownTestSuite() { remove_index_files(index_path); }
 
   auto dataset() const -> const Dataset & { return g_resources.ds_; }
   auto dim() const -> uint32_t { return g_resources.dim_; }
@@ -471,7 +358,7 @@ TEST_F(DiskANNPQTest, PQRecallQuality) {
 }
 
 // =============================================================================
-// Test Fixture 5: Searcher low-level tests
+// Test Fixture 4: Searcher low-level tests
 // =============================================================================
 
 class DiskANNSearcherTest : public ::testing::Test {
@@ -495,11 +382,7 @@ class DiskANNSearcherTest : public ::testing::Test {
     builder.build_disk_index(index_path, params.num_threads_);
   }
 
-  void TearDown() override {
-    if (std::filesystem::exists(index_path)) {
-      std::filesystem::remove(index_path);
-    }
-  }
+  void TearDown() override { remove_index_files(index_path); }
 
   auto dataset() const -> const Dataset & { return g_resources.ds_; }
   auto dim() const -> uint32_t { return g_resources.dim_; }
@@ -522,199 +405,14 @@ TEST_F(DiskANNSearcherTest, SearchDirect) {
 
   constexpr uint32_t kTopk = 10;
   DiskANNSearchParams params(50);
-  std::vector<uint32_t> results(kTopk);
 
-  searcher.search(dataset().queries_.data(), kTopk, results.data(), params);
+  auto result = searcher.search(dataset().queries_.data(), kTopk, params);
 
-  for (uint32_t i = 0; i < kTopk; ++i) {
-    if (results[i] != static_cast<uint32_t>(-1)) {
-      EXPECT_LT(results[i], data_num());
+  for (const auto &id : result.ids_) {
+    if (id != static_cast<uint32_t>(-1)) {
+      EXPECT_LT(id, data_num());
     }
   }
-}
-
-TEST_F(DiskANNSearcherTest, CachingEnabled) {
-  DiskANNSearcher<float, uint32_t> searcher;
-  searcher.open(index_path);
-
-  // Enable caching with 100 frames
-  searcher.enable_caching(100);
-  EXPECT_TRUE(searcher.is_caching_enabled());
-
-  // Perform searches
-  constexpr uint32_t kTopk = 10;
-  DiskANNSearchParams params(50);
-  std::vector<uint32_t> results(kTopk);
-
-  // First search - should be cache misses
-  searcher.search(dataset().queries_.data(), kTopk, results.data(), params);
-
-  auto stats = searcher.cache_stats();
-  EXPECT_GT(stats.total_accesses(), 0U);
-
-  // Disable caching
-  searcher.disable_caching();
-  EXPECT_FALSE(searcher.is_caching_enabled());
-}
-
-TEST_F(DiskANNSearcherTest, CacheHitRate) {
-  DiskANNSearcher<float, uint32_t> searcher;
-  searcher.open(index_path);
-
-  // Enable caching
-  searcher.enable_caching(50);
-
-  constexpr uint32_t kTopk = 10;
-  DiskANNSearchParams params(50);
-  std::vector<uint32_t> results(kTopk);
-
-  // Run same query multiple times - should get cache hits
-  for (int i = 0; i < 5; ++i) {
-    searcher.search(dataset().queries_.data(), kTopk, results.data(), params);
-  }
-
-  auto stats = searcher.cache_stats();
-  LOG_INFO("Cache stats: hits={}, misses={}, hit_rate={:.4f}",
-           stats.hits_.load(), stats.misses_.load(), stats.hit_rate());
-
-  // With repeated queries, we should have some cache hits
-  EXPECT_GT(stats.hits_.load(), 0U);
-}
-
-// =============================================================================
-// Test Fixture 6: BufferPool unit tests
-// =============================================================================
-
-class BufferPoolTest : public ::testing::Test {
- protected:
-  static constexpr size_t kFrameSize = 4096;  // 4KB frames
-  static constexpr size_t kCapacity = 10;
-};
-
-TEST_F(BufferPoolTest, Construction) {
-  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
-
-  EXPECT_EQ(pool.capacity(), kCapacity);
-  EXPECT_EQ(pool.frame_size(), kFrameSize);
-  EXPECT_EQ(pool.size(), 0U);
-  EXPECT_TRUE(pool.is_enabled());
-}
-
-TEST_F(BufferPoolTest, EmptyPoolDisabled) {
-  BufferPool<uint32_t> pool(0, kFrameSize);
-  EXPECT_FALSE(pool.is_enabled());
-  EXPECT_EQ(pool.capacity(), 0U);
-}
-
-TEST_F(BufferPoolTest, PutAndGet) {
-  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
-
-  // Create test data
-  std::vector<uint8_t> test_data(kFrameSize);
-  for (size_t i = 0; i < kFrameSize; ++i) {
-    test_data[i] = static_cast<uint8_t>(i % 256);
-  }
-
-  // Put data into cache
-  const uint8_t* cached = pool.put(42, test_data.data());
-  EXPECT_NE(cached, nullptr);
-  EXPECT_EQ(pool.size(), 1U);
-
-  // Get data back
-  const uint8_t* retrieved = pool.get(42);
-  EXPECT_NE(retrieved, nullptr);
-
-  // Verify data matches
-  for (size_t i = 0; i < kFrameSize; ++i) {
-    EXPECT_EQ(retrieved[i], test_data[i]);
-  }
-}
-
-TEST_F(BufferPoolTest, CacheMiss) {
-  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
-
-  // Try to get non-existent item
-  const uint8_t* result = pool.get(999);
-  EXPECT_EQ(result, nullptr);
-
-  auto stats = pool.stats();
-  EXPECT_EQ(stats.misses_.load(), 1U);
-  EXPECT_EQ(stats.hits_.load(), 0U);
-}
-
-TEST_F(BufferPoolTest, LRUEviction) {
-  BufferPool<uint32_t> pool(3, kFrameSize);  // Small capacity for testing eviction
-
-  std::vector<uint8_t> data(kFrameSize, 0);
-
-  // Fill the cache
-  for (uint32_t i = 0; i < 3; ++i) {
-    data[0] = static_cast<uint8_t>(i);
-    pool.put(i, data.data());
-  }
-  EXPECT_EQ(pool.size(), 3U);
-
-  // Access item 0 to make it recently used
-  (void)pool.get(0);
-
-  // Insert new item - should evict item 1 (LRU)
-  data[0] = 100;
-  pool.put(100, data.data());
-
-  // Item 0 should still be there (was accessed recently)
-  EXPECT_TRUE(pool.contains(0));
-  // Item 1 should be evicted (LRU)
-  EXPECT_FALSE(pool.contains(1));
-  // Item 2 should still be there
-  EXPECT_TRUE(pool.contains(2));
-  // New item should be there
-  EXPECT_TRUE(pool.contains(100));
-
-  auto stats = pool.stats();
-  EXPECT_GT(stats.evictions_.load(), 0U);
-}
-
-TEST_F(BufferPoolTest, Clear) {
-  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
-
-  std::vector<uint8_t> data(kFrameSize, 0);
-  for (uint32_t i = 0; i < 5; ++i) {
-    pool.put(i, data.data());
-  }
-  EXPECT_EQ(pool.size(), 5U);
-
-  pool.clear();
-  EXPECT_EQ(pool.size(), 0U);
-
-  // Items should no longer be found
-  for (uint32_t i = 0; i < 5; ++i) {
-    EXPECT_FALSE(pool.contains(i));
-  }
-}
-
-TEST_F(BufferPoolTest, Statistics) {
-  BufferPool<uint32_t> pool(kCapacity, kFrameSize);
-
-  std::vector<uint8_t> data(kFrameSize, 0);
-  pool.put(1, data.data());
-
-  // Miss
-  (void)pool.get(999);
-  // Hit
-  (void)pool.get(1);
-  // Another hit
-  (void)pool.get(1);
-
-  auto stats = pool.stats();
-  EXPECT_EQ(stats.hits_.load(), 2U);
-  EXPECT_EQ(stats.misses_.load(), 1U);
-  EXPECT_DOUBLE_EQ(stats.hit_rate(), 2.0 / 3.0);
-
-  // Reset stats
-  pool.reset_stats();
-  stats = pool.stats();
-  EXPECT_EQ(stats.hits_.load(), 0U);
-  EXPECT_EQ(stats.misses_.load(), 0U);
 }
 
 }  // namespace alaya

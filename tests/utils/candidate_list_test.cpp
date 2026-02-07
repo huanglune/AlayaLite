@@ -408,4 +408,78 @@ TEST_F(CandidateListTest, EmplaceInsertSortedOrderTest) {
   EXPECT_EQ(pool_->id(2), 6);  // New element at position 2
 }
 
+// Test to_search_result basic functionality
+TEST_F(CandidateListTest, ToSearchResultBasicTest) {
+  pool_->insert(10, 1.0);
+  pool_->insert(20, 3.0);
+  pool_->insert(30, 2.0);
+
+  auto result = pool_->to_search_result();
+
+  EXPECT_EQ(result.ids_.size(), 3);
+  EXPECT_EQ(result.distances_.size(), 3);
+
+  // Elements should be in sorted order by distance
+  EXPECT_EQ(result.ids_[0], 10);
+  EXPECT_FLOAT_EQ(result.distances_[0], 1.0);
+  EXPECT_EQ(result.ids_[1], 30);
+  EXPECT_FLOAT_EQ(result.distances_[1], 2.0);
+  EXPECT_EQ(result.ids_[2], 20);
+  EXPECT_FLOAT_EQ(result.distances_[2], 3.0);
+}
+
+// Test to_search_result on empty pool
+TEST_F(CandidateListTest, ToSearchResultEmptyTest) {
+  auto result = pool_->to_search_result();
+
+  EXPECT_EQ(result.ids_.size(), 0);
+  EXPECT_EQ(result.distances_.size(), 0);
+}
+
+// Test to_search_result strips checked flag after pop
+TEST_F(CandidateListTest, ToSearchResultAfterPopTest) {
+  pool_->insert(1, 1.0);
+  pool_->insert(2, 2.0);
+  pool_->insert(3, 3.0);
+
+  // Pop sets the checked flag on the internal id
+  pool_->pop();
+
+  auto result = pool_->to_search_result();
+
+  EXPECT_EQ(result.ids_.size(), 3);
+  // get_id should strip the checked flag, so all ids are clean
+  EXPECT_EQ(result.ids_[0], 1);
+  EXPECT_EQ(result.ids_[1], 2);
+  EXPECT_EQ(result.ids_[2], 3);
+}
+
+// Test to_search_result on full pool
+TEST_F(CandidateListTest, ToSearchResultFullPoolTest) {
+  pool_->insert(1, 5.0);
+  pool_->insert(2, 3.0);
+  pool_->insert(3, 1.0);
+  pool_->insert(4, 4.0);
+  pool_->insert(5, 2.0);
+
+  EXPECT_TRUE(pool_->is_full());
+
+  auto result = pool_->to_search_result();
+
+  EXPECT_EQ(result.ids_.size(), 5);
+  EXPECT_EQ(result.distances_.size(), 5);
+
+  // Verify sorted order: 1.0, 2.0, 3.0, 4.0, 5.0
+  EXPECT_EQ(result.ids_[0], 3);
+  EXPECT_FLOAT_EQ(result.distances_[0], 1.0);
+  EXPECT_EQ(result.ids_[1], 5);
+  EXPECT_FLOAT_EQ(result.distances_[1], 2.0);
+  EXPECT_EQ(result.ids_[2], 2);
+  EXPECT_FLOAT_EQ(result.distances_[2], 3.0);
+  EXPECT_EQ(result.ids_[3], 4);
+  EXPECT_FLOAT_EQ(result.distances_[3], 4.0);
+  EXPECT_EQ(result.ids_[4], 1);
+  EXPECT_FLOAT_EQ(result.distances_[4], 5.0);
+}
+
 }  // namespace alaya

@@ -18,6 +18,7 @@
 
 #include "io_engine.hpp"
 #include "utils/log.hpp"
+#include "utils/macros.hpp"
 #include "utils/platform.hpp"
 
 #ifdef ALAYA_OS_LINUX
@@ -27,7 +28,6 @@
   #include <cerrno>
   #include <cstring>
   #include <stdexcept>
-  #include <vector>
 
 namespace alaya {
 
@@ -38,8 +38,9 @@ namespace alaya {
 /**
  * @brief I/O engine using Linux io_uring for async operations.
  *
- * io_uring provides high-performance async I/O with minimal syscall overhead.
- * Falls back to synchronous operations if io_uring is not available.
+ * Each thread lazily initializes its own io_uring ring, so batch
+ * submit/wait operations are lock-free and thread-safe without any mutex.
+ * Synchronous pread/pwrite delegate to POSIX calls (inherently thread-safe).
  */
 class IOUringEngine final : public IOEngine {
  public:
@@ -47,20 +48,20 @@ class IOUringEngine final : public IOEngine {
   static constexpr size_t kDefaultQueueDepth = 128;
 
   /**
-   * @brief Construct IOUringEngine with specified queue depth.
-   * @param queue_depth Size of submission/completion queues
-   * @throws std::runtime_error if io_uring initialization fails
+   * @brief Construct IOUringEngine.
+   * @param queue_depth Size of per-thread submission/completion queues
+   * @throws std::runtime_error if io_uring is not supported on this kernel
    */
   explicit IOUringEngine(size_t queue_depth = kDefaultQueueDepth) : queue_depth_(queue_depth) {
     if (!is_available()) {
       throw std::runtime_error("io_uring is not available on this system");
     }
-    init_ring();
+    // Ring is lazily initialized per thread on first batch I/O call
   }
 
-  ~IOUringEngine() override { cleanup_ring(); }
+  ~IOUringEngine() override = default;
 
-  // ---- Synchronous operations (delegate to pread/pwrite for simplicity) ----
+  // ---- Synchronous operations (thread-safe, no ring needed) ----
 
   auto pread(int fd, void *buf, size_t size, uint64_t offset) -> ssize_t override {
     return ::pread(fd, buf, size, static_cast<off_t>(offset));
@@ -70,7 +71,7 @@ class IOUringEngine final : public IOEngine {
     return ::pwrite(fd, buf, size, static_cast<off_t>(offset));
   }
 
-  // ---- Async batch operations ----
+  // ---- Async batch operations (use thread-local ring) ----
 
   auto submit_reads(int fd, std::span<IORequest> requests) -> size_t override {
     return submit_batch(fd, requests, false);
@@ -81,7 +82,8 @@ class IOUringEngine final : public IOEngine {
   }
 
   auto wait(size_t min_complete, int timeout_ms) -> size_t override {
-    if (!initialized_) {
+    auto *ring = get_ring();
+    if (ring == nullptr) {
       return 0;
     }
 
@@ -91,14 +93,14 @@ class IOUringEngine final : public IOEngine {
       // Blocking wait for min_complete requests
       while (completed < min_complete) {
         struct io_uring_cqe *cqe = nullptr;
-        int ret = io_uring_wait_cqe(&ring_, &cqe);
+        int ret = io_uring_wait_cqe(ring, &cqe);
         if (ret < 0) {
           LOG_ERROR("io_uring_wait_cqe failed: {}", strerror(-ret));
           break;
         }
 
         process_cqe(cqe);
-        io_uring_cqe_seen(&ring_, cqe);
+        io_uring_cqe_seen(ring, cqe);
         ++completed;
       }
     } else {
@@ -108,7 +110,7 @@ class IOUringEngine final : public IOEngine {
 
       while (completed < min_complete) {
         struct io_uring_cqe *cqe = nullptr;
-        int ret = io_uring_wait_cqe_timeout(&ring_, &cqe, &ts);
+        int ret = io_uring_wait_cqe_timeout(ring, &cqe, &ts);
         if (ret == -ETIME) {
           break;  // Timeout
         }
@@ -118,18 +120,18 @@ class IOUringEngine final : public IOEngine {
         }
 
         process_cqe(cqe);
-        io_uring_cqe_seen(&ring_, cqe);
+        io_uring_cqe_seen(ring, cqe);
         ++completed;
       }
     }
 
     // Drain any additional completions without blocking
-    drain_completions(completed);
+    drain_completions(ring, completed);
 
     return completed;
   }
 
-  [[nodiscard]] auto supports_async() const -> bool override { return initialized_; }
+  [[nodiscard]] auto supports_async() const -> bool override { return true; }
 
   [[nodiscard]] auto name() const -> std::string_view override { return "io_uring"; }
 
@@ -151,47 +153,62 @@ class IOUringEngine final : public IOEngine {
   }
 
  private:
-  struct io_uring ring_{};
+  /// Per-thread io_uring ring with RAII cleanup on thread exit
+  struct ThreadRing {
+    struct io_uring ring;
+    bool initialized{false};
+
+    ThreadRing() { std::memset(&ring, 0, sizeof(ring)); }
+    ~ThreadRing() {
+      if (initialized) {
+        io_uring_queue_exit(&ring);
+        initialized = false;
+      }
+    }
+
+    ALAYA_NON_COPYABLE_NON_MOVABLE(ThreadRing);
+
+    void init(size_t queue_depth) {
+      if (initialized) {
+        return;
+      }
+      int ret = io_uring_queue_init(static_cast<unsigned>(queue_depth), &ring, 0);
+      if (ret < 0) {
+        LOG_ERROR("Thread-local io_uring init failed: {}", strerror(-ret));
+        return;
+      }
+      initialized = true;
+    }
+  };
+
+  /// Each thread gets its own io_uring ring — no cross-thread contention
+  static inline thread_local ThreadRing tl_ring_;  // NOLINT
   size_t queue_depth_;
-  bool initialized_{false};
-  std::vector<IORequest *> pending_requests_;
 
-  void init_ring() {
-    int ret = io_uring_queue_init(static_cast<unsigned>(queue_depth_), &ring_, 0);
-    if (ret < 0) {
-      throw std::runtime_error("io_uring_queue_init failed: " + std::string(strerror(-ret)));
-    }
-
-    initialized_ = true;
-    pending_requests_.reserve(queue_depth_);
-    LOG_INFO("IOUringEngine initialized with queue_depth={}", queue_depth_);
-  }
-
-  void cleanup_ring() {
-    if (initialized_) {
-      io_uring_queue_exit(&ring_);
-      initialized_ = false;
-    }
+  auto get_ring() -> struct io_uring * {
+    tl_ring_.init(queue_depth_);
+    return tl_ring_.initialized ? &tl_ring_.ring : nullptr;
   }
 
   auto submit_batch(int fd, std::span<IORequest> requests, bool is_write) -> size_t {
-    if (!initialized_ || requests.empty()) {
+    auto *ring = get_ring();
+    if (ring == nullptr || requests.empty()) {
       return 0;
     }
 
     size_t prepared = 0;
 
     for (auto &req : requests) {
-      struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_);
+      struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
       if (sqe == nullptr) {
         // SQ full, submit what we have and try to get more
-        int submitted = io_uring_submit(&ring_);
+        int submitted = io_uring_submit(ring);
         if (submitted < 0) {
           LOG_ERROR("io_uring_submit failed: {}", strerror(-submitted));
           break;
         }
 
-        sqe = io_uring_get_sqe(&ring_);
+        sqe = io_uring_get_sqe(ring);
         if (sqe == nullptr) {
           LOG_WARN("io_uring SQ still full after submit");
           break;
@@ -210,7 +227,7 @@ class IOUringEngine final : public IOEngine {
     }
 
     if (prepared > 0) {
-      int submitted = io_uring_submit(&ring_);
+      int submitted = io_uring_submit(ring);
       if (submitted < 0) {
         LOG_ERROR("io_uring_submit failed: {}", strerror(-submitted));
         return 0;
@@ -221,18 +238,18 @@ class IOUringEngine final : public IOEngine {
     return 0;
   }
 
-  void process_cqe(struct io_uring_cqe *cqe) {
+  static void process_cqe(struct io_uring_cqe *cqe) {
     auto *req = static_cast<IORequest *>(io_uring_cqe_get_data(cqe));
     if (req != nullptr) {
       req->result_ = cqe->res;
     }
   }
 
-  void drain_completions(size_t &completed) {
+  static void drain_completions(struct io_uring *ring, size_t &completed) {
     struct io_uring_cqe *cqe = nullptr;
-    while (io_uring_peek_cqe(&ring_, &cqe) == 0) {
+    while (io_uring_peek_cqe(ring, &cqe) == 0) {
       process_cqe(cqe);
-      io_uring_cqe_seen(&ring_, cqe);
+      io_uring_cqe_seen(ring, cqe);
       ++completed;
     }
   }

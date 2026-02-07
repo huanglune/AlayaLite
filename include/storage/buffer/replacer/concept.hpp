@@ -38,24 +38,13 @@ namespace alaya {
  * - reset(): Clear all state
  */
 template <typename T>
-concept Replacer = requires(T replacer, size_t frame_id) {
-  // Mark a frame as pinned (not evictable)
-  { replacer.pin(frame_id) } -> std::same_as<void>;
-
-  // Mark a frame as unpinned (evictable)
-  { replacer.unpin(frame_id) } -> std::same_as<void>;
-
-  // Select and remove a victim frame for eviction
-  { replacer.evict() } -> std::same_as<std::optional<size_t>>;
-
-  // Remove a specific frame from the replacer
-  { replacer.remove(frame_id) } -> std::same_as<void>;
-
-  // Get the number of evictable frames
-  { replacer.size() } -> std::same_as<size_t>;
-
-  // Reset the replacer to initial state
-  { replacer.reset() } -> std::same_as<void>;
+concept ReplacerStrategy = requires(T r, size_t frame_id) {
+  { r.pin(frame_id) } -> std::same_as<void>;
+  { r.unpin(frame_id) } -> std::same_as<void>;
+  { r.evict() } -> std::same_as<std::optional<size_t>>;
+  { r.remove(frame_id) } -> std::same_as<void>;
+  { r.size() } -> std::same_as<size_t>;
+  { r.reset() } -> std::same_as<void>;
 };
 
 }  // namespace alaya
