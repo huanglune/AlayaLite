@@ -58,9 +58,9 @@ struct CandidateList {
     if (static_cast<size_t>(lo) < cur_) {
       cur_ = lo;
     }
-    for (size_t i = 0; i < size_; i++) {
-      // LOG_INFO("i {} ,dist is {}", data_[i].id_, data_[i].distance_);
-    }
+    // for (size_t i = 0; i < size_; i++) {
+    //   LOG_INFO("i {} ,dist is {}", data_[i].id_, data_[i].distance_);
+    // }
     // LOG_INFO("cur is {} , size {}", cur_, size_);
     return true;
   }
@@ -99,6 +99,21 @@ struct CandidateList {
   void set_checked(IDType &id) { id |= 1 << 31; }
   auto is_checked(IDType id) -> bool { return (id >> 31 & 1) != 0; }
   auto is_full() -> bool { return size_ == capacity_; }
+
+  void clear() {
+    size_ = 0;
+    cur_ = 0;
+  }
+
+  void resize(size_t new_capacity) {
+    capacity_ = new_capacity;
+    if (data_.size() < capacity_ + 1) {
+      data_.resize(capacity_ + 1);
+    }
+    size_ = 0;
+    cur_ = 0;
+  }
+
   auto to_search_result(size_t topk = static_cast<size_t>(-1)) -> SearchResultType {
     size_t effective_topk = (topk == static_cast<size_t>(-1)) ? size_ : topk;
     SearchResultType result(effective_topk);

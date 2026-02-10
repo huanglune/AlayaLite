@@ -65,8 +65,7 @@ class DiskANNStorage {
  public:
   using BufferPoolType = BufferPool<IDType, ReplacerType>;
   using DataFileType = DataFile<DataType, IDType, ReplacerType>;
-  using Viewer = typename DataFileType::Viewer;
-  using Editor = typename DataFileType::Editor;
+  using NodeRef = typename DataFileType::NodeRef;
 
   ALAYA_NON_COPYABLE_BUT_MOVABLE(DiskANNStorage);
 
@@ -119,17 +118,20 @@ class DiskANNStorage {
 
     base_path_ = std::string(base_path);
 
-    // Create metadata file
+    // Create metadata file (may round up capacity for bitmap alignment)
     meta_.create(meta_path(base_path), capacity, dim, max_degree, metric_type, data_type);
+
+    // Use MetaFile's actual capacity (rounded up) for data/PQ files
+    uint32_t actual_capacity = meta_.capacity();
 
     // Create PQ file if enabled
     if (num_pq_subspaces > 0) {
-      pq_.create(pq_path(base_path), dim, num_pq_subspaces, capacity);
+      pq_.create(pq_path(base_path), dim, num_pq_subspaces, actual_capacity);
       pq_enabled_ = true;
     }
 
     // Create data file
-    data_.create(data_path(base_path), capacity, dim, max_degree);
+    data_.create(data_path(base_path), actual_capacity, dim, max_degree);
 
     is_open_ = true;
   }
@@ -225,6 +227,9 @@ class DiskANNStorage {
   [[nodiscard]] auto max_degree() const -> uint32_t { return meta_.max_degree(); }
   [[nodiscard]] auto entry_point() const -> uint32_t { return meta_.entry_point(); }
   [[nodiscard]] auto num_active() const -> uint64_t { return meta_.num_active_points(); }
+  [[nodiscard]] auto num_points() const -> uint32_t {
+    return static_cast<uint32_t>(meta_.num_active_points());
+  }
   [[nodiscard]] auto metric_type() const -> uint32_t { return meta_.header().metric_type_; }
 
   // -------------------------------------------------------------------------
@@ -263,27 +268,11 @@ class DiskANNStorage {
   // -------------------------------------------------------------------------
   // Node operations (visitor pattern) — operate on internal slot IDs
   // -------------------------------------------------------------------------
-
   /**
-   * @brief Read-only access to a node via visitor callback.
-   *
-   * @param internal_slot Internal disk slot ID
-   * @param visitor Callback receiving a const Viewer&
+   * @brief Get NodeRef
    */
-  template <typename Func>
-  void inspect_node(uint32_t internal_slot, Func &&visitor) const {
-    data_.inspect_node(internal_slot, std::forward<Func>(visitor));
-  }
-
-  /**
-   * @brief Read-write access to a node via modifier callback.
-   *
-   * @param internal_slot Internal disk slot ID
-   * @param modifier Callback receiving an Editor&
-   */
-  template <typename Func>
-  void modify_node(uint32_t internal_slot, Func &&modifier) {
-    data_.modify_node(internal_slot, std::forward<Func>(modifier));
+  [[nodiscard]] auto get_node(uint32_t internal_slot) -> NodeRef {
+    return data_.get_node(internal_slot);
   }
 
   // -------------------------------------------------------------------------
@@ -302,134 +291,31 @@ class DiskANNStorage {
    *
    * @return Internal slot ID, or -1 if full
    */
-  [[nodiscard]] auto allocate_node() -> int32_t { return meta_.allocate_slot(); }
-
-  /**
-   * @brief Insert a new node with user-specified external ID.
-   *
-   * Allocates an internal disk slot, creates the external→internal mapping,
-   * and writes vector/neighbors to disk.
-   *
-   * @param external_id User-specified external ID (must be < capacity)
-   * @param vector Vector data (dim elements)
-   * @param neighbors Neighbor IDs (internal slot IDs)
-   * @param pq_code PQ code (M bytes, nullptr if PQ disabled)
-   * @return Allocated internal slot ID, or -1 if full
-   */
-  auto insert_node(IDType external_id,
-                   std::span<const DataType> vector,
-                   std::span<const IDType> neighbors,
-                   const uint8_t *pq_code = nullptr) -> int32_t {
-    // Allocate internal slot
-    int32_t internal_slot = meta_.allocate_slot();
-
-    // Create external <-> internal mapping
-    meta_.insert_mapping(static_cast<uint32_t>(external_id), static_cast<uint32_t>(internal_slot));
-
-    // Write vector and neighbors atomically
-    data_.modify_node(static_cast<uint32_t>(internal_slot), [&](Editor &editor) -> void {
-      editor.set_vector(vector);
-      editor.set_neighbors(neighbors);
-    });
-
-    // Write PQ code if enabled
-    if (pq_enabled_ && pq_code != nullptr) {
-      pq_.update_code(static_cast<uint64_t>(internal_slot), pq_code);
-    }
-
-    return internal_slot;
-  }
-
-  /**
-   * @brief Delete a node by external ID (soft delete).
-   *
-   * @param external_id External ID to delete
-   */
-  void delete_node(IDType external_id) {
-    uint32_t internal_slot = meta_.resolve(static_cast<uint32_t>(external_id));
-    if (internal_slot == kInvalidMapping) {
-      return;  // Not mapped
-    }
-
-    if (!meta_.is_valid(internal_slot)) {
-      return;  // Already deleted
-    }
-
-    meta_.set_invalid(internal_slot);
-    meta_.remove_mapping(static_cast<uint32_t>(external_id));
-    // Note: PQ codes and data are not physically removed (tombstone approach)
-  }
-
-  /**
-   * @brief Update a node's neighbors by internal slot.
-   *
-   * @param internal_slot Internal slot ID
-   * @param neighbors New neighbor IDs (internal slot IDs)
-   */
-  void update_neighbors(uint32_t internal_slot, std::span<const IDType> neighbors) {
-    if (!meta_.is_valid(internal_slot)) {
-      throw std::runtime_error("Cannot update deleted node");
-    }
-    data_.write_neighbors(internal_slot, neighbors);
-  }
-
-  /**
-   * @brief Read a node's vector by internal slot.
-   */
-  void read_vector(uint32_t internal_slot, std::span<DataType> buffer) const {
-    data_.read_vector(internal_slot, buffer);
-  }
-
-  /**
-   * @brief Read a node's neighbors by internal slot.
-   */
-  auto read_neighbors(uint32_t internal_slot, std::span<IDType> buffer) const -> uint32_t {
-    return data_.read_neighbors(internal_slot, buffer);
-  }
+  [[nodiscard]] auto allocate_node_id() -> int32_t { return meta_.allocate_slot(); }
 
   // -------------------------------------------------------------------------
   // PQ operations
   // -------------------------------------------------------------------------
 
-  /**
-   * @brief Write PQ codebook.
-   */
   void write_pq_codebook(const float *codebook) {
     require_pq();
     pq_.write_codebook(codebook);
   }
 
-  /**
-   * @brief Write PQ codes for all vectors.
-   */
   void write_pq_codes(const uint8_t *codes, uint64_t num_vectors) {
     require_pq();
     pq_.write_codes(codes, num_vectors);
   }
 
-  /**
-   * @brief Get PQ code for a vector.
-   */
   [[nodiscard]] auto get_pq_code(uint64_t vector_id) const -> const uint8_t * {
     require_pq();
     return pq_.get_code(vector_id);
   }
 
-  /**
-   * @brief Compute ADC table for a query.
-   */
-  void compute_adc_table(const float *query, float *adc_table) const {
+  [[nodiscard]] auto get_pq_computer(const float *query, std::span<float> scratch) const ->
+      typename PQFile::DistanceComputer {
     require_pq();
-    pq_.compute_adc_table(query, adc_table);
-  }
-
-  /**
-   * @brief Compute approximate distance using ADC table.
-   */
-  [[nodiscard]] auto compute_pq_distance(const float *adc_table, uint64_t vector_id) const
-      -> float {
-    require_pq();
-    return pq_.compute_distance(adc_table, vector_id);
+    return pq_.get_computer(query, scratch);
   }
 
  private:

@@ -18,6 +18,7 @@ include(cmake/Codecov.cmake)
 
 option(ENABLE_COVERAGE "Enable code coverage instrumentation" OFF)
 option(BUILD_TESTING "Build tests" OFF)
+option(BUILD_BENCHMARKS "Build benchmarks" OFF)
 
 # ============================================================================
 # 1. C++ STANDARD AND COMPILER CONFIGURATION
@@ -50,6 +51,9 @@ find_package(spdlog REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenMP REQUIRED)
 find_package(unordered_dense REQUIRED)
+if(BUILD_BENCHMARKS)
+  find_package(benchmark REQUIRED)
+endif()
 
 set(THIRD_PARTY_LIBS
     spdlog::spdlog_header_only
@@ -85,6 +89,10 @@ if(BUILD_TESTING)
   find_package(GTest)
   set(GTEST_LIBS GTest::gtest GTest::gtest_main)
   add_subdirectory(tests)
+endif()
+
+if(BUILD_BENCHMARKS)
+  add_subdirectory(benchmark)
 endif()
 
 add_subdirectory(python)

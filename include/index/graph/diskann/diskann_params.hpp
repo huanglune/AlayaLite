@@ -110,6 +110,8 @@ struct DiskANNSearchParams {
   uint32_t pq_rerank_factor_{4};   ///< Rerank top pq_rerank_factor_ * k candidates
   uint32_t cache_capacity_{4096};  ///< Buffer pool capacity (number of 4KB pages)
   uint32_t beam_width_{4};         ///< Beam width for batched candidate expansion
+  uint32_t pipeline_width_{
+      64};  ///< Number of queries processed concurrently in pipelined batch search
 
   DiskANNSearchParams() = default;
 
@@ -137,6 +139,37 @@ struct DiskANNSearchParams {
   }
 
   auto set_beam_width(uint32_t bw) -> DiskANNSearchParams & {
+    beam_width_ = bw;
+    return *this;
+  }
+
+  auto set_pipeline_width(uint32_t pw) -> DiskANNSearchParams & {
+    pipeline_width_ = pw;
+    return *this;
+  }
+};
+
+/**
+ * @brief Parameters for DiskANN insert operations.
+ */
+struct DiskANNInsertParams {
+  uint32_t ef_construction_{128};  ///< Search budget for finding neighbors
+  float alpha_{1.2F};              ///< Pruning alpha for RobustPrune
+  uint32_t beam_width_{4};         ///< Beam width for disk-based search
+
+  DiskANNInsertParams() = default;
+
+  auto set_ef_construction(uint32_t ef) -> DiskANNInsertParams & {
+    ef_construction_ = ef;
+    return *this;
+  }
+
+  auto set_alpha(float a) -> DiskANNInsertParams & {
+    alpha_ = a;
+    return *this;
+  }
+
+  auto set_beam_width(uint32_t bw) -> DiskANNInsertParams & {
     beam_width_ = bw;
     return *this;
   }

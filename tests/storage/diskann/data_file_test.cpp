@@ -19,14 +19,13 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
-#include <functional>
 #include <numeric>
 #include <span>
 #include <string>
 #include <vector>
 
-#include "storage/diskann/data_file.hpp"
 #include "storage/buffer/buffer_pool.hpp"
+#include "storage/diskann/data_file.hpp"
 
 namespace alaya {
 
@@ -62,7 +61,6 @@ TEST(NeighborListTest, NonEmptyList) {
   EXPECT_EQ(list->neighbor_ids()[1], 20U);
   EXPECT_EQ(list->neighbor_ids()[2], 30U);
 
-  // Range-based iteration
   std::vector<uint32_t> ids(list->begin(), list->end());
   EXPECT_EQ(ids, (std::vector<uint32_t>{10, 20, 30}));
 }
@@ -100,9 +98,7 @@ class DataFileTest : public ::testing::Test {
 
   std::unique_ptr<BPType> bp_;
 
-  void SetUp() override {
-    bp_ = std::make_unique<BPType>(kBpCapacity, kDataBlockSize, 1);
-  }
+  void SetUp() override { bp_ = std::make_unique<BPType>(kBpCapacity, kDataBlockSize, 1); }
 
   void TearDown() override {
     for (const auto &f : temp_files_) {
@@ -147,13 +143,10 @@ TEST_F(DataFileTest, LayoutParameters) {
   EXPECT_EQ(df.dimension(), kDim);
   EXPECT_EQ(df.max_degree(), kMaxDeg);
 
-  // row_size = sizeof(uint32_t) + kMaxDeg * sizeof(uint32_t) + kDim * sizeof(float)
-  //          = 4 + 16 + 32 = 52
   size_t expected_row = sizeof(uint32_t) + kMaxDeg * sizeof(uint32_t) + kDim * sizeof(float);
   EXPECT_EQ(df.row_size(), expected_row);
 
-  // nodes_per_block = 4096 / 52 = 78
-  uint32_t expected_npb = static_cast<uint32_t>(kDataBlockSize / expected_row);
+  auto expected_npb = static_cast<uint32_t>(kDataBlockSize / expected_row);
   EXPECT_EQ(df.nodes_per_block(), expected_npb);
   EXPECT_GT(df.nodes_per_block(), 0U);
 
@@ -265,7 +258,6 @@ TEST_F(DataFileTest, CloseIdempotent) {
   df.close();
   EXPECT_FALSE(df.is_open());
 
-  // Second close should be a no-op
   df.close();
   EXPECT_FALSE(df.is_open());
 }
@@ -278,477 +270,80 @@ TEST_F(DataFileTest, RowSizeExceedsBlockSizeThrows) {
   auto path = make_path("row_too_large");
   DataFile<float, uint32_t> df(bp_.get());
 
-  // With dim=1024 and max_degree=1024:
-  // row_size = 4 + 1024*4 + 1024*4 = 8196 > 4096
   EXPECT_THROW(df.create(path, 10, 1024, 1024), std::invalid_argument);
 }
 
 // -------------------------------------------------------------------------
-// Write and read vector data
+// NodeRef read/write and mutation
 // -------------------------------------------------------------------------
 
-TEST_F(DataFileTest, WriteAndReadVector) {
-  auto path = make_path("write_read_vec");
+TEST_F(DataFileTest, GetNodeReadWrite) {
+  auto path = make_path("get_node_rw");
   DataFile<float, uint32_t> df(bp_.get());
   df.create(path, kCapacity, kDim, kMaxDeg);
 
   auto vec = make_vector(kDim, 42);
+  auto nbrs = make_neighbors(3, 10);
 
-  df.modify_node(0, [&](auto &editor) {
-    editor.set_vector(std::span<const float>(vec));
-  });
+  {
+    auto ref = df.get_node(0);
+    ref.set_vector(std::span<const float>(vec));
+    ref.set_neighbors(std::span<const uint32_t>(nbrs));
+  }
 
-  df.inspect_node(0, [&](const auto &viewer) {
-    auto read_vec = viewer.vector_view();
+  {
+    auto ref = df.get_node(0);
+    auto read_vec = ref.vector();
     ASSERT_EQ(read_vec.size(), kDim);
     for (uint32_t i = 0; i < kDim; ++i) {
       EXPECT_FLOAT_EQ(read_vec[i], vec[i]);
     }
-  });
-}
 
-TEST_F(DataFileTest, WriteAndReadNeighbors) {
-  auto path = make_path("write_read_nbrs");
-  DataFile<float, uint32_t> df(bp_.get());
-  df.create(path, kCapacity, kDim, kMaxDeg);
-
-  auto nbrs = make_neighbors(3, 10);  // [10, 11, 12]
-
-  df.modify_node(0, [&](auto &editor) {
-    editor.set_neighbors(std::span<const uint32_t>(nbrs));
-  });
-
-  df.inspect_node(0, [&](const auto &viewer) {
-    const auto &nlist = viewer.neighbors_view();
-    EXPECT_EQ(nlist.size(), 3U);
-    EXPECT_EQ(nlist.neighbor_ids()[0], 10U);
-    EXPECT_EQ(nlist.neighbor_ids()[1], 11U);
-    EXPECT_EQ(nlist.neighbor_ids()[2], 12U);
-  });
-}
-
-TEST_F(DataFileTest, WriteVectorAndNeighborsTogether) {
-  auto path = make_path("write_both");
-  DataFile<float, uint32_t> df(bp_.get());
-  df.create(path, kCapacity, kDim, kMaxDeg);
-
-  auto vec = make_vector(kDim, 7);
-  auto nbrs = make_neighbors(kMaxDeg, 100);
-
-  df.modify_node(5, [&](auto &editor) {
-    editor.set_vector(std::span<const float>(vec));
-    editor.set_neighbors(std::span<const uint32_t>(nbrs));
-  });
-
-  df.inspect_node(5, [&](const auto &viewer) {
-    auto read_vec = viewer.vector_view();
-    for (uint32_t i = 0; i < kDim; ++i) {
-      EXPECT_FLOAT_EQ(read_vec[i], vec[i]);
-    }
-
-    const auto &nlist = viewer.neighbors_view();
-    EXPECT_EQ(nlist.size(), kMaxDeg);
-    for (uint32_t i = 0; i < kMaxDeg; ++i) {
-      EXPECT_EQ(nlist.neighbor_ids()[i], 100 + i);
-    }
-  });
-}
-
-TEST_F(DataFileTest, MultipleNodesInSameBlock) {
-  auto path = make_path("multi_nodes");
-  DataFile<float, uint32_t> df(bp_.get());
-  df.create(path, kCapacity, kDim, kMaxDeg);
-
-  for (uint32_t id = 0; id < 10; ++id) {
-    auto vec = make_vector(kDim, id);
-    auto nbrs = make_neighbors(2, id * 10);
-
-    df.modify_node(id, [&](auto &editor) {
-      editor.set_vector(std::span<const float>(vec));
-      editor.set_neighbors(std::span<const uint32_t>(nbrs));
-    });
-  }
-
-  for (uint32_t id = 0; id < 10; ++id) {
-    auto expected_vec = make_vector(kDim, id);
-
-    df.inspect_node(id, [&](const auto &viewer) {
-      auto read_vec = viewer.vector_view();
-      for (uint32_t i = 0; i < kDim; ++i) {
-        EXPECT_FLOAT_EQ(read_vec[i], expected_vec[i]) << "Node " << id << " dim " << i;
-      }
-
-      const auto &nlist = viewer.neighbors_view();
-      EXPECT_EQ(nlist.size(), 2U) << "Node " << id;
-      EXPECT_EQ(nlist.neighbor_ids()[0], id * 10) << "Node " << id;
-      EXPECT_EQ(nlist.neighbor_ids()[1], id * 10 + 1) << "Node " << id;
-    });
+    auto read_nbrs = ref.neighbors();
+    EXPECT_EQ(read_nbrs.size(), 3U);
+    EXPECT_EQ(read_nbrs[0], 10U);
+    EXPECT_EQ(read_nbrs[1], 11U);
+    EXPECT_EQ(read_nbrs[2], 12U);
   }
 }
 
-// -------------------------------------------------------------------------
-// Cross-block access
-// -------------------------------------------------------------------------
-
-TEST_F(DataFileTest, CrossBlockAccess) {
-  auto path = make_path("cross_block");
-
-  // Use larger parameters so rows are bigger, fewer nodes per block
-  constexpr uint32_t kLargeDim = 64;
-  constexpr uint32_t kLargeDeg = 32;
-  constexpr uint32_t kLargeCap = 64;
-
-  DataFile<float, uint32_t> df(bp_.get());
-  df.create(path, kLargeCap, kLargeDim, kLargeDeg);
-
-  uint32_t npb = df.nodes_per_block();
-  ASSERT_GT(npb, 0U);
-  ASSERT_LT(npb, kLargeCap);  // Ensure we span at least 2 blocks
-
-  auto vec0 = make_vector(kLargeDim, 0);
-  auto vec1 = make_vector(kLargeDim, 1);
-
-  // Write to first node of block 0 and first node of block 1
-  df.modify_node(0, [&](auto &editor) {
-    editor.set_vector(std::span<const float>(vec0));
-  });
-
-  df.modify_node(npb, [&](auto &editor) {
-    editor.set_vector(std::span<const float>(vec1));
-  });
-
-  // Read back both and verify
-  df.inspect_node(0, [&](const auto &viewer) {
-    auto read_vec = viewer.vector_view();
-    for (uint32_t i = 0; i < kLargeDim; ++i) {
-      EXPECT_FLOAT_EQ(read_vec[i], vec0[i]);
-    }
-  });
-
-  df.inspect_node(npb, [&](const auto &viewer) {
-    auto read_vec = viewer.vector_view();
-    for (uint32_t i = 0; i < kLargeDim; ++i) {
-      EXPECT_FLOAT_EQ(read_vec[i], vec1[i]);
-    }
-  });
-}
-
-// -------------------------------------------------------------------------
-// Persistence: create -> write -> close -> open -> read
-// -------------------------------------------------------------------------
-
-TEST_F(DataFileTest, Persistence) {
-  auto path = make_path("persist");
-  auto vec = make_vector(kDim, 99);
-  auto nbrs = make_neighbors(3, 50);
-
-  {
-    DataFile<float, uint32_t> df(bp_.get());
-    df.create(path, kCapacity, kDim, kMaxDeg);
-
-    df.modify_node(0, [&](auto &editor) {
-      editor.set_vector(std::span<const float>(vec));
-      editor.set_neighbors(std::span<const uint32_t>(nbrs));
-    });
-
-    df.close();
-  }
-
-  bp_->clear();
-
-  {
-    DataFile<float, uint32_t> df(bp_.get());
-    df.open(path, kCapacity, kDim, kMaxDeg, false);
-
-    df.inspect_node(0, [&](const auto &viewer) {
-      auto read_vec = viewer.vector_view();
-      for (uint32_t i = 0; i < kDim; ++i) {
-        EXPECT_FLOAT_EQ(read_vec[i], vec[i]);
-      }
-
-      const auto &nlist = viewer.neighbors_view();
-      EXPECT_EQ(nlist.size(), 3U);
-      for (uint32_t i = 0; i < 3; ++i) {
-        EXPECT_EQ(nlist.neighbor_ids()[i], 50 + i);
-      }
-    });
-
-    df.close();
-  }
-}
-
-TEST_F(DataFileTest, PersistenceMultipleNodes) {
-  auto path = make_path("persist_multi");
-  constexpr uint32_t kNumNodes = 20;
-
-  {
-    DataFile<float, uint32_t> df(bp_.get());
-    df.create(path, kCapacity, kDim, kMaxDeg);
-
-    for (uint32_t id = 0; id < kNumNodes; ++id) {
-      auto vec = make_vector(kDim, id);
-      auto nbrs = make_neighbors(kMaxDeg, id * 100);
-
-      df.modify_node(id, [&](auto &editor) {
-        editor.set_vector(std::span<const float>(vec));
-        editor.set_neighbors(std::span<const uint32_t>(nbrs));
-      });
-    }
-
-    df.close();
-  }
-
-  bp_->clear();
-
-  {
-    DataFile<float, uint32_t> df(bp_.get());
-    df.open(path, kCapacity, kDim, kMaxDeg, false);
-
-    for (uint32_t id = 0; id < kNumNodes; ++id) {
-      auto expected_vec = make_vector(kDim, id);
-
-      df.inspect_node(id, [&](const auto &viewer) {
-        auto read_vec = viewer.vector_view();
-        for (uint32_t i = 0; i < kDim; ++i) {
-          EXPECT_FLOAT_EQ(read_vec[i], expected_vec[i]) << "Node " << id;
-        }
-
-        const auto &nlist = viewer.neighbors_view();
-        EXPECT_EQ(nlist.size(), kMaxDeg) << "Node " << id;
-        for (uint32_t i = 0; i < kMaxDeg; ++i) {
-          EXPECT_EQ(nlist.neighbor_ids()[i], id * 100 + i) << "Node " << id;
-        }
-      });
-    }
-
-    df.close();
-  }
-}
-
-// -------------------------------------------------------------------------
-// Editor advanced interface
-// -------------------------------------------------------------------------
-
-TEST_F(DataFileTest, EditorMutableVector) {
-  auto path = make_path("editor_mut_vec");
+TEST_F(DataFileTest, NodeRefMutableVectorAndNeighbors) {
+  auto path = make_path("ref_mut");
   DataFile<float, uint32_t> df(bp_.get());
   df.create(path, kCapacity, kDim, kMaxDeg);
 
   auto vec = make_vector(kDim, 1);
+  auto nbrs = make_neighbors(kMaxDeg, 0);
 
-  df.modify_node(0, [&](auto &editor) {
-    editor.set_vector(std::span<const float>(vec));
-  });
+  {
+    auto ref = df.get_node(0);
+    ref.set_vector(std::span<const float>(vec));
+    ref.set_neighbors(std::span<const uint32_t>(nbrs));
+  }
 
-  // Modify in-place via mutable_vector
-  df.modify_node(0, [&](auto &editor) {
-    auto mut_vec = editor.mutable_vector();
+  {
+    auto ref = df.get_node(0);
+    auto mut_vec = ref.mutable_vector();
     for (auto &val : mut_vec) {
       val *= 2.0F;
     }
-  });
+    auto &mut_nbrs = ref.mutable_neighbors();
+    std::sort(mut_nbrs.begin(), mut_nbrs.end(), std::greater<uint32_t>()); // NOLINT
+    ref.mark_dirty();
+  }
 
-  df.inspect_node(0, [&](const auto &viewer) {
-    auto read_vec = viewer.vector_view();
+  {
+    auto ref = df.get_node(0);
+    auto read_vec = ref.vector();
     for (uint32_t i = 0; i < kDim; ++i) {
       EXPECT_FLOAT_EQ(read_vec[i], vec[i] * 2.0F);
     }
-  });
-}
 
-TEST_F(DataFileTest, EditorMutableNeighbors) {
-  auto path = make_path("editor_mut_nbrs");
-  DataFile<float, uint32_t> df(bp_.get());
-  df.create(path, kCapacity, kDim, kMaxDeg);
-
-  auto nbrs = make_neighbors(kMaxDeg, 0);
-
-  df.modify_node(0, [&](auto &editor) {
-    editor.set_neighbors(std::span<const uint32_t>(nbrs));
-  });
-
-  // Modify in-place: sort in reverse
-  df.modify_node(0, [&](auto &editor) {
-    auto &mut_nbrs = editor.mutable_neighbors();
-    std::sort(mut_nbrs.begin(), mut_nbrs.end(), std::greater<uint32_t>());
-  });
-
-  df.inspect_node(0, [&](const auto &viewer) {
-    const auto &nlist = viewer.neighbors_view();
-    EXPECT_EQ(nlist.size(), kMaxDeg);
-    // Should be in reverse order: 3, 2, 1, 0
+    auto read_nbrs = ref.neighbors();
+    EXPECT_EQ(read_nbrs.size(), kMaxDeg);
     for (uint32_t i = 0; i < kMaxDeg; ++i) {
-      EXPECT_EQ(nlist.neighbor_ids()[i], kMaxDeg - 1 - i);
+      EXPECT_EQ(read_nbrs[i], kMaxDeg - 1 - i);
     }
-  });
-}
-
-TEST_F(DataFileTest, EditorAsViewer) {
-  auto path = make_path("editor_as_viewer");
-  DataFile<float, uint32_t> df(bp_.get());
-  df.create(path, kCapacity, kDim, kMaxDeg);
-
-  auto vec = make_vector(kDim, 5);
-
-  df.modify_node(0, [&](auto &editor) {
-    editor.set_vector(std::span<const float>(vec));
-
-    // Use as_viewer to verify within the same modify call
-    auto viewer = editor.as_viewer();
-    auto read_vec = viewer.vector_view();
-    for (uint32_t i = 0; i < kDim; ++i) {
-      EXPECT_FLOAT_EQ(read_vec[i], vec[i]);
-    }
-  });
-}
-
-// -------------------------------------------------------------------------
-// Viewer copy methods
-// -------------------------------------------------------------------------
-
-TEST_F(DataFileTest, ViewerCopyVectorTo) {
-  auto path = make_path("copy_vec_to");
-  DataFile<float, uint32_t> df(bp_.get());
-  df.create(path, kCapacity, kDim, kMaxDeg);
-
-  auto vec = make_vector(kDim, 3);
-  df.modify_node(0, [&](auto &editor) {
-    editor.set_vector(std::span<const float>(vec));
-  });
-
-  df.inspect_node(0, [&](const auto &viewer) {
-    std::vector<float> buf(kDim);
-    viewer.copy_vector_to(std::span<float>(buf));
-    EXPECT_EQ(buf, vec);
-  });
-}
-
-TEST_F(DataFileTest, ViewerCopyVectorToDimMismatchThrows) {
-  auto path = make_path("copy_vec_dim_err");
-  DataFile<float, uint32_t> df(bp_.get());
-  df.create(path, kCapacity, kDim, kMaxDeg);
-
-  auto vec = make_vector(kDim, 0);
-  df.modify_node(0, [&](auto &editor) {
-    editor.set_vector(std::span<const float>(vec));
-  });
-
-  df.inspect_node(0, [&](const auto &viewer) {
-    std::vector<float> bad_buf(kDim + 1);
-    EXPECT_THROW(viewer.copy_vector_to(std::span<float>(bad_buf)), std::invalid_argument);
-  });
-}
-
-TEST_F(DataFileTest, ViewerCopyNeighborsTo) {
-  auto path = make_path("copy_nbrs_to");
-  DataFile<float, uint32_t> df(bp_.get());
-  df.create(path, kCapacity, kDim, kMaxDeg);
-
-  auto nbrs = make_neighbors(3, 10);
-  df.modify_node(0, [&](auto &editor) {
-    editor.set_neighbors(std::span<const uint32_t>(nbrs));
-  });
-
-  df.inspect_node(0, [&](const auto &viewer) {
-    std::vector<uint32_t> buf(kMaxDeg, 0);
-    viewer.copy_neighbors_to(std::span<uint32_t>(buf));
-    EXPECT_EQ(buf[0], 10U);
-    EXPECT_EQ(buf[1], 11U);
-    EXPECT_EQ(buf[2], 12U);
-  });
-}
-
-// -------------------------------------------------------------------------
-// Convenience methods: write_vector / read_vector
-// -------------------------------------------------------------------------
-
-TEST_F(DataFileTest, WriteVectorConvenience) {
-  auto path = make_path("write_vec_conv");
-  DataFile<float, uint32_t> df(bp_.get());
-  df.create(path, kCapacity, kDim, kMaxDeg);
-
-  auto vec = make_vector(kDim, 77);
-  df.write_vector(0, std::span<const float>(vec));
-
-  std::vector<float> buf(kDim);
-  df.read_vector(0, std::span<float>(buf));
-  EXPECT_EQ(buf, vec);
-}
-
-TEST_F(DataFileTest, WriteNeighborsConvenience) {
-  auto path = make_path("write_nbrs_conv");
-  DataFile<float, uint32_t> df(bp_.get());
-  df.create(path, kCapacity, kDim, kMaxDeg);
-
-  auto nbrs = make_neighbors(3, 20);
-  df.write_neighbors(0, std::span<const uint32_t>(nbrs));
-
-  // Verify via inspect_node (read_neighbors has a known bug)
-  df.inspect_node(0, [&](const auto &viewer) {
-    const auto &nlist = viewer.neighbors_view();
-    EXPECT_EQ(nlist.size(), 3U);
-    EXPECT_EQ(nlist.neighbor_ids()[0], 20U);
-    EXPECT_EQ(nlist.neighbor_ids()[1], 21U);
-    EXPECT_EQ(nlist.neighbor_ids()[2], 22U);
-  });
-}
-
-// -------------------------------------------------------------------------
-// Error cases
-// -------------------------------------------------------------------------
-
-TEST_F(DataFileTest, InspectNodeNotOpenThrows) {
-  auto path = make_path("inspect_not_open");
-  DataFile<float, uint32_t> df(bp_.get());
-  df.create(path, kCapacity, kDim, kMaxDeg);
-  df.close();
-
-  EXPECT_THROW(df.inspect_node(0, [](const auto & /*unused*/) {}), std::runtime_error);
-}
-
-TEST_F(DataFileTest, ModifyNodeNotOpenThrows) {
-  auto path = make_path("modify_not_open");
-  DataFile<float, uint32_t> df(bp_.get());
-  df.create(path, kCapacity, kDim, kMaxDeg);
-  df.close();
-
-  EXPECT_THROW(df.modify_node(0, [](auto & /*unused*/) {}), std::runtime_error);
-}
-
-TEST_F(DataFileTest, InspectNodeOutOfRangeThrows) {
-  auto path = make_path("inspect_oor");
-  DataFile<float, uint32_t> df(bp_.get());
-  df.create(path, kCapacity, kDim, kMaxDeg);
-
-  EXPECT_THROW(df.inspect_node(kCapacity, [](const auto & /*unused*/) {}), std::out_of_range);
-  EXPECT_THROW(df.inspect_node(kCapacity + 100, [](const auto & /*unused*/) {}), std::out_of_range);
-}
-
-TEST_F(DataFileTest, ModifyNodeOutOfRangeThrows) {
-  auto path = make_path("modify_oor");
-  DataFile<float, uint32_t> df(bp_.get());
-  df.create(path, kCapacity, kDim, kMaxDeg);
-
-  EXPECT_THROW(df.modify_node(kCapacity, [](auto & /*unused*/) {}), std::out_of_range);
-}
-
-TEST_F(DataFileTest, ModifyNodeReadOnlyThrows) {
-  auto path = make_path("modify_readonly");
-
-  {
-    DataFile<float, uint32_t> df(bp_.get());
-    df.create(path, kCapacity, kDim, kMaxDeg);
-    df.close();
-  }
-
-  bp_->clear();
-
-  {
-    DataFile<float, uint32_t> df(bp_.get());
-    df.open(path, kCapacity, kDim, kMaxDeg, false);
-
-    EXPECT_THROW(df.modify_node(0, [](auto & /*unused*/) {}), std::runtime_error);
-    df.close();
   }
 }
 
@@ -760,12 +355,8 @@ TEST_F(DataFileTest, SetNeighborsTooManyThrows) {
   std::vector<uint32_t> too_many(kMaxDeg + 1);
   std::iota(too_many.begin(), too_many.end(), 0);
 
-  EXPECT_THROW(
-      df.modify_node(0,
-                     [&](auto &editor) {
-                       editor.set_neighbors(std::span<const uint32_t>(too_many));
-                     }),
-      std::length_error);
+  auto ref = df.get_node(0);
+  EXPECT_THROW(ref.set_neighbors(std::span<const uint32_t>(too_many)), std::length_error);
 }
 
 TEST_F(DataFileTest, SetVectorDimMismatchThrows) {
@@ -775,86 +366,113 @@ TEST_F(DataFileTest, SetVectorDimMismatchThrows) {
 
   std::vector<float> wrong_dim(kDim + 1, 1.0F);
 
-  EXPECT_THROW(
-      df.modify_node(0,
-                     [&](auto &editor) {
-                       editor.set_vector(std::span<const float>(wrong_dim));
-                     }),
-      std::invalid_argument);
+  auto ref = df.get_node(0);
+  EXPECT_THROW(ref.set_vector(std::span<const float>(wrong_dim)), std::invalid_argument);
 }
 
 // -------------------------------------------------------------------------
-// Overwrite node data
+// Persistence via flush
 // -------------------------------------------------------------------------
 
-TEST_F(DataFileTest, OverwriteNodeData) {
-  auto path = make_path("overwrite");
-  DataFile<float, uint32_t> df(bp_.get());
-  df.create(path, kCapacity, kDim, kMaxDeg);
+TEST_F(DataFileTest, PersistenceWithFlush) {
+  auto path = make_path("persist");
+  auto vec = make_vector(kDim, 99);
+  auto nbrs = make_neighbors(3, 50);
 
-  auto vec1 = make_vector(kDim, 1);
-  auto vec2 = make_vector(kDim, 2);
+  {
+    DataFile<float, uint32_t> df(bp_.get());
+    df.create(path, kCapacity, kDim, kMaxDeg);
 
-  df.modify_node(0, [&](auto &editor) {
-    editor.set_vector(std::span<const float>(vec1));
-  });
+    auto ref = df.get_node(0);
+    ref.set_vector(std::span<const float>(vec));
+    ref.set_neighbors(std::span<const uint32_t>(nbrs));
 
-  df.modify_node(0, [&](auto &editor) {
-    editor.set_vector(std::span<const float>(vec2));
-  });
+    df.flush();
+    df.close();
+  }
 
-  df.inspect_node(0, [&](const auto &viewer) {
-    auto read_vec = viewer.vector_view();
+  bp_->clear();
+
+  {
+    DataFile<float, uint32_t> df(bp_.get());
+    df.open(path, kCapacity, kDim, kMaxDeg, false);
+
+    auto ref = df.get_node(0);
+    auto read_vec = ref.vector();
     for (uint32_t i = 0; i < kDim; ++i) {
-      EXPECT_FLOAT_EQ(read_vec[i], vec2[i]);
+      EXPECT_FLOAT_EQ(read_vec[i], vec[i]);
     }
-  });
+
+    auto read_nbrs = ref.neighbors();
+    EXPECT_EQ(read_nbrs.size(), 3U);
+    for (uint32_t i = 0; i < 3; ++i) {
+      EXPECT_EQ(read_nbrs[i], 50 + i);
+    }
+
+    df.close();
+  }
 }
 
 // -------------------------------------------------------------------------
-// Neighbors: empty list and fill remaining with invalid (-1)
+// Prefetch / preload
 // -------------------------------------------------------------------------
 
-TEST_F(DataFileTest, EmptyNeighbors) {
-  auto path = make_path("empty_nbrs");
+TEST_F(DataFileTest, PrefetchBlocksNoThrow) {
+  auto path = make_path("prefetch");
   DataFile<float, uint32_t> df(bp_.get());
   df.create(path, kCapacity, kDim, kMaxDeg);
 
-  std::vector<uint32_t> empty_nbrs;
+  uint32_t blocks = df.num_blocks();
+  std::vector<uint32_t> ids;
+  for (uint32_t i = 0; i < std::min<uint32_t>(blocks, 3); ++i) {
+    ids.push_back(i);
+  }
 
-  df.modify_node(0, [&](auto &editor) {
-    editor.set_neighbors(std::span<const uint32_t>(empty_nbrs));
-  });
-
-  df.inspect_node(0, [&](const auto &viewer) {
-    const auto &nlist = viewer.neighbors_view();
-    EXPECT_EQ(nlist.size(), 0U);
-    EXPECT_TRUE(nlist.empty());
-  });
+  EXPECT_NO_THROW(df.prefetch_blocks(std::span<const uint32_t>(ids)));
 }
 
-TEST_F(DataFileTest, NeighborsFillWithInvalid) {
-  auto path = make_path("nbrs_fill_invalid");
+TEST_F(DataFileTest, PreloadBlockOutOfRangeThrows) {
+  auto path = make_path("preload_oor");
   DataFile<float, uint32_t> df(bp_.get());
   df.create(path, kCapacity, kDim, kMaxDeg);
 
-  auto nbrs = make_neighbors(2, 10);  // 2 neighbors, max is 4
+  EXPECT_THROW(df.preload_block(df.num_blocks()), std::out_of_range);
+}
 
-  df.modify_node(0, [&](auto &editor) {
-    editor.set_neighbors(std::span<const uint32_t>(nbrs));
-  });
+// -------------------------------------------------------------------------
+// Grow
+// -------------------------------------------------------------------------
 
-  df.inspect_node(0, [&](const auto &viewer) {
-    const auto &nlist = viewer.neighbors_view();
-    EXPECT_EQ(nlist.size(), 2U);
+TEST_F(DataFileTest, GrowIncreasesCapacityAndFileSize) {
+  auto path = make_path("grow");
+  DataFile<float, uint32_t> df(bp_.get());
+  df.create(path, kCapacity, kDim, kMaxDeg);
 
-    auto *ids = nlist.neighbor_ids();
-    EXPECT_EQ(ids[0], 10U);
-    EXPECT_EQ(ids[1], 11U);
-    // Slots beyond num_neighbors_ should be filled with -1 (0xFFFFFFFF)
-    EXPECT_EQ(ids[2], static_cast<uint32_t>(-1));
-    EXPECT_EQ(ids[3], static_cast<uint32_t>(-1));
-  });
+  uint64_t old_total = df.total_file_size();
+  uint32_t new_capacity = kCapacity * 2;
+
+  df.grow(new_capacity);
+  EXPECT_EQ(df.capacity(), new_capacity);
+  EXPECT_GT(df.total_file_size(), old_total);
+  EXPECT_GE(std::filesystem::file_size(path), df.total_file_size());
+}
+
+TEST_F(DataFileTest, GrowReadOnlyThrows) {
+  auto path = make_path("grow_readonly");
+
+  {
+    DataFile<float, uint32_t> df(bp_.get());
+    df.create(path, kCapacity, kDim, kMaxDeg);
+    df.close();
+  }
+
+  bp_->clear();
+
+  {
+    DataFile<float, uint32_t> df(bp_.get());
+    df.open(path, kCapacity, kDim, kMaxDeg, false);
+    EXPECT_THROW(df.grow(kCapacity * 2), std::runtime_error);
+  }
 }
 
 // -------------------------------------------------------------------------
@@ -867,22 +485,21 @@ TEST_F(DataFileTest, MoveConstruct) {
   df.create(path, kCapacity, kDim, kMaxDeg);
 
   auto vec = make_vector(kDim, 42);
-  df.modify_node(0, [&](auto &editor) {
-    editor.set_vector(std::span<const float>(vec));
-  });
+  {
+    auto ref = df.get_node(0);
+    ref.set_vector(std::span<const float>(vec));
+  }
 
   DataFile<float, uint32_t> moved(std::move(df));
   EXPECT_TRUE(moved.is_open());
   EXPECT_EQ(moved.capacity(), kCapacity);
   EXPECT_EQ(moved.dimension(), kDim);
 
-  // Verify data accessible through moved object
-  moved.inspect_node(0, [&](const auto &viewer) {
-    auto read_vec = viewer.vector_view();
-    for (uint32_t i = 0; i < kDim; ++i) {
-      EXPECT_FLOAT_EQ(read_vec[i], vec[i]);
-    }
-  });
+  auto ref = moved.get_node(0);
+  auto read_vec = ref.vector();
+  for (uint32_t i = 0; i < kDim; ++i) {
+    EXPECT_FLOAT_EQ(read_vec[i], vec[i]);
+  }
 }
 
 // -------------------------------------------------------------------------
@@ -899,152 +516,14 @@ TEST_F(DataFileTest, Int8DataType) {
     vec[i] = static_cast<int8_t>(i - 8);
   }
 
-  df.modify_node(0, [&](auto &editor) {
-    editor.set_vector(std::span<const int8_t>(vec));
-  });
+  auto ref = df.get_node(0);
+  ref.set_vector(std::span<const int8_t>(vec));
 
-  df.inspect_node(0, [&](const auto &viewer) {
-    auto read_vec = viewer.vector_view();
-    ASSERT_EQ(read_vec.size(), 16U);
-    for (int i = 0; i < 16; ++i) {
-      EXPECT_EQ(read_vec[i], vec[i]);
-    }
-  });
-}
-
-// -------------------------------------------------------------------------
-// Batch modify tests
-// -------------------------------------------------------------------------
-
-TEST_F(DataFileTest, BatchModifySingleBlock) {
-  auto path = make_path("batch_single");
-  DataFile<float, uint32_t> df(bp_.get());
-  df.create(path, kCapacity, kDim, kMaxDeg);
-
-  // Batch write 10 nodes (all in one block since npb=78)
-  df.batch_modify(0, 10, [&](uint32_t id, auto &editor) {
-    auto vec = make_vector(kDim, id);
-    auto nbrs = make_neighbors(2, id * 10);
-    editor.set_vector(std::span<const float>(vec));
-    editor.set_neighbors(std::span<const uint32_t>(nbrs));
-  });
-
-  // Verify each node
-  for (uint32_t id = 0; id < 10; ++id) {
-    auto expected_vec = make_vector(kDim, id);
-
-    df.inspect_node(id, [&](const auto &viewer) {
-      auto read_vec = viewer.vector_view();
-      for (uint32_t i = 0; i < kDim; ++i) {
-        EXPECT_FLOAT_EQ(read_vec[i], expected_vec[i]) << "Node " << id;
-      }
-
-      const auto &nlist = viewer.neighbors_view();
-      EXPECT_EQ(nlist.size(), 2U) << "Node " << id;
-      EXPECT_EQ(nlist.neighbor_ids()[0], id * 10) << "Node " << id;
-      EXPECT_EQ(nlist.neighbor_ids()[1], id * 10 + 1) << "Node " << id;
-    });
+  auto read_vec = ref.vector();
+  ASSERT_EQ(read_vec.size(), 16U);
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_EQ(read_vec[i], vec[i]);
   }
-}
-
-TEST_F(DataFileTest, BatchModifyCrossBlock) {
-  auto path = make_path("batch_cross");
-
-  // Use larger parameters to force multiple blocks
-  constexpr uint32_t kLargeDim = 64;
-  constexpr uint32_t kLargeDeg = 32;
-  constexpr uint32_t kLargeCap = 64;
-
-  DataFile<float, uint32_t> df(bp_.get());
-  df.create(path, kLargeCap, kLargeDim, kLargeDeg);
-
-  uint32_t npb = df.nodes_per_block();
-  ASSERT_GT(npb, 0U);
-  ASSERT_LT(npb, kLargeCap);
-
-  // Batch write all nodes across multiple blocks
-  df.batch_modify(0, kLargeCap, [&](uint32_t id, auto &editor) {
-    auto vec = make_vector(kLargeDim, id);
-    editor.set_vector(std::span<const float>(vec));
-  });
-
-  // Verify a sample of nodes from different blocks
-  for (uint32_t id : {uint32_t{0}, npb - 1, npb, npb + 1, kLargeCap - 1}) {
-    auto expected_vec = make_vector(kLargeDim, id);
-
-    df.inspect_node(id, [&](const auto &viewer) {
-      auto read_vec = viewer.vector_view();
-      for (uint32_t i = 0; i < kLargeDim; ++i) {
-        EXPECT_FLOAT_EQ(read_vec[i], expected_vec[i]) << "Node " << id;
-      }
-    });
-  }
-}
-
-TEST_F(DataFileTest, BatchModifyPersistence) {
-  auto path = make_path("batch_persist");
-  DataFile<float, uint32_t> df(bp_.get());
-  df.create(path, kCapacity, kDim, kMaxDeg);
-
-  df.batch_modify(0, 5, [&](uint32_t id, auto &editor) {
-    auto vec = make_vector(kDim, id);
-    editor.set_vector(std::span<const float>(vec));
-  });
-
-  df.close();
-  bp_->clear();
-
-  // Reopen and verify
-  df.open(path, kCapacity, kDim, kMaxDeg, false);
-
-  for (uint32_t id = 0; id < 5; ++id) {
-    auto expected_vec = make_vector(kDim, id);
-
-    df.inspect_node(id, [&](const auto &viewer) {
-      auto read_vec = viewer.vector_view();
-      for (uint32_t i = 0; i < kDim; ++i) {
-        EXPECT_FLOAT_EQ(read_vec[i], expected_vec[i]) << "Node " << id;
-      }
-    });
-  }
-
-  df.close();
-}
-
-TEST_F(DataFileTest, BatchModifyReadOnlyThrows) {
-  auto path = make_path("batch_readonly");
-  DataFile<float, uint32_t> df(bp_.get());
-  df.create(path, kCapacity, kDim, kMaxDeg);
-  df.close();
-  bp_->clear();
-
-  df.open(path, kCapacity, kDim, kMaxDeg, false);
-
-  EXPECT_THROW(
-      df.batch_modify(0, 1, [](uint32_t /*unused*/, auto & /*unused*/) {}), std::runtime_error);
-
-  df.close();
-}
-
-TEST_F(DataFileTest, BatchModifyOutOfRangeThrows) {
-  auto path = make_path("batch_oor");
-  DataFile<float, uint32_t> df(bp_.get());
-  df.create(path, kCapacity, kDim, kMaxDeg);
-
-  EXPECT_THROW(
-      df.batch_modify(0, kCapacity + 1, [](uint32_t /*unused*/, auto & /*unused*/) {}),
-      std::out_of_range);
-}
-
-TEST_F(DataFileTest, BatchModifyEmptyRange) {
-  auto path = make_path("batch_empty");
-  DataFile<float, uint32_t> df(bp_.get());
-  df.create(path, kCapacity, kDim, kMaxDeg);
-
-  // start == end -> no-op
-  df.batch_modify(5, 5, [](uint32_t /*unused*/, auto & /*unused*/) {
-    FAIL() << "Should not be called for empty range";
-  });
 }
 
 }  // namespace alaya

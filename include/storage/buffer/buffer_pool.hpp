@@ -52,6 +52,23 @@
  *   printf("Hit rate: %.2f%%\n", stats.hit_rate() * 100);
  *   printf("Hits: %lu, Misses: %lu, Evictions: %lu\n",
  *          stats.hits_.load(), stats.misses_.load(), stats.evictions_.load());
+ *
+ *   // Write-back example (flush dirty page on eviction)
+ *   DirectFileIO writer;
+ *   writer.open("data.bin", DirectFileIO::Mode::kWrite);
+ *   auto flush_cb = [&](uint32_t node_id, const uint8_t* data) {
+ *     // map node_id -> file offset as needed
+ *     uint64_t offset = static_cast<uint64_t>(node_id) * 4096;
+ *     writer.write(reinterpret_cast<const char*>(data), 4096, offset);
+ *   };
+ *
+ *   BufferPool<uint32_t> wb_pool(1000, 4096, 16, flush_cb);
+ *   auto handle = wb_pool.get_or_read(node_id, reader, offset, temp.data());
+ *   if (!handle.empty()) {
+ *     auto* mutable_ptr = handle.mutable_data();
+ *     // ... modify page for insert/delete ...
+ *     handle.mark_dirty();
+ *   }
  * @endcode
  *
  * @section ReplacementPolicies Replacement Policies
@@ -77,12 +94,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <queue>
 #include <vector>
 
-#include "replacer/clock.hpp"
-#include "replacer/clock_pro.hpp"
 #include "replacer/lru.hpp"
 #include "storage/io/direct_file_io.hpp"
 #include "utils/hash_map.hpp"
@@ -159,6 +175,12 @@ class BufferPool {
     //  View
     [[nodiscard]] auto view() const -> std::span<const uint8_t> { return {data_ptr_, size_}; }
 
+    void mark_dirty() {
+      if (shard_ && frame_idx_ < shard_->capacity()) {
+        shard_->mark_dirty(frame_idx_);
+      }
+    }
+
    private:
     // only Shard can construct PageHandles
     PageHandle(Shard *shard, size_t frame_idx, uint8_t *data, size_t size)
@@ -174,8 +196,14 @@ class BufferPool {
 
   // -----------------------------------------------------------------------
 
-  BufferPool(size_t capacity, size_t frame_size, size_t num_shards = 16)
-      : total_capacity_(capacity), frame_size_(frame_size), num_shards_(num_shards) {
+  BufferPool(size_t capacity,
+             size_t frame_size,
+             size_t num_shards = 16,
+             std::function<void(IDType, const uint8_t *)> flush_cb = nullptr)
+      : total_capacity_(capacity),
+        frame_size_(frame_size),
+        num_shards_(num_shards),
+        flush_callback_(std::move(flush_cb)) {
     if (num_shards_ == 0) {
       num_shards_ = 1;
     }
@@ -199,7 +227,8 @@ class BufferPool {
       }
 
       uint8_t *shard_base = memory_blob_.data() + (i * cap_per_shard * frame_size_);
-      shards_.emplace_back(std::make_unique<Shard>(i, actual_cap, frame_size_, shard_base, stats_));
+      shards_.emplace_back(
+          std::make_unique<Shard>(i, actual_cap, frame_size_, shard_base, stats_, flush_callback_));
     }
   }
 
@@ -210,6 +239,18 @@ class BufferPool {
    * @brief Get a page. Returns an empty Handle if not cached.
    */
   auto get(IDType node_id) -> PageHandle { return get_shard(node_id).get_page(node_id); }
+
+  /**
+   * @brief Flush all dirty pages via a caller-supplied callback.
+   *
+   * @param fn Callback invoked as fn(node_id, data_ptr) for each dirty frame.
+   */
+  template <typename Fn>
+  void flush_all(Fn &&fn) {
+    for (auto &shard : shards_) {
+      shard->flush_dirty(fn);
+    }
+  }
 
   /**
    * @brief Insert a pre-read page into the cache (no disk I/O).
@@ -257,11 +298,66 @@ class BufferPool {
     return shard.insert_page(node_id, temp_buffer);
   }
 
+  /**
+   * @brief Prefetch a page from disk into the buffer pool.
+   * * This is a "fire-and-forget" operation used for batch I/O optimization.
+   * It ensures the page is in memory (LRU MRU) but does NOT keep it pinned.
+   * * Implementation details:
+   * 1. Checks if page exists (fast path).
+   * 2. If miss, reads into a thread-local buffer (no malloc).
+   * 3. Inserts into shard (handles eviction).
+   * 4. Immediately releases handle (pin_count -> 0).
+   */
+  void prefetch(IDType node_id, DirectFileIO &io, uint64_t offset) {
+    Shard &shard = get_shard(node_id);
+
+    // 1. Try to find in cache first (Touch LRU/Clock)
+    {
+      auto handle = shard.get_page(node_id);
+      if (!handle.empty()) {
+        // Page exists. get_page() pinned it and updated replacer stats.
+        // handle destructor will unpin it immediately.
+        return;
+      }
+    }
+
+    // 2. Cache Miss: Read from disk
+    // Use thread_local buffer to avoid allocation overhead during heavy batch prefetching
+    static thread_local std::vector<uint8_t> tl_buffer;
+    if (tl_buffer.size() != frame_size_) {
+      tl_buffer.resize(frame_size_);
+    }
+
+    auto bytes = io.read(reinterpret_cast<char *>(tl_buffer.data()), frame_size_, offset);
+    if (bytes != static_cast<ssize_t>(frame_size_)) {
+      return;  // Read failed, ignore
+    }
+
+    // 3. Insert into Cache
+    // insert_page pins the page (count=1).
+    // The returned handle destructor immediately unpins it (count=0).
+    // The page remains in the pool as MRU (Most Recently Used).
+    shard.insert_page(node_id, tl_buffer.data());
+  }
+
   void clear() {
     for (auto &s : shards_) {
       s->clear();
     }
     stats_.reset();
+  }
+
+  /**
+   * @brief Set or replace the write-back callback invoked on dirty page eviction.
+   *
+   * Use this when the flush target (e.g., DataFile) is not yet available at
+   * BufferPool construction time.
+   */
+  void set_flush_callback(std::function<void(IDType, const uint8_t *)> cb) {
+    flush_callback_ = cb;
+    for (auto &shard : shards_) {
+      shard->set_flush_callback(cb);
+    }
   }
 
   auto stats() const -> const BufferPoolStats & { return stats_; }
@@ -276,11 +372,21 @@ class BufferPool {
       IDType node_id_{static_cast<IDType>(-1)};
       uint8_t *data_{nullptr};
       bool is_valid_{false};
+      bool is_dirty_{false};
       uint32_t pin_count_{0};
     };
 
-    Shard(size_t id, size_t cap, size_t fsize, const uint8_t *base, BufferPoolStats &stats)
-        : shard_id_(id), capacity_(cap), frame_size_(fsize), stats_ref_(stats) {
+    Shard(size_t id,
+          size_t cap,
+          size_t fsize,
+          const uint8_t *base,
+          BufferPoolStats &stats,
+          std::function<void(IDType, const uint8_t *)> flush_cb)
+        : shard_id_(id),
+          capacity_(cap),
+          frame_size_(fsize),
+          stats_ref_(stats),
+          flush_callback_(std::move(flush_cb)) {
       frames_.resize(capacity_);
       for (size_t i = 0; i < capacity_; ++i) {
         frames_[i].data_ = const_cast<uint8_t *>(base + (i * frame_size_));
@@ -288,6 +394,8 @@ class BufferPool {
       }
       page_table_.reserve(capacity_);
     }
+
+    [[nodiscard]] auto capacity() const -> size_t { return capacity_; }
 
     // try to get page and pin it
     auto get_page(IDType node_id) -> PageHandle {
@@ -344,6 +452,11 @@ class BufferPool {
         // Clean up victim
         Frame &vic_frame = frames_[frame_idx];
         if (vic_frame.is_valid_) {
+          if (vic_frame.is_dirty_) {
+            if (flush_callback_) {
+              flush_callback_(vic_frame.node_id_, vic_frame.data_);
+            }
+          }
           page_table_.erase(vic_frame.node_id_);
           stats_ref_.evictions_.fetch_add(1, std::memory_order_relaxed);
         }
@@ -353,6 +466,7 @@ class BufferPool {
       Frame &frame = frames_[frame_idx];
       frame.node_id_ = node_id;
       frame.is_valid_ = true;
+      frame.is_dirty_ = false;
       frame.pin_count_ = 1;
       std::memcpy(frame.data_, source_data, frame_size_);
 
@@ -375,6 +489,25 @@ class BufferPool {
       }
     }
 
+    void mark_dirty(size_t frame_idx) {
+      std::lock_guard<SpinLock> guard(lock_);
+      frames_[frame_idx].is_dirty_ = true;
+    }
+
+    /**
+     * @brief Flush all dirty frames via a caller-supplied callback.
+     */
+    template <typename Fn>
+    void flush_dirty(Fn &&fn) {
+      std::lock_guard<SpinLock> guard(lock_);
+      for (auto &frame : frames_) {
+        if (frame.is_valid_ && frame.is_dirty_) {
+          fn(frame.node_id_, frame.data_);
+          frame.is_dirty_ = false;
+        }
+      }
+    }
+
     void clear() {
       std::lock_guard<SpinLock> guard(lock_);
       page_table_.clear();
@@ -384,9 +517,15 @@ class BufferPool {
       }
       for (size_t i = 0; i < capacity_; ++i) {
         frames_[i].is_valid_ = false;
+        frames_[i].is_dirty_ = false;
         frames_[i].pin_count_ = 0;
         free_list_.push(i);
       }
+    }
+
+    void set_flush_callback(std::function<void(IDType, const uint8_t *)> cb) {
+      std::lock_guard<SpinLock> guard(lock_);
+      flush_callback_ = std::move(cb);
     }
 
    private:
@@ -403,6 +542,7 @@ class BufferPool {
     ReplacerType replacer_{capacity_};
 
     BufferPoolStats &stats_ref_;
+    std::function<void(IDType, const uint8_t *)> flush_callback_;
   };
 
   auto get_shard(IDType node_id) -> Shard & {
@@ -420,6 +560,7 @@ class BufferPool {
   AlignedBuffer memory_blob_;  // unified memory management
   std::vector<std::unique_ptr<Shard>> shards_;
   mutable BufferPoolStats stats_;
+  std::function<void(IDType, const uint8_t *)> flush_callback_;
 };
 
 // -------------------------------------------------------------------------

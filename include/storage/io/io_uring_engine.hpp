@@ -197,6 +197,7 @@ class IOUringEngine final : public IOEngine {
     }
 
     size_t prepared = 0;
+    size_t total_submitted = 0;
 
     for (auto &req : requests) {
       struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
@@ -207,6 +208,7 @@ class IOUringEngine final : public IOEngine {
           LOG_ERROR("io_uring_submit failed: {}", strerror(-submitted));
           break;
         }
+        total_submitted += static_cast<size_t>(submitted);
 
         sqe = io_uring_get_sqe(ring);
         if (sqe == nullptr) {
@@ -226,16 +228,17 @@ class IOUringEngine final : public IOEngine {
       ++prepared;
     }
 
-    if (prepared > 0) {
+    // Submit any remaining SQEs that haven't been submitted yet
+    if (prepared > total_submitted) {
       int submitted = io_uring_submit(ring);
       if (submitted < 0) {
         LOG_ERROR("io_uring_submit failed: {}", strerror(-submitted));
-        return 0;
+        return total_submitted;
       }
-      return static_cast<size_t>(submitted);
+      total_submitted += static_cast<size_t>(submitted);
     }
 
-    return 0;
+    return total_submitted;
   }
 
   static void process_cqe(struct io_uring_cqe *cqe) {

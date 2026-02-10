@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -26,13 +27,11 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
-#include <vector>
 
 #include "storage/buffer/buffer_pool.hpp"
 #include "storage/io/direct_file_io.hpp"
 #include "utils/macros.hpp"
 #include "utils/memory.hpp"
-#include "utils/types.hpp"
 
 namespace alaya {
 
@@ -41,10 +40,6 @@ namespace alaya {
 // ============================================================================
 constexpr size_t kDataBlockSize = 4096;
 inline thread_local AlignedBuffer tl_io_buffer(kDataBlockSize);
-
-// ============================================================================
-// NodeViewer and NodeEditor forward declarations
-// ============================================================================
 
 /**
  * @brief Neighbor table view mapped onto raw memory
@@ -56,7 +51,6 @@ struct NeighborList {
   uint32_t num_neighbors_;
 
   auto neighbor_ids() -> IDType * { return reinterpret_cast<IDType *>(this + 1); }
-
   auto neighbor_ids() const -> const IDType * { return reinterpret_cast<const IDType *>(this + 1); }
 
   // Vector-like access
@@ -113,107 +107,89 @@ class DataFile {
   using BufferPoolType = BufferPool<IDType, ReplacerType>;
   using PageHandle = typename BufferPoolType::PageHandle;
 
-  class Viewer {
+  /**
+   * @brief RAII node reference combining read/write access with buffer pool pinning.
+   *
+   * Unifies the former Viewer (read-only) and Editor (read-write) into a single type.
+   * Holds a PageHandle to keep the underlying page pinned while the reference
+   * is alive. Supports zero-copy reads and in-place writes.
+   *
+   * - In inspect_node: passed as const NodeRef& (only read methods accessible)
+   * - In modify_node / batch_modify: passed as NodeRef& (read + write)
+   */
+  class NodeRef {
    public:
-    /**
-     * @brief Construct a Viewer for a node row in the data file.
-     *
-     * @param row_ptr pointer to the start of the node row
-     * @param dim vector dimension
-     * @param max_deg maximum degree (R)
-     * @param vec_offset offset to the vector data within the row
-     */
-    Viewer(const char *row_ptr, uint32_t dim, uint32_t max_degree, size_t vec_offset)
-        : row_ptr_(row_ptr), dim_(dim), max_degree_(max_degree), vec_offset_(vec_offset) {}
+    NodeRef() = default;
 
-    [[nodiscard]] auto vector_view() const -> std::span<const DataType> {
-      const auto *vec_ptr = reinterpret_cast<const DataType *>(row_ptr_ + vec_offset_);
-      return std::span<const DataType>(vec_ptr, dim_);
+    NodeRef(PageHandle &&handle,
+            uint8_t *node_ptr,
+            uint32_t dim,
+            uint32_t max_deg,
+            size_t vec_offset)
+        : handle_(std::move(handle)),
+          node_ptr_(node_ptr),
+          dim_(dim),
+          max_deg_(max_deg),
+          vec_offset_(vec_offset) {}
+
+    ALAYA_NON_COPYABLE_BUT_MOVABLE(NodeRef);
+    ~NodeRef() = default;
+
+    [[nodiscard]] auto empty() const -> bool { return node_ptr_ == nullptr; }
+
+    // --- Read interface (zero-copy) ---
+
+    [[nodiscard]] auto vector() const -> std::span<const DataType> {
+      return {reinterpret_cast<const DataType *>(node_ptr_ + vec_offset_), dim_};
     }
 
-    [[nodiscard]] auto neighbors_view() const -> const NeighborList<IDType> & {
-      return *reinterpret_cast<const NeighborList<IDType> *>(row_ptr_);
+    [[nodiscard]] auto neighbors() const -> std::span<const IDType> {
+      uint32_t count = *reinterpret_cast<const uint32_t *>(node_ptr_);
+      const auto *ids = reinterpret_cast<const IDType *>(node_ptr_ + sizeof(uint32_t));
+      return {ids, count};
     }
 
-    void copy_vector_to(std::span<DataType> buffer) const {
-      if (buffer.size() != dim_) {
-        throw std::invalid_argument("Vector dim mismatch");
-      }
-      auto view = vector_view();
-      std::copy(view.begin(), view.end(), buffer.begin());
-    }
+    // --- Write interface ---
 
-    auto copy_neighbors_to(std::span<IDType> buffer) const -> uint32_t {
-      const auto &nbrs = neighbors_view();
-      size_t count = std::min(nbrs.size(), buffer.size());
-      std::copy_n(nbrs.begin(), count, buffer.begin());
-      return static_cast<uint32_t>(count);
-    }
-
-   private:
-    const char *row_ptr_;
-    uint32_t dim_;
-    uint32_t max_degree_;
-    size_t vec_offset_;
-  };
-
-  class Editor {
-   public:
-    Editor(byte *row_ptr, uint32_t dim, uint32_t max_degree, size_t vec_offset)
-        : row_ptr_(row_ptr), dim_(dim), max_degree_(max_degree), vec_offset_(vec_offset) {}
-
-    auto set_vector(std::span<const DataType> new_vec) -> void {
-      if (new_vec.size() != dim_) {
+    void set_vector(std::span<const DataType> data) {
+      if (data.size() != dim_) {
         throw std::invalid_argument("Vector dimension mismatch");
       }
-
-      auto *dest = reinterpret_cast<DataType *>(row_ptr_ + vec_offset_);
-      std::copy(new_vec.begin(), new_vec.end(), dest);
+      mark_dirty();
+      auto *dst = reinterpret_cast<DataType *>(node_ptr_ + vec_offset_);
+      std::copy(data.begin(), data.end(), dst);
     }
 
-    auto set_neighbors(std::span<const IDType> new_nbrs) -> void {
-      if (new_nbrs.size() > max_degree_) {
+    void set_neighbors(std::span<const IDType> nbrs) {
+      if (nbrs.size() > max_deg_) {
         throw std::length_error("Too many neighbors");
       }
-      // get variable reference
-      auto &list = *reinterpret_cast<NeighborList<IDType> *>(row_ptr_);
-      list.num_neighbors_ = static_cast<uint32_t>(new_nbrs.size());
-      std::copy(new_nbrs.begin(), new_nbrs.end(), list.begin());
+      mark_dirty();
+      auto &list = *reinterpret_cast<NeighborList<IDType> *>(node_ptr_);
+      list.num_neighbors_ = static_cast<uint32_t>(nbrs.size());
+      std::copy(nbrs.begin(), nbrs.end(), list.begin());
 
-      // fill remaining slots with -1 (invalid ID)
-      std::fill(list.end(), list.neighbor_ids() + max_degree_, static_cast<IDType>(-1));
+      // Optional: padding it
+      std::fill(list.end(), list.neighbor_ids() + max_deg_, static_cast<IDType>(-1));
     }
 
-    // ---------------------------------------------------------
-    // Advanced Interface: Get mutable view (for in-place sorting, in-place cropping)
-    // ---------------------------------------------------------
-
-    /**
-     * @brief Get a mutable span to the vector data for in-place modification.
-     * @return Mutable span of vector data
-     */
     auto mutable_vector() -> std::span<DataType> {
-      auto *ptr = reinterpret_cast<DataType *>(row_ptr_ + vec_offset_);
-      return std::span<DataType>(ptr, dim_);
+      return {reinterpret_cast<DataType *>(node_ptr_ + vec_offset_), dim_};
     }
 
-    /**
-     * @brief Get a mutable reference to the neighbor list for in-place modification.
-     * @return Mutable reference to NeighborList
-     */
     auto mutable_neighbors() -> NeighborList<IDType> & {
-      return *reinterpret_cast<NeighborList<IDType> *>(row_ptr_);
+      return *reinterpret_cast<NeighborList<IDType> *>(node_ptr_);
     }
 
-    [[nodiscard]] auto as_viewer() const -> Viewer {
-      return Viewer(reinterpret_cast<const char *>(row_ptr_), dim_, max_degree_, vec_offset_);
-    }
+    void mark_dirty() { handle_.mark_dirty(); }
+    [[nodiscard]] auto handle() const -> const PageHandle & { return handle_; }
 
    private:
-    byte *row_ptr_;
-    uint32_t dim_;
-    uint32_t max_degree_;
-    size_t vec_offset_;
+    PageHandle handle_;
+    uint8_t *node_ptr_{nullptr};
+    uint32_t dim_{0};
+    uint32_t max_deg_{0};
+    size_t vec_offset_{0};
   };
 
   ALAYA_NON_COPYABLE_BUT_MOVABLE(DataFile);
@@ -224,6 +200,40 @@ class DataFile {
     }
   }
   ~DataFile() { close(); }
+
+  // ==========================================================================
+  // Node Access Methods
+  // ==========================================================================
+  [[nodiscard]] auto get_node(uint32_t node_id) -> NodeRef {
+    // 1. Calculate offsets (Compiler optimizes this heavily)
+    uint32_t block_id = node_id / nodes_per_block_;
+    uint64_t block_offset = static_cast<uint64_t>(block_id) * kDataBlockSize;
+    uint32_t node_offset = (node_id % nodes_per_block_) * row_size_;
+
+    // 2. Fetch page (Thread-safe, RAII)
+    PageHandle handle = buffer_pool_->get_or_read(block_id,
+                                                  *file_,
+                                                  block_offset,
+                                                  reinterpret_cast<uint8_t *>(tl_io_buffer.data()));
+
+    if (handle.empty()) {
+      throw std::runtime_error("Failed to read node: " + std::to_string(node_id));
+    }
+
+    uint8_t *node_ptr = handle.mutable_data() + node_offset;
+    return NodeRef(std::move(handle), node_ptr, dim_, max_degree_, vector_offset_);
+  }
+
+  void prefetch_blocks(std::span<const uint32_t> block_ids) {
+    if (block_ids.empty()) {
+      return;
+    }
+
+    for (uint32_t block_id : block_ids) {
+      uint64_t offset = static_cast<uint64_t>(block_id) * kDataBlockSize;
+      buffer_pool_->prefetch(block_id, *file_, offset);
+    }
+  }
 
   // -------------------------------------------------------------------------
   // File operations
@@ -297,6 +307,20 @@ class DataFile {
   /**
    * @brief Close the data file.
    */
+  /**
+   * @brief Flush all dirty buffer pool pages back to the data file.
+   */
+  void flush() {
+    if (!is_open_ || !file_) {
+      return;
+    }
+    buffer_pool_->flush_all([this](uint32_t block_id, const uint8_t *data) -> void {
+      file_->write(reinterpret_cast<const char *>(data),
+                   kDataBlockSize,
+                   static_cast<uint64_t>(block_id) * kDataBlockSize);
+    });
+  }
+
   void close() {
     if (!is_open_) {
       return;
@@ -312,158 +336,6 @@ class DataFile {
     is_writable_ = false;
   }
 
-  // -------------------------------------------------------------------------
-  // Vector operations
-  // -------------------------------------------------------------------------
-  template <typename Func>
-  void inspect_node(uint32_t node_id, Func &&visitor) const {
-    validate_id(node_id);
-    auto [block_offset, row_offset] = get_block_and_row_offset(node_id);
-
-    // Cache key = block_id so that all nodes in the same 4KB block share one cache entry.
-    // This increases effective cache utilization by nodes_per_block_ (typically 3-5x).
-    uint32_t block_id = node_id / nodes_per_block_;
-    PageHandle handle;
-    handle = buffer_pool_->get_or_read(block_id,
-                                       *file_,
-                                       block_offset,
-                                       reinterpret_cast<uint8_t *>(tl_io_buffer.data()));
-
-    if (handle.empty()) {
-      throw std::runtime_error("Failed to read node");
-    }
-
-    Viewer viewer(reinterpret_cast<const char *>(handle.data() + row_offset),
-                  dim_,
-                  max_degree_,
-                  vector_offset_);
-    visitor(viewer);
-
-    // 4. Function ends -> handle destructs -> reference count decreases -> page becomes evictable
-  }
-
-  template <typename Func>
-  void modify_node(uint32_t node_id, Func &&modifier) {
-    if (!is_writable_) {
-      throw std::runtime_error("Read only");
-    }
-    validate_id(node_id);
-    auto [block_offset, row_offset] = get_block_and_row_offset(node_id);
-
-    // get Handle (RAII)
-    // Modification operations also need to be "read" into the Cache first, because we need to
-    // preserve other data in the block that does not require modification.
-    // Cache key = block_id so that all nodes in the same 4KB block share one cache entry.
-    uint32_t block_id = node_id / nodes_per_block_;
-    PageHandle handle;
-    if (tl_io_buffer.size() < kDataBlockSize) {
-      tl_io_buffer.resize(kDataBlockSize);
-    }
-    handle = buffer_pool_->get_or_read(block_id,
-                                       *file_,
-                                       block_offset,
-                                       reinterpret_cast<uint8_t *>(tl_io_buffer.data()));
-
-    if (handle.empty()) {
-      throw std::runtime_error("Failed to read node for modification");
-    }
-
-    Editor editor(reinterpret_cast<byte *>(handle.mutable_data() + row_offset),
-                  dim_,
-                  max_degree_,
-                  vector_offset_);
-    modifier(editor);
-
-    // 3. Write-Through
-    // Write the memory in the Cache back to the disk directly.
-    // Advantage: No need to malloc another buffer for dirty data.
-    // Note: The handle must remain alive (pinned) during the write, which is guaranteed by RAII.
-    file_->write(reinterpret_cast<char *>(handle.mutable_data()), kDataBlockSize, block_offset);
-
-    // 4. End
-    // The Cache is the latest, and the disk is also the latest.
-  }
-
-  auto read_vector(uint32_t node_id, std::span<DataType> buffer) const -> void {
-    inspect_node(node_id, [&](const Viewer &v) -> auto {
-      v.copy_vector_to(buffer);
-    });
-  }
-
-  auto read_neighbors(uint32_t node_id, std::span<IDType> buffer) const -> uint32_t {
-    uint32_t count = 0;
-    inspect_node(node_id, [&](const Viewer &v) -> auto {
-      count = v.copy_neighbors_to(buffer);
-    });
-    return count;
-  }
-
-  auto write_vector(uint32_t node_id, std::span<const DataType> buffer) -> void {
-    modify_node(node_id, [&](Editor &e) -> auto {
-      e.set_vector(buffer);
-    });
-  }
-
-  auto write_neighbors(uint32_t node_id, std::span<const IDType> buffer) -> void {
-    modify_node(node_id, [&](Editor &e) -> auto {
-      e.set_neighbors(buffer);
-    });
-  }
-
-  /**
-   * @brief Modify a range of nodes with one disk write per block.
-   *
-   * For sequential node writes (e.g., during index building), this is much
-   * more efficient than calling modify_node() per node, because all nodes
-   * sharing the same 4KB block are written to disk only once.
-   *
-   * Bypasses the BufferPool and uses direct I/O for maximum throughput.
-   *
-   * @param start_id First node ID to modify (inclusive)
-   * @param end_id Last node ID to modify (exclusive)
-   * @param modifier Callback: (uint32_t node_id, Editor &editor) -> void
-   */
-  template <typename Func>
-  void batch_modify(uint32_t start_id, uint32_t end_id, Func &&modifier) {
-    if (!is_writable_) {
-      throw std::runtime_error("Read only");
-    }
-    if (end_id > capacity_) {
-      throw std::out_of_range("Node ID range out of bounds");
-    }
-
-    AlignedBuffer block_buf(kDataBlockSize);
-    uint32_t cur = start_id;
-
-    while (cur < end_id) {
-      uint32_t block_idx = cur / nodes_per_block_;
-      uint32_t block_end_node = std::min((block_idx + 1) * nodes_per_block_, end_id);
-      block_end_node = std::min(block_end_node, capacity_);
-
-      uint64_t block_offset = static_cast<uint64_t>(block_idx) * kDataBlockSize;
-
-      // Read existing block data; zero-fill if sparse/unwritten
-      auto read_bytes = file_->read(block_buf.data(), kDataBlockSize, block_offset);
-      if (read_bytes < static_cast<ssize_t>(kDataBlockSize)) {
-        std::memset(block_buf.data(), 0, kDataBlockSize);
-      }
-
-      // Modify all nodes in this block
-      for (uint32_t id = cur; id < block_end_node; ++id) {
-        size_t row_offset = static_cast<size_t>(id % nodes_per_block_) * row_size_;
-        Editor editor(reinterpret_cast<byte *>(block_buf.data() + row_offset),
-                      dim_,
-                      max_degree_,
-                      vector_offset_);
-        modifier(id, editor);
-      }
-
-      // Single write for entire block
-      file_->write(block_buf.data(), kDataBlockSize, block_offset);
-
-      cur = block_end_node;
-    }
-  }
   // -------------------------------------------------------------------------
   // Accessors
   // -------------------------------------------------------------------------
@@ -487,99 +359,45 @@ class DataFile {
   [[nodiscard]] auto path() const -> const std::string & { return path_; }
 
   /**
-   * @brief Preload a specific block into the buffer pool.
-   *
-   * Used by the searcher to warm up the cache at open() time,
-   * reading blocks sequentially for maximum I/O throughput.
-   *
-   * @param block_id Block index (0-based)
+   * @brief Write a raw block to the data file (used by BufferPool flush callback).
    */
-  void preload_block(uint32_t block_id) const {
-    if (!is_open_ || !file_) {
+  void write_block(uint32_t block_id, const uint8_t *data) {
+    if (!is_open_ || !is_writable_ || !file_) {
       return;
     }
-    uint64_t block_offset = static_cast<uint64_t>(block_id) * kDataBlockSize;
-    buffer_pool_->get_or_read(block_id,
-                              *file_,
-                              block_offset,
-                              reinterpret_cast<uint8_t *>(tl_io_buffer.data()));
-    // Handle destructs immediately -> unpin -> page becomes evictable but stays cached
+    file_->write(reinterpret_cast<const char *>(data),
+                 kDataBlockSize,
+                 static_cast<uint64_t>(block_id) * kDataBlockSize);
   }
 
   /**
-   * @brief Batch-prefetch multiple blocks into the buffer pool via io_uring.
+   * @brief Grow the data file to accommodate a new capacity.
    *
-   * Identifies cache misses among the given block_ids, submits all reads to
-   * io_uring in a single batch (parallel SSD reads), then inserts results into
-   * the buffer pool. This converts N sequential preads into 1 batch submission,
-   * reducing total I/O latency from N * latency to ~1 * latency.
+   * Extends the file by writing zero blocks for the new region.
+   * Must be called when MetaFile auto-grows beyond the data file's capacity.
    *
-   * @param block_ids Sorted span of block IDs to prefetch (may contain duplicates)
+   * @param new_capacity New capacity (must be > current capacity)
    */
-  void prefetch_blocks(std::span<const uint32_t> block_ids) const {
-    if (!is_open_ || !file_ || block_ids.empty()) {
+  void grow(uint32_t new_capacity) {
+    if (!is_writable_) {
+      throw std::runtime_error("Cannot grow read-only DataFile");
+    }
+    if (new_capacity <= capacity_) {
       return;
     }
 
-    // 1. Deduplicate and filter to cache misses
-    std::vector<uint32_t> missing;
-    missing.reserve(block_ids.size());
-    auto prev = static_cast<uint32_t>(-1);
-    for (auto blk : block_ids) {
-      if (blk == prev) {
-        continue;  // Skip duplicates (input is sorted)
-      }
-      prev = blk;
-      auto handle = buffer_pool_->get(blk);
-      if (handle.empty()) {
-        missing.push_back(blk);
-      }
-    }
-    if (missing.empty()) {
-      return;
-    }
+    uint32_t old_num_blocks = num_blocks();
+    capacity_ = new_capacity;
+    uint32_t new_num_blocks = num_blocks();
 
-    // 2. Allocate aligned buffers and prepare IORequests
-    std::vector<AlignedBuffer> buffers;
-    buffers.reserve(missing.size());
-    std::vector<IORequest> requests;
-    requests.reserve(missing.size());
-    for (auto blk : missing) {
-      buffers.emplace_back(kDataBlockSize);
-      requests.emplace_back(buffers.back().data(),
-                            kDataBlockSize,
-                            static_cast<uint64_t>(blk) * kDataBlockSize);
+    // Write zero blocks for the new region
+    if (new_num_blocks > old_num_blocks) {
+      AlignedBuffer zeros(kDataBlockSize);
+      std::memset(zeros.data(), 0, kDataBlockSize);
+      // Write last block to extend file to full new size
+      uint64_t last_block_offset = static_cast<uint64_t>(new_num_blocks - 1) * kDataBlockSize;
+      file_->write(reinterpret_cast<char *>(zeros.data()), kDataBlockSize, last_block_offset);
     }
-
-    // 3. Submit all reads to io_uring in one batch (parallel SSD reads)
-    // Thread-safe: each thread has its own io_uring ring (thread-local)
-    file_->submit_reads(requests);
-
-    // 4. Insert completed reads into buffer pool (no additional disk I/O)
-    for (size_t i = 0; i < missing.size(); ++i) {
-      if (requests[i].is_success()) {
-        buffer_pool_->put(missing[i], reinterpret_cast<uint8_t *>(buffers[i].data()));
-        // Handle destructs → unpin → page stays cached
-      }
-    }
-  }
-
-  /**
-   * @brief Get a vector view directly from a pinned block handle.
-   *
-   * Used by block-local pinning: the caller keeps one PageHandle alive per
-   * unique block and extracts vectors without additional pin/unpin overhead.
-   *
-   * @param handle Pinned page handle for the block containing node_id
-   * @param node_id The node whose vector to extract
-   * @return Span pointing into the handle's data (valid while handle is alive)
-   */
-  [[nodiscard]] auto get_vector_in_block(const PageHandle &handle, uint32_t node_id) const
-      -> std::span<const DataType> {
-    size_t row_offset = static_cast<size_t>(node_id % nodes_per_block_) * row_size_;
-    const auto *vec_ptr =
-        reinterpret_cast<const DataType *>(handle.data() + row_offset + vector_offset_);
-    return std::span<const DataType>(vec_ptr, dim_);
   }
 
   /**
@@ -589,6 +407,23 @@ class DataFile {
     uint64_t num_blocks =
         (static_cast<uint64_t>(capacity_) + nodes_per_block_ - 1) / nodes_per_block_;
     return num_blocks * kDataBlockSize;
+  }
+
+  /**
+   * @brief Preload a block into the buffer pool cache.
+   */
+  auto preload_block(uint32_t block_id) const -> void {
+    if (!is_open_) {
+      throw std::runtime_error("Not open");
+    }
+    if (block_id >= num_blocks()) {
+      throw std::out_of_range("Block ID out of range");
+    }
+    // Touch the block to load it into the buffer pool
+    buffer_pool_->get_or_read(block_id,
+                              *file_,
+                              static_cast<uint64_t>(block_id) * kDataBlockSize,
+                              reinterpret_cast<uint8_t *>(tl_io_buffer.data()));
   }
 
  private:
@@ -619,11 +454,6 @@ class DataFile {
     if (node_id >= capacity_) {
       throw std::out_of_range("Node ID out of range");
     }
-  }
-
-  auto get_block_and_row_offset(uint32_t node_id) const -> std::pair<uint64_t, size_t> {
-    return {static_cast<size_t>(node_id / nodes_per_block_) * kDataBlockSize,
-            static_cast<size_t>(node_id % nodes_per_block_) * row_size_};
   }
 
   // Layout parameters

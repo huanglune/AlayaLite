@@ -19,10 +19,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
-#include <span>
 #include <stdexcept>
 #include <string_view>
-#include <utility>
 #include <vector>
 
 #include "diskann_params.hpp"
@@ -35,6 +33,7 @@
 #include "utils/log.hpp"
 #include "utils/macros.hpp"
 #include "utils/types.hpp"
+#include "visited_list.hpp"
 
 namespace alaya {
 
@@ -64,14 +63,51 @@ class DiskANNSearcher {
   using NeighborType = Neighbor<IDType, DistanceType>;
   using BufferPoolType = BufferPool<IDType, ReplacerType>;
   using StorageType = DiskANNStorage<DataType, IDType, ReplacerType>;
-  using Viewer = typename StorageType::Viewer;
+  using NodeRef = typename StorageType::NodeRef;
   using Params = DiskANNSearchParams;
   using Result = SearchResult<IDType, DistanceType>;
 
   /// Distance function signature: (query, vector, dim) -> distance
   using DistanceFn = auto (*)(const DataType *, const DataType *, size_t) -> float;
-
   static constexpr IDType kInvalidID = static_cast<IDType>(-1);
+  struct SearchContext {
+    CandidateList<DistanceType, IDType> candidates_;
+    diskann::VisitedList visited_;
+    std::vector<IDType> beam_queue_;
+    std::vector<IDType> next_beam_queue_;
+    std::vector<uint32_t> next_beam_io_;  // For IO deduplication
+    // Buffers for PQ Search
+    std::vector<float> adc_table_;  // M * K
+    std::vector<NeighborType> rerank_candidates_;
+
+    // Helper buffer to hold neighbors read from disk temporarily
+    std::vector<IDType> neighbor_buffer_;
+
+    explicit SearchContext(uint32_t capacity,
+                           uint32_t max_degree,
+                           uint32_t beam_width,
+                           uint32_t num_subspaces = 0,
+                           uint32_t num_centroids = 0)
+        : candidates_(capacity, 200) {
+      beam_queue_.reserve(beam_width * 2);
+      next_beam_queue_.reserve(beam_width * 2);
+      next_beam_io_.reserve(beam_width * max_degree);
+      neighbor_buffer_.reserve(max_degree);
+      if (num_subspaces > 0) {
+        adc_table_.resize(static_cast<size_t>(num_subspaces) * num_centroids);
+      }
+      rerank_candidates_.reserve(200);
+      visited_.reset(capacity);
+    }
+    void clear() {
+      candidates_.clear();
+      beam_queue_.clear();
+      next_beam_queue_.clear();
+      next_beam_io_.clear();
+      rerank_candidates_.clear();
+      neighbor_buffer_.clear();
+    }
+  };
 
  private:
   std::unique_ptr<BufferPoolType> buffer_pool_;
@@ -79,13 +115,12 @@ class DiskANNSearcher {
 
   uint32_t dimension_{0};
   uint32_t max_degree_{0};
+  uint32_t num_points_{0};
   uint32_t capacity_{0};
   IDType medoid_id_{0};
 
   bool pq_enabled_{false};
-  DistanceFn dist_fn_{simd::l2_sqr};     ///< Distance function (L2/IP, set at open time)
-  std::vector<IDType> graph_;            ///< Flat array: capacity_ * max_degree_ neighbor IDs
-  std::vector<uint32_t> graph_degrees_;  ///< Actual degree per node
+  DistanceFn dist_fn_{simd::l2_sqr};  ///< Distance function (L2/IP, set at open time)
 
  public:
   DiskANNSearcher() = default;
@@ -101,16 +136,20 @@ class DiskANNSearcher {
    * @param base_path Base path for index files (without extension)
    * @param cache_capacity Number of 4KB pages in the buffer pool
    */
-  void open(std::string_view base_path, size_t cache_capacity = 4096) {
-    buffer_pool_ = std::make_unique<BufferPoolType>(cache_capacity, kDataBlockSize);
+  void open(std::string_view base_path, size_t cache_capacity = 4096, bool writable = false) {
+    LOG_INFO("DiskANNSearcher: Opening index at {}", base_path);
 
+    buffer_pool_ = std::make_unique<BufferPoolType>(cache_capacity, kDataBlockSize);
     storage_ = std::make_unique<StorageType>(buffer_pool_.get());
-    storage_->open(base_path, false);
+    storage_->open(base_path, writable);
 
     dimension_ = storage_->dimension();
     max_degree_ = storage_->max_degree();
+
+    num_points_ = storage_->num_points();
     capacity_ = storage_->capacity();
     medoid_id_ = static_cast<IDType>(storage_->entry_point());
+    pq_enabled_ = storage_->is_pq_enabled();
 
     // Select distance function based on metric type stored in the index
     auto metric = static_cast<MetricType>(storage_->metric_type());
@@ -124,34 +163,21 @@ class DiskANNSearcher {
         break;
     }
 
-    // Load graph topology into memory for fast neighbor lookup
-    load_graph_topology();
+    size_t preload_blocks =
+        std::min(size_t{100}, static_cast<size_t>(storage_->data().num_blocks()));
+    for (size_t i = 0; i < preload_blocks; ++i) {
+      storage_->data().preload_block(i);
+    }
 
-    // Preload data blocks into buffer pool via sequential I/O.
-    // This converts random search-time I/O into sequential startup I/O,
-    // which is ~100x faster on HDD and ~10x on SSD.
-    preload_data_blocks();
-
-    // Enable PQ if the index was built with PQ
-    pq_enabled_ = storage_->is_pq_enabled();
-
-    LOG_INFO("DiskANNSearcher: Opened index, capacity={}, dim={}, R={}, medoid={}, pq={}",
-             capacity_,
-             dimension_,
-             max_degree_,
-             medoid_id_,
-             pq_enabled_);
+    LOG_INFO(
+        "DiskANNSearcher: Opened index, capacity={}, num_point={}, dim={}, R={}, medoid={}, pq={}",
+        capacity_,
+        num_points_,
+        dimension_,
+        max_degree_,
+        medoid_id_,
+        pq_enabled_);
   }
-
-  [[nodiscard]] auto is_open() const -> bool { return storage_ != nullptr && storage_->is_open(); }
-  [[nodiscard]] auto is_pq_enabled() const -> bool { return pq_enabled_; }
-  [[nodiscard]] auto num_points() const -> uint64_t {
-    return storage_ ? storage_->num_active() : 0;
-  }
-  [[nodiscard]] auto dimension() const -> uint32_t { return dimension_; }
-  [[nodiscard]] auto max_degree() const -> uint32_t { return max_degree_; }
-  [[nodiscard]] auto storage() const -> const StorageType * { return storage_.get(); }
-  [[nodiscard]] auto buffer_pool() const -> const BufferPoolType * { return buffer_pool_.get(); }
 
   /**
    * @brief Search for k nearest neighbors.
@@ -162,343 +188,184 @@ class DiskANNSearcher {
     if (!is_open()) {
       throw std::runtime_error("DiskANNSearcher: Index not loaded");
     }
+    auto &ctx = get_search_context(params);
+    ctx.clear();
+
+    uint32_t ef = std::max(params.ef_search_, topk);
+    ctx.candidates_.resize(ef);
+    ctx.visited_.reset(capacity_);
+
     if (pq_enabled_ && params.use_pq_rerank_) {
-      return search_pq(query, topk, params);
+      return search_pq(ctx, query, topk, params);
     }
-    return search_disk(query, topk, params);
+    return search_disk(ctx, query, topk, params);
   }
 
   /**
    * @brief Batch search for multiple queries.
+   *
+   * Runs single-query search sequentially for each query vector.
+   *
+   * @param queries Query vectors (num_queries * dimension)
+   * @param num_queries Number of queries
+   * @param topk Number of neighbors per query
+   * @param params Search parameters
+   * @return Vector of SearchResult, one per query
    */
   auto batch_search(const DataType *queries,
                     uint32_t num_queries,
                     uint32_t topk,
                     const Params &params = Params{}) -> std::vector<Result> {
-    std::vector<Result> batch_results(num_queries);
+    std::vector<Result> results(num_queries);
 
-    auto search_thread = params.num_threads_;
-    if (search_thread == 0) {
-      search_thread = 1;
-    }
-
-#pragma omp parallel for schedule(dynamic) num_threads(search_thread)
+#pragma omp parallel for schedule(dynamic, 1) num_threads(params.num_threads_)
     for (uint32_t i = 0; i < num_queries; ++i) {
-      batch_results[i] = search(queries + i * dimension_, topk, params);
+      results[i] = std::move(search(queries + static_cast<size_t>(i) * dimension_, topk, params));
     }
-
-    return batch_results;
+    return results;
   }
 
-  // -------------------------------------------------------------------------
-  // Graph mutation methods (for future insert/delete support)
-  // -------------------------------------------------------------------------
+  // =========================================================================
+  // Accessors
+  // =========================================================================
 
-  /**
-   * @brief Update the in-memory graph topology for a node.
-   *
-   * Call this after inserting a node and writing its neighbors to disk.
-   */
-  void insert_to_graph(IDType node_id, std::span<const IDType> neighbors) {
-    if (node_id >= capacity_) {
-      return;
-    }
-    auto *dst = graph_.data() + static_cast<size_t>(node_id) * max_degree_;
-    auto count = std::min(static_cast<uint32_t>(neighbors.size()), max_degree_);
-    std::copy_n(neighbors.begin(), count, dst);
-    std::fill(dst + count, dst + max_degree_, kInvalidID);
-    graph_degrees_[node_id] = count;
+  [[nodiscard]] auto is_open() const -> bool { return storage_ != nullptr && storage_->is_open(); }
+  [[nodiscard]] auto num_points() const -> uint32_t { return num_points_; }
+  [[nodiscard]] auto dimension() const -> uint32_t { return dimension_; }
+  [[nodiscard]] auto capacity() const -> uint32_t { return capacity_; }
+
+  // =========================================================================
+  // Mutation (for incremental insert support)
+  // =========================================================================
+
+  void reserve_capacity(uint32_t /*new_capacity*/) {
+    // TODO(diskann): implement capacity growth for incremental inserts
   }
 
-  /**
-   * @brief Mark a node as removed from the in-memory graph.
-   *
-   * Sets degree to 0 so the node is never expanded during search.
-   */
-  void remove_from_graph(IDType node_id) {
-    if (node_id >= capacity_) {
-      return;
+  void insert(const DataType * /*vector*/,
+              IDType /*external_id*/,
+              const DiskANNInsertParams & /*params*/ = DiskANNInsertParams{}) {
+    // TODO(diskann): implement single-vector insertion
+  }
+
+  void flush() {
+    if (storage_ && storage_->is_open()) {
+      storage_->save_meta();
     }
-    graph_degrees_[node_id] = 0;
   }
 
  private:
-  // =========================================================================
-  // Graph topology loading
-  // =========================================================================
-
-  /**
-   * @brief Load all neighbor IDs from disk into the in-memory graph.
-   *
-   * After this, graph traversal requires zero disk I/O.
-   * Memory cost: capacity * (max_degree * sizeof(IDType) + sizeof(uint32_t)).
-   */
-  void load_graph_topology() {
-    graph_.resize(static_cast<size_t>(capacity_) * max_degree_, kInvalidID);
-    graph_degrees_.resize(capacity_, 0);
-
-    for (uint32_t node_id = 0; node_id < capacity_; ++node_id) {
-      if (!storage_->is_valid(node_id)) {
-        continue;
-      }
-      storage_->inspect_node(node_id, [&](const Viewer &viewer) -> void {
-        const auto &nbrs = viewer.neighbors_view();
-        auto degree = static_cast<uint32_t>(nbrs.size());
-        graph_degrees_[node_id] = degree;
-        auto *dst = graph_.data() + static_cast<size_t>(node_id) * max_degree_;
-        std::copy_n(nbrs.begin(), degree, dst);
-      });
-    }
-    LOG_INFO("DiskANNSearcher: Loaded graph topology for {} nodes", capacity_);
-  }
-
-  /**
-   * @brief Sequentially preload all data blocks into the buffer pool.
-   *
-   * Sequential I/O at startup is much faster than random I/O during queries.
-   * Only loads blocks that fit in the buffer pool capacity.
-   */
-  void preload_data_blocks() {
-    auto &data_file = storage_->data();
-    uint32_t total_blocks = data_file.num_blocks();
-    uint32_t loaded = 0;
-
-    for (uint32_t block_id = 0; block_id < total_blocks; ++block_id) {
-      data_file.preload_block(block_id);
-      ++loaded;
-    }
-    LOG_INFO("DiskANNSearcher: Preloaded {} data blocks into buffer pool", loaded);
+  auto get_search_context(const Params &params) -> SearchContext & {
+    static thread_local SearchContext ctx(num_points_,
+                                          max_degree_,
+                                          params.beam_width_ > 0 ? params.beam_width_ : 128,
+                                          pq_enabled_ ? storage_->pq().num_subspaces() : 0,
+                                          pq_enabled_ ? storage_->pq().num_centroids() : 0);
+    return ctx;
   }
 
   // =========================================================================
-  // Two-phase PQ search
+  // Helper: Read Neighbors using NodeRef (Zero-Copy)
   // =========================================================================
+  auto get_neighbors_from_disk(IDType node_id, std::vector<IDType> &out_buffer) -> uint32_t {
+    auto node = storage_->data().get_node(node_id);
+    auto neighbors_span = node.neighbors();
 
-  /**
-   * @brief Phase 1 + Phase 2: PQ navigation followed by exact reranking.
-   *
-   * Phase 1 (all in-memory):
-   *   - Pre-compute ADC distance table for the query.
-   *   - Traverse graph using in-memory neighbor IDs and PQ distances.
-   *
-   * Phase 2 (minimal disk I/O):
-   *   - Read full vectors from disk for top rerank_count candidates.
-   *   - Compute exact distances and return top-k.
-   */
-  auto search_pq(const DataType *query, uint32_t topk, const Params &params) -> Result {
-    uint32_t ef = std::max(params.ef_search_, topk);
-    ef = std::min(ef, capacity_);
-    uint32_t rerank_count = std::min(ef, topk * params.pq_rerank_factor_);
-    rerank_count = std::max(rerank_count, topk);
-
-    // Pre-compute ADC distance table: M * K floats
-    auto num_subspaces = storage_->pq().num_subspaces();
-    auto num_centroids = storage_->pq().num_centroids();
-    std::vector<float> adc_table(static_cast<size_t>(num_subspaces) * num_centroids);
-    storage_->pq().compute_adc_table(query, adc_table.data());
-
-    // Phase 1: PQ navigation (in-memory)
-    CandidateList<DistanceType, IDType> candidates(capacity_, static_cast<int>(ef));
-
-    // Seed with medoid
-    auto medoid_dist = storage_->pq().compute_distance(adc_table.data(), medoid_id_);
-    candidates.insert(medoid_id_, medoid_dist);
-    candidates.vis_.set(medoid_id_);
-
-    while (candidates.has_next()) {
-      auto cur_id = candidates.pop();
-
-      // Get neighbors from IN-MEMORY graph (zero disk I/O)
-      auto [nbrs, degree] = get_neighbors(cur_id);
-
-      for (uint32_t i = 0; i < degree; ++i) {
-        auto neighbor = nbrs[i];
-        if (neighbor == kInvalidID) {
-          break;
-        }
-        if (candidates.vis_.get(neighbor)) {
-          continue;
-        }
-        candidates.vis_.set(neighbor);
-
-        // PQ distance: O(M) table lookups (in-memory, ~100x faster than exact L2)
-        auto pq_dist = storage_->pq().compute_distance(adc_table.data(), neighbor);
-        candidates.insert(neighbor, pq_dist);
+    // 3. Copy to output buffer (Required because span invalidates when node dies)
+    out_buffer.clear();
+    for (auto n : neighbors_span) {
+      if (n == kInvalidID) {
+        break;
       }
+      out_buffer.push_back(n);
     }
 
-    // Phase 2: Exact reranking (disk I/O only for top candidates)
-    std::vector<NeighborType> rerank_pool;
-    rerank_pool.reserve(rerank_count);
-    for (uint32_t i = 0; i < std::min(static_cast<uint32_t>(candidates.size()), rerank_count);
-         ++i) {
-      rerank_pool.emplace_back(candidates.id(i), candidates.dist(i));
-    }
-
-    // Batch prefetch rerank candidates
-    prefetch_node_blocks(rerank_pool);
-
-    for (auto &candidate : rerank_pool) {
-      auto exact_dist = compute_node_distance(query, candidate.id_);
-      candidate.distance_ = exact_dist;
-    }
-
-    std::sort(rerank_pool.begin(), rerank_pool.end());
-
-    // Build result
-    auto actual_k = std::min(static_cast<size_t>(topk), rerank_pool.size());
-    Result result(actual_k);
-    for (size_t i = 0; i < actual_k; ++i) {
-      result.ids_.emplace_back(rerank_pool[i].id_);
-      result.distances_.emplace_back(rerank_pool[i].distance_);
-    }
-    return result;
+    // 4. NodeRef destructor is called here -> Page is unpinned
+    return static_cast<uint32_t>(out_buffer.size());
   }
 
   // =========================================================================
-  // Disk-only search with beam expansion and block-sorted I/O
+  // Helper: Compute Exact Distance using NodeRef
   // =========================================================================
+  auto compute_exact_distance(const DataType *query, IDType node_id) -> float {
+    auto node = storage_->data().get_node(node_id);
+    auto vec_span = node.vector();
+    return dist_fn_(query, vec_span.data(), dimension_);
+  }
 
-  /**
-   * @brief Search using beam expansion + block-sorted distance computation.
-   *
-   * Instead of expanding one candidate at a time (random I/O per neighbor),
-   * expands beam_width candidates together. All their unvisited neighbors are
-   * collected, sorted by block_id, and processed sequentially. This yields:
-   * - Block deduplication: nodes sharing a 4KB block require only one pread
-   * - Sequential access: sorted block_ids enable OS readahead / SSD prefetch
-   * - Reduced LRU pressure: same block processed consecutively stays pinned
-   */
-  auto search_disk(const DataType *query, uint32_t topk, const Params &params) -> Result {
-    uint32_t ef = std::max(params.ef_search_, topk);
-    ef = std::min(ef, capacity_);
-    uint32_t beam_width = std::max(params.beam_width_, 1U);
+  auto search_disk(SearchContext &ctx, const DataType *query, uint32_t topk, const Params &params)
+      -> Result {
+    auto &candidates = ctx.candidates_;
+    auto &visited = ctx.visited_;
+    auto &beam_queue = ctx.beam_queue_;
+    auto &next_beam_io = ctx.next_beam_io_;
+    auto &next_beam_queue = ctx.next_beam_queue_;
 
-    CandidateList<DistanceType, IDType> candidates(capacity_, static_cast<int>(ef));
+    // Init Medoid
+    // No explicit prefetch needed for single point, get_node handles it
+    float start_dist = compute_exact_distance(query, medoid_id_);
+    candidates.insert(medoid_id_, start_dist);
+    visited.mark(medoid_id_);
+    beam_queue.push_back(medoid_id_);
 
-    auto dist = compute_node_distance(query, medoid_id_);
-    candidates.insert(medoid_id_, dist);
-    candidates.vis_.set(medoid_id_);
+    uint32_t beam_width = std::max(1U, params.beam_width_);
+    while (!beam_queue.empty()) {
+      next_beam_queue.clear();
+      next_beam_io.clear();
 
-    // Reusable buffers to avoid per-iteration heap allocation
-    std::vector<IDType> beam;
-    beam.reserve(beam_width);
-    std::vector<std::pair<uint32_t, IDType>> neighbor_blocks;
-    neighbor_blocks.reserve(static_cast<size_t>(beam_width) * max_degree_);
+      // A. Expand Beam (Read Neighbors)
+      // Since beam nodes were just computed, their pages are HOT in BufferPool.
+      // get_node() will likely return immediately without IO.
+      for (IDType node_id : beam_queue) {
+        get_neighbors_from_disk(node_id, ctx.neighbor_buffer_);
 
-    while (candidates.has_next()) {
-      // --- Pop beam_width candidates at once ---
-      beam.clear();
-      for (uint32_t b = 0; b < beam_width && candidates.has_next(); ++b) {
-        beam.push_back(candidates.pop());
-      }
-
-      // --- Collect all unvisited neighbors from the beam ---
-      neighbor_blocks.clear();
-      for (auto cur_id : beam) {
-        auto [nbrs, degree] = get_neighbors(cur_id);
-        for (uint32_t i = 0; i < degree; ++i) {
-          auto nbr = nbrs[i];
-          if (nbr == kInvalidID) {
-            break;
-          }
-          if (candidates.vis_.get(nbr)) {
+        for (IDType nbr : ctx.neighbor_buffer_) {
+          if (visited.is_visited(nbr)) {
             continue;
           }
-          candidates.vis_.set(nbr);
-          uint32_t block_id = storage_->data().block_id_of(static_cast<uint32_t>(nbr));
-          neighbor_blocks.emplace_back(block_id, nbr);
+          visited.mark(nbr);
+
+          // Collect block ID for batch prefetch
+          next_beam_io.push_back(storage_->data().block_id_of(nbr));
+          next_beam_queue.push_back(nbr);
         }
       }
 
-      if (neighbor_blocks.empty()) {
-        continue;
+      if (next_beam_queue.empty()) {
+        break;
       }
 
-      // --- Sort by block_id for sequential disk access ---
-      std::sort(neighbor_blocks.begin(), neighbor_blocks.end());
+      // B. IO Deduplication & Prefetching
+      std::sort(next_beam_io.begin(), next_beam_io.end());
+      next_beam_io.erase(std::unique(next_beam_io.begin(), next_beam_io.end()), next_beam_io.end());
 
-      // --- Batch prefetch via io_uring ---
-      prefetch_neighbor_blocks(neighbor_blocks);
+      // Batch submit IO requests to OS/SSD
+      storage_->data().prefetch_blocks(next_beam_io);
 
-      // --- Block-local pinning: one pin/unpin per unique block ---
-      uint32_t prev_blk = UINT32_MAX;
-      typename BufferPoolType::PageHandle block_handle;
-      bool handle_valid = false;
+      // C. Compute Distances
+      // Iterate over nodes. Their blocks have been prefetched.
+      // get_node() will find them in BufferPool.
+      for (auto nbr : next_beam_queue) {
+        float dist = compute_exact_distance(query, nbr);
+        candidates.insert(nbr, dist);
+      }
 
-      for (auto [blk, nbr] : neighbor_blocks) {
-        if (blk != prev_blk) {
-          block_handle = buffer_pool_->get(static_cast<IDType>(blk));
-          prev_blk = blk;
-          handle_valid = !block_handle.empty();
-        }
-
-        if (handle_valid) {
-          auto vec = storage_->data().get_vector_in_block(block_handle, nbr);
-          auto nbr_dist = dist_fn_(query, vec.data(), dimension_);
-          candidates.insert(nbr, nbr_dist);
-        } else {
-          auto nbr_dist = compute_node_distance(query, nbr);
-          candidates.insert(nbr, nbr_dist);
-        }
+      // D. Form next beam
+      beam_queue.clear();
+      for (uint32_t i = 0; i < beam_width && candidates.has_next(); ++i) {
+        beam_queue.push_back(candidates.pop());
       }
     }
 
     return candidates.to_search_result(topk);
   }
 
-  // =========================================================================
-  // Helper methods
-  // =========================================================================
-
-  /**
-   * @brief Get neighbor IDs from the in-memory graph.
-   */
-  [[nodiscard]] auto get_neighbors(IDType node_id) const -> std::pair<const IDType *, uint32_t> {
-    const IDType *neighbors = graph_.data() + static_cast<size_t>(node_id) * max_degree_;
-    uint32_t degree = graph_degrees_[node_id];
-    return {neighbors, degree};
-  }
-
-  /**
-   * @brief Read a node's full vector from disk and compute exact distance.
-   */
-  auto compute_node_distance(const DataType *query, IDType node_id) -> DistanceType {
-    DistanceType dist = 0;
-    storage_->inspect_node(node_id, [&](const Viewer &viewer) -> void {
-      auto vec = viewer.vector_view();
-      dist = dist_fn_(query, vec.data(), dimension_);
-    });
-    return dist;
-  }
-
-  /**
-   * @brief Prefetch blocks for rerank candidates (search_pq Phase 2).
-   *
-   * Computes block_id for each candidate, sorts, and submits batch I/O.
-   */
-  void prefetch_node_blocks(std::span<const NeighborType> candidates) {
-    std::vector<uint32_t> block_ids;
-    block_ids.reserve(candidates.size());
-    for (const auto &c : candidates) {
-      block_ids.push_back(storage_->data().block_id_of(static_cast<uint32_t>(c.id_)));
-    }
-    std::ranges::sort(block_ids);
-    storage_->data().prefetch_blocks(block_ids);
-  }
-
-  /**
-   * @brief Prefetch blocks for neighbor expansion (search_disk).
-   *
-   * neighbor_blocks is already sorted by block_id (first element of pair).
-   */
-  void prefetch_neighbor_blocks(std::span<const std::pair<uint32_t, IDType>> neighbor_blocks) {
-    std::vector<uint32_t> block_ids;
-    block_ids.reserve(neighbor_blocks.size());
-    for (auto [blk, nbr] : neighbor_blocks) {
-      block_ids.push_back(blk);
-    }
-    storage_->data().prefetch_blocks(block_ids);
+  auto search_pq(SearchContext & /*ctx*/,
+                 const DataType * /*query*/,
+                 uint32_t /*topk*/,
+                 const Params & /*params*/) -> Result {
+    // TODO(diskann): implement PQ two-phase search
+    return Result(0);
   }
 };
 

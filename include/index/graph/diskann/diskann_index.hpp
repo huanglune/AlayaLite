@@ -76,24 +76,6 @@ class DiskANNIndex {
   // ==========================================================================
   // Static Build Methods
   // ==========================================================================
-
-  /**
-   * @brief Build a DiskANN index from a distance space.
-   *
-   * @tparam DistanceSpaceType Type satisfying the Space concept
-   * @param space Shared pointer to the distance space containing data
-   * @param output_path Path to write the index file
-   * @param params Build parameters (default values if not specified)
-   */
-  template <typename DistanceSpaceType>
-    requires Space<DistanceSpaceType>
-  static auto build(std::shared_ptr<DistanceSpaceType> space,
-                    std::string_view output_path,
-                    const DiskANNBuildParams &params = DiskANNBuildParams{}) -> void {
-    DiskANNBuilder<DistanceSpaceType> builder(space, params);
-    builder.build_disk_index(output_path, params.num_threads_);
-  }
-
   /**
    * @brief Build a DiskANN index and return the in-memory graph.
    *
@@ -113,15 +95,12 @@ class DiskANNIndex {
       -> std::unique_ptr<Graph<typename DistanceSpaceType::DataTypeAlias,
                                typename DistanceSpaceType::IDTypeAlias>> {
     DiskANNBuilder<DistanceSpaceType> builder(space, params);
-
-    // Build the graph
     auto graph = builder.build_graph(params.num_threads_);
-
-    // Optionally write to disk
     if (!output_path.empty()) {
-      builder.build_disk_index(output_path, params.num_threads_);
+      builder.save_disk_index(output_path, *graph);
+    } else {
+      LOG_INFO("DiskANNIndex: Skipping saving index to disk");
     }
-
     return graph;
   }
 
@@ -134,43 +113,21 @@ class DiskANNIndex {
    *
    * @param index_path Path to the index file
    */
-  auto load(std::string_view index_path, size_t cache_capacity = 4096) -> void {
+  auto load(std::string_view index_path, size_t cache_capacity = 4096, bool writable = false)
+      -> void {
     searcher_ = std::make_unique<SearcherType>();
-    searcher_->open(index_path, cache_capacity);
+    searcher_->open(index_path, cache_capacity, writable);
     index_path_ = std::string(index_path);
     LOG_INFO("DiskANNIndex: Loaded index from {}", index_path_);
   }
 
-  /**
-   * @brief Check if an index is loaded.
-   *
-   * @return true if ready for search
-   */
   [[nodiscard]] auto is_loaded() const -> bool {
     return searcher_ != nullptr && searcher_->is_open();
   }
-
-  /**
-   * @brief Get the number of vectors in the index.
-   *
-   * @return Number of indexed vectors
-   */
   [[nodiscard]] auto size() const -> uint64_t { return searcher_ ? searcher_->num_points() : 0; }
-
-  /**
-   * @brief Get the vector dimension.
-   *
-   * @return Vector dimension
-   */
   [[nodiscard]] auto dimension() const -> uint32_t {
     return searcher_ ? searcher_->dimension() : 0;
   }
-
-  /**
-   * @brief Get the index file path.
-   *
-   * @return Path to the loaded index
-   */
   [[nodiscard]] auto path() const -> const std::string & { return index_path_; }
 
   /**
@@ -248,6 +205,53 @@ class DiskANNIndex {
   void close() {
     searcher_.reset();
     index_path_.clear();
+  }
+
+  // ==========================================================================
+  // Insert Methods
+  // ==========================================================================
+
+  /**
+   * @brief Pre-allocate capacity for future inserts.
+   *
+   * Call this before bulk inserts to avoid repeated auto-grow reallocations.
+   *
+   * @param new_capacity Desired total capacity
+   */
+  void reserve(uint32_t new_capacity) {
+    if (!is_loaded()) {
+      throw std::runtime_error("DiskANNIndex: No index loaded");
+    }
+    searcher_->reserve_capacity(new_capacity);
+  }
+
+  /**
+   * @brief Insert a new vector into the loaded index.
+   *
+   * Requires the index to be loaded with writable=true.
+   *
+   * @param vector      Query vector (dimension elements)
+   * @param external_id User-visible external ID
+   * @param params      Insert parameters
+   */
+  void insert(const DataType *vector,
+              IDType external_id,
+              const DiskANNInsertParams &params = DiskANNInsertParams{}) {
+    if (!is_loaded()) {
+      throw std::runtime_error("DiskANNIndex: No index loaded");
+    }
+    searcher_->insert(vector, external_id, params);
+  }
+
+  /**
+   * @brief Persist metadata changes to disk.
+   *
+   * Call after inserts to ensure bitmap and ID mappings survive a crash.
+   */
+  void flush() {
+    if (is_loaded()) {
+      searcher_->flush();
+    }
   }
 
   /**

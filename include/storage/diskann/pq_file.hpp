@@ -22,13 +22,16 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 
+#include "utils/macros.hpp"
 #include "utils/math.hpp"
 #include "utils/memory.hpp"
 
@@ -79,14 +82,10 @@ struct alignas(64) PQFileHeader {
 
   uint32_t num_subspaces_{0};    // M
   uint32_t num_centroids_{256};  // K
-
-  uint32_t subspace_dim_{0};  // D/M
-  uint32_t dim_original_{0};  // D
-
-  uint64_t num_vectors_{0};  // N (current count)
-
-  uint64_t file_capacity_{0};  // Total file capacity
-
+  uint32_t subspace_dim_{0};     // D/M
+  uint32_t dim_original_{0};     // D
+  uint64_t num_vectors_{0};      // N (current count)
+  uint64_t file_capacity_{0};    // Total file capacity
   uint64_t codebook_offset_{kPQFileHeaderSize};
   uint64_t codes_offset_{0};
   uint64_t codes_capacity_{0};  // Pre-allocated codes space
@@ -175,13 +174,47 @@ static_assert(sizeof(PQFileHeader) == kPQFileHeaderSize, "PQFileHeader must be e
  */
 class PQFile {
  public:
+  class DistanceComputer {
+   public:
+    DistanceComputer(const PQFile &pq, const float *query, std::span<float> scratch)
+        : pq_(pq),
+          adc_table_(scratch.data()),
+          codes_base_(pq.codes_),
+          num_subspaces_(pq.header_.num_subspaces_),
+          num_centroids_(pq.header_.num_centroids_) {
+      pq_.compute_adc_table(query, adc_table_);
+    }
+
+    ALAYA_NON_COPYABLE(DistanceComputer);  // disable copy(forbid large buffer copy)
+    DistanceComputer(DistanceComputer &&) = default;
+
+    [[nodiscard]] __attribute__((always_inline)) auto operator()(uint64_t vector_id) const
+        -> float {
+      assert(vector_id < pq_.num_vectors());
+      const uint8_t *code = codes_base_ + vector_id * num_subspaces_;
+
+      float dist = 0.0F;
+      const float *table_ptr = adc_table_;
+
+      for (uint32_t m = 0; m < num_subspaces_; ++m) {
+        dist += table_ptr[*code];
+        table_ptr += num_centroids_;
+        code++;
+      }
+      return dist;
+    }
+
+   private:
+    const PQFile &pq_;
+    float *adc_table_;
+    const uint8_t *codes_base_;
+    uint32_t num_subspaces_;
+    uint32_t num_centroids_;
+  };
+
   PQFile() = default;
   ~PQFile() { close(); }
-
-  // Non-copyable
-  PQFile(const PQFile &) = delete;
-  auto operator=(const PQFile &) -> PQFile & = delete;
-
+  ALAYA_NON_COPYABLE(PQFile);
   // Movable
   PQFile(PQFile &&other) noexcept
       : path_(std::move(other.path_)),
@@ -221,6 +254,11 @@ class PQFile {
       other.is_open_ = false;
     }
     return *this;
+  }
+
+  [[nodiscard]] auto get_computer(const float *query, std::span<float> scratch) const
+      -> DistanceComputer {
+    return {*this, query, scratch};
   }
 
   /**
@@ -482,9 +520,7 @@ class PQFile {
    * @return Pointer to the PQ code (M bytes)
    */
   [[nodiscard]] auto get_code(uint64_t vector_id) const -> const uint8_t * {
-    if (vector_id >= header_.num_vectors_) {
-      throw std::out_of_range("Vector ID out of range");
-    }
+    assert(vector_id < header_.num_vectors_ && "Vector ID out of range");
     return codes_ + vector_id * header_.num_subspaces_;
   }
 
@@ -502,35 +538,29 @@ class PQFile {
    * @param adc_table Output ADC table (M * K floats)
    */
   void compute_adc_table(const float *query, float *adc_table) const {
-    for (uint32_t m = 0; m < header_.num_subspaces_; ++m) {
-      const float *query_subvec = query + m * header_.subspace_dim_;
-      float *table_row = adc_table + m * header_.num_centroids_;
+    const uint32_t M = header_.num_subspaces_;     // NOLINT
+    const uint32_t K = header_.num_centroids_;     // NOLINT
+    const uint32_t D_sub = header_.subspace_dim_;  // NOLINT
 
-      for (uint32_t k = 0; k < header_.num_centroids_; ++k) {
-        const float *centroid = get_centroid(m, k);
+    const float *current_centroid_ptr = codebook_;  // Points to start of codebook
+    const float *current_query_sub = query;         // Points to start of query
+    float *current_table_row = adc_table;           // Points to start of ADC table
+
+    for (uint32_t m = 0; m < M; ++m) {
+      for (uint32_t k = 0; k < K; ++k) {
         float dist = 0.0F;
-        for (uint32_t d = 0; d < header_.subspace_dim_; ++d) {
-          float diff = query_subvec[d] - centroid[d];
+        for (uint32_t d = 0; d < D_sub; ++d) {
+          float diff = current_query_sub[d] - current_centroid_ptr[d];
           dist += diff * diff;
         }
-        table_row[k] = dist;
-      }
-    }
-  }
 
-  /**
-   * @brief Compute approximate distance using ADC table and PQ code.
-   *
-   * @param adc_table Pre-computed ADC table (M * K floats)
-   * @param code PQ code (M bytes)
-   * @return Approximate squared L2 distance
-   */
-  [[nodiscard]] auto compute_distance(const float *adc_table, const uint8_t *code) const -> float {
-    float dist = 0.0F;
-    for (uint32_t m = 0; m < header_.num_subspaces_; ++m) {
-      dist += adc_table[m * header_.num_centroids_ + code[m]];
+        *current_table_row = dist;
+        current_table_row++;
+
+        current_centroid_ptr += D_sub;
+      }
+      current_query_sub += D_sub;
     }
-    return dist;
   }
 
   /**
@@ -542,6 +572,27 @@ class PQFile {
    */
   [[nodiscard]] auto compute_distance(const float *adc_table, uint64_t vector_id) const -> float {
     return compute_distance(adc_table, get_code(vector_id));
+  }
+
+  /**
+   * @brief Compute approximate distance using ADC table and PQ code.
+   *
+   * @param adc_table Pre-computed ADC table (M * K floats)
+   * @param code PQ code (M bytes)
+   * @return Approximate squared L2 distance
+   */
+  [[nodiscard]] auto compute_distance(const float *adc_table, const uint8_t *code) const -> float {
+    float dist = 0.0F;
+    const float *table_ptr = adc_table;
+    uint32_t K = header_.num_centroids_;  // NOLINT
+    for (uint32_t m = 0; m < header_.num_subspaces_; ++m) {
+      dist += table_ptr[*code];
+
+      // Advance to next subspace's ADC row
+      table_ptr += K;
+      code++;
+    }
+    return dist;
   }
 
   // -------------------------------------------------------------------------
@@ -581,18 +632,16 @@ class PQFile {
       throw std::runtime_error("Failed to extend PQ file");
     }
 
-    // Unmap old mapping
-    if (mmap_addr_ != nullptr && mmap_addr_ != MAP_FAILED) {
-      munmap(mmap_addr_, mmap_size_);
-    }
-
-    // Create new mapping
-    mmap_size_ = new_capacity;
-    mmap_addr_ = mmap(nullptr, mmap_size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
-    if (mmap_addr_ == MAP_FAILED) {
-      mmap_addr_ = nullptr;
+    // Remap atomically via mremap (Linux). If the kernel can extend in-place,
+    // the address stays the same; otherwise MREMAP_MAYMOVE relocates it.
+    // NOTE: Concurrent readers must still be synchronized externally,
+    // as MREMAP_MAYMOVE may relocate the mapping to a new address.
+    void *new_addr = mremap(mmap_addr_, mmap_size_, new_capacity, MREMAP_MAYMOVE);
+    if (new_addr == MAP_FAILED) {
       throw std::runtime_error("Failed to remap PQ file");
     }
+    mmap_addr_ = new_addr;
+    mmap_size_ = new_capacity;
 
     // Update header
     header_.file_capacity_ = new_capacity;
