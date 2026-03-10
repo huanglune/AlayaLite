@@ -19,7 +19,8 @@ RUN echo "tzdata tzdata/Areas select Asia" | debconf-set-selections && \
     apt install -y python3-pip
 
 # install required packages and alayalite
-RUN python3.11 -m pip install python-docx numpy streamlit langchain_text_splitters FlagEmbedding pypdf
+COPY requirements.txt .
+RUN python3.11 -m pip install -r ./requirements.txt
 RUN python3.11 -m pip install alayalite
 
 # set the mirror of embedding models
