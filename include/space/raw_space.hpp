@@ -121,6 +121,7 @@ class RawSpace {
         break;
     }
   }
+  [[nodiscard]] auto get_metric_name() -> std::string_view { return kMetricMap[metric_]; }
 
   /**
    * @brief Fit the data into the space
@@ -161,58 +162,15 @@ class RawSpace {
     return data_storage_.remove(id);
   }
 
-  /**
-   * @brief Get the data pointer for a specific ID
-   * @param id The ID of the data point
-   * @return Pointer to the data for the given ID
-   */
   auto get_data_by_id(IDType id) const -> DataType * { return data_storage_[id]; }
-
-  /**
-   * @brief Calculate the distance between two data points
-   * @param i ID of the first data point
-   * @param j ID of the second data point
-   * @return The calculated distance
-   */
   auto get_distance(IDType i, IDType j) -> DistanceType {
     return distance_calu_func_(get_data_by_id(i), get_data_by_id(j), dim_);
   }
-
-  /**
-   * @brief Get the number of the vector data
-   * @return The number of vector data.
-   */
   auto get_data_num() -> IDType { return item_cnt_; }
-
-  /**
-   * @brief Get the number of the available vector data
-   * @return The number of vector data.
-   */
   auto get_avl_data_num() -> IDType { return item_cnt_ - delete_cnt_; }
-
-  /**
-   * @brief Get the capacity object
-   *
-   * @return IDType The capacity of the space.
-   */
   auto get_capacity() -> IDType { return capacity_; }
-
-  /**
-   * @brief Get the size of each data point in bytes
-   * @return The size of each data point
-   */
   auto get_data_size() -> size_t { return data_size_; }
-
-  /**
-   * @brief Get the distance calculation function
-   * @return The distance calculation function
-   */
   auto get_dist_func() -> DistFunc<DataType, DistanceType> { return distance_calu_func_; }
-
-  /**
-   * @brief Get the dimensionality of the data points
-   * @return The dimensionality
-   */
   auto get_dim() -> uint32_t { return dim_; }
 
   auto load(std::string_view filename) -> void {
@@ -314,9 +272,7 @@ class RawSpace {
    * @param address The address of the data to prefetch
    */
   auto prefetch_by_address(DataType *address) -> void { mem_prefetch_l1(address, data_size_ / 64); }
-
   auto get_query_computer(const DataType *query) { return QueryComputer(*this, query); }
-
   auto get_query_computer(IDType id) { return QueryComputer(*this, id); }
 };
 

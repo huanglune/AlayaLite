@@ -6,7 +6,7 @@
 # Configuration
 BUILD_DIR      := build
 BUILD_TYPE     := Release
-CMAKE_FLAGS    := -DBUILD_TESTING=ON
+CMAKE_FLAGS    := -DBUILD_TESTING=ON -DBUILD_BENCHMARKS=ON
 PYTEST_FLAGS   := -v
 CTEST_FLAGS    := --output-on-failure
 JOBS           := $(shell nproc 2>/dev/null || echo 4)

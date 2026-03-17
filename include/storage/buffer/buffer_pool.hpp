@@ -113,6 +113,16 @@ struct BufferPoolStats {
   std::atomic<uint64_t> evictions_{0};
   std::atomic<uint64_t> pins_{0};
 
+  [[nodiscard]] auto hit_rate() const -> double {
+    auto hits = hits_.load(std::memory_order_relaxed);
+    auto misses = misses_.load(std::memory_order_relaxed);
+    auto total = hits + misses;
+    if (total == 0) {
+      return 0.0;
+    }
+    return static_cast<double>(hits) / static_cast<double>(total);
+  }
+
   void reset() {
     hits_ = 0;
     misses_ = 0;

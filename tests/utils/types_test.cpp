@@ -35,4 +35,11 @@ TEST(MetricTypeTest, StringViewCopyBehavior) {
   EXPECT_EQ(test_key, "L2");
 }
 
+// Test metric name retrieval
+TEST(MetricTypeTest, GetMetricName) {
+  MetricType metric = MetricType::IP;
+  auto metric_name = kMetricMap[metric];
+  EXPECT_EQ(metric_name, "IP");
+}
+
 }  // namespace alaya

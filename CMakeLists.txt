@@ -19,6 +19,7 @@ include(cmake/Codecov.cmake)
 option(ENABLE_COVERAGE "Enable code coverage instrumentation" OFF)
 option(BUILD_TESTING "Build tests" OFF)
 option(BUILD_BENCHMARKS "Build benchmarks" OFF)
+option(BUILD_PYTHON "Build Python bindings" OFF)
 
 # ============================================================================
 # 1. C++ STANDARD AND COMPILER CONFIGURATION
@@ -33,6 +34,12 @@ if(MSVC)
   add_compile_options(/EHsc /utf-8 /O2)
 else()
   add_compile_options(-Wall -Ofast)
+  if(BUILD_TESTING OR BUILD_BENCHMARKS)
+    add_compile_options(-g -fno-omit-frame-pointer)
+  else()
+    add_compile_options(-flto=auto)
+    add_link_options(-flto=auto)
+  endif()
 endif()
 
 # ============================================================================
@@ -95,5 +102,7 @@ if(BUILD_BENCHMARKS)
   add_subdirectory(benchmark)
 endif()
 
-add_subdirectory(python)
+if(BUILD_PYTHON)
+  add_subdirectory(python)
+endif()
 print_build_summary()

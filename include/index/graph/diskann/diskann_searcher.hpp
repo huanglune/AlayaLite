@@ -233,6 +233,7 @@ class DiskANNSearcher {
   [[nodiscard]] auto num_points() const -> uint32_t { return num_points_; }
   [[nodiscard]] auto dimension() const -> uint32_t { return dimension_; }
   [[nodiscard]] auto capacity() const -> uint32_t { return capacity_; }
+  [[nodiscard]] auto buffer_pool() -> BufferPoolType & { return *buffer_pool_; }
 
   // =========================================================================
   // Mutation (for incremental insert support)

@@ -146,6 +146,23 @@ inline auto deep1m(const std::filesystem::path &data_dir) -> DatasetConfig {
   };
 }
 
+/**
+ * @brief Create config for DEEP10M dataset (10M vectors, 96 dim, angular/cosine).
+ *
+ * Converted from http://ann-benchmarks.com/deep-image-96-angular.hdf5
+ * via: uv run scripts/hdf5_to_fvecs.py --input <url> --output data/deep10M
+ */
+inline auto deep10m(const std::filesystem::path &data_dir) -> DatasetConfig {
+  auto dir = data_dir / "deep10M";
+  return DatasetConfig{
+      .name_ = "deep10M",
+      .dir_ = dir,
+      .data_file_ = dir / "deep10M_base.fvecs",
+      .query_file_ = dir / "deep10M_query.fvecs",
+      .gt_file_ = dir / "deep10M_groundtruth.ivecs",
+  };
+}
+
 namespace detail {
 inline auto generate_random_dataset(const DatasetConfig &config) -> Dataset {
   Dataset ds;
@@ -199,6 +216,16 @@ inline auto load_dataset(const DatasetConfig &config) -> Dataset {
                      std::filesystem::exists(config.query_file_) &&
                      std::filesystem::exists(config.gt_file_);
   if (!files_exist) {
+    if (config.download_url_.empty()) {
+      LOG_CRITICAL(
+          "Dataset '{}' files not found and no download URL configured. "
+          "Expected files:\n  {}\n  {}\n  {}",
+          config.name_,
+          config.data_file_.string(),
+          config.query_file_.string(),
+          config.gt_file_.string());
+      exit(-1);
+    }
     if (!std::filesystem::exists(config.dir_)) {
       std::filesystem::create_directories(config.dir_);
     }

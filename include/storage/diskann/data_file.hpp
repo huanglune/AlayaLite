@@ -198,6 +198,10 @@ class DataFile {
     if (buffer_pool_ == nullptr) {
       throw std::invalid_argument("DataFile requires a valid BufferPool");
     }
+
+    buffer_pool_->set_flush_callback([this](IDType block_id, const uint8_t *data) -> void {
+      write_block(block_id, data);
+    });
   }
   ~DataFile() { close(); }
 

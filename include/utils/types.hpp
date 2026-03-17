@@ -55,10 +55,24 @@ struct MetricMap {
     }
     return MetricType::NONE;
   }
+
+  constexpr auto operator[](const MetricType type) const -> std::string_view {
+    for (const auto &[key, val] : kStaticMap) {
+      if (val == type) {
+        return key;
+      }
+    }
+    return "NONE";
+  }
 };
 
 inline constexpr MetricMap kMetricMap{};
 static_assert(kMetricMap["L2"] == MetricType::L2);
+static_assert(kMetricMap["IP"] == MetricType::IP);
+static_assert(kMetricMap["COS"] == MetricType::COS);
+static_assert(kMetricMap[MetricType::L2] == "L2");
+static_assert(kMetricMap[MetricType::IP] == "IP");
+static_assert(kMetricMap[MetricType::COS] == "COS");
 
 // ============================================================================
 // DiskDataType - Data type identifier for vector elements stored on disk
