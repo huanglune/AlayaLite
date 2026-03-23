@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <memory>
@@ -46,7 +47,7 @@ struct SearcherTestResources {
   uint32_t data_num_{0};
   uint32_t query_num_{0};
   std::shared_ptr<RawSpace<>> space_;
-  uint32_t max_threads_{std::min(std::thread::hardware_concurrency(), 60U)};
+  uint32_t max_threads_{std::max(1U, std::min(std::thread::hardware_concurrency(), 60U))};
 
   std::filesystem::path tmp_dir_;
   std::filesystem::path index_path_;
@@ -60,7 +61,10 @@ struct SearcherTestResources {
     space_ = std::make_shared<RawSpace<>>(data_num_, dim_, MetricType::L2);
     space_->fit(ds_.data_.data(), data_num_);
 
-    tmp_dir_ = std::filesystem::temp_directory_path() / "diskann_searcher_test";
+    auto unique_suffix =
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    tmp_dir_ =
+        std::filesystem::temp_directory_path() / ("diskann_searcher_test_" + unique_suffix);
     std::filesystem::create_directories(tmp_dir_);
     index_path_ = tmp_dir_ / "test_idx";
 
@@ -120,6 +124,12 @@ class DiskANNSearcherTest : public ::testing::Test {
     return index;
   }
 
+  auto load_writable_index(size_t cache_cap = 4096) -> DiskANNIndex<> {
+    DiskANNIndex<> index;
+    index.load(index_path(), cache_cap, true);
+    return index;
+  }
+
   auto compute_recall(const uint32_t *results, uint32_t topk) -> float {
     return calc_recall(results, dataset().ground_truth_.data(), query_num(), dataset().gt_dim_, topk);
   }
@@ -173,6 +183,32 @@ TEST_F(DiskANNSearcherTest, IndexSizeAndDimension) {
   EXPECT_EQ(index.dimension(), dim());
   // capacity may be rounded up for bitmap alignment, so size >= data_num
   EXPECT_GE(index.size(), data_num());
+}
+
+TEST_F(DiskANNSearcherTest, ReserveRequiresWritableIndex) {
+  auto index = load_index();
+  EXPECT_THROW(index.reserve(static_cast<uint32_t>(index.size()) + 64), std::runtime_error);
+}
+
+TEST_F(DiskANNSearcherTest, ReserveAndFlushPersistCapacityGrowth) {
+  auto index = load_writable_index();
+  uint32_t old_capacity = index.get_searcher().capacity();
+  uint32_t requested_capacity = old_capacity + 57;
+
+  index.reserve(requested_capacity);
+  EXPECT_GE(index.get_searcher().capacity(), requested_capacity);
+  index.flush();
+  index.close();
+
+  auto reopened = load_index();
+  EXPECT_GE(reopened.get_searcher().capacity(), requested_capacity);
+}
+
+TEST_F(DiskANNSearcherTest, InsertFailsFastInsteadOfSilentlySucceeding) {
+  auto index = load_writable_index();
+  std::vector<float> vec(dim(), 1.0F);
+
+  EXPECT_THROW(index.insert(vec.data(), data_num() + 1), std::logic_error);
 }
 
 // -----------------------------------------------------------------------------
@@ -497,7 +533,7 @@ TEST_F(DiskANNSearcherTest, SearchParamsDefault) {
 
   EXPECT_EQ(params.ef_search_, 64U);
   EXPECT_EQ(params.beam_width_, 4U);
-  EXPECT_TRUE(params.use_pq_rerank_);
+  EXPECT_FALSE(params.use_pq_rerank_);
   EXPECT_EQ(params.pq_rerank_factor_, 4U);
   EXPECT_EQ(params.cache_capacity_, 4096U);
 }
@@ -648,6 +684,86 @@ TEST_F(DiskANNSearcherDirectTest, MultipleSearchesOnSameInstance) {
       }
     }
   }
+}
+
+TEST_F(DiskANNSearcherTest, SearchWithBeamWidthOneReturnsTopKOnSmallIndex) {
+  constexpr uint32_t kSmallDataNum = 64;
+  constexpr uint32_t kTopk = 5;
+
+  std::vector<float> small_data(dataset().data_.begin(),
+                                dataset().data_.begin() + kSmallDataNum * dim());
+  auto small_space = std::make_shared<RawSpace<>>(kSmallDataNum, dim(), MetricType::L2);
+  small_space->fit(small_data.data(), kSmallDataNum);
+
+  auto tmp_dir =
+      std::filesystem::temp_directory_path() / "diskann_searcher_beam_width_one_test";
+  std::filesystem::remove_all(tmp_dir);
+  std::filesystem::create_directories(tmp_dir);
+  auto small_index_path = tmp_dir / "test_idx";
+
+  auto build_params = DiskANNBuildParams()
+                          .set_max_degree(8)
+                          .set_ef_construction(16)
+                          .set_num_iterations(1)
+                          .set_num_threads(std::min(max_threads(), 4U));
+  DiskANNIndex<>::build_graph(small_space, small_index_path.string(), build_params);
+
+  DiskANNIndex<> index;
+  index.load(small_index_path.string());
+
+  DiskANNSearchParams search_params;
+  search_params.set_beam_width(1).set_ef_search(8);
+
+  std::vector<uint32_t> results(kTopk, static_cast<uint32_t>(-1));
+  EXPECT_NO_THROW(
+      index.search(dataset().queries_.data(), kTopk, results.data(), search_params));
+  EXPECT_EQ(std::count_if(results.begin(),
+                          results.end(),
+                          [](uint32_t id) { return id != static_cast<uint32_t>(-1); }),
+            static_cast<int>(kTopk));
+
+  for (uint32_t id : results) {
+    EXPECT_LT(id, kSmallDataNum);
+  }
+
+  index.close();
+  std::filesystem::remove_all(tmp_dir);
+}
+
+TEST_F(DiskANNSearcherTest, SearchWithEfSearchOneDoesNotCrashOnSmallIndex) {
+  constexpr uint32_t kSmallDataNum = 64;
+  constexpr uint32_t kTopk = 5;
+
+  std::vector<float> small_data(dataset().data_.begin(),
+                                dataset().data_.begin() + kSmallDataNum * dim());
+  auto small_space = std::make_shared<RawSpace<>>(kSmallDataNum, dim(), MetricType::L2);
+  small_space->fit(small_data.data(), kSmallDataNum);
+
+  auto tmp_dir =
+      std::filesystem::temp_directory_path() / "diskann_searcher_ef_search_one_test";
+  std::filesystem::remove_all(tmp_dir);
+  std::filesystem::create_directories(tmp_dir);
+  auto small_index_path = tmp_dir / "test_idx";
+
+  auto build_params = DiskANNBuildParams()
+                          .set_max_degree(8)
+                          .set_ef_construction(16)
+                          .set_num_iterations(1)
+                          .set_num_threads(std::min(max_threads(), 4U));
+  DiskANNIndex<>::build_graph(small_space, small_index_path.string(), build_params);
+
+  DiskANNIndex<> index;
+  index.load(small_index_path.string());
+
+  DiskANNSearchParams search_params;
+  search_params.set_ef_search(1).set_beam_width(4);
+
+  std::vector<uint32_t> results(kTopk, static_cast<uint32_t>(-1));
+  EXPECT_NO_THROW(
+      index.search(dataset().queries_.data(), kTopk, results.data(), search_params));
+
+  index.close();
+  std::filesystem::remove_all(tmp_dir);
 }
 
 }  // namespace alaya

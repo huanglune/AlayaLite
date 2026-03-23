@@ -262,6 +262,14 @@ TEST_F(DataFileTest, CloseIdempotent) {
   EXPECT_FALSE(df.is_open());
 }
 
+TEST_F(DataFileTest, GetNodeOutOfRangeThrows) {
+  auto path = make_path("get_node_oor");
+  DataFile<float, uint32_t> df(bp_.get());
+  df.create(path, kCapacity, kDim, kMaxDeg);
+
+  EXPECT_THROW(static_cast<void>(df.get_node(kCapacity)), std::out_of_range);
+}
+
 // -------------------------------------------------------------------------
 // Row size too large throws
 // -------------------------------------------------------------------------
@@ -347,6 +355,33 @@ TEST_F(DataFileTest, NodeRefMutableVectorAndNeighbors) {
   }
 }
 
+TEST_F(DataFileTest, ReadOnlyNodeRefRejectsMutation) {
+  auto path = make_path("readonly_rejects_mutation");
+
+  {
+    DataFile<float, uint32_t> df(bp_.get());
+    df.create(path, kCapacity, kDim, kMaxDeg);
+    auto ref = df.get_node(0);
+    ref.set_vector(std::span<const float>(make_vector(kDim, 7)));
+    ref.set_neighbors(std::span<const uint32_t>(make_neighbors(2, 3)));
+    df.close();
+  }
+
+  bp_->clear();
+
+  DataFile<float, uint32_t> df(bp_.get());
+  df.open(path, kCapacity, kDim, kMaxDeg, false);
+
+  auto ref = df.get_node(0);
+  auto vec = make_vector(kDim, 9);
+  auto nbrs = make_neighbors(2, 5);
+  EXPECT_THROW(ref.set_vector(std::span<const float>(vec)), std::runtime_error);
+  EXPECT_THROW(ref.set_neighbors(std::span<const uint32_t>(nbrs)), std::runtime_error);
+  EXPECT_THROW(static_cast<void>(ref.mutable_vector()), std::runtime_error);
+  EXPECT_THROW(static_cast<void>(ref.mutable_neighbors()), std::runtime_error);
+  EXPECT_THROW(ref.mark_dirty(), std::runtime_error);
+}
+
 TEST_F(DataFileTest, SetNeighborsTooManyThrows) {
   auto path = make_path("too_many_nbrs");
   DataFile<float, uint32_t> df(bp_.get());
@@ -413,6 +448,41 @@ TEST_F(DataFileTest, PersistenceWithFlush) {
   }
 }
 
+TEST_F(DataFileTest, ClosePersistsDirtyPages) {
+  auto path = make_path("close_persist");
+  auto vec = make_vector(kDim, 11);
+  auto nbrs = make_neighbors(3, 20);
+
+  {
+    DataFile<float, uint32_t> df(bp_.get());
+    df.create(path, kCapacity, kDim, kMaxDeg);
+
+    auto ref = df.get_node(2);
+    ref.set_vector(std::span<const float>(vec));
+    ref.set_neighbors(std::span<const uint32_t>(nbrs));
+    df.close();
+  }
+
+  bp_->clear();
+
+  {
+    DataFile<float, uint32_t> df(bp_.get());
+    df.open(path, kCapacity, kDim, kMaxDeg, false);
+
+    auto ref = df.get_node(2);
+    auto read_vec = ref.vector();
+    auto read_nbrs = ref.neighbors();
+    ASSERT_EQ(read_vec.size(), kDim);
+    ASSERT_EQ(read_nbrs.size(), nbrs.size());
+    for (uint32_t i = 0; i < kDim; ++i) {
+      EXPECT_FLOAT_EQ(read_vec[i], vec[i]);
+    }
+    for (size_t i = 0; i < nbrs.size(); ++i) {
+      EXPECT_EQ(read_nbrs[i], nbrs[i]);
+    }
+  }
+}
+
 // -------------------------------------------------------------------------
 // Prefetch / preload
 // -------------------------------------------------------------------------
@@ -429,6 +499,26 @@ TEST_F(DataFileTest, PrefetchBlocksNoThrow) {
   }
 
   EXPECT_NO_THROW(df.prefetch_blocks(std::span<const uint32_t>(ids)));
+}
+
+TEST_F(DataFileTest, PrefetchBlocksPopulateBufferPool) {
+  auto path = make_path("prefetch_populates_cache");
+  DataFile<float, uint32_t> df(bp_.get());
+  df.create(path, kCapacity, kDim, kMaxDeg);
+
+  {
+    auto ref = df.get_node(0);
+    ref.set_vector(std::span<const float>(make_vector(kDim, 7)));
+    ref.set_neighbors(std::span<const uint32_t>(make_neighbors(2, 3)));
+  }
+  df.flush();
+  bp_->clear();
+
+  std::vector<uint32_t> ids{0};
+  df.prefetch_blocks(std::span<const uint32_t>(ids));
+
+  auto handle = bp_->get(0);
+  EXPECT_FALSE(handle.empty());
 }
 
 TEST_F(DataFileTest, PreloadBlockOutOfRangeThrows) {
@@ -499,6 +589,43 @@ TEST_F(DataFileTest, MoveConstruct) {
   auto read_vec = ref.vector();
   for (uint32_t i = 0; i < kDim; ++i) {
     EXPECT_FLOAT_EQ(read_vec[i], vec[i]);
+  }
+}
+
+TEST_F(DataFileTest, MoveConstructRebindsFlushCallback) {
+  constexpr uint32_t kLargeCapacity = 256;
+  auto path = make_path("move_ctor_flush_callback");
+  BufferPool<uint32_t> small_bp(1, kDataBlockSize, 1);
+  DataFile<float, uint32_t> df(&small_bp);
+  df.create(path, kLargeCapacity, kDim, kMaxDeg);
+
+  DataFile<float, uint32_t> moved(std::move(df));
+  auto vec0 = make_vector(kDim, 21);
+  auto vec1 = make_vector(kDim, 22);
+  uint32_t second_block_node = moved.nodes_per_block();
+  ASSERT_LT(second_block_node, kLargeCapacity);
+
+  {
+    auto ref = moved.get_node(0);
+    ref.set_vector(std::span<const float>(vec0));
+  }
+
+  {
+    auto ref = moved.get_node(second_block_node);
+    ref.set_vector(std::span<const float>(vec1));
+  }
+
+  moved.close();
+  small_bp.clear();
+
+  DataFile<float, uint32_t> reopened(&small_bp);
+  reopened.open(path, kLargeCapacity, kDim, kMaxDeg, false);
+
+  auto ref = reopened.get_node(0);
+  auto read_vec = ref.vector();
+  ASSERT_EQ(read_vec.size(), kDim);
+  for (uint32_t i = 0; i < kDim; ++i) {
+    EXPECT_FLOAT_EQ(read_vec[i], vec0[i]);
   }
 }
 

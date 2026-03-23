@@ -143,9 +143,11 @@ class DirectFileIO {
         path_(std::move(other.path_)),
         file_size_(other.file_size_),
         sector_size_(other.sector_size_),
+        bypass_page_cache_(other.bypass_page_cache_),
         engine_(std::move(other.engine_)) {
     other.fd_ = -1;
     other.file_size_ = 0;
+    other.bypass_page_cache_ = false;
   }
 
   auto operator=(DirectFileIO &&other) noexcept -> DirectFileIO & {
@@ -155,9 +157,11 @@ class DirectFileIO {
       path_ = std::move(other.path_);
       file_size_ = other.file_size_;
       sector_size_ = other.sector_size_;
+      bypass_page_cache_ = other.bypass_page_cache_;
       engine_ = std::move(other.engine_);
       other.fd_ = -1;
       other.file_size_ = 0;
+      other.bypass_page_cache_ = false;
     }
     return *this;
   }
@@ -204,6 +208,7 @@ class DirectFileIO {
     }
     path_.clear();
     file_size_ = 0;
+    bypass_page_cache_ = false;
   }
 
   /**
@@ -229,6 +234,7 @@ class DirectFileIO {
    * @return Sector size in bytes
    */
   [[nodiscard]] auto sector_size() const -> size_t { return sector_size_; }
+  [[nodiscard]] auto bypasses_page_cache() const -> bool { return bypass_page_cache_; }
 
   // ==========================================================================
   // Synchronous I/O
@@ -369,6 +375,7 @@ class DirectFileIO {
   std::string path_;
   uint64_t file_size_{0};
   size_t sector_size_{kDefaultSectorSize};
+  bool bypass_page_cache_{false};
   std::unique_ptr<IOEngine> engine_;
 
   // ==========================================================================
@@ -388,7 +395,10 @@ class DirectFileIO {
         LOG_ERROR("Failed to open file: {} (errno={})", path_, errno);
         return false;
       }
+      bypass_page_cache_ = false;
       LOG_WARN("Opened {} without Direct IO", path_);
+    } else {
+      bypass_page_cache_ = true;
     }
 
     update_file_size();
@@ -409,7 +419,10 @@ class DirectFileIO {
 
     // Enable F_NOCACHE for Direct IO behavior
     if (fcntl(fd_, F_NOCACHE, 1) == -1) {
+      bypass_page_cache_ = false;
       LOG_WARN("Failed to set F_NOCACHE on {}", path_);
+    } else {
+      bypass_page_cache_ = true;
     }
 
     update_file_size();
@@ -450,6 +463,9 @@ class DirectFileIO {
         LOG_ERROR("Failed to open file: {} (error={})", path_, GetLastError());
         return false;
       }
+      bypass_page_cache_ = false;
+    } else {
+      bypass_page_cache_ = true;
     }
 
     fd_ = _open_osfhandle(reinterpret_cast<intptr_t>(handle), 0);
@@ -475,6 +491,7 @@ class DirectFileIO {
 
     update_file_size();
     LOG_WARN("Opened {} without Direct IO support", path_);
+    bypass_page_cache_ = false;
     return true;
   }
 

@@ -249,6 +249,26 @@ TEST_F(DiskANNBuilderTest, BuildGraphBasicStructure) {
   check_no_isolated_nodes(graph.get(), kDefaultR);
 }
 
+TEST_F(DiskANNBuilderTest, ParallelBuildStressKeepsGraphInvariants) {
+  if (max_threads() < 2) {
+    GTEST_SKIP() << "Parallel build test requires at least 2 threads";
+  }
+
+  constexpr int kStressRuns = 3;
+  auto params = make_params().set_num_threads(std::min(max_threads(), 8U));
+  for (int run = 0; run < kStressRuns; ++run) {
+    DiskANNBuilder<RawSpace<>> builder(space(), params);
+    auto graph = builder.build_graph(params.num_threads_);
+
+    ASSERT_NE(graph, nullptr);
+    check_no_self_loops(graph.get(), kDefaultR);
+    check_no_duplicate_edges(graph.get(), kDefaultR);
+    check_edges_in_range(graph.get(), kDefaultR);
+    check_edges_padded_with_invalid_id(graph.get(), kDefaultR);
+    check_no_isolated_nodes(graph.get(), kDefaultR);
+  }
+}
+
 // -----------------------------------------------------------------------------
 // 3. Different max_degree values
 // -----------------------------------------------------------------------------
@@ -482,6 +502,59 @@ TEST_F(DiskANNBuilderDeep1MTest, DISABLED_BuildGraph) {
     }
     std::cout << "[CHECK] BFS Connectivity from Medoid: " << visited_count << "/" << data_num() << '\n';
     EXPECT_GT(visited_count, data_num() * 0.9);
+}
+
+TEST_F(DiskANNBuilderTest, IPMetricRobustPruneBuildGraphRecallPositive) {
+  std::vector<float> normalized_data(dataset().data_.begin(), dataset().data_.end());
+  for (uint32_t i = 0; i < data_num(); ++i) {
+    math::normalize(normalized_data.data() + i * dim(), dim());
+  }
+
+  auto ip_space = std::make_shared<RawSpace<float>>(data_num(), dim(), MetricType::IP);
+  ip_space->fit(normalized_data.data(), data_num());
+
+  auto params = DiskANNBuildParams()
+                    .set_max_degree(kDefaultR)
+                    .set_ef_construction(kDefaultEf)
+                    .set_num_iterations(2)
+                    .set_num_threads(max_threads());
+
+  DiskANNBuilder<RawSpace<float>> builder(ip_space, params);
+  // build_graph() exercises robust_prune during neighbor selection
+  // and reverse-edge updates.
+  auto graph = builder.build_graph(params.num_threads_);
+  ASSERT_NE(graph, nullptr);
+
+  auto dist_fn = ip_space->get_dist_func();
+  uint32_t hits = 0;
+  for (uint32_t i = 0; i < data_num(); ++i) {
+    float best_dist = std::numeric_limits<float>::max();
+    uint32_t true_nn = i;
+    for (uint32_t j = 0; j < data_num(); ++j) {
+      if (i == j) {
+        continue;
+      }
+      float dist = dist_fn(ip_space->get_data_by_id(i), ip_space->get_data_by_id(j), dim());
+      if (dist < best_dist) {
+        best_dist = dist;
+        true_nn = j;
+      }
+    }
+
+    const auto *edges = graph->edges(i);
+    for (uint32_t k = 0; k < kDefaultR; ++k) {
+      if (edges[k] == DiskANNBuilder<RawSpace<float>>::kInvalidID) {
+        break;
+      }
+      if (edges[k] == true_nn) {
+        ++hits;
+        break;
+      }
+    }
+  }
+
+  float recall = static_cast<float>(hits) / static_cast<float>(data_num());
+  EXPECT_GT(recall, 0.0F);
 }
 
 }  // namespace alaya

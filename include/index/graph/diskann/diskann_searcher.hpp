@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -80,9 +81,6 @@ class DiskANNSearcher {
     std::vector<float> adc_table_;  // M * K
     std::vector<NeighborType> rerank_candidates_;
 
-    // Helper buffer to hold neighbors read from disk temporarily
-    std::vector<IDType> neighbor_buffer_;
-
     explicit SearchContext(uint32_t capacity,
                            uint32_t max_degree,
                            uint32_t beam_width,
@@ -92,7 +90,6 @@ class DiskANNSearcher {
       beam_queue_.reserve(beam_width * 2);
       next_beam_queue_.reserve(beam_width * 2);
       next_beam_io_.reserve(beam_width * max_degree);
-      neighbor_buffer_.reserve(max_degree);
       if (num_subspaces > 0) {
         adc_table_.resize(static_cast<size_t>(num_subspaces) * num_centroids);
       }
@@ -105,7 +102,6 @@ class DiskANNSearcher {
       next_beam_queue_.clear();
       next_beam_io_.clear();
       rerank_candidates_.clear();
-      neighbor_buffer_.clear();
     }
   };
 
@@ -233,55 +229,83 @@ class DiskANNSearcher {
   [[nodiscard]] auto num_points() const -> uint32_t { return num_points_; }
   [[nodiscard]] auto dimension() const -> uint32_t { return dimension_; }
   [[nodiscard]] auto capacity() const -> uint32_t { return capacity_; }
+  [[nodiscard]] auto buffer_pool() -> BufferPoolType & { return *buffer_pool_; }
+  [[nodiscard]] auto bypasses_page_cache() const -> bool {
+    return storage_ != nullptr && storage_->data().bypasses_page_cache();
+  }
 
   // =========================================================================
   // Mutation (for incremental insert support)
   // =========================================================================
 
-  void reserve_capacity(uint32_t /*new_capacity*/) {
-    // TODO(diskann): implement capacity growth for incremental inserts
+  void reserve_capacity(uint32_t new_capacity) {
+    require_writable("reserve_capacity");
+    if (new_capacity <= capacity_) {
+      return;
+    }
+    if (pq_enabled_) {
+      throw std::logic_error(
+          "DiskANNSearcher::reserve_capacity does not support PQ-enabled indices");
+    }
+
+    storage_->meta().grow(new_capacity);
+    storage_->data().grow(storage_->meta().capacity());
+    capacity_ = storage_->capacity();
   }
 
   void insert(const DataType * /*vector*/,
               IDType /*external_id*/,
               const DiskANNInsertParams & /*params*/ = DiskANNInsertParams{}) {
-    // TODO(diskann): implement single-vector insertion
+    require_writable("insert");
+    throw std::logic_error(
+        "DiskANNSearcher::insert is not implemented yet; incremental graph updates are "
+        "unsupported");
   }
 
   void flush() {
     if (storage_ && storage_->is_open()) {
+      storage_->data().flush();
       storage_->save_meta();
     }
   }
 
  private:
-  auto get_search_context(const Params &params) -> SearchContext & {
-    static thread_local SearchContext ctx(num_points_,
-                                          max_degree_,
-                                          params.beam_width_ > 0 ? params.beam_width_ : 128,
-                                          pq_enabled_ ? storage_->pq().num_subspaces() : 0,
-                                          pq_enabled_ ? storage_->pq().num_centroids() : 0);
-    return ctx;
+  void require_writable(std::string_view operation) const {
+    if (!is_open()) {
+      throw std::runtime_error("DiskANNSearcher: Index not loaded");
+    }
+    if (!storage_->data().is_writable()) {
+      throw std::runtime_error("DiskANNSearcher: " + std::string(operation) +
+                               " requires writable=true");
+    }
   }
 
-  // =========================================================================
-  // Helper: Read Neighbors using NodeRef (Zero-Copy)
-  // =========================================================================
-  auto get_neighbors_from_disk(IDType node_id, std::vector<IDType> &out_buffer) -> uint32_t {
-    auto node = storage_->data().get_node(node_id);
-    auto neighbors_span = node.neighbors();
+  auto get_search_context(const Params &params) -> SearchContext & {
+    static thread_local std::unique_ptr<SearchContext> ctx;
+    static thread_local uint32_t ctx_capacity = 0;
+    static thread_local uint32_t ctx_max_degree = 0;
+    static thread_local uint32_t ctx_beam_width = 0;
+    static thread_local uint32_t ctx_num_subspaces = 0;
+    static thread_local uint32_t ctx_num_centroids = 0;
 
-    // 3. Copy to output buffer (Required because span invalidates when node dies)
-    out_buffer.clear();
-    for (auto n : neighbors_span) {
-      if (n == kInvalidID) {
-        break;
-      }
-      out_buffer.push_back(n);
+    uint32_t beam_width = params.beam_width_ > 0 ? params.beam_width_ : 128;
+    uint32_t num_subspaces = pq_enabled_ ? storage_->pq().num_subspaces() : 0;
+    uint32_t num_centroids = pq_enabled_ ? storage_->pq().num_centroids() : 0;
+    if (!ctx || ctx_capacity != num_points_ || ctx_max_degree != max_degree_ ||
+        ctx_beam_width != beam_width || ctx_num_subspaces != num_subspaces ||
+        ctx_num_centroids != num_centroids) {
+      ctx = std::make_unique<SearchContext>(num_points_,
+                                            max_degree_,
+                                            beam_width,
+                                            num_subspaces,
+                                            num_centroids);
+      ctx_capacity = num_points_;
+      ctx_max_degree = max_degree_;
+      ctx_beam_width = beam_width;
+      ctx_num_subspaces = num_subspaces;
+      ctx_num_centroids = num_centroids;
     }
-
-    // 4. NodeRef destructor is called here -> Page is unpinned
-    return static_cast<uint32_t>(out_buffer.size());
+    return *ctx;
   }
 
   // =========================================================================
@@ -291,6 +315,30 @@ class DiskANNSearcher {
     auto node = storage_->data().get_node(node_id);
     auto vec_span = node.vector();
     return dist_fn_(query, vec_span.data(), dimension_);
+  }
+
+  void collect_unvisited_neighbors(SearchContext &ctx, IDType node_id) {
+    auto node = storage_->data().get_node(node_id);
+    auto neighbors_span = node.neighbors();
+
+    for (size_t i = 0; i < neighbors_span.size(); ++i) {
+      IDType nbr = neighbors_span[i];
+      if (nbr == kInvalidID) {
+        break;
+      }
+
+      if (i + 1 < neighbors_span.size() && neighbors_span[i + 1] != kInvalidID) {
+        ctx.visited_.prefetch(neighbors_span[i + 1]);
+      }
+
+      if (ctx.visited_.is_visited(nbr)) {
+        continue;
+      }
+
+      ctx.visited_.mark(nbr);
+      ctx.next_beam_io_.push_back(storage_->data().block_id_of(nbr));
+      ctx.next_beam_queue_.push_back(nbr);
+    }
   }
 
   auto search_disk(SearchContext &ctx, const DataType *query, uint32_t topk, const Params &params)
@@ -306,7 +354,7 @@ class DiskANNSearcher {
     float start_dist = compute_exact_distance(query, medoid_id_);
     candidates.insert(medoid_id_, start_dist);
     visited.mark(medoid_id_);
-    beam_queue.push_back(medoid_id_);
+    beam_queue.push_back(candidates.pop());
 
     uint32_t beam_width = std::max(1U, params.beam_width_);
     while (!beam_queue.empty()) {
@@ -317,22 +365,18 @@ class DiskANNSearcher {
       // Since beam nodes were just computed, their pages are HOT in BufferPool.
       // get_node() will likely return immediately without IO.
       for (IDType node_id : beam_queue) {
-        get_neighbors_from_disk(node_id, ctx.neighbor_buffer_);
-
-        for (IDType nbr : ctx.neighbor_buffer_) {
-          if (visited.is_visited(nbr)) {
-            continue;
-          }
-          visited.mark(nbr);
-
-          // Collect block ID for batch prefetch
-          next_beam_io.push_back(storage_->data().block_id_of(nbr));
-          next_beam_queue.push_back(nbr);
-        }
+        collect_unvisited_neighbors(ctx, node_id);
       }
 
       if (next_beam_queue.empty()) {
-        break;
+        beam_queue.clear();
+        for (uint32_t i = 0; i < beam_width && candidates.has_next(); ++i) {
+          beam_queue.push_back(candidates.pop());
+        }
+        if (beam_queue.empty()) {
+          break;
+        }
+        continue;
       }
 
       // B. IO Deduplication & Prefetching
@@ -341,6 +385,15 @@ class DiskANNSearcher {
 
       // Batch submit IO requests to OS/SSD
       storage_->data().prefetch_blocks(next_beam_io);
+
+      std::sort(next_beam_queue.begin(),
+                next_beam_queue.end(),
+                [this](IDType lhs, IDType rhs) -> bool {
+                  auto &data = storage_->data();
+                  uint32_t lhs_block = data.block_id_of(lhs);
+                  uint32_t rhs_block = data.block_id_of(rhs);
+                  return lhs_block == rhs_block ? lhs < rhs : lhs_block < rhs_block;
+                });
 
       // C. Compute Distances
       // Iterate over nodes. Their blocks have been prefetched.
@@ -364,8 +417,8 @@ class DiskANNSearcher {
                  const DataType * /*query*/,
                  uint32_t /*topk*/,
                  const Params & /*params*/) -> Result {
-    // TODO(diskann): implement PQ two-phase search
-    return Result(0);
+    throw std::logic_error(
+        "DiskANNSearcher::search_pq is not implemented yet; disable PQ rerank to use disk search");
   }
 };
 

@@ -1,16 +1,19 @@
 # AlayaLite Makefile
 # Usage: make help
 
-.PHONY: help build build-debug build-release test test-cpp test-py lint clean install dev-install wheel
+.PHONY: help build build-debug build-release build-coverage configure test test-cpp test-py test-py-cov lint lint-commit-msg clean clean-all install dev-install wheel
 
 # Configuration
-BUILD_DIR      := build
-BUILD_TYPE     := Release
-CMAKE_FLAGS    := -DBUILD_TESTING=ON
-PYTEST_FLAGS   := -v
-CTEST_FLAGS    := --output-on-failure
-JOBS           := $(shell nproc 2>/dev/null || echo 4)
-PYTHON_VERSION := 3.11
+BUILD_DIR         := build
+BUILD_TYPE        ?= Release
+CMAKE_FLAGS       := -DBUILD_TESTING=ON -DBUILD_BENCHMARKS=ON
+EXTRA_CMAKE_FLAGS ?=
+PYTEST_FLAGS      := -v
+PYTEST_COV_FLAGS  := --cov=python/src/alayalite --cov=app --cov-report=html
+CTEST_FLAGS       := --output-on-failure
+JOBS              := $(shell nproc 2>/dev/null || echo 4)
+PYTHON_VERSION    := 3.11
+COMMIT_MSG        ?=
 
 # Suppress "Entering/Leaving directory" messages from sub-makes
 MAKEFLAGS     += --no-print-directory
@@ -36,51 +39,65 @@ help: ## Show this help message
 # Build
 # ============================================================================
 
-build: build-release ## Build project (release mode)
+build: BUILD_TYPE := Release
+build: configure ## Build project (release mode)
+	@cmake --build $(BUILD_DIR) --config $(BUILD_TYPE) -j$(JOBS)
 
+build-debug: BUILD_TYPE := Debug
 build-debug: ## Build project in debug mode
-	@cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Debug $(CMAKE_FLAGS)
-	@cmake --build $(BUILD_DIR) -j$(JOBS)
+	@cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CMAKE_FLAGS)
+	@cmake --build $(BUILD_DIR) --config $(BUILD_TYPE) -j$(JOBS)
 
+build-release: BUILD_TYPE := Release
 build-release: ## Build project in release mode
-	@cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Release $(CMAKE_FLAGS)
-	@cmake --build $(BUILD_DIR) -j$(JOBS)
+	@cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CMAKE_FLAGS)
+	@cmake --build $(BUILD_DIR) --config $(BUILD_TYPE) -j$(JOBS)
 
+build-coverage: BUILD_TYPE := Debug
+build-coverage: EXTRA_CMAKE_FLAGS := -DENABLE_COVERAGE=ON
 build-coverage: ## Build with coverage instrumentation
-	@cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Debug $(CMAKE_FLAGS) -DENABLE_COVERAGE=ON
-	@cmake --build $(BUILD_DIR) -j$(JOBS)
+	@cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CMAKE_FLAGS) $(EXTRA_CMAKE_FLAGS)
+	@cmake --build $(BUILD_DIR) --config $(BUILD_TYPE) -j$(JOBS)
 
 configure: ## Only configure cmake (no build)
-	@cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CMAKE_FLAGS)
+	@cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CMAKE_FLAGS) $(EXTRA_CMAKE_FLAGS)
 
 # ============================================================================
 # Test
 # ============================================================================
 
-test: test-cpp test-py ## Run all tests (C++ and Python)
+test: test-cpp test-py ## Run all tests (C++ and pytest suites)
 
+test-cpp: BUILD_TYPE := Release
 test-cpp: build ## Run C++ tests with CTest
-	@cd $(BUILD_DIR) && ctest $(CTEST_FLAGS) -j$(JOBS)
+	@ctest --test-dir $(BUILD_DIR) $(CTEST_FLAGS) -C $(BUILD_TYPE) -j$(JOBS)
 
-test-py: ## Run Python tests with pytest
+test-py: ## Run Python and API tests with pytest
 	@uv run pytest $(PYTEST_FLAGS)
 
-test-py-cov: ## Run Python tests with coverage
-	@uv run pytest $(PYTEST_FLAGS) --cov=python/src --cov-report=html
+test-py-cov: ## Run Python and API tests with coverage
+	@uv run pytest $(PYTEST_FLAGS) $(PYTEST_COV_FLAGS)
 
 # ============================================================================
 # Code Quality
 # ============================================================================
 
-lint: ## Run all pre-commit checks
+lint: ## Run file-based pre-commit checks
 	@uvx pre-commit run -a
+
+lint-commit-msg: ## Validate commit message (use COMMIT_MSG="type: subject")
+	@test -n "$(COMMIT_MSG)" || (echo "COMMIT_MSG is required" >&2; exit 1)
+	@tmp_file=$$(mktemp); \
+	trap 'rm -f "$$tmp_file"' EXIT; \
+	printf '%s\n' "$(COMMIT_MSG)" > "$$tmp_file"; \
+	uvx pre-commit run --hook-stage commit-msg conventional-pre-commit --commit-msg-filename "$$tmp_file"
 
 # ============================================================================
 # Install & Package
 # ============================================================================
 
-install: ## Install package (production only)
-	@uv sync --no-dev
+install: ## Install package without dev dependencies (non-editable)
+	@uv sync --no-dev --no-editable
 
 dev-install: ## Install package with dev dependencies
 	@uv sync

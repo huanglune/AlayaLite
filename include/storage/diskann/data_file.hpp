@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -27,6 +28,7 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "storage/buffer/buffer_pool.hpp"
 #include "storage/io/direct_file_io.hpp"
@@ -39,7 +41,6 @@ namespace alaya {
 // Constants for DataFile
 // ============================================================================
 constexpr size_t kDataBlockSize = 4096;
-inline thread_local AlignedBuffer tl_io_buffer(kDataBlockSize);
 
 /**
  * @brief Neighbor table view mapped onto raw memory
@@ -125,12 +126,14 @@ class DataFile {
             uint8_t *node_ptr,
             uint32_t dim,
             uint32_t max_deg,
-            size_t vec_offset)
+            size_t vec_offset,
+            bool writable)
         : handle_(std::move(handle)),
           node_ptr_(node_ptr),
           dim_(dim),
           max_deg_(max_deg),
-          vec_offset_(vec_offset) {}
+          vec_offset_(vec_offset),
+          writable_(writable) {}
 
     ALAYA_NON_COPYABLE_BUT_MOVABLE(NodeRef);
     ~NodeRef() = default;
@@ -145,6 +148,7 @@ class DataFile {
 
     [[nodiscard]] auto neighbors() const -> std::span<const IDType> {
       uint32_t count = *reinterpret_cast<const uint32_t *>(node_ptr_);
+      count = std::min(count, max_deg_);
       const auto *ids = reinterpret_cast<const IDType *>(node_ptr_ + sizeof(uint32_t));
       return {ids, count};
     }
@@ -155,6 +159,7 @@ class DataFile {
       if (data.size() != dim_) {
         throw std::invalid_argument("Vector dimension mismatch");
       }
+      ensure_writable();
       mark_dirty();
       auto *dst = reinterpret_cast<DataType *>(node_ptr_ + vec_offset_);
       std::copy(data.begin(), data.end(), dst);
@@ -164,6 +169,7 @@ class DataFile {
       if (nbrs.size() > max_deg_) {
         throw std::length_error("Too many neighbors");
       }
+      ensure_writable();
       mark_dirty();
       auto &list = *reinterpret_cast<NeighborList<IDType> *>(node_ptr_);
       list.num_neighbors_ = static_cast<uint32_t>(nbrs.size());
@@ -174,37 +180,70 @@ class DataFile {
     }
 
     auto mutable_vector() -> std::span<DataType> {
+      ensure_writable();
+      mark_dirty();
       return {reinterpret_cast<DataType *>(node_ptr_ + vec_offset_), dim_};
     }
 
     auto mutable_neighbors() -> NeighborList<IDType> & {
+      ensure_writable();
+      mark_dirty();
       return *reinterpret_cast<NeighborList<IDType> *>(node_ptr_);
     }
 
-    void mark_dirty() { handle_.mark_dirty(); }
+    void mark_dirty() {
+      ensure_writable();
+      handle_.mark_dirty();
+    }
     [[nodiscard]] auto handle() const -> const PageHandle & { return handle_; }
 
    private:
+    void ensure_writable() const {
+      if (!writable_) {
+        throw std::runtime_error("Cannot modify a read-only DataFile node");
+      }
+    }
+
     PageHandle handle_;
     uint8_t *node_ptr_{nullptr};
     uint32_t dim_{0};
     uint32_t max_deg_{0};
     size_t vec_offset_{0};
+    bool writable_{false};
   };
 
-  ALAYA_NON_COPYABLE_BUT_MOVABLE(DataFile);
+  ALAYA_NON_COPYABLE(DataFile);
 
   explicit DataFile(BufferPoolType *bp = nullptr) : buffer_pool_(bp) {
     if (buffer_pool_ == nullptr) {
       throw std::invalid_argument("DataFile requires a valid BufferPool");
     }
+    install_flush_callback();
   }
-  ~DataFile() { close(); }
+
+  DataFile(DataFile &&other) noexcept { move_from(std::move(other)); }
+
+  auto operator=(DataFile &&other) noexcept -> DataFile & {
+    if (this != &other) {
+      close();
+      move_from(std::move(other));
+    }
+    return *this;
+  }
+
+  ~DataFile() noexcept {
+    try {
+      close();
+    } catch (...) {
+    }
+  }
 
   // ==========================================================================
   // Node Access Methods
   // ==========================================================================
   [[nodiscard]] auto get_node(uint32_t node_id) -> NodeRef {
+    validate_id(node_id);
+
     // 1. Calculate offsets (Compiler optimizes this heavily)
     uint32_t block_id = node_id / nodes_per_block_;
     uint64_t block_offset = static_cast<uint64_t>(block_id) * kDataBlockSize;
@@ -214,24 +253,52 @@ class DataFile {
     PageHandle handle = buffer_pool_->get_or_read(block_id,
                                                   *file_,
                                                   block_offset,
-                                                  reinterpret_cast<uint8_t *>(tl_io_buffer.data()));
+                                                  reinterpret_cast<uint8_t *>(io_buffer_.data()));
 
     if (handle.empty()) {
       throw std::runtime_error("Failed to read node: " + std::to_string(node_id));
     }
 
     uint8_t *node_ptr = handle.mutable_data() + node_offset;
-    return NodeRef(std::move(handle), node_ptr, dim_, max_degree_, vector_offset_);
+    return NodeRef(std::move(handle), node_ptr, dim_, max_degree_, vector_offset_, is_writable_);
   }
 
   void prefetch_blocks(std::span<const uint32_t> block_ids) {
     if (block_ids.empty()) {
       return;
     }
+    std::vector<uint32_t> pending_blocks;
+    std::vector<AlignedBuffer> read_buffers;
+    std::vector<IORequest> requests;
+    pending_blocks.reserve(block_ids.size());
+    read_buffers.reserve(block_ids.size());
+    requests.reserve(block_ids.size());
 
     for (uint32_t block_id : block_ids) {
-      uint64_t offset = static_cast<uint64_t>(block_id) * kDataBlockSize;
-      buffer_pool_->prefetch(block_id, *file_, offset);
+      if (buffer_pool_->touch_if_cached(block_id)) {
+        buffer_pool_->record_reuse_hit();
+        continue;
+      }
+
+      buffer_pool_->record_reuse_miss();
+      buffer_pool_->record_miss();
+      pending_blocks.push_back(block_id);
+      read_buffers.emplace_back(kDataBlockSize);
+      requests.emplace_back(read_buffers.back().data(),
+                            kDataBlockSize,
+                            static_cast<uint64_t>(block_id) * kDataBlockSize);
+    }
+
+    if (requests.empty()) {
+      return;
+    }
+
+    file_->submit_reads(requests);
+
+    for (size_t i = 0; i < requests.size(); ++i) {
+      if (requests[i].is_success()) {
+        buffer_pool_->put(pending_blocks[i], read_buffers[i].data());
+      }
     }
   }
 
@@ -256,7 +323,10 @@ class DataFile {
     init_layout(capacity, dim, max_degree);
 
     file_ = std::make_unique<DirectFileIO>();
-    file_->open(path_, DirectFileIO::Mode::kReadWrite);
+    if (!file_->open(path_, DirectFileIO::Mode::kReadWrite)) {
+      file_.reset();
+      throw std::runtime_error("Failed to open data file: " + path_);
+    }
 
     // Pre-allocate file by writing zeros to the last block
     uint64_t total_size = total_file_size();
@@ -265,9 +335,10 @@ class DataFile {
       // Write last block to extend file to full size
       AlignedBuffer zeros(kDataBlockSize);
       std::memset(zeros.data(), 0, kDataBlockSize);
-      file_->write(reinterpret_cast<char *>(zeros.data()),
-                   kDataBlockSize,
-                   total_size - kDataBlockSize);
+      write_exact(zeros.data(),
+                  kDataBlockSize,
+                  total_size - kDataBlockSize,
+                  "Failed to create data file");
     }
 
     is_open_ = true;
@@ -298,7 +369,11 @@ class DataFile {
     init_layout(capacity, dim, max_degree);
 
     file_ = std::make_unique<DirectFileIO>();
-    file_->open(path_, writable ? DirectFileIO::Mode::kReadWrite : DirectFileIO::Mode::kRead);
+    if (!file_->open(path_,
+                     writable ? DirectFileIO::Mode::kReadWrite : DirectFileIO::Mode::kRead)) {
+      file_.reset();
+      throw std::runtime_error("Failed to open data file: " + path_);
+    }
 
     is_open_ = true;
     is_writable_ = writable;
@@ -311,21 +386,30 @@ class DataFile {
    * @brief Flush all dirty buffer pool pages back to the data file.
    */
   void flush() {
-    if (!is_open_ || !file_) {
+    if (!is_open_ || !file_ || !is_writable_) {
       return;
     }
     buffer_pool_->flush_all([this](uint32_t block_id, const uint8_t *data) -> void {
-      file_->write(reinterpret_cast<const char *>(data),
-                   kDataBlockSize,
-                   static_cast<uint64_t>(block_id) * kDataBlockSize);
+      write_block(block_id, data);
     });
   }
 
   void close() {
     if (!is_open_) {
+      disconnect_flush_callback();
       return;
     }
 
+    std::exception_ptr close_error;
+    if (is_writable_) {
+      try {
+        flush();
+      } catch (...) {
+        close_error = std::current_exception();
+      }
+    }
+
+    disconnect_flush_callback();
     if (file_) {
       file_->close();
       file_.reset();
@@ -334,6 +418,10 @@ class DataFile {
     path_.clear();
     is_open_ = false;
     is_writable_ = false;
+
+    if (close_error != nullptr) {
+      std::rethrow_exception(close_error);
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -357,6 +445,9 @@ class DataFile {
   [[nodiscard]] auto is_open() const -> bool { return is_open_; }
   [[nodiscard]] auto is_writable() const -> bool { return is_writable_; }
   [[nodiscard]] auto path() const -> const std::string & { return path_; }
+  [[nodiscard]] auto bypasses_page_cache() const -> bool {
+    return file_ != nullptr && file_->bypasses_page_cache();
+  }
 
   /**
    * @brief Write a raw block to the data file (used by BufferPool flush callback).
@@ -365,9 +456,10 @@ class DataFile {
     if (!is_open_ || !is_writable_ || !file_) {
       return;
     }
-    file_->write(reinterpret_cast<const char *>(data),
-                 kDataBlockSize,
-                 static_cast<uint64_t>(block_id) * kDataBlockSize);
+    write_exact(data,
+                kDataBlockSize,
+                static_cast<uint64_t>(block_id) * kDataBlockSize,
+                "Failed to write data block");
   }
 
   /**
@@ -387,8 +479,7 @@ class DataFile {
     }
 
     uint32_t old_num_blocks = num_blocks();
-    capacity_ = new_capacity;
-    uint32_t new_num_blocks = num_blocks();
+    uint32_t new_num_blocks = (new_capacity + nodes_per_block_ - 1) / nodes_per_block_;
 
     // Write zero blocks for the new region
     if (new_num_blocks > old_num_blocks) {
@@ -396,8 +487,10 @@ class DataFile {
       std::memset(zeros.data(), 0, kDataBlockSize);
       // Write last block to extend file to full new size
       uint64_t last_block_offset = static_cast<uint64_t>(new_num_blocks - 1) * kDataBlockSize;
-      file_->write(reinterpret_cast<char *>(zeros.data()), kDataBlockSize, last_block_offset);
+      write_exact(zeros.data(), kDataBlockSize, last_block_offset, "Failed to grow data file");
     }
+
+    capacity_ = new_capacity;
   }
 
   /**
@@ -412,7 +505,7 @@ class DataFile {
   /**
    * @brief Preload a block into the buffer pool cache.
    */
-  auto preload_block(uint32_t block_id) const -> void {
+  auto preload_block(uint32_t block_id) -> void {
     if (!is_open_) {
       throw std::runtime_error("Not open");
     }
@@ -423,7 +516,7 @@ class DataFile {
     buffer_pool_->get_or_read(block_id,
                               *file_,
                               static_cast<uint64_t>(block_id) * kDataBlockSize,
-                              reinterpret_cast<uint8_t *>(tl_io_buffer.data()));
+                              reinterpret_cast<uint8_t *>(io_buffer_.data()));
   }
 
  private:
@@ -456,6 +549,69 @@ class DataFile {
     }
   }
 
+  void install_flush_callback() {
+    if (buffer_pool_ == nullptr) {
+      return;
+    }
+    buffer_pool_->set_flush_callback([this](IDType block_id, const uint8_t *data) -> void {
+      write_block(block_id, data);
+    });
+  }
+
+  void disconnect_flush_callback() {
+    if (buffer_pool_ == nullptr) {
+      return;
+    }
+    buffer_pool_->set_flush_callback({});
+  }
+
+  void write_exact(const void *data, size_t size, uint64_t offset, std::string_view error) {
+    ssize_t written = file_ != nullptr ? file_->write(data, size, offset) : -1;
+    if (written != static_cast<ssize_t>(size)) {
+      throw std::runtime_error(std::string(error) + ": " + path_);
+    }
+  }
+
+  void move_from(DataFile &&other) {
+    // Clear the old callback on the source's buffer_pool before we take ownership.
+    // This closes the use-after-free window: once cleared, the old `this` pointer
+    // captured in the lambda can never be invoked again.
+    if (other.buffer_pool_ != nullptr) {
+      other.buffer_pool_->set_flush_callback({});
+    }
+
+    dim_ = other.dim_;
+    max_degree_ = other.max_degree_;
+    capacity_ = other.capacity_;
+    row_size_ = other.row_size_;
+    neighbor_size_ = other.neighbor_size_;
+    vector_offset_ = other.vector_offset_;
+    nodes_per_block_ = other.nodes_per_block_;
+    path_ = std::move(other.path_);
+    file_ = std::move(other.file_);
+    buffer_pool_ = other.buffer_pool_;
+    is_open_ = other.is_open_;
+    is_writable_ = other.is_writable_;
+
+    io_buffer_ = std::move(other.io_buffer_);
+    // Ensure the moved-from object has a valid (empty) buffer
+    other.io_buffer_ = AlignedBuffer(kDataBlockSize);
+
+    other.dim_ = 0;
+    other.max_degree_ = 0;
+    other.capacity_ = 0;
+    other.row_size_ = 0;
+    other.neighbor_size_ = 0;
+    other.vector_offset_ = 0;
+    other.nodes_per_block_ = 0;
+    other.buffer_pool_ = nullptr;
+    other.is_open_ = false;
+    other.is_writable_ = false;
+
+    // Now install the callback with the new (this) pointer.
+    install_flush_callback();
+  }
+
   // Layout parameters
   uint32_t dim_{0};              // Vector dimension
   uint32_t max_degree_{0};       // Maximum out-degree (R)
@@ -468,6 +624,8 @@ class DataFile {
   // I/O
   std::string path_;
   std::unique_ptr<DirectFileIO> file_;
+  AlignedBuffer io_buffer_ =
+      AlignedBuffer(kDataBlockSize);      // Per-instance I/O buffer (avoids shared thread_local)
   BufferPoolType *buffer_pool_{nullptr};  // Reference to external buffer pool
   bool is_open_{false};
   bool is_writable_{false};

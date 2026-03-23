@@ -107,17 +107,9 @@ class ClockProReplacer {
 
     const auto &entry = it->second;
     if (entry.is_hot_) {
-      // Remove from hot list
-      if (hot_hand_ == entry.iter_) {
-        advance_hot_hand();
-      }
-      hot_list_.erase(entry.iter_);
+      erase_hot_entry(entry.iter_);
     } else {
-      // Remove from cold list
-      if (cold_hand_ == entry.iter_) {
-        advance_cold_hand();
-      }
-      cold_list_.erase(entry.iter_);
+      erase_cold_entry(entry.iter_);
     }
     frame_map_.erase(it);
   }
@@ -230,11 +222,34 @@ class ClockProReplacer {
     bool ref_bit_{true};  // Reference bit (recently accessed)
   };
 
+  using PageList = std::list<PageEntry>;
+  using PageIter = PageList::iterator;
+
   struct FrameInfo {
-    std::list<PageEntry>::iterator iter_;
+    PageIter iter_;
     bool is_hot_;   // true if in hot_list_, false if in cold_list_
     bool ref_bit_;  // Cached reference bit for quick access
   };
+
+  static auto wrap_hand(PageList &list, PageIter iter) -> PageIter {
+    if (iter == list.end() && !list.empty()) {
+      return list.begin();
+    }
+    return iter;
+  }
+
+  static auto erase_entry(PageList &list, PageIter hand, PageIter entry) -> PageIter {
+    if (hand == entry) {
+      return wrap_hand(list, list.erase(entry));
+    }
+
+    list.erase(entry);
+    return list.empty() ? list.end() : hand;
+  }
+
+  void erase_cold_entry(PageIter entry) { cold_hand_ = erase_entry(cold_list_, cold_hand_, entry); }
+
+  void erase_hot_entry(PageIter entry) { hot_hand_ = erase_entry(hot_list_, hot_hand_, entry); }
 
   /**
    * @brief Add a frame to cold list.
@@ -301,8 +316,7 @@ class ClockProReplacer {
         // Found victim - demote to cold
         size_t frame_id = entry.frame_id_;
         auto old_iter = hot_hand_;
-        advance_hot_hand();
-        hot_list_.erase(old_iter);
+        erase_hot_entry(old_iter);
         frame_map_.erase(it);
 
         // Add to cold list
@@ -326,8 +340,7 @@ class ClockProReplacer {
     if (hot_hand_ != hot_list_.end()) {
       size_t frame_id = hot_hand_->frame_id_;
       auto old_iter = hot_hand_;
-      advance_hot_hand();
-      hot_list_.erase(old_iter);
+      erase_hot_entry(old_iter);
       frame_map_.erase(frame_id);
       add_cold(frame_id);
     }
@@ -367,8 +380,7 @@ class ClockProReplacer {
       if (it == frame_map_.end()) {
         // Stale entry, remove and continue
         auto old_iter = cold_hand_;
-        advance_cold_hand();
-        cold_list_.erase(old_iter);
+        erase_cold_entry(old_iter);
         continue;
       }
 
@@ -376,8 +388,7 @@ class ClockProReplacer {
         // Found victim
         size_t victim = entry.frame_id_;
         auto old_iter = cold_hand_;
-        advance_cold_hand();
-        cold_list_.erase(old_iter);
+        erase_cold_entry(old_iter);
         frame_map_.erase(it);
 
         // Add to test set (track recently evicted)
@@ -402,8 +413,7 @@ class ClockProReplacer {
       }
       size_t victim = cold_hand_->frame_id_;
       auto old_iter = cold_hand_;
-      advance_cold_hand();
-      cold_list_.erase(old_iter);
+      erase_cold_entry(old_iter);
       frame_map_.erase(victim);
       add_to_test(victim);
       return victim;
@@ -446,14 +456,14 @@ class ClockProReplacer {
   size_t max_hot_size_;   ///< Maximum hot pages (typically capacity/2)
   size_t max_test_size_;  ///< Maximum test entries
 
-  std::list<PageEntry> cold_list_;  ///< Cold pages (candidates for eviction)
-  std::list<PageEntry> hot_list_;   ///< Hot pages (protected)
-  fast::set<size_t> test_set_;      ///< Recently evicted page IDs
+  PageList cold_list_;          ///< Cold pages (candidates for eviction)
+  PageList hot_list_;           ///< Hot pages (protected)
+  fast::set<size_t> test_set_;  ///< Recently evicted page IDs
 
   fast::map<size_t, FrameInfo> frame_map_;  ///< frame_id -> info
 
-  std::list<PageEntry>::iterator cold_hand_;  ///< Clock hand for cold list
-  std::list<PageEntry>::iterator hot_hand_;   ///< Clock hand for hot list
+  PageIter cold_hand_;  ///< Clock hand for cold list
+  PageIter hot_hand_;   ///< Clock hand for hot list
 };
 
 // Static assertion to verify ClockProReplacer satisfies the Replacer concept

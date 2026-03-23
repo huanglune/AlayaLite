@@ -30,7 +30,6 @@
 #include "utils/macros.hpp"
 
 namespace alaya {
-
 /**
  * @brief Unified interface for DiskANN index operations.
  *
@@ -129,6 +128,7 @@ class DiskANNIndex {
     return searcher_ ? searcher_->dimension() : 0;
   }
   [[nodiscard]] auto path() const -> const std::string & { return index_path_; }
+  [[nodiscard]] auto get_searcher() -> SearcherType & { return *searcher_; }
 
   /**
    * @brief Search for k nearest neighbors.

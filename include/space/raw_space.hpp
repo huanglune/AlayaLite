@@ -121,6 +121,7 @@ class RawSpace {
         break;
     }
   }
+  [[nodiscard]] auto get_metric_name() -> std::string_view { return kMetricMap[metric_]; }
 
   /**
    * @brief Fit the data into the space
@@ -130,11 +131,14 @@ class RawSpace {
   void fit(const DataType *data, IDType item_cnt) {
     item_cnt_ = item_cnt;
     for (IDType i = 0; i < item_cnt_; ++i) {
-      // if the metric is cosine, normalize the query
       if (metric_ == MetricType::COS) {
-        math::normalize(const_cast<DataType *>(data + (i * dim_)), dim_);
+        // Copy to a local buffer before normalizing to avoid modifying caller data.
+        std::vector<DataType> tmp(data + (i * dim_), data + (i * dim_) + dim_);
+        math::normalize(tmp.data(), dim_);
+        data_storage_.insert(tmp.data());
+      } else {
+        data_storage_.insert(data + (i * dim_));
       }
-      data_storage_.insert(data + (i * dim_));
     }
   }
 
@@ -143,11 +147,13 @@ class RawSpace {
    * @param data Pointer to the data point
    */
   auto insert(const DataType *data) -> IDType {
-    // if the metric is cosine, normalize the query
-    if (metric_ == MetricType::COS) {
-      math::normalize(const_cast<DataType *>(data), dim_);
-    }
     item_cnt_++;
+    if (metric_ == MetricType::COS) {
+      // Copy to a local buffer before normalizing to avoid modifying caller data.
+      std::vector<DataType> tmp(data, data + dim_);
+      math::normalize(tmp.data(), dim_);
+      return data_storage_.insert(tmp.data());
+    }
     return data_storage_.insert(data);
   }
 
@@ -161,58 +167,15 @@ class RawSpace {
     return data_storage_.remove(id);
   }
 
-  /**
-   * @brief Get the data pointer for a specific ID
-   * @param id The ID of the data point
-   * @return Pointer to the data for the given ID
-   */
   auto get_data_by_id(IDType id) const -> DataType * { return data_storage_[id]; }
-
-  /**
-   * @brief Calculate the distance between two data points
-   * @param i ID of the first data point
-   * @param j ID of the second data point
-   * @return The calculated distance
-   */
   auto get_distance(IDType i, IDType j) -> DistanceType {
     return distance_calu_func_(get_data_by_id(i), get_data_by_id(j), dim_);
   }
-
-  /**
-   * @brief Get the number of the vector data
-   * @return The number of vector data.
-   */
   auto get_data_num() -> IDType { return item_cnt_; }
-
-  /**
-   * @brief Get the number of the available vector data
-   * @return The number of vector data.
-   */
   auto get_avl_data_num() -> IDType { return item_cnt_ - delete_cnt_; }
-
-  /**
-   * @brief Get the capacity object
-   *
-   * @return IDType The capacity of the space.
-   */
   auto get_capacity() -> IDType { return capacity_; }
-
-  /**
-   * @brief Get the size of each data point in bytes
-   * @return The size of each data point
-   */
   auto get_data_size() -> size_t { return data_size_; }
-
-  /**
-   * @brief Get the distance calculation function
-   * @return The distance calculation function
-   */
   auto get_dist_func() -> DistFunc<DataType, DistanceType> { return distance_calu_func_; }
-
-  /**
-   * @brief Get the dimensionality of the data points
-   * @return The dimensionality
-   */
   auto get_dim() -> uint32_t { return dim_; }
 
   auto load(std::string_view filename) -> void {
@@ -262,14 +225,13 @@ class RawSpace {
      */
     QueryComputer(const RawSpace &distance_space, const DataType *query)
         : distance_space_(distance_space) {
-      // if the metric is cosine, normalize the query
-      if (distance_space_.metric_ == MetricType::COS) {
-        math::normalize(const_cast<DataType *>(query), distance_space_.dim_);
-      }
-
       auto aligned_size = math::round_up_pow2(distance_space_.data_size_, kAlignment);
       query_ = static_cast<DataType *>(alaya_aligned_alloc_impl(aligned_size, kAlignment));
       std::memcpy(query_, query, distance_space.data_size_);
+      // Normalize the copy, not the caller's original data.
+      if (distance_space_.metric_ == MetricType::COS) {
+        math::normalize(query_, distance_space_.dim_);
+      }
     }
 
     QueryComputer(const RawSpace &distance_space, const IDType id)
@@ -314,9 +276,7 @@ class RawSpace {
    * @param address The address of the data to prefetch
    */
   auto prefetch_by_address(DataType *address) -> void { mem_prefetch_l1(address, data_size_ / 64); }
-
   auto get_query_computer(const DataType *query) { return QueryComputer(*this, query); }
-
   auto get_query_computer(IDType id) { return QueryComputer(*this, id); }
 };
 

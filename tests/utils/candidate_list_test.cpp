@@ -22,11 +22,11 @@ namespace alaya {
 
 class CandidateListTest : public ::testing::Test {
  protected:
-  void SetUp() override { pool_ = new CandidateList<float, int>(10, 5); }
+  void SetUp() override { pool_ = new CandidateList<float, uint32_t>(10, 5); }
 
   void TearDown() override { delete pool_; }
 
-  CandidateList<float, int> *pool_;
+  CandidateList<float, uint32_t> *pool_;
 };
 
 TEST_F(CandidateListTest, InsertBoundaryTest) {
@@ -147,7 +147,7 @@ TEST_F(CandidateListTest, FindBsearchTest) {
 TEST_F(CandidateListTest, CapacityTest) {
   EXPECT_EQ(pool_->capacity(), 5);
 
-  CandidateList<float, int> large_pool(100, 50);
+  CandidateList<float, uint32_t> large_pool(100, 50);
   EXPECT_EQ(large_pool.capacity(), 50);
 }
 
@@ -205,23 +205,23 @@ TEST_F(CandidateListTest, HasNextAndNextIdTest) {
 
 // Test get_id, set_checked, is_checked functions
 TEST_F(CandidateListTest, CheckedFlagTest) {
-  int id = 42;
+  uint32_t id = 42;
 
   // Initially not checked
   EXPECT_FALSE(pool_->is_checked(id));
-  EXPECT_EQ(pool_->get_id(id), 42);
+  EXPECT_EQ(pool_->get_id(id), 42U);
 
   // Set checked flag
   pool_->set_checked(id);
   EXPECT_TRUE(pool_->is_checked(id));
-  EXPECT_EQ(pool_->get_id(id), 42);  // get_id should still return original ID
+  EXPECT_EQ(pool_->get_id(id), 42U);  // get_id should still return original ID
 
   // Test with larger ID
-  int large_id = 1000000;
+  uint32_t large_id = 1000000;
   EXPECT_FALSE(pool_->is_checked(large_id));
   pool_->set_checked(large_id);
   EXPECT_TRUE(pool_->is_checked(large_id));
-  EXPECT_EQ(pool_->get_id(large_id), 1000000);
+  EXPECT_EQ(pool_->get_id(large_id), 1000000U);
 }
 
 // Test empty pool behavior
@@ -256,9 +256,9 @@ TEST_F(CandidateListTest, SameDistanceInsertTest) {
   EXPECT_EQ(pool_->size(), 3);
 
   // All should be accessible
-  int popped1 = pool_->pop();
-  int popped2 = pool_->pop();
-  int popped3 = pool_->pop();
+  uint32_t popped1 = pool_->pop();
+  uint32_t popped2 = pool_->pop();
+  uint32_t popped3 = pool_->pop();
 
   // All IDs should be popped
   EXPECT_TRUE((popped1 == 1 || popped1 == 2 || popped1 == 3));
@@ -323,14 +323,14 @@ TEST_F(CandidateListTest, CursorBehaviorTest) {
 
 // Test kMask constant
 TEST_F(CandidateListTest, MaskConstantTest) {
-  EXPECT_EQ((CandidateList<float, int>::kMask), 2147483647);
-  EXPECT_EQ((CandidateList<float, int>::kMask), 0x7FFFFFFF);
+  EXPECT_EQ((CandidateList<float, uint32_t>::kMask), 2147483647);
+  EXPECT_EQ((CandidateList<float, uint32_t>::kMask), 0x7FFFFFFF);
 }
 
 // Test large capacity pool
 TEST(CandidateListLargeTest, LargeCapacityTest) {
   const int kCapacity = 1000;
-  CandidateList<float, int> pool(10000, kCapacity);
+  CandidateList<float, uint32_t> pool(10000, kCapacity);
 
   for (int i = 0; i < 2000; ++i) {
     pool.insert(i, static_cast<float>(i % 500));

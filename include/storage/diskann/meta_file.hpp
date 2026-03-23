@@ -16,7 +16,9 @@
 
 #pragma once
 
+#include <fcntl.h>
 #include <sys/types.h>
+#include <unistd.h>
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -430,34 +432,61 @@ class MetaFile {
 
     std::string temp_path = path_ + ".tmp";
 
+    // Write to temp file using a raw fd so we can fsync before rename.
     {
-      std::ofstream file(temp_path, std::ios::binary | std::ios::trunc);
-      if (!file) {
-        throw std::runtime_error("Failed to create temporary metadata file");
+      int tmp_fd = ::open(temp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+      if (tmp_fd < 0) {
+        throw std::runtime_error("Failed to create temporary metadata file: " + temp_path);
       }
+
+      auto write_all = [&](const void *buf, size_t len) {
+        const auto *ptr = reinterpret_cast<const char *>(buf);
+        size_t remaining = len;
+        while (remaining > 0) {
+          ssize_t n = ::write(tmp_fd, ptr, remaining);
+          if (n < 0) {
+            ::close(tmp_fd);
+            throw std::runtime_error("Failed to write temporary metadata file");
+          }
+          ptr += n;
+          remaining -= static_cast<size_t>(n);
+        }
+      };
 
       // Write header with updated checksum
       MetaFileHeader header_copy = header_;
       header_copy.update_checksum();
-      file.write(reinterpret_cast<const char *>(&header_copy), sizeof(MetaFileHeader));
+      write_all(&header_copy, sizeof(MetaFileHeader));
 
       // Write validity bitmap directly from bitset
-      file.write(reinterpret_cast<const char *>(validity_bitmap_.data()),
-                 static_cast<std::streamsize>(header_.bitset_size_bytes()));
+      write_all(validity_bitmap_.data(), header_.bitset_size_bytes());
 
       // Write ID mapping vectors
-      file.write(reinterpret_cast<const char *>(id_map_.data()),
-                 static_cast<std::streamsize>(id_map_.size() * sizeof(uint32_t)));
-      file.write(reinterpret_cast<const char *>(reverse_map_.data()),
-                 static_cast<std::streamsize>(reverse_map_.size() * sizeof(uint32_t)));
+      write_all(id_map_.data(), id_map_.size() * sizeof(uint32_t));
+      write_all(reverse_map_.data(), reverse_map_.size() * sizeof(uint32_t));
 
-      file.flush();
-      // Note: For production, should call fsync() here
+      // fsync to ensure all data is durable before we rename
+      if (::fsync(tmp_fd) != 0) {
+        ::close(tmp_fd);
+        throw std::runtime_error("Failed to fsync temporary metadata file");
+      }
+      ::close(tmp_fd);
     }
 
     // Atomic rename
     if (std::rename(temp_path.c_str(), path_.c_str()) != 0) {
       throw std::runtime_error("Failed to rename temporary metadata file");
+    }
+
+    // fsync the parent directory to make the rename durable
+    {
+      auto slash_pos = path_.rfind('/');
+      std::string dir = (slash_pos != std::string::npos) ? path_.substr(0, slash_pos) : ".";
+      int dir_fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+      if (dir_fd >= 0) {
+        ::fsync(dir_fd);
+        ::close(dir_fd);
+      }
     }
 
     dirty_ = false;
@@ -468,24 +497,12 @@ class MetaFile {
    *
    * Saves if dirty before closing.
    */
-  void close() {
-    if (!is_open_) {
-      return;
-    }
+  void close() { close_impl(true); }
 
-    if (dirty_) {
-      save();
-    }
-
-    path_.clear();
-    validity_bitmap_ = Bitset();
-    freelist_.clear();
-    id_map_.clear();
-    reverse_map_.clear();
-    header_ = MetaFileHeader();
-    dirty_ = false;
-    is_open_ = false;
-  }
+  /**
+   * @brief Close the metadata file without persisting dirty state.
+   */
+  void close_without_save() { close_impl(false); }
 
   // -------------------------------------------------------------------------
   // Node validity management
@@ -581,7 +598,7 @@ class MetaFile {
 
     // No free slots — grow capacity dynamically
     uint32_t old_capacity = header_.num_capacity_;
-    uint32_t new_capacity = old_capacity + std::max(old_capacity / 2, uint32_t{1024});
+    uint32_t new_capacity = next_growth_capacity();
     LOG_INFO("MetaFile: Auto-growing capacity from {} to {}", old_capacity, new_capacity);
     grow(new_capacity);
 
@@ -606,6 +623,13 @@ class MetaFile {
   [[nodiscard]] auto dimension() const -> uint32_t { return header_.dim_; }
   [[nodiscard]] auto max_degree() const -> uint32_t { return header_.max_degree_; }
   [[nodiscard]] auto entry_point() const -> uint32_t { return header_.entry_point_id_; }
+  [[nodiscard]] auto is_full() const -> bool {
+    return header_.num_active_points_ >= static_cast<uint64_t>(header_.num_capacity_);
+  }
+  [[nodiscard]] auto next_growth_capacity() const -> uint32_t {
+    uint32_t growth = std::max(header_.num_capacity_ / 2, uint32_t{1024});
+    return math::round_up_pow2(header_.num_capacity_ + growth, 64);
+  }
 
   [[nodiscard]] auto is_open() const -> bool { return is_open_; }
   [[nodiscard]] auto is_dirty() const -> bool { return dirty_; }
@@ -720,6 +744,29 @@ class MetaFile {
   }
 
  private:
+  void close_impl(bool save_if_dirty) {
+    if (!is_open_) {
+      return;
+    }
+
+    if (save_if_dirty && dirty_) {
+      save();
+    }
+
+    reset_state();
+  }
+
+  void reset_state() {
+    path_.clear();
+    validity_bitmap_ = Bitset();
+    freelist_.clear();
+    id_map_.clear();
+    reverse_map_.clear();
+    header_ = MetaFileHeader();
+    dirty_ = false;
+    is_open_ = false;
+  }
+
   /**
    * @brief Rebuild freelist from the validity bitmap.
    *

@@ -46,6 +46,7 @@ class IOUringEngine final : public IOEngine {
  public:
   /// Default submission queue depth
   static constexpr size_t kDefaultQueueDepth = 128;
+  static constexpr int32_t kRequestNotSubmitted = INT32_MIN;
 
   /**
    * @brief Construct IOUringEngine.
@@ -191,54 +192,130 @@ class IOUringEngine final : public IOEngine {
   }
 
   auto submit_batch(int fd, std::span<IORequest> requests, bool is_write) -> size_t {
-    auto *ring = get_ring();
-    if (ring == nullptr || requests.empty()) {
+    if (requests.empty()) {
       return 0;
     }
 
-    size_t prepared = 0;
-    size_t total_submitted = 0;
+    mark_pending(requests);
 
-    for (auto &req : requests) {
-      struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
-      if (sqe == nullptr) {
-        // SQ full, submit what we have and try to get more
-        int submitted = io_uring_submit(ring);
-        if (submitted < 0) {
-          LOG_ERROR("io_uring_submit failed: {}", strerror(-submitted));
-          break;
-        }
-        total_submitted += static_cast<size_t>(submitted);
-
-        sqe = io_uring_get_sqe(ring);
-        if (sqe == nullptr) {
-          LOG_WARN("io_uring SQ still full after submit");
-          break;
-        }
-      }
-
-      if (is_write) {
-        io_uring_prep_write(sqe, fd, req.buffer_, static_cast<unsigned>(req.size_), req.offset_);
-      } else {
-        io_uring_prep_read(sqe, fd, req.buffer_, static_cast<unsigned>(req.size_), req.offset_);
-      }
-
-      io_uring_sqe_set_data(sqe, &req);
-      req.result_ = 0;  // Reset result
-      ++prepared;
+    auto *ring = get_ring();
+    if (ring == nullptr) {
+      return 0;
     }
 
-    // Submit any remaining SQEs that haven't been submitted yet
-    if (prepared > total_submitted) {
-      int submitted = io_uring_submit(ring);
-      if (submitted < 0) {
-        LOG_ERROR("io_uring_submit failed: {}", strerror(-submitted));
+    size_t total_submitted = 0;
+    size_t next_request = 0;
+
+    while (next_request < requests.size()) {
+      size_t chunk_start = next_request;
+      size_t chunk_size = std::min(queue_depth_, requests.size() - chunk_start);
+      size_t prepared =
+          prepare_chunk(ring, fd, requests, chunk_start, chunk_size, next_request, is_write);
+      if (prepared == 0) {
         return total_submitted;
       }
-      total_submitted += static_cast<size_t>(submitted);
+      if (!submit_chunk(ring,
+                        chunk_start,
+                        requests.subspan(chunk_start, prepared),
+                        total_submitted)) {
+        return total_submitted;
+      }
     }
 
     return total_submitted;
+  }
+
+  static void mark_pending(std::span<IORequest> requests) {
+    for (auto &req : requests) {
+      req.result_ = kRequestNotSubmitted;
+    }
+  }
+
+  static auto prepare_chunk(struct io_uring *ring,
+                            int fd,
+                            std::span<IORequest> requests,
+                            size_t chunk_start,
+                            size_t chunk_size,
+                            size_t &next_request,
+                            bool is_write) -> size_t {
+    size_t prepared = 0;
+    while (prepared < chunk_size) {
+      auto &req = requests[chunk_start + prepared];
+      struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+      if (sqe == nullptr) {
+        if (prepared == 0) {
+          LOG_ERROR("io_uring SQ is full before request {} could be prepared", chunk_start);
+        }
+        break;
+      }
+      prepare_sqe(sqe, fd, req, is_write);
+      ++prepared;
+      next_request = chunk_start + prepared;
+    }
+    return prepared;
+  }
+
+  static void prepare_sqe(struct io_uring_sqe *sqe, int fd, IORequest &req, bool is_write) {
+    if (is_write) {
+      io_uring_prep_write(sqe, fd, req.buffer_, static_cast<unsigned>(req.size_), req.offset_);
+    } else {
+      io_uring_prep_read(sqe, fd, req.buffer_, static_cast<unsigned>(req.size_), req.offset_);
+    }
+    io_uring_sqe_set_data(sqe, &req);
+    req.result_ = 0;
+  }
+
+  static auto submit_chunk(struct io_uring *ring,
+                           size_t chunk_start,
+                           std::span<IORequest> chunk_requests,
+                           size_t &total_submitted) -> bool {
+    size_t chunk_submitted = 0;
+
+    while (chunk_submitted < chunk_requests.size()) {
+      int submitted = io_uring_submit(ring);
+      if (submitted < 0) {
+        mark_not_submitted(chunk_requests, chunk_submitted);
+        LOG_ERROR(
+            "io_uring_submit failed after submitting {}/{} requests for chunk starting "
+            "from {}: {}",
+            chunk_submitted,
+            chunk_requests.size(),
+            chunk_start,
+            strerror(-submitted));
+        return false;
+      }
+      if (submitted == 0) {
+        mark_not_submitted(chunk_requests, chunk_submitted);
+        LOG_ERROR(
+            "io_uring_submit made no progress after submitting {}/{} requests for chunk "
+            "starting from {}",
+            chunk_submitted,
+            chunk_requests.size(),
+            chunk_start);
+        return false;
+      }
+
+      chunk_submitted += static_cast<size_t>(submitted);
+      total_submitted += static_cast<size_t>(submitted);
+
+      if (chunk_submitted < chunk_requests.size()) {
+        LOG_WARN(
+            "io_uring_submit submitted {}/{} requests for chunk starting from {}, retrying "
+            "the remaining {}",
+            chunk_submitted,
+            chunk_requests.size(),
+            chunk_start,
+            chunk_requests.size() - chunk_submitted);
+      }
+    }
+
+    return true;
+  }
+
+  static void mark_not_submitted(std::span<IORequest> requests, size_t start_index = 0) {
+    for (size_t i = start_index; i < requests.size(); ++i) {
+      requests[i].result_ = kRequestNotSubmitted;
+    }
   }
 
   static void process_cqe(struct io_uring_cqe *cqe) {

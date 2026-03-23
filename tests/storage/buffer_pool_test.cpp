@@ -97,18 +97,21 @@ TEST_F(LRUReplacerTest, EvictReturnsLRU) {
   // First evict should return 0 (least recently used)
   auto victim = replacer.evict();
   ASSERT_TRUE(victim.has_value());
-  EXPECT_EQ(victim.value(), 0U);
+  size_t victim_id = *victim;
+  EXPECT_EQ(victim_id, 0U);
   EXPECT_EQ(replacer.size(), 2U);
 
   // Second evict should return 1
   victim = replacer.evict();
   ASSERT_TRUE(victim.has_value());
-  EXPECT_EQ(victim.value(), 1U);
+  victim_id = *victim;
+  EXPECT_EQ(victim_id, 1U);
 
   // Third evict should return 2
   victim = replacer.evict();
   ASSERT_TRUE(victim.has_value());
-  EXPECT_EQ(victim.value(), 2U);
+  victim_id = *victim;
+  EXPECT_EQ(victim_id, 2U);
 
   // Fourth evict should return nullopt
   victim = replacer.evict();
@@ -128,13 +131,16 @@ TEST_F(LRUReplacerTest, UnpinUpdatesLRUOrder) {
 
   // Evict order should now be: 1, 2, 0
   auto victim = replacer.evict();
-  EXPECT_EQ(victim.value(), 1U);
+  ASSERT_TRUE(victim.has_value());
+  EXPECT_EQ(*victim, 1U);
 
   victim = replacer.evict();
-  EXPECT_EQ(victim.value(), 2U);
+  ASSERT_TRUE(victim.has_value());
+  EXPECT_EQ(*victim, 2U);
 
   victim = replacer.evict();
-  EXPECT_EQ(victim.value(), 0U);
+  ASSERT_TRUE(victim.has_value());
+  EXPECT_EQ(*victim, 0U);
 }
 
 TEST_F(LRUReplacerTest, Remove) {
@@ -154,10 +160,12 @@ TEST_F(LRUReplacerTest, Remove) {
 
   // Evict should skip removed frame
   auto victim = replacer.evict();
-  EXPECT_EQ(victim.value(), 0U);
+  ASSERT_TRUE(victim.has_value());
+  EXPECT_EQ(*victim, 0U);
 
   victim = replacer.evict();
-  EXPECT_EQ(victim.value(), 2U);
+  ASSERT_TRUE(victim.has_value());
+  EXPECT_EQ(*victim, 2U);
 }
 
 TEST_F(LRUReplacerTest, Reset) {
@@ -197,7 +205,8 @@ TEST_F(LRUReplacerTest, MoveConstruction) {
   EXPECT_EQ(replacer2.size(), 2U);
 
   auto victim = replacer2.evict();
-  EXPECT_EQ(victim.value(), 0U);
+  ASSERT_TRUE(victim.has_value());
+  EXPECT_EQ(*victim, 0U);
 }
 
 TEST_F(LRUReplacerTest, MoveAssignment) {
@@ -305,9 +314,10 @@ TEST_F(ClockReplacerTest, UnpinSetsRefBit) {
   // Evict once to clear ref bits via second chance
   auto victim = replacer.evict();
   ASSERT_TRUE(victim.has_value());
+  const size_t victim_id = *victim;
 
   // Access remaining frame - sets ref bit again
-  size_t remaining = (victim.value() == 0) ? 1 : 0;
+  size_t remaining = (victim_id == 0) ? 1 : 0;
   replacer.unpin(remaining);
 
   // Should still be evictable (but with ref bit set)
@@ -415,6 +425,23 @@ TEST_F(ClockProReplacerTest, PinRemoves) {
   EXPECT_EQ(replacer.size(), 1U);
 }
 
+TEST_F(ClockProReplacerTest, SingleEntryPinUnpinCycleRemainsValid) {
+  ClockProReplacer replacer(1);
+
+  for (int i = 0; i < 32; ++i) {
+    replacer.unpin(0);
+    EXPECT_EQ(replacer.size(), 1U);
+    replacer.pin(0);
+    EXPECT_EQ(replacer.size(), 0U);
+  }
+
+  replacer.unpin(0);
+  auto victim = replacer.evict();
+  ASSERT_TRUE(victim.has_value());
+  EXPECT_EQ(*victim, 0U);
+  EXPECT_EQ(replacer.size(), 0U);
+}
+
 TEST_F(ClockProReplacerTest, EvictFromCold) {
   ClockProReplacer replacer(kCapacity);
 
@@ -444,7 +471,7 @@ TEST_F(ClockProReplacerTest, TestSetPromotion) {
   replacer.unpin(0);
   auto victim = replacer.evict();
   ASSERT_TRUE(victim.has_value());
-  size_t evicted_id = victim.value();
+  const size_t evicted_id = *victim;
 
   // The evicted page is now in test set
   EXPECT_EQ(replacer.test_size(), 1U);
@@ -505,6 +532,8 @@ TEST_F(BufferPoolStatsTest, DefaultConstruction) {
   BufferPoolStats stats;
   EXPECT_EQ(stats.hits_.load(), 0U);
   EXPECT_EQ(stats.misses_.load(), 0U);
+  EXPECT_EQ(stats.reuse_hits_.load(), 0U);
+  EXPECT_EQ(stats.reuse_misses_.load(), 0U);
   EXPECT_EQ(stats.evictions_.load(), 0U);
   EXPECT_EQ(stats.pins_.load(), 0U);
 }
@@ -513,6 +542,8 @@ TEST_F(BufferPoolStatsTest, Reset) {
   BufferPoolStats stats;
   stats.hits_.store(10);
   stats.misses_.store(5);
+  stats.reuse_hits_.store(7);
+  stats.reuse_misses_.store(4);
   stats.evictions_.store(2);
   stats.pins_.store(3);
 
@@ -520,6 +551,8 @@ TEST_F(BufferPoolStatsTest, Reset) {
 
   EXPECT_EQ(stats.hits_.load(), 0U);
   EXPECT_EQ(stats.misses_.load(), 0U);
+  EXPECT_EQ(stats.reuse_hits_.load(), 0U);
+  EXPECT_EQ(stats.reuse_misses_.load(), 0U);
   EXPECT_EQ(stats.evictions_.load(), 0U);
   EXPECT_EQ(stats.pins_.load(), 0U);
 }
@@ -572,9 +605,22 @@ TEST_F(BufferPoolTest, Construction) {
 }
 
 TEST_F(BufferPoolTest, ZeroCapacity) {
-  BufferPool<uint32_t> pool(0, kFrameSize);
-  // Should construct without crash
-  EXPECT_EQ(pool.stats().hits_.load(), 0U);
+  EXPECT_THROW(
+      {
+        BufferPool<uint32_t> pool(0, kFrameSize);
+      },
+      std::invalid_argument);
+}
+
+TEST_F(BufferPoolTest, NumShardsGreaterThanCapacity) {
+  BufferPool<uint32_t> pool(1, kFrameSize, 16);
+  std::vector<uint8_t> data(kFrameSize, 0x5A);
+
+  auto handle = pool.put(7, data.data());
+
+  ASSERT_FALSE(handle.empty());
+  EXPECT_EQ(handle.size(), kFrameSize);
+  EXPECT_EQ(handle.data()[0], 0x5A);
 }
 
 TEST_F(BufferPoolTest, SingleShard) {
@@ -915,6 +961,8 @@ TEST_F(BufferPoolTest, Clear) {
   // Stats should be reset
   EXPECT_EQ(pool.stats().hits_.load(), 0U);
   EXPECT_EQ(pool.stats().misses_.load(), 0U);
+  EXPECT_EQ(pool.stats().reuse_hits_.load(), 0U);
+  EXPECT_EQ(pool.stats().reuse_misses_.load(), 0U);
   EXPECT_EQ(pool.stats().evictions_.load(), 0U);
 
   // Previously cached pages should no longer be found
@@ -923,6 +971,63 @@ TEST_F(BufferPoolTest, Clear) {
 
   handle = pool.get(4);
   EXPECT_TRUE(handle.empty());
+}
+
+TEST_F(BufferPoolTest, ClearWithActivePageHandlesThrows) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  auto handle = pool.get_or_read(0, io, 0, temp.data());
+  ASSERT_FALSE(handle.empty());
+
+  EXPECT_THROW(pool.clear(), std::logic_error);
+
+  handle = BufferPool<uint32_t>::PageHandle{};
+  EXPECT_NO_THROW(pool.clear());
+}
+
+TEST_F(BufferPoolTest, PrefetchUsesCachedPageOnSecondAccess) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+
+  pool.prefetch(0, io, 0);
+  pool.prefetch(0, io, 0);
+
+  EXPECT_EQ(pool.stats().misses_.load(), 1U);
+  EXPECT_EQ(pool.stats().hits_.load(), 1U);
+  EXPECT_EQ(pool.stats().reuse_misses_.load(), 1U);
+  EXPECT_EQ(pool.stats().reuse_hits_.load(), 1U);
+}
+
+TEST_F(BufferPoolTest, ResetStatsKeepsCachedPages) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 1);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  {
+    auto handle = pool.get_or_read(0, io, 0, temp.data());
+    EXPECT_FALSE(handle.empty());
+  }
+  {
+    auto handle = pool.get(0);
+    EXPECT_FALSE(handle.empty());
+  }
+
+  EXPECT_EQ(pool.stats().misses_.load(), 1U);
+  EXPECT_EQ(pool.stats().hits_.load(), 1U);
+
+  pool.reset_stats();
+
+  EXPECT_EQ(pool.stats().hits_.load(), 0U);
+  EXPECT_EQ(pool.stats().misses_.load(), 0U);
+  EXPECT_EQ(pool.stats().reuse_hits_.load(), 0U);
+  EXPECT_EQ(pool.stats().reuse_misses_.load(), 0U);
+
+  auto handle = pool.get(0);
+  EXPECT_FALSE(handle.empty());
+  EXPECT_EQ(pool.stats().hits_.load(), 1U);
+  EXPECT_EQ(pool.stats().misses_.load(), 0U);
 }
 
 TEST_F(BufferPoolTest, StatsTracking) {
@@ -1196,6 +1301,7 @@ TEST_F(BufferPoolThreadTest, ConcurrentClearAndAccess) {
   DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
 
   std::atomic<bool> done{false};
+  std::atomic<int> clear_failures{0};
 
   // Writer thread: continuously load pages
   std::thread writer([&pool, &io, &done]() -> void {
@@ -1210,10 +1316,14 @@ TEST_F(BufferPoolThreadTest, ConcurrentClearAndAccess) {
   });
 
   // Clear thread: periodically clear the pool
-  std::thread clearer([&pool, &done]() -> void {
+  std::thread clearer([&pool, &done, &clear_failures]() -> void {
     for (int i = 0; i < 10; ++i) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      pool.clear();
+      try {
+        pool.clear();
+      } catch (const std::logic_error &) {
+        clear_failures.fetch_add(1, std::memory_order_relaxed);
+      }
     }
     done.store(true, std::memory_order_relaxed);
   });
@@ -1222,6 +1332,7 @@ TEST_F(BufferPoolThreadTest, ConcurrentClearAndAccess) {
   clearer.join();
 
   // Should complete without crash
+  EXPECT_GE(clear_failures.load(std::memory_order_relaxed), 0);
 }
 
 TEST_F(BufferPoolThreadTest, ConcurrentClockProReplacer) {
@@ -1252,6 +1363,103 @@ TEST_F(BufferPoolThreadTest, ConcurrentClockProReplacer) {
   }
 
   EXPECT_GT(pool.stats().hits_.load() + pool.stats().misses_.load(), 0U);
+}
+
+TEST_F(BufferPoolTest, SingleFrameSingleShardWorks) {
+  BufferPool<uint32_t> pool(1, kFrameSize, 1);
+  std::vector<uint8_t> data(kFrameSize, 0x5A);
+
+  auto inserted = pool.put(7, data.data());
+  ASSERT_FALSE(inserted.empty());
+  EXPECT_EQ(inserted.data()[0], 0x5A);
+
+  auto cached = pool.get(7);
+  ASSERT_FALSE(cached.empty());
+  EXPECT_EQ(cached.data()[0], 0x5A);
+}
+
+TEST_F(BufferPoolTest, CapacityEqualsShardCountWorks) {
+  BufferPool<uint32_t> pool(16, kFrameSize, 16);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  for (uint32_t i = 0; i < 16; ++i) {
+    auto handle = pool.get_or_read(i, io, i * kFrameSize, temp.data());
+    ASSERT_FALSE(handle.empty());
+    EXPECT_EQ(handle.data()[0], static_cast<uint8_t>(i));
+  }
+
+  for (uint32_t i = 0; i < 16; ++i) {
+    auto handle = pool.get(i);
+    ASSERT_FALSE(handle.empty());
+    EXPECT_EQ(handle.data()[0], static_cast<uint8_t>(i));
+  }
+}
+
+TEST_F(BufferPoolTest, NonDivisibleCapacityFiveAcrossFourShardsWorks) {
+  BufferPool<uint32_t> pool(5, kFrameSize, 4);
+  const uint32_t kIds[] = {0, 1, 2, 3, 7};
+
+  for (uint32_t id : kIds) {
+    std::vector<uint8_t> data(kFrameSize, static_cast<uint8_t>(id));
+    auto handle = pool.put(id, data.data());
+    ASSERT_FALSE(handle.empty());
+    EXPECT_EQ(handle.data()[0], static_cast<uint8_t>(id));
+  }
+
+  for (uint32_t id : kIds) {
+    auto handle = pool.get(id);
+    ASSERT_FALSE(handle.empty());
+    EXPECT_EQ(handle.data()[0], static_cast<uint8_t>(id));
+  }
+}
+
+TEST_F(BufferPoolTest, NonDivisibleCapacityTenAcrossSixShardsWorks) {
+  BufferPool<uint32_t> pool(10, kFrameSize, 6);
+  const uint32_t kIds[] = {0, 1, 7, 2, 8, 3, 4, 10, 5, 11};
+
+  for (uint32_t id : kIds) {
+    std::vector<uint8_t> data(kFrameSize, static_cast<uint8_t>(id));
+    auto handle = pool.put(id, data.data());
+    ASSERT_FALSE(handle.empty());
+    EXPECT_EQ(handle.data()[0], static_cast<uint8_t>(id));
+  }
+
+  for (uint32_t id : kIds) {
+    auto handle = pool.get(id);
+    ASSERT_FALSE(handle.empty());
+    EXPECT_EQ(handle.data()[0], static_cast<uint8_t>(id));
+  }
+}
+
+TEST_F(BufferPoolTest, ClearWithActiveHandlesAcrossShardsThrows) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 4);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  auto h0 = pool.get_or_read(0, io, 0, temp.data());
+  auto h1 = pool.get_or_read(1, io, kFrameSize, temp.data());
+  ASSERT_FALSE(h0.empty());
+  ASSERT_FALSE(h1.empty());
+
+  EXPECT_THROW(pool.clear(), std::logic_error);
+}
+
+TEST_F(BufferPoolTest, ClearAfterReleasingHandlesAcrossShardsWorks) {
+  BufferPool<uint32_t> pool(kCapacity, kFrameSize, 4);
+  DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
+  AlignedBuffer temp(kFrameSize);
+
+  {
+    auto h0 = pool.get_or_read(0, io, 0, temp.data());
+    auto h1 = pool.get_or_read(1, io, kFrameSize, temp.data());
+    ASSERT_FALSE(h0.empty());
+    ASSERT_FALSE(h1.empty());
+  }
+
+  EXPECT_NO_THROW(pool.clear());
+  EXPECT_TRUE(pool.get(0).empty());
+  EXPECT_TRUE(pool.get(1).empty());
 }
 
 }  // namespace alaya

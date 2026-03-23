@@ -27,6 +27,7 @@
 #include <random>
 #include <span>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -42,6 +43,7 @@
 #include "utils/log.hpp"
 #include "utils/macros.hpp"
 #include "utils/prefetch.hpp"
+#include "utils/progress_bar.hpp"
 #include "utils/thread_pool.hpp"
 #include "utils/timer.hpp"
 
@@ -67,9 +69,11 @@ struct DiskANNBuilder {
   struct PruneScratch {
     std::vector<IDType> result_buf_;
     std::vector<IDType> reserve_buf_;
+    std::vector<IDType> neighbor_snapshot_;
     explicit PruneScratch(uint32_t max_degree) {
       result_buf_.reserve(max_degree + 1);
       reserve_buf_.reserve(max_degree + 1);
+      neighbor_snapshot_.reserve(max_degree);
     }
     void clear() { result_buf_.clear(); }
   };
@@ -113,6 +117,45 @@ struct DiskANNBuilder {
     return scratch;
   }
 
+  auto snapshot_neighbors(const Graph<DataType, IDType> *graph, IDType node_id)
+      -> std::span<const IDType> {
+    auto &snapshot = get_prune_scratch().neighbor_snapshot_;
+    snapshot.clear();
+
+    std::lock_guard<std::mutex> lock(*locks_[node_id % num_locks_]);
+    const auto *edges = graph->edges(node_id);
+    for (uint32_t i = 0; i < params_.max_degree_; ++i) {
+      if (edges[i] == kInvalidID) {
+        break;
+      }
+      snapshot.push_back(edges[i]);
+    }
+    return snapshot;
+  }
+
+  void merge_existing_neighbors(IDType node_id, std::vector<NeighborType> &candidates) {
+    std::sort(candidates.begin(), candidates.end(), [](const auto &lhs, const auto &rhs) -> bool {
+      if (lhs.id_ != rhs.id_) {
+        return lhs.id_ < rhs.id_;
+      }
+      return lhs.distance_ < rhs.distance_;
+    });
+    auto last = std::unique(candidates.begin(),
+                            candidates.end(),
+                            [](const auto &lhs, const auto &rhs) -> bool {
+                              return lhs.id_ == rhs.id_;
+                            });
+    candidates.erase(last, candidates.end());
+
+    for (auto &candidate : candidates) {
+      if (candidate.distance_ != kUncomputedDist) {
+        continue;
+      }
+      candidate.distance_ = space_->get_distance(node_id, candidate.id_);
+    }
+    std::sort(candidates.begin(), candidates.end());
+  }
+
   /**
    * @brief Build the graph using Vamana algorithm.
    *
@@ -120,13 +163,18 @@ struct DiskANNBuilder {
    * @return Unique pointer to the constructed graph
    */
   auto build_graph(uint32_t thread_num = 1) -> std::unique_ptr<Graph<DataType, IDType>> {
+    if (thread_num == 0) {
+      thread_num = std::max(1u, std::thread::hardware_concurrency());
+    }
+
     auto vec_num = space_->get_data_num();
-    LOG_INFO("DiskANN: Building graph with {} vectors, R={}, L={}, alpha={}, threads={}",
+    LOG_INFO("DiskANN: Building graph with {} vectors, R={}, L={}, alpha={}, threads={}, metric={}",
              vec_num,
              params_.max_degree_,
              params_.ef_construction_,
              params_.alpha_,
-             thread_num);
+             thread_num,
+             space_->get_metric_name());
     // Initialize graph
     auto graph =
         std::make_unique<Graph<DataType, IDType>>(space_->get_capacity(), params_.max_degree_);
@@ -148,7 +196,10 @@ struct DiskANNBuilder {
                pass + 1,
                params_.num_iterations_,
                current_alpha);
-      build_pass(graph.get(), thread_num, current_alpha);
+      build_pass(graph.get(),
+                 thread_num,
+                 current_alpha,
+                 fmt::format("Pass {}/{}", pass + 1, params_.num_iterations_));
 
       calculate_average_degree(graph.get());
       LOG_INFO("DiskANN: Pass {}/{} completed, cost: {:.2f}s, avg_r={:.2f}(R={})",
@@ -292,12 +343,12 @@ struct DiskANNBuilder {
 
     // Initialize random neighbors for each node
     ThreadPool pool(thread_num);
-    std::atomic<uint32_t> progress{0};
+    ProgressBar progress_bar("Init Random Graph", static_cast<uint64_t>(vec_num));
 
     size_t num_tasks = 0;
     for (size_t chunk_begin = 0; chunk_begin < vec_num; chunk_begin += kChunkSize) {
       size_t chunk_end = std::min(chunk_begin + kChunkSize, static_cast<size_t>(vec_num));
-      pool.enqueue([this, chunk_begin, chunk_end, &graph, &progress, vec_num]() -> auto {
+      pool.enqueue([this, chunk_begin, chunk_end, &graph, &progress_bar, vec_num]() -> auto {
         for (size_t node_id = chunk_begin; node_id < chunk_end; ++node_id) {
           auto *cur_edges = graph->edges(node_id);
 
@@ -327,16 +378,12 @@ struct DiskANNBuilder {
           }
 
           memcpy(cur_edges, candidates.data(), candidates.size() * sizeof(IDType));
-          uint32_t cur = progress.fetch_add(1) + 1;
-          if (cur % 100000 == 0) {
-            LOG_INFO("DiskANN: Initialization progress: [{}/{}]", cur, vec_num);
-          }
+          progress_bar.tick();
         }
       });
       ++num_tasks;
     }
     pool.wait_until_all_tasks_completed(num_tasks);
-    LOG_DEBUG("DiskANN: Random graph initialization done");
   }
 
   /**
@@ -387,7 +434,10 @@ struct DiskANNBuilder {
    * @param thread_num Number of threads
    * @param alpha Alpha parameter for RobustPrune (1.0 for pass 1, higher for pass 2+)
    */
-  void build_pass(Graph<DataType, IDType> *graph, uint32_t thread_num, float alpha) {
+  void build_pass(Graph<DataType, IDType> *graph,
+                  uint32_t thread_num,
+                  float alpha,
+                  const std::string &progress_prefix) {
     auto vec_num = space_->get_data_num();
 
     // Create random permutation
@@ -396,80 +446,51 @@ struct DiskANNBuilder {
     std::shuffle(perm.begin(), perm.end(), std::mt19937(std::random_device()()));
 
     ThreadPool pool(thread_num);
-    std::atomic<uint32_t> progress{0};
+    ProgressBar progress_bar(progress_prefix, static_cast<uint64_t>(vec_num));
 
     size_t num_tasks = 0;
     for (IDType chunk_begin = 0; chunk_begin < vec_num;
          chunk_begin += static_cast<IDType>(kChunkSize)) {
       IDType chunk_end = std::min(chunk_begin + static_cast<IDType>(kChunkSize), vec_num);
 
-      pool.enqueue(
-          [this, chunk_begin, chunk_end, &graph, &perm, &progress, vec_num, alpha]() -> auto {
-            for (IDType chunk_id = chunk_begin; chunk_id < chunk_end; ++chunk_id) {
-              IDType node_id = perm[chunk_id];
-              // Greedy search from medoid to find candidates
-              auto candidates = greedy_search(graph, node_id, params_.ef_construction_);
+      pool.enqueue([this, chunk_begin, chunk_end, &graph, &perm, &progress_bar, alpha]() -> auto {
+        for (IDType chunk_id = chunk_begin; chunk_id < chunk_end; ++chunk_id) {
+          IDType node_id = perm[chunk_id];
+          auto candidates = greedy_search(graph, node_id, params_.ef_construction_);
 
-              // Add the existing neighbors in the current image to the candidates.
-              {
-                {
-                  std::lock_guard<std::mutex> lock(*locks_[node_id % num_locks_]);
-                  const auto *edges = graph->edges(node_id);
-                  for (uint32_t i = 0; i < params_.max_degree_; ++i) {
-                    if (edges[i] == kInvalidID) {
-                      break;
-                    }
-                    candidates.emplace_back(edges[i], kUncomputedDist, true);
-                  }
-                }
-                std::sort(candidates.begin(),
-                          candidates.end(),
-                          [](const auto &a, const auto &b) -> bool {
-                            if (a.id_ != b.id_) {
-                              return a.id_ < b.id_;
-                            }
-                            return a.distance_ < b.distance_;  // Real dist < Uncomputed
-                          });
-                auto last = std::unique(candidates.begin(),
-                                        candidates.end(),
-                                        [](const auto &a, const auto &b) -> bool {
-                                          return a.id_ == b.id_;
-                                        });
-                candidates.erase(last, candidates.end());
-
-                for (auto &cand : candidates) {
-                  if (cand.distance_ == kUncomputedDist) {
-                    cand.distance_ = space_->get_distance(node_id, cand.id_);
-                  }
-                }
-                std::sort(candidates.begin(), candidates.end());
+          auto &scratch = get_prune_scratch();  // get thread-local scratch for pruning
+          auto &res_buf = scratch.result_buf_;
+          {
+            std::lock_guard<std::mutex> lock(*locks_[node_id % num_locks_]);
+            const auto *edges = graph->edges(node_id);
+            for (uint32_t i = 0; i < params_.max_degree_; ++i) {
+              if (edges[i] == kInvalidID) {
+                break;
               }
-
-              auto &scratch = get_prune_scratch();  // get thread-local scratch for pruning
-              auto &res_buf = scratch.result_buf_;
-              robust_prune(node_id, candidates, alpha, res_buf);
-
-              // update graph, use shared lock
-              {
-                std::lock_guard<std::mutex> lock(*locks_[node_id % num_locks_]);
-                graph->update(node_id, res_buf.data());
-              }
-
-              // Add reverse edges
-              for (auto neighbor : res_buf) {
-                if (neighbor == kInvalidID) {
-                  break;
-                }
-                std::lock_guard<std::mutex> lock(*locks_[neighbor % num_locks_]);
-                add_reverse_edge(graph, neighbor, node_id, alpha);
-              }
-
-              uint32_t cur = progress.fetch_add(1) + 1;
-              if (cur % 100000 == 0) {
-                LOG_INFO("DiskANN: Build progress: [{}/{}]", cur, vec_num);
-              }
+              candidates.emplace_back(edges[i], kUncomputedDist, true);
             }
-          });
+          }
+
+          merge_existing_neighbors(node_id, candidates);
+          robust_prune(node_id, candidates, alpha, res_buf);
+
+          {
+            std::lock_guard<std::mutex> lock(*locks_[node_id % num_locks_]);
+            graph->update(node_id, res_buf.data());
+          }
+
+          // Add reverse edges
+          for (auto neighbor : res_buf) {
+            if (neighbor == kInvalidID) {
+              break;
+            }
+            std::lock_guard<std::mutex> lock(*locks_[neighbor % num_locks_]);
+            add_reverse_edge(graph, neighbor, node_id, alpha);
+          }
+
+          progress_bar.tick();
+        }
+      });
       ++num_tasks;
     }
     pool.wait_until_all_tasks_completed(num_tasks);
@@ -507,15 +528,12 @@ struct DiskANNBuilder {
       }
 
       auto cur_id = candidates.pop();
-      const auto *edges = graph->edges(cur_id);
-      prefetch_l1(edges);
+      auto neighbors = snapshot_neighbors(graph, cur_id);
+      if (!neighbors.empty()) {
+        prefetch_l1(neighbors.data());
+      }
 
-      // Expand neighbors
-      for (uint32_t i = 0; i < params_.max_degree_; ++i) {
-        auto neighbor = edges[i];
-        if (neighbor == kInvalidID) {
-          break;
-        }
+      for (auto neighbor : neighbors) {
         if (visited.is_visited(neighbor)) {
           continue;
         }
@@ -554,13 +572,9 @@ struct DiskANNBuilder {
                     std::vector<IDType> &output_edges) -> void {
     output_edges.clear();
 
-    // All distances from the same space share the same sign convention:
-    //   L2 → positive, IP/COS → negative (−dot product).
-    // For α-domination we need d * α to inflate "away from zero":
-    //   positive d: d * α  → larger  (farther from zero)   ⇒ eff_alpha = α
-    //   negative d: d / α  → less negative (farther from zero) ⇒ eff_alpha = 1/α
-    float eff_alpha =
-        (!candidates.empty() && candidates.front().distance_ < 0) ? (1.0F / alpha) : alpha;
+    auto inflate = [alpha](float distance) -> float {
+      return distance >= 0 ? distance * alpha : distance / alpha;
+    };
 
     for (const auto &cand : candidates) {
       if (output_edges.size() >= params_.max_degree_) {
@@ -574,7 +588,7 @@ struct DiskANNBuilder {
       bool dominated = false;
       for (const auto &selected_id : output_edges) {
         auto dist_cand_selected = space_->get_distance(cand.id_, selected_id);
-        if (dist_cand_selected * eff_alpha < cand.distance_) {
+        if (inflate(dist_cand_selected) < cand.distance_) {
           dominated = true;
           break;
         }
@@ -675,12 +689,6 @@ struct DiskANNBuilder {
                    params_.max_degree_,
                    num_pq_subspaces,
                    static_cast<uint32_t>(space_->metric_));
-
-    // Now that DataFile is open, install a write-back callback so dirty pages
-    // evicted from the pool are automatically persisted instead of silently lost.
-    buffer_pool.set_flush_callback([&storage](IDType block_id, const uint8_t *data) -> void {
-      storage.data().write_block(block_id, data);
-    });
 
     // Set metadata
     storage.set_entry_point(static_cast<uint32_t>(medoid_id_));

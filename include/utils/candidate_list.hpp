@@ -17,7 +17,9 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <type_traits>
 #include <vector>
 #include "../index/neighbor.hpp"
 #include "bitset.hpp"
@@ -27,6 +29,7 @@ namespace alaya {
 
 template <typename DistanceType, typename IDType>
 struct CandidateList {
+  static_assert(std::is_unsigned_v<IDType>, "CandidateList requires an unsigned IDType");
   using SearchResultType = ::alaya::SearchResult<IDType, DistanceType>;
   CandidateList(IDType n, int capacity)
       : nb_(n), capacity_(capacity), data_(capacity_ + 1), vis_(n) {}
@@ -93,10 +96,9 @@ struct CandidateList {
   auto size() const -> size_t { return size_; }
   auto capacity() const -> size_t { return capacity_; }
 
-  constexpr static int kMask = 2147483647;
+  constexpr static IDType kMask = static_cast<IDType>(0x7fffffffU);
   auto get_id(IDType id) const -> IDType { return id & kMask; }
-  // Need to assert IDType is uint32_t instead of uint64_t
-  void set_checked(IDType &id) { id |= 1 << 31; }
+  void set_checked(IDType &id) { id |= static_cast<IDType>(1U << 31); }
   auto is_checked(IDType id) -> bool { return (id >> 31 & 1) != 0; }
   auto is_full() -> bool { return size_ == capacity_; }
 

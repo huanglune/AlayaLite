@@ -22,6 +22,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -343,6 +344,14 @@ TEST_F(DirectFileIOTest, IORequestBasic) {
   EXPECT_FALSE(req.is_success());
   req.result_ = static_cast<int32_t>(kDefaultSectorSize);
   EXPECT_TRUE(req.is_success());
+}
+
+TEST_F(DirectFileIOTest, IORequestNotSubmittedIsNotSuccess) {
+  AlignedBuffer buf(kDefaultSectorSize);
+  IORequest req(buf.data(), kDefaultSectorSize, 4096, nullptr);
+
+  req.result_ = std::numeric_limits<int32_t>::min();
+  EXPECT_FALSE(req.is_success());
 }
 
 // =============================================================================

@@ -90,6 +90,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -97,6 +98,7 @@
 #include <functional>
 #include <mutex>
 #include <queue>
+#include <stdexcept>
 #include <vector>
 
 #include "replacer/lru.hpp"
@@ -110,12 +112,36 @@ namespace alaya {
 struct BufferPoolStats {
   std::atomic<uint64_t> hits_{0};
   std::atomic<uint64_t> misses_{0};
+  std::atomic<uint64_t> reuse_hits_{0};
+  std::atomic<uint64_t> reuse_misses_{0};
   std::atomic<uint64_t> evictions_{0};
   std::atomic<uint64_t> pins_{0};
+
+  [[nodiscard]] auto hit_rate() const -> double {
+    auto hits = hits_.load(std::memory_order_relaxed);
+    auto misses = misses_.load(std::memory_order_relaxed);
+    auto total = hits + misses;
+    if (total == 0) {
+      return 0.0;
+    }
+    return static_cast<double>(hits) / static_cast<double>(total);
+  }
+
+  [[nodiscard]] auto reuse_hit_rate() const -> double {
+    auto hits = reuse_hits_.load(std::memory_order_relaxed);
+    auto misses = reuse_misses_.load(std::memory_order_relaxed);
+    auto total = hits + misses;
+    if (total == 0) {
+      return 0.0;
+    }
+    return static_cast<double>(hits) / static_cast<double>(total);
+  }
 
   void reset() {
     hits_ = 0;
     misses_ = 0;
+    reuse_hits_ = 0;
+    reuse_misses_ = 0;
     evictions_ = 0;
     pins_ = 0;
   }
@@ -204,29 +230,24 @@ class BufferPool {
         frame_size_(frame_size),
         num_shards_(num_shards),
         flush_callback_(std::move(flush_cb)) {
-    if (num_shards_ == 0) {
-      num_shards_ = 1;
-    }
     if (total_capacity_ == 0) {
-      return;
+      throw std::invalid_argument("BufferPool capacity must be greater than 0");
     }
+    num_shards_ = std::max(size_t{1}, std::min(num_shards_, total_capacity_));
 
     // 1. Allocate a large contiguous memory block (Huge Page Friendly)
     size_t total_bytes = total_capacity_ * frame_size_;
     memory_blob_.resize(total_bytes);
 
     // 2. Initialize shards
-    size_t cap_per_shard = (total_capacity_ + num_shards_ - 1) / num_shards_;
     shards_.reserve(num_shards_);
 
     for (size_t i = 0; i < num_shards_; ++i) {
-      size_t actual_cap = cap_per_shard;
-      // Adjust the size of the last shard
-      if (i == num_shards_ - 1) {
-        actual_cap = total_capacity_ - (cap_per_shard * (num_shards_ - 1));
-      }
+      size_t start = i * total_capacity_ / num_shards_;
+      size_t end = (i + 1) * total_capacity_ / num_shards_;
+      size_t actual_cap = end - start;
 
-      uint8_t *shard_base = memory_blob_.data() + (i * cap_per_shard * frame_size_);
+      uint8_t *shard_base = memory_blob_.data() + (start * frame_size_);
       shards_.emplace_back(
           std::make_unique<Shard>(i, actual_cap, frame_size_, shard_base, stats_, flush_callback_));
     }
@@ -298,6 +319,11 @@ class BufferPool {
     return shard.insert_page(node_id, temp_buffer);
   }
 
+  auto touch_if_cached(IDType node_id) -> bool {
+    auto handle = get(node_id);
+    return !handle.empty();
+  }
+
   /**
    * @brief Prefetch a page from disk into the buffer pool.
    * * This is a "fire-and-forget" operation used for batch I/O optimization.
@@ -309,21 +335,16 @@ class BufferPool {
    * 4. Immediately releases handle (pin_count -> 0).
    */
   void prefetch(IDType node_id, DirectFileIO &io, uint64_t offset) {
-    Shard &shard = get_shard(node_id);
-
-    // 1. Try to find in cache first (Touch LRU/Clock)
-    {
-      auto handle = shard.get_page(node_id);
-      if (!handle.empty()) {
-        // Page exists. get_page() pinned it and updated replacer stats.
-        // handle destructor will unpin it immediately.
-        return;
-      }
+    if (touch_if_cached(node_id)) {
+      record_reuse_hit();
+      return;
     }
 
     // 2. Cache Miss: Read from disk
+    record_reuse_miss();
+    record_miss();
     // Use thread_local buffer to avoid allocation overhead during heavy batch prefetching
-    static thread_local std::vector<uint8_t> tl_buffer;
+    static thread_local AlignedBuffer tl_buffer;
     if (tl_buffer.size() != frame_size_) {
       tl_buffer.resize(frame_size_);
     }
@@ -337,15 +358,27 @@ class BufferPool {
     // insert_page pins the page (count=1).
     // The returned handle destructor immediately unpins it (count=0).
     // The page remains in the pool as MRU (Most Recently Used).
+    Shard &shard = get_shard(node_id);
     shard.insert_page(node_id, tl_buffer.data());
   }
 
+  void record_miss() { stats_.misses_.fetch_add(1, std::memory_order_relaxed); }
+  void record_reuse_hit() { stats_.reuse_hits_.fetch_add(1, std::memory_order_relaxed); }
+  void record_reuse_miss() { stats_.reuse_misses_.fetch_add(1, std::memory_order_relaxed); }
+
   void clear() {
+    for (const auto &s : shards_) {
+      if (s->has_active_pins()) {
+        throw std::logic_error("Cannot clear BufferPool: active page handles exist");
+      }
+    }
     for (auto &s : shards_) {
       s->clear();
     }
     stats_.reset();
   }
+
+  void reset_stats() { stats_.reset(); }
 
   /**
    * @brief Set or replace the write-back callback invoked on dirty page eviction.
@@ -419,59 +452,78 @@ class BufferPool {
     }
 
     auto insert_page(IDType node_id, const uint8_t *source_data) -> PageHandle {
-      std::lock_guard<SpinLock> guard(lock_);
+      // Variables for deferred flush (performed outside the lock).
+      IDType flush_node_id{};
+      uint8_t *flush_data_ptr{nullptr};
+      bool need_flush{false};
 
-      // check again if another thread inserted it during IO
-      if (auto it = page_table_.find(node_id); it != page_table_.end()) {
-        size_t idx = it->second;
-        Frame &frame = frames_[idx];
+      size_t frame_idx{0};
 
-        if (frame.pin_count_ == 0) {
-          replacer_.pin(idx);
-        }
-        frame.pin_count_++;
+      {
+        std::lock_guard<SpinLock> guard(lock_);
 
-        // Optional: overwrite data? Usually not needed, assuming disk data is immutable or version
-        // control is handled by upper layers
-        return PageHandle(this, idx, frame.data_, frame_size_);
-      }
+        // check again if another thread inserted it during IO
+        if (auto it = page_table_.find(node_id); it != page_table_.end()) {
+          size_t idx = it->second;
+          Frame &frame = frames_[idx];
 
-      // mallocate new frame or evict existing one
-      size_t frame_idx;
-      if (!free_list_.empty()) {
-        frame_idx = free_list_.front();
-        free_list_.pop();
-      } else {
-        auto victim = replacer_.evict();
-        if (!victim) {
-          // Cache is full and all pages are pinned! This is an edge case of system overload.
-          return {};
-        }
-        frame_idx = *victim;
-
-        // Clean up victim
-        Frame &vic_frame = frames_[frame_idx];
-        if (vic_frame.is_valid_) {
-          if (vic_frame.is_dirty_) {
-            if (flush_callback_) {
-              flush_callback_(vic_frame.node_id_, vic_frame.data_);
-            }
+          if (frame.pin_count_ == 0) {
+            replacer_.pin(idx);
           }
-          page_table_.erase(vic_frame.node_id_);
-          stats_ref_.evictions_.fetch_add(1, std::memory_order_relaxed);
+          frame.pin_count_++;
+
+          // Optional: overwrite data? Usually not needed, assuming disk data is immutable or
+          // version control is handled by upper layers
+          return PageHandle(this, idx, frame.data_, frame_size_);
         }
+
+        // Allocate a new frame or evict an existing one.
+        if (!free_list_.empty()) {
+          frame_idx = free_list_.front();
+          free_list_.pop();
+        } else {
+          auto victim = replacer_.evict();
+          if (!victim) {
+            // Cache is full and all pages are pinned — system overload edge case.
+            return {};
+          }
+          frame_idx = *victim;
+
+          // Collect dirty-page info to flush after releasing the lock.
+          Frame &vic_frame = frames_[frame_idx];
+          if (vic_frame.is_valid_) {
+            if (vic_frame.is_dirty_ && flush_callback_) {
+              flush_node_id = vic_frame.node_id_;
+              flush_data_ptr = vic_frame.data_;
+              need_flush = true;
+            }
+            page_table_.erase(vic_frame.node_id_);
+            stats_ref_.evictions_.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+
+        // Mark the frame as pinned/in-use before we release the lock so no
+        // other thread can evict it while we are copying data into it.
+        Frame &frame = frames_[frame_idx];
+        frame.node_id_ = node_id;
+        frame.is_valid_ = true;
+        frame.is_dirty_ = false;
+        frame.pin_count_ = 1;
+        page_table_[node_id] = frame_idx;
+        replacer_.pin(frame_idx);
+        // Note: we intentionally do NOT memcpy here yet; we do it after the
+        // lock is released so the copy does not hold the lock.
       }
 
-      // 3. fill frame
-      Frame &frame = frames_[frame_idx];
-      frame.node_id_ = node_id;
-      frame.is_valid_ = true;
-      frame.is_dirty_ = false;
-      frame.pin_count_ = 1;
-      std::memcpy(frame.data_, source_data, frame_size_);
+      // Perform the potentially slow disk write outside the lock.
+      if (need_flush) {
+        flush_callback_(flush_node_id, flush_data_ptr);
+      }
 
-      page_table_[node_id] = frame_idx;
-      replacer_.pin(frame_idx);
+      // Fill the frame with the new data (lock not held — safe because
+      // pin_count == 1 prevents eviction).
+      Frame &frame = frames_[frame_idx];
+      std::memcpy(frame.data_, source_data, frame_size_);
 
       return PageHandle(this, frame_idx, frame.data_, frame_size_);
     }
@@ -508,6 +560,13 @@ class BufferPool {
       }
     }
 
+    [[nodiscard]] auto has_active_pins() const -> bool {
+      std::lock_guard<SpinLock> guard(lock_);
+      return std::any_of(frames_.begin(), frames_.end(), [](const Frame &frame) {
+        return frame.pin_count_ > 0;
+      });
+    }
+
     void clear() {
       std::lock_guard<SpinLock> guard(lock_);
       page_table_.clear();
@@ -534,7 +593,7 @@ class BufferPool {
     const size_t frame_size_;  // NOLINT
 
     // aliasing to avoid False Sharing
-    alignas(64) SpinLock lock_;
+    alignas(64) mutable SpinLock lock_;
 
     std::vector<Frame> frames_;
     fast::map<IDType, size_t> page_table_;

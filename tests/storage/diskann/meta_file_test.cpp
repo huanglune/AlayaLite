@@ -558,8 +558,11 @@ TEST_F(MetaFileTest, MoveConstruct) {
   EXPECT_EQ(moved.num_active_points(), 2U);
   EXPECT_EQ(moved.capacity(), 256U);
 
-  // NOLINTNEXTLINE(bugprone-use-after-move)
-  EXPECT_FALSE(meta.is_open());
+  moved.close();
+  MetaFile reopened;
+  reopened.open(path);
+  EXPECT_TRUE(reopened.is_open());
+  reopened.close();
 }
 
 TEST_F(MetaFileTest, MoveAssign) {
@@ -578,8 +581,11 @@ TEST_F(MetaFileTest, MoveAssign) {
   EXPECT_EQ(meta2.capacity(), 128U);
   EXPECT_EQ(meta2.num_active_points(), 1U);
 
-  // NOLINTNEXTLINE(bugprone-use-after-move)
-  EXPECT_FALSE(meta1.is_open());
+  meta2.close();
+  MetaFile reopened;
+  reopened.open(path1);
+  EXPECT_TRUE(reopened.is_open());
+  reopened.close();
 }
 
 // -------------------------------------------------------------------------
@@ -610,6 +616,29 @@ TEST_F(MetaFileTest, DirtyTracking) {
   // close() auto-saves if dirty
   meta.close();
   EXPECT_FALSE(meta.is_dirty());
+}
+
+TEST_F(MetaFileTest, CloseWithoutSaveDiscardsDirtyChanges) {
+  auto path = make_path("close_without_save");
+  {
+    MetaFile meta;
+    meta.create(path, 256, 16, 32);
+    meta.set_entry_point(7);
+    meta.save();
+
+    meta.set_entry_point(42);
+    EXPECT_EQ(meta.allocate_slot(), 0);
+    EXPECT_TRUE(meta.is_dirty());
+
+    meta.close_without_save();
+    EXPECT_FALSE(meta.is_open());
+  }
+
+  MetaFile reopened;
+  reopened.open(path);
+  EXPECT_EQ(reopened.entry_point(), 7U);
+  EXPECT_EQ(reopened.num_active_points(), 0U);
+  EXPECT_FALSE(reopened.is_dirty());
 }
 
 // -------------------------------------------------------------------------

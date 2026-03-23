@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cstdint>
+#include <exception>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <span>
 #include <stdexcept>
@@ -74,7 +75,12 @@ class DiskANNStorage {
       throw std::invalid_argument("DiskANNStorage requires a valid BufferPool");
     }
   }
-  ~DiskANNStorage() { close(); }
+  ~DiskANNStorage() noexcept {
+    try {
+      close();
+    } catch (...) {
+    }
+  }
 
   // -------------------------------------------------------------------------
   // Path generation helpers
@@ -117,23 +123,30 @@ class DiskANNStorage {
     }
 
     base_path_ = std::string(base_path);
+    try {
+      // Create metadata file (may round up capacity for bitmap alignment)
+      meta_.create(meta_path(base_path), capacity, dim, max_degree, metric_type, data_type);
 
-    // Create metadata file (may round up capacity for bitmap alignment)
-    meta_.create(meta_path(base_path), capacity, dim, max_degree, metric_type, data_type);
+      // Use MetaFile's actual capacity (rounded up) for data/PQ files
+      uint32_t actual_capacity = meta_.capacity();
 
-    // Use MetaFile's actual capacity (rounded up) for data/PQ files
-    uint32_t actual_capacity = meta_.capacity();
+      // Create PQ file if enabled
+      if (num_pq_subspaces > 0) {
+        pq_.create(pq_path(base_path), dim, num_pq_subspaces, actual_capacity);
+        pq_enabled_ = true;
+      }
 
-    // Create PQ file if enabled
-    if (num_pq_subspaces > 0) {
-      pq_.create(pq_path(base_path), dim, num_pq_subspaces, actual_capacity);
-      pq_enabled_ = true;
+      // Create data file
+      data_.create(data_path(base_path), actual_capacity, dim, max_degree);
+
+      is_open_ = true;
+    } catch (...) {
+      cleanup_failed_create();
+      base_path_.clear();
+      pq_enabled_ = false;
+      is_open_ = false;
+      throw;
     }
-
-    // Create data file
-    data_.create(data_path(base_path), actual_capacity, dim, max_degree);
-
-    is_open_ = true;
   }
 
   /**
@@ -148,25 +161,33 @@ class DiskANNStorage {
     }
 
     base_path_ = std::string(base_path);
+    try {
+      // Open metadata file
+      meta_.open(meta_path(base_path));
 
-    // Open metadata file
-    meta_.open(meta_path(base_path));
+      // Open PQ file if exists
+      std::string pq_file_path = pq_path(base_path);
+      if (std::filesystem::exists(pq_file_path)) {
+        pq_.open(pq_file_path, writable);
+        pq_enabled_ = true;
+      }
 
-    // Open PQ file if exists
-    std::string pq_file_path = pq_path(base_path);
-    if (std::filesystem::exists(pq_file_path)) {
-      pq_.open(pq_file_path, writable);
-      pq_enabled_ = true;
+      // Open data file
+      data_.open(data_path(base_path),
+                 meta_.capacity(),
+                 meta_.dimension(),
+                 meta_.max_degree(),
+                 writable);
+
+      is_open_ = true;
+    } catch (...) {
+      pq_.close();
+      data_.close();
+      meta_.close();
+      base_path_.clear();
+      pq_enabled_ = false;
+      throw;
     }
-
-    // Open data file
-    data_.open(data_path(base_path),
-               meta_.capacity(),
-               meta_.dimension(),
-               meta_.max_degree(),
-               writable);
-
-    is_open_ = true;
   }
 
   /**
@@ -177,15 +198,38 @@ class DiskANNStorage {
       return;
     }
 
-    meta_.close();
+    std::exception_ptr close_error;
     if (pq_enabled_) {
-      pq_.close();
+      try {
+        pq_.close();
+      } catch (...) {
+        if (close_error == nullptr) {
+          close_error = std::current_exception();
+        }
+      }
     }
-    data_.close();
+    try {
+      data_.close();
+    } catch (...) {
+      if (close_error == nullptr) {
+        close_error = std::current_exception();
+      }
+    }
+    try {
+      meta_.close();
+    } catch (...) {
+      if (close_error == nullptr) {
+        close_error = std::current_exception();
+      }
+    }
 
     base_path_.clear();
     pq_enabled_ = false;
     is_open_ = false;
+
+    if (close_error != nullptr) {
+      std::rethrow_exception(close_error);
+    }
   }
 
   /**
@@ -291,7 +335,12 @@ class DiskANNStorage {
    *
    * @return Internal slot ID, or -1 if full
    */
-  [[nodiscard]] auto allocate_node_id() -> int32_t { return meta_.allocate_slot(); }
+  [[nodiscard]] auto allocate_node_id() -> int32_t {
+    if (meta_.is_full()) {
+      data_.grow(meta_.next_growth_capacity());
+    }
+    return meta_.allocate_slot();
+  }
 
   // -------------------------------------------------------------------------
   // PQ operations
@@ -326,6 +375,18 @@ class DiskANNStorage {
 
   bool pq_enabled_{false};
   bool is_open_{false};
+
+  void cleanup_failed_create() {
+    pq_.close();
+    data_.close();
+    meta_.close_without_save();
+
+    std::error_code ec;
+    std::filesystem::remove(meta_path(base_path_), ec);
+    std::filesystem::remove(meta_path(base_path_) + ".tmp", ec);
+    std::filesystem::remove(pq_path(base_path_), ec);
+    std::filesystem::remove(data_path(base_path_), ec);
+  }
 
   void require_pq() const {
     if (!pq_enabled_) {

@@ -54,6 +54,7 @@ wheel.packages = ["python/src/alayalite"]
 
 [tool.scikit-build.cmake.define]
 BUILD_TESTING="OFF"
+BUILD_PYTHON="ON"
 
 [tool.cibuildwheel]
 build = "cp3{8,9,10,11,12,13}-*"

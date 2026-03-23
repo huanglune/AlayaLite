@@ -106,7 +106,7 @@ struct DiskANNBuildParams {
 struct DiskANNSearchParams {
   uint32_t ef_search_{64};         ///< Search list size (L)
   uint32_t num_threads_{1};        ///< Number of threads for batch search
-  bool use_pq_rerank_{true};       ///< Use PQ for navigation, then rerank with exact distances
+  bool use_pq_rerank_{false};      ///< Use PQ for navigation, then rerank with exact distances
   uint32_t pq_rerank_factor_{4};   ///< Rerank top pq_rerank_factor_ * k candidates
   uint32_t cache_capacity_{4096};  ///< Buffer pool capacity (number of 4KB pages)
   uint32_t beam_width_{4};         ///< Beam width for batched candidate expansion
