@@ -31,6 +31,8 @@ Checks          :
 - -readability-qualified-auto,
 - -readability-redundant-access-specifiers,
 - -bugprone-exception-escape,
+- -bugprone-branch-clone,
+- -bugprone-macro-parentheses,
 - -readability-math-missing-parentheses,
 
 CheckOptions    :

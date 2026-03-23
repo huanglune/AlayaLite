@@ -21,10 +21,10 @@
 namespace alaya {
 class Timer {
   using clock_ = std::chrono::high_resolution_clock;
-  std::chrono::time_point<clock_> m_beg_;
+  std::chrono::time_point<clock_> m_beg_{clock_::now()};
 
  public:
-  Timer() : m_beg_(clock_::now()) {}
+  Timer() = default;
 
   void reset() { m_beg_ = clock_::now(); }
 

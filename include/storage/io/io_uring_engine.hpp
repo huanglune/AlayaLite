@@ -156,29 +156,29 @@ class IOUringEngine final : public IOEngine {
  private:
   /// Per-thread io_uring ring with RAII cleanup on thread exit
   struct ThreadRing {
-    struct io_uring ring;
-    bool initialized{false};
+    struct io_uring ring_;
+    bool initialized_{false};
 
-    ThreadRing() { std::memset(&ring, 0, sizeof(ring)); }
+    ThreadRing() { std::memset(&ring_, 0, sizeof(ring_)); }
     ~ThreadRing() {
-      if (initialized) {
-        io_uring_queue_exit(&ring);
-        initialized = false;
+      if (initialized_) {
+        io_uring_queue_exit(&ring_);
+        initialized_ = false;
       }
     }
 
     ALAYA_NON_COPYABLE_NON_MOVABLE(ThreadRing);
 
     void init(size_t queue_depth) {
-      if (initialized) {
+      if (initialized_) {
         return;
       }
-      int ret = io_uring_queue_init(static_cast<unsigned>(queue_depth), &ring, 0);
+      int ret = io_uring_queue_init(static_cast<unsigned>(queue_depth), &ring_, 0);
       if (ret < 0) {
         LOG_ERROR("Thread-local io_uring init failed: {}", strerror(-ret));
         return;
       }
-      initialized = true;
+      initialized_ = true;
     }
   };
 
@@ -188,7 +188,7 @@ class IOUringEngine final : public IOEngine {
 
   auto get_ring() -> struct io_uring * {
     tl_ring_.init(queue_depth_);
-    return tl_ring_.initialized ? &tl_ring_.ring : nullptr;
+    return tl_ring_.initialized_ ? &tl_ring_.ring_ : nullptr;
   }
 
   auto submit_batch(int fd, std::span<IORequest> requests, bool is_write) -> size_t {

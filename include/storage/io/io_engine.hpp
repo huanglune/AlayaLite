@@ -117,7 +117,7 @@ class IOEngine {
    * @param timeout_ms Timeout in milliseconds (-1 for infinite)
    * @return Number of completed requests
    */
-  virtual auto wait(size_t min_complete, int timeout_ms = -1) -> size_t = 0;
+  virtual auto wait(size_t min_complete, int timeout_ms) -> size_t = 0;
 
   /**
    * @brief Check if engine supports true async I/O.

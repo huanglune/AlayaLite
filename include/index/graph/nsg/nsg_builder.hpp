@@ -625,6 +625,7 @@ struct NSGBuilder {
    * @param nn The node to insert.
    * @return int The position of the inserted node in the pool.
    */
+  // NOLINTNEXTLINE(readability-non-const-parameter)
   auto insert_into_pool(Neighbor<IDType> *pool, int pool_size, const Neighbor<IDType> &nn) const
       -> int {
     for (int i = 0; i < pool_size; i++) {

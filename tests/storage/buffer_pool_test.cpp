@@ -97,21 +97,18 @@ TEST_F(LRUReplacerTest, EvictReturnsLRU) {
   // First evict should return 0 (least recently used)
   auto victim = replacer.evict();
   ASSERT_TRUE(victim.has_value());
-  size_t victim_id = *victim;
-  EXPECT_EQ(victim_id, 0U);
+  EXPECT_EQ(*victim, 0U);  // NOLINT(bugprone-unchecked-optional-access)
   EXPECT_EQ(replacer.size(), 2U);
 
   // Second evict should return 1
   victim = replacer.evict();
   ASSERT_TRUE(victim.has_value());
-  victim_id = *victim;
-  EXPECT_EQ(victim_id, 1U);
+  EXPECT_EQ(*victim, 1U);  // NOLINT(bugprone-unchecked-optional-access)
 
   // Third evict should return 2
   victim = replacer.evict();
   ASSERT_TRUE(victim.has_value());
-  victim_id = *victim;
-  EXPECT_EQ(victim_id, 2U);
+  EXPECT_EQ(*victim, 2U);  // NOLINT(bugprone-unchecked-optional-access)
 
   // Fourth evict should return nullopt
   victim = replacer.evict();
@@ -132,15 +129,15 @@ TEST_F(LRUReplacerTest, UnpinUpdatesLRUOrder) {
   // Evict order should now be: 1, 2, 0
   auto victim = replacer.evict();
   ASSERT_TRUE(victim.has_value());
-  EXPECT_EQ(*victim, 1U);
+  EXPECT_EQ(*victim, 1U);  // NOLINT(bugprone-unchecked-optional-access)
 
   victim = replacer.evict();
   ASSERT_TRUE(victim.has_value());
-  EXPECT_EQ(*victim, 2U);
+  EXPECT_EQ(*victim, 2U);  // NOLINT(bugprone-unchecked-optional-access)
 
   victim = replacer.evict();
   ASSERT_TRUE(victim.has_value());
-  EXPECT_EQ(*victim, 0U);
+  EXPECT_EQ(*victim, 0U);  // NOLINT(bugprone-unchecked-optional-access)
 }
 
 TEST_F(LRUReplacerTest, Remove) {
@@ -161,11 +158,11 @@ TEST_F(LRUReplacerTest, Remove) {
   // Evict should skip removed frame
   auto victim = replacer.evict();
   ASSERT_TRUE(victim.has_value());
-  EXPECT_EQ(*victim, 0U);
+  EXPECT_EQ(*victim, 0U);  // NOLINT(bugprone-unchecked-optional-access)
 
   victim = replacer.evict();
   ASSERT_TRUE(victim.has_value());
-  EXPECT_EQ(*victim, 2U);
+  EXPECT_EQ(*victim, 2U);  // NOLINT(bugprone-unchecked-optional-access)
 }
 
 TEST_F(LRUReplacerTest, Reset) {
@@ -206,7 +203,7 @@ TEST_F(LRUReplacerTest, MoveConstruction) {
 
   auto victim = replacer2.evict();
   ASSERT_TRUE(victim.has_value());
-  EXPECT_EQ(*victim, 0U);
+  EXPECT_EQ(*victim, 0U);  // NOLINT(bugprone-unchecked-optional-access)
 }
 
 TEST_F(LRUReplacerTest, MoveAssignment) {
@@ -314,10 +311,10 @@ TEST_F(ClockReplacerTest, UnpinSetsRefBit) {
   // Evict once to clear ref bits via second chance
   auto victim = replacer.evict();
   ASSERT_TRUE(victim.has_value());
-  const size_t victim_id = *victim;
+  size_t vid = *victim;  // NOLINT(bugprone-unchecked-optional-access)
 
   // Access remaining frame - sets ref bit again
-  size_t remaining = (victim_id == 0) ? 1 : 0;
+  size_t remaining = (vid == 0) ? 1 : 0;
   replacer.unpin(remaining);
 
   // Should still be evictable (but with ref bit set)
@@ -438,7 +435,7 @@ TEST_F(ClockProReplacerTest, SingleEntryPinUnpinCycleRemainsValid) {
   replacer.unpin(0);
   auto victim = replacer.evict();
   ASSERT_TRUE(victim.has_value());
-  EXPECT_EQ(*victim, 0U);
+  EXPECT_EQ(*victim, 0U);  // NOLINT(bugprone-unchecked-optional-access)
   EXPECT_EQ(replacer.size(), 0U);
 }
 
@@ -471,7 +468,7 @@ TEST_F(ClockProReplacerTest, TestSetPromotion) {
   replacer.unpin(0);
   auto victim = replacer.evict();
   ASSERT_TRUE(victim.has_value());
-  const size_t evicted_id = *victim;
+  size_t evicted_id = *victim;  // NOLINT(bugprone-unchecked-optional-access)
 
   // The evicted page is now in test set
   EXPECT_EQ(replacer.test_size(), 1U);

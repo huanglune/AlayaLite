@@ -234,7 +234,7 @@ class DataFile {
   ~DataFile() noexcept {
     try {
       close();
-    } catch (...) {
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
     }
   }
 

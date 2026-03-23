@@ -128,7 +128,7 @@ class HNSWImpl {
         free(link_lists_[i]);
       }
     }
-    free(link_lists_);
+    free(reinterpret_cast<void *>(link_lists_));
   }
 
   /**
@@ -248,7 +248,7 @@ class HNSWImpl {
    * @param internal_id The internal id of required node in hnsw graph.
    * @return char* The raw vector data.
    */
-  inline auto get_data_by_internal_id(InternalID internal_id) const -> const char * {
+  auto get_data_by_internal_id(InternalID internal_id) const -> const char * {
     return reinterpret_cast<const char *>(space_->get_data_by_id(get_external_label(internal_id)));
   }
   /**
@@ -305,13 +305,13 @@ class HNSWImpl {
 
     // Transfer all top candidates to the queue_closest, negating the distances for max-heap
     // behavior.
-    while (top_candidates.size() > 0) {
+    while (!top_candidates.empty()) {
       queue_closest.emplace(-top_candidates.top().first, top_candidates.top().second);
       top_candidates.pop();
     }
 
     // Iterate through the closest candidates to filter and select the best ones.
-    while (queue_closest.size()) {
+    while (!queue_closest.empty()) {
       // If we have already selected m neighbors, exit the loop.
       if (return_list.size() >= m) {
         break;
@@ -525,7 +525,7 @@ class HNSWImpl {
     std::vector<InternalID> selected_neighbors;
     selected_neighbors.reserve(max_edge_num_);  // Reserve space for efficiency.
     // Extract neighbors from the priority queue into the selected_neighbors vector.
-    while (top_candidates.size() > 0) {
+    while (!top_candidates.empty()) {
       // LOG_INFO("mutually first : u {} , v {} , dist {}", get_external_label(cur_c),
       //  top_candidates.top().second, top_candidates.top().first);
       selected_neighbors.push_back(top_candidates.top().second);
@@ -618,7 +618,7 @@ class HNSWImpl {
 
           // Replace the weakest connections in the neighbor's link list with the new connection.
           int index = 0;
-          while (candidates.size() > 0) {
+          while (!candidates.empty()) {
             data[index] =
                 candidates.top().second;  // Update the link list with the new connections.
             candidates.pop();
@@ -702,8 +702,7 @@ class HNSWImpl {
             data = get_linklist(curr_node, level);
             LinkListSizeType size = get_list_count(data);
 
-            auto *datal = static_cast<InternalID *>(reinterpret_cast<LinkListSizeType *>(data) +
-                                                    1);  // NOLINT
+            auto *datal = reinterpret_cast<InternalID *>(data + 1);  // NOLINT
             for (LinkListSizeType i = 0; i < size; i++) {
               InternalID cand = datal[i];
               DistanceType d = space_->get_distance(label, get_external_label(cand));

@@ -117,7 +117,7 @@ class RawSpace {
       case MetricType::COS:
         distance_calu_func_ = simd::ip_sqr<DataType, DistanceType>;
         break;
-      default:
+      case MetricType::NONE:
         break;
     }
   }

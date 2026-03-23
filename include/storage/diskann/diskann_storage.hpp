@@ -78,7 +78,7 @@ class DiskANNStorage {
   ~DiskANNStorage() noexcept {
     try {
       close();
-    } catch (...) {
+    } catch (...) {  // NOLINT(bugprone-empty-catch)
     }
   }
 
@@ -368,9 +368,9 @@ class DiskANNStorage {
   }
 
  private:
-  std::string base_path_;
-  MetaFile meta_;
   PQFile pq_;
+  MetaFile meta_;
+  std::string base_path_;
   DataFileType data_;
 
   bool pq_enabled_{false};

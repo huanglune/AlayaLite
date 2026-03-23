@@ -33,7 +33,7 @@ auto find_exact_gt(const std::vector<DataType> &queries,
                    const std::vector<DataType> &data_view,
                    uint32_t dim,
                    uint32_t topk,
-                   std::unordered_set<IDType> *deleted = nullptr,
+                   const std::unordered_set<IDType> *deleted = nullptr,
                    MetricType metric = MetricType::L2) -> std::vector<IDType> {
   if (queries.empty() || data_view.empty() || queries.size() % dim != 0 ||
       data_view.size() % dim != 0) {

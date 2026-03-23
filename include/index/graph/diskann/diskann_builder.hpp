@@ -164,7 +164,7 @@ struct DiskANNBuilder {
    */
   auto build_graph(uint32_t thread_num = 1) -> std::unique_ptr<Graph<DataType, IDType>> {
     if (thread_num == 0) {
-      thread_num = std::max(1u, std::thread::hardware_concurrency());
+      thread_num = std::max(1U, std::thread::hardware_concurrency());
     }
 
     auto vec_num = space_->get_data_num();

@@ -588,20 +588,19 @@ class BufferPool {
     }
 
    private:
-    const size_t shard_id_;    // NOLINT
-    const size_t capacity_;    // NOLINT
-    const size_t frame_size_;  // NOLINT
-
     // aliasing to avoid False Sharing
     alignas(64) mutable SpinLock lock_;
 
+    const size_t shard_id_;    // NOLINT
+    const size_t capacity_;    // NOLINT
+    const size_t frame_size_;  // NOLINT
+    BufferPoolStats &stats_ref_;
+
     std::vector<Frame> frames_;
+    std::function<void(IDType, const uint8_t *)> flush_callback_;
+    ReplacerType replacer_{capacity_};
     fast::map<IDType, size_t> page_table_;
     std::queue<size_t> free_list_;
-    ReplacerType replacer_{capacity_};
-
-    BufferPoolStats &stats_ref_;
-    std::function<void(IDType, const uint8_t *)> flush_callback_;
   };
 
   auto get_shard(IDType node_id) -> Shard & {
