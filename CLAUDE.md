@@ -1,5 +1,11 @@
 # CLAUDE.md
 
+## EXECUTION RULE
+NEVER run build/test/deploy cmds directly. MUST use: `.claude/scripts/run_and_log.sh <desc> <cmd>`
+1. <desc>: 1st arg. English ONLY, no spaces (e.g., `build_api`).
+2. <cmd>: 2nd+ args. Real cmd. NO ALIASES (use `ls -la`, NOT `ll`).
+Logs saved to `./logs/`. Script returns original exit code.
+
 ## Build & Test
 
 ```bash
@@ -31,7 +37,8 @@ Pytest: `uv run pytest python/tests/ -v -k "test_search"`
 
 ```
 include/
-├── index/graph/     # ANN indices: HNSW, NSG, DiskANN, KNNG, QG, Fusion (templated on Space)
+├── index/graph/     # In-memory ANN indices: HNSW, NSG, KNNG, QG, Fusion (templated on Space)
+├── index/diskann/   # DiskANN: out-of-core builder, searcher, partitioner, merger (async, disk-based)
 ├── space/           # Distance computation: RawSpace, PQSpace, SQ4/SQ8Space, RaBitQSpace
 ├── storage/         # BufferPool, DiskANN files (Meta/Data/PQ), DirectFileIO, io_uring
 ├── executor/        # Coroutine scheduler, workers, search/update jobs

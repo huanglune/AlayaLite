@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -42,7 +43,7 @@ class DiskANNStorageTest : public ::testing::Test {
     for (const auto &base : temp_bases_) {
       std::filesystem::remove(base + ".meta");
       std::filesystem::remove(base + ".meta.tmp");
-      std::filesystem::remove(base + ".pq");
+      std::filesystem::remove(base + ".pq");  // legacy cleanup
       std::filesystem::remove(base + ".data");
     }
   }
@@ -103,8 +104,68 @@ TEST_F(DiskANNStorageTest, CreateFailureRemovesPartialFiles) {
   EXPECT_FALSE(storage.is_open());
   EXPECT_FALSE(std::filesystem::exists(kBasePath + ".meta"));
   EXPECT_FALSE(std::filesystem::exists(kBasePath + ".meta.tmp"));
-  EXPECT_FALSE(std::filesystem::exists(kBasePath + ".pq"));
   EXPECT_FALSE(std::filesystem::exists(kBasePath + ".data"));
+}
+
+TEST_F(DiskANNStorageTest, OpenRejectsLegacyPQSidecar) {
+  const std::string kBasePath = make_base_path("legacy_pq");
+
+  // Create a valid index first
+  {
+    StorageType storage(buffer_pool_.get());
+    storage.create(kBasePath, 64, 8, 16);
+    storage.close();
+  }
+
+  // Place a fake .pq sidecar file
+  {
+    std::ofstream pq_file(kBasePath + ".pq");
+    pq_file << "fake pq data";
+  }
+
+  // Open should fail fast with a clear error
+  StorageType storage(buffer_pool_.get());
+  EXPECT_THROW(
+      {
+        try {
+          storage.open(kBasePath);
+        } catch (const std::runtime_error &e) {
+          EXPECT_NE(std::string(e.what()).find("Legacy PQ sidecar"), std::string::npos);
+          throw;
+        }
+      },
+      std::runtime_error);
+}
+
+TEST_F(DiskANNStorageTest, RebuildInPlaceCleansUpStalePQSidecar) {
+  const std::string kBasePath = make_base_path("rebuild_inplace");
+
+  // Create an index and place a fake .pq sidecar (simulating an old PQ-enabled build)
+  {
+    StorageType storage(buffer_pool_.get());
+    storage.create(kBasePath, 64, 8, 16);
+    storage.close();
+  }
+  {
+    std::ofstream pq_file(kBasePath + ".pq");
+    pq_file << "fake pq data";
+  }
+  ASSERT_TRUE(std::filesystem::exists(kBasePath + ".pq"));
+
+  // Rebuild in place — create() should remove the stale .pq
+  {
+    StorageType storage(buffer_pool_.get());
+    storage.create(kBasePath, 64, 8, 16);
+    EXPECT_FALSE(std::filesystem::exists(kBasePath + ".pq"));
+    storage.close();
+  }
+
+  // open() should succeed now (no .pq sidecar to block it)
+  {
+    StorageType storage(buffer_pool_.get());
+    EXPECT_NO_THROW(storage.open(kBasePath));
+    storage.close();
+  }
 }
 
 }  // namespace alaya

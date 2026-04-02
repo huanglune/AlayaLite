@@ -36,6 +36,15 @@
 namespace alaya {
 
 // ============================================================================
+// Async I/O callback type
+// ============================================================================
+
+/// Callback invoked when an async I/O operation completes.
+/// @param arg   User-provided context pointer (passed to submit_async_read)
+/// @param result Bytes transferred (positive) or negative errno on error
+using AsyncIOCallback = void (*)(void *arg, int32_t result);
+
+// ============================================================================
 // IORequest - Simplified I/O request structure
 // ============================================================================
 
@@ -118,6 +127,56 @@ class IOEngine {
    * @return Number of completed requests
    */
   virtual auto wait(size_t min_complete, int timeout_ms) -> size_t = 0;
+
+  // ==========================================================================
+  // Callback-based async I/O (for coroutine integration)
+  // ==========================================================================
+
+  /**
+   * @brief Submit a single async read with a completion callback.
+   *
+   * The callback is invoked when the I/O completes (via check_completion).
+   * The caller must ensure callback_arg remains valid until the callback fires.
+   *
+   * @note Must be called on the same thread that will call check_completion().
+   *       Do NOT mix with batch submit_reads/wait on the same thread.
+   *
+   * @param fd File descriptor
+   * @param buffer Destination buffer (must be aligned for Direct IO)
+   * @param size Bytes to read
+   * @param offset File offset
+   * @param callback Function to call on completion
+   * @param callback_arg Opaque context passed to callback
+   * @return true if successfully submitted
+   */
+  virtual auto submit_async_read(int fd,
+                                 void *buffer,
+                                 size_t size,
+                                 uint64_t offset,
+                                 AsyncIOCallback callback,
+                                 void *callback_arg) -> bool {
+    // Default: not supported. Subclasses override.
+    (void)fd;
+    (void)buffer;
+    (void)size;
+    (void)offset;
+    (void)callback;
+    (void)callback_arg;
+    return false;
+  }
+
+  /**
+   * @brief Non-blockingly reap all available async completions and invoke callbacks.
+   * @return Number of completions processed
+   */
+  virtual auto check_completion() -> size_t { return 0; }
+
+  /**
+   * @brief Block until all in-flight async reads complete, invoking their callbacks.
+   *
+   * Called during Worker shutdown to drain pending I/O before ring destruction.
+   */
+  virtual void drain_pending() {}
 
   /**
    * @brief Check if engine supports true async I/O.

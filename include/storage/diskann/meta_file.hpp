@@ -29,6 +29,8 @@
 #include <string_view>
 #include <vector>
 #include "utils/bitset.hpp"
+#include "utils/free_list.hpp"
+#include "utils/locks.hpp"
 #include "utils/log.hpp"
 #include "utils/macros.hpp"
 #include "utils/math.hpp"
@@ -44,48 +46,6 @@ constexpr uint32_t kMetaFileVersion = 1;                 // Current version
 constexpr size_t kMetaFileHeaderSize = 128;              // Header size in bytes
 constexpr uint64_t kGrowthChunkSize = 64 * 1024 * 1024;  // 64MB growth chunk
 constexpr uint32_t kInvalidMapping = UINT32_MAX;         // Sentinel for unmapped IDs
-
-// ============================================================================
-// FreeList - Stack-based free slot tracker for O(1) allocation/deallocation
-// ============================================================================
-
-/**
- * @brief Stack-based free slot tracker.
- *
- * Provides O(1) allocation and deallocation by maintaining a stack of free slot IDs.
- * When a slot is freed, its ID is pushed onto the stack.
- * When allocating, we pop from the stack if available.
- *
- * File format:
- * - uint32_t count: number of free slots
- * - uint32_t slots[count]: array of free slot IDs
- */
-class FreeList {
- public:
-  FreeList() = default;
-
-  void push(uint32_t slot_id) { free_slots_.push_back(slot_id); }
-  [[nodiscard]] auto pop() -> int32_t {
-    if (free_slots_.empty()) {
-      return -1;
-    }
-    auto slot = static_cast<int32_t>(free_slots_.back());
-    free_slots_.pop_back();
-    return slot;
-  }
-  [[nodiscard]] auto empty() const noexcept -> bool { return free_slots_.empty(); }
-  [[nodiscard]] auto size() const noexcept -> size_t { return free_slots_.size(); }
-  void clear() { free_slots_.clear(); }
-  [[nodiscard]] auto data() noexcept -> uint32_t * { return free_slots_.data(); }
-  [[nodiscard]] auto data() const noexcept -> const uint32_t * { return free_slots_.data(); }
-  void resize(size_t count) { free_slots_.resize(count); }
-  [[nodiscard]] auto size_in_bytes() const noexcept -> size_t {
-    return sizeof(uint32_t) + free_slots_.size() * sizeof(uint32_t);
-  }
-
- private:
-  std::vector<uint32_t> free_slots_;
-};
 
 // ============================================================================
 // MetaFileHeader - Fixed-size header for metadata file
@@ -527,6 +487,7 @@ class MetaFile {
    * @param node_id Node ID to mark as valid
    */
   void set_valid(uint32_t node_id) {
+    SpinLockGuard guard(lock_);
     if (node_id >= header_.num_capacity_) {
       throw std::out_of_range("Node ID out of range");
     }
@@ -550,6 +511,7 @@ class MetaFile {
    * @param node_id Node ID to mark as invalid
    */
   void set_invalid(uint32_t node_id) {
+    SpinLockGuard guard(lock_);
     if (node_id >= header_.num_capacity_) {
       throw std::out_of_range("Node ID out of range");
     }
@@ -578,6 +540,7 @@ class MetaFile {
    * @return Allocated node ID
    */
   [[nodiscard]] auto allocate_slot() -> int32_t {
+    SpinLockGuard guard(lock_);
     // Try freelist first (O(1) for previously freed slots)
     int32_t slot = freelist_.pop();
     if (slot >= 0) {
@@ -600,7 +563,7 @@ class MetaFile {
     uint32_t old_capacity = header_.num_capacity_;
     uint32_t new_capacity = next_growth_capacity();
     LOG_INFO("MetaFile: Auto-growing capacity from {} to {}", old_capacity, new_capacity);
-    grow(new_capacity);
+    grow_unlocked(new_capacity);
 
     validity_bitmap_.set(old_capacity);
     ++header_.num_active_points_;
@@ -661,6 +624,7 @@ class MetaFile {
    * @param internal_slot Allocated disk slot
    */
   void insert_mapping(uint32_t external_id, uint32_t internal_slot) {
+    SpinLockGuard guard(lock_);
     if (external_id >= id_map_.size()) {
       throw std::out_of_range("External ID out of range");
     }
@@ -678,6 +642,7 @@ class MetaFile {
    * @param external_id External ID to unmap
    */
   void remove_mapping(uint32_t external_id) {
+    SpinLockGuard guard(lock_);
     if (external_id >= id_map_.size()) {
       return;
     }
@@ -732,6 +697,16 @@ class MetaFile {
    * @param new_capacity The new capacity (must be > current capacity)
    */
   void grow(uint32_t new_capacity) {
+    SpinLockGuard guard(lock_);
+    grow_unlocked(new_capacity);
+  }
+
+  /// Number of free slots available for reuse.
+  [[nodiscard]] auto freelist_depth() const -> size_t { return freelist_.size(); }
+
+ private:
+  /// Internal grow without lock (called from allocate_slot which already holds the lock)
+  void grow_unlocked(uint32_t new_capacity) {
     new_capacity = math::round_up_pow2(new_capacity, 64);  // maintain 64-alignment
     if (new_capacity <= header_.num_capacity_) {
       return;
@@ -743,7 +718,6 @@ class MetaFile {
     dirty_ = true;
   }
 
- private:
   void close_impl(bool save_if_dirty) {
     if (!is_open_) {
       return;
@@ -794,6 +768,7 @@ class MetaFile {
       reverse_map_;  // reverse_map_[internal_slot] = external_id (kInvalidMapping if unmapped)
   mutable bool dirty_{false};
   bool is_open_{false};
+  mutable SpinLock lock_;  ///< Protects mutation operations for thread safety
 };
 
 }  // namespace alaya

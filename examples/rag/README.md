@@ -1,82 +1,68 @@
-# Try Your Own RAG App with AlayaLite
+# RAG Example
 
-This tutorial gives a step-by-step guidance to deploy a RAG web app uing AlayaLite.
+This example shows how to build a small document Q&A app with AlayaLite, Streamlit, and an OpenAI-compatible chat completion endpoint.
 
+## What Is Included
 
-## 0. Project Overview
+| File | Purpose |
+| --- | --- |
+| `ui.py` | Streamlit interface for upload, chat, and export |
+| `db.py` | AlayaLite-backed insert and retrieval helpers |
+| `llm.py` | Chat completion request helper |
+| `utils.py` | Text splitting and embedding helpers |
+| `test_docs.txt` | Sample input document |
 
-There are only 4 core files:
-- `ui.py`: Defines webpage frontend, using [streamlit](https://streamlit.io/);
-- `db.py`: Includes core interfaces to manage documents. It has two key APIs: `insert_text` put text into database, and `query_text` get the related documents for the query from the database;
-- `llm.py`: Creates prompt and generates response from LLM;
-- `utils.py`: Includes util functions, i.e., `splitter` and `embedder`, to process text.
+The app accepts `txt`, `md`, `pdf`, and `docx` files.
 
-The overview is shown below
+## Quick Start With Docker
 
-![Overview](https://github.com/AlayaDB-AI/AlayaLite/blob/main/examples/rag/figures/overview.png?raw=true)
-
-
-## 1. Setup Environment
-
-We prepare a docker environment for you to setup the project quickly.
-`Docker` is an open source container engine.
-It allows applications to run consistently across environments and platforms.
-
-Run the following command to build an image using the given `Dockerfile` and start a container to run it:
+From `examples/rag/`:
 
 ```bash
-# build image using Dockerfile at current directory
-# notice the "." at the end
-docker build -t try-rag-image .
+docker build -t alayalite-rag .
+docker run -it --rm -p 8501:8501 -v "$(pwd):/app" alayalite-rag /bin/bash
 ```
 
-It will take several minutes to download and install packages.
-If success, you will see `Successfully tagged try-rag-image:latest`.
-Then you can start a container to run it.
-
-```bash
-# create a container with the image and go into it
-docker run -it -v "$(pwd):/app" -p 8501:8501 --name try-rag-container try-rag-image /bin/bash
-```
-
-Now you will see your bash prompt like `/app#`, indicating that you are inside the docker container.
-
-<details>
-<summary>If you would like to know more about docker, click me!</summary>
-
-- Exit and close the container: `exit`
-- Remove a closed container: `docker rm try-rag-container`
-- Enter a running container: `docker exec -it try-rag-container /bin/bash`
-
-See also: <a href="https://docs.docker.com/reference/cli/docker/">Docker Docs</a>
-</details>
-
-
-## 2. Run Your App
-
-Run this command to launch your web application:
+Inside the container:
 
 ```bash
 streamlit run ui.py
 ```
 
-Your app will start at the port `8501`.
-You CANNOT visit the webpage by using the URL shown in the terminal, but `Github Codespaces` will forward the service to a public location.
-You can switch to the tab `PORT` to see the forwarded URL.
+Then open `http://127.0.0.1:8501`.
 
-![PORT](https://github.com/AlayaDB-AI/AlayaLite/blob/main/examples/rag/figures/port.png?raw=true)
+## Local Run
 
-Open the URL, you will see the interface.
-Input your LLM service URL and api key upload the files, then you can try to ask LLM about your files.
-We provide a test document `test_docs.txt` for you.
+If you prefer to run it without Docker, install the required Python packages first:
 
-```
-Sample question:
-What are advanced chunking techniques?
+```bash
+pip install alayalite streamlit langchain_text_splitters FlagEmbedding python-docx pypdf requests torch
+cd examples/rag
+streamlit run ui.py
 ```
 
-![Interface](https://github.com/AlayaDB-AI/AlayaLite/blob/main/examples/rag/figures/interface.png?raw=true)
+## How It Works
 
-```
-Notice: the first time after you set/change the embedding model, the system takes some time to download it.
-```
+1. Upload documents in the sidebar.
+2. The app normalizes file content and splits it into chunks.
+3. `FlagEmbedding` generates embeddings for each chunk.
+4. Chunks are inserted into an in-memory AlayaLite collection named `rag_collection`.
+5. Queries are embedded, retrieved from AlayaLite, and passed to the LLM request helper.
+
+## UI Settings
+
+The sidebar lets you configure:
+
+- `LLM Base URL`
+- `LLM API Key`
+- `LLM Model`
+- `Embedding Model`
+
+The default chat endpoint logic appends `/completions` to the base URL. For example, a base URL ending in `/v1/chat` becomes `/v1/chat/completions`.
+
+## Notes
+
+- Uploading a new batch of files resets the in-memory database before processing.
+- The first embedding request may take time because the model can be downloaded on demand.
+- The Docker image sets `HF_ENDPOINT=https://hf-mirror.com`; set or remove that environment variable based on your environment.
+- When running in Codespaces or a similar environment, forward port `8501` to access the Streamlit UI.

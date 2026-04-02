@@ -1,4 +1,5 @@
-add_executable(diskann_searcher_benchmark ${CMAKE_CURRENT_SOURCE_DIR}/diskann_searcher_benchmark.cpp)
+add_executable(diskann_update_bench ${CMAKE_CURRENT_SOURCE_DIR}/diskann_update_bench.cpp)
+target_link_libraries(diskann_update_bench PRIVATE ${THIRD_PARTY_LIBS} tomlplusplus::tomlplusplus)
 
-target_compile_definitions(diskann_searcher_benchmark PRIVATE ALAYA_PROJECT_ROOT="${CMAKE_SOURCE_DIR}")
-target_link_libraries(diskann_searcher_benchmark PRIVATE ${THIRD_PARTY_LIBS} benchmark::benchmark)
+add_executable(hnsw_bench ${CMAKE_CURRENT_SOURCE_DIR}/hnsw_bench.cpp)
+target_link_libraries(hnsw_bench PRIVATE ${THIRD_PARTY_LIBS} tomlplusplus::tomlplusplus)

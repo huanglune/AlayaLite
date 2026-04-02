@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace alaya {
@@ -24,7 +25,7 @@ namespace alaya {
  * @brief Parameters for DiskANN index construction.
  *
  * These parameters control the behavior of the Vamana graph construction
- * algorithm and optional PQ quantization.
+ * algorithm.
  *
  * Key parameters:
  * - R (max_degree_): Maximum out-degree of each node. Higher values improve
@@ -43,8 +44,9 @@ struct DiskANNBuildParams {
   uint32_t ef_construction_{128};  ///< L: Search list size during construction
   uint32_t num_threads_{0};        ///< Number of threads (0 = hardware concurrency)
   uint32_t num_iterations_{2};     ///< Number of Vamana iterations (typically 2)
-  uint32_t num_pq_chunks_{0};      ///< Number of PQ chunks (0 = disable PQ)
-  uint32_t pq_sample_rate_{100};   ///< Sampling rate for PQ training (percentage)
+  size_t max_memory_mb_{4096};     ///< Memory budget for out-of-core partitioned build
+  float sample_rate_{0.02F};       ///< KMeans sample rate for partitioning (fraction in (0,1])
+  uint32_t overlap_factor_{2};     ///< Number of shard assignments per vector during partitioning
 
   DiskANNBuildParams() = default;
 
@@ -91,13 +93,20 @@ struct DiskANNBuildParams {
     return *this;
   }
 
-  auto set_pq_params(uint32_t num_chunks, uint32_t sample_rate = 100) -> DiskANNBuildParams & {
-    num_pq_chunks_ = num_chunks;
-    pq_sample_rate_ = sample_rate;
+  auto set_max_memory_mb(size_t memory_mb) -> DiskANNBuildParams & {
+    max_memory_mb_ = memory_mb;
     return *this;
   }
 
-  [[nodiscard]] auto is_pq_enabled() const -> bool { return num_pq_chunks_ > 0; }
+  auto set_sample_rate(float rate) -> DiskANNBuildParams & {
+    sample_rate_ = rate;
+    return *this;
+  }
+
+  auto set_overlap_factor(uint32_t factor) -> DiskANNBuildParams & {
+    overlap_factor_ = factor;
+    return *this;
+  }
 };
 
 /**
@@ -106,8 +115,6 @@ struct DiskANNBuildParams {
 struct DiskANNSearchParams {
   uint32_t ef_search_{64};         ///< Search list size (L)
   uint32_t num_threads_{1};        ///< Number of threads for batch search
-  bool use_pq_rerank_{false};      ///< Use PQ for navigation, then rerank with exact distances
-  uint32_t pq_rerank_factor_{4};   ///< Rerank top pq_rerank_factor_ * k candidates
   uint32_t cache_capacity_{4096};  ///< Buffer pool capacity (number of 4KB pages)
   uint32_t beam_width_{4};         ///< Beam width for batched candidate expansion
   uint32_t pipeline_width_{
@@ -124,12 +131,6 @@ struct DiskANNSearchParams {
 
   auto set_num_threads(uint32_t n) -> DiskANNSearchParams & {
     num_threads_ = n;
-    return *this;
-  }
-
-  auto set_pq_rerank(bool enable, uint32_t factor = 4) -> DiskANNSearchParams & {
-    use_pq_rerank_ = enable;
-    pq_rerank_factor_ = factor;
     return *this;
   }
 

@@ -315,6 +315,37 @@ class DirectFileIO {
   }
 
   // ==========================================================================
+  // Callback-based Async I/O (for coroutine integration)
+  // ==========================================================================
+
+  /**
+   * @brief Submit a single async read with completion callback.
+   * @see IOEngine::submit_async_read
+   */
+  auto submit_async_read(void *buffer,
+                         size_t size,
+                         uint64_t offset,
+                         AsyncIOCallback callback,
+                         void *callback_arg) -> bool {
+    if (!is_open()) {
+      return false;
+    }
+    return engine_->submit_async_read(fd_, buffer, size, offset, callback, callback_arg);
+  }
+
+  /**
+   * @brief Non-blockingly reap async completions on the current thread.
+   * @see IOEngine::check_completion
+   */
+  auto check_completion() -> size_t { return engine_->check_completion(); }
+
+  /**
+   * @brief Drain all in-flight async reads on the current thread.
+   * @see IOEngine::drain_pending
+   */
+  void drain_pending() { engine_->drain_pending(); }
+
+  // ==========================================================================
   // Alignment Helpers
   // ==========================================================================
 

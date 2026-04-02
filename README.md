@@ -1,96 +1,137 @@
 <p align="center">
-  <a href="https://github.com/AlayaDB-AI"><img src="https://github.com/AlayaDB-AI/AlayaLite/blob/main/.assets/banner.jpg?raw=true" width=300 alt="AlayaDB Log"></a>
+  <a href="https://github.com/AlayaDB-AI"><img src="https://github.com/AlayaDB-AI/AlayaLite/blob/main/.assets/banner.jpg?raw=true" width="300" alt="AlayaLite banner"></a>
 </p>
 
-
 <p align="center">
-    <b>AlayaLite – A Fast, Flexible Vector Database for Everyone</b>. <br />
-    Seamless Knowledge, Smarter Outcomes.
+  <b>AlayaLite</b> is a lightweight vector database toolkit with a header-only C++20 core,
+  Python bindings, an optional FastAPI service, and example RAG applications.
 </p>
 
 <div class="column" align="middle">
   <a href="https://github.com/AlayaDB-AI/AlayaLite/releases"><img height="20" src="https://img.shields.io/badge/alayalite-blue" alt="release"></a>
-  <a href="https://pypi.org/project/alayalite/"><img src="https://img.shields.io/pypi/v/alayalite" alt="PyPi"></a>
+  <a href="https://pypi.org/project/alayalite/"><img src="https://img.shields.io/pypi/v/alayalite" alt="PyPI"></a>
   <a href="https://github.com/AlayaDB-AI/AlayaLite/blob/main/LICENSE"><img height="20" src="https://img.shields.io/badge/license-Apache--2.0-green.svg" alt="LICENSE"></a>
   <a href="https://codecov.io/github/AlayaDB-AI/AlayaLite"><img height="20" src="https://codecov.io/github/AlayaDB-AI/AlayaLite/graph/badge.svg?token=KA6V0DHHUU" alt="codecov"></a>
   <a href="https://github.com/AlayaDB-AI/AlayaLite/actions/workflows/code-checker.yaml"><img height="20" src="https://github.com/AlayaDB-AI/AlayaLite/actions/workflows/code-checker.yaml/badge.svg?branch=main" alt="CI"></a>
 </div>
 
+## Highlights
 
-## Features
+- Header-only C++20 vector indexing components under `include/`.
+- Python SDK with `Client`, `Collection`, and `Index` abstractions.
+- Multiple index and quantization options, including `hnsw`, `nsg`, `fusion`, `sq8`, `sq4`, and `rabitq`.
+- Optional standalone FastAPI service in `app/`.
+- Example Streamlit RAG app in `examples/rag/`.
 
-- **High Performance**: Modern vector techniques integrated into a well-designed architecture.
-- **Elastic Scalability**: Seamlessly scale across multiple threads, which is optimized by C++20 coroutines.
-- **Adaptive Flexibility**: Easy customization for quantization methods, metrics, and data types.
-- **Ease of Use**: [Intuitive APIs](https://github.com/AlayaDB-AI/AlayaLite/blob/main/python/README.md) in Python.
+## Repository Guide
 
+| Path | What it contains |
+| --- | --- |
+| [`python/README.md`](python/README.md) | Python SDK usage and API reference |
+| [`app/README.md`](app/README.md) | FastAPI standalone service |
+| [`examples/rag/README.md`](examples/rag/README.md) | End-to-end RAG demo |
+| [`include/simd/README.md`](include/simd/README.md) | SIMD kernels and dispatch overview |
+| [`scripts/README.md`](scripts/README.md) | Helper scripts for builds, data prep, and benchmarks |
 
-## Getting Started!
+## Install
 
-Get started with just one command!
+### Python package
+
 ```bash
-pip install alayalite # install the python package.
+pip install alayalite
 ```
 
+### Local development
 
+```bash
+uv sync
+make build
+```
 
-Access your vectors using simple APIs.
+`make dev-install` is also available if you want the standard development setup in one step.
+
+## Quick Start
+
+### Collection workflow
+
 ```python
-from alayalite import Client, Index
-from alayalite.utils import calc_recall, calc_gt
+from alayalite import Client
 import numpy as np
 
-# Initialize the client and create an index. The client can manage multiple indices with distinct names.
-client = Client()
-index = client.create_index("default")
+client = Client(url="./data")
+collection = client.create_collection("docs", metric="cosine")
 
-# Generate random vectors and queries, then calculate the ground truth top-10 nearest neighbors for each query.
-vectors = np.random.rand(1000, 128).astype(np.float32)
-queries = np.random.rand(10, 128).astype(np.float32)
-gt = calc_gt(vectors, queries, 10)
+items = [
+    (1, "first document", np.array([0.1, 0.2, 0.3], dtype=np.float32), {"source": "guide"}),
+    (2, "second document", np.array([0.2, 0.1, 0.4], dtype=np.float32), {"source": "faq"}),
+]
 
-# Insert vectors to the index
-index.fit(vectors)
+collection.insert(items)
 
-# Perform batch search for the queries and retrieve top-10 results
-result = index.batch_search(queries, 10)
+results = collection.batch_query(
+    [[0.1, 0.2, 0.3]],
+    limit=2,
+    ef_search=10,
+)
 
-# Compute the recall based on the search results and ground truth
-recall = calc_recall(result, gt)
-print(recall)
+print(results["document"][0])
+client.save_collection("docs")
 ```
 
-## Benchmark
+### Lower-level index workflow
 
-We evaluate the performance of AlayaLite against other vector database systems using [ANN-Benchmark](https://github.com/erikbern/ann-benchmarks) (compile locally and open `-march=native` in your `CMakeLists.txt` to reproduce the results). Several experimental results are presented below.
+```python
+from alayalite import Client
+import numpy as np
 
-|     ![Fashion-MNIST	784 Euclidean](./.assets/fashion-mnist-784-euclidean.png)     |    ![Gist 960 Euclidean](./.assets/gist-960-euclidean.png)    |
-| :---------------------------------------------------------: | :-----------------------------------------------------------: |
-| <div style="text-align: center;">**Fashion-MNIST	784 Euclidean**</div> | <div style="text-align: center;">**Gist 960 Euclidean**</div> |
+vectors = np.random.rand(1000, 128).astype(np.float32)
+queries = np.random.rand(10, 128).astype(np.float32)
 
+client = Client()
+index = client.create_index("default", index_type="hnsw", metric="l2")
+index.fit(vectors, ef_construction=100, num_threads=1)
 
+neighbors = index.batch_search(queries, topk=10, ef_search=100, num_threads=1)
+print(neighbors.shape)
+```
+
+## Standalone Service
+
+The FastAPI app lives in `app/` and exposes collection-oriented endpoints under `/api/v1`.
+
+```bash
+uv sync --group api
+uv run uvicorn app.main:app --reload
+```
+
+See [`app/README.md`](app/README.md) for endpoint examples and Docker usage.
+
+## Build and Test
+
+```bash
+make build          # release build
+make build-debug    # debug build
+make test           # C++ + Python tests
+make test-cpp       # C++ tests only
+make test-py        # Python + API tests
+make lint           # pre-commit checks
+```
+
+Additional project scripts are documented in [`scripts/README.md`](scripts/README.md).
+
+## Benchmarks
+
+Benchmark sources and runners live in `benchmark/` and `scripts/benchmark/`.
+The SIMD helpers used by distance kernels are documented in [`include/simd/README.md`](include/simd/README.md).
 
 ## Contributing
 
-We welcome contributions to AlayaLite! If you would like to contribute, please follow these steps:
-
-1. Start by creating an issue outlining the feature or bug you plan to work on.
-2. We will collaborate on the best approach to move forward based on your issue.
-3. Fork the repository, implement your changes, and commit them with a clear message.
-4. Push your changes to your forked repository.
-5. Submit a pull request to the main repository.
-
-Please ensure that your code follows the coding standards of the project and includes appropriate tests.
-
-## Acknowledgements
-
-We would like to thank all the contributors and users of AlayaLite for their support and feedback.
+Contributions are welcome. Please open an issue or pull request and include tests for behavior changes.
 
 ## Contact
 
-If you have any questions or suggestions, please feel free to open an issue or contact us at **dev@alayadb.ai**.
-
+Questions or ideas: `dev@alayadb.ai`
 
 ## License
 
-[Apache 2.0](https://github.com/AlayaDB-AI/AlayaLite/blob/main/LICENSE)
+[Apache 2.0](LICENSE)

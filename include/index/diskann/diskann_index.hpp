@@ -75,32 +75,28 @@ class DiskANNIndex {
   // ==========================================================================
   // Static Build Methods
   // ==========================================================================
+
   /**
-   * @brief Build a DiskANN index and return the in-memory graph.
+   * @brief Build a DiskANN index and write it to disk.
    *
-   * This is useful when you want to both have an in-memory graph and save to disk.
+   * Uses the out-of-core partitioned builder to construct the index
+   * within the configured memory budget.
    *
    * @tparam DistanceSpaceType Type satisfying the Space concept
    * @param space Shared pointer to the distance space containing data
-   * @param output_path Optional path to write the index file (empty to skip)
+   * @param output_path Path to write the index files (base path without extension)
    * @param params Build parameters (default values if not specified)
-   * @return Unique pointer to the constructed graph
    */
   template <typename DistanceSpaceType>
     requires Space<DistanceSpaceType>
-  static auto build_graph(std::shared_ptr<DistanceSpaceType> space,
-                          std::string_view output_path = "",
-                          const DiskANNBuildParams &params = DiskANNBuildParams{})
-      -> std::unique_ptr<Graph<typename DistanceSpaceType::DataTypeAlias,
-                               typename DistanceSpaceType::IDTypeAlias>> {
-    DiskANNBuilder<DistanceSpaceType> builder(space, params);
-    auto graph = builder.build_graph(params.num_threads_);
-    if (!output_path.empty()) {
-      builder.save_disk_index(output_path, *graph);
-    } else {
-      LOG_INFO("DiskANNIndex: Skipping saving index to disk");
+  static void build(std::shared_ptr<DistanceSpaceType> space,
+                    std::string_view output_path,
+                    const DiskANNBuildParams &params = DiskANNBuildParams{}) {
+    if (output_path.empty()) {
+      throw std::invalid_argument("DiskANNIndex::build requires a non-empty output path");
     }
-    return graph;
+    DiskANNBuilder<DistanceSpaceType> builder(space, params);
+    builder.build(output_path);
   }
 
   // ==========================================================================
@@ -205,6 +201,26 @@ class DiskANNIndex {
   void close() {
     searcher_.reset();
     index_path_.clear();
+  }
+
+  // ==========================================================================
+  // Delete Methods
+  // ==========================================================================
+
+  /**
+   * @brief Delete a vector by external ID.
+   *
+   * Performs lazy delete: marks the slot invalid, removes the ID mapping,
+   * and caches the deleted node's neighbors for graph repair.
+   * Requires the index to be loaded with writable=true.
+   *
+   * @param external_id External ID of the vector to delete
+   */
+  void delete_vector(IDType external_id) {
+    if (!is_loaded()) {
+      throw std::runtime_error("DiskANNIndex: No index loaded");
+    }
+    searcher_->delete_vector(external_id);
   }
 
   // ==========================================================================

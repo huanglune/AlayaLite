@@ -250,10 +250,12 @@ class DataFile {
     uint32_t node_offset = (node_id % nodes_per_block_) * row_size_;
 
     // 2. Fetch page (Thread-safe, RAII)
+    // Use thread_local buffer to avoid data races across Worker threads
+    static thread_local AlignedBuffer tl_io_buffer(kDataBlockSize);
     PageHandle handle = buffer_pool_->get_or_read(block_id,
                                                   *file_,
                                                   block_offset,
-                                                  reinterpret_cast<uint8_t *>(io_buffer_.data()));
+                                                  reinterpret_cast<uint8_t *>(tl_io_buffer.data()));
 
     if (handle.empty()) {
       throw std::runtime_error("Failed to read node: " + std::to_string(node_id));
@@ -300,6 +302,53 @@ class DataFile {
         buffer_pool_->put(pending_blocks[i], read_buffers[i].data());
       }
     }
+  }
+
+  /**
+   * @brief Submit async reads for multiple blocks, returning pending results.
+   *
+   * For each block: if already cached, skip. Otherwise, submit an async read
+   * via begin_async_read. Returns a vector of pending AsyncReadResults that
+   * the caller must poll until all are ready.
+   *
+   * @param block_ids Deduplicated block IDs to prefetch
+   * @return Pending async reads (only those not already cached)
+   */
+  auto begin_async_prefetch(std::span<const uint32_t> block_ids)
+      -> std::vector<typename BufferPoolType::AsyncReadResult> {
+    std::vector<typename BufferPoolType::AsyncReadResult> pending;
+    for (uint32_t block_id : block_ids) {
+      auto ar = buffer_pool_->begin_async_read(block_id,
+                                               *file_,
+                                               static_cast<uint64_t>(block_id) * kDataBlockSize);
+      if (!ar.is_ready()) {
+        pending.push_back(std::move(ar));
+      }
+    }
+    return pending;
+  }
+
+  /// Check if all pending async reads have completed.
+  static auto all_async_ready(const std::vector<typename BufferPoolType::AsyncReadResult> &pending)
+      -> bool {
+    for (const auto &ar : pending) {
+      if (!ar.is_ready()) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /// Check if any completed async read had an I/O error.
+  /// Call only after all_async_ready() returns true.
+  static auto any_async_error(const std::vector<typename BufferPoolType::AsyncReadResult> &pending)
+      -> bool {
+    for (const auto &ar : pending) {
+      if (ar.has_error()) {
+        return true;
+      }
+    }
+    return false;
   }
 
   // -------------------------------------------------------------------------
@@ -445,6 +494,8 @@ class DataFile {
   [[nodiscard]] auto is_open() const -> bool { return is_open_; }
   [[nodiscard]] auto is_writable() const -> bool { return is_writable_; }
   [[nodiscard]] auto path() const -> const std::string & { return path_; }
+  [[nodiscard]] auto buffer_pool() -> BufferPoolType & { return *buffer_pool_; }
+  [[nodiscard]] auto file() -> DirectFileIO & { return *file_; }
   [[nodiscard]] auto bypasses_page_cache() const -> bool {
     return file_ != nullptr && file_->bypasses_page_cache();
   }
@@ -513,10 +564,11 @@ class DataFile {
       throw std::out_of_range("Block ID out of range");
     }
     // Touch the block to load it into the buffer pool
+    static thread_local AlignedBuffer tl_io_buffer(kDataBlockSize);
     buffer_pool_->get_or_read(block_id,
                               *file_,
                               static_cast<uint64_t>(block_id) * kDataBlockSize,
-                              reinterpret_cast<uint8_t *>(io_buffer_.data()));
+                              reinterpret_cast<uint8_t *>(tl_io_buffer.data()));
   }
 
  private:
@@ -593,10 +645,6 @@ class DataFile {
     is_open_ = other.is_open_;
     is_writable_ = other.is_writable_;
 
-    io_buffer_ = std::move(other.io_buffer_);
-    // Ensure the moved-from object has a valid (empty) buffer
-    other.io_buffer_ = AlignedBuffer(kDataBlockSize);
-
     other.dim_ = 0;
     other.max_degree_ = 0;
     other.capacity_ = 0;
@@ -624,8 +672,6 @@ class DataFile {
   // I/O
   std::string path_;
   std::unique_ptr<DirectFileIO> file_;
-  AlignedBuffer io_buffer_ =
-      AlignedBuffer(kDataBlockSize);      // Per-instance I/O buffer (avoids shared thread_local)
   BufferPoolType *buffer_pool_{nullptr};  // Reference to external buffer pool
   bool is_open_{false};
   bool is_writable_{false};

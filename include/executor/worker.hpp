@@ -25,6 +25,7 @@
 #include <tuple>
 #include <vector>
 
+#include "storage/io/io_engine.hpp"
 #include "task_queue.hpp"
 #include "utils/locks.hpp"
 #include "utils/log.hpp"
@@ -45,14 +46,25 @@ class Worker : public std::enable_shared_from_this<Worker> {
          TaskQueue *task_queue,
          std::atomic<size_t> *total_task_cnt,
          std::atomic<size_t> *total_finish_cnt,
-         uint32_t local_task_cnt = 4)
+         uint32_t local_task_cnt = 8,
+         IOEngine *io_engine = nullptr)
       : id_(worker_id),
         cpu_id_(cpu_id),
         task_queue_(task_queue),
         local_task_cnt_(local_task_cnt),
-        local_tasks_(std::vector<std::coroutine_handle<>>(local_task_cnt)),
+        local_tasks_(local_task_cnt),
+        active_slots_(local_task_cnt),
+        free_slots_(local_task_cnt),
         total_task_cnt_(total_task_cnt),
-        total_finish_cnt_(total_finish_cnt) {}
+        total_finish_cnt_(total_finish_cnt),
+        io_engine_(io_engine) {
+    // Initialize free_slots stack: all slots start as free
+    for (uint32_t i = 0; i < local_task_cnt; ++i) {
+      free_slots_[i] = i;
+    }
+    free_count_ = local_task_cnt;
+    active_count_ = 0;
+  }
 
   /**
    * @brief Retrieves the unique identifier of the current Worker.
@@ -109,27 +121,68 @@ class Worker : public std::enable_shared_from_this<Worker> {
   void run() {
     // set_affinity();
 
-    uint32_t navigator = 0;
-
     while (true) {
-      uint32_t idx = navigator++ % local_task_cnt_;
-      auto &handle = local_tasks_[idx];
+      // Poll io_uring completions first — callbacks enqueue resumed coroutines to TaskQueue
+      if (io_engine_ != nullptr) {
+        io_engine_->check_completion();
+      }
 
-      if (handle == nullptr) {
-        auto success = task_queue_->pop(handle);
-        if (!success) {
-          if (total_finish_cnt_->load() == total_task_cnt_->load()) {
-            break;
+      // Try to fill free slots from the task queue
+      while (free_count_ > 0) {
+        std::coroutine_handle<> handle;
+        if (!task_queue_->pop(handle)) {
+          break;
+        }
+        // Pop a free slot and add to active set
+        uint32_t slot = free_slots_[--free_count_];
+        local_tasks_[slot] = handle;
+        active_slots_[active_count_++] = slot;
+      }
+
+      if (active_count_ == 0) {
+        // No active coroutines — check if all tasks are done
+        if (total_finish_cnt_->load() == total_task_cnt_->load()) {
+          break;
+        }
+        continue;
+      }
+
+      // Reverse iteration over active slots: swap-with-last for O(1) removal
+      for (int32_t i = static_cast<int32_t>(active_count_) - 1; i >= 0; --i) {
+        uint32_t slot = active_slots_[i];
+        auto &handle = local_tasks_[slot];
+
+        handle.resume();
+
+        if (handle.done()) {
+          handle = nullptr;
+          total_finish_cnt_->fetch_add(1);
+
+          // Return slot to free stack
+          free_slots_[free_count_++] = slot;
+
+          // Remove from active set: swap with last, shrink
+          active_count_--;
+          if (static_cast<uint32_t>(i) < active_count_) {
+            active_slots_[i] = active_slots_[active_count_];
           }
-          continue;
         }
       }
-      handle.resume();
-      if (handle.done()) {
-        handle = nullptr;
-        total_finish_cnt_->fetch_add(1);
-      } else {
+
+      // Poll completions again after processing active coroutines
+      if (io_engine_ != nullptr) {
+        io_engine_->check_completion();
       }
+    }
+
+    // Assert: no abandoned suspended coroutines
+    for (uint32_t i = 0; i < local_task_cnt_; ++i) {
+      assert(local_tasks_[i] == nullptr && "Worker exit with abandoned suspended coroutine");
+    }
+
+    // Drain any remaining async I/O before thread exits
+    if (io_engine_ != nullptr) {
+      io_engine_->drain_pending();
     }
   }
 
@@ -192,11 +245,18 @@ class Worker : public std::enable_shared_from_this<Worker> {
       local_tasks_;  ///< The mini-batch of tasks assigned to the worker. Each task is
                      ///< represented by a coroutine handle.
 
+  std::vector<uint32_t> active_slots_;  ///< Compact array of slot indices with active coroutines.
+  uint32_t active_count_{0};            ///< Number of currently active slots.
+  std::vector<uint32_t> free_slots_;    ///< Stack of free slot indices.
+  uint32_t free_count_{0};              ///< Number of free slots in the stack.
+
   std::atomic<size_t> *total_task_cnt_;  ///< Pointer to an atomic variable that tracks the
                                          ///< total number of tasks across all workers.
   std::atomic<size_t>
       *total_finish_cnt_;  ///< Pointer to an atomic variable that tracks the number of tasks that
                            ///< have been completed across all workers.
+
+  IOEngine *io_engine_{nullptr};  ///< Optional I/O engine for polling async completions.
 };
 
 }  // namespace alaya

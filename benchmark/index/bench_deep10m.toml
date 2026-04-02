@@ -1,0 +1,22 @@
+[dataset]
+data_path  = "/md1/huangliang/data/deep10M/deep10M_base.fvecs"
+query_path = "/md1/huangliang/data/deep10M/deep10M_query.fvecs"
+gt_path    = "/md1/huangliang/data/deep10M/deep10M_groundtruth.ivecs"
+metric     = "L2"
+
+[index]
+R          = [16]
+beam_width = 4
+num_threads = 60
+
+[search]
+ef_search   = [10, 16]
+topk        = 10
+num_queries = 10000
+search_threads = 1
+
+[benchmark]
+index_dir    = "/tmp/diskann_bench_deep10m"
+delete_ratio = 0.01
+num_rounds   = 3
+cache_ratio  = 0.20

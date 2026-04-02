@@ -23,6 +23,7 @@
 
 #include "task_queue.hpp"
 #include "utils/locks.hpp"
+#include "utils/log.hpp"
 #include "utils/macros.hpp"
 #include "utils/types.hpp"
 #include "worker.hpp"
@@ -108,7 +109,8 @@ class Scheduler {
    * @param cpus A vector of CPU IDs that the scheduler will utilize to distribute tasks across
    * workers.
    */
-  explicit Scheduler(std::vector<CpuID> &cpus) : cpus_(cpus) {
+  explicit Scheduler(std::vector<CpuID> &cpus, IOEngine *io_engine)
+      : cpus_(cpus), io_engine_(io_engine) {
     task_queue_ = std::make_unique<TaskQueue>();
   }
 
@@ -133,13 +135,21 @@ class Scheduler {
    * available CPU, and begins the task scheduling process. The worker threads will process tasks
    * as they are scheduled.
    */
-  void begin() {
+  void begin(uint32_t local_task_cnt = 8) {
+    if (io_engine_ == nullptr) {
+      LOG_WARN(
+          "Scheduler started without IOEngine; async I/O completions will not "
+          "be polled. Coroutines using co_search/co_insert/co_delete_vector "
+          "will hang. Pass a valid IOEngine* if disk-based coroutines are used.");
+    }
     for (CpuID i = 0; i < cpus_.size(); i++) {
       workers_.emplace_back(std::make_unique<Worker>(i,
                                                      cpus_.at(i),
                                                      task_queue_.get(),
                                                      &this->total_task_count_,
-                                                     &this->total_finish_count_));
+                                                     &this->total_finish_count_,
+                                                     local_task_cnt,
+                                                     io_engine_));
     }
     for (auto &worker : workers_) {
       worker->start();
@@ -181,7 +191,6 @@ class Scheduler {
    */
   void schedule(std::coroutine_handle<> handle) {
     assert(handle != nullptr);
-    SpinLockGuard guard(enqueue_lock_);
     total_task_count_.fetch_add(1);
     task_queue_->push(handle);
   }
@@ -196,17 +205,16 @@ class Scheduler {
    */
   void resume(std::coroutine_handle<> handle) {
     assert(handle != nullptr);
-    SpinLockGuard guard(enqueue_lock_);
     task_queue_->push(handle);
   }
 
  private:
   std::vector<CpuID> cpus_;  ///< List of CPU IDs on which worker threads will run.
 
-  std::atomic<std::size_t>
-      total_task_count_;  ///< Atomic counter tracking the total number of tasks scheduled.
-  std::atomic<std::size_t>
-      total_finish_count_;  ///< Atomic counter tracking the total number of completed tasks.
+  std::atomic<std::size_t> total_task_count_{
+      0};  ///< Atomic counter tracking the total number of tasks scheduled.
+  std::atomic<std::size_t> total_finish_count_{
+      0};  ///< Atomic counter tracking the total number of completed tasks.
 
   std::unique_ptr<TaskQueue>
       task_queue_;  ///< The shared task queue that holds tasks for workers to process.
@@ -214,9 +222,13 @@ class Scheduler {
   std::vector<std::unique_ptr<Worker>>
       workers_;  ///< List of workers managing task execution across CPUs.
 
-  SpinLock enqueue_lock_;  ///< Lock used to synchronize task enqueuing to the task queue.
-
   std::atomic_bool shutdown_{false};  ///< Flag indicating whether the scheduler is shutting down.
+
+  IOEngine *io_engine_{nullptr};  ///< Optional I/O engine for Worker completion polling.
+
+ public:
+  /// Access the shared task queue (e.g., for async buffer pool callbacks).
+  [[nodiscard]] auto task_queue() const -> TaskQueue * { return task_queue_.get(); }
 };
 
 }  // namespace alaya

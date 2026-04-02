@@ -28,6 +28,7 @@ class AlayaLiteConan(ConanFile):
         self.requires("spdlog/1.9.2")
         self.requires("eigen/3.4.0")
         self.requires("unordered_dense/4.8.1")  # High-performance hash map
+        self.requires("tomlplusplus/3.4.0")  # TOML config parser (header-only)
 
         # Linux-specific async I/O support
         if self.settings.os == "Linux":

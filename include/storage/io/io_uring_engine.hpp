@@ -132,6 +132,67 @@ class IOUringEngine final : public IOEngine {
     return completed;
   }
 
+  // ---- Callback-based async I/O (for coroutine integration) ----
+
+  auto submit_async_read(int fd,
+                         void *buffer,
+                         size_t size,
+                         uint64_t offset,
+                         AsyncIOCallback callback,
+                         void *callback_arg) -> bool override {
+    auto *ring = get_ring();
+    if (ring == nullptr) {
+      return false;
+    }
+
+    auto *sqe = io_uring_get_sqe(ring);
+    if (sqe == nullptr) {
+      LOG_ERROR("io_uring SQ is full, cannot submit async read");
+      return false;
+    }
+
+    io_uring_prep_read(sqe, fd, buffer, static_cast<unsigned>(size), offset);
+
+    // Heap-allocate callback context; freed in check_completion/drain_pending.
+    auto *ctx = new AsyncCallbackData{callback, callback_arg};
+    io_uring_sqe_set_data(sqe, ctx);
+
+    int ret = io_uring_submit(ring);
+    if (ret < 0) {
+      delete ctx;
+      LOG_ERROR("io_uring async submit failed: {}", strerror(-ret));
+      return false;
+    }
+
+    tl_ring_.async_in_flight_++;
+    return true;
+  }
+
+  auto check_completion() -> size_t override {
+    if (!tl_ring_.initialized_ || tl_ring_.async_in_flight_ == 0) {
+      return 0;
+    }
+
+    auto *ring = &tl_ring_.ring_;
+    size_t completed = 0;
+    struct io_uring_cqe *cqe = nullptr;
+
+    while (io_uring_peek_cqe(ring, &cqe) == 0) {
+      auto *ctx = static_cast<AsyncCallbackData *>(io_uring_cqe_get_data(cqe));
+      if (ctx != nullptr) {
+        ctx->callback(ctx->arg, cqe->res);
+        delete ctx;
+      }
+      io_uring_cqe_seen(ring, cqe);
+      ++completed;
+    }
+
+    tl_ring_.async_in_flight_ -= completed;
+    return completed;
+  }
+
+  void drain_pending() override { tl_ring_.drain_async(); }
+
   [[nodiscard]] auto supports_async() const -> bool override { return true; }
 
   [[nodiscard]] auto name() const -> std::string_view override { return "io_uring"; }
@@ -154,14 +215,23 @@ class IOUringEngine final : public IOEngine {
   }
 
  private:
+  /// Context stored as io_uring user_data for callback-based async reads.
+  struct AsyncCallbackData {
+    AsyncIOCallback callback;
+    void *arg;
+  };
+
   /// Per-thread io_uring ring with RAII cleanup on thread exit
   struct ThreadRing {
     struct io_uring ring_;
     bool initialized_{false};
+    size_t async_in_flight_{0};  ///< Pending async reads on this ring
 
     ThreadRing() { std::memset(&ring_, 0, sizeof(ring_)); }
+
     ~ThreadRing() {
       if (initialized_) {
+        drain_async();
         io_uring_queue_exit(&ring_);
         initialized_ = false;
       }
@@ -179,6 +249,25 @@ class IOUringEngine final : public IOEngine {
         return;
       }
       initialized_ = true;
+    }
+
+    /// Block until all pending async reads complete, invoking their callbacks.
+    void drain_async() {
+      while (async_in_flight_ > 0) {
+        struct io_uring_cqe *cqe = nullptr;
+        int ret = io_uring_wait_cqe(&ring_, &cqe);
+        if (ret < 0) {
+          LOG_ERROR("drain_async: io_uring_wait_cqe failed: {}", strerror(-ret));
+          break;
+        }
+        auto *ctx = static_cast<AsyncCallbackData *>(io_uring_cqe_get_data(cqe));
+        if (ctx != nullptr) {
+          ctx->callback(ctx->arg, cqe->res);
+          delete ctx;
+        }
+        io_uring_cqe_seen(&ring_, cqe);
+        --async_in_flight_;
+      }
     }
   };
 

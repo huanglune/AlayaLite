@@ -76,7 +76,7 @@ class HNSWCoroutineTest : public ::testing::Test {
 
   void init_scheduler() {
     std::vector<CpuID> cpus{0, 1, 2, 3};
-    scheduler_ = std::make_unique<Scheduler>(cpus);
+    scheduler_ = std::make_unique<Scheduler>(cpus, nullptr);
     scheduler_->begin();
   }
 };

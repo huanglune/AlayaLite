@@ -25,7 +25,7 @@ class SchedulerTest : public ::testing::Test {
  protected:
   void SetUp() override {
     cpus_ = {0};
-    scheduler_ = std::make_unique<Scheduler>(cpus_);
+    scheduler_ = std::make_unique<Scheduler>(cpus_, nullptr);
   }
 
   void TearDown() override { scheduler_->join(); }

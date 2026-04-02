@@ -26,7 +26,6 @@
 
 #include "data_file.hpp"
 #include "meta_file.hpp"
-#include "pq_file.hpp"
 #include "utils/macros.hpp"
 
 namespace alaya {
@@ -36,7 +35,6 @@ namespace alaya {
 // ============================================================================
 
 constexpr std::string_view kMetaFileExtension = ".meta";
-constexpr std::string_view kPQFileExtension = ".pq";
 constexpr std::string_view kDataFileExtension = ".data";
 
 // ============================================================================
@@ -44,16 +42,14 @@ constexpr std::string_view kDataFileExtension = ".data";
 // ============================================================================
 
 /**
- * @brief Unified storage manager for three-file DiskANN architecture.
+ * @brief Unified storage manager for two-file DiskANN architecture.
  *
  * Coordinates access to:
  * - MetaFile: In-memory metadata and validity tracking
- * - PQFile: Memory-mapped PQ data for fast approximate distances
  * - DataFile: Direct I/O for full vector/graph access (with BufferPool caching)
  *
  * File naming convention:
  * - base_path.meta - Metadata file
- * - base_path.pq   - PQ data file (optional)
  * - base_path.data - Graph/vector data file
  *
  * @tparam DataType Vector element type (float, int8_t, etc.)
@@ -89,9 +85,6 @@ class DiskANNStorage {
   [[nodiscard]] static auto meta_path(std::string_view base) -> std::string {
     return std::string(base) + std::string(kMetaFileExtension);
   }
-  [[nodiscard]] static auto pq_path(std::string_view base) -> std::string {
-    return std::string(base) + std::string(kPQFileExtension);
-  }
   [[nodiscard]] static auto data_path(std::string_view base) -> std::string {
     return std::string(base) + std::string(kDataFileExtension);
   }
@@ -101,13 +94,13 @@ class DiskANNStorage {
   // -------------------------------------------------------------------------
 
   /**
-   * @brief Create a new DiskANN index with three-file architecture.
+   * @brief Create a new DiskANN index with two-file architecture.
    *
    * @param base_path Base path for index files (without extension)
    * @param capacity Maximum number of vectors
    * @param dim Vector dimension
    * @param max_degree Maximum out-degree (R)
-   * @param num_pq_subspaces Number of PQ subspaces (0 to disable PQ)
+   * @param num_pq_subspaces Unused (kept for API compatibility, must be 0)
    * @param metric_type Metric type enum (0=L2, 1=IP, 2=COS)
    * @param data_type Data type enum
    */
@@ -118,6 +111,7 @@ class DiskANNStorage {
               uint32_t num_pq_subspaces = 0,
               uint32_t metric_type = 0,
               uint32_t data_type = 0) {
+    (void)num_pq_subspaces;
     if (is_open_) {
       throw std::runtime_error("DiskANNStorage already open");
     }
@@ -127,14 +121,8 @@ class DiskANNStorage {
       // Create metadata file (may round up capacity for bitmap alignment)
       meta_.create(meta_path(base_path), capacity, dim, max_degree, metric_type, data_type);
 
-      // Use MetaFile's actual capacity (rounded up) for data/PQ files
+      // Use MetaFile's actual capacity (rounded up) for data file
       uint32_t actual_capacity = meta_.capacity();
-
-      // Create PQ file if enabled
-      if (num_pq_subspaces > 0) {
-        pq_.create(pq_path(base_path), dim, num_pq_subspaces, actual_capacity);
-        pq_enabled_ = true;
-      }
 
       // Create data file
       data_.create(data_path(base_path), actual_capacity, dim, max_degree);
@@ -143,9 +131,24 @@ class DiskANNStorage {
     } catch (...) {
       cleanup_failed_create();
       base_path_.clear();
-      pq_enabled_ = false;
       is_open_ = false;
       throw;
+    }
+
+    // Remove stale PQ sidecar only after successful creation, so a failed
+    // rebuild-in-place does not additionally destroy the old .pq file.
+    std::string legacy_pq = std::string(base_path) + ".pq";
+    if (std::filesystem::exists(legacy_pq)) {
+      std::error_code ec;
+      std::filesystem::remove(legacy_pq, ec);
+      if (ec) {
+        // Index was created successfully but stale .pq couldn't be removed.
+        // Close the new index and report the error — open() would reject it.
+        close();
+        throw std::runtime_error(
+            "Index created but failed to remove stale PQ sidecar at " + legacy_pq +
+            ": " + ec.message() + ". Remove it manually, then re-open.");
+      }
     }
   }
 
@@ -162,15 +165,16 @@ class DiskANNStorage {
 
     base_path_ = std::string(base_path);
     try {
+      // Fail fast if a legacy PQ sidecar exists
+      std::string legacy_pq = std::string(base_path) + ".pq";
+      if (std::filesystem::exists(legacy_pq)) {
+        throw std::runtime_error(
+            "Legacy PQ sidecar found at " + legacy_pq +
+            ". PQ indexes are no longer supported — rebuild the index without PQ.");
+      }
+
       // Open metadata file
       meta_.open(meta_path(base_path));
-
-      // Open PQ file if exists
-      std::string pq_file_path = pq_path(base_path);
-      if (std::filesystem::exists(pq_file_path)) {
-        pq_.open(pq_file_path, writable);
-        pq_enabled_ = true;
-      }
 
       // Open data file
       data_.open(data_path(base_path),
@@ -181,11 +185,9 @@ class DiskANNStorage {
 
       is_open_ = true;
     } catch (...) {
-      pq_.close();
       data_.close();
       meta_.close();
       base_path_.clear();
-      pq_enabled_ = false;
       throw;
     }
   }
@@ -199,15 +201,6 @@ class DiskANNStorage {
     }
 
     std::exception_ptr close_error;
-    if (pq_enabled_) {
-      try {
-        pq_.close();
-      } catch (...) {
-        if (close_error == nullptr) {
-          close_error = std::current_exception();
-        }
-      }
-    }
     try {
       data_.close();
     } catch (...) {
@@ -224,7 +217,6 @@ class DiskANNStorage {
     }
 
     base_path_.clear();
-    pq_enabled_ = false;
     is_open_ = false;
 
     if (close_error != nullptr) {
@@ -248,9 +240,6 @@ class DiskANNStorage {
   [[nodiscard]] auto meta() -> MetaFile & { return meta_; }
   [[nodiscard]] auto meta() const -> const MetaFile & { return meta_; }
 
-  [[nodiscard]] auto pq() -> PQFile & { return pq_; }
-  [[nodiscard]] auto pq() const -> const PQFile & { return pq_; }
-
   [[nodiscard]] auto data() -> DataFileType & { return data_; }
   [[nodiscard]] auto data() const -> const DataFileType & { return data_; }
 
@@ -259,7 +248,6 @@ class DiskANNStorage {
   // -------------------------------------------------------------------------
 
   [[nodiscard]] auto is_open() const -> bool { return is_open_; }
-  [[nodiscard]] auto is_pq_enabled() const -> bool { return pq_enabled_; }
   [[nodiscard]] auto base_path() const -> const std::string & { return base_path_; }
 
   // -------------------------------------------------------------------------
@@ -342,56 +330,21 @@ class DiskANNStorage {
     return meta_.allocate_slot();
   }
 
-  // -------------------------------------------------------------------------
-  // PQ operations
-  // -------------------------------------------------------------------------
-
-  void write_pq_codebook(const float *codebook) {
-    require_pq();
-    pq_.write_codebook(codebook);
-  }
-
-  void write_pq_codes(const uint8_t *codes, uint64_t num_vectors) {
-    require_pq();
-    pq_.write_codes(codes, num_vectors);
-  }
-
-  [[nodiscard]] auto get_pq_code(uint64_t vector_id) const -> const uint8_t * {
-    require_pq();
-    return pq_.get_code(vector_id);
-  }
-
-  [[nodiscard]] auto get_pq_computer(const float *query, std::span<float> scratch) const ->
-      typename PQFile::DistanceComputer {
-    require_pq();
-    return pq_.get_computer(query, scratch);
-  }
-
  private:
-  PQFile pq_;
   MetaFile meta_;
   std::string base_path_;
   DataFileType data_;
 
-  bool pq_enabled_{false};
   bool is_open_{false};
 
   void cleanup_failed_create() {
-    pq_.close();
     data_.close();
     meta_.close_without_save();
 
     std::error_code ec;
     std::filesystem::remove(meta_path(base_path_), ec);
     std::filesystem::remove(meta_path(base_path_) + ".tmp", ec);
-    std::filesystem::remove(pq_path(base_path_), ec);
     std::filesystem::remove(data_path(base_path_), ec);
-  }
-
-  void require_pq() const {
-    if (!pq_enabled_) {
-      throw std::runtime_error("PQ not enabled");
-    }
   }
 };
 

@@ -101,6 +101,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "disk_read_awaitable.hpp"
 #include "replacer/lru.hpp"
 #include "storage/io/direct_file_io.hpp"
 #include "utils/hash_map.hpp"
@@ -162,6 +163,7 @@ class BufferPool {
    */
   class PageHandle {
     friend class Shard;
+    friend class BufferPool;
 
    public:
     PageHandle() = default;
@@ -319,6 +321,73 @@ class BufferPool {
     return shard.insert_page(node_id, temp_buffer);
   }
 
+  /// Result of begin_async_read: a pinned PageHandle plus optional pending I/O state.
+  struct AsyncReadResult {
+    PageHandle handle;        ///< Pinned page handle (data valid only when is_ready() == true)
+    AsyncReadState *pending;  ///< Non-null if async I/O is in-flight
+
+    [[nodiscard]] auto is_ready() const -> bool {
+      return pending == nullptr || pending->finish_read.load(std::memory_order_acquire);
+    }
+
+    /// True if the async I/O completed with an error (short read or negative errno).
+    /// Only meaningful after is_ready() returns true.
+    [[nodiscard]] auto has_error() const -> bool {
+      return pending != nullptr && pending->has_error.load(std::memory_order_acquire);
+    }
+  };
+
+  /**
+   * @brief Start an async page read. Returns immediately with a pinned handle.
+   *
+   * On cache hit, data is immediately available (pending == nullptr).
+   * On cache miss, submits async I/O via io_uring and returns pending state.
+   *
+   * Usage from a top-level coroutine (in Worker's local_tasks_):
+   * @code
+   *   auto ar = pool.begin_async_read(node_id, io, offset);
+   *   while (!ar.is_ready()) {
+   *     co_await YieldAwaitable{};  // yield to Worker, which polls io_uring
+   *   }
+   *   // ar.handle.data() is now valid
+   * @endcode
+   */
+  auto begin_async_read(IDType node_id, DirectFileIO &io, uint64_t offset) -> AsyncReadResult {
+    Shard &shard = get_shard(node_id);
+
+    auto result = shard.allocate_for_async_read(node_id);
+    if (result.frame_data == nullptr) {
+      return {PageHandle{}, nullptr};
+    }
+
+    if (result.is_hit) {
+      return {PageHandle(&shard, result.frame_idx, result.frame_data, frame_size_), nullptr};
+    }
+
+    stats_.misses_.fetch_add(1, std::memory_order_relaxed);
+
+    if (result.needs_io) {
+      auto *notifier = new AsyncReadNotifier{result.async_state};
+      bool submitted = io.submit_async_read(result.frame_data,
+                                            frame_size_,
+                                            offset,
+                                            async_read_callback,
+                                            notifier);
+      if (!submitted) {
+        // Async submission failed — fall back to synchronous read.
+        delete notifier;
+        auto bytes = io.read(reinterpret_cast<char *>(result.frame_data), frame_size_, offset);
+        if (bytes != static_cast<ssize_t>(frame_size_)) {
+          result.async_state->has_error.store(true, std::memory_order_relaxed);
+        }
+        result.async_state->finish_read.store(true, std::memory_order_release);
+      }
+    }
+
+    return {PageHandle(&shard, result.frame_idx, result.frame_data, frame_size_),
+            result.async_state};
+  }
+
   auto touch_if_cached(IDType node_id) -> bool {
     auto handle = get(node_id);
     return !handle.empty();
@@ -394,6 +463,7 @@ class BufferPool {
   }
 
   auto stats() const -> const BufferPoolStats & { return stats_; }
+  [[nodiscard]] auto num_shards() const -> size_t { return num_shards_; }
 
  private:
   // -----------------------------------------------------------------------
@@ -407,6 +477,7 @@ class BufferPool {
       bool is_valid_{false};
       bool is_dirty_{false};
       uint32_t pin_count_{0};
+      AsyncReadState async_state_;  ///< Async I/O state for coroutine-based reads
     };
 
     Shard(size_t id,
@@ -430,7 +501,7 @@ class BufferPool {
 
     [[nodiscard]] auto capacity() const -> size_t { return capacity_; }
 
-    // try to get page and pin it
+    // try to get page and pin it (sync path — skips frames still being async-loaded)
     auto get_page(IDType node_id) -> PageHandle {
       std::lock_guard<SpinLock> guard(lock_);
 
@@ -441,6 +512,13 @@ class BufferPool {
 
       size_t frame_idx = it->second;
       Frame &frame = frames_[frame_idx];
+
+      // If an async read is still in-flight, treat as miss. The sync caller
+      // (get_or_read / prefetch) will do its own disk read and insert_page()
+      // will handle the race with the in-flight async I/O.
+      if (!frame.async_state_.finish_read.load(std::memory_order_acquire)) {
+        return {};
+      }
 
       if (frame.pin_count_ == 0) {
         replacer_.pin(frame_idx);
@@ -456,6 +534,7 @@ class BufferPool {
       IDType flush_node_id{};
       uint8_t *flush_data_ptr{nullptr};
       bool need_flush{false};
+      bool overwrite_async{false};
 
       size_t frame_idx{0};
 
@@ -467,52 +546,61 @@ class BufferPool {
           size_t idx = it->second;
           Frame &frame = frames_[idx];
 
-          if (frame.pin_count_ == 0) {
-            replacer_.pin(idx);
-          }
-          frame.pin_count_++;
-
-          // Optional: overwrite data? Usually not needed, assuming disk data is immutable or
-          // version control is handled by upper layers
-          return PageHandle(this, idx, frame.data_, frame_size_);
-        }
-
-        // Allocate a new frame or evict an existing one.
-        if (!free_list_.empty()) {
-          frame_idx = free_list_.front();
-          free_list_.pop();
-        } else {
-          auto victim = replacer_.evict();
-          if (!victim) {
-            // Cache is full and all pages are pinned — system overload edge case.
-            return {};
-          }
-          frame_idx = *victim;
-
-          // Collect dirty-page info to flush after releasing the lock.
-          Frame &vic_frame = frames_[frame_idx];
-          if (vic_frame.is_valid_) {
-            if (vic_frame.is_dirty_ && flush_callback_) {
-              flush_node_id = vic_frame.node_id_;
-              flush_data_ptr = vic_frame.data_;
-              need_flush = true;
+          // If an async read is still in-flight, reuse the frame and overwrite
+          // with our sync-read data. The async callback only sets finish_read
+          // (targets the same frame.data_ buffer), so the overwrite is safe.
+          if (!frame.async_state_.finish_read.load(std::memory_order_acquire)) {
+            if (frame.pin_count_ == 0) {
+              replacer_.pin(idx);
             }
-            page_table_.erase(vic_frame.node_id_);
-            stats_ref_.evictions_.fetch_add(1, std::memory_order_relaxed);
+            frame.pin_count_++;
+            frame_idx = idx;
+            overwrite_async = true;
+          } else {
+            if (frame.pin_count_ == 0) {
+              replacer_.pin(idx);
+            }
+            frame.pin_count_++;
+            return PageHandle(this, idx, frame.data_, frame_size_);
           }
         }
 
-        // Mark the frame as pinned/in-use before we release the lock so no
-        // other thread can evict it while we are copying data into it.
-        Frame &frame = frames_[frame_idx];
-        frame.node_id_ = node_id;
-        frame.is_valid_ = true;
-        frame.is_dirty_ = false;
-        frame.pin_count_ = 1;
-        page_table_[node_id] = frame_idx;
-        replacer_.pin(frame_idx);
-        // Note: we intentionally do NOT memcpy here yet; we do it after the
-        // lock is released so the copy does not hold the lock.
+        if (!overwrite_async) {
+          // Allocate a new frame or evict an existing one.
+          if (!free_list_.empty()) {
+            frame_idx = free_list_.front();
+            free_list_.pop();
+          } else {
+            auto victim = replacer_.evict();
+            if (!victim) {
+              // Cache is full and all pages are pinned — system overload edge case.
+              return {};
+            }
+            frame_idx = *victim;
+
+            // Collect dirty-page info to flush after releasing the lock.
+            Frame &vic_frame = frames_[frame_idx];
+            if (vic_frame.is_valid_) {
+              if (vic_frame.is_dirty_ && flush_callback_) {
+                flush_node_id = vic_frame.node_id_;
+                flush_data_ptr = vic_frame.data_;
+                need_flush = true;
+              }
+              page_table_.erase(vic_frame.node_id_);
+              stats_ref_.evictions_.fetch_add(1, std::memory_order_relaxed);
+            }
+          }
+
+          // Mark the frame as pinned/in-use before we release the lock so no
+          // other thread can evict it while we are copying data into it.
+          Frame &frame = frames_[frame_idx];
+          frame.node_id_ = node_id;
+          frame.is_valid_ = true;
+          frame.is_dirty_ = false;
+          frame.pin_count_ = 1;
+          page_table_[node_id] = frame_idx;
+          replacer_.pin(frame_idx);
+        }
       }
 
       // Perform the potentially slow disk write outside the lock.
@@ -521,9 +609,13 @@ class BufferPool {
       }
 
       // Fill the frame with the new data (lock not held — safe because
-      // pin_count == 1 prevents eviction).
+      // pin_count >= 1 prevents eviction).
       Frame &frame = frames_[frame_idx];
       std::memcpy(frame.data_, source_data, frame_size_);
+
+      // Ensure finish_read is true so sync get_page() returns this frame.
+      frame.async_state_.has_error.store(false, std::memory_order_relaxed);
+      frame.async_state_.finish_read.store(true, std::memory_order_release);
 
       return PageHandle(this, frame_idx, frame.data_, frame_size_);
     }
@@ -585,6 +677,95 @@ class BufferPool {
     void set_flush_callback(std::function<void(IDType, const uint8_t *)> cb) {
       std::lock_guard<SpinLock> guard(lock_);
       flush_callback_ = std::move(cb);
+    }
+
+    /// Result of allocate_for_async_read.
+    struct AsyncAllocResult {
+      size_t frame_idx{0};
+      uint8_t *frame_data{nullptr};
+      AsyncReadState *async_state{nullptr};
+      bool is_hit{false};    ///< true = data already valid (cache hit or sync-loaded)
+      bool needs_io{false};  ///< true = caller must submit async I/O
+    };
+
+    /**
+     * @brief Allocate or find a frame for an async read.
+     *
+     * Under the shard lock:
+     * - If page is cached and fully loaded: returns is_hit=true
+     * - If page is cached but loading (another coroutine started I/O): returns is_hit=false,
+     *   needs_io=false (caller should co_await)
+     * - If page is not cached: allocates frame, returns needs_io=true (caller submits I/O)
+     *
+     * In all non-hit cases, the frame is pinned (pin_count incremented).
+     */
+    auto allocate_for_async_read(IDType node_id) -> AsyncAllocResult {
+      IDType flush_node_id{};
+      uint8_t *flush_data_ptr{nullptr};
+      bool need_flush{false};
+      size_t frame_idx{0};
+      bool needs_io = false;
+
+      {
+        std::lock_guard<SpinLock> guard(lock_);
+
+        auto it = page_table_.find(node_id);
+        if (it != page_table_.end()) {
+          // Page exists in page_table
+          size_t idx = it->second;
+          Frame &frame = frames_[idx];
+          if (frame.pin_count_ == 0) {
+            replacer_.pin(idx);
+          }
+          frame.pin_count_++;
+
+          bool data_ready = frame.async_state_.finish_read.load(std::memory_order_acquire);
+          if (data_ready) {
+            stats_ref_.hits_.fetch_add(1, std::memory_order_relaxed);
+          }
+          return {idx, frame.data_, &frame.async_state_, data_ready, false};
+        }
+
+        // Not in page_table - allocate new frame
+        if (!free_list_.empty()) {
+          frame_idx = free_list_.front();
+          free_list_.pop();
+        } else {
+          auto victim = replacer_.evict();
+          if (!victim) {
+            return {};  // pool full, all pinned
+          }
+          frame_idx = *victim;
+
+          Frame &vic_frame = frames_[frame_idx];
+          if (vic_frame.is_valid_) {
+            if (vic_frame.is_dirty_ && flush_callback_) {
+              flush_node_id = vic_frame.node_id_;
+              flush_data_ptr = vic_frame.data_;
+              need_flush = true;
+            }
+            page_table_.erase(vic_frame.node_id_);
+            stats_ref_.evictions_.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+
+        Frame &frame = frames_[frame_idx];
+        frame.node_id_ = node_id;
+        frame.is_valid_ = true;
+        frame.is_dirty_ = false;
+        frame.pin_count_ = 1;
+        frame.async_state_.reset_for_async();  // finish_read=false, awaiting_list=nullptr
+        page_table_[node_id] = frame_idx;
+        replacer_.pin(frame_idx);
+        needs_io = true;
+      }
+
+      if (need_flush) {
+        flush_callback_(flush_node_id, flush_data_ptr);
+      }
+
+      Frame &frame = frames_[frame_idx];
+      return {frame_idx, frame.data_, &frame.async_state_, false, needs_io};
     }
 
    private:
