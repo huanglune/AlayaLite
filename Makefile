@@ -1,17 +1,18 @@
 # AlayaLite Makefile
 # Usage: make help
 
-.PHONY: help build build-debug build-release build-coverage configure test test-cpp test-py test-py-cov lint lint-commit-msg clean clean-all install dev-install wheel
+.PHONY: help build build-debug build-release build-coverage configure test test-cpp test-py test-py-cov lint lint-tidy lint-commit-msg clean clean-all install dev-install wheel
 
 # Configuration
 BUILD_DIR         := build
 BUILD_TYPE        ?= Release
+CMAKE_GENERATOR   ?= Ninja
 CMAKE_FLAGS       := -DBUILD_TESTING=ON -DBUILD_BENCHMARKS=ON
 EXTRA_CMAKE_FLAGS ?=
 PYTEST_FLAGS      := -v
 PYTEST_COV_FLAGS  := --cov=python/src/alayalite --cov=app --cov-report=html
 CTEST_FLAGS       := --output-on-failure
-JOBS              := $(shell nproc 2>/dev/null || echo 4)
+JOBS              ?= 60
 PYTHON_VERSION    := 3.11
 COMMIT_MSG        ?=
 
@@ -45,22 +46,22 @@ build: configure ## Build project (release mode)
 
 build-debug: BUILD_TYPE := Debug
 build-debug: ## Build project in debug mode
-	@cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CMAKE_FLAGS)
+	@cmake -G "$(CMAKE_GENERATOR)" -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CMAKE_FLAGS)
 	@cmake --build $(BUILD_DIR) --config $(BUILD_TYPE) -j$(JOBS)
 
 build-release: BUILD_TYPE := Release
 build-release: ## Build project in release mode
-	@cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CMAKE_FLAGS)
+	@cmake -G "$(CMAKE_GENERATOR)" -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CMAKE_FLAGS)
 	@cmake --build $(BUILD_DIR) --config $(BUILD_TYPE) -j$(JOBS)
 
 build-coverage: BUILD_TYPE := Debug
 build-coverage: EXTRA_CMAKE_FLAGS := -DENABLE_COVERAGE=ON
 build-coverage: ## Build with coverage instrumentation
-	@cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CMAKE_FLAGS) $(EXTRA_CMAKE_FLAGS)
+	@cmake -G "$(CMAKE_GENERATOR)" -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CMAKE_FLAGS) $(EXTRA_CMAKE_FLAGS)
 	@cmake --build $(BUILD_DIR) --config $(BUILD_TYPE) -j$(JOBS)
 
 configure: ## Only configure cmake (no build)
-	@cmake -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CMAKE_FLAGS) $(EXTRA_CMAKE_FLAGS)
+	@cmake -G "$(CMAKE_GENERATOR)" -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CMAKE_FLAGS) $(EXTRA_CMAKE_FLAGS)
 
 # ============================================================================
 # Test
@@ -84,6 +85,10 @@ test-py-cov: ## Run Python and API tests with coverage
 
 lint: ## Run file-based pre-commit checks
 	@uvx pre-commit run -a
+
+lint-tidy: ## Run clang-tidy static analysis (clean rebuild with checks enabled)
+	@cmake -G "$(CMAKE_GENERATOR)" -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Release $(CMAKE_FLAGS) -DENABLE_CLANG_TIDY=ON $(EXTRA_CMAKE_FLAGS)
+	@cmake --build $(BUILD_DIR) --config Release --clean-first -j$(JOBS)
 
 lint-commit-msg: ## Validate commit message (use COMMIT_MSG="type: subject")
 	@test -n "$(COMMIT_MSG)" || (echo "COMMIT_MSG is required" >&2; exit 1)

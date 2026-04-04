@@ -6,7 +6,7 @@ gt_path    = "/home/huangliang/alaya-dev/hnswlib/lab/sift/sift_groundtruth.ivecs
 metric     = "L2"
 
 [index]
-R               = [16]
+R               = [32]
 ef_construction = [200]
 num_threads     = 0
 

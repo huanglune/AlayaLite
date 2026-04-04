@@ -21,7 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <filesystem>
+#include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
 #include <limits>
 #include <mutex>
@@ -162,8 +162,7 @@ class ShardVamanaBuilder {
         id_map_(ShardIdMap<GlobalIDType>::build(shard_members)),
         dist_fn_(dist_fn),
         config_(config),
-        neighbor_table_(static_cast<uint32_t>(id_map_.local_to_global_.size()),
-                        config.max_degree_),
+        neighbor_table_(static_cast<uint32_t>(id_map_.local_to_global_.size()), config.max_degree_),
         node_mutexes_(id_map_.local_to_global_.size()) {
     if (dim_ == 0 || dist_fn_ == nullptr) {
       throw std::invalid_argument("ShardVamanaBuilder requires a dimension and distance function");
@@ -398,7 +397,9 @@ class ShardVamanaBuilder {
     for (uint32_t t = 0; t < num_threads; ++t) {
       auto begin = t * chunk;
       auto end = std::min(begin + chunk, n);
-      if (begin >= n) break;
+      if (begin >= n) {
+        break;
+      }
       threads.emplace_back([this, &perm, alpha, begin, end] {
         std::vector<NeighborType> candidates;
         std::vector<NeighborType> selected;
@@ -439,7 +440,9 @@ class ShardVamanaBuilder {
   void merge_existing_neighbors(LocalIDType node_id, std::vector<NeighborType> &candidates) const {
     auto existing = neighbor_table_.neighbors(node_id);
     for (auto neighbor_id : existing) {
-      if (neighbor_id >= num_nodes()) continue;  // skip stale IDs from concurrent writes
+      if (neighbor_id >= num_nodes()) {
+        continue;
+      }  // skip stale IDs from concurrent writes
       candidates.emplace_back(neighbor_id, distance(node_id, neighbor_id), true);
     }
 

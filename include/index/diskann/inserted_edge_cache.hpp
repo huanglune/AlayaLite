@@ -54,37 +54,37 @@ class InsertedEdgeCache {
 
   void add(size_t shard, IDType target_id, IDType source_id) {
     auto &state = shard_state(shard);
-    auto existing = state.map.find(target_id);
-    if (existing != state.map.end()) {
-      existing->second->sources.push_back(source_id);
-      state.lru_list.splice(state.lru_list.begin(), state.lru_list, existing->second);
+    auto existing = state.map_.find(target_id);
+    if (existing != state.map_.end()) {
+      existing->second->sources_.push_back(source_id);
+      state.lru_list_.splice(state.lru_list_.begin(), state.lru_list_, existing->second);
       return;
     }
 
-    if (state.map.size() >= max_keys_per_shard_) {
-      auto &lru_entry = state.lru_list.back();
-      state.map.erase(lru_entry.target_id);
-      state.lru_list.pop_back();
+    if (state.map_.size() >= max_keys_per_shard_) {
+      auto &lru_entry = state.lru_list_.back();
+      state.map_.erase(lru_entry.target_id_);
+      state.lru_list_.pop_back();
     }
 
-    state.lru_list.emplace_front(Entry{target_id, {}});
-    auto entry = state.lru_list.begin();
-    entry->sources.push_back(source_id);
-    state.map.emplace(target_id, entry);
+    state.lru_list_.emplace_front(Entry{target_id, {}});
+    auto entry = state.lru_list_.begin();
+    entry->sources_.push_back(source_id);
+    state.map_.emplace(target_id, entry);
   }
 
   auto consume(size_t shard, IDType target_id) -> std::vector<IDType> {
     auto &state = shard_state(shard);
-    auto existing = state.map.find(target_id);
-    if (existing == state.map.end()) {
+    auto existing = state.map_.find(target_id);
+    if (existing == state.map_.end()) {
       return {};
     }
 
-    auto result = existing->second->sources.to_vector();
-    state.lru_list.erase(existing->second);
-    state.map.erase(existing);
-    if (state.map.empty()) {
-      state.map = Map{};
+    auto result = existing->second->sources_.to_vector();
+    state.lru_list_.erase(existing->second);
+    state.map_.erase(existing);
+    if (state.map_.empty()) {
+      state.map_ = Map{};
     }
     return result;
   }
@@ -92,7 +92,7 @@ class InsertedEdgeCache {
   [[nodiscard]] auto size() const -> size_t {
     size_t total = 0;
     for (const auto &shard : shards_) {
-      total += shard.map.size();
+      total += shard.map_.size();
     }
     return total;
   }
@@ -102,40 +102,40 @@ class InsertedEdgeCache {
   [[nodiscard]] auto shard_capacity() const -> size_t { return max_keys_per_shard_; }
 
   [[nodiscard]] auto bucket_count(size_t shard) const -> size_t {
-    return shard_state(shard).map.bucket_count();
+    return shard_state(shard).map_.bucket_count();
   }
 
  private:
   struct SourceEntries {
-    std::array<IDType, kMaxEntriesPerKey> values{};
-    size_t count{0};
+    std::array<IDType, kMaxEntriesPerKey> values_{};
+    size_t count_{0};
 
     void push_back(IDType source_id) {
-      if (count < kMaxEntriesPerKey) {
-        values[count++] = source_id;
+      if (count_ < kMaxEntriesPerKey) {
+        values_[count_++] = source_id;
         return;
       }
 
-      std::move(values.begin() + 1, values.end(), values.begin());
-      values[kMaxEntriesPerKey - 1] = source_id;
+      std::move(values_.begin() + 1, values_.end(), values_.begin());
+      values_[kMaxEntriesPerKey - 1] = source_id;
     }
 
     [[nodiscard]] auto to_vector() const -> std::vector<IDType> {
-      return std::vector<IDType>(values.begin(), values.begin() + count);
+      return std::vector<IDType>(values_.begin(), values_.begin() + count_);
     }
   };
 
   struct Entry {
-    IDType target_id;
-    SourceEntries sources;
+    IDType target_id_;
+    SourceEntries sources_;
   };
 
   using LruList = std::list<Entry>;
   using Map = std::unordered_map<IDType, typename LruList::iterator>;
 
   struct ShardState {
-    LruList lru_list;
-    Map map;
+    LruList lru_list_;
+    Map map_;
   };
 
   [[nodiscard]] auto shard_state(size_t shard) -> ShardState & { return shards_.at(shard); }

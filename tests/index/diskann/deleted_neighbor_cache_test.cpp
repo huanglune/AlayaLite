@@ -36,10 +36,11 @@ TEST_F(DeletedNeighborCacheTest, InsertAndLookup) {
 
   auto result = cache.get(10);
   ASSERT_TRUE(result.has_value());
-  ASSERT_EQ(result->size(), 3U);
-  EXPECT_EQ((*result)[0], 1U);
-  EXPECT_EQ((*result)[1], 2U);
-  EXPECT_EQ((*result)[2], 3U);
+  auto &vec = result.value();  // NOLINT(bugprone-unchecked-optional-access)
+  ASSERT_EQ(vec.size(), 3U);
+  EXPECT_EQ(vec[0], 1U);
+  EXPECT_EQ(vec[1], 2U);
+  EXPECT_EQ(vec[2], 3U);
 }
 
 TEST_F(DeletedNeighborCacheTest, CacheMiss) {
@@ -109,8 +110,9 @@ TEST_F(DeletedNeighborCacheTest, UpdateExistingEntry) {
 
   auto result = cache.get(1);
   ASSERT_TRUE(result.has_value());
-  ASSERT_EQ(result->size(), 3U);
-  EXPECT_EQ((*result)[0], 20U);
+  auto &vec = result.value();  // NOLINT(bugprone-unchecked-optional-access)
+  ASSERT_EQ(vec.size(), 3U);
+  EXPECT_EQ(vec[0], 20U);
   EXPECT_EQ(cache.size(), 1U);
 }
 
@@ -154,7 +156,7 @@ TEST_F(DeletedNeighborCacheTest, EmptyNeighborList) {
   cache.put(1, {});
   auto result = cache.get(1);
   ASSERT_TRUE(result.has_value());
-  EXPECT_EQ(result->size(), 0U);
+  EXPECT_EQ(result.value().size(), 0U);  // NOLINT(bugprone-unchecked-optional-access)
 }
 
 }  // namespace alaya

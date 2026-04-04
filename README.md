@@ -17,38 +17,44 @@
 
 ## Highlights
 
-- Header-only C++20 vector indexing components under `include/`.
+- Header-only C++20 ANN components under `include/`.
+- In-memory graph indices for `hnsw`, `nsg`, and `fusion`.
+- DiskANN-oriented C++ modules for build, search, storage, and async I/O.
 - Python SDK with `Client`, `Collection`, and `Index` abstractions.
-- Multiple index and quantization options, including `hnsw`, `nsg`, `fusion`, `sq8`, `sq4`, and `rabitq`.
-- Optional standalone FastAPI service in `app/`.
-- Example Streamlit RAG app in `examples/rag/`.
+- Quantization options including `sq8`, `sq4`, and `rabitq`.
+- Optional FastAPI service in `app/`.
+- Streamlit RAG demo in `examples/rag/`.
 
 ## Repository Guide
 
 | Path | What it contains |
 | --- | --- |
-| [`python/README.md`](python/README.md) | Python SDK usage and API reference |
-| [`app/README.md`](app/README.md) | FastAPI standalone service |
-| [`examples/rag/README.md`](examples/rag/README.md) | End-to-end RAG demo |
-| [`include/simd/README.md`](include/simd/README.md) | SIMD kernels and dispatch overview |
-| [`scripts/README.md`](scripts/README.md) | Helper scripts for builds, data prep, and benchmarks |
+| [`python/README.md`](python/README.md) | Python SDK usage, persistence, and supported parameters |
+| [`app/README.md`](app/README.md) | FastAPI standalone service and HTTP examples |
+| [`examples/rag/README.md`](examples/rag/README.md) | End-to-end Streamlit RAG demo |
 
 ## Install
 
-### Python package
+### Repository install
 
 ```bash
-pip install alayalite
+make install
 ```
+
+This installs the package from the repository without development dependencies.
 
 ### Local development
 
 ```bash
-uv sync
+make dev-install
 make build
 ```
 
-`make dev-install` is also available if you want the standard development setup in one step.
+Notes:
+
+- `make dev-install` installs the editable Python package plus development dependencies.
+- `make build` builds the C++ tests and benchmarks in release mode.
+- To build the pybind target through CMake as well, run `EXTRA_CMAKE_FLAGS="-DBUILD_PYTHON=ON" make build`.
 
 ## Quick Start
 
@@ -72,6 +78,7 @@ results = collection.batch_query(
     [[0.1, 0.2, 0.3]],
     limit=2,
     ef_search=10,
+    num_threads=1,
 )
 
 print(results["document"][0])
@@ -88,45 +95,67 @@ vectors = np.random.rand(1000, 128).astype(np.float32)
 queries = np.random.rand(10, 128).astype(np.float32)
 
 client = Client()
-index = client.create_index("default", index_type="hnsw", metric="l2")
+index = client.create_index(
+    "default",
+    index_type="hnsw",
+    metric="l2",
+    quantization_type="none",
+)
 index.fit(vectors, ef_construction=100, num_threads=1)
 
 neighbors = index.batch_search(queries, topk=10, ef_search=100, num_threads=1)
 print(neighbors.shape)
 ```
 
-## Standalone Service
-
-The FastAPI app lives in `app/` and exposes collection-oriented endpoints under `/api/v1`.
-
-```bash
-uv sync --group api
-uv run uvicorn app.main:app --reload
-```
-
-See [`app/README.md`](app/README.md) for endpoint examples and Docker usage.
-
 ## Build and Test
 
 ```bash
-make build          # release build
+make build          # release build with tests + benchmarks
 make build-debug    # debug build
 make test           # C++ + Python tests
 make test-cpp       # C++ tests only
 make test-py        # Python + API tests
 make lint           # pre-commit checks
+make lint-tidy      # clang-tidy rebuild
 ```
 
-Additional project scripts are documented in [`scripts/README.md`](scripts/README.md).
+Direct CMake defaults are intentionally leaner than the Makefile:
+
+- `BUILD_TESTING=OFF`
+- `BUILD_BENCHMARKS=OFF`
+- `BUILD_PYTHON=OFF`
 
 ## Benchmarks
 
-Benchmark sources and runners live in `benchmark/` and `scripts/benchmark/`.
-The SIMD helpers used by distance kernels are documented in [`include/simd/README.md`](include/simd/README.md).
+Benchmark sources live in `benchmark/`, with dataset/config samples under `benchmark/index/configs/`.
+
+Current CMake benchmark targets:
+
+- `graph_search_bench`: graph build and search benchmark driven by a TOML config
+- `diskann_update_bench`: DiskANN delete/insert/search benchmark driven by a TOML config
+
+Example:
+
+```bash
+./build/benchmark/index/graph_search_bench benchmark/index/configs/bench_hnsw_gist.toml
+```
+
+The helper scripts and coverage utilities are documented in [`scripts/README.md`](scripts/README.md).
+
+## Standalone Service
+
+The FastAPI app lives in `app/` and exposes collection-oriented endpoints under `/api/v1`.
+
+```bash
+uv sync --group api --group test
+uv run uvicorn app.main:app --reload
+```
+
+See [`app/README.md`](app/README.md) for endpoint examples and Docker usage.
 
 ## Contributing
 
-Contributions are welcome. Please open an issue or pull request and include tests for behavior changes.
+Contributions are welcome. Please include tests for behavior changes and keep documentation in sync with the relevant module.
 
 ## Contact
 

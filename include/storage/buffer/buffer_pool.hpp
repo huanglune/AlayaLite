@@ -323,24 +323,24 @@ class BufferPool {
 
   /// Result of begin_async_read: a pinned PageHandle plus optional pending I/O state.
   struct AsyncReadResult {
-    PageHandle handle;        ///< Pinned page handle (data valid only when is_ready() == true)
-    AsyncReadState *pending;  ///< Non-null if async I/O is in-flight
+    PageHandle handle_;        ///< Pinned page handle (data valid only when is_ready() == true)
+    AsyncReadState *pending_;  ///< Non-null if async I/O is in-flight
 
     [[nodiscard]] auto is_ready() const -> bool {
-      return pending == nullptr || pending->finish_read.load(std::memory_order_acquire);
+      return pending_ == nullptr || pending_->finish_read_.load(std::memory_order_acquire);
     }
 
     /// True if the async I/O completed with an error (short read or negative errno).
     /// Only meaningful after is_ready() returns true.
     [[nodiscard]] auto has_error() const -> bool {
-      return pending != nullptr && pending->has_error.load(std::memory_order_acquire);
+      return pending_ != nullptr && pending_->has_error_.load(std::memory_order_acquire);
     }
   };
 
   /**
    * @brief Start an async page read. Returns immediately with a pinned handle.
    *
-   * On cache hit, data is immediately available (pending == nullptr).
+   * On cache hit, data is immediately available (pending_ == nullptr).
    * On cache miss, submits async I/O via io_uring and returns pending state.
    *
    * Usage from a top-level coroutine (in Worker's local_tasks_):
@@ -349,26 +349,26 @@ class BufferPool {
    *   while (!ar.is_ready()) {
    *     co_await YieldAwaitable{};  // yield to Worker, which polls io_uring
    *   }
-   *   // ar.handle.data() is now valid
+   *   // ar.handle_.data() is now valid
    * @endcode
    */
   auto begin_async_read(IDType node_id, DirectFileIO &io, uint64_t offset) -> AsyncReadResult {
     Shard &shard = get_shard(node_id);
 
     auto result = shard.allocate_for_async_read(node_id);
-    if (result.frame_data == nullptr) {
+    if (result.frame_data_ == nullptr) {
       return {PageHandle{}, nullptr};
     }
 
-    if (result.is_hit) {
-      return {PageHandle(&shard, result.frame_idx, result.frame_data, frame_size_), nullptr};
+    if (result.is_hit_) {
+      return {PageHandle(&shard, result.frame_idx_, result.frame_data_, frame_size_), nullptr};
     }
 
     stats_.misses_.fetch_add(1, std::memory_order_relaxed);
 
-    if (result.needs_io) {
-      auto *notifier = new AsyncReadNotifier{result.async_state};
-      bool submitted = io.submit_async_read(result.frame_data,
+    if (result.needs_io_) {
+      auto *notifier = new AsyncReadNotifier{result.async_state_};
+      bool submitted = io.submit_async_read(result.frame_data_,
                                             frame_size_,
                                             offset,
                                             async_read_callback,
@@ -376,16 +376,16 @@ class BufferPool {
       if (!submitted) {
         // Async submission failed — fall back to synchronous read.
         delete notifier;
-        auto bytes = io.read(reinterpret_cast<char *>(result.frame_data), frame_size_, offset);
+        auto bytes = io.read(reinterpret_cast<char *>(result.frame_data_), frame_size_, offset);
         if (bytes != static_cast<ssize_t>(frame_size_)) {
-          result.async_state->has_error.store(true, std::memory_order_relaxed);
+          result.async_state_->has_error_.store(true, std::memory_order_relaxed);
         }
-        result.async_state->finish_read.store(true, std::memory_order_release);
+        result.async_state_->finish_read_.store(true, std::memory_order_release);
       }
     }
 
-    return {PageHandle(&shard, result.frame_idx, result.frame_data, frame_size_),
-            result.async_state};
+    return {PageHandle(&shard, result.frame_idx_, result.frame_data_, frame_size_),
+            result.async_state_};
   }
 
   auto touch_if_cached(IDType node_id) -> bool {
@@ -516,7 +516,7 @@ class BufferPool {
       // If an async read is still in-flight, treat as miss. The sync caller
       // (get_or_read / prefetch) will do its own disk read and insert_page()
       // will handle the race with the in-flight async I/O.
-      if (!frame.async_state_.finish_read.load(std::memory_order_acquire)) {
+      if (!frame.async_state_.finish_read_.load(std::memory_order_acquire)) {
         return {};
       }
 
@@ -549,7 +549,7 @@ class BufferPool {
           // If an async read is still in-flight, reuse the frame and overwrite
           // with our sync-read data. The async callback only sets finish_read
           // (targets the same frame.data_ buffer), so the overwrite is safe.
-          if (!frame.async_state_.finish_read.load(std::memory_order_acquire)) {
+          if (!frame.async_state_.finish_read_.load(std::memory_order_acquire)) {
             if (frame.pin_count_ == 0) {
               replacer_.pin(idx);
             }
@@ -613,9 +613,9 @@ class BufferPool {
       Frame &frame = frames_[frame_idx];
       std::memcpy(frame.data_, source_data, frame_size_);
 
-      // Ensure finish_read is true so sync get_page() returns this frame.
-      frame.async_state_.has_error.store(false, std::memory_order_relaxed);
-      frame.async_state_.finish_read.store(true, std::memory_order_release);
+      // Ensure finish_read_ is true so sync get_page() returns this frame.
+      frame.async_state_.has_error_.store(false, std::memory_order_relaxed);
+      frame.async_state_.finish_read_.store(true, std::memory_order_release);
 
       return PageHandle(this, frame_idx, frame.data_, frame_size_);
     }
@@ -681,21 +681,21 @@ class BufferPool {
 
     /// Result of allocate_for_async_read.
     struct AsyncAllocResult {
-      size_t frame_idx{0};
-      uint8_t *frame_data{nullptr};
-      AsyncReadState *async_state{nullptr};
-      bool is_hit{false};    ///< true = data already valid (cache hit or sync-loaded)
-      bool needs_io{false};  ///< true = caller must submit async I/O
+      size_t frame_idx_{0};
+      uint8_t *frame_data_{nullptr};
+      AsyncReadState *async_state_{nullptr};
+      bool is_hit_{false};    ///< true = data already valid (cache hit or sync-loaded)
+      bool needs_io_{false};  ///< true = caller must submit async I/O
     };
 
     /**
      * @brief Allocate or find a frame for an async read.
      *
      * Under the shard lock:
-     * - If page is cached and fully loaded: returns is_hit=true
-     * - If page is cached but loading (another coroutine started I/O): returns is_hit=false,
-     *   needs_io=false (caller should co_await)
-     * - If page is not cached: allocates frame, returns needs_io=true (caller submits I/O)
+     * - If page is cached and fully loaded: returns is_hit_=true
+     * - If page is cached but loading (another coroutine started I/O): returns is_hit_=false,
+     *   needs_io_=false (caller should co_await)
+     * - If page is not cached: allocates frame, returns needs_io_=true (caller submits I/O)
      *
      * In all non-hit cases, the frame is pinned (pin_count incremented).
      */
@@ -719,7 +719,7 @@ class BufferPool {
           }
           frame.pin_count_++;
 
-          bool data_ready = frame.async_state_.finish_read.load(std::memory_order_acquire);
+          bool data_ready = frame.async_state_.finish_read_.load(std::memory_order_acquire);
           if (data_ready) {
             stats_ref_.hits_.fetch_add(1, std::memory_order_relaxed);
           }
@@ -754,7 +754,7 @@ class BufferPool {
         frame.is_valid_ = true;
         frame.is_dirty_ = false;
         frame.pin_count_ = 1;
-        frame.async_state_.reset_for_async();  // finish_read=false, awaiting_list=nullptr
+        frame.async_state_.reset_for_async();  // finish_read_=false, awaiting_list=nullptr
         page_table_[node_id] = frame_idx;
         replacer_.pin(frame_idx);
         needs_io = true;

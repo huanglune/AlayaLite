@@ -180,7 +180,7 @@ class IOUringEngine final : public IOEngine {
     while (io_uring_peek_cqe(ring, &cqe) == 0) {
       auto *ctx = static_cast<AsyncCallbackData *>(io_uring_cqe_get_data(cqe));
       if (ctx != nullptr) {
-        ctx->callback(ctx->arg, cqe->res);
+        ctx->callback_(ctx->arg_, cqe->res);
         delete ctx;
       }
       io_uring_cqe_seen(ring, cqe);
@@ -217,8 +217,8 @@ class IOUringEngine final : public IOEngine {
  private:
   /// Context stored as io_uring user_data for callback-based async reads.
   struct AsyncCallbackData {
-    AsyncIOCallback callback;
-    void *arg;
+    AsyncIOCallback callback_;
+    void *arg_;
   };
 
   /// Per-thread io_uring ring with RAII cleanup on thread exit
@@ -262,7 +262,7 @@ class IOUringEngine final : public IOEngine {
         }
         auto *ctx = static_cast<AsyncCallbackData *>(io_uring_cqe_get_data(cqe));
         if (ctx != nullptr) {
-          ctx->callback(ctx->arg, cqe->res);
+          ctx->callback_(ctx->arg_, cqe->res);
           delete ctx;
         }
         io_uring_cqe_seen(&ring_, cqe);

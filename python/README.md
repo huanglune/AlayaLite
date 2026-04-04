@@ -24,7 +24,7 @@ uv sync
 
 ### `Client`
 
-`Client` manages named collections and indices. If you pass `url=...`, it also loads persisted data from that directory and enables save/delete-on-disk operations.
+`Client` manages named collections and indices. Passing `url=...` enables persistence and auto-loads saved objects from that directory at startup.
 
 ```python
 from alayalite import Client
@@ -48,6 +48,12 @@ Useful methods:
 - `save_collection(collection_name)`
 - `save_index(index_name)`
 - `reset(delete_on_disk=False)`
+
+Persistence notes:
+
+- `save_*()` requires `Client(url=...)`.
+- Saved collections and indices are reloaded automatically when a new client points at the same directory.
+- `delete_on_disk=True` removes the persisted directory as well as the in-memory handle.
 
 ## Collection API
 
@@ -76,6 +82,12 @@ Item format:
 (id, document, embedding, metadata)
 ```
 
+Behavior notes:
+
+- The first insert initializes the backing index and fixes vector dimensionality.
+- Call `set_metric(metric)` before the first insert if you want something other than the default `l2`.
+- `insert([])` and `upsert([])` are treated as no-ops.
+
 ### Query
 
 ```python
@@ -87,7 +99,7 @@ result = collection.batch_query(
 )
 ```
 
-`batch_query(...)` returns a dictionary with one entry per query:
+`batch_query(...)` returns a dictionary shaped like:
 
 ```python
 {
@@ -115,12 +127,11 @@ collection.reindex()
 Notes:
 
 - `filter_query(...)` performs exact-match filtering over metadata keys.
-- `set_metric(metric)` must be called before the first insert or fit.
-- `reindex()` is useful after large delete-heavy workloads.
+- `reindex()` is useful after large delete-heavy workloads because it rebuilds the underlying index and ID maps.
 
 ## Index API
 
-`Index` is the lower-level vector interface if you want to manage only embeddings.
+`Index` is the lower-level vector interface when you want to manage embeddings only.
 
 ### Create and fit
 
@@ -177,7 +188,7 @@ from alayalite import Index
 loaded = Index.load("./data", "saved_index")
 ```
 
-## Configuration Parameters
+## Supported Parameters
 
 `create_collection(...)` and `create_index(...)` accept the same index-related keyword arguments.
 
@@ -191,6 +202,11 @@ loaded = Index.load("./data", "saved_index")
 | `capacity` | positive integer | `100000` |
 | `max_nbrs` | integer in `(0, 1000)` | `32` |
 
+Notes:
+
+- `rabitq` support is intended for x86_64 environments with AVX-512.
+- The Python SDK currently exposes graph-style indices; DiskANN-specific components are C++-side today.
+
 If you need direct access to the parameter object, import `IndexParams` from `alayalite.schema`.
 
 ## Utilities
@@ -203,6 +219,10 @@ from alayalite import calc_gt, calc_recall, load_fvecs, load_ivecs
 - `calc_recall(result, gt_data)` computes recall for a result matrix.
 - `load_fvecs(path)` loads `fvecs` files into `numpy.float32`.
 - `load_ivecs(path)` loads `ivecs` files into `numpy.int32`.
+
+## RAG Helpers
+
+The package also ships reusable RAG helpers under `alayalite.rag.*`, including chunkers and embedders for higher-level retrieval pipelines.
 
 ## End-to-End Example
 

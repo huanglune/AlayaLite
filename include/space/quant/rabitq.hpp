@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
+#include <limits>
 
 #include "utils/log.hpp"
 #include "utils/macros.hpp"
@@ -73,7 +74,7 @@ struct RaBitQQuantizer {
     // P^(-1)·（o_r - c）
     RowMajorArray<DataType> residual_arr = data_arr - cent_arr;
     // |P^(-1)·(or-c)|^2 = |or-c|^2 (Orthogonal transformations preserve Euclidean distance)
-    DataType l2_sqr = ::alaya::l2_sqr<DataType>(residual_arr.data(), padded_dim_);
+    auto l2_sqr = ::alaya::l2_sqr<DataType>(residual_arr.data(), padded_dim_);
 
     // unsigned representation, modifications to y_u will be cast to binary code as well
     RowMajorArrayMap<int> y_u(binary_code, 1, static_cast<long>(padded_dim_));  // NOLINT
@@ -84,12 +85,12 @@ struct RaBitQQuantizer {
     // y_bar = y_u + c_b * 1_D
     RowMajorArray<DataType> y_bar = y_u.template cast<DataType>() + cb;
     // dot product between centroid and xu_cb, i.e.,<y_bar,P^(-1)·c>
-    DataType ip_rotated_c_and_y_bar = dot_product<DataType>(centroid, y_bar.data(), padded_dim_);
+    auto ip_rotated_c_and_y_bar = dot_product<DataType>(centroid, y_bar.data(), padded_dim_);
     // dot product between residual and xu_cb, i.e.,<y_bar,P^(-1)·(or-c)>
-    DataType ip_rotated_resi_and_y_bar =
+    auto ip_rotated_resi_and_y_bar =
         dot_product<DataType>(residual_arr.data(), y_bar.data(), padded_dim_);
     if (ip_rotated_resi_and_y_bar == 0) {
-      ip_rotated_resi_and_y_bar = std::numeric_limits<DataType>::infinity();
+      ip_rotated_resi_and_y_bar = std::numeric_limits<DataType>::max();
     }
 
     // calculate factors (for l2 metric type only)

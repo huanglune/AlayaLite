@@ -502,7 +502,7 @@ class QGBuilder {
       std::unordered_set<IDType> neighbor_set;
       neighbor_set.reserve(degree_bound_);
       while (neighbor_set.size() < degree_bound_) {
-        IDType rand_id = rand_integer<IDType>(0, num_nodes_ - 1);
+        auto rand_id = rand_integer<IDType>(0, num_nodes_ - 1);
         if (rand_id != static_cast<IDType>(i)) {
           neighbor_set.emplace(rand_id);
         }

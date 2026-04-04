@@ -20,7 +20,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
+#include <filesystem>  // NOLINT(build/c++17)
 #include <memory>
 #include <span>
 #include <string>

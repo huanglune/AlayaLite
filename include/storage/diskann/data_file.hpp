@@ -331,24 +331,18 @@ class DataFile {
   /// Check if all pending async reads have completed.
   static auto all_async_ready(const std::vector<typename BufferPoolType::AsyncReadResult> &pending)
       -> bool {
-    for (const auto &ar : pending) {
-      if (!ar.is_ready()) {
-        return false;
-      }
-    }
-    return true;
+    return std::ranges::all_of(pending, [](const auto &ar) {
+      return ar.is_ready();
+    });
   }
 
   /// Check if any completed async read had an I/O error.
   /// Call only after all_async_ready() returns true.
   static auto any_async_error(const std::vector<typename BufferPoolType::AsyncReadResult> &pending)
       -> bool {
-    for (const auto &ar : pending) {
-      if (ar.has_error()) {
-        return true;
-      }
-    }
-    return false;
+    return std::ranges::any_of(pending, [](const auto &ar) {
+      return ar.has_error();
+    });
   }
 
   // -------------------------------------------------------------------------

@@ -33,6 +33,10 @@ auto name = alaya::simd::get_simd_level_name();
 - `alaya::simd::SimdLevel::kAvx2`
 - `alaya::simd::SimdLevel::kAvx512`
 
+Implementation detail:
+
+- Some code paths intentionally prefer `AVX2` even on AVX-512-capable machines when it benchmarks better for that operation.
+
 ## Public APIs
 
 ### L2 distance
@@ -69,7 +73,7 @@ Available entrypoints:
 - `get_ip_sqr_sq8_func()`
 - `get_ip_sqr_sq4_func()`
 
-`ip_sqr` returns the negative inner product so smaller values mean more similar vectors.
+`ip_sqr` returns the negative inner product so smaller values still mean more similar vectors.
 
 ### FHT helpers
 
@@ -79,7 +83,7 @@ Available entrypoints:
 alaya::simd::fht_float(buffer, log_n);
 ```
 
-The transform helpers cover `2^6` through `2^11` specialized paths, with generic fallback outside those optimized cases.
+The transform helpers cover specialized paths for powers `2^6` through `2^11`, with generic fallback outside those optimized cases.
 
 ## Quantized Inputs
 
@@ -89,6 +93,6 @@ The transform helpers cover `2^6` through `2^11` specialized paths, with generic
 
 ## When to Use What
 
-- Use the template wrappers such as `l2_sqr(...)` and `ip_sqr(...)` for normal call sites.
-- Use `get_*_func()` if you need to cache a dispatched function pointer inside a hot loop.
+- Use `l2_sqr(...)` and `ip_sqr(...)` at normal call sites.
+- Use `get_*_func()` if you want to cache a dispatched function pointer in a hot loop.
 - Use `get_simd_level_name()` when debugging performance or verifying feature detection on a target machine.

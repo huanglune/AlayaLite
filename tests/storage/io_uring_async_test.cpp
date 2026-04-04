@@ -58,14 +58,14 @@ class IOUringAsyncTest : public ::testing::Test {
 
 /// Callback that records result and sets a flag.
 struct CallbackState {
-  std::atomic<bool> completed{false};
-  int32_t result{0};
+  std::atomic<bool> completed_{false};
+  int32_t result_{0};
 };
 
 static void test_callback(void *arg, int32_t result) {
   auto *state = static_cast<CallbackState *>(arg);
-  state->result = result;
-  state->completed.store(true, std::memory_order_release);
+  state->result_ = result;
+  state->completed_.store(true, std::memory_order_release);
 }
 
 TEST_F(IOUringAsyncTest, SubmitAndCheckCompletion) {
@@ -84,20 +84,20 @@ TEST_F(IOUringAsyncTest, SubmitAndCheckCompletion) {
 
   // Poll until completion
   size_t total = 0;
-  for (int i = 0; i < 1000 && !state.completed.load(std::memory_order_acquire); i++) {
+  for (int i = 0; i < 1000 && !state.completed_.load(std::memory_order_acquire); i++) {
     total += reader.check_completion();
     std::this_thread::yield();
   }
   // Final check
   total += reader.check_completion();
 
-  EXPECT_TRUE(state.completed.load());
-  EXPECT_EQ(state.result, static_cast<int32_t>(kDefaultSectorSize));
-  EXPECT_GE(total, 1u);
+  EXPECT_TRUE(state.completed_.load());
+  EXPECT_EQ(state.result_, static_cast<int32_t>(kDefaultSectorSize));
+  EXPECT_GE(total, 1U);
 
   // Verify data: sector 0 filled with byte value 1
   for (size_t i = 0; i < kDefaultSectorSize; i++) {
-    EXPECT_EQ(buf.data()[i], 1) << "Mismatch at byte " << i;
+    EXPECT_EQ(buf[i], 1) << "Mismatch at byte " << i;
   }
 }
 
@@ -127,7 +127,7 @@ TEST_F(IOUringAsyncTest, MultipleAsyncReads) {
     reader.check_completion();
     bool all_done = true;
     for (size_t i = 0; i < kNumSectors; i++) {
-      if (!states[i].completed.load(std::memory_order_acquire)) {
+      if (!states[i].completed_.load(std::memory_order_acquire)) {
         all_done = false;
         break;
       }
@@ -140,11 +140,11 @@ TEST_F(IOUringAsyncTest, MultipleAsyncReads) {
 
   // Verify all completed with correct data
   for (size_t i = 0; i < kNumSectors; i++) {
-    EXPECT_TRUE(states[i].completed.load()) << "Sector " << i << " not completed";
-    EXPECT_EQ(states[i].result, static_cast<int32_t>(kDefaultSectorSize))
+    EXPECT_TRUE(states[i].completed_.load()) << "Sector " << i << " not completed";
+    EXPECT_EQ(states[i].result_, static_cast<int32_t>(kDefaultSectorSize))
         << "Sector " << i << " wrong result";
     for (size_t j = 0; j < kDefaultSectorSize; j++) {
-      EXPECT_EQ(buffers[i].data()[j], static_cast<uint8_t>(i + 1))
+      EXPECT_EQ(buffers[i][j], static_cast<uint8_t>(i + 1))
           << "Sector " << i << " mismatch at byte " << j;
     }
   }
@@ -153,7 +153,7 @@ TEST_F(IOUringAsyncTest, MultipleAsyncReads) {
 TEST_F(IOUringAsyncTest, CheckCompletionNoPending) {
   // check_completion on a fresh engine with no pending I/O should return 0
   DirectFileIO reader;
-  EXPECT_EQ(reader.check_completion(), 0u);
+  EXPECT_EQ(reader.check_completion(), 0U);
 }
 
 TEST_F(IOUringAsyncTest, DrainPending) {
@@ -171,8 +171,8 @@ TEST_F(IOUringAsyncTest, DrainPending) {
   // Drain should block until completion and invoke callback
   reader.drain_pending();
 
-  EXPECT_TRUE(state.completed.load());
-  EXPECT_EQ(state.result, static_cast<int32_t>(kDefaultSectorSize));
+  EXPECT_TRUE(state.completed_.load());
+  EXPECT_EQ(state.result_, static_cast<int32_t>(kDefaultSectorSize));
 }
 
 TEST_F(IOUringAsyncTest, ThreadLocalRingIsolation) {
@@ -192,12 +192,12 @@ TEST_F(IOUringAsyncTest, ThreadLocalRingIsolation) {
         reader.submit_async_read(buf.data(), kDefaultSectorSize, offset, test_callback, &state);
     EXPECT_TRUE(ok);
 
-    for (int i = 0; i < 10000 && !state.completed.load(std::memory_order_acquire); i++) {
+    for (int i = 0; i < 10000 && !state.completed_.load(std::memory_order_acquire); i++) {
       reader.check_completion();
       std::this_thread::yield();
     }
     reader.check_completion();
-    EXPECT_TRUE(state.completed.load());
+    EXPECT_TRUE(state.completed_.load());
   };
 
   std::thread t1(worker, std::ref(buf1), std::ref(state1), 0);
@@ -205,13 +205,13 @@ TEST_F(IOUringAsyncTest, ThreadLocalRingIsolation) {
   t1.join();
   t2.join();
 
-  EXPECT_TRUE(state1.completed.load());
-  EXPECT_TRUE(state2.completed.load());
+  EXPECT_TRUE(state1.completed_.load());
+  EXPECT_TRUE(state2.completed_.load());
 
   // Verify data integrity
   for (size_t i = 0; i < kDefaultSectorSize; i++) {
-    EXPECT_EQ(buf1.data()[i], 1);
-    EXPECT_EQ(buf2.data()[i], 2);
+    EXPECT_EQ(buf1[i], 1);
+    EXPECT_EQ(buf2[i], 2);
   }
 }
 

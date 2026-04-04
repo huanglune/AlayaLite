@@ -451,8 +451,10 @@ class DiskANNSearcher {
           cached_neighbors.push_back(nbr);
         }
       }
-      deleted_neighbors_->put(static_cast<IDType>(internal_id),
-                              std::vector<IDType>(cached_neighbors));
+      if (deleted_neighbors_.has_value()) {
+        deleted_neighbors_->put(static_cast<IDType>(internal_id),
+                                std::vector<IDType>(cached_neighbors));
+      }
     }
 
     meta.set_invalid(internal_id);
@@ -588,8 +590,10 @@ class DiskANNSearcher {
           cached_neighbors.push_back(nbr);
         }
       }
-      deleted_neighbors_->put(static_cast<IDType>(internal_id),
-                              std::vector<IDType>(cached_neighbors));
+      if (deleted_neighbors_.has_value()) {
+        deleted_neighbors_->put(static_cast<IDType>(internal_id),
+                                std::vector<IDType>(cached_neighbors));
+      }
     }
 
     // Mark invalid and remove mapping (if explicit mapping exists)
@@ -980,7 +984,7 @@ class DiskANNSearcher {
   InsertedEdgeCache<IDType> inserted_edge_cache_;
 
   /// Alpha parameter for repair connect_tasks triggered by deletion.
-  float repair_alpha_{1.2f};
+  float repair_alpha_{1.2F};
 
   /**
    * @brief Alpha-dominance pruning shared helper.
@@ -1105,7 +1109,7 @@ class DiskANNSearcher {
 
       if (!meta.is_valid(nbr)) {
         // Deleted neighbor: add two-hop candidates from cache (capped)
-        auto cached = deleted_neighbors_->get(nbr);
+        auto cached = deleted_neighbors_.has_value() ? deleted_neighbors_->get(nbr) : std::nullopt;
         if (cached.has_value()) {
           size_t two_hop_count = 0;
           for (auto two_hop : cached.value()) {

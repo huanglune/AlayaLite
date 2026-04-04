@@ -2,7 +2,7 @@
  * DiskANN Delete/Insert/Search benchmark.
  *
  * Usage:
- *   ./diskann_bench <config.toml>
+ *   ./diskann_update_bench <config.toml>
  */
 
 #include <atomic>
@@ -18,7 +18,7 @@
 #include <thread>
 #include <vector>
 
-#include <toml++/toml.hpp>
+#include "bench_config.hpp"
 
 #include "index/diskann/diskann_index.hpp"
 #include "index/diskann/diskann_params.hpp"
@@ -29,102 +29,74 @@
 #include "utils/dataset_utils.hpp"
 #include "utils/evaluate.hpp"
 #include "utils/log.hpp"
+#include "utils/timer.hpp"
+#include "utils/types.hpp"
 
-using namespace alaya;
+using alaya::BufferPool;
+using alaya::ClockReplacer;
+using alaya::DataFile;
+using alaya::Dataset;
+using alaya::DatasetConfig;
+using alaya::DiskANNBuildParams;
+using alaya::DiskANNIndex;
+using alaya::DiskANNInsertParams;
+using alaya::DiskANNSearchParams;
+using alaya::RawSpace;
+using alaya::Timer;
+using alaya::calc_recall;
+using alaya::kDataBlockSize;
+using alaya::kMetricMap;
+using alaya::load_dataset;
+using alaya::load_fvecs;
 
 // =============================================================================
 // Config
 // =============================================================================
 
+struct DiskannBenchSection {
+  std::string index_dir_ = "/tmp/diskann_bench";
+  float delete_ratio_ = 0.01F;
+  uint32_t num_rounds_ = 3;
+  float cache_ratio_ = 0.20F;
+};
+
 struct Config {
-  // [dataset]
-  std::string data_path;
-  std::string query_path;
-  std::string gt_path;
-  std::string metric = "L2";
-
-  // [index]
-  std::vector<uint32_t> R = {16, 32};
-  uint32_t beam_width = 4;
-  uint32_t num_threads = 0;  // 0 = min(hardware_concurrency, 60)
-
-  // [search]
-  std::vector<uint32_t> ef_search = {4, 8};
-  uint32_t topk = 10;
-  uint32_t num_queries = 200;
-  uint32_t search_threads = 1;
-
-  // [benchmark]
-  std::string index_dir = "/tmp/diskann_bench";
-  float delete_ratio = 0.01F;
-  uint32_t num_rounds = 3;
-  float cache_ratio = 0.20F;
+  bench::DatasetSection dataset_;
+  bench::IndexSection index_;
+  bench::SearchSection search_;
+  DiskannBenchSection benchmark_;
 
   void print() const {
-    printf("[dataset]\n");
-    printf("  data_path  = %s\n", data_path.c_str());
-    printf("  query_path = %s\n", query_path.c_str());
-    printf("  gt_path    = %s\n", gt_path.c_str());
-    printf("  metric     = %s\n", metric.c_str());
-    printf("[index]\n");
-    printf("  R          = [");
-    for (size_t i = 0; i < R.size(); ++i) printf("%s%u", i ? ", " : "", R[i]);
-    printf("]\n");
-    printf("  beam_width = %u\n", beam_width);
-    printf("  num_threads= %u\n", num_threads);
-    printf("[search]\n");
-    printf("  ef_search  = [");
-    for (size_t i = 0; i < ef_search.size(); ++i) printf("%s%u", i ? ", " : "", ef_search[i]);
-    printf("]\n");
-    printf("  topk       = %u\n", topk);
-    printf("  num_queries= %u\n", num_queries);
-    printf("  search_threads= %u\n", search_threads);
+    dataset_.print();
+    index_.print();
+    search_.print();
     printf("[benchmark]\n");
-    printf("  index_dir  = %s\n", index_dir.c_str());
-    printf("  delete_ratio = %.2f\n", delete_ratio);
-    printf("  num_rounds = %u\n", num_rounds);
-    printf("  cache_ratio= %.2f\n", cache_ratio);
+    printf("  index_dir  = %s\n", benchmark_.index_dir_.c_str());
+    printf("  delete_ratio = %.2f\n", benchmark_.delete_ratio_);
+    printf("  num_rounds = %u\n", benchmark_.num_rounds_);
+    printf("  cache_ratio= %.2f\n", benchmark_.cache_ratio_);
   }
 };
 
-template <typename T>
-static auto toml_array_to_vec(const toml::array &arr) -> std::vector<T> {
-  std::vector<T> v;
-  for (auto &el : arr) v.push_back(static_cast<T>(el.value_or(T{0})));
-  return v;
-}
-
 static auto load_config(const char *path) -> Config {
-  auto tbl = toml::parse_file(path);
+  auto parsed = bench::parse_common(path);
   Config c;
-
-  if (auto ds = tbl["dataset"].as_table()) {
-    c.data_path  = ds->get("data_path")->value_or(std::string{});
-    c.query_path = ds->get("query_path")->value_or(std::string{});
-    c.gt_path    = ds->get("gt_path")->value_or(std::string{});
-    c.metric     = ds->get("metric")->value_or(std::string{"L2"});
-  }
-  if (auto idx = tbl["index"].as_table()) {
-    if (auto *a = idx->get("R"); a && a->is_array())
-      c.R = toml_array_to_vec<uint32_t>(*a->as_array());
-    c.beam_width = idx->get("beam_width")->value_or(4);
-    if (auto *v = idx->get("num_threads")) c.num_threads = v->value_or(0);
-  }
-  if (auto s = tbl["search"].as_table()) {
-    if (auto *a = s->get("ef_search"); a && a->is_array())
-      c.ef_search = toml_array_to_vec<uint32_t>(*a->as_array());
-    c.topk        = s->get("topk")->value_or(10);
-    c.num_queries = s->get("num_queries")->value_or(200);
-    if (auto *v = s->get("search_threads")) c.search_threads = v->value_or(1);
-  }
-  if (auto b = tbl["benchmark"].as_table()) {
-    c.index_dir    = b->get("index_dir")->value_or(std::string{"/tmp/diskann_bench"});
-    c.delete_ratio = static_cast<float>(b->get("delete_ratio")->value_or(0.01));
-    c.num_rounds   = b->get("num_rounds")->value_or(3);
-    c.cache_ratio  = static_cast<float>(b->get("cache_ratio")->value_or(0.20));
+  c.dataset_ = std::move(parsed.dataset_);
+  c.index_ = std::move(parsed.index_);
+  c.search_ = std::move(parsed.search_);
+  if (auto *b = parsed.root_["benchmark"].as_table()) {
+    c.benchmark_.index_dir_ =
+        bench::toml_get<std::string>(*b, "index_dir", "/tmp/diskann_bench");
+    c.benchmark_.delete_ratio_ =
+        bench::toml_get<float>(*b, "delete_ratio", 0.01F);
+    c.benchmark_.num_rounds_ =
+        bench::toml_get<uint32_t>(*b, "num_rounds", 3);
+    c.benchmark_.cache_ratio_ =
+        bench::toml_get<float>(*b, "cache_ratio", 0.20F);
   }
 
-  if (c.data_path.empty() || c.query_path.empty() || c.gt_path.empty()) {
+  if (c.dataset_.data_path_.empty() || c.dataset_.query_path_.empty() ||
+      c.dataset_.gt_path_.empty()) {
     fprintf(stderr, "Config must specify [dataset] data_path, query_path, gt_path\n");
     exit(1);
   }
@@ -135,30 +107,6 @@ static auto load_config(const char *path) -> Config {
 // Helpers
 // =============================================================================
 
-struct Stopwatch {
-  std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
-  auto sec() const -> double {
-    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-  }
-};
-
-/// Read current process RSS from /proc/self/status (Linux only).
-static auto get_rss_mb() -> double {
-#if defined(__linux__)
-  std::ifstream f("/proc/self/status");
-  std::string line;
-  while (std::getline(f, line)) {
-    if (line.rfind("VmRSS:", 0) == 0) {
-      // Format: "VmRSS:    12345 kB"
-      long kb = 0;
-      std::sscanf(line.c_str(), "VmRSS: %ld", &kb);
-      return static_cast<double>(kb) / 1024.0;
-    }
-  }
-#endif
-  return -1.0;
-}
-
 /// Tracks peak RSS in a background thread (polls every 5 ms).
 class PeakRSSTracker {
  public:
@@ -167,8 +115,8 @@ class PeakRSSTracker {
     running_.store(true, std::memory_order_relaxed);
     thread_ = std::thread([this] {
       while (running_.load(std::memory_order_relaxed)) {
-        long cur = rss_kb();
-        long prev = peak_kb_.load(std::memory_order_relaxed);
+        std::int64_t cur = rss_kb();
+        std::int64_t prev = peak_kb_.load(std::memory_order_relaxed);
         while (cur > prev &&
                !peak_kb_.compare_exchange_weak(prev, cur, std::memory_order_relaxed)) {
         }
@@ -187,14 +135,14 @@ class PeakRSSTracker {
   }
 
  private:
-  static auto rss_kb() -> long {
+  static auto rss_kb() -> std::int64_t {
 #if defined(__linux__)
     std::ifstream f("/proc/self/status");
     std::string line;
     while (std::getline(f, line)) {
-      if (line.rfind("VmRSS:", 0) == 0) {
-        long kb = 0;
-        std::sscanf(line.c_str(), "VmRSS: %ld", &kb);
+      if (line.starts_with("VmRSS:")) {
+        std::int64_t kb = 0;
+        kb = static_cast<std::int64_t>(std::stoll(line.substr(std::string("VmRSS:").size())));
         return kb;
       }
     }
@@ -202,7 +150,7 @@ class PeakRSSTracker {
     return 0;
   }
 
-  std::atomic<long> peak_kb_{0};
+  std::atomic<std::int64_t> peak_kb_{0};
   std::atomic<bool> running_{false};
   std::thread thread_;
 };
@@ -213,10 +161,12 @@ static void print_io_stats(DiskANNIndex<> &idx,
                            double peak_rss = -1.0,
                            double prev_rss = -1.0) {
   auto *srch = idx.searcher();
-  if (srch == nullptr) return;
+  if (srch == nullptr) {
+    return;
+  }
   auto &stats = srch->buffer_pool().stats();
   bool direct_io = srch->bypasses_page_cache();
-  double rss = get_rss_mb();
+  double rss = bench::get_rss_mb();
   double delta = (prev_rss > 0.0 && rss > 0.0) ? rss - prev_rss : 0.0;
   if (peak_rss > 0.0) {
     printf("  [%s] Direct-I/O=%s  RSS=%.0fMB (peak=%.0fMB delta=%+.0fMB)  "
@@ -248,8 +198,9 @@ static void print_io_stats(DiskANNIndex<> &idx,
 static void copy_index(const std::string &src, const std::string &dst) {
   for (const char *ext : {".data", ".meta"}) {
     auto s = src + ext;
-    if (std::filesystem::exists(s))
+    if (std::filesystem::exists(s)) {
       std::filesystem::copy_file(s, dst + ext, std::filesystem::copy_options::overwrite_existing);
+    }
   }
 }
 
@@ -284,9 +235,13 @@ static auto measure_recall(DiskANNIndex<> &idx, const Dataset &ds,
   return calc_recall(ids.data(), ds.ground_truth_.data(), nq, ds.gt_dim_, topk);
 }
 
-static auto measure_qps(DiskANNIndex<> &idx, const Dataset &ds,
-                         uint32_t nq, uint32_t topk, uint32_t ef, uint32_t bw,
-                         uint32_t search_threads) -> double {
+static auto measure_qps(DiskANNIndex<> &idx,
+                        const Dataset &ds,
+                        uint32_t nq,
+                        uint32_t topk,
+                        uint32_t ef,
+                        uint32_t bw,
+                        uint32_t search_threads) -> double {
   DiskANNSearchParams p;
   p.set_ef_search(ef).set_beam_width(bw).set_num_threads(search_threads);
   std::vector<uint32_t> ids(static_cast<size_t>(nq) * topk);
@@ -294,9 +249,9 @@ static auto measure_qps(DiskANNIndex<> &idx, const Dataset &ds,
     idx.search(ds.queries_.data() + (q % ds.query_num_) * ds.dim_, topk,
                ids.data() + q * topk, p);
   }
-  Stopwatch t;
+  Timer t;
   idx.batch_search(ds.queries_.data(), nq, topk, ids.data(), p);
-  double elapsed = t.sec();
+  double elapsed = t.elapsed_s();
   return nq / std::max(elapsed, 1e-9);
 }
 
@@ -306,32 +261,37 @@ static auto measure_qps(DiskANNIndex<> &idx, const Dataset &ds,
 
 static void run(const Config &cfg, Dataset &ds, uint32_t R) {
   // Compute cache
-  size_t row = 4 + size_t(R) * 4 + size_t(ds.dim_) * 4;
-  uint32_t npb = std::max(1U, uint32_t(4096 / row));
+  std::size_t row =
+      4 + static_cast<std::size_t>(R) * 4 + static_cast<std::size_t>(ds.dim_) * 4;
+  uint32_t npb = std::max(1U, static_cast<uint32_t>(4096 / row));
   uint32_t blocks = (ds.data_num_ + npb - 1) / npb;
-  auto cache = static_cast<size_t>(float(blocks) * cfg.cache_ratio);
+  auto cache = static_cast<std::size_t>(static_cast<float>(blocks) * cfg.benchmark_.cache_ratio_);
   uint32_t ef_con = std::max(R * 2, 64U);
-  uint32_t num_del = static_cast<uint32_t>(ds.data_num_ * cfg.delete_ratio);
+  auto num_del = static_cast<uint32_t>(ds.data_num_ * cfg.benchmark_.delete_ratio_);
+  uint32_t nq = cfg.search_.num_queries_ > 0
+                    ? std::min(cfg.search_.num_queries_, ds.query_num_)
+                    : ds.query_num_;
 
-  auto idx_path = cfg.index_dir + "/idx_r" + std::to_string(R);
+  auto idx_path = cfg.benchmark_.index_dir_ + "/idx_r" + std::to_string(R);
 
   printf("\n==========================================================\n");
   printf("R=%u  L=%u  cache=%zu pages (%.0f MB, %.0f%%)\n",
-         R, ef_con, cache, cache * 4096.0 / 1048576, cfg.cache_ratio * 100);
+         R, ef_con, cache, cache * 4096.0 / 1048576, cfg.benchmark_.cache_ratio_ * 100);
   printf("==========================================================\n\n");
 
   // Build
-  for (const char *ext : {".data", ".meta"})
+  for (const char *ext : {".data", ".meta"}) {
     std::filesystem::remove(idx_path + ext);
-  std::filesystem::create_directories(cfg.index_dir);
+  }
+  std::filesystem::create_directories(cfg.benchmark_.index_dir_);
   {
-    auto metric = (cfg.metric == "IP") ? MetricType::IP : MetricType::L2;
+    auto metric = kMetricMap[cfg.dataset_.metric_];
     // Load raw vectors locally so they are freed after fit(), before any search
     // benchmarks run. This keeps RSS clean (buffer pool only, not raw dataset).
     std::vector<float> raw;
     [[maybe_unused]] uint32_t raw_num = 0;
     [[maybe_unused]] uint32_t raw_dim = 0;
-    load_fvecs(cfg.data_path, raw, raw_num, raw_dim);
+    load_fvecs(cfg.dataset_.data_path_, raw, raw_num, raw_dim);
     auto sp = std::make_shared<RawSpace<>>(ds.data_num_, ds.dim_, metric);
     sp->fit(raw.data(), ds.data_num_);
     raw.clear();
@@ -340,12 +300,12 @@ static void run(const Config &cfg, Dataset &ds, uint32_t R) {
                  .set_max_degree(R)
                  .set_ef_construction(ef_con)
                  .set_num_iterations(2)
-                 .set_num_threads(cfg.num_threads);
+                 .set_num_threads(cfg.index_.num_threads_);
     printf("Building... ");
     fflush(stdout);
-    Stopwatch t;
+    Timer t;
     DiskANNIndex<>::build(sp, idx_path, p);
-    printf("%.1fs\n\n", t.sec());
+    printf("%.1fs\n\n", t.elapsed_s());
   }
 
   // --- 1. Baseline ---
@@ -356,16 +316,18 @@ static void run(const Config &cfg, Dataset &ds, uint32_t R) {
     print_io_stats(idx, "load");
     PeakRSSTracker srch_tracker;
     srch_tracker.start();
-    for (uint32_t ef : cfg.ef_search) {
-      float rc = measure_recall(idx, ds, cfg.num_queries, cfg.topk, ef, cfg.beam_width, cfg.search_threads);
-      double qps = measure_qps(idx, ds, cfg.num_queries, cfg.topk, ef, cfg.beam_width, cfg.search_threads);
-      printf("  ef=%u  recall@%u=%.4f  QPS=%.1f\n", ef, cfg.topk, rc, qps);
+    for (uint32_t ef : cfg.search_.ef_search_) {
+      float rc = measure_recall(idx, ds, nq, cfg.search_.topk_, ef,
+                                cfg.index_.beam_width_, cfg.search_.search_threads_);
+      double qps = measure_qps(idx, ds, nq, cfg.search_.topk_, ef,
+                               cfg.index_.beam_width_, cfg.search_.search_threads_);
+      printf("  ef=%u  recall@%u=%.4f  QPS=%.1f\n", ef, cfg.search_.topk_, rc, qps);
     }
     print_io_stats(idx, "after search", srch_tracker.stop_mb());
   }
 
   // --- 2. Delete-only ---
-  printf("\n[Delete-only %.0f%% (%u)]\n", cfg.delete_ratio * 100, num_del);
+  printf("\n[Delete-only %.0f%% (%u)]\n", cfg.benchmark_.delete_ratio_ * 100, num_del);
   {
     auto tmp = std::filesystem::temp_directory_path() / "bench_del";
     std::filesystem::create_directories(tmp);
@@ -383,16 +345,17 @@ static void run(const Config &cfg, Dataset &ds, uint32_t R) {
     uint32_t n = 0;
     PeakRSSTracker del_tracker;
     del_tracker.start();
-    Stopwatch t;
+    Timer t;
     for (uint32_t i = 0; i < pool.size() && n < num_del; ++i) {
       try { idx.delete_vector(pool[i]); ++n; }
-      catch (const std::logic_error &) {}
+      catch (const std::logic_error &e) { (void)e; /* already deleted */ }
     }
-    double del_elapsed = t.sec();
+    double del_elapsed = t.elapsed_s();
     printf("  %u deleted in %.2fs  QPS=%.1f\n", n, del_elapsed, n / std::max(del_elapsed, 1e-9));
-    for (uint32_t ef : cfg.ef_search) {
-      float rc = measure_recall(idx, ds, cfg.num_queries, cfg.topk, ef, cfg.beam_width, cfg.search_threads);
-      printf("  ef=%u  recall@%u=%.4f\n", ef, cfg.topk, rc);
+    for (uint32_t ef : cfg.search_.ef_search_) {
+      float rc = measure_recall(idx, ds, nq, cfg.search_.topk_, ef,
+                                cfg.index_.beam_width_, cfg.search_.search_threads_);
+      printf("  ef=%u  recall@%u=%.4f\n", ef, cfg.search_.topk_, rc);
     }
     print_io_stats(idx, "after delete+search", del_tracker.stop_mb());
     idx.close();
@@ -401,7 +364,8 @@ static void run(const Config &cfg, Dataset &ds, uint32_t R) {
 
   // --- 3. Delete + Insert rounds ---
   printf("\n[Delete %.0f%% + Insert %.0f%%, %u rounds]\n",
-         cfg.delete_ratio * 100, cfg.delete_ratio * 100, cfg.num_rounds);
+         cfg.benchmark_.delete_ratio_ * 100, cfg.benchmark_.delete_ratio_ * 100,
+         cfg.benchmark_.num_rounds_);
   {
     auto tmp = std::filesystem::temp_directory_path() / "bench_di";
     std::filesystem::create_directories(tmp);
@@ -414,10 +378,12 @@ static void run(const Config &cfg, Dataset &ds, uint32_t R) {
     print_io_stats(idx, "load");
 
     // Baseline
-    for (uint32_t ef : cfg.ef_search) {
-      float rc = measure_recall(idx, ds, cfg.num_queries, cfg.topk, ef, cfg.beam_width, cfg.search_threads);
-      double qps = measure_qps(idx, ds, cfg.num_queries, cfg.topk, ef, cfg.beam_width, cfg.search_threads);
-      printf("  baseline  ef=%u  recall@%u=%.4f  QPS=%.1f\n", ef, cfg.topk, rc, qps);
+    for (uint32_t ef : cfg.search_.ef_search_) {
+      float rc = measure_recall(idx, ds, nq, cfg.search_.topk_, ef,
+                                cfg.index_.beam_width_, cfg.search_.search_threads_);
+      double qps = measure_qps(idx, ds, nq, cfg.search_.topk_, ef,
+                               cfg.index_.beam_width_, cfg.search_.search_threads_);
+      printf("  baseline  ef=%u  recall@%u=%.4f  QPS=%.1f\n", ef, cfg.search_.topk_, rc, qps);
     }
 
     // All live IDs — re-shuffled each round so deletion targets the full live set,
@@ -427,10 +393,10 @@ static void run(const Config &cfg, Dataset &ds, uint32_t R) {
     std::mt19937 rng(42);
 
     DiskANNInsertParams ip;
-    ip.set_ef_construction(ef_con).set_alpha(1.2F).set_beam_width(cfg.beam_width);
+    ip.set_ef_construction(ef_con).set_alpha(1.2F).set_beam_width(cfg.index_.beam_width_);
 
-    double prev_rss = get_rss_mb();
-    for (uint32_t rd = 1; rd <= cfg.num_rounds; ++rd) {
+    double prev_rss = bench::get_rss_mb();
+    for (uint32_t rd = 1; rd <= cfg.benchmark_.num_rounds_; ++rd) {
       // Re-shuffle each round to sample randomly from the full live set.
       std::shuffle(pool.begin(), pool.end(), rng);
       std::vector<uint32_t> ids(pool.begin(), pool.begin() + num_del);
@@ -446,33 +412,36 @@ static void run(const Config &cfg, Dataset &ds, uint32_t R) {
       std::vector<std::vector<float>> del_vecs;
       del_ids.reserve(ids.size());
       del_vecs.reserve(ids.size());
-      Stopwatch td;
+      Timer td;
       for (size_t i = 0; i < ids.size(); ++i) {
         try {
           idx.delete_vector(ids[i]);
           del_ids.push_back(ids[i]);
           del_vecs.push_back(std::move(vecs[i]));
-        } catch (const std::logic_error &) {}
+        } catch (const std::logic_error &e) { (void)e; /* already deleted */ }
       }
-      double d_sec = td.sec();
+      double d_sec = td.elapsed_s();
 
       // Insert
-      Stopwatch ti;
-      for (size_t i = 0; i < del_ids.size(); ++i)
+      Timer ti;
+      for (size_t i = 0; i < del_ids.size(); ++i) {
         idx.insert(del_vecs[i].data(), del_ids[i], ip);
-      double i_sec = ti.sec();
+      }
+      double i_sec = ti.elapsed_s();
 
       auto dn = static_cast<double>(del_ids.size());
       printf("  round %u  del=%.2fs(%.0f QPS)  ins=%.2fs(%.1f QPS)\n",
              rd, d_sec, dn / std::max(d_sec, 1e-9), i_sec, dn / std::max(i_sec, 1e-9));
-      for (uint32_t ef : cfg.ef_search) {
-        float rc = measure_recall(idx, ds, cfg.num_queries, cfg.topk, ef, cfg.beam_width, cfg.search_threads);
-        double qps = measure_qps(idx, ds, cfg.num_queries, cfg.topk, ef, cfg.beam_width, cfg.search_threads);
-        printf("           ef=%u  recall@%u=%.4f  QPS=%.1f\n", ef, cfg.topk, rc, qps);
+      for (uint32_t ef : cfg.search_.ef_search_) {
+        float rc = measure_recall(idx, ds, nq, cfg.search_.topk_, ef,
+                                  cfg.index_.beam_width_, cfg.search_.search_threads_);
+        double qps = measure_qps(idx, ds, nq, cfg.search_.topk_, ef,
+                                 cfg.index_.beam_width_, cfg.search_.search_threads_);
+        printf("           ef=%u  recall@%u=%.4f  QPS=%.1f\n", ef, cfg.search_.topk_, rc, qps);
       }
       print_io_stats(idx, ("round " + std::to_string(rd)).c_str(), round_tracker.stop_mb(),
                      prev_rss);
-      prev_rss = get_rss_mb();
+      prev_rss = bench::get_rss_mb();
     }
     idx.close();
     std::filesystem::remove_all(tmp);
@@ -484,9 +453,9 @@ static void run(const Config &cfg, Dataset &ds, uint32_t R) {
 // Main
 // =============================================================================
 
-int main(int argc, char **argv) {
+auto main(int argc, char **argv) -> int {
   if (argc < 2) {
-    fprintf(stderr, "Usage: %s <config.conf>\n", argv[0]);
+    fprintf(stderr, "Usage: %s <config.toml>\n", argv[0]);
     return 1;
   }
 
@@ -498,27 +467,28 @@ int main(int argc, char **argv) {
   // Load dataset via existing infrastructure
   DatasetConfig dc;
   dc.name_ = "bench";
-  dc.dir_ = std::filesystem::path(cfg.data_path).parent_path();
-  dc.data_file_ = cfg.data_path;
-  dc.query_file_ = cfg.query_path;
-  dc.gt_file_ = cfg.gt_path;
+  dc.dir_ = std::filesystem::path(cfg.dataset_.data_path_).parent_path();
+  dc.data_file_ = cfg.dataset_.data_path_;
+  dc.query_file_ = cfg.dataset_.query_path_;
+  dc.gt_file_ = cfg.dataset_.gt_path_;
   auto ds = load_dataset(dc);
   // Raw vectors are only needed inside run() during the build phase.
   // Free them here so the ~1 GB allocation does not inflate RSS measurements.
   ds.data_.clear();
   ds.data_.shrink_to_fit();
 
-  if (cfg.num_queries < ds.query_num_) {
-    ds.query_num_ = cfg.num_queries;
-    ds.queries_.resize(size_t(ds.query_num_) * ds.dim_);
-    ds.ground_truth_.resize(size_t(ds.query_num_) * ds.gt_dim_);
+  if (cfg.search_.num_queries_ > 0 && cfg.search_.num_queries_ < ds.query_num_) {
+    ds.query_num_ = cfg.search_.num_queries_;
+    ds.queries_.resize(static_cast<std::size_t>(ds.query_num_) * ds.dim_);
+    ds.ground_truth_.resize(static_cast<std::size_t>(ds.query_num_) * ds.gt_dim_);
   }
 
   printf("Loaded: %u vectors, dim=%u, %u queries, gt_dim=%u\n\n",
          ds.data_num_, ds.dim_, ds.query_num_, ds.gt_dim_);
 
-  for (uint32_t r : cfg.R)
+  for (uint32_t r : cfg.index_.r_) {
     run(cfg, ds, r);
+  }
 
   printf("Done.\n");
   return 0;

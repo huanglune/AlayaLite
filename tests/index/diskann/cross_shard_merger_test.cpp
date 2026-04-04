@@ -500,7 +500,10 @@ TEST(CrossShardMergerTest, EmptyShardFile) {
   auto dir = make_temp_dir("empty_shard");
 
   // Create an empty shard file
-  std::ofstream(dir / "shard_0.graph", std::ios::binary | std::ios::trunc);
+  auto empty_shard_path = dir / "shard_0.graph";
+  std::ofstream empty_shard_file(empty_shard_path, std::ios::binary | std::ios::trunc);
+  ASSERT_TRUE(empty_shard_file.good());
+  empty_shard_file.close();
 
   std::vector<ShardGraphReader::NodeEntry> shard1 = {
       {0, {{1, 1.0F, 1}}},
@@ -509,7 +512,7 @@ TEST(CrossShardMergerTest, EmptyShardFile) {
   write_shard_graph(dir / "shard_1.graph", shard1);
 
   CrossShardMerger merger({kMaxDegree, 1.2F});
-  merger.open({dir / "shard_0.graph", dir / "shard_1.graph"});
+  merger.open({empty_shard_path, dir / "shard_1.graph"});
 
   std::vector<CrossShardMerger::MergedNode> results;
   merger.merge_all([&](const CrossShardMerger::MergedNode &node) { results.push_back(node); });

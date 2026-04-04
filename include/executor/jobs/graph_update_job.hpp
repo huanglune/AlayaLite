@@ -111,14 +111,14 @@ class GraphUpdateJob {
       if (nbr == static_cast<IDType>(-1)) {
         break;
       }
-      if (job_context_->removed_vertices_.count(nbr)) {
+      if (job_context_->removed_vertices_.contains(nbr)) {
         for (auto &second_hop_nbr : job_context_->removed_node_nbrs_.at(nbr)) {
           candidate_nbrs.insert(second_hop_nbr);
         }
       }
       candidate_nbrs.insert(nbr);
     }
-    if (job_context_->inserted_edges_.count(node_id)) {
+    if (job_context_->inserted_edges_.contains(node_id)) {
       for (auto inserted_nbr : job_context_->inserted_edges_.at(node_id)) {
         candidate_nbrs.insert(inserted_nbr);
       }

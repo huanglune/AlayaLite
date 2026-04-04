@@ -308,7 +308,7 @@ class PyIndex : public BasePyIndex {
     for (uint32_t i = 0; i < num_threads; i++) {
       worker_cpus.push_back(i);
     }
-    auto scheduler = std::make_shared<alaya::Scheduler>(worker_cpus);
+    auto scheduler = std::make_shared<alaya::Scheduler>(worker_cpus, nullptr);
     for (uint32_t i = 0; i < query_size; i++) {
       auto cur_query = query_ptr + i * query_dim;
 
@@ -390,7 +390,7 @@ class PyIndex : public BasePyIndex {
     for (uint32_t i = 0; i < num_threads; i++) {
       worker_cpus.push_back(i);
     }
-    auto scheduler = std::make_shared<alaya::Scheduler>(worker_cpus);
+    auto scheduler = std::make_shared<alaya::Scheduler>(worker_cpus, nullptr);
     if constexpr (std::is_same<SearchSpaceType, BuildSpaceType>::value) {
       dist_pool = std::vector<std::vector<DistanceType>>(query_size, std::vector<DistanceType>(ef));
     }

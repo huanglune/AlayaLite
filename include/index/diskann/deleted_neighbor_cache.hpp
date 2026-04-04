@@ -77,7 +77,7 @@ class DeletedNeighborCache {
     auto it = map_.find(node_id);
     if (it != map_.end()) {
       // Update existing entry, move to front (MRU)
-      it->second->neighbors = std::move(neighbors);
+      it->second->neighbors_ = std::move(neighbors);
       lru_list_.splice(lru_list_.begin(), lru_list_, it->second);
       return;
     }
@@ -85,7 +85,7 @@ class DeletedNeighborCache {
     // Evict LRU if at capacity
     if (map_.size() >= capacity_) {
       auto &back = lru_list_.back();
-      map_.erase(back.node_id);
+      map_.erase(back.node_id_);
       lru_list_.pop_back();
     }
 
@@ -111,7 +111,7 @@ class DeletedNeighborCache {
 
     // Move to front (MRU)
     lru_list_.splice(lru_list_.begin(), lru_list_, it->second);
-    return it->second->neighbors;  // return a copy so caller is safe after lock release
+    return it->second->neighbors_;  // return a copy so caller is safe after lock release
   }
 
   /**
@@ -134,8 +134,8 @@ class DeletedNeighborCache {
 
  private:
   struct Entry {
-    IDType node_id;
-    std::vector<IDType> neighbors;
+    IDType node_id_;
+    std::vector<IDType> neighbors_;
   };
 
   size_t capacity_;

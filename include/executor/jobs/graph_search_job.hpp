@@ -19,8 +19,10 @@
 #include <coroutine>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <stdexcept>
+#include <utility>
 
 #include "../../index/graph/graph.hpp"
 #include "../../space/space_concepts.hpp"
@@ -83,7 +85,7 @@ struct GraphSearchJob {
   explicit GraphSearchJob(std::shared_ptr<DistanceSpaceType> space,
                           std::shared_ptr<Graph<DataType, IDType>> graph,
                           std::shared_ptr<JobContext<IDType>> job_context = nullptr)
-      : space_(space), graph_(graph), job_context_(job_context) {
+      : space_(std::move(space)), graph_(std::move(graph)), job_context_(std::move(job_context)) {
     if (!job_context_) {
       job_context_ = std::make_shared<JobContext<IDType>>();
     }
@@ -377,7 +379,7 @@ struct GraphSearchJob {
 
     while (pool.has_next()) {
       auto u = pool.pop();
-      if (job_context_->removed_node_nbrs_.count(u)) {
+      if (job_context_->removed_node_nbrs_.contains(u)) {
         for (auto &second_hop_nbr : job_context_->removed_node_nbrs_.at(u)) {
           if (pool.vis_.get(second_hop_nbr)) {
             continue;

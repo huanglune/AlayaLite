@@ -874,8 +874,8 @@ TEST_F(DiskANNUpdateDeleteTest, SearchAfterDeleteExcludesDeletedIDs) {
     try {
       index.delete_vector(id);
       deleted_ids.push_back(id);
-    } catch (const std::logic_error &) {
-      // Entry point, skip
+    } catch (const std::logic_error &e) {
+      (void)e;  // Entry point, skip
     }
   }
   ASSERT_FALSE(deleted_ids.empty());
@@ -944,7 +944,7 @@ TEST_F(DiskANNUpdateDeleteTest, DeleteEntryPointThrows) {
       found_medoid = true;
       break;
     } catch (...) {
-      // Not the right exception
+      (void)0;  // Not the right exception
     }
   }
   EXPECT_TRUE(found_medoid) << "Entry point should be protected from deletion";
@@ -1020,8 +1020,8 @@ TEST_F(DiskANNUpdateDeleteTest, MixedInsertDeleteWorkload) {
     try {
       index.delete_vector(id);
       deleted.push_back(id);
-    } catch (const std::logic_error &) {
-      // medoid, skip
+    } catch (const std::logic_error &e) {
+      (void)e;  // medoid, skip
     }
   }
 
@@ -1138,7 +1138,6 @@ TEST_F(DiskANNUpdateDeleteTest, InsertBeyondCapacityAutoGrows) {
 
 TEST_F(DiskANNUpdateDeleteTest, DeleteInsertCyclesNoSearchContextRealloc) {
   auto index = load_writable();
-  auto &searcher = index.get_searcher();
 
   // Warmup: do one search to initialize the thread-local SearchContext
   {
@@ -1150,14 +1149,14 @@ TEST_F(DiskANNUpdateDeleteTest, DeleteInsertCyclesNoSearchContextRealloc) {
   }
 
   // Record RSS after warmup
-  auto get_rss_kb = []() -> long {
+  auto get_rss_kb = []() -> int64_t {
 #if defined(__linux__)
     std::ifstream f("/proc/self/status");
     std::string line;
     while (std::getline(f, line)) {
-      if (line.rfind("VmRSS:", 0) == 0) {
-        long kb = 0;
-        std::sscanf(line.c_str(), "VmRSS: %ld", &kb);
+      if (line.starts_with("VmRSS:")) {
+        int64_t kb = 0;
+        kb = static_cast<int64_t>(std::stoll(line.substr(std::string("VmRSS:").size())));
         return kb;
       }
     }
@@ -1165,7 +1164,7 @@ TEST_F(DiskANNUpdateDeleteTest, DeleteInsertCyclesNoSearchContextRealloc) {
     return -1;
   };
 
-  long rss_before = get_rss_kb();
+  int64_t rss_before = get_rss_kb();
 
   // Perform multiple delete+insert rounds without growing capacity
   constexpr uint32_t kRounds = 5;
@@ -1180,8 +1179,8 @@ TEST_F(DiskANNUpdateDeleteTest, DeleteInsertCyclesNoSearchContextRealloc) {
       try {
         index.delete_vector(id);
         deleted.push_back(id);
-      } catch (const std::logic_error &) {
-        // medoid, skip
+      } catch (const std::logic_error &e) {
+        (void)e;  // medoid, skip
       }
     }
 
@@ -1200,13 +1199,13 @@ TEST_F(DiskANNUpdateDeleteTest, DeleteInsertCyclesNoSearchContextRealloc) {
     index.search(query, kTopk, ids.data(), params);
   }
 
-  long rss_after = get_rss_kb();
+  int64_t rss_after = get_rss_kb();
 
   // RSS should not grow significantly (< 20MB tolerance for a 200-vector index)
   // If SearchContext were rebuilt every time, each rebuild allocates ~capacity*4 bytes
   // for VisitedList, causing RSS growth from arena fragmentation.
   if (rss_before > 0 && rss_after > 0) {
-    long rss_growth_kb = rss_after - rss_before;
+    int64_t rss_growth_kb = rss_after - rss_before;
     LOG_INFO("Delete+insert cycle RSS: before={}KB, after={}KB, growth={}KB",
              rss_before, rss_after, rss_growth_kb);
     EXPECT_LT(rss_growth_kb, 20 * 1024)
@@ -1583,7 +1582,7 @@ TEST_F(MultiWorkerTest, MultiWorkerSearchMatchesSingleWorker) {
     // At least 80% of IDs should match (allowing for tie-breaking differences)
     size_t matches = 0;
     for (auto id : single_ids) {
-      if (multi_ids.count(id) > 0) {
+      if (multi_ids.contains(id)) {
         ++matches;
       }
     }
@@ -1755,19 +1754,11 @@ TEST_F(DiskANNUpdateDeleteTest, DeleteRepairsFormerNeighbors) {
 
   // Compute baseline recall using data vectors as queries
   uint32_t num_queries = 20;
-  uint32_t found_baseline = 0;
   for (uint32_t q = 1; q <= num_queries; ++q) {
     const float *query = make_query(q);
     std::vector<uint32_t> ids(kTopk);
     std::vector<float> dists(kTopk);
     index.search_with_distance(query, kTopk, ids.data(), dists.data(), params);
-    // Check if the query vector itself is in the results (self-recall)
-    for (uint32_t i = 0; i < kTopk; ++i) {
-      if (ids[i] == q) {
-        ++found_baseline;
-        break;
-      }
-    }
   }
 
   // Delete ~5% of non-medoid nodes
@@ -1776,8 +1767,8 @@ TEST_F(DiskANNUpdateDeleteTest, DeleteRepairsFormerNeighbors) {
     try {
       index.delete_vector(id);
       deleted.push_back(id);
-    } catch (const std::logic_error &) {
-      // Skip medoid
+    } catch (const std::logic_error &e) {
+      (void)e;  // Skip medoid
     }
   }
   ASSERT_FALSE(deleted.empty());
@@ -1931,7 +1922,7 @@ TEST_F(DiskANNSearcherTest, EmptyBeamTerminatesCorrectly) {
 
   // Use a very large ef_search relative to index size to exhaust candidates
   DiskANNSearchParams params;
-  params.set_ef_search(static_cast<uint32_t>(data_num()));
+  params.set_ef_search(data_num());
   params.set_beam_width(1);
 
   std::vector<float> query(dim(), 0.0F);

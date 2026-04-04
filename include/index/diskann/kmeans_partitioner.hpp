@@ -20,7 +20,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
+#include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
 #include <limits>
 #include <numeric>
@@ -158,7 +158,7 @@ class KMeansPartitioner {
   template <typename DistanceSpaceType>
     requires Space<DistanceSpaceType> &&
              requires(DistanceSpaceType &space, typename DistanceSpaceType::IDTypeAlias id) {
-               { space.get_data_by_id(id) };
+               space.get_data_by_id(id);
              }
   auto partition(DistanceSpaceType &space,
                  uint32_t max_degree,
@@ -300,7 +300,7 @@ class KMeansPartitioner {
     layout.node_to_shards_.assign(static_cast<size_t>(num_nodes) * max_assignments,
                                   Layout::kInvalidShard);
     layout.assignment_distances_.assign(static_cast<size_t>(num_nodes) * max_assignments,
-                                        std::numeric_limits<float>::infinity());
+                                        std::numeric_limits<float>::max());
 
     std::vector<std::pair<float, uint32_t>> distances(num_shards);
     for (uint32_t node_id = 0; node_id < num_nodes; ++node_id) {
@@ -377,7 +377,7 @@ class KMeansPartitioner {
           auto idx = static_cast<size_t>(node_id) * layout.max_assignments_ + slot;
           if (layout.node_to_shards_[idx] == shard) {
             layout.node_to_shards_[idx] = Layout::kInvalidShard;
-            layout.assignment_distances_[idx] = std::numeric_limits<float>::infinity();
+            layout.assignment_distances_[idx] = std::numeric_limits<float>::max();
             members.pop_back();
             break;
           }

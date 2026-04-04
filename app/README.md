@@ -9,6 +9,8 @@ This directory contains the FastAPI service that exposes collection-oriented Ala
 - Persistent storage controlled by `ALAYALITE_DATA_DIR`
 - Interactive API docs at `/docs`
 
+The root route `GET /` returns a simple readiness payload. All collection operations use `POST`.
+
 ## Local Development
 
 Run these commands from the repository root:
@@ -30,7 +32,8 @@ uv run pytest app/tests -v
 
 - Default storage directory: `./data`
 - Override with `ALAYALITE_DATA_DIR`
-- The directory is created automatically on startup (the parent path must be writable)
+- The directory is created automatically on startup
+- Saved collections are reloaded when the service restarts with the same storage directory
 
 Example:
 
@@ -59,15 +62,13 @@ docker run -d \
 
 ## Endpoints
 
-All collection endpoints use `POST`.
-
 | Endpoint | Purpose |
 | --- | --- |
 | `/api/v1/collection/create` | Create a collection |
 | `/api/v1/collection/set_metric` | Set the metric before the first insert |
 | `/api/v1/collection/list` | List collection names |
 | `/api/v1/collection/delete` | Delete a collection |
-| `/api/v1/collection/reset` | Clear all in-memory collections |
+| `/api/v1/collection/reset` | Clear all collections |
 | `/api/v1/collection/insert` | Insert items |
 | `/api/v1/collection/query` | Search by query vectors |
 | `/api/v1/collection/upsert` | Insert or update items |
@@ -75,7 +76,12 @@ All collection endpoints use `POST`.
 | `/api/v1/collection/delete_by_filter` | Delete items by metadata filter |
 | `/api/v1/collection/save` | Persist a collection to disk |
 
-The root route `GET /` returns a simple readiness message.
+Request model notes:
+
+- `delete` accepts `delete_on_disk` and defaults to `false`
+- `reset` accepts `delete_on_disk` and defaults to `false`
+- `insert` and `upsert` expect items in `[id, document, embedding, metadata]` form
+- `query` expects `query_vector`, `limit`, `ef_search`, and `num_threads`
 
 ## Example Requests
 
@@ -138,6 +144,14 @@ The response shape matches `Collection.batch_query(...)`:
 }
 ```
 
+### Delete a collection from memory and disk
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/collection/delete \
+  -H "Content-Type: application/json" \
+  -d '{"collection_name":"demo","delete_on_disk":true}'
+```
+
 ### Save a collection
 
 ```bash
@@ -146,4 +160,8 @@ curl -X POST http://127.0.0.1:8000/api/v1/collection/save \
   -d '{"collection_name":"demo"}'
 ```
 
-For a fuller endpoint walkthrough, see `app/API_Usage_Documentation.md`.
+Common error cases:
+
+- `409` when creating a collection that already exists
+- `404` when operating on a collection that does not exist
+- `400` for invalid insert/query payload values that pass schema validation but fail runtime checks

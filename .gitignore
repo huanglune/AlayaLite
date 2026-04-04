@@ -77,7 +77,6 @@ logs/
 data/
 benchmark/results/
 benchmark/index/*.png
-benchmark/index/plot_hnsw.py
 
 # ============================================================
 # Tooling

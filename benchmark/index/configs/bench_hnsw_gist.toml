@@ -1,0 +1,20 @@
+# GIST1M benchmark — R=32 equiv hnswlib M=16
+[dataset]
+data_path  = "/home/huangliang/alaya-dev/hnswlib/lab/gist/gist_base.fvecs"
+query_path = "/home/huangliang/alaya-dev/hnswlib/lab/gist/gist_query.fvecs"
+gt_path    = "/home/huangliang/alaya-dev/hnswlib/lab/gist/gist_groundtruth.ivecs"
+metric     = "L2"
+
+[index]
+R               = [32]
+ef_construction = [200]
+num_threads     = 0
+
+[search]
+ef_search   = [10, 20, 30, 40, 50, 60, 80, 100, 120, 150, 200, 300, 500, 800]
+topk        = 10
+
+[benchmark]
+graph_dir      = "/tmp/hnsw_bench_gist"
+warmup_rounds  = 3
+measure_rounds = 5

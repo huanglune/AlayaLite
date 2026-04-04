@@ -145,9 +145,9 @@ class DiskANNStorage {
         // Index was created successfully but stale .pq couldn't be removed.
         // Close the new index and report the error — open() would reject it.
         close();
-        throw std::runtime_error(
-            "Index created but failed to remove stale PQ sidecar at " + legacy_pq +
-            ": " + ec.message() + ". Remove it manually, then re-open.");
+        throw std::runtime_error("Index created but failed to remove stale PQ sidecar at " +
+                                 legacy_pq + ": " + ec.message() +
+                                 ". Remove it manually, then re-open.");
       }
     }
   }

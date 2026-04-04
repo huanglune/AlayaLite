@@ -405,7 +405,7 @@ TEST_F(DiskANNBuilderTest, RecallBenchmark) {
     index.search(query, kTopk, results.data(), search_params);
 
     for (auto id : results) {
-      if (gt_set.count(id) > 0) {
+      if (gt_set.contains(id)) {
         ++total_hits;
       }
     }

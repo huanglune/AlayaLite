@@ -74,8 +74,8 @@ TEST_F(AsyncBufferPoolTest, CacheHitReturnsReady) {
 
   auto ar = pool.begin_async_read(0, io, 0);
   EXPECT_TRUE(ar.is_ready());
-  EXPECT_FALSE(ar.handle.empty());
-  EXPECT_EQ(ar.handle.data()[0], 1);
+  EXPECT_FALSE(ar.handle_.empty());
+  EXPECT_EQ(ar.handle_.data()[0], 1);
 }
 
 // Test 2: Cache miss - submit async I/O and poll until completion
@@ -84,8 +84,8 @@ TEST_F(AsyncBufferPoolTest, CacheMissPollCompletion) {
   DirectFileIO io(test_file_, DirectFileIO::Mode::kRead);
 
   auto ar = pool.begin_async_read(3, io, 3 * kFrameSize);
-  EXPECT_FALSE(ar.handle.empty());
-  EXPECT_NE(ar.pending, nullptr);
+  EXPECT_FALSE(ar.handle_.empty());
+  EXPECT_NE(ar.pending_, nullptr);
 
   // Poll until I/O completes
   for (int i = 0; i < 10000 && !ar.is_ready(); i++) {
@@ -94,7 +94,7 @@ TEST_F(AsyncBufferPoolTest, CacheMissPollCompletion) {
   }
 
   EXPECT_TRUE(ar.is_ready());
-  EXPECT_EQ(ar.handle.data()[0], 4);  // sector 3 filled with byte 4
+  EXPECT_EQ(ar.handle_.data()[0], 4);  // sector 3 filled with byte 4
 }
 
 // Test 3: Multiple async reads on different pages
@@ -129,7 +129,7 @@ TEST_F(AsyncBufferPoolTest, MultiplePagesAsyncRead) {
 
   for (uint32_t i = 0; i < kNumReads; i++) {
     EXPECT_TRUE(results[i].is_ready()) << "Page " << i << " not ready";
-    EXPECT_EQ(results[i].handle.data()[0], static_cast<uint8_t>(i + 1))
+    EXPECT_EQ(results[i].handle_.data()[0], static_cast<uint8_t>(i + 1))
         << "Page " << i << " wrong data";
   }
 }
@@ -141,13 +141,13 @@ TEST_F(AsyncBufferPoolTest, MultipleWaitersOnSamePage) {
 
   // First read triggers I/O
   auto ar1 = pool.begin_async_read(5, io, 5 * kFrameSize);
-  EXPECT_NE(ar1.pending, nullptr);
-  EXPECT_TRUE(ar1.pending != nullptr && ar1.pending == pool.begin_async_read(5, io, 5 * kFrameSize).pending
+  EXPECT_NE(ar1.pending_, nullptr);
+  EXPECT_TRUE(ar1.pending_ != nullptr && ar1.pending_ == pool.begin_async_read(5, io, 5 * kFrameSize).pending_
               ? true : true);  // both share same pending state
 
   // Second read on same page should NOT trigger new I/O (needs_io=false)
   auto ar2 = pool.begin_async_read(5, io, 5 * kFrameSize);
-  EXPECT_FALSE(ar2.handle.empty());
+  EXPECT_FALSE(ar2.handle_.empty());
 
   // Poll until I/O completes
   for (int i = 0; i < 10000 && !ar1.is_ready(); i++) {
@@ -157,8 +157,8 @@ TEST_F(AsyncBufferPoolTest, MultipleWaitersOnSamePage) {
 
   EXPECT_TRUE(ar1.is_ready());
   EXPECT_TRUE(ar2.is_ready());
-  EXPECT_EQ(ar1.handle.data()[0], 6);
-  EXPECT_EQ(ar2.handle.data()[0], 6);
+  EXPECT_EQ(ar1.handle_.data()[0], 6);
+  EXPECT_EQ(ar2.handle_.data()[0], 6);
 }
 
 // Test 5: PageHandle keeps page pinned
@@ -171,7 +171,7 @@ TEST_F(AsyncBufferPoolTest, PagePinnedDuringAsync) {
   while (!ar0.is_ready()) {
     io.check_completion();
   }
-  EXPECT_EQ(ar0.handle.data()[0], 1);
+  EXPECT_EQ(ar0.handle_.data()[0], 1);
 
   // Read 3 more pages (fills pool capacity)
   for (uint32_t i = 1; i <= 3; i++) {
@@ -181,8 +181,8 @@ TEST_F(AsyncBufferPoolTest, PagePinnedDuringAsync) {
     }
   }
 
-  // Page 0 should still be valid (pinned by ar0.handle)
-  EXPECT_EQ(ar0.handle.data()[0], 1);
+  // Page 0 should still be valid (pinned by ar0.handle_)
+  EXPECT_EQ(ar0.handle_.data()[0], 1);
 }
 
 // Test 6: Concurrent async reads from multiple threads
@@ -199,7 +199,7 @@ TEST_F(AsyncBufferPoolTest, ConcurrentThreadAsyncReads) {
       io.check_completion();
       std::this_thread::yield();
     }
-    results[page_id] = ar.handle.data()[0];
+    results[page_id] = ar.handle_.data()[0];
   };
 
   std::vector<std::thread> threads;
