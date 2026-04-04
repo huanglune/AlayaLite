@@ -35,8 +35,10 @@
 #include "storage/buffer/buffer_pool.hpp"
 #include "storage/diskann/data_file.hpp"
 #include "storage/diskann/diskann_storage.hpp"
+#include "utils/console.hpp"
 #include "utils/log.hpp"
 #include "utils/macros.hpp"
+#include "utils/progress_bar.hpp"
 #include "utils/timer.hpp"
 
 namespace alaya {
@@ -111,7 +113,7 @@ struct DiskANNBuilder {
     try {
       // ---- Phase 1: KMeans Partitioning ----
       Timer phase_timer;
-      LOG_INFO("DiskANN: Phase 1 - KMeans partitioning");
+      console::phase_start("Phase 1", "KMeans partitioning");
 
       typename KMeansPartitioner<DataType, IDType>::Config partition_config;
       partition_config.max_memory_mb_ = params_.max_memory_mb_;
@@ -132,14 +134,14 @@ struct DiskANNBuilder {
         cleanup_paths.push_back(layout.shuffle_path_);
       }
 
-      LOG_INFO("DiskANN: Phase 1 complete in {:.2f}s - {} shards, capacity {}",
-               phase_timer.elapsed_s(),
+      console::phase_done("Phase 1", phase_timer.elapsed_s());
+      LOG_INFO("DiskANN: Phase 1 - {} shards, capacity {}",
                layout.num_shards_,
                layout.shard_capacity_);
 
       // ---- Phase 2: Per-Shard Vamana Build ----
       phase_timer.reset();
-      LOG_INFO("DiskANN: Phase 2 - Per-shard Vamana build ({} shards)", layout.num_shards_);
+      console::phase_start("Phase 2", "Per-shard Vamana build");
 
       std::vector<std::filesystem::path> shard_graph_paths;
       shard_graph_paths.reserve(layout.num_shards_);
@@ -179,7 +181,14 @@ struct DiskANNBuilder {
                                                            dist_fn,
                                                            shard_config);
 
-        shard_builder.build();
+        uint64_t shard_total = static_cast<uint64_t>(members.size()) * shard_config.num_iterations_;
+        std::string shard_prefix =
+            "Shard " + std::to_string(shard_id + 1) + "/" + std::to_string(layout.num_shards_);
+        ProgressBar shard_bar(shard_prefix, shard_total);
+        shard_builder.build([&shard_bar]() {
+          shard_bar.tick();
+        });
+        shard_bar.finish();
 
         auto graph_path = intermediate_prefix + ".shard_" + std::to_string(shard_id) + ".graph";
         auto summary = shard_builder.export_graph(shard_id, graph_path);
@@ -193,11 +202,11 @@ struct DiskANNBuilder {
                  summary.estimated_peak_memory_bytes_ / (1024 * 1024));
       }
 
-      LOG_INFO("DiskANN: Phase 2 complete in {:.2f}s", phase_timer.elapsed_s());
+      console::phase_done("Phase 2", phase_timer.elapsed_s());
 
       // ---- Phase 3: Cross-Shard Merge ----
       phase_timer.reset();
-      LOG_INFO("DiskANN: Phase 3 - Cross-shard merge");
+      console::phase_start("Phase 3", "Cross-shard merge");
 
       CrossShardMerger::Config merge_config;
       merge_config.max_degree_ = params_.max_degree_;
@@ -216,6 +225,7 @@ struct DiskANNBuilder {
                      static_cast<uint32_t>(space_->metric_));
 
       uint32_t nodes_written = 0;
+      ProgressBar merge_bar("Merging", vec_num);
       merger.merge_all([&](const CrossShardMerger::MergedNode &node) {
         auto node_id = static_cast<IDType>(node.global_id_);
         const auto *vec = space_->get_data_by_id(node_id);
@@ -231,15 +241,16 @@ struct DiskANNBuilder {
         ref.set_neighbors(std::span<const IDType>(neighbor_ids.data(), neighbor_ids.size()));
 
         ++nodes_written;
+        merge_bar.tick();
       });
+      merge_bar.finish();
 
-      LOG_INFO("DiskANN: Phase 3 complete in {:.2f}s - {} nodes merged",
-               phase_timer.elapsed_s(),
-               nodes_written);
+      console::phase_done("Phase 3", phase_timer.elapsed_s());
+      LOG_INFO("DiskANN: Phase 3 - {} nodes merged", nodes_written);
 
       // ---- Phase 4: Finalization ----
       phase_timer.reset();
-      LOG_INFO("DiskANN: Phase 4 - Finalization");
+      console::phase_start("Phase 4", "Finalization");
 
       auto entry_point = select_entry_point(layout);
       LOG_INFO("DiskANN: Entry point = {}", entry_point);
@@ -261,8 +272,11 @@ struct DiskANNBuilder {
       // Cleanup intermediate files (success path)
       cleanup_intermediates(cleanup_paths);
 
-      LOG_INFO("DiskANN: Phase 4 complete in {:.2f}s", phase_timer.elapsed_s());
-      LOG_INFO("DiskANN: Index built successfully in {:.2f}s total", total_timer.elapsed_s());
+      console::phase_done("Phase 4", phase_timer.elapsed_s());
+      auto total_elapsed = total_timer.elapsed_s();
+      std::string detail = std::to_string(vec_num) + " vectors";
+      console::summary("Index built", detail, total_elapsed);
+      LOG_INFO("DiskANN: Index built successfully in {:.2f}s total", total_elapsed);
     } catch (...) {
       LOG_WARN("DiskANN: Build failed, cleaning up intermediate files");
       cleanup_intermediates(cleanup_paths);

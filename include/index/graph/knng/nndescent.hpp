@@ -26,6 +26,7 @@
 #include "index/neighbor.hpp"
 #include "space/space_concepts.hpp"
 #include "utils/log.hpp"
+#include "utils/progress_bar.hpp"
 #include "utils/random.hpp"
 #include "utils/thread_pool.hpp"
 #include "utils/timer.hpp"
@@ -234,13 +235,16 @@ struct NndescentImpl {
     gen_eval_gt(eval_points, eval_gt);
 
     auto t1 = Timer();
+    ProgressBar descent_bar("NNDescent", iterations_);
     for (uint32_t iter = 1; iter <= iterations_; ++iter) {
       join();
       update();
 
       float recall = eval_recall(eval_points, eval_gt);
       LOG_INFO("NNDescent iter: [{}/{}], recall: {}", iter, iterations_, recall);
+      descent_bar.tick();
     }
+    descent_bar.finish();
 
     LOG_INFO("NNDescent cost: {}", t1.elapsed() / 1000 / 1000);
   }

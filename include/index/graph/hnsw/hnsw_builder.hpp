@@ -27,6 +27,7 @@
 #include "space/space_concepts.hpp"
 #include "utils/log.hpp"
 #include "utils/macros.hpp"
+#include "utils/progress_bar.hpp"
 #include "utils/thread_pool.hpp"
 #include "utils/timer.hpp"
 
@@ -103,28 +104,23 @@ struct HNSWBuilder {
                                                           vec_num,
                                                           max_nbrs_overlay_,
                                                           ef_construction_);
-    std::atomic<int> cnt{0};
-
     // Build the graph by adding the node.
     Timer timer;
     hnsw_->add_point(0);
 
     LOG_INFO("graph->max_nodes_: {}", graph->max_nodes_);
+    ProgressBar hnsw_bar("Building HNSW", vec_num - 1);
     ThreadPool thread_pool(thread_num);
     for (IDType i = 1; i < vec_num; ++i) {
-      thread_pool.enqueue([i, &cnt, &vec_num, this]() -> auto {  // Capture 'i' by value
+      thread_pool.enqueue([i, &hnsw_bar, this]() -> auto {
         hnsw_->add_point(i);
-
-        // Increment the counter and log progress outside the lambda
-        int cur = cnt.fetch_add(1) + 1;  // Increment and get the current count
-        if ((cur + 1) % 100000 == 0) {
-          LOG_INFO("HNSW building progress: [{}/{}]", cur + 1, vec_num);
-        }
+        hnsw_bar.tick();
       });
     }
     thread_pool.wait_until_all_tasks_completed(vec_num - 1);
+    hnsw_bar.finish();
 
-    LOG_INFO("HNSW building cost: {}s\n", timer.elapsed() / 1000 / 1000);
+    LOG_INFO("HNSW building cost: {}s", timer.elapsed() / 1000 / 1000);
 
     // {
     //   for (int i = 0; i < graph->max_nodes_; i++) {

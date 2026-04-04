@@ -30,6 +30,7 @@
 #include "index/graph/knng/nndescent.hpp"
 #include "index/neighbor.hpp"
 #include "utils/log.hpp"
+#include "utils/progress_bar.hpp"
 #include "utils/random.hpp"
 #include "utils/thread_pool.hpp"
 #include "utils/timer.hpp"
@@ -287,13 +288,13 @@ struct NSGBuilder {
    */
   void link(const std::unique_ptr<Graph<DataType, IDType>> &knng, Graph<DataType, IDType> &graph) {
     auto t1 = Timer();
-    std::atomic<int> cnt{0};
     unsigned int num_cores = std::thread::hardware_concurrency();
     ThreadPool pool(num_cores);
+    ProgressBar nsg_bar("Building NSG", vector_num_);
 
     IDType per_core_num = (vector_num_ + num_cores - 1) / num_cores;
     for (uint32_t thread_id = 0; thread_id < num_cores; thread_id++) {
-      pool.enqueue([this, &knng, &graph, &cnt, per_core_num, thread_id]() -> auto {
+      pool.enqueue([this, &knng, &graph, &nsg_bar, per_core_num, thread_id]() -> auto {
         for (IDType i = thread_id * per_core_num;
              i < (thread_id + 1) * per_core_num && i < vector_num_;
              i++) {
@@ -310,14 +311,12 @@ struct NSGBuilder {
           sync_prune(i, pool, vis, knng, graph);
           pool.clear();
           tmp.clear();
-          int cur = cnt.fetch_add(1);
-          if ((cur + 1) % 10000 == 0) {
-            LOG_INFO("NSG building progress: [{}/{}]", cur + 1, vector_num_);
-          }
+          nsg_bar.tick();
         }
       });
     }
     pool.wait_until_all_tasks_completed(num_cores);
+    nsg_bar.finish();
 
     pool.reset_task();
     std::vector<std::mutex> locks(vector_num_);

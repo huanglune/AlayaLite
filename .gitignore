@@ -70,6 +70,7 @@ coverage_c++.info
 *.swo
 *~
 logs/
+alaya.log
 
 # ============================================================
 # Data & benchmark results

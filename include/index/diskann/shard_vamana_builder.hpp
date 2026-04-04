@@ -23,6 +23,7 @@
 #include <cstring>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <numeric>
@@ -127,6 +128,7 @@ class ShardVamanaBuilder {
   using NeighborType = Neighbor<LocalIDType, DistanceType>;
   using GlobalNeighborType = Neighbor<GlobalIDType, DistanceType>;
   using DistanceFn = DistFunc<DataType, DistanceType>;
+  using ProgressCallback = std::function<void()>;
 
   struct Config {
     uint32_t max_degree_{64};
@@ -209,13 +211,13 @@ class ShardVamanaBuilder {
 
   [[nodiscard]] auto medoid_local_id() const -> LocalIDType { return medoid_local_id_; }
 
-  void build() {
+  void build(ProgressCallback on_progress = nullptr) {
     enforce_memory_budget();
     initialize_random_graph();
     medoid_local_id_ = compute_medoid();
     for (uint32_t pass = 0; pass < config_.num_iterations_; ++pass) {
       auto alpha = pass == 0 ? config_.alpha_first_pass_ : config_.alpha_;
-      build_pass(alpha);
+      build_pass(alpha, on_progress);
     }
   }
 
@@ -377,14 +379,14 @@ class ShardVamanaBuilder {
     return std::max(1U, t);
   }
 
-  void build_pass(float alpha) {
+  void build_pass(float alpha, const ProgressCallback &on_progress) {
     std::vector<LocalIDType> perm(num_nodes());
     std::iota(perm.begin(), perm.end(), 0U);
     std::shuffle(perm.begin(), perm.end(), std::mt19937(42));
 
     auto num_threads = std::min(effective_threads(), num_nodes());
     if (num_threads <= 1) {
-      build_pass_single(perm, alpha);
+      build_pass_single(perm, alpha, on_progress);
       return;
     }
 
@@ -400,7 +402,7 @@ class ShardVamanaBuilder {
       if (begin >= n) {
         break;
       }
-      threads.emplace_back([this, &perm, alpha, begin, end] {
+      threads.emplace_back([this, &perm, &on_progress, alpha, begin, end] {
         std::vector<NeighborType> candidates;
         std::vector<NeighborType> selected;
         for (auto i = begin; i < end; ++i) {
@@ -415,6 +417,9 @@ class ShardVamanaBuilder {
           for (const auto &neighbor : selected) {
             add_reverse_edge(neighbor.id_, node_id, alpha);
           }
+          if (on_progress) {
+            on_progress();
+          }
         }
       });
     }
@@ -423,7 +428,9 @@ class ShardVamanaBuilder {
     }
   }
 
-  void build_pass_single(const std::vector<LocalIDType> &perm, float alpha) {
+  void build_pass_single(const std::vector<LocalIDType> &perm,
+                         float alpha,
+                         const ProgressCallback &on_progress) {
     std::vector<NeighborType> candidates;
     std::vector<NeighborType> selected;
     for (auto node_id : perm) {
@@ -433,6 +440,9 @@ class ShardVamanaBuilder {
       neighbor_table_.update(node_id, selected);
       for (const auto &neighbor : selected) {
         add_reverse_edge(neighbor.id_, node_id, alpha);
+      }
+      if (on_progress) {
+        on_progress();
       }
     }
   }

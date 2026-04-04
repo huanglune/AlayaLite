@@ -39,7 +39,8 @@ namespace alaya {
 ///   - ETA estimation based on elapsed time
 ///   - Green checkmark on completion
 ///
-/// Falls back to periodic LOG_INFO when stderr is not a terminal.
+/// Falls back to periodic fprintf(stderr) when stderr is not a terminal.
+/// Respects ALAYA_QUIET=1: suppresses all stderr output when set.
 ///
 /// Usage:
 /// @code
@@ -61,8 +62,9 @@ class ProgressBar {
         last_fallback_pct_(0),
         finished_(false),
         rendering_(false),
-        is_tty_(isatty(fileno(stderr)) != 0) {
-    if (is_tty_ && total_ > 0) {
+        is_tty_(isatty(fileno(stderr)) != 0),
+        quiet_(is_quiet()) {
+    if (!quiet_ && is_tty_ && total_ > 0) {
       render_line(0, /*is_final=*/false);
     }
   }
@@ -74,6 +76,10 @@ class ProgressBar {
   /// Thread-safe: increment progress by 1.
   void tick() {
     uint64_t cur = current_.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    if (quiet_) {
+      return;
+    }
 
     if (is_tty_) {
       auto now_us =
@@ -89,13 +95,18 @@ class ProgressBar {
         }
       }
     } else {
-      // Non-TTY fallback: LOG_INFO every 10%
+      // Non-TTY fallback: fprintf(stderr) every 10%
       if (total_ > 0) {
         uint64_t pct = cur * 100 / total_;
         uint64_t last = last_fallback_pct_.load(std::memory_order_relaxed);
         if (pct / 10 > last / 10 || cur >= total_) {
           last_fallback_pct_.store(pct, std::memory_order_relaxed);
-          LOG_INFO("{}: [{}/{}] ({}%)", prefix_, cur, total_, pct);
+          std::fprintf(stderr,
+                       "%s: [%" PRIu64 "/%" PRIu64 "] (%" PRIu64 "%%)\n",
+                       prefix_.c_str(),
+                       cur,
+                       total_,
+                       pct);
         }
       }
     }
@@ -105,6 +116,9 @@ class ProgressBar {
   /// Safe to call multiple times; only the first call takes effect.
   void finish() {
     if (finished_.exchange(true)) {
+      return;
+    }
+    if (quiet_) {
       return;
     }
     if (is_tty_) {
@@ -262,6 +276,7 @@ class ProgressBar {
   std::atomic<bool> rendering_;  // CAS spinlock for render exclusion
   uint32_t spinner_frame_{0};    // only modified under rendering_ lock
   bool is_tty_;
+  bool quiet_;
 };
 
 }  // namespace alaya
