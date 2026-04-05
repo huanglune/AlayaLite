@@ -301,11 +301,8 @@ static void run(const Config &cfg, Dataset &ds, uint32_t R) {
                  .set_ef_construction(ef_con)
                  .set_num_iterations(2)
                  .set_num_threads(cfg.index_.num_threads_);
-    printf("Building... ");
-    fflush(stdout);
-    Timer t;
     DiskANNIndex<>::build(sp, idx_path, p);
-    printf("%.1fs\n\n", t.elapsed_s());
+    printf("\n");
   }
 
   // --- 1. Baseline ---

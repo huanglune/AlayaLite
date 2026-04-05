@@ -100,7 +100,7 @@ TEST_F(KMeansPartitionerTest, OverlappingAssignmentPreservesPrimaryAndPersistsMa
 
   auto layout = partitioner.partition(*space, kMaxDegree, output_prefix);
 
-  ASSERT_EQ(layout.num_shards_, 3U);
+  ASSERT_EQ(layout.num_shards_, 5U);
   uint32_t exact_overlap = 0;
   uint32_t reduced_overlap = 0;
   for (uint32_t node_id = 0; node_id < layout.num_nodes_; ++node_id) {

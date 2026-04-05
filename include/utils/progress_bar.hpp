@@ -26,18 +26,19 @@
 #include <cstdio>
 #include <string>
 
+#include "utils/console.hpp"
 #include "utils/log.hpp"
 #include "utils/macros.hpp"
 
 namespace alaya {
 
-/// @brief Thread-safe animated progress bar with spinner, color, and ETA.
+/// @brief Thread-safe animated progress bar with uv-style aesthetics.
 ///
-/// Renders a tqdm/uv-style progress bar to stderr with:
+/// Renders a progress bar to stderr matching uv's visual style:
 ///   - Braille dot spinner animation (~10 fps)
-///   - ANSI color: green filled bar, yellow gradient edge, dim empty portion
-///   - ETA estimation based on elapsed time
-///   - Green checkmark on completion
+///   - Green filled blocks (█), dim empty blocks (░)
+///   - Percentage + ETA display
+///   - On completion: bar replaced with green checkmark summary line
 ///
 /// Falls back to periodic fprintf(stderr) when stderr is not a terminal.
 /// Respects ALAYA_QUIET=1: suppresses all stderr output when set.
@@ -95,18 +96,13 @@ class ProgressBar {
         }
       }
     } else {
-      // Non-TTY fallback: fprintf(stderr) every 10%
+      // Non-TTY fallback: print every 10%
       if (total_ > 0) {
         uint64_t pct = cur * 100 / total_;
         uint64_t last = last_fallback_pct_.load(std::memory_order_relaxed);
         if (pct / 10 > last / 10 || cur >= total_) {
           last_fallback_pct_.store(pct, std::memory_order_relaxed);
-          std::fprintf(stderr,
-                       "%s: [%" PRIu64 "/%" PRIu64 "] (%" PRIu64 "%%)\n",
-                       prefix_.c_str(),
-                       cur,
-                       total_,
-                       pct);
+          std::fprintf(stderr, "  %s: %" PRIu64 "%%\n", prefix_.c_str(), pct);
         }
       }
     }
@@ -121,17 +117,20 @@ class ProgressBar {
     if (quiet_) {
       return;
     }
+    auto current = current_.load(std::memory_order_relaxed);
     if (is_tty_) {
-      render_line(current_.load(std::memory_order_relaxed), /*is_final=*/true);
+      render_line(current, /*is_final=*/true);
       std::fprintf(stderr, "\n");
+      console::notify_progress_complete();
+    } else if (total_ > 0 && current >= total_) {
+      console::notify_progress_complete();
     }
   }
 
  private:
   // ── Timing & layout ──────────────────────────────────────────────────
   static constexpr int64_t kRenderIntervalUs = 100'000;  // 100 ms (~10 fps)
-  static constexpr uint32_t kBarWidth = 30;
-  static constexpr uint32_t kPrefixWidth = 24;
+  static constexpr uint32_t kBarWidth = 20;
   static constexpr uint32_t kSpinnerFrameCount = 10;
 
   // ── ANSI escape codes ────────────────────────────────────────────────
@@ -139,16 +138,12 @@ class ProgressBar {
   static constexpr const char *kBold = "\033[1m";
   static constexpr const char *kDim = "\033[2m";
   static constexpr const char *kGreen = "\033[32m";
-  static constexpr const char *kYellow = "\033[33m";
   static constexpr const char *kBoldCyan = "\033[1;36m";
-  static constexpr const char *kBoldGreen = "\033[1;32m";
   static constexpr const char *kClearLine = "\r\033[K";
 
   // ── Unicode symbols (UTF-8 encoded) ──────────────────────────────────
   static constexpr const char *kFullBlock = "\xe2\x96\x88";   // █ U+2588
-  static constexpr const char *kDarkShade = "\xe2\x96\x93";   // ▓ U+2593
   static constexpr const char *kLightShade = "\xe2\x96\x91";  // ░ U+2591
-  static constexpr const char *kCheckMark = "\xe2\x9c\x93";   // ✓ U+2713
 
   // ── Braille dot spinner frames ───────────────────────────────────────
   static constexpr const char *kSpinnerFrames[kSpinnerFrameCount] = {
@@ -164,40 +159,22 @@ class ProgressBar {
       "\xe2\xa0\x8f",
   };
 
-  /// Pad or truncate prefix to fixed width for alignment.
-  auto format_prefix() -> std::string {
-    if (prefix_.size() <= kPrefixWidth) {
-      std::string result = prefix_;
-      result.append(kPrefixWidth - prefix_.size(), ' ');
-      return result;
-    }
-    return prefix_.substr(0, kPrefixWidth - 3) + "...";
-  }
-
-  /// Build the colored bar string with gradient edge.
+  /// Build the uv-style bar: green ████ + dim ░░░░.
   auto build_bar(uint32_t filled) -> std::string {
     std::string bar;
-    bar.reserve(kBarWidth * 10);
+    bar.reserve(kBarWidth * 8);
 
-    // Filled portion (green)
     if (filled > 0) {
       bar += kGreen;
       for (uint32_t i = 0; i < filled && i < kBarWidth; ++i) {
         bar += kFullBlock;
       }
-    }
-
-    // Gradient edge (yellow)
-    if (filled < kBarWidth) {
-      bar += kYellow;
-      bar += kDarkShade;
       bar += kReset;
     }
 
-    // Empty portion (dim)
-    if (filled + 1 < kBarWidth) {
+    if (filled < kBarWidth) {
       bar += kDim;
-      for (uint32_t i = filled + 1; i < kBarWidth; ++i) {
+      for (uint32_t i = filled; i < kBarWidth; ++i) {
         bar += kLightShade;
       }
       bar += kReset;
@@ -206,8 +183,51 @@ class ProgressBar {
     return bar;
   }
 
+  /// Render the in-progress bar line.
+  void render_progress(double frac,
+                       uint32_t filled,
+                       double elapsed_s,
+                       uint64_t current,
+                       std::string &line) {
+    // 2-space indent + spinner
+    line += "  ";
+    line += kBoldCyan;
+    line += kSpinnerFrames[spinner_frame_++ % kSpinnerFrameCount];
+    line += kReset;
+    line += ' ';
+
+    // Prefix (bold)
+    line += kBold;
+    line += prefix_;
+    line += kReset;
+    line += "  ";
+
+    // Bar
+    line += build_bar(filled);
+    line += "  ";
+
+    // Percentage
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%3.0f%%", frac * 100.0);
+    line += buf;
+
+    // ETA (dim)
+    if (current > 0 && current < total_) {
+      double eta_s =
+          elapsed_s * static_cast<double>(total_ - current) / static_cast<double>(current);
+      std::snprintf(buf, sizeof(buf), "  ETA %.1fs", eta_s);
+      line += kDim;
+      line += buf;
+      line += kReset;
+    }
+  }
+
+  /// Render the completion line (reuses console's shared formatter).
+  void render_completion(double elapsed_s, std::string &line) {
+    line += console::detail::format_completion_line(prefix_, elapsed_s);
+  }
+
   /// Render one frame of the progress bar.
-  /// @param is_final  true = show green checkmark; false = show spinning indicator
   void render_line(uint64_t current, bool is_final) {
     double frac = (total_ > 0) ? static_cast<double>(current) / static_cast<double>(total_) : 0.0;
     frac = std::min(frac, 1.0);
@@ -218,47 +238,10 @@ class ProgressBar {
     line.reserve(256);
     line += kClearLine;
 
-    // Leading icon: spinner or checkmark
     if (is_final) {
-      line += kBoldGreen;
-      line += kCheckMark;
+      render_completion(elapsed_s, line);
     } else {
-      line += kBoldCyan;
-      line += kSpinnerFrames[spinner_frame_++ % kSpinnerFrameCount];
-    }
-    line += kReset;
-    line += ' ';
-
-    // Prefix (bold)
-    line += kBold;
-    line += format_prefix();
-    line += kReset;
-    line += "  ";
-
-    // Colored bar
-    line += build_bar(filled);
-    line += "  ";
-
-    // Percentage (bold)
-    char buf[64];
-    std::snprintf(buf, sizeof(buf), "%.1f%%", frac * 100.0);
-    line += kBold;
-    line += buf;
-    line += kReset;
-    line += ' ';
-
-    // Count and elapsed time
-    std::snprintf(buf, sizeof(buf), "(%" PRIu64 "/%" PRIu64 ") %.1fs", current, total_, elapsed_s);
-    line += buf;
-
-    // ETA (dim, only during progress)
-    if (!is_final && current > 0 && current < total_) {
-      double eta_s =
-          elapsed_s * static_cast<double>(total_ - current) / static_cast<double>(current);
-      std::snprintf(buf, sizeof(buf), " ETA %.1fs", eta_s);
-      line += kDim;
-      line += buf;
-      line += kReset;
+      render_progress(frac, filled, elapsed_s, current, line);
     }
 
     std::fwrite(line.data(), 1, line.size(), stderr);

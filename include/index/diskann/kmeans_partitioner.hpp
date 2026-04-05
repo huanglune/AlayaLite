@@ -118,9 +118,13 @@ class KMeansPartitioner {
 
   [[nodiscard]] auto config() const -> const Config & { return config_; }
 
+  /// Must match ShardVamanaBuilder::estimate_peak_memory_bytes per-node cost
+  /// (vectors + neighbor_table + scratch).
   [[nodiscard]] static auto estimate_per_node_memory(uint32_t dim, uint32_t max_degree) -> size_t {
-    return static_cast<size_t>(dim) * sizeof(DataType) +
-           static_cast<size_t>(max_degree) * (sizeof(IDType) + sizeof(float));
+    auto vectors_bytes = static_cast<size_t>(dim) * sizeof(DataType);
+    auto neighbor_table_bytes = static_cast<size_t>(max_degree) * sizeof(IDType);
+    auto scratch_bytes = static_cast<size_t>(max_degree) * sizeof(float);
+    return vectors_bytes + neighbor_table_bytes + scratch_bytes;
   }
 
   [[nodiscard]] static auto compute_shard_capacity(uint32_t dim,
@@ -186,11 +190,18 @@ class KMeansPartitioner {
     layout.dim_ = dim;
     layout.max_assignments_ = config_.overlap_factor_;
     layout.shard_capacity_ = compute_shard_capacity(dim, max_degree, config_.max_memory_mb_);
-    layout.num_shards_ = compute_num_shards(num_nodes, layout.shard_capacity_);
-    layout.shard_size_cap_ = compute_shard_size_cap(num_nodes,
-                                                    layout.num_shards_,
-                                                    config_.overlap_factor_,
-                                                    config_.shard_overflow_factor_);
+    // Each node appears in ~overlap_factor shards, so effective node count per shard
+    // is num_nodes * overlap_factor / num_shards. Account for this when sizing.
+    auto effective_nodes = static_cast<uint64_t>(num_nodes) * config_.overlap_factor_;
+    layout.num_shards_ =
+        compute_num_shards(static_cast<uint32_t>(std::min<uint64_t>(effective_nodes, UINT32_MAX)),
+                           layout.shard_capacity_);
+    layout.shard_size_cap_ =
+        std::min(compute_shard_size_cap(num_nodes,
+                                        layout.num_shards_,
+                                        config_.overlap_factor_,
+                                        config_.shard_overflow_factor_),
+                 layout.shard_capacity_);
 
     auto sample = build_sample(space, layout.num_shards_);
     KMeans<SpaceDataType> kmeans(

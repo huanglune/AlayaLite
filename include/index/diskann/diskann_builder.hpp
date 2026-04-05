@@ -134,7 +134,7 @@ struct DiskANNBuilder {
         cleanup_paths.push_back(layout.shuffle_path_);
       }
 
-      console::phase_done("Phase 1", phase_timer.elapsed_s());
+      console::phase_done("KMeans partitioning", phase_timer.elapsed_s());
       LOG_INFO("DiskANN: Phase 1 - {} shards, capacity {}",
                layout.num_shards_,
                layout.shard_capacity_);
@@ -159,6 +159,12 @@ struct DiskANNBuilder {
                  layout.num_shards_,
                  members.size());
 
+        // Create ProgressBar early so the spinner shows during vector loading I/O.
+        uint64_t shard_total = static_cast<uint64_t>(members.size()) * params_.num_iterations_;
+        std::string shard_prefix =
+            "Shard " + std::to_string(shard_id + 1) + "/" + std::to_string(layout.num_shards_);
+        ProgressBar shard_bar(shard_prefix, shard_total);
+
         auto shard_vectors =
             ShardVamanaBuilder<DataType,
                                IDType>::load_vectors_from_shuffle(layout.shuffle_path_,
@@ -181,10 +187,6 @@ struct DiskANNBuilder {
                                                            dist_fn,
                                                            shard_config);
 
-        uint64_t shard_total = static_cast<uint64_t>(members.size()) * shard_config.num_iterations_;
-        std::string shard_prefix =
-            "Shard " + std::to_string(shard_id + 1) + "/" + std::to_string(layout.num_shards_);
-        ProgressBar shard_bar(shard_prefix, shard_total);
         shard_builder.build([&shard_bar]() {
           shard_bar.tick();
         });
@@ -202,7 +204,7 @@ struct DiskANNBuilder {
                  summary.estimated_peak_memory_bytes_ / (1024 * 1024));
       }
 
-      console::phase_done("Phase 2", phase_timer.elapsed_s());
+      console::phase_done("Per-shard Vamana build", phase_timer.elapsed_s());
 
       // ---- Phase 3: Cross-Shard Merge ----
       phase_timer.reset();
@@ -225,7 +227,7 @@ struct DiskANNBuilder {
                      static_cast<uint32_t>(space_->metric_));
 
       uint32_t nodes_written = 0;
-      ProgressBar merge_bar("Merging", vec_num);
+      ProgressBar merge_bar("Cross-shard merge", vec_num);
       merger.merge_all([&](const CrossShardMerger::MergedNode &node) {
         auto node_id = static_cast<IDType>(node.global_id_);
         const auto *vec = space_->get_data_by_id(node_id);
@@ -245,7 +247,7 @@ struct DiskANNBuilder {
       });
       merge_bar.finish();
 
-      console::phase_done("Phase 3", phase_timer.elapsed_s());
+      console::phase_done("Cross-shard merge", phase_timer.elapsed_s());
       LOG_INFO("DiskANN: Phase 3 - {} nodes merged", nodes_written);
 
       // ---- Phase 4: Finalization ----
@@ -272,7 +274,7 @@ struct DiskANNBuilder {
       // Cleanup intermediate files (success path)
       cleanup_intermediates(cleanup_paths);
 
-      console::phase_done("Phase 4", phase_timer.elapsed_s());
+      console::phase_done("Finalization", phase_timer.elapsed_s());
       auto total_elapsed = total_timer.elapsed_s();
       std::string detail = std::to_string(vec_num) + " vectors";
       console::summary("Index built", detail, total_elapsed);
