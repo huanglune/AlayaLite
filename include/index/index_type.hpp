@@ -31,15 +31,17 @@ enum class IndexType {
   FUSION = 3,
   QG = 4,
   DISKANN = 5,
+  LASER = 6,
 };
 // NOLINTEND
 
 struct IndexTypeMap {
-  static constexpr std::array<std::tuple<std::string_view, IndexType>, 4> kStaticMap = {
+  static constexpr std::array<std::tuple<std::string_view, IndexType>, 5> kStaticMap = {
       std::make_tuple("FLAT", IndexType::FLAT),
       std::make_tuple("HNSW", IndexType::HNSW),
       std::make_tuple("QG", IndexType::QG),
       std::make_tuple("DISKANN", IndexType::DISKANN),
+      std::make_tuple("LASER", IndexType::LASER),
   };
 
   constexpr auto operator[](const std::string_view str) const -> IndexType {
@@ -54,11 +56,12 @@ struct IndexTypeMap {
 
 // index type to string
 struct IndexTypeToString {
-  static constexpr std::array<std::tuple<IndexType, std::string_view>, 4> kStaticMap = {
+  static constexpr std::array<std::tuple<IndexType, std::string_view>, 5> kStaticMap = {
       std::make_tuple(IndexType::FLAT, "FLAT"),
       std::make_tuple(IndexType::HNSW, "HNSW"),
       std::make_tuple(IndexType::QG, "QG"),
       std::make_tuple(IndexType::DISKANN, "DISKANN"),
+      std::make_tuple(IndexType::LASER, "LASER"),
   };
 
   constexpr auto operator[](IndexType index_type) const -> std::string_view {
@@ -77,5 +80,6 @@ inline constexpr IndexTypeToString kIndexType2str{};
 static_assert(kIndexType["HNSW"] == IndexType::HNSW);
 static_assert(kIndexType["QG"] == IndexType::QG);
 static_assert(kIndexType["DISKANN"] == IndexType::DISKANN);
+static_assert(kIndexType["LASER"] == IndexType::LASER);
 
 }  // namespace alaya

@@ -52,7 +52,7 @@ DistanceMetric: TypeAlias = Literal["euclidean", "l2", "ip", "cosine", "cos"]
 QuantizationType: TypeAlias = Literal[None, "none", "sq8", "sq4", "rabitq"]
 """ Type alias for one of {None, "none", "sq8", "sq4"} """
 IndexType: TypeAlias = Literal["hnsw", "nsg", "fusion"]
-""" Type alias for one of {"hnsw", "nsg" ,"fusion"} """
+""" Type alias for one of {"hnsw", "nsg", "fusion"} (laser uses LaserIndex directly) """
 VectorLike: TypeAlias = npt.NDArray[VectorDType]  # type: ignore
 """ Type alias for something that can be treated as a vector """
 VectorLikeBatch: TypeAlias = npt.NDArray[VectorDType]  # type: ignore

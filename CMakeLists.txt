@@ -21,6 +21,7 @@ option(ENABLE_CLANG_TIDY "Enable clang-tidy static analysis during build" OFF)
 option(BUILD_TESTING "Build tests" OFF)
 option(BUILD_BENCHMARKS "Build benchmarks" OFF)
 option(BUILD_PYTHON "Build Python bindings" OFF)
+option(USE_JEMALLOC "Use jemalloc as process-level allocator" OFF)
 
 # ============================================================================
 # 1. C++ STANDARD AND COMPILER CONFIGURATION
@@ -34,7 +35,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if(MSVC)
   add_compile_options(/EHsc /utf-8 /O2)
 else()
-  add_compile_options(-Wall -Ofast)
+  add_compile_options(-Wall -Ofast -march=native)
   if(BUILD_TESTING OR BUILD_BENCHMARKS)
     add_compile_options(-g -fno-omit-frame-pointer)
   elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
@@ -132,6 +133,31 @@ if(UNIX AND NOT APPLE)
   find_package(libcoro REQUIRED)
   find_package(liburing REQUIRED)
   list(APPEND THIRD_PARTY_LIBS libcoro::libcoro liburing::liburing)
+
+  # libaio for Laser index I/O
+  find_library(LIBAIO_LIBRARY aio)
+  find_path(LIBAIO_INCLUDE_DIR libaio.h)
+  if(LIBAIO_LIBRARY AND LIBAIO_INCLUDE_DIR)
+    message(STATUS "Found libaio: ${LIBAIO_LIBRARY}")
+    list(APPEND THIRD_PARTY_LIBS ${LIBAIO_LIBRARY})
+    set(LASER_AVAILABLE ON)
+    add_compile_definitions(LASER_AVAILABLE)
+  else()
+    message(WARNING "libaio not found — Laser index support will be unavailable. "
+                    "Install: sudo apt-get install libaio-dev")
+    set(LASER_AVAILABLE OFF)
+  endif()
+endif()
+
+if(USE_JEMALLOC)
+  find_library(JEMALLOC_LIBRARY jemalloc)
+  if(JEMALLOC_LIBRARY)
+    message(STATUS "Found jemalloc: ${JEMALLOC_LIBRARY}")
+    list(APPEND THIRD_PARTY_LIBS ${JEMALLOC_LIBRARY})
+  else()
+    message(FATAL_ERROR "USE_JEMALLOC=ON but jemalloc not found. "
+                        "Install: sudo apt-get install libjemalloc-dev")
+  endif()
 endif()
 
 # ============================================================================

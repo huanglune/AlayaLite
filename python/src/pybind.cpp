@@ -23,6 +23,9 @@
 
 #include "index/graph/hnsw/hnsw_builder.hpp"
 #include "index/index_type.hpp"
+#ifdef LASER_AVAILABLE
+#include "index/laser/laser_index.hpp"
+#endif
 // #include "reg.hpp"
 #include "params.hpp"
 #include "space/raw_space.hpp"
@@ -51,6 +54,9 @@ PYBIND11_MODULE(_alayalitepy, m) {
       .value("NSG", alaya::IndexType::NSG)
       .value("FUSION", alaya::IndexType::FUSION)
       .value("DISKANN", alaya::IndexType::DISKANN)
+#ifdef LASER_AVAILABLE
+      .value("LASER", alaya::IndexType::LASER)
+#endif
       .export_values();
 
   py::enum_<alaya::MetricType>(m, "MetricType")
@@ -146,4 +152,61 @@ PYBIND11_MODULE(_alayalitepy, m) {
            py::arg("data_path"),            //
            py::arg("quant_path") = std::string())
       .def("get_data_dim", &alaya::PyIndexInterface::get_data_dim);
+
+#ifdef LASER_AVAILABLE
+  // LaserIndex bindings
+  py::class_<symqg::LaserSearchParams>(m, "LaserSearchParams")
+      .def(py::init<>())
+      .def_readwrite("ef_search", &symqg::LaserSearchParams::ef_search)
+      .def_readwrite("num_threads", &symqg::LaserSearchParams::num_threads)
+      .def_readwrite("beam_width", &symqg::LaserSearchParams::beam_width)
+      .def_readwrite("search_dram_budget_gb", &symqg::LaserSearchParams::search_dram_budget_gb);
+
+  py::class_<alaya::LaserIndex>(m, "LaserIndex")
+      .def(py::init<>())
+      .def("load",
+           &alaya::LaserIndex::load,
+           py::arg("prefix"),
+           py::arg("num_points"),
+           py::arg("degree"),
+           py::arg("main_dim"),
+           py::arg("full_dim"),
+           py::arg("params"))
+      .def("search",
+           [](alaya::LaserIndex& self, py::array_t<float> query, uint32_t k) {
+             auto full_dim = static_cast<ssize_t>(self.full_dimension());
+             if (query.size() < full_dim) {
+               throw std::invalid_argument(
+                   "query must have full_dimension (" + std::to_string(full_dim) +
+                   ") elements, got " + std::to_string(query.size()));
+             }
+             py::array_t<uint32_t> results(k);
+             self.search(query.data(), k, results.mutable_data());
+             return results;
+           },
+           py::arg("query"),
+           py::arg("k"))
+      .def("batch_search",
+           [](alaya::LaserIndex& self, py::array_t<float> queries, uint32_t k) {
+             auto full_dim = static_cast<ssize_t>(self.full_dimension());
+             if (queries.ndim() < 2 || queries.shape(1) < full_dim) {
+               throw std::invalid_argument(
+                   "queries must have shape (N, " + std::to_string(full_dim) +
+                   "), got shape(1)=" + std::to_string(queries.ndim() >= 2 ? queries.shape(1) : 0));
+             }
+             auto num_queries = static_cast<size_t>(queries.shape(0));
+             py::array_t<uint32_t> results({num_queries, static_cast<size_t>(k)});
+             self.batch_search(queries.data(), num_queries, k, results.mutable_data());
+             return results;
+           },
+           py::arg("queries"),
+           py::arg("k"))
+      .def("set_search_params", &alaya::LaserIndex::set_search_params, py::arg("params"))
+      .def("is_loaded", &alaya::LaserIndex::is_loaded)
+      .def("num_points", &alaya::LaserIndex::num_points)
+      .def("dimension", &alaya::LaserIndex::dimension)
+      .def("full_dimension", &alaya::LaserIndex::full_dimension)
+      .def("cached_node_count", &alaya::LaserIndex::cached_node_count)
+      .def("cache_size_bytes", &alaya::LaserIndex::cache_size_bytes);
+#endif
 }

@@ -132,7 +132,7 @@ class QGBuilder {
 #if defined(__AVX512F__)
   #pragma omp parallel for schedule(dynamic)
     for (int64_t i = 0; i < static_cast<int64_t>(num_nodes_); ++i) {
-      IDType cur_id = static_cast<IDType>(i);
+      auto cur_id = static_cast<IDType>(i);
       auto tid = omp_get_thread_num();
       CandidateList candidates;
       HashBasedBooleanSet &vis = visited_list_[tid];
@@ -148,7 +148,7 @@ class QGBuilder {
         }
       }
 
-      size_t min_size = std::min(candidates.size(), kMaxCandidatePoolSize);
+      auto min_size = std::min(candidates.size(), kMaxCandidatePoolSize);
       std::partial_sort(candidates.begin(),
                         candidates.begin() + static_cast<long>(min_size),  // NOLINT
                         candidates.end());
@@ -257,7 +257,7 @@ class QGBuilder {
           ids.emplace(neighbor.id_);
         }
         while (new_result.size() < degree_bound_) {
-          IDType rand_id = rand_integer<IDType>(0, static_cast<IDType>(num_nodes_) - 1);
+          auto rand_id = rand_integer<IDType>(0, static_cast<IDType>(num_nodes_) - 1);
           if (rand_id != static_cast<IDType>(i) && ids.find(rand_id) == ids.end()) {
             new_result.emplace_back(rand_id, space_->get_distance(rand_id, i));
             ids.emplace(rand_id);

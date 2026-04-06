@@ -8,3 +8,8 @@ target_link_libraries(graph_search_bench PRIVATE ${THIRD_PARTY_LIBS} tomlplusplu
 
 add_executable(diskann_search_bench ${CMAKE_CURRENT_SOURCE_DIR}/diskann_search_bench.cpp)
 target_link_libraries(diskann_search_bench PRIVATE ${THIRD_PARTY_LIBS} tomlplusplus::tomlplusplus)
+
+if(LASER_AVAILABLE)
+  add_executable(laser_search_bench ${CMAKE_CURRENT_SOURCE_DIR}/laser_search_bench.cpp)
+  target_link_libraries(laser_search_bench PRIVATE ${THIRD_PARTY_LIBS})
+endif()
