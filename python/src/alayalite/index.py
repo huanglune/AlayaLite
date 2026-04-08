@@ -77,6 +77,7 @@ class Index:
         vectors: VectorLikeBatch,
         ef_construction: int = 100,
         num_threads: int = 1,
+        laser_build_params=None,
     ):
         """
         Build the index with the given set of vectors.
@@ -92,6 +93,8 @@ class Index:
             raise ValueError(f"Data type mismatch: {self.__params.data_type} vs {data_type}")
 
         self.__params.fill_none_values()
+        if self.__params.index_type == "laser" and laser_build_params is not None:
+            self.__params.laser_build_params = laser_build_params
         self.__dim = vectors.shape[1]
         self.__index = _PyIndexInterface(self.__params.to_cpp_params())
         self.__is_initialized = True
@@ -199,6 +202,10 @@ class Index:
         if not os.path.exists(url):
             os.makedirs(url)
 
+        if self.__params.index_type == "laser":
+            self.__index.save(url, "", "")
+            return load_schema(os.path.join(url, "schema.json"))
+
         index_path = self.__params.index_path(url)
         data_path = self.__params.data_path(url)
         quant_path = self.__params.quant_path(url)
@@ -220,6 +227,12 @@ class Index:
         params = IndexParams.from_str_dict(load_schema(schema_url)["index"])
         instance = cls(name, params)
         instance.__index = _PyIndexInterface(params.to_cpp_params())
+
+        if params.index_type == "laser":
+            instance.__index.load(index_url, "", "")
+            instance.__is_initialized = True
+            instance.__dim = instance.__index.get_data_dim()
+            return instance
 
         index_path = params.index_path(index_url)
         data_path = params.data_path(index_url)

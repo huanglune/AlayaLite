@@ -48,9 +48,9 @@ class CompactNeighborTable {
 
   CompactNeighborTable() = default;
 
-  CompactNeighborTable(uint32_t num_nodes, uint32_t max_degree)
-      : max_degree_(max_degree),
-        neighbors_(static_cast<size_t>(num_nodes) * max_degree, kInvalidID) {}
+  CompactNeighborTable(uint32_t num_nodes, uint32_t max_degree, float slack_factor = 1.0F)
+      : max_degree_(static_cast<uint32_t>(static_cast<float>(max_degree) * slack_factor)),
+        neighbors_(static_cast<size_t>(num_nodes) * max_degree_, kInvalidID) {}
 
   [[nodiscard]] auto num_nodes() const -> uint32_t {
     return max_degree_ == 0 ? 0 : static_cast<uint32_t>(neighbors_.size() / max_degree_);
@@ -136,9 +136,12 @@ class ShardVamanaBuilder {
     uint32_t num_iterations_{2};
     float alpha_{1.2F};
     float alpha_first_pass_{1.0F};
+    uint32_t max_occlusion_size_{750};  ///< Max candidates for pruning (DiskANN maxc)
     size_t max_memory_mb_{4096};
     uint32_t num_threads_{0};  ///< 0 = hardware concurrency, 1 = single-threaded
   };
+
+  static constexpr float kGraphSlackFactor = 1.3F;
 
   struct ExportedNode {
     GlobalIDType global_id_{0};
@@ -164,7 +167,9 @@ class ShardVamanaBuilder {
         id_map_(ShardIdMap<GlobalIDType>::build(shard_members)),
         dist_fn_(dist_fn),
         config_(config),
-        neighbor_table_(static_cast<uint32_t>(id_map_.local_to_global_.size()), config.max_degree_),
+        neighbor_table_(static_cast<uint32_t>(id_map_.local_to_global_.size()),
+                        config.max_degree_,
+                        kGraphSlackFactor),
         node_mutexes_(id_map_.local_to_global_.size()) {
     if (dim_ == 0 || dist_fn_ == nullptr) {
       throw std::invalid_argument("ShardVamanaBuilder requires a dimension and distance function");
@@ -181,9 +186,12 @@ class ShardVamanaBuilder {
   [[nodiscard]] static auto estimate_peak_memory_bytes(uint32_t shard_size,
                                                        uint32_t dim,
                                                        uint32_t max_degree) -> size_t {
+    auto slack_degree =
+        static_cast<uint32_t>(static_cast<float>(max_degree) * kGraphSlackFactor);
     auto vectors_bytes = static_cast<size_t>(shard_size) * dim * sizeof(DataType);
-    auto neighbor_table_bytes = static_cast<size_t>(shard_size) * max_degree * sizeof(LocalIDType);
-    auto scratch_bytes = static_cast<size_t>(shard_size) * max_degree * sizeof(DistanceType);
+    auto neighbor_table_bytes =
+        static_cast<size_t>(shard_size) * slack_degree * sizeof(LocalIDType);
+    auto scratch_bytes = static_cast<size_t>(shard_size) * slack_degree * sizeof(DistanceType);
     return vectors_bytes + neighbor_table_bytes + scratch_bytes;
   }
 
@@ -219,6 +227,8 @@ class ShardVamanaBuilder {
       auto alpha = pass == 0 ? config_.alpha_first_pass_ : config_.alpha_;
       build_pass(alpha, on_progress);
     }
+    // Final cleanup: prune any over-provisioned nodes back to max_degree
+    cleanup_overprovisioned();
   }
 
   [[nodiscard]] auto export_nodes() const -> std::vector<ExportedNode> {
@@ -305,6 +315,23 @@ class ShardVamanaBuilder {
   CompactNeighborTable<LocalIDType> neighbor_table_;
   std::vector<std::mutex> node_mutexes_;
   LocalIDType medoid_local_id_{0};
+
+  void cleanup_overprovisioned() {
+    for (LocalIDType node_id = 0; node_id < num_nodes(); ++node_id) {
+      auto existing = neighbor_table_.neighbors(node_id);
+      if (existing.size() <= config_.max_degree_) {
+        continue;
+      }
+      // Build candidate pool with distances and prune to max_degree
+      std::vector<NeighborType> candidates;
+      candidates.reserve(existing.size());
+      for (auto neighbor_id : existing) {
+        candidates.emplace_back(neighbor_id, distance(node_id, neighbor_id));
+      }
+      std::sort(candidates.begin(), candidates.end());
+      neighbor_table_.update(node_id, robust_prune(node_id, candidates, config_.alpha_));
+    }
+  }
 
   void enforce_memory_budget() const {
     constexpr double kBudgetFraction = 0.9;
@@ -473,21 +500,24 @@ class ShardVamanaBuilder {
   [[nodiscard]] auto greedy_search(LocalIDType query_id, uint32_t ef) const
       -> std::vector<NeighborType> {
     auto &visited = diskann::GlobalVisitedList::get(num_nodes());
-    CandidateList<float, LocalIDType> candidates(num_nodes(), ef + config_.max_degree_);
+    CandidateList<float, LocalIDType> candidates(num_nodes(), ef);
+
+    // Collect ALL expanded nodes for pruning (matching DiskANN behavior)
+    std::vector<NeighborType> expanded_nodes;
+    expanded_nodes.reserve(ef * 2);
 
     visited.mark(medoid_local_id_);
-    candidates.insert(medoid_local_id_, distance(query_id, medoid_local_id_));
+    auto medoid_dist = distance(query_id, medoid_local_id_);
+    candidates.insert(medoid_local_id_, medoid_dist);
 
     while (candidates.has_next()) {
-      if (candidates.is_full() &&
-          candidates.dist(candidates.cur_) > candidates.dist(candidates.size() - 1)) {
-        break;
-      }
-
+      auto cur_dist = candidates.dist(candidates.cur_);
       auto cur_id = candidates.pop();
+      expanded_nodes.emplace_back(cur_id, cur_dist);
+
       for (auto neighbor_id : neighbor_table_.neighbors(cur_id)) {
         if (neighbor_id >= num_nodes()) {
-          continue;  // skip stale IDs from concurrent writes
+          continue;
         }
         if (visited.is_visited(neighbor_id)) {
           continue;
@@ -497,44 +527,57 @@ class ShardVamanaBuilder {
       }
     }
 
-    size_t final_size = std::min<size_t>(candidates.size(), ef);
-    std::vector<NeighborType> results;
-    results.reserve(final_size);
-    for (size_t i = 0; i < final_size; ++i) {
-      results.emplace_back(candidates.id(i), candidates.dist(i), true);
-    }
-    return results;
+    // Sort expanded nodes by distance for pruning
+    std::sort(expanded_nodes.begin(), expanded_nodes.end());
+    return expanded_nodes;
   }
 
   [[nodiscard]] auto robust_prune(LocalIDType node_id,
-                                  const std::vector<NeighborType> &candidates,
+                                  std::vector<NeighborType> &candidates,
                                   float alpha) const -> std::vector<NeighborType> {
+    // Truncate candidate pool at maxc (matching DiskANN behavior)
+    if (candidates.size() > config_.max_occlusion_size_) {
+      candidates.resize(config_.max_occlusion_size_);
+    }
+
     std::vector<NeighborType> selected;
     selected.reserve(config_.max_degree_);
 
-    auto inflate = [alpha](float dist) -> float {
-      return dist >= 0.0F ? dist * alpha : dist / alpha;
-    };
+    // Per-candidate occlusion factor: max ratio of dist(query,cand)/dist(selected,cand)
+    std::vector<float> occlude_factor(candidates.size(), 0.0F);
 
-    for (const auto &candidate : candidates) {
-      if (selected.size() >= config_.max_degree_) {
-        break;
-      }
-      if (candidate.id_ == node_id) {
-        continue;
-      }
-
-      bool dominated = false;
-      for (const auto &chosen : selected) {
-        if (inflate(distance(candidate.id_, chosen.id_)) < candidate.distance_) {
-          dominated = true;
+    // Multi-round alpha escalation: 1.0 -> 1.2 -> 1.44 -> ...
+    constexpr float kAlphaStep = 1.2F;
+    float cur_alpha = 1.0F;
+    while (cur_alpha <= alpha && selected.size() < config_.max_degree_) {
+      for (size_t i = 0; i < candidates.size(); ++i) {
+        if (selected.size() >= config_.max_degree_) {
           break;
         }
-      }
+        if (occlude_factor[i] > cur_alpha) {
+          continue;
+        }
 
-      if (!dominated) {
-        selected.push_back(candidate);
+        // Select this candidate
+        occlude_factor[i] = std::numeric_limits<float>::max();
+        if (candidates[i].id_ != node_id) {
+          selected.push_back(candidates[i]);
+        }
+
+        // Update occlusion factors for remaining candidates
+        for (size_t j = i + 1; j < candidates.size(); ++j) {
+          if (occlude_factor[j] > alpha) {
+            continue;
+          }
+          float djk = distance(candidates[j].id_, candidates[i].id_);
+          if (djk == 0.0F) {
+            occlude_factor[j] = std::numeric_limits<float>::max();
+          } else {
+            occlude_factor[j] = std::max(occlude_factor[j], candidates[j].distance_ / djk);
+          }
+        }
       }
+      cur_alpha *= kAlphaStep;
     }
 
     return selected;
@@ -547,7 +590,11 @@ class ShardVamanaBuilder {
       return;
     }
 
-    if (existing.size() < config_.max_degree_) {
+    auto slack_limit =
+        static_cast<size_t>(static_cast<float>(config_.max_degree_) * kGraphSlackFactor);
+
+    if (existing.size() < slack_limit) {
+      // Under slack limit: add without pruning (matching DiskANN behavior)
       existing.push_back(dst);
       std::vector<NeighborType> expanded;
       expanded.reserve(existing.size());
@@ -559,6 +606,7 @@ class ShardVamanaBuilder {
       return;
     }
 
+    // At slack limit: prune back to max_degree
     std::vector<NeighborType> candidates;
     candidates.reserve(existing.size() + 1);
     for (auto neighbor_id : existing) {

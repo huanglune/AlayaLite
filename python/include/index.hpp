@@ -35,6 +35,7 @@
 #include <utility>
 #include <variant>
 #include <vector>
+#include "base_py_index.hpp"
 #include "dispatch.hpp"
 #include "executor/jobs/graph_search_job.hpp"
 #include "executor/jobs/graph_update_job.hpp"
@@ -45,6 +46,9 @@
 #include "index/graph/nsg/nsg_builder.hpp"
 #include "index/graph/qg/qg_builder.hpp"
 #include "params.hpp"
+#ifdef LASER_AVAILABLE
+  #include "py_laser_index.hpp"
+#endif
 #include "space/rabitq_space.hpp"
 #include "space/raw_space.hpp"
 #include "space/sq4_space.hpp"
@@ -73,13 +77,6 @@ auto get_topk_array(const std::vector<std::vector<T>> &res_pool, size_t topk) ->
   }
   return ret;
 }
-
-class BasePyIndex {
- public:
-  uint32_t data_dim_{0};
-  BasePyIndex() = default;
-  ~BasePyIndex() = default;
-};
 
 template <typename GraphBuilderType, typename SearchSpaceType>
 class PyIndex : public BasePyIndex {
@@ -507,6 +504,13 @@ class PyIndex : public BasePyIndex {
 class PyIndexInterface {
  public:
   explicit PyIndexInterface(const IndexParams &params) : params_(params) {  // NOLINT
+#ifdef LASER_AVAILABLE
+    if (params_.index_type_ == IndexType::LASER) {
+      index_ = std::make_shared<PyLaserIndex>(params_);
+      is_laser_ = true;
+      return;
+    }
+#endif
     DISPATCH_AND_CREATE(params);
   };
 
@@ -515,6 +519,14 @@ class PyIndexInterface {
   auto fit(py::array &vectors,  // NOLINT
            uint32_t ef_construction,
            uint32_t num_threads) -> void {
+#ifdef LASER_AVAILABLE
+    if (is_laser_) {
+      auto laser_index = std::reinterpret_pointer_cast<PyLaserIndex>(index_);
+      auto typed_vectors = vectors.cast<py::array_t<float>>();
+      laser_index->fit(typed_vectors, ef_construction, num_threads);
+      return;
+    }
+#endif
     DISPATCH_AND_CAST_WITH_ARR(vectors,
                                typed_vectors,
                                index,
@@ -522,6 +534,13 @@ class PyIndexInterface {
   }
 
   auto search(py::array &query, uint32_t topk, uint32_t ef) -> py::array {  // NOLINT
+#ifdef LASER_AVAILABLE
+    if (is_laser_) {
+      auto laser_index = std::reinterpret_pointer_cast<PyLaserIndex>(index_);
+      auto typed_query = query.cast<py::array_t<float>>();
+      return laser_index->search(typed_query, topk, ef);
+    }
+#endif
     DISPATCH_AND_CAST_WITH_ARR(query,
                                typed_query,
                                index,
@@ -529,10 +548,22 @@ class PyIndexInterface {
   }
 
   auto get_data_by_id(uint32_t id) -> py::array {  // NOLINT
+#ifdef LASER_AVAILABLE
+    if (is_laser_) {
+      return std::reinterpret_pointer_cast<PyLaserIndex>(index_)->get_data_by_id(id);
+    }
+#endif
     DISPATCH_AND_CAST(index, return index->get_data_by_id(id););
   }
 
   auto insert(py::array &insert_data, uint32_t ef) -> std::variant<uint32_t, uint64_t> {  // NOLINT
+#ifdef LASER_AVAILABLE
+    if (is_laser_) {
+      auto laser_index = std::reinterpret_pointer_cast<PyLaserIndex>(index_);
+      auto typed_insert_data = insert_data.cast<py::array_t<float>>();
+      return laser_index->insert(typed_insert_data, ef);
+    }
+#endif
     DISPATCH_AND_CAST_WITH_ARR(insert_data,
                                typed_insert_data,
                                index,
@@ -540,6 +571,12 @@ class PyIndexInterface {
   }
 
   auto remove(uint32_t id) -> void {  // NOLINT
+#ifdef LASER_AVAILABLE
+    if (is_laser_) {
+      std::reinterpret_pointer_cast<PyLaserIndex>(index_)->remove(id);
+      return;
+    }
+#endif
     DISPATCH_AND_CAST(index, index->remove(id););
   }
 
@@ -547,6 +584,13 @@ class PyIndexInterface {
                     uint32_t topk,
                     uint32_t ef,  // NOLINT
                     uint32_t num_threads) -> py::array {
+#ifdef LASER_AVAILABLE
+    if (is_laser_) {
+      auto laser_index = std::reinterpret_pointer_cast<PyLaserIndex>(index_);
+      auto typed_queries = queries.cast<py::array_t<float>>();
+      return laser_index->batch_search(typed_queries, topk, ef, num_threads);
+    }
+#endif
     DISPATCH_AND_CAST_WITH_ARR(queries,
                                typed_queries,
                                index,
@@ -557,6 +601,13 @@ class PyIndexInterface {
                                   uint32_t topk,
                                   uint32_t ef,  // NOLINT
                                   uint32_t num_threads) -> py::object {
+#ifdef LASER_AVAILABLE
+    if (is_laser_) {
+      auto laser_index = std::reinterpret_pointer_cast<PyLaserIndex>(index_);
+      auto typed_queries = queries.cast<py::array_t<float>>();
+      return laser_index->batch_search_with_distance(typed_queries, topk, ef, num_threads);
+    }
+#endif
     DISPATCH_AND_CAST_WITH_ARR(queries,
                                typed_queries,
                                index,
@@ -569,12 +620,24 @@ class PyIndexInterface {
   auto load(const std::string &index_path,  // NOLINT
             const std::string &data_path = std::string(),
             const std::string &quant_path = std::string()) -> void {
+#ifdef LASER_AVAILABLE
+    if (is_laser_) {
+      std::reinterpret_pointer_cast<PyLaserIndex>(index_)->load(index_path, data_path, quant_path);
+      return;
+    }
+#endif
     DISPATCH_AND_CAST(index, index->load(index_path, data_path, quant_path););
   }
 
   auto save(const std::string &index_path,  // NOLINT
             const std::string &data_path = std::string(),
             const std::string &quant_path = std::string()) -> void {
+#ifdef LASER_AVAILABLE
+    if (is_laser_) {
+      std::reinterpret_pointer_cast<PyLaserIndex>(index_)->save(index_path, data_path, quant_path);
+      return;
+    }
+#endif
     DISPATCH_AND_CAST(index, index->save(index_path, data_path, quant_path););
   }
 
@@ -583,6 +646,7 @@ class PyIndexInterface {
   virtual ~PyIndexInterface() = default;
   IndexParams params_;
   std::shared_ptr<BasePyIndex> index_;
+  bool is_laser_{false};
 };
 // NOLINTEND
 }  // namespace alaya

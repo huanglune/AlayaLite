@@ -24,7 +24,8 @@
 #include "index/graph/hnsw/hnsw_builder.hpp"
 #include "index/index_type.hpp"
 #ifdef LASER_AVAILABLE
-#include "index/laser/laser_index.hpp"
+  #include "index/laser/laser_build_params.hpp"
+  #include "index/laser/laser_index.hpp"
 #endif
 // #include "reg.hpp"
 #include "params.hpp"
@@ -72,26 +73,30 @@ PYBIND11_MODULE(_alayalitepy, m) {
       .value("RABITQ", alaya::QuantizationType::RABITQ)
       .export_values();
 
-  py::class_<alaya::IndexParams>(m, "IndexParams")
-      .def(py::init<>())
-      .def(py::init<alaya::IndexType,
-                    py::dtype,
-                    py::dtype,
-                    alaya::QuantizationType,
-                    alaya::MetricType,
-                    uint32_t>(),
-           py::arg("index_type_") = alaya::IndexType::HNSW,
-           py::arg("data_type_") = py::dtype::of<float>(),
-           py::arg("id_type_") = py::dtype::of<uint32_t>(),
-           py::arg("quantization_type_") = alaya::QuantizationType::NONE,
-           py::arg("metric_") = alaya::MetricType::L2,
-           py::arg("capacity_") = py::dtype::of<uint32_t>())
-      .def_readwrite("index_type_", &alaya::IndexParams::index_type_)
-      .def_readwrite("data_type_", &alaya::IndexParams::data_type_)
-      .def_readwrite("id_type_", &alaya::IndexParams::id_type_)
-      .def_readwrite("quantization_type_", &alaya::IndexParams::quantization_type_)
-      .def_readwrite("metric_", &alaya::IndexParams::metric_)
-      .def_readwrite("capacity_", &alaya::IndexParams::capacity_);
+  auto index_params_cls =
+      py::class_<alaya::IndexParams>(m, "IndexParams")
+          .def(py::init<>())
+          .def(py::init<alaya::IndexType,
+                        py::dtype,
+                        py::dtype,
+                        alaya::QuantizationType,
+                        alaya::MetricType,
+                        uint32_t,
+                        uint32_t>(),
+               py::arg("index_type_") = alaya::IndexType::HNSW,
+               py::arg("data_type_") = py::dtype::of<float>(),
+               py::arg("id_type_") = py::dtype::of<uint32_t>(),
+               py::arg("quantization_type_") = alaya::QuantizationType::NONE,
+               py::arg("metric_") = alaya::MetricType::L2,
+               py::arg("capacity_") = 100000,
+               py::arg("max_nbrs_") = 32)
+          .def_readwrite("index_type_", &alaya::IndexParams::index_type_)
+          .def_readwrite("data_type_", &alaya::IndexParams::data_type_)
+          .def_readwrite("id_type_", &alaya::IndexParams::id_type_)
+          .def_readwrite("quantization_type_", &alaya::IndexParams::quantization_type_)
+          .def_readwrite("metric_", &alaya::IndexParams::metric_)
+          .def_readwrite("capacity_", &alaya::IndexParams::capacity_)
+          .def_readwrite("max_nbrs_", &alaya::IndexParams::max_nbrs_);
 
   alaya::IndexParams default_param;
 
@@ -154,6 +159,24 @@ PYBIND11_MODULE(_alayalitepy, m) {
       .def("get_data_dim", &alaya::PyIndexInterface::get_data_dim);
 
 #ifdef LASER_AVAILABLE
+  py::class_<alaya::LaserBuildParams>(m, "LaserBuildParams")
+      .def(py::init<>())
+      .def_readwrite("main_dim", &alaya::LaserBuildParams::main_dim_)
+      .def_readwrite("max_degree", &alaya::LaserBuildParams::max_degree_)
+      .def_readwrite("ef_construction", &alaya::LaserBuildParams::ef_construction_)
+      .def_readwrite("ef_build", &alaya::LaserBuildParams::ef_build_)
+      .def_readwrite("alpha", &alaya::LaserBuildParams::alpha_)
+      .def_readwrite("num_medoids", &alaya::LaserBuildParams::num_medoids_)
+      .def_readwrite("pca_sample_ratio", &alaya::LaserBuildParams::pca_sample_ratio_)
+      .def_readwrite("pca_sample_cap", &alaya::LaserBuildParams::pca_sample_cap_)
+      .def_readwrite("medoid_sample_ratio", &alaya::LaserBuildParams::medoid_sample_ratio_)
+      .def_readwrite("medoid_sample_cap", &alaya::LaserBuildParams::medoid_sample_cap_)
+      .def_readwrite("num_threads", &alaya::LaserBuildParams::num_threads_)
+      .def_readwrite("max_memory_mb", &alaya::LaserBuildParams::max_memory_mb_)
+      .def_readwrite("keep_intermediates", &alaya::LaserBuildParams::keep_intermediates_);
+
+  index_params_cls.def_readwrite("laser_build_params_", &alaya::IndexParams::laser_build_params_);
+
   // LaserIndex bindings
   py::class_<symqg::LaserSearchParams>(m, "LaserSearchParams")
       .def(py::init<>())
@@ -172,35 +195,37 @@ PYBIND11_MODULE(_alayalitepy, m) {
            py::arg("main_dim"),
            py::arg("full_dim"),
            py::arg("params"))
-      .def("search",
-           [](alaya::LaserIndex& self, py::array_t<float> query, uint32_t k) {
-             auto full_dim = static_cast<ssize_t>(self.full_dimension());
-             if (query.size() < full_dim) {
-               throw std::invalid_argument(
-                   "query must have full_dimension (" + std::to_string(full_dim) +
-                   ") elements, got " + std::to_string(query.size()));
-             }
-             py::array_t<uint32_t> results(k);
-             self.search(query.data(), k, results.mutable_data());
-             return results;
-           },
-           py::arg("query"),
-           py::arg("k"))
-      .def("batch_search",
-           [](alaya::LaserIndex& self, py::array_t<float> queries, uint32_t k) {
-             auto full_dim = static_cast<ssize_t>(self.full_dimension());
-             if (queries.ndim() < 2 || queries.shape(1) < full_dim) {
-               throw std::invalid_argument(
-                   "queries must have shape (N, " + std::to_string(full_dim) +
-                   "), got shape(1)=" + std::to_string(queries.ndim() >= 2 ? queries.shape(1) : 0));
-             }
-             auto num_queries = static_cast<size_t>(queries.shape(0));
-             py::array_t<uint32_t> results({num_queries, static_cast<size_t>(k)});
-             self.batch_search(queries.data(), num_queries, k, results.mutable_data());
-             return results;
-           },
-           py::arg("queries"),
-           py::arg("k"))
+      .def(
+          "search",
+          [](alaya::LaserIndex &self, py::array_t<float> query, uint32_t k) {
+            auto full_dim = static_cast<ssize_t>(self.full_dimension());
+            if (query.size() < full_dim) {
+              throw std::invalid_argument("query must have full_dimension (" +
+                                          std::to_string(full_dim) + ") elements, got " +
+                                          std::to_string(query.size()));
+            }
+            py::array_t<uint32_t> results(k);
+            self.search(query.data(), k, results.mutable_data());
+            return results;
+          },
+          py::arg("query"),
+          py::arg("k"))
+      .def(
+          "batch_search",
+          [](alaya::LaserIndex &self, py::array_t<float> queries, uint32_t k) {
+            auto full_dim = static_cast<ssize_t>(self.full_dimension());
+            if (queries.ndim() < 2 || queries.shape(1) < full_dim) {
+              throw std::invalid_argument(
+                  "queries must have shape (N, " + std::to_string(full_dim) +
+                  "), got shape(1)=" + std::to_string(queries.ndim() >= 2 ? queries.shape(1) : 0));
+            }
+            auto num_queries = static_cast<size_t>(queries.shape(0));
+            py::array_t<uint32_t> results({num_queries, static_cast<size_t>(k)});
+            self.batch_search(queries.data(), num_queries, k, results.mutable_data());
+            return results;
+          },
+          py::arg("queries"),
+          py::arg("k"))
       .def("set_search_params", &alaya::LaserIndex::set_search_params, py::arg("params"))
       .def("is_loaded", &alaya::LaserIndex::is_loaded)
       .def("num_points", &alaya::LaserIndex::num_points)

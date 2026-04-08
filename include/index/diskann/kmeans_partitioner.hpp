@@ -196,12 +196,11 @@ class KMeansPartitioner {
     layout.num_shards_ =
         compute_num_shards(static_cast<uint32_t>(std::min<uint64_t>(effective_nodes, UINT32_MAX)),
                            layout.shard_capacity_);
-    layout.shard_size_cap_ =
-        std::min(compute_shard_size_cap(num_nodes,
-                                        layout.num_shards_,
-                                        config_.overlap_factor_,
-                                        config_.shard_overflow_factor_),
-                 layout.shard_capacity_);
+    layout.shard_size_cap_ = std::min(compute_shard_size_cap(num_nodes,
+                                                             layout.num_shards_,
+                                                             config_.overlap_factor_,
+                                                             config_.shard_overflow_factor_),
+                                      layout.shard_capacity_);
 
     auto sample = build_sample(space, layout.num_shards_);
     KMeans<SpaceDataType> kmeans(

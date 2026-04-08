@@ -24,6 +24,7 @@ import warnings
 from .client import Client  # noqa: E402
 from .collection import Collection  # noqa: E402
 from .index import Index  # noqa: E402
+from .schema import LaserBuildParams  # noqa: E402
 from .utils import calc_gt, calc_recall, load_fvecs, load_ivecs  # noqa: E402
 
 # Ignore warnings related to "subnormal numbers"
@@ -40,6 +41,7 @@ __all__ = [
     "Client",
     "Index",
     "Collection",
+    "LaserBuildParams",
     # utils
     "load_fvecs",
     "load_ivecs",

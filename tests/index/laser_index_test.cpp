@@ -19,6 +19,7 @@
 #include "index/laser/laser_index.hpp"
 #include "index/laser/laser_types.hpp"
 #include "index/laser/quantized_graph.hpp"
+#include "index/laser/thread_date.hpp"
 
 // ==========================================================================
 // Task 11.5: OngoingSlot and OngoingTable tests
@@ -170,8 +171,25 @@ TEST(LaserSearchParamsTest, DefaultAioEvents) {
     params.beam_width = 16;
     EXPECT_EQ(params.effective_aio_events(), 32U);  // 2 * beam_width
 
-    params.aio_events_per_thread = 64;
+    params.aio_events_per_thread_ = 64;
     EXPECT_EQ(params.effective_aio_events(), 64U);  // explicit override
+}
+
+TEST(ThreadDateTest, AllocateVisitedSetCanTrackAllNodes) {
+    constexpr size_t kNumPoints = 1000;
+
+    symqg::ThreadDate data;
+    data.allocate(64, 32, 8, symqg::kSectorLen, 100, 128, kNumPoints);
+
+    auto &visited = data.search_ctx_.visited_set();
+    for (uint32_t id = 0; id < kNumPoints; ++id) {
+        visited.set(id);
+    }
+    for (uint32_t id = 0; id < kNumPoints; ++id) {
+        EXPECT_TRUE(visited.get(id)) << "missing visited id " << id;
+    }
+
+    data.deallocate();
 }
 
 // ==========================================================================

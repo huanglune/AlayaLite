@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-#include <chrono>
 #include <iomanip>
 #include <iostream>
 #include <random>
@@ -22,6 +21,7 @@
 #include <vector>
 
 #include "simd/fht.hpp"
+#include "utils/timer.hpp"
 
 namespace {
 
@@ -66,16 +66,13 @@ auto run_benchmark(Func func, std::vector<float>& buf, size_t iterations) -> dou
   }
   (void)sink;
 
-  auto start = std::chrono::high_resolution_clock::now();
+  alaya::Timer timer;
   for (size_t i = 0; i < iterations; ++i) {
     buf = backup;
     func(buf.data());
   }
-  auto end = std::chrono::high_resolution_clock::now();
 
-  auto duration_ns =
-      std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-  return static_cast<double>(duration_ns) / static_cast<double>(iterations);
+  return timer.elapsed_us() * 1000.0 / static_cast<double>(iterations);
 }
 
 auto run_benchmarks_for_size(size_t log_n) -> SizeResults {

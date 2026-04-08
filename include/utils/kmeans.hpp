@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <omp.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -45,6 +47,7 @@ class KMeans {
     uint32_t num_clusters_{256};  ///< Number of clusters (K)
     uint32_t max_iter_{20};       ///< Maximum iterations
     uint32_t num_trials_{3};      ///< Number of trials (best selected)
+    uint32_t num_threads_{0};     ///< 0 = omp_get_max_threads()
   };
 
   /**
@@ -200,6 +203,11 @@ class KMeans {
   }
 
  private:
+  [[nodiscard]] auto effective_threads() const -> int {
+    return config_.num_threads_ == 0 ? omp_get_max_threads()
+                                     : static_cast<int>(config_.num_threads_);
+  }
+
   /**
    * @brief Initialize centroids using K-means++ algorithm.
    */
@@ -218,12 +226,12 @@ class KMeans {
     // Distance from each point to nearest centroid
     std::vector<float> min_dists(num_points, std::numeric_limits<float>::max());
 
-    // Choose remaining centroids with probability proportional to distance²
+    // Choose remaining centroids with probability proportional to distance^2
     for (uint32_t k = 1; k < config_.num_clusters_; ++k) {
-      // Update distances to include new centroid
       const DataType *last_centroid = centroids + static_cast<size_t>(k - 1) * dim;
       float total_dist = 0.0F;
 
+#pragma omp parallel for num_threads(effective_threads()) reduction(+ : total_dist) schedule(static)
       for (size_t i = 0; i < num_points; ++i) {
         float d = compute_l2_sqr(data + i * dim, last_centroid, dim);
         min_dists[i] = std::min(min_dists[i], d);
@@ -251,7 +259,7 @@ class KMeans {
   }
 
   /**
-   * @brief Run K-means Lloyd iterations.
+   * @brief Run K-means Lloyd iterations (parallelized).
    *
    * @return Final quantization cost (sum of squared distances)
    */
@@ -260,54 +268,63 @@ class KMeans {
                uint32_t dim,
                DataType *centroids,
                std::vector<uint32_t> &assignments) -> float {
-    std::vector<uint32_t> counts(config_.num_clusters_);
-    std::vector<double> new_centroids(static_cast<size_t>(config_.num_clusters_) * dim);
-
     float cost = 0.0F;
-
     for (uint32_t iter = 0; iter < config_.max_iter_; ++iter) {
-      // Assignment step
-      cost = 0.0F;
-      for (size_t i = 0; i < num_points; ++i) {
-        const DataType *vec = data + i * dim;
-        float min_dist = std::numeric_limits<float>::max();
-        uint32_t best_k = 0;
+      cost = assign_points(data, num_points, dim, centroids, assignments);
+      update_centroids(data, num_points, dim, centroids, assignments);
+    }
+    return cost;
+  }
 
-        for (uint32_t k = 0; k < config_.num_clusters_; ++k) {
-          float d = compute_l2_sqr(vec, centroids + static_cast<size_t>(k) * dim, dim);
-          if (d < min_dist) {
-            min_dist = d;
-            best_k = k;
-          }
-        }
-        assignments[i] = best_k;
-        cost += min_dist;
-      }
-
-      // Update step
-      std::ranges::fill(counts, 0);
-      std::ranges::fill(new_centroids, 0.0);
-
-      for (size_t i = 0; i < num_points; ++i) {
-        uint32_t k = assignments[i];
-        counts[k]++;
-        for (uint32_t d = 0; d < dim; ++d) {
-          new_centroids[static_cast<size_t>(k) * dim + d] += static_cast<double>(data[i * dim + d]);
-        }
-      }
-
-      // Compute new centroids
+  auto assign_points(const DataType *data,
+                     size_t num_points,
+                     uint32_t dim,
+                     const DataType *centroids,
+                     std::vector<uint32_t> &assignments) -> float {
+    float cost = 0.0F;
+#pragma omp parallel for num_threads(effective_threads()) reduction(+ : cost) schedule(static)
+    for (size_t i = 0; i < num_points; ++i) {
+      const DataType *vec = data + i * dim;
+      float min_dist = std::numeric_limits<float>::max();
+      uint32_t best_k = 0;
       for (uint32_t k = 0; k < config_.num_clusters_; ++k) {
-        if (counts[k] > 0) {
-          for (uint32_t d = 0; d < dim; ++d) {
-            centroids[static_cast<size_t>(k) * dim + d] =
-                static_cast<DataType>(new_centroids[static_cast<size_t>(k) * dim + d] / counts[k]);
-          }
+        float d = compute_l2_sqr(vec, centroids + static_cast<size_t>(k) * dim, dim);
+        if (d < min_dist) {
+          min_dist = d;
+          best_k = k;
         }
+      }
+      assignments[i] = best_k;
+      cost += min_dist;
+    }
+    return cost;
+  }
+
+  void update_centroids(const DataType *data,
+                        size_t num_points,
+                        uint32_t dim,
+                        DataType *centroids,
+                        const std::vector<uint32_t> &assignments) {
+    size_t centroid_size = static_cast<size_t>(config_.num_clusters_) * dim;
+    std::vector<double> sums(centroid_size, 0.0);
+    std::vector<uint32_t> counts(config_.num_clusters_, 0);
+
+    for (size_t i = 0; i < num_points; ++i) {
+      uint32_t k = assignments[i];
+      counts[k]++;
+      for (uint32_t d = 0; d < dim; ++d) {
+        sums[static_cast<size_t>(k) * dim + d] += static_cast<double>(data[i * dim + d]);
       }
     }
 
-    return cost;
+    for (uint32_t k = 0; k < config_.num_clusters_; ++k) {
+      if (counts[k] > 0) {
+        for (uint32_t d = 0; d < dim; ++d) {
+          centroids[static_cast<size_t>(k) * dim + d] =
+              static_cast<DataType>(sums[static_cast<size_t>(k) * dim + d] / counts[k]);
+        }
+      }
+    }
   }
 };
 

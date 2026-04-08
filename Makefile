@@ -5,6 +5,7 @@
 
 # Configuration
 BUILD_DIR         := build
+TIDY_BUILD_DIR    := build-tidy
 BUILD_TYPE        ?= Release
 CMAKE_GENERATOR   ?= Ninja
 CMAKE_FLAGS       := -DBUILD_TESTING=ON -DBUILD_BENCHMARKS=ON
@@ -87,8 +88,8 @@ lint: ## Run file-based pre-commit checks
 	@uvx pre-commit run -a
 
 lint-tidy: ## Run clang-tidy static analysis (clean rebuild with checks enabled)
-	@cmake -G "$(CMAKE_GENERATOR)" -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Release $(CMAKE_FLAGS) -DENABLE_CLANG_TIDY=ON $(EXTRA_CMAKE_FLAGS)
-	@cmake --build $(BUILD_DIR) --config Release --clean-first -j$(JOBS)
+	@cmake -G "$(CMAKE_GENERATOR)" -B $(TIDY_BUILD_DIR) -DCMAKE_BUILD_TYPE=Release $(CMAKE_FLAGS) -DENABLE_CLANG_TIDY=ON $(EXTRA_CMAKE_FLAGS)
+	@cmake --build $(TIDY_BUILD_DIR) --config Release --clean-first -j$(JOBS)
 
 lint-commit-msg: ## Validate commit message (use COMMIT_MSG="type: subject")
 	@test -n "$(COMMIT_MSG)" || (echo "COMMIT_MSG is required" >&2; exit 1)
@@ -116,6 +117,7 @@ wheel: ## Build wheel package (use PYTHON_VERSION=3.x to specify)
 
 clean: ## Remove build artifacts
 	@rm -rf $(BUILD_DIR)
+	@rm -rf $(TIDY_BUILD_DIR)
 	@rm -rf dist *.egg-info
 	@find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 	@find . -type d -name ".pytest_cache" -exec rm -rf {} + 2>/dev/null || true

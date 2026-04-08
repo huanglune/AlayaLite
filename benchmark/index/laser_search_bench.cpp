@@ -20,17 +20,129 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "index/laser/laser_index.hpp"
+#include "utils/timer.hpp"
+
+// ============================================================================
+// RSS monitor — background thread that polls /proc/self/status
+// ============================================================================
+
+static auto read_current_rss_kb() -> size_t {
+    std::ifstream fin("/proc/self/status");
+    if (!fin.is_open()) {
+        return 0;
+    }
+    std::string line;
+    while (std::getline(fin, line)) {
+        if (line.compare(0, 6, "VmRSS:") == 0) {
+            return std::stoull(line.substr(6));
+        }
+    }
+    return 0;
+}
+
+class RssMonitor {
+  public:
+    explicit RssMonitor(std::chrono::milliseconds interval)
+        : interval_(interval) {}
+
+    void start() {
+        running_.store(true, std::memory_order_release);
+        thread_ = std::thread([this] { sample_loop(); });
+    }
+
+    void stop() {
+        running_.store(false, std::memory_order_release);
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+    /// Mark a named phase boundary (e.g. "load", "search ef=80").
+    void mark_phase(const std::string& name) {
+        size_t current = read_current_rss_kb();
+        std::lock_guard<std::mutex> lock(mu_);
+        phases_.push_back({name, current, peak_kb_.load(std::memory_order_acquire)});
+    }
+
+    void print_report() const {
+        size_t peak = peak_kb_.load(std::memory_order_acquire);
+        size_t samples = sample_count_.load(std::memory_order_acquire);
+
+        std::cout << "\n=== RSS Monitor Report ===" << '\n';
+        std::cout << "  Sampling interval: " << interval_.count() << " ms"
+                  << "  |  Total samples: " << samples << '\n';
+
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (!phases_.empty()) {
+                std::cout << "\n  Phase snapshots:\n";
+                std::cout << "  " << std::left << std::setw(28) << "Phase"
+                          << std::setw(16) << "RSS (MB)"
+                          << "Peak so far (MB)" << '\n';
+                std::cout << "  " << std::string(60, '-') << '\n';
+                for (const auto& p : phases_) {
+                    std::cout << "  " << std::left << std::setw(28) << p.name_
+                              << std::setw(16) << p.rss_kb_ / 1024
+                              << p.peak_so_far_kb_ / 1024 << '\n';
+                }
+            }
+        }
+
+        std::cout << "\n  >>> Peak RSS: " << peak / 1024
+                  << " MB (" << peak << " kB) <<<" << '\n';
+        std::cout << std::string(28, '=') << '\n';
+    }
+
+    ~RssMonitor() { stop(); }
+
+    RssMonitor(const RssMonitor&) = delete;
+    auto operator=(const RssMonitor&) -> RssMonitor& = delete;
+    RssMonitor(RssMonitor&&) = delete;
+    auto operator=(RssMonitor&&) -> RssMonitor& = delete;
+
+  private:
+    struct PhaseSnapshot {
+        std::string name_;
+        size_t rss_kb_;
+        size_t peak_so_far_kb_;
+    };
+
+    void sample_loop() {
+        while (running_.load(std::memory_order_acquire)) {
+            size_t rss = read_current_rss_kb();
+            // Update peak via CAS loop
+            size_t prev = peak_kb_.load(std::memory_order_relaxed);
+            while (rss > prev &&
+                   !peak_kb_.compare_exchange_weak(prev, rss, std::memory_order_release,
+                                                   std::memory_order_relaxed)) {
+            }
+            sample_count_.fetch_add(1, std::memory_order_relaxed);
+            std::this_thread::sleep_for(interval_);
+        }
+    }
+
+    std::chrono::milliseconds interval_;
+    std::atomic<bool> running_{false};
+    std::atomic<size_t> peak_kb_{0};
+    std::atomic<size_t> sample_count_{0};
+    mutable std::mutex mu_;
+    std::vector<PhaseSnapshot> phases_;
+    std::thread thread_;
+};
 
 // ============================================================================
 // Binary file I/O (compatible with Laser's .fbin/.ibin format)
@@ -132,8 +244,8 @@ auto main(int argc, char* argv[]) -> int {
     float dram_budget = argc > 10 ? std::stof(argv[10]) : 1.0F;
 
     constexpr uint32_t kTopK = 10;
-    constexpr size_t kWarmupQueries = 100;
-    constexpr size_t kRuns = 3;
+    constexpr size_t kWarmupQueries = 3;
+    constexpr size_t kRuns = 5;
 
     // ef_search sweep (matching Laser's settings.py)
     std::vector<size_t> ef_values = {80, 90, 100, 110, 130, 150, 200, 250, 300, 400, 500};
@@ -161,6 +273,12 @@ auto main(int argc, char* argv[]) -> int {
     std::cout << "  Full dim:   " << full_dim << '\n';
     std::cout << "  DRAM budget: " << dram_budget << " GB" << '\n';
 
+    // Start RSS monitor (samples every 10ms)
+    constexpr auto kRssSampleInterval = std::chrono::milliseconds(10);
+    RssMonitor rss_monitor(kRssSampleInterval);
+    rss_monitor.start();
+    rss_monitor.mark_phase("before load");
+
     alaya::LaserIndex index;
     symqg::LaserSearchParams params;
     params.ef_search = 200;
@@ -168,14 +286,15 @@ auto main(int argc, char* argv[]) -> int {
     params.beam_width = beam_width;
     params.search_dram_budget_gb = dram_budget;
 
-    auto load_start = std::chrono::high_resolution_clock::now();
+    alaya::Timer load_timer;
     index.load(index_prefix, num_points, degree, main_dim, full_dim, params);
-    auto load_end = std::chrono::high_resolution_clock::now();
-    double load_ms = std::chrono::duration<double, std::milli>(load_end - load_start).count();
+    double load_ms = load_timer.elapsed_ms();
 
     std::cout << "  Load time:  " << std::fixed << std::setprecision(1) << load_ms << " ms" << '\n';
     std::cout << "  Cached:     " << index.cached_node_count() << " nodes" << '\n';
     std::cout << "  Cache size: " << index.cache_size_bytes() / (1024 * 1024) << " MB" << '\n';
+    std::cout << std::flush;
+    rss_monitor.mark_phase("after load");
 
     bool single_search = (num_threads == 1);
 
@@ -188,10 +307,17 @@ auto main(int argc, char* argv[]) -> int {
               << std::setw(18) << "Mean Lat(us)"
               << std::setw(18) << "P99.9 Lat(us)"
               << '\n';
-    std::cout << std::string(90, '-') << '\n';
+    std::cout << std::string(90, '-') << '\n' << std::flush;
 
     // Benchmark loop with warmup + multi-run averaging
-    for (size_t ef : ef_values) {
+    for (size_t ef_idx = 0; ef_idx < ef_values.size(); ++ef_idx) {
+        size_t ef = ef_values[ef_idx];
+        std::cout << "[Search] Measuring EF=" << ef
+                  << " (" << (ef_idx + 1) << "/" << ef_values.size() << ")"
+                  << ", runs=" << kRuns
+                  << ", queries=" << nq << '\n'
+                  << std::flush;
+
         params.ef_search = ef;
         params.num_threads = num_threads;
         params.beam_width = beam_width;
@@ -219,24 +345,22 @@ auto main(int argc, char* argv[]) -> int {
             if (single_search) {
                 latencies.reserve(nq);
                 for (int32_t i = 0; i < nq; ++i) {
-                    auto t1 = std::chrono::high_resolution_clock::now();
+                    alaya::Timer query_timer;
                     index.search(
                         queries.data() + i * qd, kTopK,
                         results.data() + i * kTopK
                     );
-                    auto t2 = std::chrono::high_resolution_clock::now();
-                    double us = std::chrono::duration<double, std::micro>(t2 - t1).count();
+                    double us = query_timer.elapsed_us();
                     latencies.push_back(us);
                     total_time += us;
                 }
                 total_time /= 1e6;
             } else {
-                auto t1 = std::chrono::high_resolution_clock::now();
+                alaya::Timer batch_timer;
                 index.batch_search(
                     queries.data(), static_cast<size_t>(nq), kTopK, results.data()
                 );
-                auto t2 = std::chrono::high_resolution_clock::now();
-                total_time = std::chrono::duration<double>(t2 - t1).count();
+                total_time = batch_timer.elapsed_s();
             }
 
             sum_qps += nq / total_time;
@@ -262,9 +386,17 @@ auto main(int argc, char* argv[]) -> int {
                   << std::setw(15) << std::setprecision(2) << last_recall
                   << std::setw(18) << std::setprecision(1) << avg_mean_lat
                   << std::setw(18) << std::setprecision(1) << avg_p99_9_lat
-                  << '\n';
+                  << '\n'
+                  << std::flush;
+
+        rss_monitor.mark_phase("after search ef=" + std::to_string(ef));
     }
 
-    std::cout << std::string(90, '=') << '\n';
+    std::cout << std::string(90, '=') << '\n' << std::flush;
+
+    rss_monitor.mark_phase("after all searches");
+    rss_monitor.stop();
+    rss_monitor.print_report();
+
     return 0;
 }

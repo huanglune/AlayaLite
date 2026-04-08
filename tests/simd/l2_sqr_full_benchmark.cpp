@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
-#include <chrono>
 #include <iomanip>
 #include <iostream>
 #include <random>
+
+#include "utils/timer.hpp"
 #include <string>
 #include <vector>
 
@@ -60,15 +61,12 @@ auto run_benchmark(Func func, const float* x, const float* y, size_t dim,
   }
   (void)sink;
 
-  auto start = std::chrono::high_resolution_clock::now();
+  alaya::Timer timer;
   for (size_t i = 0; i < iterations; ++i) {
     sink = func(x, y, dim);
   }
-  auto end = std::chrono::high_resolution_clock::now();
 
-  auto duration_ns =
-      std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-  return static_cast<double>(duration_ns) / static_cast<double>(iterations);
+  return timer.elapsed_us() * 1000.0 / static_cast<double>(iterations);
 }
 
 auto run_benchmarks_for_dim(size_t dim) -> DimResults {

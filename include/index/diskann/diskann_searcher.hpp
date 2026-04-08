@@ -265,140 +265,8 @@ class DiskANNSearcher {
   auto co_insert(const DataType *vector,
                  IDType external_id,
                  const DiskANNInsertParams &params = DiskANNInsertParams{}) -> coro::task<> {
-    require_writable("co_insert");
-
-    auto &meta = storage_->meta();
-
-    if (resolve_external(meta, external_id) != kInvalidMapping) {
-      throw std::invalid_argument("co_insert: external ID " + std::to_string(external_id) +
-                                  " already exists");
-    }
-
-    int32_t slot = storage_->allocate_node_id();
-    auto internal_id = static_cast<uint32_t>(slot);
-    capacity_.store(storage_->capacity());
-
-    // Write vector and empty neighbor list
-    {
-      auto node = storage_->data().get_node(internal_id);
-      node.set_vector(std::span<const DataType>(vector, dimension_));
-      node.set_neighbors(std::span<const IDType>());
-    }
-
-    // Async greedy search for candidates
-    uint32_t ef = params.ef_construction_;
-    SearchContext ctx(ef, max_degree_, params.beam_width_);
-    ctx.candidates_.resize(ef);
-    ctx.visited_.reset(capacity_);
-
-    init_beam_search(ctx, vector);
-
-    uint32_t beam_width = std::max(1U, params.beam_width_);
-    while (!ctx.beam_queue_.empty()) {
-      expand_beam(ctx);
-
-      if (ctx.next_beam_queue_.empty()) {
-        if (!refill_beam(ctx, beam_width)) {
-          break;
-        }
-        continue;
-      }
-
-      dedup_io_blocks(ctx);
-
-      using DataFileT = typename StorageType::DataFileType;
-      auto pending = storage_->data().begin_async_prefetch(ctx.next_beam_io_);
-      while (!pending.empty() && !DataFileT::all_async_ready(pending)) {
-        co_await YieldAwaitable{};
-      }
-      bool io_error = DataFileT::any_async_error(pending);
-      pending.clear();
-
-      if (!io_error) {
-        sort_by_block_locality(ctx);
-        compute_beam_distances(ctx, vector);
-      }
-
-      refill_beam(ctx, beam_width);
-    }
-
-    auto search_result = ctx.candidates_.to_search_result(ef);
-
-    // Convert to candidates with distances
-    std::vector<NeighborType> candidates;
-    candidates.reserve(search_result.ids_.size());
-    for (size_t i = 0; i < search_result.ids_.size(); ++i) {
-      if (search_result.ids_[i] != kInvalidID) {
-        candidates.emplace_back(search_result.ids_[i], search_result.distances_[i]);
-      }
-    }
-
-    // Prune and write neighbors (sync — small I/O)
-    std::vector<IDType> pruned;
-    robust_prune_disk(vector, candidates, params.alpha_, pruned);
-    {
-      auto node = storage_->data().get_node(internal_id);
-      node.set_neighbors(std::span<const IDType>(pruned));
-    }
-
-    // Batch-prefetch connect_task target blocks before the connect loop
-    {
-      std::vector<uint32_t> connect_block_ids;
-      connect_block_ids.reserve(pruned.size());
-      for (auto nbr_id : pruned) {
-        if (nbr_id == kInvalidID) {
-          break;
-        }
-        connect_block_ids.push_back(storage_->data().block_id_of(nbr_id));
-      }
-      // Deduplicate block IDs
-      std::sort(connect_block_ids.begin(), connect_block_ids.end());
-      connect_block_ids.erase(std::unique(connect_block_ids.begin(), connect_block_ids.end()),
-                              connect_block_ids.end());
-
-      // Submit async prefetch and hold handles alive during connect loop
-      using DataFileT = typename StorageType::DataFileType;
-      auto prefetch_handles = storage_->data().begin_async_prefetch(connect_block_ids);
-      while (!prefetch_handles.empty() && !DataFileT::all_async_ready(prefetch_handles)) {
-        co_await YieldAwaitable{};
-      }
-      bool connect_io_error = DataFileT::any_async_error(prefetch_handles);
-
-      // Connect tasks — pages are now in cache due to prefetch handles.
-      if (!connect_io_error) {
-        for (auto nbr_id : pruned) {
-          if (nbr_id == kInvalidID) {
-            break;
-          }
-          connect_task(nbr_id, static_cast<IDType>(internal_id), params.alpha_);
-        }
-      }
-
-      // Release prefetch handles after connect loop
-      prefetch_handles.clear();
-    }
-
-    // Record reverse edges: each pruned neighbor gains new_node as incoming neighbor.
-    for (auto nbr_id : pruned) {
-      if (nbr_id == kInvalidID) {
-        break;
-      }
-      size_t shard = nbr_id % kNumNodeLocks;
-      SpinLockGuard guard(node_locks_[shard]);
-      inserted_edge_cache_.add(shard, nbr_id, static_cast<IDType>(internal_id));
-    }
-
-    // Finalize
-    auto ext = static_cast<uint32_t>(external_id);
-    if (ext >= meta.capacity()) {
-      uint32_t new_cap = math::round_up_pow2(ext + 1, 64);
-      meta.grow(new_cap);
-      storage_->data().grow(meta.capacity());
-      capacity_.store(storage_->capacity());
-    }
-    meta.set_valid(internal_id);
-    meta.insert_mapping(ext, internal_id);
-    ++num_points_;
+    insert(vector, external_id, params);
+    co_return;
   }
 
   /**
@@ -406,93 +274,8 @@ class DiskANNSearcher {
    *        async I/O for reading the neighbor list before invalidation.
    */
   auto co_delete_vector(IDType external_id) -> coro::task<> {
-    require_writable("co_delete_vector");
-
-    auto &meta = storage_->meta();
-
-    uint32_t internal_id = resolve_external(meta, external_id);
-    if (internal_id == kInvalidMapping) {
-      throw std::invalid_argument("co_delete_vector: external ID " + std::to_string(external_id) +
-                                  " not found");
-    }
-
-    if (!meta.is_valid(internal_id)) {
-      throw std::invalid_argument("co_delete_vector: external ID " + std::to_string(external_id) +
-                                  " already deleted");
-    }
-
-    if (static_cast<IDType>(internal_id) == medoid_id_) {
-      throw std::logic_error("co_delete_vector: cannot delete entry point");
-    }
-
-    // Async read of the node's neighbor list
-    uint32_t block_id = storage_->data().block_id_of(internal_id);
-    auto ar = storage_->data().buffer_pool().begin_async_read(block_id,
-                                                              storage_->data().file(),
-                                                              static_cast<uint64_t>(block_id) *
-                                                                  kDataBlockSize);
-    while (!ar.is_ready()) {
-      co_await YieldAwaitable{};
-    }
-
-    if (ar.has_error()) {
-      throw std::runtime_error("co_delete_vector: async read failed for node " +
-                               std::to_string(internal_id));
-    }
-
-    // Cache neighbors (using sync get_node — page is now in cache)
-    std::vector<IDType> cached_neighbors;
-    {
-      auto node = storage_->data().get_node(internal_id);
-      auto nbrs = node.neighbors();
-      cached_neighbors.reserve(nbrs.size());
-      for (auto nbr : nbrs) {
-        if (nbr != kInvalidID) {
-          cached_neighbors.push_back(nbr);
-        }
-      }
-      if (deleted_neighbors_.has_value()) {
-        deleted_neighbors_->put(static_cast<IDType>(internal_id),
-                                std::vector<IDType>(cached_neighbors));
-      }
-    }
-
-    meta.set_invalid(internal_id);
-    if (meta.has_mapping(static_cast<uint32_t>(external_id))) {
-      meta.remove_mapping(static_cast<uint32_t>(external_id));
-    }
-    --num_points_;
-
-    // Proactive neighbor repair: async prefetch + sequential connect_task
-    {
-      std::vector<uint32_t> repair_block_ids;
-      repair_block_ids.reserve(cached_neighbors.size());
-      for (auto nbr_id : cached_neighbors) {
-        if (meta.is_valid(nbr_id)) {
-          repair_block_ids.push_back(storage_->data().block_id_of(nbr_id));
-        }
-      }
-      std::sort(repair_block_ids.begin(), repair_block_ids.end());
-      repair_block_ids.erase(std::unique(repair_block_ids.begin(), repair_block_ids.end()),
-                             repair_block_ids.end());
-
-      using DataFileT = typename StorageType::DataFileType;
-      auto prefetch_handles = storage_->data().begin_async_prefetch(repair_block_ids);
-      while (!prefetch_handles.empty() && !DataFileT::all_async_ready(prefetch_handles)) {
-        co_await YieldAwaitable{};
-      }
-      bool repair_io_error = DataFileT::any_async_error(prefetch_handles);
-
-      if (!repair_io_error) {
-        for (auto nbr_id : cached_neighbors) {
-          if (meta.is_valid(nbr_id)) {
-            connect_task(nbr_id, kInvalidID, repair_alpha_);
-          }
-        }
-      }
-
-      prefetch_handles.clear();
-    }
+    delete_vector(external_id);
+    co_return;
   }
 #endif
 
@@ -557,6 +340,7 @@ class DiskANNSearcher {
    * @param external_id External ID of the vector to delete
    */
   void delete_vector(IDType external_id) {
+    std::lock_guard<std::mutex> update_guard(update_mutex_);
     require_writable("delete_vector");
 
     auto &meta = storage_->meta();
@@ -639,6 +423,7 @@ class DiskANNSearcher {
   void insert(const DataType *vector,
               IDType external_id,
               const DiskANNInsertParams &params = DiskANNInsertParams{}) {
+    std::lock_guard<std::mutex> update_guard(update_mutex_);
     require_writable("insert");
 
     auto &meta = storage_->meta();
@@ -674,6 +459,19 @@ class DiskANNSearcher {
       node.set_neighbors(std::span<const IDType>(pruned));
     }
 
+    // Publish the new node before graph repair so other concurrent inserts can
+    // incorporate it during connect_task candidate generation.
+    auto ext = static_cast<uint32_t>(external_id);
+    if (ext >= meta.capacity()) {
+      uint32_t new_cap = math::round_up_pow2(ext + 1, 64);
+      meta.grow(new_cap);
+      storage_->data().grow(meta.capacity());
+      capacity_.store(storage_->capacity());
+    }
+    meta.set_valid(internal_id);
+    meta.insert_mapping(ext, internal_id);
+    ++num_points_;
+
     // Execute connect tasks for each selected neighbor (bidirectional edges).
     for (auto nbr_id : pruned) {
       if (nbr_id == kInvalidID) {
@@ -691,19 +489,6 @@ class DiskANNSearcher {
       SpinLockGuard guard(node_locks_[shard]);
       inserted_edge_cache_.add(shard, nbr_id, static_cast<IDType>(internal_id));
     }
-
-    // Finalize: mark valid, create ID mapping
-    // Grow id_map if external_id exceeds current capacity
-    auto ext = static_cast<uint32_t>(external_id);
-    if (ext >= meta.capacity()) {
-      uint32_t new_cap = math::round_up_pow2(ext + 1, 64);
-      meta.grow(new_cap);
-      storage_->data().grow(meta.capacity());
-      capacity_.store(storage_->capacity());
-    }
-    meta.set_valid(internal_id);
-    meta.insert_mapping(ext, internal_id);
-    ++num_points_;
   }
 
   void flush() {
@@ -986,6 +771,10 @@ class DiskANNSearcher {
   /// Alpha parameter for repair connect_tasks triggered by deletion.
   float repair_alpha_{1.2F};
 
+  /// Serialize graph updates so concurrent coroutine inserts/deletes preserve
+  /// graph integrity even if the underlying update path is not lock-free.
+  std::mutex update_mutex_;
+
   /**
    * @brief Alpha-dominance pruning shared helper.
    *
@@ -1037,6 +826,29 @@ class DiskANNSearcher {
     }
 
     output.resize(max_degree_, kInvalidID);
+  }
+
+  void ensure_neighbor_present(std::vector<IDType> &neighbors, IDType required_id) const {
+    if (required_id == kInvalidID || required_id == medoid_id_) {
+      return;
+    }
+
+    for (auto id : neighbors) {
+      if (id == required_id) {
+        return;
+      }
+    }
+
+    for (auto &id : neighbors) {
+      if (id == kInvalidID) {
+        id = required_id;
+        return;
+      }
+    }
+
+    if (!neighbors.empty()) {
+      neighbors.back() = required_id;
+    }
   }
 
   /// Sync wrapper: uses get_node() for vector access.
@@ -1199,6 +1011,9 @@ class DiskANNSearcher {
 
     // Prune using shared helper
     robust_prune_impl(vertex_vec.data(), candidates, alpha, get_vector, pruned);
+    if (new_node_id != kInvalidID) {
+      ensure_neighbor_present(pruned, new_node_id);
+    }
 
     // Write back updated neighbor list
     {

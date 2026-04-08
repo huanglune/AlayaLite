@@ -9,7 +9,6 @@
  */
 
 #include <algorithm>
-#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -142,11 +141,10 @@ static auto run_search(DiskANNIndex<> &idx,
   for (uint32_t round = 0; round < measure_rounds; ++round) {
     double round_total = 0;
     for (uint32_t q = 0; q < nq; ++q) {
-      auto t0 = std::chrono::high_resolution_clock::now();
+      Timer query_timer;
       idx.search(ds.queries_.data() + (q % ds.query_num_) * ds.dim_,
                  topk, ids.data() + q * topk, params);
-      auto t1 = std::chrono::high_resolution_clock::now();
-      double us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+      double us = query_timer.elapsed_us();
       latencies[q] = us;
       round_total += us;
     }

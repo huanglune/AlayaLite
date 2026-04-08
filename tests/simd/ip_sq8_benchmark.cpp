@@ -21,7 +21,6 @@
  * Default dimensions: 96, 128, 256, 384, 512, 768, 960, 1024, 1536
  */
 
-#include <chrono>
 #include <iomanip>
 #include <iostream>
 #include <random>
@@ -29,6 +28,7 @@
 #include <vector>
 
 #include "simd/distance_ip.hpp"
+#include "utils/timer.hpp"
 
 namespace {
 
@@ -80,15 +80,12 @@ auto run_benchmark(Func func, const uint8_t* x, const uint8_t* y,
   }
   (void)sink;
 
-  auto start = std::chrono::high_resolution_clock::now();
+  alaya::Timer timer;
   for (size_t i = 0; i < iterations; ++i) {
     sink = func(x, y, dim, min_vals, max_vals);
   }
-  auto end = std::chrono::high_resolution_clock::now();
 
-  auto duration_ns =
-      std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
-  return static_cast<double>(duration_ns) / static_cast<double>(iterations);
+  return timer.elapsed_us() * 1000.0 / static_cast<double>(iterations);
 }
 
 auto run_benchmarks_for_dim(size_t dim) -> DimResults {

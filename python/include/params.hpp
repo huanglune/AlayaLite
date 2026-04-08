@@ -20,6 +20,9 @@
 #include <cstdint>
 
 #include "index/index_type.hpp"
+#ifdef LASER_AVAILABLE
+  #include "index/laser/laser_build_params.hpp"
+#endif
 #include "utils/quantization_type.hpp"
 #include "utils/types.hpp"
 
@@ -34,6 +37,9 @@ struct IndexParams {
   MetricType metric_ = MetricType::L2;
   uint32_t capacity_ = 100000;
   uint32_t max_nbrs_ = 32;
+#ifdef LASER_AVAILABLE
+  LaserBuildParams laser_build_params_;
+#endif
 
   IndexParams(IndexType index_type = IndexType::HNSW,  // NOLINT
               py::dtype data_type = py::dtype::of<float>(),

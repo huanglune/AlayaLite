@@ -23,7 +23,7 @@ namespace symqg {
 #define LIKELY(x) __builtin_expect(!!(x), 1)
 #define UNLIKELY(x) __builtin_expect(!!(x), 0)
 
-using PID = uint32_t;                   // Point ID type for graph nodes
+using PID = uint32_t;                     // Point ID type for graph nodes
 constexpr uint32_t kPidMax = 0xFFFFFFFF;  // Maximum valid PID value
 
 constexpr float kCacheRatio = 0.15;  // Maximum ratio of nodes to cache in memory (15%)
@@ -35,7 +35,7 @@ template <typename T>
 using ColMatrix = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
 
 template <typename T>
-using DistFunc = std::function<T(const T*, const T*, size_t)>;
+using DistFunc = std::function<T(const T *, const T *, size_t)>;
 
 /**
  * @brief Represents a candidate node in k-NN search with its distance to query.
@@ -43,14 +43,14 @@ using DistFunc = std::function<T(const T*, const T*, size_t)>;
  */
 template <typename T>
 struct Candidate {
-    PID id;        // Node identifier  // NOLINT(readability-identifier-naming)
-    T distance;    // Distance to query vector  // NOLINT(readability-identifier-naming)
+  PID id;      // Node identifier  // NOLINT(readability-identifier-naming)
+  T distance;  // Distance to query vector  // NOLINT(readability-identifier-naming)
 
-    Candidate() = default;
-    explicit Candidate(PID vec_id, T dis) : id(vec_id), distance(dis) {}
+  Candidate() = default;
+  explicit Candidate(PID vec_id, T dis) : id(vec_id), distance(dis) {}
 
-    auto operator<(const Candidate& other) const -> bool { return distance < other.distance; }
+  auto operator<(const Candidate &other) const -> bool { return distance < other.distance; }
 
-    auto operator>(const Candidate& other) const -> bool { return !(*this < other); }
+  auto operator>(const Candidate &other) const -> bool { return !(*this < other); }
 };
 }  // namespace symqg

@@ -144,7 +144,8 @@ if(UNIX AND NOT APPLE)
     add_compile_definitions(LASER_AVAILABLE)
   else()
     message(WARNING "libaio not found — Laser index support will be unavailable. "
-                    "Install: sudo apt-get install libaio-dev")
+                    "Install: sudo apt-get install libaio-dev"
+    )
     set(LASER_AVAILABLE OFF)
   endif()
 endif()
@@ -155,8 +156,7 @@ if(USE_JEMALLOC)
     message(STATUS "Found jemalloc: ${JEMALLOC_LIBRARY}")
     list(APPEND THIRD_PARTY_LIBS ${JEMALLOC_LIBRARY})
   else()
-    message(FATAL_ERROR "USE_JEMALLOC=ON but jemalloc not found. "
-                        "Install: sudo apt-get install libjemalloc-dev")
+    message(FATAL_ERROR "USE_JEMALLOC=ON but jemalloc not found. " "Install: sudo apt-get install libjemalloc-dev")
   endif()
 endif()
 

@@ -12,4 +12,7 @@ target_link_libraries(diskann_search_bench PRIVATE ${THIRD_PARTY_LIBS} tomlplusp
 if(LASER_AVAILABLE)
   add_executable(laser_search_bench ${CMAKE_CURRENT_SOURCE_DIR}/laser_search_bench.cpp)
   target_link_libraries(laser_search_bench PRIVATE ${THIRD_PARTY_LIBS})
+
+  add_executable(laser_build_bench ${CMAKE_CURRENT_SOURCE_DIR}/laser_build_bench.cpp)
+  target_link_libraries(laser_build_bench PRIVATE ${THIRD_PARTY_LIBS})
 endif()

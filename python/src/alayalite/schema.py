@@ -25,6 +25,11 @@ from dataclasses import dataclass
 import numpy as np
 
 from ._alayalitepy import IndexParams as _IndexParams
+
+try:
+    from ._alayalitepy import LaserBuildParams as _LaserBuildParams
+except ImportError:  # pragma: no cover - depends on LASER build support
+    _LaserBuildParams = None
 from .common import (
     IDType,
     VectorDType,
@@ -40,7 +45,43 @@ from .common import (
     valid_quantization_type,
 )
 
-__all__ = ["IndexParams", "load_schema", "save_schema"]
+__all__ = ["IndexParams", "LaserBuildParams", "load_schema", "save_schema"]
+
+
+def LaserBuildParams():  # pylint: disable=invalid-name
+    """Create a pybind11 LASER build params object when LASER support is available."""
+    if _LaserBuildParams is None:
+        raise RuntimeError("LASER support is not available in this build")
+    return _LaserBuildParams()
+
+
+def _laser_build_params_to_dict(params):
+    if params is None:
+        return None
+    return {
+        "main_dim": params.main_dim,
+        "max_degree": params.max_degree,
+        "ef_construction": params.ef_construction,
+        "ef_build": params.ef_build,
+        "alpha": params.alpha,
+        "num_medoids": params.num_medoids,
+        "pca_sample_ratio": params.pca_sample_ratio,
+        "pca_sample_cap": params.pca_sample_cap,
+        "medoid_sample_ratio": params.medoid_sample_ratio,
+        "medoid_sample_cap": params.medoid_sample_cap,
+        "num_threads": params.num_threads,
+        "max_memory_mb": params.max_memory_mb,
+        "keep_intermediates": params.keep_intermediates,
+    }
+
+
+def _laser_build_params_from_dict(data):
+    if data is None:
+        return None
+    params = LaserBuildParams()
+    for key, value in data.items():
+        setattr(params, key, value)
+    return params
 
 
 @dataclass
@@ -54,6 +95,7 @@ class IndexParams:
     metric: str = None
     capacity: np.uint32 = None
     max_nbrs: int = None
+    laser_build_params: object = None
 
     def index_path(self, folder_uri):
         return os.path.join(folder_uri, f"{self.index_type}_{self.metric}_{self.max_nbrs}.index")
@@ -91,14 +133,18 @@ class IndexParams:
         native_quantization_type = valid_quantization_type(self.quantization_type)
         capacity = valid_capacity_type(self.capacity)
 
-        return _IndexParams(
+        cpp_params = _IndexParams(
             index_type_=native_index_type,
             data_type_=native_data_type,
             id_type_=native_id_type,
             quantization_type_=native_quantization_type,
             metric_=native_metric_type,
             capacity_=capacity,
+            max_nbrs_=self.max_nbrs,
         )
+        if hasattr(cpp_params, "laser_build_params_") and self.laser_build_params is not None:
+            cpp_params.laser_build_params_ = self.laser_build_params
+        return cpp_params
 
     def to_json_dict(self) -> str:
         return {
@@ -109,6 +155,7 @@ class IndexParams:
             "metric": self.metric,
             "capacity": self.capacity,
             "max_nbrs": self.max_nbrs,
+            "laser_build_params": _laser_build_params_to_dict(self.laser_build_params),
         }
 
     @classmethod
@@ -122,6 +169,7 @@ class IndexParams:
             metric=data["metric"],
             capacity=data["capacity"],
             max_nbrs=data["max_nbrs"],
+            laser_build_params=_laser_build_params_from_dict(data.get("laser_build_params")),
         )
 
     @classmethod
@@ -133,6 +181,7 @@ class IndexParams:
         metric = None
         capacity = None
         max_nbrs = None
+        laser_build_params = None
 
         if kwargs.get("index_type") is not None:
             ind_type = kwargs.get("index_type")
@@ -154,6 +203,8 @@ class IndexParams:
             capacity = valid_capacity_type(kwargs.get("capacity"))
         if kwargs.get("max_nbrs") is not None:
             max_nbrs = valid_max_nbrs(kwargs.get("max_nbrs"))
+        if kwargs.get("laser_build_params") is not None:
+            laser_build_params = kwargs.get("laser_build_params")
         return cls(
             index_type=index_type,
             data_type=data_type,
@@ -162,6 +213,7 @@ class IndexParams:
             metric=metric,
             capacity=capacity,
             max_nbrs=max_nbrs,
+            laser_build_params=laser_build_params,
         )
 
 

@@ -51,8 +51,8 @@ DistanceMetric: TypeAlias = Literal["euclidean", "l2", "ip", "cosine", "cos"]
 """ Type alias for one of {"euclidean", "l2", "ip", "cosine", "cos"} """
 QuantizationType: TypeAlias = Literal[None, "none", "sq8", "sq4", "rabitq"]
 """ Type alias for one of {None, "none", "sq8", "sq4"} """
-IndexType: TypeAlias = Literal["hnsw", "nsg", "fusion"]
-""" Type alias for one of {"hnsw", "nsg", "fusion"} (laser uses LaserIndex directly) """
+IndexType: TypeAlias = Literal["hnsw", "nsg", "fusion", "laser"]
+""" Type alias for one of {"hnsw", "nsg", "fusion", "laser"} """
 VectorLike: TypeAlias = npt.NDArray[VectorDType]  # type: ignore
 """ Type alias for something that can be treated as a vector """
 VectorLikeBatch: TypeAlias = npt.NDArray[VectorDType]  # type: ignore
@@ -61,7 +61,7 @@ VectorLikeBatch: TypeAlias = npt.NDArray[VectorDType]  # type: ignore
 _VALID_IDTYPES = [np.uint64, np.uint32]
 _VALID_DTYPES = [np.float32, np.int8, np.uint8, np.float64, np.int32, np.uint32]
 _VALID_METRIC_TYPES = ["euclidean", "l2", "ip", "cosine", "cos"]
-_VALID_INDEX_TYPES = ["hnsw", "nsg", "fusion"]
+_VALID_INDEX_TYPES = ["hnsw", "nsg", "fusion", "laser"]
 _VALID_SQ_TYPES = [None, "none", "sq8", "sq4", "rabitq"]
 
 __all__ = [
@@ -157,6 +157,8 @@ def valid_index_type(index: str) -> _IndexType:
         return _IndexType.NSG
     elif index.lower() == "fusion":
         return _IndexType.FUSION
+    elif index.lower() == "laser":
+        return _IndexType.LASER
 
 
 def valid_max_nbrs(max_nbrs: np.uint32) -> np.uint32:
