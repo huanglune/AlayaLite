@@ -19,7 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
-#include <filesystem>
+#include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -39,11 +39,7 @@ enum class LaserBuildPhase : uint8_t {
   kCount
 };
 
-enum class PhaseStatus : uint8_t {
-  kPending = 0,
-  kInProgress,
-  kCompleted
-};
+enum class PhaseStatus : uint8_t { kPending = 0, kInProgress, kCompleted };
 
 class BuildState {
  public:
@@ -167,8 +163,7 @@ class BuildState {
     output << "  \"phases\": {\n";
     for (size_t i = 0; i < static_cast<size_t>(LaserBuildPhase::kCount); ++i) {
       auto phase = static_cast<LaserBuildPhase>(i);
-      output << "    \"" << phase_name(phase) << "\": \""
-             << phase_status_name(phases_[i]) << "\"";
+      output << "    \"" << phase_name(phase) << "\": \"" << phase_status_name(phases_[i]) << "\"";
       output << (i + 1 == static_cast<size_t>(LaserBuildPhase::kCount) ? "\n" : ",\n");
     }
     output << "  },\n";
@@ -256,8 +251,7 @@ class BuildState {
       return 0;
     }
     auto digit_end = json.find_first_not_of("0123456789", digit_start);
-    return static_cast<uint64_t>(
-        std::stoull(json.substr(digit_start, digit_end - digit_start)));
+    return static_cast<uint64_t>(std::stoull(json.substr(digit_start, digit_end - digit_start)));
   }
 
   [[nodiscard]] static auto extract_int_array(const std::string &json, const std::string &key)

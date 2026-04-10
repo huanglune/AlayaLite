@@ -3,7 +3,7 @@
  * @brief Zero-allocation search context for Laser index queries.
  *
  * LaserSearchContext provides typed accessors to pre-allocated scratch buffers
- * owned by ThreadDate. It is constructed as a lightweight view at query start
+ * owned by ThreadData. It is constructed as a lightweight view at query start
  * and passed by reference through the entire search call chain.
  *
  * All per-query and per-node heap allocations are eliminated by reusing these
@@ -22,48 +22,59 @@
 
 namespace symqg {
 
+/**
+ * @brief Aggregates all buffer pointers and config for search context initialization.
+ * Replaces the 14-parameter init() call with a single struct.
+ */
+struct SearchContextBuffers {
+  // Buffer pointers (borrowed from ThreadData — no ownership)
+  uint8_t *lut = nullptr;
+  float *rotated_query = nullptr;
+  uint8_t *byte_query = nullptr;
+  uint16_t *scan_result = nullptr;
+  float *scan_float = nullptr;
+  float *appro_dist = nullptr;
+  io_event *io_events = nullptr;
+  AlignedRead *frontier_reqs = nullptr;
+  iocb *iocb_buf = nullptr;
+  iocb **iocb_ptrs = nullptr;
+
+  // Dimension and capacity config
+  size_t padded_dim = 0;
+  size_t degree_bound = 0;
+  size_t max_beam_width = 0;
+  size_t visited_capacity = 0;
+};
+
 class LaserSearchContext {
  public:
   LaserSearchContext() = default;
 
   /**
    * @brief Construct a context as a view over pre-allocated buffers.
-   * All pointers are borrowed from ThreadDate — no ownership.
+   * All pointers are borrowed from ThreadData — no ownership.
    */
-  void init(uint8_t *lut_buf,
-            float *rotated_query_buf,
-            uint8_t *byte_query_buf,
-            uint16_t *scan_result_buf,
-            float *scan_float_buf,
-            float *appro_dist_buf,
-            io_event *io_events_buf,
-            AlignedRead *frontier_reqs_buf,
-            iocb *iocb_buf,
-            iocb **iocb_ptrs_buf,
-            size_t padded_dim,
-            size_t degree_bound,
-            size_t max_beam_width,
-            size_t visited_capacity) {
-    lut_ = lut_buf;
-    rotated_query_ = rotated_query_buf;
-    byte_query_ = byte_query_buf;
-    scan_result_ = scan_result_buf;
-    scan_float_ = scan_float_buf;
-    appro_dist_ = appro_dist_buf;
-    io_events_ = io_events_buf;
-    frontier_reqs_ = frontier_reqs_buf;
-    iocb_buf_ = iocb_buf;
-    iocb_ptrs_buf_ = iocb_ptrs_buf;
+  void init(const SearchContextBuffers &bufs) {
+    lut_ = bufs.lut;
+    rotated_query_ = bufs.rotated_query;
+    byte_query_ = bufs.byte_query;
+    scan_result_ = bufs.scan_result;
+    scan_float_ = bufs.scan_float;
+    appro_dist_ = bufs.appro_dist;
+    io_events_ = bufs.io_events;
+    frontier_reqs_ = bufs.frontier_reqs;
+    iocb_buf_ = bufs.iocb_buf;
+    iocb_ptrs_buf_ = bufs.iocb_ptrs;
 
-    padded_dim_ = padded_dim;
-    degree_bound_ = degree_bound;
-    max_beam_width_ = max_beam_width;
+    padded_dim_ = bufs.padded_dim;
+    degree_bound_ = bufs.degree_bound;
+    max_beam_width_ = bufs.max_beam_width;
 
-    ongoing_table_ = OngoingTable(2 * max_beam_width);
-    visited_set_ = TaggedVisitedSet(visited_capacity);
-    prepared_ring_ = FixedRingBuffer<std::pair<PID, char *>>(2 * max_beam_width);
-    free_slot_stack_ = FixedStack<char *>(2 * max_beam_width);
-    cache_nhoods_.reserve(max_beam_width);
+    ongoing_table_ = OngoingTable(2 * bufs.max_beam_width);
+    visited_set_ = TaggedVisitedSet(bufs.visited_capacity);
+    prepared_ring_ = FixedRingBuffer<std::pair<PID, char *>>(2 * bufs.max_beam_width);
+    free_slot_stack_ = FixedStack<char *>(2 * bufs.max_beam_width);
+    cache_nhoods_.reserve(bufs.max_beam_width);
   }
 
   /**
@@ -102,7 +113,7 @@ class LaserSearchContext {
   [[nodiscard]] auto result_buffer() -> buffer::ResultBuffer & { return result_buffer_; }
 
  private:
-  // Borrowed buffer pointers (owned by ThreadDate)
+  // Borrowed buffer pointers (owned by ThreadData)
   uint8_t *lut_ = nullptr;
   float *rotated_query_ = nullptr;
   uint8_t *byte_query_ = nullptr;

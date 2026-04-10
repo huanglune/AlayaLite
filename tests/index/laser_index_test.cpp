@@ -19,7 +19,7 @@
 #include "index/laser/laser_index.hpp"
 #include "index/laser/laser_types.hpp"
 #include "index/laser/quantized_graph.hpp"
-#include "index/laser/thread_date.hpp"
+#include "index/laser/thread_data.hpp"
 
 // ==========================================================================
 // Task 11.5: OngoingSlot and OngoingTable tests
@@ -175,10 +175,10 @@ TEST(LaserSearchParamsTest, DefaultAioEvents) {
     EXPECT_EQ(params.effective_aio_events(), 64U);  // explicit override
 }
 
-TEST(ThreadDateTest, AllocateVisitedSetCanTrackAllNodes) {
+TEST(ThreadDataTest, AllocateVisitedSetCanTrackAllNodes) {
     constexpr size_t kNumPoints = 1000;
 
-    symqg::ThreadDate data;
+    symqg::ThreadData data;
     data.allocate(64, 32, 8, symqg::kSectorLen, 100, 128, kNumPoints);
 
     auto &visited = data.search_ctx_.visited_set();

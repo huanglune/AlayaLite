@@ -21,7 +21,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <iostream>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -56,10 +55,6 @@ struct Graph {
                               ///< node ids of its neighbors
   std::unique_ptr<OverlayGraphType> overlay_graph_ = nullptr;  ///< the overlay graph of HNSW
   std::vector<NodeIDType> eps_;                                ///< the entry points
-
-  // bool include_raw_data_;  ///< include_raw_data_ is a flag to indicate whether the raw data is
-  ///< included in the graph
-  // DataType *base_data_ = nullptr;  ///< the raw data of the graph
 
   Graph() = default;
 
@@ -142,14 +137,16 @@ struct Graph {
    * @param cand_pool  The candidate pool for search.
    * @param dist_func The computer function of distance computation.
    */
-  template <typename CandPoolType, typename DistFuncType>
-  void initialize_search(CandPoolType &cand_pool, const DistFuncType &dist_func) const {
+  template <typename CandPoolType, typename VisitedType, typename DistFuncType>
+  void initialize_search(CandPoolType &cand_pool,
+                         VisitedType &visited,
+                         const DistFuncType &dist_func) const {
     if (overlay_graph_) {
-      overlay_graph_->initialize(cand_pool, dist_func);
+      overlay_graph_->initialize(cand_pool, visited, dist_func);
     } else {
       for (auto ep : eps_) {
         cand_pool.insert(ep, dist_func(ep));
-        cand_pool.vis_.set(ep);
+        visited.set(ep);
       }
     }
   }
@@ -176,19 +173,6 @@ struct Graph {
     writer.write(const_cast<char *>(reinterpret_cast<const char *>(&max_nbrs_)),
                  sizeof(NodeIDType));
     data_storage_.save(writer);
-
-    // raw data
-    // include_raw_data = include_raw_data;
-    // writer.write(const_cast<char *>(reinterpret_cast<const char *>(&include_raw_data_)),
-    //  sizeof(bool));
-    // if (include_raw_data_) {
-    //   if (raw_data == nullptr) {
-    //     throw std::runtime_error("raw_data is nullptr");
-    //   }
-    //   writer.write(const_cast<char *>(reinterpret_cast<const char *>(&dim)), sizeof(uint32_t));
-    //   writer.write(const_cast<char *>(reinterpret_cast<const char *>(raw_data)),
-    //                max_nodes_ * dim * sizeof(DataType));
-    // }
 
     if (overlay_graph_) {
       overlay_graph_->save(writer);
@@ -219,14 +203,6 @@ struct Graph {
 
     data_storage_.load(reader);
 
-    // reader.read(reinterpret_cast<char *>(&include_raw_data_), sizeof(bool));
-    // if (include_raw_data_) {
-    //   reader.read(reinterpret_cast<char *>(&dim_), sizeof(uint32_t));
-    //   base_data_ = static_cast<DataType *>(
-    //       alaya::alloc_2m(static_cast<size_t>(max_nodes_) * dim_ * sizeof(DataType)));
-    //   reader.read(reinterpret_cast<char *>(base_data_), max_nodes_ * dim_ * sizeof(DataType));
-    // }
-
     if (reader.peek() != EOF) {
       overlay_graph_ = std::make_unique<OverlayGraph<NodeIDType>>(max_nodes_, max_nbrs_);
       overlay_graph_->load(reader);
@@ -234,21 +210,6 @@ struct Graph {
     LOG_INFO("Graph Loading done\n");
   }
 
-  /**
-   * @brief Get the Graph object
-   *
-   * @return Graph<Id> The final graph of the HNSW .
-   */
-  auto print_graph() -> void {
-    for (int i = 0; i < max_nodes_; i++) {
-      for (int j = 0; j < max_nbrs_; j++) {
-        if (at(i, j) == -1) {
-          break;
-        }
-        LOG_INFO("u id {} -> v id {}", i, at(i, j));
-      }
-    }
-  }
 };
 
 }  // namespace alaya

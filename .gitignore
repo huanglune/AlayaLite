@@ -12,6 +12,7 @@ CTestTestfile.cmake
 DartConfiguration.tcl
 _deps/
 build/
+build-tidy/
 build-debug/
 Testing/
 
@@ -76,6 +77,8 @@ alaya.log
 # Data & benchmark results
 # ============================================================
 data/
+*.csv
+*.svg
 benchmark/results/
 benchmark/index/*.png
 

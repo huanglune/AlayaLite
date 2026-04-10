@@ -89,11 +89,23 @@ class FileLock {
 #endif
 };
 
+/// @brief Platform-specific pause hint for spin-wait loops.
+/// Reduces power consumption and avoids starving hyper-thread siblings.
+inline void spin_pause() noexcept {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+  __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(_M_ARM64)
+  __asm__ volatile("yield");
+#else
+  // No-op fallback for other architectures
+#endif
+}
+
 class SpinLock {
  public:
   void lock() {
     while (flag_.test_and_set(std::memory_order_acquire)) {
-      // Spin-wait lock release
+      spin_pause();
     }
   }
 
@@ -134,6 +146,7 @@ class SharedLock {
       expected = state_.load();
       // Wait if the current lock is exclusive lock (-1)
       while (expected == -1) {
+        spin_pause();
         expected = state_.load();
       }
     } while (!state_.compare_exchange_weak(expected, expected + 1));
@@ -147,6 +160,7 @@ class SharedLock {
     int expected = 0;
     // Wait until there is no other shared lock and exclusive lock
     while (!state_.compare_exchange_weak(expected, -1)) {
+      spin_pause();
       expected = 0;
     }
   }

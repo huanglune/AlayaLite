@@ -21,7 +21,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
+#include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -195,26 +195,41 @@ class LaserBuilder {
       return;
     }
 
-    run_phase(LaserBuildPhase::kPca, [this]() { run_pca(); });
+    run_phase(LaserBuildPhase::kPca, [this]() {
+      run_pca();
+    });
     if (!params_.external_vamana_.empty()) {
       // Use externally-built Vamana graph (e.g. from DiskANN)
       run_phase(LaserBuildPhase::kPartition, []() {});
       run_phase(LaserBuildPhase::kShardBuilds, []() {});
       run_phase(LaserBuildPhase::kMerge, [this]() {
-        std::filesystem::copy_file(params_.external_vamana_, vamana_path(),
+        std::filesystem::copy_file(params_.external_vamana_,
+                                   vamana_path(),
                                    std::filesystem::copy_options::overwrite_existing);
       });
     } else if (params_.single_shard_) {
       run_phase(LaserBuildPhase::kPartition, []() {});
       run_phase(LaserBuildPhase::kShardBuilds, []() {});
-      run_phase(LaserBuildPhase::kMerge, [this]() { run_single_shard_vamana(); });
+      run_phase(LaserBuildPhase::kMerge, [this]() {
+        run_single_shard_vamana();
+      });
     } else {
-      run_phase(LaserBuildPhase::kPartition, [this]() { run_partition(); });
-      run_phase(LaserBuildPhase::kShardBuilds, [this]() { run_shard_builds(); });
-      run_phase(LaserBuildPhase::kMerge, [this]() { run_merge(); });
+      run_phase(LaserBuildPhase::kPartition, [this]() {
+        run_partition();
+      });
+      run_phase(LaserBuildPhase::kShardBuilds, [this]() {
+        run_shard_builds();
+      });
+      run_phase(LaserBuildPhase::kMerge, [this]() {
+        run_merge();
+      });
     }
-    run_phase(LaserBuildPhase::kMedoids, [this]() { run_medoid(); });
-    run_phase(LaserBuildPhase::kQGBuild, [this]() { run_qg_build(); });
+    run_phase(LaserBuildPhase::kMedoids, [this]() {
+      run_medoid();
+    });
+    run_phase(LaserBuildPhase::kQGBuild, [this]() {
+      run_qg_build();
+    });
 
     if (!params_.keep_intermediates_) {
       cleanup_intermediates();
@@ -270,8 +285,8 @@ class LaserBuilder {
     effective_params.num_threads_ = num_threads_;
 
     state_ = BuildState(build_dir_ / "build_state.json");
-    std::string checkpoint_hash = effective_params.params_hash() + "|" + std::to_string(num_points_) +
-                                  "|" + std::to_string(full_dim_);
+    std::string checkpoint_hash = effective_params.params_hash() + "|" +
+                                  std::to_string(num_points_) + "|" + std::to_string(full_dim_);
     state_.load_or_reset(checkpoint_hash);
   }
 
@@ -281,8 +296,8 @@ class LaserBuilder {
       return;
     }
 
-    std::cout << "[LaserBuilder] Phase " << BuildState::phase_name(phase)
-              << " started..." << std::endl;
+    std::cout << "[LaserBuilder] Phase " << BuildState::phase_name(phase) << " started..."
+              << '\n';
     Timer phase_timer;
 
     state_.mark_in_progress(phase);
@@ -292,9 +307,8 @@ class LaserBuilder {
     fn();
     state_.mark_completed(phase);
 
-    std::cout << "[LaserBuilder] Phase " << BuildState::phase_name(phase)
-              << " completed in " << std::fixed << std::setprecision(1)
-              << phase_timer.elapsed_s() << " s" << std::endl;
+    std::cout << "[LaserBuilder] Phase " << BuildState::phase_name(phase) << " completed in "
+              << std::fixed << std::setprecision(1) << phase_timer.elapsed_s() << " s" << '\n';
   }
 
   void run_pca() {
@@ -346,7 +360,8 @@ class LaserBuilder {
 
       pca.transform_batch(batch_in.data(), batch_out.data(), count);
       output.write(reinterpret_cast<const char *>(batch_out.data()),
-                   static_cast<std::streamsize>(static_cast<size_t>(count) * full_dim_ * sizeof(float)));
+                   static_cast<std::streamsize>(static_cast<size_t>(count) * full_dim_ *
+                                                sizeof(float)));
     }
 
     Eigen::setNbThreads(prev_eigen_threads);
@@ -354,7 +369,9 @@ class LaserBuilder {
 
   void run_partition() {
     auto pca_vectors = load_fbin(pca_base_path());
-    RawSpace<float, float, uint32_t> pca_space(pca_vectors.num_points_, pca_vectors.dimension_, MetricType::L2);
+    RawSpace<float, float, uint32_t> pca_space(pca_vectors.num_points_,
+                                               pca_vectors.dimension_,
+                                               MetricType::L2);
     pca_space.fit(pca_vectors.data_.data(), pca_vectors.num_points_);
 
     typename KMeansPartitioner<float, uint32_t>::Config config;
@@ -379,11 +396,11 @@ class LaserBuilder {
         continue;
       }
 
-      auto vectors =
-          ShardVamanaBuilder<float, uint32_t>::load_vectors_from_shuffle(partition.shuffle_path_,
-                                                                         partition.shuffle_offsets_[shard_id],
-                                                                         partition.shuffle_counts_[shard_id],
-                                                                         full_dim_);
+      auto vectors = ShardVamanaBuilder<float, uint32_t>::
+          load_vectors_from_shuffle(partition.shuffle_path_,
+                                    partition.shuffle_offsets_[shard_id],
+                                    partition.shuffle_counts_[shard_id],
+                                    full_dim_);
       ShardVamanaBuilder<float, uint32_t> builder(std::move(vectors),
                                                   full_dim_,
                                                   partition.shard_members_[shard_id],
@@ -391,10 +408,12 @@ class LaserBuilder {
                                                   config);
       uint64_t total_work =
           static_cast<uint64_t>(partition.shard_members_[shard_id].size()) * config.num_iterations_;
-      std::string label = "Shard " + std::to_string(shard_id + 1) + "/" +
-                           std::to_string(partition.num_shards_);
+      std::string label =
+          "Shard " + std::to_string(shard_id + 1) + "/" + std::to_string(partition.num_shards_);
       auto bar = std::make_shared<ProgressBar>(label, total_work);
-      builder.build([bar]() { bar->tick(); });
+      builder.build([bar]() {
+        bar->tick();
+      });
       auto summary = builder.export_graph(shard_id, shard_graph_path(shard_id));
       (void)summary;
       state_.mark_shard_completed(shard_id);
@@ -416,7 +435,9 @@ class LaserBuilder {
 
     VamanaFormatWriter writer(vamana_path(), params_.max_degree_, num_points_);
     writer.open();
-    merger.merge_all([&writer](const CrossShardMerger::MergedNode &node) { writer.write_node(node); });
+    merger.merge_all([&writer](const CrossShardMerger::MergedNode &node) {
+      writer.write_node(node);
+    });
     writer.finalize();
   }
 
@@ -433,13 +454,17 @@ class LaserBuilder {
     config.max_memory_mb_ = params_.max_memory_mb_;
     config.num_threads_ = num_threads_;
 
-    ShardVamanaBuilder<float, uint32_t> builder(
-        std::move(pca_vectors.data_), full_dim_, std::move(all_ids),
-        simd::l2_sqr<float, float>, config);
+    ShardVamanaBuilder<float, uint32_t> builder(std::move(pca_vectors.data_),
+                                                full_dim_,
+                                                std::move(all_ids),
+                                                simd::l2_sqr<float, float>,
+                                                config);
 
     uint64_t total_work = static_cast<uint64_t>(num_points_) * config.num_iterations_;
     auto bar = std::make_shared<ProgressBar>("Building Vamana graph", total_work);
-    builder.build([bar]() { bar->tick(); });
+    builder.build([bar]() {
+      bar->tick();
+    });
 
     // Export directly to Vamana format
     VamanaFormatWriter writer(vamana_path(), params_.max_degree_, num_points_);
@@ -461,15 +486,17 @@ class LaserBuilder {
     Timer load_timer;
     auto pca_vectors = load_fbin(pca_base_path());
     std::cout << "  [Medoid] load PCA vectors: " << std::fixed << std::setprecision(1)
-              << load_timer.elapsed_s()
-              << " s (" << pca_vectors.num_points_ << " x " << pca_vectors.dimension_ << ")"
-              << std::endl;
+              << load_timer.elapsed_s() << " s (" << pca_vectors.num_points_ << " x "
+              << pca_vectors.dimension_ << ")" << '\n';
 
     MedoidGenerator generator({.num_medoids_ = params_.num_medoids_,
                                .sample_ratio_ = params_.medoid_sample_ratio_,
                                .sample_cap_ = params_.medoid_sample_cap_,
                                .num_threads_ = num_threads_});
-    (void)generator.generate(pca_vectors.data_, pca_vectors.num_points_, pca_vectors.dimension_, output_prefix_);
+    (void)generator.generate(pca_vectors.data_,
+                             pca_vectors.num_points_,
+                             pca_vectors.dimension_,
+                             output_prefix_);
   }
 
   void run_qg_build() {
@@ -502,7 +529,8 @@ class LaserBuilder {
   }
 
   [[nodiscard]] auto try_load_partition_artifacts() const -> std::optional<PartitionArtifacts> {
-    if (!std::filesystem::exists(shard_members_path()) || !std::filesystem::exists(shuffle_path())) {
+    if (!std::filesystem::exists(shard_members_path()) ||
+        !std::filesystem::exists(shuffle_path())) {
       return std::nullopt;
     }
     return load_partition_artifacts();

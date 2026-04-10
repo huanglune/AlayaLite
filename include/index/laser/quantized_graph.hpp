@@ -45,7 +45,7 @@
 #include "index/laser/qg_scanner.hpp"
 #include "index/laser/quantization/rabitq.hpp"
 #include "index/laser/space/l2.hpp"
-#include "index/laser/thread_date.hpp"
+#include "index/laser/thread_data.hpp"
 #include "index/laser/transform/fht_rotator.hpp"
 #include "index/laser/transform/pca_transform.hpp"
 #include "index/laser/utils/concurrent_queue.hpp"
@@ -53,6 +53,8 @@
 #include "index/laser/utils/memory.hpp"
 #include "index/laser/utils/search_buffer.hpp"
 #include "utils/aligned_array.hpp"
+
+class MemLimitQGBuilder;  // Forward declaration for benchmark friend access
 
 namespace symqg {
 
@@ -105,6 +107,7 @@ inline void check_aio_capacity(size_t num_threads, size_t events_per_thread) {
 
 class QuantizedGraph {
   friend class QGBuilder;
+  friend class ::MemLimitQGBuilder;
 
  private:
   size_t num_points_ = 0;
@@ -119,7 +122,7 @@ class QuantizedGraph {
   FHTRotator rotator_;
   PCATransform pca_transform_;
   LinuxAlignedFileReader aligned_file_reader_;
-  ConcurrentQueue<ThreadDate> thread_data_;
+  ConcurrentQueue<ThreadData> thread_data_;
   size_t ef_search_ = 200;
 
   size_t node_len_ = 0;
@@ -135,6 +138,10 @@ class QuantizedGraph {
   std::vector<char> cache_nodes_;
   alaya::fast::map<PID, char *> caches_;
 
+  // NUMA mmap tracking: non-null when cache was allocated via mmap+mbind.
+  void *numa_mmap_ptr_ = nullptr;
+  size_t numa_mmap_size_ = 0;
+
   size_t nthreads_ = 1;
 
   size_t res_dim_offset_ = 0;
@@ -148,7 +155,7 @@ class QuantizedGraph {
   void disk_search_qg(const float *__restrict__ query,
                       uint32_t knn,
                       uint32_t *__restrict__ results,
-                      ThreadDate &data);
+                      ThreadData &data);
 
   [[nodiscard]] auto get_page_offset(uint64_t node_id) const -> uint64_t {
     return kSectorLen + page_size_ * (node_id / node_per_page_);
@@ -225,7 +232,16 @@ inline QuantizedGraph::QuantizedGraph(size_t num, size_t max_deg, size_t main_di
   initialize();
 }
 
-inline QuantizedGraph::~QuantizedGraph() { destroy_thread_data(); }
+inline QuantizedGraph::~QuantizedGraph() {
+  destroy_thread_data();
+#ifdef LASER_USE_NUMA
+  if (numa_mmap_ptr_ != nullptr) {
+    munmap(numa_mmap_ptr_, numa_mmap_size_);
+    numa_mmap_ptr_ = nullptr;
+    numa_mmap_size_ = 0;
+  }
+#endif
+}
 
 inline void QuantizedGraph::initialize() {
   assert(padded_dim_ % 64 == 0);
@@ -263,7 +279,7 @@ inline void QuantizedGraph::set_params(size_t ef_search, size_t num_threads, int
 #pragma omp critical
     {
       aligned_file_reader_.register_thread(aio_events);
-      ThreadDate data;
+      ThreadData data;
       data.ctx_ = aligned_file_reader_.get_ctx();
       data.allocate(padded_dim_,
                     degree_bound_,
@@ -279,7 +295,7 @@ inline void QuantizedGraph::set_params(size_t ef_search, size_t num_threads, int
 
 inline void QuantizedGraph::destroy_thread_data() {
   while (thread_data_.size() > 0) {
-    ThreadDate data = thread_data_.pop();
+    ThreadData data = thread_data_.pop();
     while (data.sector_scratch_ == nullptr) {
       thread_data_.wait_for_push_notify();
       data = thread_data_.pop();
@@ -293,7 +309,7 @@ inline void QuantizedGraph::destroy_thread_data() {
 inline void QuantizedGraph::search(const float *__restrict__ query,
                                    uint32_t knn,
                                    uint32_t *__restrict__ results) {
-  ThreadDate data = thread_data_.pop();
+  ThreadData data = thread_data_.pop();
   while (data.sector_scratch_ == nullptr) {
     thread_data_.wait_for_push_notify();
     data = thread_data_.pop();
@@ -310,7 +326,7 @@ inline void QuantizedGraph::batch_search(const float *__restrict__ query,
   // Thread-affine context: each thread acquires once, reuses across queries
 #pragma omp parallel num_threads(static_cast<int>(nthreads_))
   {
-    ThreadDate data = thread_data_.pop();
+    ThreadData data = thread_data_.pop();
     while (data.sector_scratch_ == nullptr) {
       thread_data_.wait_for_push_notify();
       data = thread_data_.pop();
@@ -330,7 +346,7 @@ inline void QuantizedGraph::batch_search(const float *__restrict__ query,
 inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
                                            uint32_t knn,
                                            uint32_t *__restrict__ results,
-                                           ThreadDate &data) {
+                                           ThreadData &data) {
   auto &ctx = data.search_ctx_;
   ctx.reset();
   data.search_pool_.clear();
@@ -619,7 +635,7 @@ inline void QuantizedGraph::load_disk_index(const char *prefix, float search_dra
 #pragma omp critical
     {
       aligned_file_reader_.register_thread(aio_events);
-      ThreadDate data;
+      ThreadData data;
       data.ctx_ = aligned_file_reader_.get_ctx();
       data.allocate(padded_dim_,
                     degree_bound_,
@@ -722,7 +738,9 @@ inline void QuantizedGraph::load_cache(std::string &cache_ids_file,
     if (ret == 0) {
       cache_vectors_input.read(reinterpret_cast<char *>(numa_ptr),
                                static_cast<std::streamsize>(cache_bytes));
-      // Use a sentinel-sized vector and point caches_ into mmap'd memory
+      // Track mmap allocation for cleanup in destructor.
+      numa_mmap_ptr_ = numa_ptr;
+      numa_mmap_size_ = cache_bytes;
       cache_nodes_.resize(0);
       for (size_t i = 0; i < cache_ids_.size(); i++) {
         caches_[cache_ids_[i]] = reinterpret_cast<char *>(numa_ptr) + i * node_len_;

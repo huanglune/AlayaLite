@@ -21,7 +21,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
+#include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -86,27 +86,24 @@ class MedoidGenerator {
                   sample.data() + static_cast<size_t>(sample_idx) * dim);
     }
 
-    std::cout << "  [Medoid] sampling " << sample_size << " vectors: "
-              << std::fixed << std::setprecision(1)
-              << timer.elapsed_s() << " s" << std::endl;
+    std::cout << "  [Medoid] sampling " << sample_size << " vectors: " << std::fixed
+              << std::setprecision(1) << timer.elapsed_s() << " s" << '\n';
     timer.reset();
 
     KMeans<float> kmeans({.num_clusters_ = medoid_count,
-                         .max_iter_ = 20,
-                         .num_trials_ = 3,
-                         .num_threads_ = config_.num_threads_});
+                          .max_iter_ = 20,
+                          .num_trials_ = 3,
+                          .num_threads_ = config_.num_threads_});
     auto clustering = kmeans.fit(sample.data(), sample_size, dim);
 
-    std::cout << "  [Medoid] KMeans fit (k=" << medoid_count
-              << ", samples=" << sample_size << "): "
-              << timer.elapsed_s() << " s" << std::endl;
+    std::cout << "  [Medoid] KMeans fit (k=" << medoid_count << ", samples=" << sample_size
+              << "): " << timer.elapsed_s() << " s" << '\n';
     timer.reset();
 
-    auto result = find_nearest_points(
-        vectors, num_points, dim, clustering.centroids_.data(), medoid_count);
+    auto result =
+        find_nearest_points(vectors, num_points, dim, clustering.centroids_.data(), medoid_count);
 
-    std::cout << "  [Medoid] nearest neighbor search: "
-              << timer.elapsed_s() << " s" << std::endl;
+    std::cout << "  [Medoid] nearest neighbor search: " << timer.elapsed_s() << " s" << '\n';
 
     write_outputs(output_prefix, result);
     return result;
@@ -133,10 +130,7 @@ class MedoidGenerator {
 
     std::vector<float> best_dists(medoid_count, std::numeric_limits<float>::max());
     std::vector<uint32_t> best_ids(medoid_count, 0);
-    int nthreads = config_.num_threads_ == 0 ? omp_get_max_threads()
-                                             : static_cast<int>(config_.num_threads_);
-
-#pragma omp parallel num_threads(nthreads)
+#pragma omp parallel num_threads(static_cast<int>(config_.num_threads_ == 0 ? omp_get_max_threads() : config_.num_threads_))
     {
       std::vector<float> local_dists(medoid_count, std::numeric_limits<float>::max());
       std::vector<uint32_t> local_ids(medoid_count, 0);
@@ -145,8 +139,8 @@ class MedoidGenerator {
       for (uint32_t pid = 0; pid < num_points; ++pid) {
         const auto *point = vectors.data() + static_cast<size_t>(pid) * dim;
         for (uint32_t c = 0; c < medoid_count; ++c) {
-          float d = KMeans<float>::compute_l2_sqr(
-              centroids + static_cast<size_t>(c) * dim, point, dim);
+          float d =
+              KMeans<float>::compute_l2_sqr(centroids + static_cast<size_t>(c) * dim, point, dim);
           if (d < local_dists[c]) {
             local_dists[c] = d;
             local_ids[c] = pid;
@@ -175,11 +169,13 @@ class MedoidGenerator {
   }
 
   [[nodiscard]] auto resolved_sample_size(uint32_t num_points) const -> uint32_t {
-    auto requested =
-        static_cast<uint32_t>(static_cast<double>(num_points) * static_cast<double>(config_.sample_ratio_));
+    auto requested = static_cast<uint32_t>(static_cast<double>(num_points) *
+                                           static_cast<double>(config_.sample_ratio_));
     auto capped = std::min(num_points, config_.sample_cap_);
     auto minimum = std::min<uint32_t>(std::max<uint32_t>(1U, config_.num_medoids_), num_points);
-    return std::clamp<uint32_t>(requested == 0 ? minimum : requested, minimum, std::max<uint32_t>(minimum, capped));
+    return std::clamp<uint32_t>(requested == 0 ? minimum : requested,
+                                minimum,
+                                std::max<uint32_t>(minimum, capped));
   }
 
   static void write_outputs(const std::filesystem::path &output_prefix, const Result &result) {

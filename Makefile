@@ -14,6 +14,7 @@ PYTEST_FLAGS      := -v
 PYTEST_COV_FLAGS  := --cov=python/src/alayalite --cov=app --cov-report=html
 CTEST_FLAGS       := --output-on-failure
 JOBS              ?= 60
+TEST_JOBS         ?= 4
 PYTHON_VERSION    := 3.11
 COMMIT_MSG        ?=
 
@@ -72,7 +73,7 @@ test: test-cpp test-py ## Run all tests (C++ and pytest suites)
 
 test-cpp: BUILD_TYPE := Release
 test-cpp: build ## Run C++ tests with CTest
-	@ctest --test-dir $(BUILD_DIR) $(CTEST_FLAGS) -C $(BUILD_TYPE) -j$(JOBS)
+	@ctest --test-dir $(BUILD_DIR) $(CTEST_FLAGS) -C $(BUILD_TYPE) -j$(TEST_JOBS)
 
 test-py: ## Run Python and API tests with pytest
 	@uv run pytest $(PYTEST_FLAGS)

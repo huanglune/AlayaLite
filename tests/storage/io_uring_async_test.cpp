@@ -25,6 +25,7 @@
 #include <thread>
 #include <vector>
 
+#include "storage/io/io_uring_engine.hpp"
 #include "utils/memory.hpp"
 
 namespace alaya {
@@ -34,6 +35,9 @@ class IOUringAsyncTest : public ::testing::Test {
   std::string test_file_;
 
   void SetUp() override {
+    if (!IOUringEngine::is_available()) {
+      GTEST_SKIP() << "io_uring is not available on this system";
+    }
     test_file_ = "/tmp/io_uring_async_test_" +
                  std::to_string(::testing::UnitTest::GetInstance()->random_seed()) + ".bin";
   }
@@ -117,8 +121,11 @@ TEST_F(IOUringAsyncTest, MultipleAsyncReads) {
 
   // Submit all reads
   for (size_t i = 0; i < kNumSectors; i++) {
-    bool ok = reader.submit_async_read(buffers[i].data(), kDefaultSectorSize,
-                                       i * kDefaultSectorSize, test_callback, &states[i]);
+    bool ok = reader.submit_async_read(buffers[i].data(),
+                                       kDefaultSectorSize,
+                                       i * kDefaultSectorSize,
+                                       test_callback,
+                                       &states[i]);
     ASSERT_TRUE(ok) << "Failed to submit read for sector " << i;
   }
 

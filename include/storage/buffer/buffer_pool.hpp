@@ -367,7 +367,8 @@ class BufferPool {
     stats_.misses_.fetch_add(1, std::memory_order_relaxed);
 
     if (result.needs_io_) {
-      auto *notifier = new AsyncReadNotifier{result.async_state_};
+      auto *notifier =
+          new AsyncReadNotifier{result.async_state_, static_cast<int32_t>(frame_size_)};
       bool submitted = io.submit_async_read(result.frame_data_,
                                             frame_size_,
                                             offset,
@@ -546,16 +547,27 @@ class BufferPool {
           size_t idx = it->second;
           Frame &frame = frames_[idx];
 
-          // If an async read is still in-flight, reuse the frame and overwrite
-          // with our sync-read data. The async callback only sets finish_read
-          // (targets the same frame.data_ buffer), so the overwrite is safe.
+          // If an async read is still in-flight for the same page, wait for
+          // it to complete rather than overwriting — the DMA engine may still
+          // be writing into frame.data_.
           if (!frame.async_state_.finish_read_.load(std::memory_order_acquire)) {
             if (frame.pin_count_ == 0) {
               replacer_.pin(idx);
             }
             frame.pin_count_++;
-            frame_idx = idx;
-            overwrite_async = true;
+            // Spin-wait for the async DMA to finish (short, bounded by I/O latency).
+            while (!frame.async_state_.finish_read_.load(std::memory_order_acquire)) {
+              spin_pause();
+            }
+            // Async read completed — check for error.
+            if (frame.async_state_.has_error_.load(std::memory_order_relaxed)) {
+              // Async read failed: overwrite with our sync data.
+              frame_idx = idx;
+              overwrite_async = true;
+            } else {
+              // Async read succeeded: reuse the data directly.
+              return PageHandle(this, idx, frame.data_, frame_size_);
+            }
           } else {
             if (frame.pin_count_ == 0) {
               replacer_.pin(idx);

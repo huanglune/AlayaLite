@@ -124,7 +124,7 @@ class GraphUpdateJob {
       }
     }
     auto handler = space_->get_query_computer(node_id);
-    CandidateList<DistanceType, IDType> pool(space_->get_data_num(), graph_->max_nbrs_);
+    CandidateList<DistanceType, IDType> pool(static_cast<int>(graph_->max_nbrs_));
     for (auto &nbr : candidate_nbrs) {
       auto dist = handler(nbr);
       pool.insert(nbr, dist);

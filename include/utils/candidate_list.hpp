@@ -16,13 +16,14 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <type_traits>
 #include <vector>
 #include "../index/neighbor.hpp"
-#include "bitset.hpp"
 #include "memory.hpp"
 
 namespace alaya {
@@ -31,8 +32,7 @@ template <typename DistanceType, typename IDType>
 struct CandidateList {
   static_assert(std::is_unsigned_v<IDType>, "CandidateList requires an unsigned IDType");
   using SearchResultType = ::alaya::SearchResult<IDType, DistanceType>;
-  CandidateList(IDType n, int capacity)
-      : nb_(n), capacity_(capacity), data_(capacity_ + 1), vis_(n) {}
+  explicit CandidateList(int capacity) : capacity_(capacity), data_(capacity_ + 1) {}
 
   auto find_bsearch(DistanceType dist) -> int {
     int l = 0;
@@ -61,15 +61,11 @@ struct CandidateList {
     if (static_cast<size_t>(lo) < cur_) {
       cur_ = lo;
     }
-    // for (size_t i = 0; i < size_; i++) {
-    //   LOG_INFO("i {} ,dist is {}", data_[i].id_, data_[i].distance_);
-    // }
-    // LOG_INFO("cur is {} , size {}", cur_, size_);
     return true;
   }
 
   void emplace_insert(IDType u, DistanceType dist) {
-    if (dist >= data_[size_ - 1].distance_) {
+    if (size_ == 0 || dist >= data_[size_ - 1].distance_) {
       return;
     }
     int lo = find_bsearch(dist);
@@ -85,7 +81,6 @@ struct CandidateList {
       cur_++;
     }
 
-    // LOG_INFO("pop idx is {} , {}",data_[pre].id_, get_id(data_[pre].id_));
     return get_id(data_[pre].id_);
   }
 
@@ -135,9 +130,8 @@ struct CandidateList {
     return result;
   }
 
-  size_t nb_, size_ = 0, cur_ = 0, capacity_;
+  size_t size_ = 0, cur_ = 0, capacity_;
   std::vector<Neighbor<IDType, DistanceType>, AlignedAlloc<Neighbor<IDType, DistanceType>>> data_;
-  Bitset vis_;
 };
 
 }  // namespace alaya

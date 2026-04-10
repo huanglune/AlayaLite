@@ -47,8 +47,8 @@ class OngoingTable {
   OngoingTable() = default;
 
   explicit OngoingTable(size_t capacity)
-      : capacity_(capacity), mask_(capacity - 1), slots_(capacity) {
-    std::memset(slots_.data(), 0, capacity * sizeof(OngoingSlot));
+      : capacity_(next_pow2(capacity)), mask_(capacity_ - 1), slots_(capacity_) {
+    std::memset(slots_.data(), 0, capacity_ * sizeof(OngoingSlot));
   }
 
   auto reset() -> void {
@@ -103,6 +103,21 @@ class OngoingTable {
   }
 
  private:
+  /// Round up to the next power of two (open-addressing requires power-of-two capacity).
+  static constexpr auto next_pow2(size_t v) -> size_t {
+    if (v == 0) {
+      return 1;
+    }
+    --v;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    v |= v >> 32;
+    return v + 1;
+  }
+
   size_t capacity_ = kDefaultCapacity;
   size_t mask_ = kDefaultCapacity - 1;
   uint32_t gen_ = 1;

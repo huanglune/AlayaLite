@@ -22,7 +22,7 @@ namespace alaya {
 
 class CandidateListTest : public ::testing::Test {
  protected:
-  void SetUp() override { pool_ = new CandidateList<float, uint32_t>(10, 5); }
+  void SetUp() override { pool_ = new CandidateList<float, uint32_t>(5); }
 
   void TearDown() override { delete pool_; }
 
@@ -147,7 +147,7 @@ TEST_F(CandidateListTest, FindBsearchTest) {
 TEST_F(CandidateListTest, CapacityTest) {
   EXPECT_EQ(pool_->capacity(), 5);
 
-  CandidateList<float, uint32_t> large_pool(100, 50);
+  CandidateList<float, uint32_t> large_pool(50);
   EXPECT_EQ(large_pool.capacity(), 50);
 }
 
@@ -292,7 +292,7 @@ TEST_F(CandidateListTest, InsertReplacesWorstTest) {
 
 // Test with different data types
 TEST(CandidateListTypesTest, DoubleDistanceTest) {
-  CandidateList<double, uint32_t> pool(100, 10);
+  CandidateList<double, uint32_t> pool(10);
 
   pool.insert(1, 1.111111);
   pool.insert(2, 2.222222);
@@ -330,7 +330,7 @@ TEST_F(CandidateListTest, MaskConstantTest) {
 // Test large capacity pool
 TEST(CandidateListLargeTest, LargeCapacityTest) {
   const int kCapacity = 1000;
-  CandidateList<float, uint32_t> pool(10000, kCapacity);
+  CandidateList<float, uint32_t> pool(kCapacity);
 
   for (int i = 0; i < 2000; ++i) {
     pool.insert(i, static_cast<float>(i % 500));

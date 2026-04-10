@@ -1,10 +1,10 @@
 /**
- * @file thread_date.hpp
+ * @file thread_data.hpp
  * @brief Thread-affine memory owner for Laser search contexts.
  *
- * ThreadDate owns all memory for one search thread. It is allocated once
+ * ThreadData owns all memory for one search thread. It is allocated once
  * at set_params() time and recycled via a ConcurrentQueue pool.
- * LaserSearchContext is constructed as a lightweight view over ThreadDate
+ * LaserSearchContext is constructed as a lightweight view over ThreadData
  * at query start.
  *
  * Memory layout:
@@ -28,7 +28,7 @@ namespace symqg {
 
 constexpr size_t kSectorLen = 4096;
 
-struct ThreadDate {
+struct ThreadData {
   // I/O context for libaio
   io_context_t ctx_ = nullptr;
 
@@ -56,47 +56,17 @@ struct ThreadDate {
   // Reusable search context (view over the above buffers)
   LaserSearchContext search_ctx_;
 
-  ThreadDate() = default;
-  ThreadDate(const ThreadDate &) = delete;
-  auto operator=(const ThreadDate &) -> ThreadDate & = delete;
+  ThreadData() = default;
+  ThreadData(const ThreadData &) = delete;
+  auto operator=(const ThreadData &) -> ThreadData & = delete;
 
-  ThreadDate(ThreadDate &&other) noexcept
-      : ctx_(std::exchange(other.ctx_, nullptr)),
-        search_pool_(std::move(other.search_pool_)),
-        sector_scratch_(std::exchange(other.sector_scratch_, nullptr)),
-        pca_query_scratch_(std::exchange(other.pca_query_scratch_, nullptr)),
-        lut_buf_(std::exchange(other.lut_buf_, nullptr)),
-        rotated_query_buf_(std::exchange(other.rotated_query_buf_, nullptr)),
-        byte_query_buf_(std::exchange(other.byte_query_buf_, nullptr)),
-        scan_result_buf_(std::exchange(other.scan_result_buf_, nullptr)),
-        scan_float_buf_(std::exchange(other.scan_float_buf_, nullptr)),
-        appro_dist_buf_(std::exchange(other.appro_dist_buf_, nullptr)),
-        io_events_buf_(std::exchange(other.io_events_buf_, nullptr)),
-        frontier_reqs_buf_(std::exchange(other.frontier_reqs_buf_, nullptr)),
-        iocb_buf_(std::exchange(other.iocb_buf_, nullptr)),
-        iocb_ptrs_buf_(std::exchange(other.iocb_ptrs_buf_, nullptr)),
-        search_ctx_(std::move(other.search_ctx_)) {}
+  ThreadData(ThreadData &&other) noexcept { steal_from(other); }
 
-  auto operator=(ThreadDate &&other) noexcept -> ThreadDate & {
-    if (this == &other) {
-      return *this;
+  auto operator=(ThreadData &&other) noexcept -> ThreadData & {
+    if (this != &other) {
+      deallocate();
+      steal_from(other);
     }
-    deallocate();
-    ctx_ = std::exchange(other.ctx_, nullptr);
-    search_pool_ = std::move(other.search_pool_);
-    sector_scratch_ = std::exchange(other.sector_scratch_, nullptr);
-    pca_query_scratch_ = std::exchange(other.pca_query_scratch_, nullptr);
-    lut_buf_ = std::exchange(other.lut_buf_, nullptr);
-    rotated_query_buf_ = std::exchange(other.rotated_query_buf_, nullptr);
-    byte_query_buf_ = std::exchange(other.byte_query_buf_, nullptr);
-    scan_result_buf_ = std::exchange(other.scan_result_buf_, nullptr);
-    scan_float_buf_ = std::exchange(other.scan_float_buf_, nullptr);
-    appro_dist_buf_ = std::exchange(other.appro_dist_buf_, nullptr);
-    io_events_buf_ = std::exchange(other.io_events_buf_, nullptr);
-    frontier_reqs_buf_ = std::exchange(other.frontier_reqs_buf_, nullptr);
-    iocb_buf_ = std::exchange(other.iocb_buf_, nullptr);
-    iocb_ptrs_buf_ = std::exchange(other.iocb_ptrs_buf_, nullptr);
-    search_ctx_ = std::move(other.search_ctx_);
     return *this;
   }
 
@@ -149,25 +119,26 @@ struct ThreadDate {
     // Search pool
     search_pool_.resize(ef_search);
 
-    // Initialize search context as a view over the allocated buffers
+    // Initialize search context as a view over the allocated buffers.
     // Beam search correctness depends on being able to mark every visited node.
     // A smaller hash table silently drops inserts when full, which can cause
     // repeated revisits and effectively unbounded query time on larger graphs.
-    size_t visited_capacity = num_points;
-    search_ctx_.init(lut_buf_,
-                     rotated_query_buf_,
-                     byte_query_buf_,
-                     scan_result_buf_,
-                     scan_float_buf_,
-                     appro_dist_buf_,
-                     io_events_buf_,
-                     frontier_reqs_buf_,
-                     iocb_buf_,
-                     iocb_ptrs_buf_,
-                     padded_dim,
-                     degree_bound,
-                     max_beam_width,
-                     visited_capacity);
+    SearchContextBuffers bufs;
+    bufs.lut = lut_buf_;
+    bufs.rotated_query = rotated_query_buf_;
+    bufs.byte_query = byte_query_buf_;
+    bufs.scan_result = scan_result_buf_;
+    bufs.scan_float = scan_float_buf_;
+    bufs.appro_dist = appro_dist_buf_;
+    bufs.io_events = io_events_buf_;
+    bufs.frontier_reqs = frontier_reqs_buf_;
+    bufs.iocb_buf = iocb_buf_;
+    bufs.iocb_ptrs = iocb_ptrs_buf_;
+    bufs.padded_dim = padded_dim;
+    bufs.degree_bound = degree_bound;
+    bufs.max_beam_width = max_beam_width;
+    bufs.visited_capacity = num_points;
+    search_ctx_.init(bufs);
   }
 
   /**
@@ -210,6 +181,25 @@ struct ThreadDate {
 
     delete[] iocb_ptrs_buf_;
     iocb_ptrs_buf_ = nullptr;
+  }
+
+ private:
+  void steal_from(ThreadData &other) noexcept {
+    ctx_ = std::exchange(other.ctx_, nullptr);
+    search_pool_ = std::move(other.search_pool_);
+    sector_scratch_ = std::exchange(other.sector_scratch_, nullptr);
+    pca_query_scratch_ = std::exchange(other.pca_query_scratch_, nullptr);
+    lut_buf_ = std::exchange(other.lut_buf_, nullptr);
+    rotated_query_buf_ = std::exchange(other.rotated_query_buf_, nullptr);
+    byte_query_buf_ = std::exchange(other.byte_query_buf_, nullptr);
+    scan_result_buf_ = std::exchange(other.scan_result_buf_, nullptr);
+    scan_float_buf_ = std::exchange(other.scan_float_buf_, nullptr);
+    appro_dist_buf_ = std::exchange(other.appro_dist_buf_, nullptr);
+    io_events_buf_ = std::exchange(other.io_events_buf_, nullptr);
+    frontier_reqs_buf_ = std::exchange(other.frontier_reqs_buf_, nullptr);
+    iocb_buf_ = std::exchange(other.iocb_buf_, nullptr);
+    iocb_ptrs_buf_ = std::exchange(other.iocb_ptrs_buf_, nullptr);
+    search_ctx_ = std::move(other.search_ctx_);
   }
 };
 

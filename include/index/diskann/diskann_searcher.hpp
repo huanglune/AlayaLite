@@ -83,7 +83,7 @@ class DiskANNSearcher {
     std::vector<uint32_t> next_beam_io_;  // For IO deduplication
 
     explicit SearchContext(uint32_t capacity, uint32_t max_degree, uint32_t beam_width)
-        : candidates_(capacity, 200) {
+        : candidates_(200) {
       beam_queue_.reserve(beam_width * 2);
       next_beam_queue_.reserve(beam_width * 2);
       next_beam_io_.reserve(beam_width * max_degree);
@@ -775,6 +775,15 @@ class DiskANNSearcher {
   /// graph integrity even if the underlying update path is not lock-free.
   std::mutex update_mutex_;
 
+  /// Per-instance scratch buffers for connect_task, guarded by update_mutex_.
+  /// Avoids static thread_local that would be shared across instances.
+  struct RepairScratch {
+    std::vector<DataType> vertex_vec_;
+    std::vector<IDType> current_nbrs_;
+    std::vector<NeighborType> candidates_;
+    std::vector<IDType> pruned_;
+  } repair_scratch_;
+
   /**
    * @brief Alpha-dominance pruning shared helper.
    *
@@ -808,9 +817,10 @@ class DiskANNSearcher {
         break;
       }
 
+      // Hoist candidate vector fetch outside inner loop to avoid O(n^2) I/O.
+      const DataType *cand_vec = get_vector(cand.id_);
       bool dominated = false;
       for (auto selected_id : output) {
-        const DataType *cand_vec = get_vector(cand.id_);
         const DataType *selected_vec = get_vector(selected_id);
         float dist_cand_selected = dist_fn_(cand_vec, selected_vec, dimension_);
 
@@ -981,18 +991,17 @@ class DiskANNSearcher {
   void connect_task(IDType vertex_v, IDType new_node_id, float alpha) {
     SpinLockGuard guard(node_locks_[vertex_v % kNumNodeLocks]);
 
-    // Thread-local buffers: reused across calls to avoid per-call heap churn
-    static thread_local std::vector<DataType> vertex_vec;
-    static thread_local std::vector<IDType> current_nbrs_copy;
-    static thread_local std::vector<NeighborType> candidates;
-    static thread_local std::vector<IDType> pruned;
+    // Per-instance scratch buffers (guarded by update_mutex_ in caller).
+    auto &vertex_vec = repair_scratch_.vertex_vec_;
+    auto &current_nbrs_copy = repair_scratch_.current_nbrs_;
+    auto &candidates = repair_scratch_.candidates_;
+    auto &pruned = repair_scratch_.pruned_;
     vertex_vec.resize(dimension_);
     current_nbrs_copy.clear();
     {
       auto node = storage_->data().get_node(vertex_v);
       auto vec = node.vector();
       std::copy(vec.begin(), vec.end(), vertex_vec.begin());
-      // Copy neighbor IDs into local vector before NodeRef destructs (avoid dangling span)
       auto nbrs = node.neighbors();
       current_nbrs_copy.assign(nbrs.begin(), nbrs.end());
     }
@@ -1001,7 +1010,6 @@ class DiskANNSearcher {
       return storage_->data().get_node(id).vector().data();
     };
 
-    // Build candidates using shared helper (uses copied neighbor list)
     build_connect_candidates(vertex_vec.data(),
                              vertex_v,
                              new_node_id,
@@ -1009,13 +1017,11 @@ class DiskANNSearcher {
                              get_vector,
                              candidates);
 
-    // Prune using shared helper
     robust_prune_impl(vertex_vec.data(), candidates, alpha, get_vector, pruned);
     if (new_node_id != kInvalidID) {
       ensure_neighbor_present(pruned, new_node_id);
     }
 
-    // Write back updated neighbor list
     {
       auto node = storage_->data().get_node(vertex_v);
       node.set_neighbors(std::span<const IDType>(pruned));

@@ -18,14 +18,19 @@
 
 namespace symqg {
 
+struct ApproDistParams {
+  float sqr_y;
+  float width;
+  float vl;
+  float sqr_qr;
+  int32_t sumq;
+};
+
 /**
  * @brief Computes approximate distances using precomputed factors.
  */
 static inline void appro_dist_impl(size_t num_points,
-                                   float sqr_y,
-                                   float width,
-                                   float vl,
-                                   float sqr_qr,
+                                   const ApproDistParams &params,
                                    const float *__restrict__ result,
                                    const float *__restrict__ triple_x,
                                    const float *__restrict__ fac_dq,
@@ -33,10 +38,10 @@ static inline void appro_dist_impl(size_t num_points,
                                    float *__restrict__ appro_dist) {
 // NOLINTBEGIN(portability-simd-intrinsics)
 #if defined(__AVX512F__)
-  const __m512 kSqrYSimd = _mm512_set1_ps(sqr_y);
-  const __m512 kWidthSimd = _mm512_set1_ps(width);
-  const __m512 kVlSimd = _mm512_set1_ps(vl);
-  const __m512 kSqrQrSimd = _mm512_set1_ps(sqr_qr);
+  const __m512 kSqrYSimd = _mm512_set1_ps(params.sqr_y);
+  const __m512 kWidthSimd = _mm512_set1_ps(params.width);
+  const __m512 kVlSimd = _mm512_set1_ps(params.vl);
+  const __m512 kSqrQrSimd = _mm512_set1_ps(params.sqr_qr);
 
   for (size_t i = 0; i < num_points; i += 16) {
     __m512 result_simd = _mm512_loadu_ps(&result[i]);
@@ -54,10 +59,10 @@ static inline void appro_dist_impl(size_t num_points,
     _mm512_storeu_ps(&appro_dist[i], triple_x_simd);
   }
 #elif defined(__AVX2__)
-  const __m256 kSqrYSimd = _mm256_set1_ps(sqr_y);
-  const __m256 kWidthSimd = _mm256_set1_ps(width);
-  const __m256 kVlSimd = _mm256_set1_ps(vl);
-  const __m256 kSqrQrSimd = _mm256_set1_ps(sqr_qr);
+  const __m256 kSqrYSimd = _mm256_set1_ps(params.sqr_y);
+  const __m256 kWidthSimd = _mm256_set1_ps(params.width);
+  const __m256 kVlSimd = _mm256_set1_ps(params.vl);
+  const __m256 kSqrQrSimd = _mm256_set1_ps(params.sqr_qr);
 
   for (size_t i = 0; i < num_points; i += 8) {
     __m256 result_simd = _mm256_loadu_ps(&result[i]);
@@ -72,6 +77,7 @@ static inline void appro_dist_impl(size_t num_points,
 
     triple_x_simd = _mm256_add_ps(_mm256_add_ps(triple_x_simd, fac_dq_simd), fac_vq_simd);
     triple_x_simd = _mm256_add_ps(triple_x_simd, kSqrQrSimd);
+    _mm256_storeu_ps(&appro_dist[i], triple_x_simd);
   }
 // NOLINTEND(portability-simd-intrinsics)
 #else
@@ -151,16 +157,8 @@ class QGScanner {
     const float *triple_x = factor;
     const float *fac_dq = &triple_x[degree_bound_];
     const float *fac_vq = &fac_dq[degree_bound_];
-    appro_dist_impl(degree_bound_,
-                    sqr_y,
-                    width,
-                    vl,
-                    sqr_qr,
-                    result_float,
-                    triple_x,
-                    fac_dq,
-                    fac_vq,
-                    appro_dist);
+    ApproDistParams params{sqr_y, width, vl, sqr_qr, sumq};
+    appro_dist_impl(degree_bound_, params, result_float, triple_x, fac_dq, fac_vq, appro_dist);
   }
 };
 }  // namespace symqg

@@ -119,8 +119,10 @@ class OverlayGraph {
    * @param cand_pool  The candidate pool for search.
    * @param dist_func The computer function of distance computation.
    */
-  template <typename CandPoolType, typename DistFuncType>
-  void initialize(CandPoolType &cand_pool, const DistFuncType &dist_func) const {
+  template <typename CandPoolType, typename VisitedType, typename DistFuncType>
+  void initialize(CandPoolType &cand_pool,
+                  VisitedType &visited,
+                  const DistFuncType &dist_func) const {
     uint32_t u = ep_;
     auto cur_dist = dist_func(u);
     for (int level = levels_[u]; level > 0; --level) {
@@ -140,7 +142,7 @@ class OverlayGraph {
       }
     }
     cand_pool.insert(u, cur_dist);
-    cand_pool.vis_.set(u);
+    visited.set(u);
   }
 
   /**

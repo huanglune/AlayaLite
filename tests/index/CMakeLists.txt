@@ -75,3 +75,10 @@ if(LASER_AVAILABLE)
   add_test(NAME index_test_laser_vamana_format COMMAND $<TARGET_FILE:laser_vamana_format_test>)
   add_test(NAME index_test_laser_builder COMMAND $<TARGET_FILE:laser_builder_test>)
 endif()
+
+# Stress tests: DISABLED_ tests that can be run explicitly via `ctest -L stress`
+add_test(NAME diskann_searcher_stress
+         COMMAND $<TARGET_FILE:diskann_searcher_test>
+                 --gtest_also_run_disabled_tests
+                 --gtest_filter="MultiWorkerTest.DISABLED_*")
+set_tests_properties(diskann_searcher_stress PROPERTIES LABELS "stress")

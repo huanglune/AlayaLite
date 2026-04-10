@@ -69,6 +69,7 @@ struct AsyncReadState {
 /// Context passed as callback_arg to submit_async_read. Heap-allocated, freed in callback.
 struct AsyncReadNotifier {
   AsyncReadState *state_;
+  int32_t expected_bytes_;
 };
 
 /**
@@ -81,7 +82,7 @@ struct AsyncReadNotifier {
  */
 inline void async_read_callback(void *arg, int32_t result) {
   auto *notifier = static_cast<AsyncReadNotifier *>(arg);
-  if (result <= 0) {
+  if (result != notifier->expected_bytes_) {
     notifier->state_->has_error_.store(true, std::memory_order_relaxed);
   }
   notifier->state_->finish_read_.store(true, std::memory_order_release);

@@ -203,9 +203,15 @@ class KMeans {
   }
 
  private:
-  [[nodiscard]] auto effective_threads() const -> int {
-    return config_.num_threads_ == 0 ? omp_get_max_threads()
-                                     : static_cast<int>(config_.num_threads_);
+  [[nodiscard]] auto effective_threads(size_t num_points) const -> int {
+    if (config_.num_threads_ != 0) {
+      return static_cast<int>(config_.num_threads_);
+    }
+    // OMP overhead dominates on small workloads; cap threads to ~1 per 2K points
+    static constexpr size_t kPointsPerThread = 2000;
+    int hw = omp_get_max_threads();
+    int data_bound = std::max(1, static_cast<int>(num_points / kPointsPerThread));
+    return std::min(hw, data_bound);
   }
 
   /**
@@ -231,7 +237,7 @@ class KMeans {
       const DataType *last_centroid = centroids + static_cast<size_t>(k - 1) * dim;
       float total_dist = 0.0F;
 
-#pragma omp parallel for num_threads(effective_threads()) reduction(+ : total_dist) schedule(static)
+#pragma omp parallel for num_threads(effective_threads(num_points)) reduction(+ : total_dist) schedule(static)
       for (size_t i = 0; i < num_points; ++i) {
         float d = compute_l2_sqr(data + i * dim, last_centroid, dim);
         min_dists[i] = std::min(min_dists[i], d);
@@ -282,7 +288,7 @@ class KMeans {
                      const DataType *centroids,
                      std::vector<uint32_t> &assignments) -> float {
     float cost = 0.0F;
-#pragma omp parallel for num_threads(effective_threads()) reduction(+ : cost) schedule(static)
+#pragma omp parallel for num_threads(effective_threads(num_points)) reduction(+ : cost) schedule(static)
     for (size_t i = 0; i < num_points; ++i) {
       const DataType *vec = data + i * dim;
       float min_dist = std::numeric_limits<float>::max();

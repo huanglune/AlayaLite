@@ -310,14 +310,7 @@ auto main(int argc, char* argv[]) -> int {
     std::cout << std::string(90, '-') << '\n' << std::flush;
 
     // Benchmark loop with warmup + multi-run averaging
-    for (size_t ef_idx = 0; ef_idx < ef_values.size(); ++ef_idx) {
-        size_t ef = ef_values[ef_idx];
-        std::cout << "[Search] Measuring EF=" << ef
-                  << " (" << (ef_idx + 1) << "/" << ef_values.size() << ")"
-                  << ", runs=" << kRuns
-                  << ", queries=" << nq << '\n'
-                  << std::flush;
-
+    for (size_t ef : ef_values) {
         params.ef_search = ef;
         params.num_threads = num_threads;
         params.beam_width = beam_width;

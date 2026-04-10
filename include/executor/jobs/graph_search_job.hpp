@@ -26,6 +26,7 @@
 
 #include "../../index/graph/graph.hpp"
 #include "../../space/space_concepts.hpp"
+#include "../../utils/bitset.hpp"
 #include "../../utils/candidate_list.hpp"
 #include "../../utils/prefetch.hpp"
 #include "job_context.hpp"
@@ -222,8 +223,9 @@ struct GraphSearchJob {
   }
   auto search(DataType *query, uint32_t k, IDType *ids, uint32_t ef) -> coro::task<> {
     auto query_computer = space_->get_query_computer(query);
-    CandidateList<DistanceType, IDType> pool(space_->get_data_num(), ef);
-    graph_->initialize_search(pool, query_computer);
+    CandidateList<DistanceType, IDType> pool(static_cast<int>(ef));
+    Bitset visited(space_->get_data_num());
+    graph_->initialize_search(pool, visited, query_computer);
 
     space_->prefetch_by_address(query);
 
@@ -240,10 +242,10 @@ struct GraphSearchJob {
           break;
         }
 
-        if (pool.vis_.get(v)) {
+        if (visited.get(v)) {
           continue;
         }
-        pool.vis_.set(v);
+        visited.set(v);
 
         space_->prefetch_by_id(v);
         co_await std::suspend_always{};
@@ -262,8 +264,9 @@ struct GraphSearchJob {
   auto search(DataType *query, uint32_t k, IDType *ids, DistanceType *distances, uint32_t ef)
       -> coro::task<> {
     auto query_computer = space_->get_query_computer(query);
-    CandidateList<DistanceType, IDType> pool(space_->get_data_num(), ef);
-    graph_->initialize_search(pool, query_computer);
+    CandidateList<DistanceType, IDType> pool(static_cast<int>(ef));
+    Bitset visited(space_->get_data_num());
+    graph_->initialize_search(pool, visited, query_computer);
 
     space_->prefetch_by_address(query);
 
@@ -280,10 +283,10 @@ struct GraphSearchJob {
           break;
         }
 
-        if (pool.vis_.get(v)) {
+        if (visited.get(v)) {
           continue;
         }
-        pool.vis_.set(v);
+        visited.set(v);
 
         space_->prefetch_by_id(v);
         co_await std::suspend_always{};
@@ -303,8 +306,9 @@ struct GraphSearchJob {
 
   void search_solo(DataType *query, uint32_t k, IDType *ids, uint32_t ef) {
     auto query_computer = space_->get_query_computer(query);
-    CandidateList<DistanceType, IDType> pool(space_->get_data_num(), ef);
-    graph_->initialize_search(pool, query_computer);
+    CandidateList<DistanceType, IDType> pool(static_cast<int>(ef));
+    Bitset visited(space_->get_data_num());
+    graph_->initialize_search(pool, visited, query_computer);
 
     while (pool.has_next()) {
       auto u = pool.pop();
@@ -315,10 +319,10 @@ struct GraphSearchJob {
           break;
         }
 
-        if (pool.vis_.get(v)) {
+        if (visited.get(v)) {
           continue;
         }
-        pool.vis_.set(v);
+        visited.set(v);
 
         auto jump_prefetch = i + 3;
         if (jump_prefetch < graph_->max_nbrs_) {
@@ -338,8 +342,9 @@ struct GraphSearchJob {
 
   void search_solo(DataType *query, uint32_t k, IDType *ids, DistanceType *distances, uint32_t ef) {
     auto query_computer = space_->get_query_computer(query);
-    CandidateList<DistanceType, IDType> pool(space_->get_data_num(), ef);
-    graph_->initialize_search(pool, query_computer);
+    CandidateList<DistanceType, IDType> pool(static_cast<int>(ef));
+    Bitset visited(space_->get_data_num());
+    graph_->initialize_search(pool, visited, query_computer);
 
     while (pool.has_next()) {
       auto u = pool.pop();
@@ -350,10 +355,10 @@ struct GraphSearchJob {
           break;
         }
 
-        if (pool.vis_.get(v)) {
+        if (visited.get(v)) {
           continue;
         }
-        pool.vis_.set(v);
+        visited.set(v);
 
         auto jump_prefetch = i + 3;
         if (jump_prefetch < graph_->max_nbrs_) {
@@ -374,17 +379,18 @@ struct GraphSearchJob {
 
   void search_solo_updated(DataType *query, uint32_t k, IDType *ids, uint32_t ef) {
     auto query_computer = space_->get_query_computer(query);
-    CandidateList<DistanceType, IDType> pool(space_->get_data_num(), ef);
-    graph_->initialize_search(pool, query_computer);
+    CandidateList<DistanceType, IDType> pool(static_cast<int>(ef));
+    Bitset visited(space_->get_data_num());
+    graph_->initialize_search(pool, visited, query_computer);
 
     while (pool.has_next()) {
       auto u = pool.pop();
       if (job_context_->removed_node_nbrs_.contains(u)) {
         for (auto &second_hop_nbr : job_context_->removed_node_nbrs_.at(u)) {
-          if (pool.vis_.get(second_hop_nbr)) {
+          if (visited.get(second_hop_nbr)) {
             continue;
           }
-          pool.vis_.set(second_hop_nbr);
+          visited.set(second_hop_nbr);
           auto dist = query_computer(second_hop_nbr);
           pool.insert(second_hop_nbr, dist);
         }
@@ -397,10 +403,10 @@ struct GraphSearchJob {
           break;
         }
 
-        if (pool.vis_.get(v)) {
+        if (visited.get(v)) {
           continue;
         }
-        pool.vis_.set(v);
+        visited.set(v);
 
         auto jump_prefetch = i + 3;
         if (jump_prefetch < graph_->max_nbrs_) {

@@ -62,21 +62,15 @@ class PCATransform {
    * @param count Number of training vectors
    */
   void train(const float *data, uint64_t count) {
-    std::vector<float> centralized_data(count * input_dim_, 0.0F);
     std::vector<float> covariance_matrix(input_dim_ * input_dim_, 0.0F);
 
     // 1. Compute mean (stored in mean_)
     compute_column_mean(data, count);
 
-    // 2. Centralize data
-    for (uint64_t i = 0; i < count; ++i) {
-      centralize_data(data + i * input_dim_, centralized_data.data() + i * input_dim_);
-    }
+    // 2. Compute covariance in blocks (avoids full centralized copy)
+    compute_covariance_blocked(data, count, covariance_matrix.data());
 
-    // 3. Get covariance matrix
-    compute_covariance_matrix(centralized_data.data(), count, covariance_matrix.data());
-
-    // 4. Eigen decomposition (stored in pca_matrix_)
+    // 3. Eigen decomposition (stored in pca_matrix_)
     perform_eigen_decomposition(covariance_matrix.data());
 
     loaded_ = true;
@@ -226,7 +220,9 @@ class PCATransform {
     Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
         input_mat(input, static_cast<Eigen::Index>(count), static_cast<Eigen::Index>(input_dim_));
     Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
-        output_mat(output, static_cast<Eigen::Index>(count), static_cast<Eigen::Index>(output_dim_));
+        output_mat(output,
+                   static_cast<Eigen::Index>(count),
+                   static_cast<Eigen::Index>(output_dim_));
     Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
         pca_map(pca_matrix_.data(),
                 static_cast<Eigen::Index>(output_dim_),
@@ -242,22 +238,12 @@ class PCATransform {
   [[nodiscard]] auto output_dimension() const -> size_t { return output_dim_; }
   [[nodiscard]] auto is_loaded() const -> bool { return loaded_; }
 
-  // Test helper methods
-  void copy_pca_matrix_for_test(float *out_pca_matrix) const {
-    std::memcpy(out_pca_matrix, pca_matrix_.data(), pca_matrix_.size() * sizeof(float));
-  }
-
-  void copy_mean_for_test(float *out_mean) const {
-    std::memcpy(out_mean, mean_.data(), mean_.size() * sizeof(float));
-  }
-
-  void set_mean_for_test(const float *input_mean) {
-    std::memcpy(mean_.data(), input_mean, mean_.size() * sizeof(float));
-  }
-
-  void set_pca_matrix_for_test(const float *input_pca_matrix) {
-    std::memcpy(pca_matrix_.data(), input_pca_matrix, pca_matrix_.size() * sizeof(float));
-  }
+  // Direct access for incremental / external training
+  [[nodiscard]] auto mean_data() -> float * { return mean_.data(); }
+  [[nodiscard]] auto mean_data() const -> const float * { return mean_.data(); }
+  [[nodiscard]] auto pca_matrix_data() -> float * { return pca_matrix_.data(); }
+  [[nodiscard]] auto pca_matrix_data() const -> const float * { return pca_matrix_.data(); }
+  void mark_loaded() { loaded_ = true; }
 
  private:
   void compute_column_mean(const float *data, uint64_t count) {
@@ -280,22 +266,37 @@ class PCATransform {
     }
   }
 
-  void compute_covariance_matrix(const float *centralized_data,
-                                 uint64_t count,
-                                 float *covariance_matrix) const {
-    // Use Eigen for efficient matrix multiplication: cov = X^T * X / (n-1)
-    Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
-        data_map(centralized_data,
-                 static_cast<Eigen::Index>(count),
-                 static_cast<Eigen::Index>(input_dim_));
+  void compute_covariance_blocked(const float *data,
+                                  uint64_t count,
+                                  float *covariance_matrix) const {
+    constexpr uint64_t kBlockSize = 10000;
+    std::vector<float> block(kBlockSize * input_dim_);
+
     Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
         cov_map(covariance_matrix,
                 static_cast<Eigen::Index>(input_dim_),
                 static_cast<Eigen::Index>(input_dim_));
+    cov_map.setZero();
 
-    cov_map.noalias() = data_map.transpose() * data_map;
+    Eigen::Map<const Eigen::VectorXf> mean_vec(mean_.data(),
+                                                static_cast<Eigen::Index>(input_dim_));
 
-    // Unbiased estimator
+    for (uint64_t start = 0; start < count; start += kBlockSize) {
+      auto block_count = static_cast<Eigen::Index>(std::min(kBlockSize, count - start));
+
+      // Centralize this block into the reusable buffer
+      for (Eigen::Index i = 0; i < block_count; ++i) {
+        for (size_t j = 0; j < input_dim_; ++j) {
+          block[static_cast<size_t>(i) * input_dim_ + j] =
+              data[(start + static_cast<uint64_t>(i)) * input_dim_ + j] - mean_[j];
+        }
+      }
+
+      Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
+          block_map(block.data(), block_count, static_cast<Eigen::Index>(input_dim_));
+      cov_map.noalias() += block_map.transpose() * block_map;
+    }
+
     float scale = 1.0F / static_cast<float>(count - 1);
     cov_map *= scale;
   }

@@ -21,10 +21,10 @@
 
 #include <algorithm>
 #include <chrono>
-#include <filesystem>
+#include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
-#include <memory>
 #include <limits>
+#include <memory>
 #include <regex>
 #include <stdexcept>
 #include <string>
@@ -33,10 +33,10 @@
 #include <utility>
 #include <vector>
 
+#include "base_py_index.hpp"
 #include "index/laser/laser_build_params.hpp"
 #include "index/laser/laser_builder.hpp"
 #include "index/laser/laser_index.hpp"
-#include "base_py_index.hpp"
 #include "params.hpp"
 #include "space/raw_space.hpp"
 
@@ -66,7 +66,8 @@ class PyLaserIndex : public BasePyIndex {
       build_params_.num_threads_ = num_threads;
     }
 
-    data_space_ = std::make_shared<RawSpace<float, float, uint32_t>>(num_points, dim, MetricType::L2);
+    data_space_ =
+        std::make_shared<RawSpace<float, float, uint32_t>>(num_points, dim, MetricType::L2);
     data_space_->fit(data, num_points);
     data_dim_ = dim;
 
@@ -151,10 +152,8 @@ class PyLaserIndex : public BasePyIndex {
     return result;
   }
 
-  auto batch_search(py::array_t<float> &queries,
-                    uint32_t topk,
-                    uint32_t ef,
-                    uint32_t num_threads) -> py::array_t<uint32_t> {
+  auto batch_search(py::array_t<float> &queries, uint32_t topk, uint32_t ef, uint32_t num_threads)
+      -> py::array_t<uint32_t> {
     ensure_loaded();
     ensure_data_space();
     validate_queries(queries);
@@ -183,7 +182,8 @@ class PyLaserIndex : public BasePyIndex {
     validate_queries(queries);
 
     auto ids = batch_search(queries, topk, ef, num_threads);
-    py::array_t<float> distances({static_cast<size_t>(queries.shape(0)), static_cast<size_t>(topk)});
+    py::array_t<float> distances(
+        {static_cast<size_t>(queries.shape(0)), static_cast<size_t>(topk)});
 
     auto *id_ptr = ids.mutable_data();
     auto *dist_ptr = distances.mutable_data();
@@ -223,8 +223,7 @@ class PyLaserIndex : public BasePyIndex {
   uint32_t full_dimension_{0};
 
   static auto make_temp_dir() -> std::filesystem::path {
-    auto stamp = std::to_string(
-        std::chrono::steady_clock::now().time_since_epoch().count());
+    auto stamp = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     auto dir = std::filesystem::temp_directory_path() / ("alayalite_laser_" + stamp);
     std::filesystem::create_directories(dir);
     return dir;
@@ -274,9 +273,11 @@ class PyLaserIndex : public BasePyIndex {
                        uint32_t topk,
                        uint32_t ef_search,
                        size_t num_threads = 0) -> std::vector<uint32_t> {
-    auto candidate_k = std::min<uint32_t>(num_points_, std::max<uint32_t>(topk, std::max<uint32_t>(ef_search, 32)));
-    update_search_params(std::max<uint32_t>(candidate_k, ef_search), num_threads == 0 ? search_params_.num_threads
-                                                                                       : num_threads);
+    auto candidate_k =
+        std::min<uint32_t>(num_points_,
+                           std::max<uint32_t>(topk, std::max<uint32_t>(ef_search, 32)));
+    update_search_params(std::max<uint32_t>(candidate_k, ef_search),
+                         num_threads == 0 ? search_params_.num_threads : num_threads);
 
     std::vector<uint32_t> candidate_ids(candidate_k, 0);
     index_->search(query, candidate_k, candidate_ids.data());
@@ -314,8 +315,9 @@ class PyLaserIndex : public BasePyIndex {
   void load_index(const std::string &prefix) {
     search_params_.ef_search =
         std::max<size_t>(search_params_.ef_search, std::max<size_t>(build_params_.ef_build_, 64));
-    search_params_.num_threads =
-        search_params_.num_threads == 0 ? build_params_.resolved_num_threads() : search_params_.num_threads;
+    search_params_.num_threads = search_params_.num_threads == 0
+                                     ? build_params_.resolved_num_threads()
+                                     : search_params_.num_threads;
     search_params_.beam_width = search_params_.beam_width == 0 ? 16 : search_params_.beam_width;
     search_params_.search_dram_budget_gb =
         search_params_.search_dram_budget_gb <= 0.0F ? 1.0F : search_params_.search_dram_budget_gb;
@@ -324,7 +326,8 @@ class PyLaserIndex : public BasePyIndex {
     index_->load(prefix, num_points_, max_degree_, main_dim_, full_dimension_, search_params_);
   }
 
-  static void copy_file_if_exists(const std::filesystem::path &src, const std::filesystem::path &dst) {
+  static void copy_file_if_exists(const std::filesystem::path &src,
+                                  const std::filesystem::path &dst) {
     if (!std::filesystem::exists(src)) {
       throw std::runtime_error("Missing LASER artifact: " + src.string());
     }
@@ -335,8 +338,10 @@ class PyLaserIndex : public BasePyIndex {
                                    const std::string &dst_prefix,
                                    uint32_t max_degree,
                                    uint32_t main_dim) {
-    auto src_base = src_prefix + "_R" + std::to_string(max_degree) + "_MD" + std::to_string(main_dim) + ".index";
-    auto dst_base = dst_prefix + "_R" + std::to_string(max_degree) + "_MD" + std::to_string(main_dim) + ".index";
+    auto src_base = src_prefix + "_R" + std::to_string(max_degree) + "_MD" +
+                    std::to_string(main_dim) + ".index";
+    auto dst_base = dst_prefix + "_R" + std::to_string(max_degree) + "_MD" +
+                    std::to_string(main_dim) + ".index";
 
     copy_file_if_exists(src_prefix + "_pca.bin", dst_prefix + "_pca.bin");
     copy_file_if_exists(src_prefix + "_medoids_indices", dst_prefix + "_medoids_indices");
@@ -381,7 +386,8 @@ class PyLaserIndex : public BasePyIndex {
     output << "      \"medoid_sample_cap\": " << build_params_.medoid_sample_cap_ << ",\n";
     output << "      \"num_threads\": " << build_params_.num_threads_ << ",\n";
     output << "      \"max_memory_mb\": " << build_params_.max_memory_mb_ << ",\n";
-    output << "      \"keep_intermediates\": " << (build_params_.keep_intermediates_ ? "true" : "false") << "\n";
+    output << "      \"keep_intermediates\": "
+           << (build_params_.keep_intermediates_ ? "true" : "false") << "\n";
     output << "    }\n";
     output << "  }\n";
     output << "}\n";
@@ -442,7 +448,8 @@ class PyLaserIndex : public BasePyIndex {
     schema.main_dim_ = extract_uint(text, "main_dim");
     schema.max_degree_ = extract_uint(text, "max_degree");
     schema.num_points_ = extract_uint(text, "num_points");
-    schema.full_dimension_ = std::max(extract_uint(text, "full_dimension"), extract_uint(text, "dimension"));
+    schema.full_dimension_ =
+        std::max(extract_uint(text, "full_dimension"), extract_uint(text, "dimension"));
 
     schema.build_params_.main_dim_ = extract_uint(text, "main_dim");
     schema.build_params_.max_degree_ = extract_uint(text, "max_degree");

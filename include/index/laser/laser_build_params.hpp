@@ -42,7 +42,7 @@ struct LaserBuildParams {
   uint32_t num_threads_{0};
   size_t max_memory_mb_{4096};
   bool keep_intermediates_{false};
-  bool single_shard_{false};   ///< Skip partitioning; build one full Vamana graph
+  bool single_shard_{false};     ///< Skip partitioning; build one full Vamana graph
   std::string external_vamana_;  ///< If set, use this Vamana file instead of building
 
   [[nodiscard]] static auto auto_main_dim(uint32_t full_dim) -> uint32_t {
@@ -88,10 +88,12 @@ struct LaserBuildParams {
     if (num_points == 0) {
       return 0;
     }
-    auto requested =
-        static_cast<uint32_t>(static_cast<double>(num_points) * static_cast<double>(pca_sample_ratio_));
+    auto requested = static_cast<uint32_t>(static_cast<double>(num_points) *
+                                           static_cast<double>(pca_sample_ratio_));
     auto capped = std::min(num_points, pca_sample_cap_);
-    return std::clamp<uint32_t>(requested == 0 ? 1U : requested, 1U, std::max<uint32_t>(1U, capped));
+    return std::clamp<uint32_t>(requested == 0 ? 1U : requested,
+                                1U,
+                                std::max<uint32_t>(1U, capped));
   }
 
   [[nodiscard]] auto resolved_medoid_sample_count(uint32_t num_points) const -> uint32_t {
@@ -101,7 +103,9 @@ struct LaserBuildParams {
     auto requested = static_cast<uint32_t>(static_cast<double>(num_points) *
                                            static_cast<double>(medoid_sample_ratio_));
     auto capped = std::min(num_points, medoid_sample_cap_);
-    return std::clamp<uint32_t>(requested == 0 ? 1U : requested, 1U, std::max<uint32_t>(1U, capped));
+    return std::clamp<uint32_t>(requested == 0 ? 1U : requested,
+                                1U,
+                                std::max<uint32_t>(1U, capped));
   }
 
   [[nodiscard]] auto params_hash() const -> std::string {
