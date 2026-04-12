@@ -77,8 +77,7 @@ if(LASER_AVAILABLE)
 endif()
 
 # Stress tests: DISABLED_ tests that can be run explicitly via `ctest -L stress`
-add_test(NAME diskann_searcher_stress
-         COMMAND $<TARGET_FILE:diskann_searcher_test>
-                 --gtest_also_run_disabled_tests
-                 --gtest_filter="MultiWorkerTest.DISABLED_*")
+add_test(NAME diskann_searcher_stress COMMAND $<TARGET_FILE:diskann_searcher_test> --gtest_also_run_disabled_tests
+                                              --gtest_filter="MultiWorkerTest.DISABLED_*"
+)
 set_tests_properties(diskann_searcher_stress PROPERTIES LABELS "stress")

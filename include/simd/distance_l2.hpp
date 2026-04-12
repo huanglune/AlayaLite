@@ -101,6 +101,17 @@ template <typename DataType = float, typename DistanceType = float>
 auto l2_sqr(const DataType *__restrict x, const DataType *__restrict y, size_t dim) -> DistanceType;
 
 /**
+ * @brief Compute squared L2 norm of a single vector: ||x||^2.
+ *
+ * Returns sum(x[i]^2).
+ *
+ * @param x Pointer to input vector.
+ * @param dim Dimensionality of the vector.
+ * @return float Squared L2 norm.
+ */
+auto l2_sqr_norm(const float *__restrict x, size_t dim) -> float;
+
+/**
  * @brief Compute L2 squared distance between two SQ8 quantized vectors.
  *
  * Returns sum(((x[i] - y[i]) * scale[i])^2), where scale[i] = (max[i] - min[i]) / 255.

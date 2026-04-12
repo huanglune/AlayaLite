@@ -237,7 +237,8 @@ class KMeans {
       const DataType *last_centroid = centroids + static_cast<size_t>(k - 1) * dim;
       float total_dist = 0.0F;
 
-#pragma omp parallel for num_threads(effective_threads(num_points)) reduction(+ : total_dist) schedule(static)
+#pragma omp parallel for num_threads(effective_threads(num_points)) reduction(+ : total_dist) \
+    schedule(static)
       for (size_t i = 0; i < num_points; ++i) {
         float d = compute_l2_sqr(data + i * dim, last_centroid, dim);
         min_dists[i] = std::min(min_dists[i], d);
@@ -288,7 +289,8 @@ class KMeans {
                      const DataType *centroids,
                      std::vector<uint32_t> &assignments) -> float {
     float cost = 0.0F;
-#pragma omp parallel for num_threads(effective_threads(num_points)) reduction(+ : cost) schedule(static)
+#pragma omp parallel for num_threads(effective_threads(num_points)) reduction(+ : cost) \
+    schedule(static)
     for (size_t i = 0; i < num_points; ++i) {
       const DataType *vec = data + i * dim;
       float min_dist = std::numeric_limits<float>::max();

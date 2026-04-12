@@ -12,12 +12,13 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <vector>
 
 #include "index/laser/laser_common.hpp"
-#include "index/laser/utils/memory.hpp"
+#include "utils/memory.hpp"
 
 namespace symqg {
 
@@ -282,6 +283,62 @@ struct LaserSearchParams {
 
   [[nodiscard]] auto effective_aio_events() const -> size_t {
     return aio_events_per_thread_ > 0 ? aio_events_per_thread_ : 2 * beam_width;
+  }
+};
+
+// ============================================================================
+// ResultBuffer: sorted buffer for final k-NN results (separate id/distance arrays)
+// ============================================================================
+
+class ResultBuffer {
+ public:
+  explicit ResultBuffer(size_t capacity)
+      : ids_(capacity + 1), distances_(capacity + 1), capacity_(capacity) {}
+
+  void insert(PID data_id, float dist) {
+    if (size_ == capacity_ && dist > distances_[size_ - 1]) {
+      return;
+    }
+    size_t lo = binary_search(dist);
+    std::memmove(&ids_[lo + 1], &ids_[lo], (size_ - lo) * sizeof(PID));
+    ids_[lo] = data_id;
+    std::memmove(&distances_[lo + 1], &distances_[lo], (size_ - lo) * sizeof(float));
+    distances_[lo] = dist;
+    size_ += static_cast<size_t>(size_ < capacity_);
+  }
+
+  [[nodiscard]] auto is_full() const -> bool { return size_ == capacity_; }
+
+  auto ids() -> const std::vector<PID, alaya::AlignedAlloc<PID>> & { return ids_; }
+
+  void copy_results(PID *knn) const { std::copy(ids_.begin(), ids_.begin() + size_, knn); }
+
+  void clear() { size_ = 0; }
+
+  void reset(size_t new_capacity) {
+    if (new_capacity > capacity_) {
+      ids_.resize(new_capacity + 1);
+      distances_.resize(new_capacity + 1);
+    }
+    capacity_ = new_capacity;
+    size_ = 0;
+  }
+
+ private:
+  std::vector<PID, alaya::AlignedAlloc<PID>> ids_;
+  std::vector<float, alaya::AlignedAlloc<float>> distances_;
+  size_t size_ = 0, capacity_;
+
+  [[nodiscard]] auto binary_search(float dist) const -> size_t {
+    size_t lo = 0;
+    size_t len = size_;
+    size_t half;
+    while (len > 1) {
+      half = len >> 1;
+      len -= half;
+      lo += static_cast<size_t>(distances_[lo + half - 1] < dist) * half;
+    }
+    return (lo < size_ && distances_[lo] < dist) ? lo + 1 : lo;
   }
 };
 

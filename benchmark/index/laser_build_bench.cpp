@@ -39,11 +39,10 @@
 #include "index/laser/laser_common.hpp"
 #include "index/laser/laser_index.hpp"
 #include "index/laser/quantized_graph.hpp"
-#include "index/laser/space/l2.hpp"
 #include "index/laser/transform/pca_transform.hpp"
-#include "index/laser/utils/tools.hpp"
 #include "storage/io/io_uring_engine.hpp"
 #include "utils/kmeans.hpp"
+#include "utils/math.hpp"
 #include "utils/timer.hpp"
 
 // ============================================================================
@@ -584,9 +583,9 @@ class MemLimitQGBuilder {
             {
                 auto tctx = ctx[omp_get_thread_num()];
                 char* pg = reinterpret_cast<char*>(
-                    symqg::memory::align_allocate<symqg::kSectorLen>(g.page_size_));
+                    std::aligned_alloc(symqg::kSectorLen, alaya::math::round_up_general(g.page_size_, symqg::kSectorLen)));
                 char* nb = reinterpret_cast<char*>(
-                    symqg::memory::align_allocate<symqg::kSectorLen>(nbsz));
+                    std::aligned_alloc(symqg::kSectorLen, alaya::math::round_up_general(nbsz, symqg::kSectorLen)));
                 symqg::RowMatrix<float> cp(1, g.padded_dim_), cr(1, g.padded_dim_);
                 std::vector<AlignedRead> rq;
                 rq.reserve(max_degree + 1);
@@ -664,7 +663,7 @@ class MemLimitQGBuilder {
             co.write(reinterpret_cast<const char*>(&g.node_len_), sizeof(size_t));
             constexpr size_t kCB = 1024;
             char* cb = reinterpret_cast<char*>(
-                symqg::memory::align_allocate<symqg::kSectorLen>(kCB * g.page_size_));
+                std::aligned_alloc(symqg::kSectorLen, alaya::math::round_up_general(kCB * g.page_size_, symqg::kSectorLen)));
             LinuxAlignedFileReader cr2;
             cr2.open(idx_path);
             cr2.register_thread();

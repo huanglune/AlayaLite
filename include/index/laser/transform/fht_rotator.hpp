@@ -20,9 +20,9 @@
 #include <iostream>
 #include <random>
 
-#include "index/laser/utils/memory.hpp"
 #include "simd/fht.hpp"
 #include "utils/aligned_array.hpp"
+#include "utils/memory.hpp"
 
 namespace symqg {
 
@@ -33,7 +33,7 @@ namespace symqg {
  * (to rotate query vectors) with the same random signs for consistency.
  */
 class FHTRotator {
-  using data_type = data::Array<float, std::vector<size_t>, memory::AlignedAllocator<float>>;
+  using data_type = data::Array<float, std::vector<size_t>, alaya::AlignedAlloc<float, 64>>;
 
  private:
   std::function<void(float *)> fht_float_ = alaya::simd::helper_float_6;
@@ -47,8 +47,10 @@ class FHTRotator {
   FHTRotator() = default;
 
   explicit FHTRotator(size_t dim)
-      : dimension_(dim), paded_dim_(1 << ceil_log2(dim)), mat_(std::vector<size_t>{1, paded_dim_}) {
-    size_t log_b = ceil_log2(dim);
+      : dimension_(dim),
+        paded_dim_(1 << alaya::math::ceil_log2(dim)),
+        mat_(std::vector<size_t>{1, paded_dim_}) {
+    size_t log_b = alaya::math::ceil_log2(dim);
 
     std::uniform_int_distribution<int> bernoulli(0, 1);
     std::random_device rdd;

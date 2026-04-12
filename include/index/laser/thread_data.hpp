@@ -21,8 +21,9 @@
 #include <utility>
 
 #include "index/laser/laser_search_context.hpp"
-#include "index/laser/utils/memory.hpp"
-#include "index/laser/utils/search_buffer.hpp"
+#include "utils/candidate_list.hpp"
+#include "utils/math.hpp"
+#include "utils/memory.hpp"
 
 namespace symqg {
 
@@ -33,7 +34,7 @@ struct ThreadData {
   io_context_t ctx_ = nullptr;
 
   // Search pool (beam search frontier)
-  buffer::SearchBuffer search_pool_;
+  alaya::CandidateList<float, uint32_t> search_pool_{0};
 
   // Sector-aligned scratch for async I/O reads
   char *sector_scratch_ = nullptr;
@@ -82,8 +83,10 @@ struct ThreadData {
                 size_t full_dim,
                 size_t num_points) {
     // Sector scratch: 2 * max_beam_width pages, sector-aligned
-    sector_scratch_ = reinterpret_cast<char *>(
-        memory::align_allocate<kSectorLen>(2 * max_beam_width * page_size));
+    size_t scratch_bytes =
+        alaya::math::round_up_general(2 * max_beam_width * page_size, kSectorLen);
+    sector_scratch_ = static_cast<char *>(std::aligned_alloc(kSectorLen, scratch_bytes));
+    std::memset(sector_scratch_, 0, scratch_bytes);
 
     // PCA query scratch
     pca_query_scratch_ = new float[full_dim];

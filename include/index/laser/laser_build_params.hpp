@@ -24,7 +24,7 @@
 #include <stdexcept>
 #include <string>
 
-#include "index/laser/utils/tools.hpp"
+#include <thread>
 
 namespace alaya {
 
@@ -81,7 +81,8 @@ struct LaserBuildParams {
     if (num_threads_ != 0) {
       return num_threads_;
     }
-    return static_cast<uint32_t>(symqg::total_threads());
+    auto n = std::thread::hardware_concurrency();
+    return n == 0 ? 1U : n;
   }
 
   [[nodiscard]] auto resolved_pca_sample_count(uint32_t num_points) const -> uint32_t {

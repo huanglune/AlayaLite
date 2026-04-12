@@ -130,7 +130,8 @@ class MedoidGenerator {
 
     std::vector<float> best_dists(medoid_count, std::numeric_limits<float>::max());
     std::vector<uint32_t> best_ids(medoid_count, 0);
-#pragma omp parallel num_threads(static_cast<int>(config_.num_threads_ == 0 ? omp_get_max_threads() : config_.num_threads_))
+#pragma omp parallel num_threads(static_cast<int>( \
+        config_.num_threads_ == 0 ? omp_get_max_threads() : config_.num_threads_))
     {
       std::vector<float> local_dists(medoid_count, std::numeric_limits<float>::max());
       std::vector<uint32_t> local_ids(medoid_count, 0);

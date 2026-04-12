@@ -151,7 +151,7 @@ function occlude_prune(node, candidates, max_degree, alpha):
     truncate to MaxC (750)
     occlude_factor = [0.0] * len(candidates)
     result = []
-    
+
     cur_alpha = 1.0
     while cur_alpha <= alpha and len(result) < max_degree:
         for each candidate c (in distance order):
@@ -161,7 +161,7 @@ function occlude_prune(node, candidates, max_degree, alpha):
                 djk = dist(c, t)
                 occlude_factor[t] = max(occlude_factor[t], dist_to_query[t] / djk)
         cur_alpha *= 1.2
-    
+
     return result
 ```
 

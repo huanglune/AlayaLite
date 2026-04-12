@@ -18,7 +18,6 @@
 
 #include "index/laser/io/aligned_file_reader.hpp"
 #include "index/laser/laser_types.hpp"
-#include "index/laser/utils/search_buffer.hpp"
 
 namespace symqg {
 
@@ -110,7 +109,7 @@ class LaserSearchContext {
   [[nodiscard]] auto cache_nhoods() -> std::vector<std::pair<PID, char *>> & {
     return cache_nhoods_;
   }
-  [[nodiscard]] auto result_buffer() -> buffer::ResultBuffer & { return result_buffer_; }
+  [[nodiscard]] auto result_buffer() -> ResultBuffer & { return result_buffer_; }
 
  private:
   // Borrowed buffer pointers (owned by ThreadData)
@@ -135,7 +134,7 @@ class LaserSearchContext {
   FixedRingBuffer<std::pair<PID, char *>> prepared_ring_;
   FixedStack<char *> free_slot_stack_;
   std::vector<std::pair<PID, char *>> cache_nhoods_;
-  buffer::ResultBuffer result_buffer_{0};
+  ResultBuffer result_buffer_{0};
 };
 
 }  // namespace symqg

@@ -209,7 +209,6 @@ struct Graph {
     }
     LOG_INFO("Graph Loading done\n");
   }
-
 };
 
 }  // namespace alaya

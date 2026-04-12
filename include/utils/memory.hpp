@@ -43,7 +43,7 @@ constexpr size_t kAlign2M = 2 * 1024 * 1024;
  * @tparam Alignment Alignment requirement. Use kAlignAuto (0) for automatic
  *         selection based on size: 64B for < 16KB, 2MB for >= 16KB.
  */
-template <typename T, size_t Alignment = kAlignAuto>
+template <typename T, size_t Alignment = kAlignAuto, bool HugePage = false>
 class AlignedAlloc {
  private:
   static constexpr size_t kAlignSmall = 64;
@@ -51,7 +51,9 @@ class AlignedAlloc {
   static constexpr size_t kHugePageThreshold = 16 * 1024;  // 16KB
 
   static constexpr auto get_alignment(size_t raw_size) -> size_t {
-    if constexpr (Alignment != kAlignAuto) {
+    if constexpr (HugePage) {
+      return (Alignment != kAlignAuto) ? Alignment : kAlignSmall;
+    } else if constexpr (Alignment != kAlignAuto) {
       return Alignment;
     } else {
       return (raw_size >= kHugePageThreshold) ? kAlignLarge : kAlignSmall;
@@ -67,14 +69,15 @@ class AlignedAlloc {
 
   template <class U>
   struct rebind {  // NOLINT
-    using other = AlignedAlloc<U, Alignment>;
+    using other = AlignedAlloc<U, Alignment, HugePage>;
   };
 
   constexpr AlignedAlloc() noexcept = default;
   constexpr AlignedAlloc(const AlignedAlloc &) noexcept = default;
 
-  template <typename U, size_t OtherAlign>
-  constexpr explicit AlignedAlloc(const AlignedAlloc<U, OtherAlign> & /*unused*/) noexcept {}
+  template <typename U, size_t OtherAlign, bool OtherHP>
+  constexpr explicit AlignedAlloc(
+      const AlignedAlloc<U, OtherAlign, OtherHP> & /*unused*/) noexcept {}
 
   /**
    * @brief Allocate aligned memory
@@ -94,7 +97,7 @@ class AlignedAlloc {
 
     size_t raw_size = n * sizeof(T);
     size_t align = get_alignment(raw_size);
-    bool use_huge_page = (align == kAlignLarge);
+    bool use_huge_page = HugePage || (align == kAlignLarge);
 
     const auto kNbytes = math::round_up_pow2(raw_size, align);
     void *ptr = alaya_aligned_alloc_impl(kNbytes, align);
@@ -104,7 +107,6 @@ class AlignedAlloc {
 
 #ifdef ALAYA_OS_LINUX
     if (use_huge_page) {
-      // Suggest using THP (Transparent Huge Pages) for the kernel
       madvise(ptr, kNbytes, MADV_HUGEPAGE);
     }
 #endif
@@ -123,17 +125,46 @@ class AlignedAlloc {
   }
 };
 
-template <typename T, size_t A1, typename U, size_t A2>
-auto operator==(const AlignedAlloc<T, A1> & /*unused*/,
-                const AlignedAlloc<U, A2> & /*unused*/) noexcept -> bool {
-  return A1 == A2;
+template <typename T, size_t A1, bool HP1, typename U, size_t A2, bool HP2>
+auto operator==(const AlignedAlloc<T, A1, HP1> & /*unused*/,
+                const AlignedAlloc<U, A2, HP2> & /*unused*/) noexcept -> bool {
+  return A1 == A2 && HP1 == HP2;
 }
 
-template <typename T, size_t A1, typename U, size_t A2>
-auto operator!=(const AlignedAlloc<T, A1> & /*unused*/,
-                const AlignedAlloc<U, A2> & /*unused*/) noexcept -> bool {
-  return A1 != A2;
+template <typename T, size_t A1, bool HP1, typename U, size_t A2, bool HP2>
+auto operator!=(const AlignedAlloc<T, A1, HP1> & /*unused*/,
+                const AlignedAlloc<U, A2, HP2> & /*unused*/) noexcept -> bool {
+  return !(A1 == A2 && HP1 == HP2);
 }
+
+// =====================================================================
+// Default-init allocator (skips value-initialization for trivial types)
+// =====================================================================
+
+/**
+ * @brief STL-compatible allocator that default-initializes instead of
+ *        value-initializing. For trivial types this means no zeroing.
+ */
+template <typename T>
+struct DefaultInitAlloc {
+  using value_type = T;
+
+  constexpr DefaultInitAlloc() noexcept = default;
+
+  template <typename U>
+  explicit constexpr DefaultInitAlloc(const DefaultInitAlloc<U> & /*unused*/) noexcept {}
+
+  [[nodiscard]] constexpr auto allocate(std::size_t n) -> T * {
+    return static_cast<T *>(::operator new(n * sizeof(T), std::align_val_t(alignof(T))));
+  }
+
+  constexpr void deallocate(T *ptr, size_t count) noexcept { ::operator delete(ptr, count); }
+
+  template <typename U>
+  void construct(U *ptr) noexcept(std::is_nothrow_default_constructible_v<U>) {
+    ::new (static_cast<void *>(ptr)) U;
+  }
+};
 
 // =====================================================================
 // Aligned buffer types

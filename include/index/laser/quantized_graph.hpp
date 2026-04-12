@@ -44,15 +44,16 @@
 #include "index/laser/qg_query.hpp"
 #include "index/laser/qg_scanner.hpp"
 #include "index/laser/quantization/rabitq.hpp"
-#include "index/laser/space/l2.hpp"
 #include "index/laser/thread_data.hpp"
 #include "index/laser/transform/fht_rotator.hpp"
 #include "index/laser/transform/pca_transform.hpp"
 #include "index/laser/utils/concurrent_queue.hpp"
 #include "index/laser/utils/io.hpp"
-#include "index/laser/utils/memory.hpp"
-#include "index/laser/utils/search_buffer.hpp"
+#include "simd/distance_l2.hpp"
 #include "utils/aligned_array.hpp"
+#include "utils/candidate_list.hpp"
+#include "utils/memory.hpp"
+#include "utils/prefetch.hpp"
 
 class MemLimitQGBuilder;  // Forward declaration for benchmark friend access
 
@@ -117,7 +118,7 @@ class QuantizedGraph {
   size_t padded_dim_ = 0;
   PID entry_point_ = 0;
 
-  data::Array<float, std::vector<size_t>, memory::AlignedAllocator<float, 1 << 22, true>> data_;
+  data::Array<float, std::vector<size_t>, alaya::AlignedAlloc<float, 1 << 22, true>> data_;
   QGScanner scanner_;
   FHTRotator rotator_;
   PCATransform pca_transform_;
@@ -173,7 +174,7 @@ class QuantizedGraph {
   auto scan_neighbors(const QGQuery &q_obj,
                       const float *cur_data,
                       float *appro_dist,
-                      buffer::SearchBuffer &search_pool,
+                      alaya::CandidateList<float, uint32_t> &search_pool,
                       uint32_t cur_degree,
                       TaggedVisitedSet &visited,
                       LaserSearchContext &ctx) const -> float;
@@ -218,7 +219,7 @@ inline QuantizedGraph::QuantizedGraph(size_t num, size_t max_deg, size_t main_di
       degree_bound_(max_deg),
       dimension_(main_dim),
       residual_dimension_(dim - main_dim),
-      padded_dim_(1 << ceil_log2(main_dim)),
+      padded_dim_(1 << alaya::math::ceil_log2(main_dim)),
       scanner_(padded_dim_, degree_bound_),
       rotator_(main_dim),
       node_len_((32 * main_dim + 32 * (dim - main_dim) + 128 * max_deg + max_deg * padded_dim_) /
@@ -363,8 +364,9 @@ inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
   q_obj.query_prepare(rotator_, scanner_, ctx);
 
   const float *residual_query = transformed_query + dimension_;
-  float sqr_qr =
-      (residual_dimension_ > 0) ? space::l2_sqr_single(residual_query, residual_dimension_) : 0.0F;
+  float sqr_qr = (residual_dimension_ > 0)
+                     ? alaya::simd::l2_sqr_norm(residual_query, residual_dimension_)
+                     : 0.0F;
   q_obj.set_sqr_qr(sqr_qr);
 
   // Initialize search pool with entry points
@@ -373,8 +375,9 @@ inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
     float best_dist = FLT_MAX;
     size_t full_dim = dimension_ + residual_dimension_;
     for (size_t cur_m = 0; cur_m < medoids_.size(); cur_m++) {
-      float cur_dist =
-          space::l2_sqr(transformed_query, medoids_vector_.data() + full_dim * cur_m, dimension_);
+      float cur_dist = alaya::simd::l2_sqr<float, float>(transformed_query,
+                                                         medoids_vector_.data() + full_dim * cur_m,
+                                                         dimension_);
       if (cur_dist < best_dist) {
         best_medoid = medoids_[cur_m];
         best_dist = cur_dist;
@@ -412,9 +415,9 @@ inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
                                  ctx);
     if (residual_dimension_ > 0) {
       float *residual_data = cur_data + dimension_;
-      sqr_y += space::l2_sqr(reinterpret_cast<const float *>(residual_data),
-                             residual_query,
-                             residual_dimension_);
+      sqr_y += alaya::simd::l2_sqr<float, float>(reinterpret_cast<const float *>(residual_data),
+                                                 residual_query,
+                                                 residual_dimension_);
     }
     res_pool.insert(cur_node, sqr_y);
   };
@@ -432,7 +435,7 @@ inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
       if (buf != nullptr) {
         // Prefetch the node data into L2 cache while it's being queued
         const char *node_ptr = buf + offset_to_node(id);
-        memory::mem_prefetch_l2(node_ptr, prefetch_lines);
+        alaya::mem_prefetch_l2(node_ptr, prefetch_lines);
         prepared.push_back({id, buf});
         ongoing.erase(id);
       }
@@ -503,8 +506,8 @@ inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
     // Process cached nodes with look-ahead prefetch (no double lookup)
     for (size_t ci = 0; ci < cache_nhoods.size(); ++ci) {
       if (ci + 1 < cache_nhoods.size()) {
-        memory::mem_prefetch_l1(reinterpret_cast<const char *>(cache_nhoods[ci + 1].second),
-                                prefetch_lines);
+        alaya::mem_prefetch_l1(reinterpret_cast<const char *>(cache_nhoods[ci + 1].second),
+                               prefetch_lines);
       }
       process_node(cache_nhoods[ci].first, reinterpret_cast<float *>(cache_nhoods[ci].second));
     }
@@ -520,7 +523,7 @@ inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
         // L1 prefetch the next node while processing current
         if (!prepared.empty()) {
           auto &next = prepared.front();
-          memory::mem_prefetch_l1(next.second + offset_to_node(next.first), prefetch_lines);
+          alaya::mem_prefetch_l1(next.second + offset_to_node(next.first), prefetch_lines);
         }
         process_node(node.first,
                      reinterpret_cast<float *>(node.second + offset_to_node(node.first)));
@@ -538,7 +541,7 @@ inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
       auto node = prepared.pop_front();
       if (!prepared.empty()) {
         auto &next = prepared.front();
-        memory::mem_prefetch_l1(next.second + offset_to_node(next.first), prefetch_lines);
+        alaya::mem_prefetch_l1(next.second + offset_to_node(next.first), prefetch_lines);
       }
       process_node(node.first, reinterpret_cast<float *>(node.second + offset_to_node(node.first)));
       --previous_remain_num;
@@ -554,11 +557,11 @@ inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
 inline auto QuantizedGraph::scan_neighbors(const QGQuery &q_obj,
                                            const float *cur_data,
                                            float *appro_dist,
-                                           buffer::SearchBuffer &search_pool,
+                                           alaya::CandidateList<float, uint32_t> &search_pool,
                                            uint32_t cur_degree,
                                            TaggedVisitedSet &visited,
                                            LaserSearchContext &ctx) const -> float {
-  float sqr_y = space::l2_sqr(q_obj.query_data(), cur_data, dimension_);
+  float sqr_y = alaya::simd::l2_sqr<float, float>(q_obj.query_data(), cur_data, dimension_);
 
   const auto *packed_code = reinterpret_cast<const uint8_t *>(&cur_data[code_offset_]);
   const auto *factor = &cur_data[factor_offset_];
@@ -577,7 +580,7 @@ inline auto QuantizedGraph::scan_neighbors(const QGQuery &q_obj,
   for (uint32_t i = 0; i < cur_degree; ++i) {
     PID cur_neighbor = ptr_nb[i];
     float tmp_dist = appro_dist[i];
-    if (search_pool.is_full(tmp_dist) || visited.get(cur_neighbor)) {
+    if (visited.get(cur_neighbor)) {
       continue;
     }
     search_pool.insert(cur_neighbor, tmp_dist);

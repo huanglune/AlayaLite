@@ -18,7 +18,7 @@
 #include <fstream>
 #include <utility>
 
-#include "index/laser/utils/memory.hpp"
+#include "utils/memory.hpp"
 
 namespace symqg::data::array_impl {
 /**
@@ -37,7 +37,9 @@ template <typename Dims>
 }  // namespace symqg::data::array_impl
 
 namespace symqg::data {
-template <typename T, typename Dims = std::vector<size_t>, typename Alloc = memory::Allocator<T>>
+template <typename T,
+          typename Dims = std::vector<size_t>,
+          typename Alloc = alaya::DefaultInitAlloc<T>>
 class Array {
  private:
   static_assert(std::is_trivial_v<T>);  // only handle trivial types

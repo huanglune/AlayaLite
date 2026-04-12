@@ -33,9 +33,10 @@
 
 #include "index/laser/laser_common.hpp"
 #include "index/laser/quantized_graph.hpp"
-#include "index/laser/space/l2.hpp"
 #include "index/laser/utils/partitioner.hpp"
-#include "index/laser/utils/tools.hpp"
+#include "simd/distance_l2.hpp"
+#include "utils/math.hpp"
+#include "utils/random.hpp"
 
 namespace symqg {
 constexpr size_t kMaxBsIter = 5;
@@ -73,11 +74,12 @@ class QGBuilder {
   explicit QGBuilder(QuantizedGraph &index, uint32_t ef_build, size_t num_threads)
       : qg_{index},
         ef_build_{ef_build},
-        num_threads_{std::min(num_threads, total_threads() * 4)},
+        num_threads_{
+            std::min(num_threads, static_cast<size_t>(std::thread::hardware_concurrency()) * 4)},
         num_nodes_{qg_.num_vertices()},
         dim_{qg_.dimension()},
         degree_bound_(qg_.degree_bound()),
-        dist_func_{space::l2_sqr},
+        dist_func_{alaya::simd::l2_sqr<float, float>},
         new_neighbors_(qg_.num_vertices()),
         degrees_(qg_.num_vertices(), static_cast<uint32_t>(degree_bound_)) {}
 
@@ -187,9 +189,12 @@ class QGBuilder {
         vector_reader.register_thread();
         ctx = vector_reader.get_ctx();
       }
-      char *cur_page = reinterpret_cast<char *>(memory::align_allocate<kSectorLen>(qg_.page_size_));
-      char *neighbor_buf =
-          reinterpret_cast<char *>(memory::align_allocate<kSectorLen>(neighbor_buf_size));
+      char *cur_page = reinterpret_cast<char *>(
+          std::aligned_alloc(kSectorLen,
+                             alaya::math::round_up_general(qg_.page_size_, kSectorLen)));
+      char *neighbor_buf = reinterpret_cast<char *>(
+          std::aligned_alloc(kSectorLen,
+                             alaya::math::round_up_general(neighbor_buf_size, kSectorLen)));
       RowMatrix<float> c_pad(1, qg_.padded_dim_);
       RowMatrix<float> c_rotated(1, qg_.padded_dim_);
       std::vector<AlignedRead> reqs;
@@ -207,8 +212,17 @@ class QGBuilder {
           continue;
         }
 
-        build_node(i, cur_degree, cur_page, neighbor_buf, c_pad, c_rotated, reqs, full_dim,
-                   full_page_size, vector_reader, ctx);
+        build_node(i,
+                   cur_degree,
+                   cur_page,
+                   neighbor_buf,
+                   c_pad,
+                   c_rotated,
+                   reqs,
+                   full_dim,
+                   full_page_size,
+                   vector_reader,
+                   ctx);
 
         size_t page_id = i / qg_.node_per_page_;
         size_t node_offset = (i % qg_.node_per_page_) * qg_.node_len_;
@@ -247,10 +261,14 @@ class QGBuilder {
     reqs.clear();
     for (size_t j = 0; j < cur_degree; ++j) {
       auto nid = new_neighbors_[node_id][j].id;
-      reqs.emplace_back(nid * full_page_size, full_page_size, nid,
+      reqs.emplace_back(nid * full_page_size,
+                        full_page_size,
+                        nid,
                         reinterpret_cast<void *>(neighbor_buf + j * full_page_size));
     }
-    reqs.emplace_back(node_id * full_page_size, full_page_size, node_id,
+    reqs.emplace_back(node_id * full_page_size,
+                      full_page_size,
+                      node_id,
                       reinterpret_cast<void *>(cur_page));
 
     vector_reader.read(reqs, ctx, false);
@@ -319,7 +337,9 @@ class QGBuilder {
 
     constexpr size_t kCacheBatchSize = 1024;
     char *cache_buffer = reinterpret_cast<char *>(
-        memory::align_allocate<kSectorLen>(kCacheBatchSize * qg_.page_size_));
+        std::aligned_alloc(kSectorLen,
+                           alaya::math::round_up_general(kCacheBatchSize * qg_.page_size_,
+                                                         kSectorLen)));
     LinuxAlignedFileReader cache_reader;
     cache_reader.open(index_path);
     cache_reader.register_thread();
@@ -331,7 +351,9 @@ class QGBuilder {
       for (size_t j = 0; j < cur_batch; ++j) {
         auto cache_id = qg_.cache_ids_[i + j];
         size_t page_id = cache_id / qg_.node_per_page_;
-        cache_reqs.emplace_back(kSectorLen + (page_id * qg_.page_size_), qg_.page_size_, cache_id,
+        cache_reqs.emplace_back(kSectorLen + (page_id * qg_.page_size_),
+                                qg_.page_size_,
+                                cache_id,
                                 cache_buffer + (j * qg_.page_size_));
       }
       cache_reader.read(cache_reqs, cache_reader.get_ctx(), false);
@@ -340,9 +362,9 @@ class QGBuilder {
       for (size_t j = 0; j < cur_batch; ++j) {
         auto cache_id = qg_.cache_ids_[i + j];
         size_t node_offset = (cache_id % qg_.node_per_page_) * qg_.node_len_;
-        cache_nodes_out.write(
-            reinterpret_cast<const char *>(cache_buffer + (j * qg_.page_size_) + node_offset),
-            static_cast<std::streamsize>(qg_.node_len_));
+        cache_nodes_out.write(reinterpret_cast<const char *>(cache_buffer + (j * qg_.page_size_) +
+                                                             node_offset),
+                              static_cast<std::streamsize>(qg_.node_len_));
       }
     }
     cache_nodes_out.close();
@@ -372,8 +394,8 @@ inline void QGBuilder::init_from_vamana(const std::string &filename) {
 
   if (max_observed_degree != qg_.degree_bound()) {
     throw std::runtime_error("Vamana degree mismatch: expected " +
-                             std::to_string(qg_.degree_bound()) +
-                             ", got " + std::to_string(max_observed_degree));
+                             std::to_string(qg_.degree_bound()) + ", got " +
+                             std::to_string(max_observed_degree));
   }
   qg_.set_ep(start);
 
@@ -410,8 +432,7 @@ inline void QGBuilder::init_from_vamana(const std::string &filename) {
   });
 
   if (nodes_read != num_nodes_) {
-    throw std::runtime_error("Vamana node count mismatch: expected " +
-                             std::to_string(num_nodes_) +
+    throw std::runtime_error("Vamana node count mismatch: expected " + std::to_string(num_nodes_) +
                              ", got " + std::to_string(nodes_read));
   }
 }

@@ -278,8 +278,7 @@ class PCATransform {
                 static_cast<Eigen::Index>(input_dim_));
     cov_map.setZero();
 
-    Eigen::Map<const Eigen::VectorXf> mean_vec(mean_.data(),
-                                                static_cast<Eigen::Index>(input_dim_));
+    Eigen::Map<const Eigen::VectorXf> mean_vec(mean_.data(), static_cast<Eigen::Index>(input_dim_));
 
     for (uint64_t start = 0; start < count; start += kBlockSize) {
       auto block_count = static_cast<Eigen::Index>(std::min(kBlockSize, count - start));

@@ -296,8 +296,7 @@ class LaserBuilder {
       return;
     }
 
-    std::cout << "[LaserBuilder] Phase " << BuildState::phase_name(phase) << " started..."
-              << '\n';
+    std::cout << "[LaserBuilder] Phase " << BuildState::phase_name(phase) << " started..." << '\n';
     Timer phase_timer;
 
     state_.mark_in_progress(phase);

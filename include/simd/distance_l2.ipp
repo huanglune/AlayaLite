@@ -741,6 +741,41 @@ inline auto l2_sqr(const DataType *__restrict x, const DataType *__restrict y, s
   }
 }
 
+inline auto l2_sqr_norm(const float *__restrict x, size_t dim) -> float {
+  float sum = 0.0F;
+  size_t i = 0;
+#ifdef ALAYA_ARCH_X86
+  const auto &f = get_cpu_features();
+  if (f.avx2_) {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    for (; i + 16 <= dim; i += 16) {
+      __m256 v0 = _mm256_loadu_ps(x + i);
+      __m256 v1 = _mm256_loadu_ps(x + i + 8);
+      acc0 = _mm256_fmadd_ps(v0, v0, acc0);
+      acc1 = _mm256_fmadd_ps(v1, v1, acc1);
+    }
+    for (; i + 8 <= dim; i += 8) {
+      __m256 v = _mm256_loadu_ps(x + i);
+      acc0 = _mm256_fmadd_ps(v, v, acc0);
+    }
+    acc0 = _mm256_add_ps(acc0, acc1);
+    __m128 hi = _mm256_extractf128_ps(acc0, 1);
+    __m128 lo = _mm256_castps256_ps128(acc0);
+    __m128 s128 = _mm_add_ps(lo, hi);
+    __m128 shuf = _mm_movehdup_ps(s128);
+    s128 = _mm_add_ps(s128, shuf);
+    shuf = _mm_movehl_ps(shuf, s128);
+    s128 = _mm_add_ss(s128, shuf);
+    sum = _mm_cvtss_f32(s128);
+  }
+#endif
+  for (; i < dim; ++i) {
+    sum += x[i] * x[i];
+  }
+  return sum;
+}
+
 template <typename DataType, typename DistanceType>
 inline auto l2_sqr_sq8(const uint8_t *__restrict x,
                        const uint8_t *__restrict y,
