@@ -53,10 +53,11 @@ class CompactNeighborTable {
 
   CompactNeighborTable(uint32_t num_nodes, uint32_t max_degree, float slack_factor = 1.0F)
       : max_degree_(static_cast<uint32_t>(static_cast<float>(max_degree) * slack_factor)),
+        degrees_(num_nodes, 0),
         neighbors_(static_cast<size_t>(num_nodes) * max_degree_, kInvalidID) {}
 
   [[nodiscard]] auto num_nodes() const -> uint32_t {
-    return max_degree_ == 0 ? 0 : static_cast<uint32_t>(neighbors_.size() / max_degree_);
+    return static_cast<uint32_t>(degrees_.size());
   }
   [[nodiscard]] auto max_degree() const -> uint32_t { return max_degree_; }
   [[nodiscard]] auto bytes_used() const -> size_t { return neighbors_.size() * sizeof(IDType); }
@@ -74,9 +75,7 @@ class CompactNeighborTable {
     for (; count < neighbors.size() && count < max_degree_; ++count) {
       row[count] = neighbors[count].id_;
     }
-    for (; count < max_degree_; ++count) {
-      row[count] = kInvalidID;
-    }
+    degrees_[node_id] = count;
   }
 
   void update_ids(uint32_t node_id, const std::vector<IDType> &neighbors) {
@@ -85,38 +84,25 @@ class CompactNeighborTable {
     for (; count < neighbors.size() && count < max_degree_; ++count) {
       row[count] = neighbors[count];
     }
-    for (; count < max_degree_; ++count) {
-      row[count] = kInvalidID;
-    }
+    degrees_[node_id] = count;
   }
 
   [[nodiscard]] auto degree(uint32_t node_id) const -> uint32_t {
-    auto *row = data(node_id);
-    uint32_t count = 0;
-    while (count < max_degree_ && row[count] != kInvalidID) {
-      ++count;
-    }
-    return count;
+    return degrees_[node_id];
   }
 
   [[nodiscard]] auto neighbors_view(uint32_t node_id) const -> std::span<const IDType> {
-    auto *row = data(node_id);
-    return {row, degree(node_id)};
+    return {data(node_id), degrees_[node_id]};
   }
 
   auto append(uint32_t node_id, IDType neighbor_id) -> bool {
-    auto *row = data(node_id);
-    for (uint32_t i = 0; i < max_degree_; ++i) {
-      if (row[i] != kInvalidID) {
-        continue;
-      }
-      row[i] = neighbor_id;
-      if (i + 1 < max_degree_) {
-        row[i + 1] = kInvalidID;
-      }
-      return true;
+    auto deg = degrees_[node_id];
+    if (deg >= max_degree_) {
+      return false;
     }
-    return false;
+    data(node_id)[deg] = neighbor_id;
+    degrees_[node_id] = deg + 1;
+    return true;
   }
 
   [[nodiscard]] auto neighbors(uint32_t node_id) const -> std::vector<IDType> {
@@ -126,6 +112,7 @@ class CompactNeighborTable {
 
  private:
   uint32_t max_degree_{0};
+  std::vector<uint32_t> degrees_;
   std::vector<IDType> neighbors_;
 };
 
@@ -158,12 +145,13 @@ class ShardVamanaBuilder {
   struct Config {
     uint32_t max_degree_{64};
     uint32_t ef_construction_{128};
-    uint32_t num_iterations_{2};
+    uint32_t num_iterations_{1};        ///< Matching official DiskANN (1 pass)
     float alpha_{1.2F};
     float alpha_first_pass_{1.0F};
     uint32_t max_occlusion_size_{750};  ///< Max candidates for pruning (DiskANN maxc)
     size_t max_memory_mb_{4096};
-    uint32_t num_threads_{0};  ///< 0 = hardware concurrency, 1 = single-threaded
+    uint32_t num_threads_{0};           ///< 0 = hardware concurrency, 1 = single-threaded
+    bool saturate_graph_{false};        ///< Backfill under-connected nodes to max_degree
   };
 
   static constexpr float kGraphSlackFactor = 1.3F;
@@ -245,10 +233,13 @@ class ShardVamanaBuilder {
 
   void build(ProgressCallback on_progress = nullptr) {
     enforce_memory_budget();
-    initialize_random_graph();
     medoid_local_id_ = compute_medoid();
+    bootstrap_medoid();
     for (uint32_t pass = 0; pass < config_.num_iterations_; ++pass) {
-      auto alpha = pass == 0 ? config_.alpha_first_pass_ : config_.alpha_;
+      // Single-pass: use alpha_ directly (matching official DiskANN).
+      // Multi-pass: pass 0 uses alpha_first_pass_ (strict), subsequent passes use alpha_.
+      auto alpha =
+          (config_.num_iterations_ == 1) ? config_.alpha_ : (pass == 0 ? config_.alpha_first_pass_ : config_.alpha_);
       build_pass(alpha, on_progress);
     }
     // Final cleanup: prune any over-provisioned nodes back to max_degree
@@ -335,7 +326,8 @@ class ShardVamanaBuilder {
     CandidateList<float, LocalIDType> candidate_list_;
     std::vector<NeighborType> expanded_nodes_;
     std::vector<float> occlude_factor_;
-    std::vector<LocalIDType> neighbor_snapshot_;  // Snapshot buffer for concurrent-safe reads
+    std::vector<LocalIDType> neighbor_snapshot_;
+    std::vector<LocalIDType> unvisited_ids_;  // Batch buffer for greedy_search
 
     BuildScratch(uint32_t ef, uint32_t max_occlusion_size) : candidate_list_(static_cast<int>(ef)) {
       expanded_nodes_.reserve(
@@ -368,19 +360,43 @@ class ShardVamanaBuilder {
   LocalIDType medoid_local_id_{0};
 
   void cleanup_overprovisioned() {
-    for (LocalIDType node_id = 0; node_id < num_nodes(); ++node_id) {
-      auto existing = neighbor_table_.neighbors_view(node_id);
-      if (existing.size() <= config_.max_degree_) {
-        continue;
+    auto num_threads = std::min(effective_threads(), num_nodes());
+    std::atomic<uint32_t> next_idx{0};
+    constexpr uint32_t kBatchSize = 256;
+
+    auto worker = [this, &next_idx] {
+      BuildScratch scratch(config_.ef_construction_, config_.max_occlusion_size_);
+      std::vector<NeighborType> selected;
+      while (true) {
+        auto begin = next_idx.fetch_add(kBatchSize);
+        if (begin >= num_nodes()) {
+          break;
+        }
+        auto end = std::min(begin + kBatchSize, num_nodes());
+        for (auto node_id = begin; node_id < end; ++node_id) {
+          auto existing = neighbor_table_.neighbors_view(node_id);
+          if (existing.size() <= config_.max_degree_) {
+            continue;
+          }
+          std::vector<NeighborType> candidates;
+          candidates.reserve(existing.size());
+          for (auto neighbor_id : existing) {
+            candidates.emplace_back(neighbor_id, distance(node_id, neighbor_id));
+          }
+          std::sort(candidates.begin(), candidates.end());
+          robust_prune(node_id, candidates, config_.alpha_, scratch, selected);
+          neighbor_table_.update(node_id, selected);
+        }
       }
-      // Build candidate pool with distances and prune to max_degree
-      std::vector<NeighborType> candidates;
-      candidates.reserve(existing.size());
-      for (auto neighbor_id : existing) {
-        candidates.emplace_back(neighbor_id, distance(node_id, neighbor_id));
-      }
-      std::sort(candidates.begin(), candidates.end());
-      neighbor_table_.update(node_id, robust_prune(node_id, candidates, config_.alpha_));
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+    for (uint32_t t = 0; t < num_threads; ++t) {
+      threads.emplace_back(worker);
+    }
+    for (auto &t : threads) {
+      t.join();
     }
   }
 
@@ -459,6 +475,26 @@ class ShardVamanaBuilder {
     return medoid;
   }
 
+  /// Bootstrap the medoid with its nearest neighbors so greedy_search on
+  /// the empty graph can immediately find reachable nodes. Equivalent to
+  /// official DiskANN's "frozen point" mechanism.
+  void bootstrap_medoid() {
+    auto degree_limit = std::min(config_.max_degree_, num_nodes() - 1);
+    std::vector<NeighborType> candidates;
+    candidates.reserve(num_nodes());
+    for (LocalIDType i = 0; i < num_nodes(); ++i) {
+      if (i == medoid_local_id_) {
+        continue;
+      }
+      candidates.emplace_back(i, distance(medoid_local_id_, i));
+    }
+    std::sort(candidates.begin(), candidates.end());
+    if (candidates.size() > degree_limit) {
+      candidates.resize(degree_limit);
+    }
+    neighbor_table_.update(medoid_local_id_, candidates);
+  }
+
   [[nodiscard]] auto effective_threads() const -> uint32_t {
     auto t = config_.num_threads_;
     if (t == 0) {
@@ -468,10 +504,7 @@ class ShardVamanaBuilder {
   }
 
   void build_pass(float alpha, const ProgressCallback &on_progress) {
-    constexpr uint32_t kBatchSize = 64;
-    std::vector<LocalIDType> perm(num_nodes());
-    std::iota(perm.begin(), perm.end(), 0U);
-    std::shuffle(perm.begin(), perm.end(), std::mt19937(42));
+    constexpr uint32_t kBatchSize = 2048;
 
     auto num_threads = std::min(effective_threads(), num_nodes());
     std::atomic<uint32_t> next_idx{0};
@@ -479,22 +512,20 @@ class ShardVamanaBuilder {
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
     for (uint32_t t = 0; t < num_threads; ++t) {
-      threads.emplace_back([this, &perm, &on_progress, alpha, &next_idx] {
+      threads.emplace_back([this, &on_progress, alpha, &next_idx] {
         BuildScratch scratch(config_.ef_construction_, config_.max_occlusion_size_);
         std::vector<NeighborType> selected;
         selected.reserve(config_.max_degree_);
 
         while (true) {
           auto begin = next_idx.fetch_add(kBatchSize);
-          if (begin >= perm.size()) {
+          if (begin >= num_nodes()) {
             break;
           }
-          auto end = std::min(begin + kBatchSize, static_cast<uint32_t>(perm.size()));
-          for (auto i = begin; i < end; ++i) {
-            auto node_id = perm[i];
+          auto end = std::min(begin + kBatchSize, num_nodes());
+          for (auto node_id = begin; node_id < end; ++node_id) {
             greedy_search(node_id, config_.ef_construction_, scratch);
             auto &candidates = scratch.expanded_nodes_;
-            merge_existing_neighbors(node_id, candidates);
             robust_prune(node_id, candidates, alpha, scratch, selected);
             {
               std::lock_guard<std::mutex> lock(node_mutexes_[node_id]);
@@ -543,20 +574,22 @@ class ShardVamanaBuilder {
     scratch.reset(ef, config_.max_occlusion_size_);
     auto &candidates = scratch.candidate_list_;
     auto &expanded_nodes = scratch.expanded_nodes_;
+    auto &unvisited = scratch.unvisited_ids_;
+
+    const auto *query_vec = vector_ptr(query_id);
 
     visited.mark(medoid_local_id_);
-    auto medoid_dist = distance(query_id, medoid_local_id_);
-    candidates.insert(medoid_local_id_, medoid_dist);
+    candidates.insert(medoid_local_id_, dist_fn_(query_vec, vector_ptr(medoid_local_id_), dim_));
 
     while (candidates.has_next()) {
       auto cur_dist = candidates.dist(candidates.cur_);
       auto cur_id = candidates.pop();
       expanded_nodes.emplace_back(cur_id, cur_dist);
 
-      // Snapshot the neighbor row to avoid reading torn data from concurrent writes.
-      // The row pointer is stable (no realloc), but individual IDs may be mid-update.
+      // Snapshot + collect unvisited neighbors in batch
       auto nbr_view = neighbor_table_.neighbors_view(cur_id);
       scratch.neighbor_snapshot_.assign(nbr_view.begin(), nbr_view.end());
+      unvisited.clear();
       for (auto neighbor_id : scratch.neighbor_snapshot_) {
         if (neighbor_id >= num_nodes()) {
           continue;
@@ -565,11 +598,34 @@ class ShardVamanaBuilder {
           continue;
         }
         visited.mark(neighbor_id);
-        candidates.insert(neighbor_id, distance(query_id, neighbor_id));
+        unvisited.push_back(neighbor_id);
+      }
+
+      // Batch distance computation with prefetch
+      for (size_t idx = 0; idx < unvisited.size(); ++idx) {
+        if (idx + 1 < unvisited.size()) {
+          __builtin_prefetch(vector_ptr(unvisited[idx + 1]), 0, 0);
+        }
+        candidates.insert(unvisited[idx], dist_fn_(query_vec, vector_ptr(unvisited[idx]), dim_));
       }
     }
 
-    // Sort expanded nodes by distance for pruning
+    // Include unexpanded candidates from the search frontier in the pruning pool.
+    // Official DiskANN prunes from the full pool (expanded + unexpanded).
+    for (size_t idx = 0; idx < candidates.size(); ++idx) {
+      auto nid = candidates.id(static_cast<LocalIDType>(idx));
+      if (nid != query_id) {
+        expanded_nodes.emplace_back(nid, candidates.dist(static_cast<LocalIDType>(idx)));
+      }
+    }
+
+    // Dedup (expanded nodes may overlap with candidate list entries)
+    std::sort(expanded_nodes.begin(), expanded_nodes.end(), [](const auto &a, const auto &b) {
+      return a.id_ < b.id_ || (a.id_ == b.id_ && a.distance_ < b.distance_);
+    });
+    auto last = std::unique(expanded_nodes.begin(), expanded_nodes.end(),
+                            [](const auto &a, const auto &b) { return a.id_ == b.id_; });
+    expanded_nodes.erase(last, expanded_nodes.end());
     std::sort(expanded_nodes.begin(), expanded_nodes.end());
   }
 
@@ -632,6 +688,22 @@ class ShardVamanaBuilder {
       }
       cur_alpha *= kAlphaStep;
     }
+
+    // Saturation: if enabled and alpha > 1, backfill under-connected nodes.
+    if (config_.saturate_graph_ && alpha > 1.0F && selected.size() < config_.max_degree_) {
+      for (size_t i = 0; i < candidates.size(); ++i) {
+        if (selected.size() >= config_.max_degree_) {
+          break;
+        }
+        if (occlude_factor[i] >= std::numeric_limits<float>::max()) {
+          continue;  // already selected
+        }
+        if (candidates[i].id_ == node_id) {
+          continue;
+        }
+        selected.push_back(candidates[i]);
+      }
+    }
   }
 
   [[nodiscard]] auto robust_prune(LocalIDType node_id,
@@ -644,33 +716,42 @@ class ShardVamanaBuilder {
   }
 
   void add_reverse_edge(LocalIDType src, LocalIDType dst, float alpha, BuildScratch &scratch) {
-    std::lock_guard<std::mutex> lock(node_mutexes_[src]);
-    auto existing = neighbor_table_.neighbors_view(src);
-    if (std::find(existing.begin(), existing.end(), dst) != existing.end()) {
-      return;
-    }
-
-    auto slack_limit =
-        static_cast<size_t>(static_cast<float>(config_.max_degree_) * kGraphSlackFactor);
-
-    if (existing.size() < slack_limit) {
-      if (!neighbor_table_.append(src, dst)) {
-        throw std::logic_error("append failed below slack limit");
-      }
-      return;
-    }
-
-    // At slack limit: prune back to max_degree
     std::vector<NeighborType> candidates;
-    candidates.reserve(existing.size() + 1);
-    for (auto neighbor_id : existing) {
-      candidates.emplace_back(neighbor_id, distance(src, neighbor_id));
+    bool needs_prune = false;
+
+    {
+      std::lock_guard<std::mutex> lock(node_mutexes_[src]);
+      auto existing = neighbor_table_.neighbors_view(src);
+      if (std::find(existing.begin(), existing.end(), dst) != existing.end()) {
+        return;
+      }
+
+      auto slack_limit =
+          static_cast<size_t>(static_cast<float>(config_.max_degree_) * kGraphSlackFactor);
+
+      if (existing.size() < slack_limit) {
+        if (!neighbor_table_.append(src, dst)) {
+          throw std::logic_error("append failed below slack limit");
+        }
+        return;
+      }
+
+      // At slack limit: snapshot neighbors and release lock before pruning
+      candidates.reserve(existing.size() + 1);
+      for (auto neighbor_id : existing) {
+        candidates.emplace_back(neighbor_id, distance(src, neighbor_id));
+      }
+      candidates.emplace_back(dst, distance(src, dst));
+      needs_prune = true;
     }
-    candidates.emplace_back(dst, distance(src, dst));
-    std::sort(candidates.begin(), candidates.end());
-    std::vector<NeighborType> selected;
-    robust_prune(src, candidates, alpha, scratch, selected);
-    neighbor_table_.update(src, selected);
+
+    if (needs_prune) {
+      std::sort(candidates.begin(), candidates.end());
+      std::vector<NeighborType> selected;
+      robust_prune(src, candidates, alpha, scratch, selected);
+      std::lock_guard<std::mutex> lock(node_mutexes_[src]);
+      neighbor_table_.update(src, selected);
+    }
   }
 
   void add_reverse_edge(LocalIDType src, LocalIDType dst, float alpha) {

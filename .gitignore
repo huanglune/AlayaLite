@@ -80,6 +80,7 @@ data/
 *.csv
 *.svg
 benchmark/results/
+benchmark_results
 benchmark/index/*.png
 
 # ============================================================

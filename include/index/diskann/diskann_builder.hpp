@@ -173,7 +173,12 @@ struct DiskANNBuilder {
                                                                   dim_);
 
         typename ShardVamanaBuilder<DataType, IDType>::Config shard_config;
-        shard_config.max_degree_ = params_.max_degree_;
+        // Reduce per-shard degree so that after merge (each node appears in
+        // ~overlap_factor shards) the combined degree is ~R.
+        // Formula: shard_degree = 2*R / (overlap_factor + 1).
+        // overlap=2 → 2R/3, overlap=1 → R (no reduction), overlap=3 → R/2.
+        shard_config.max_degree_ =
+            std::max(1U, 2 * params_.max_degree_ / (params_.overlap_factor_ + 1));
         shard_config.ef_construction_ = params_.ef_construction_;
         shard_config.num_iterations_ = params_.num_iterations_;
         shard_config.alpha_ = params_.alpha_;

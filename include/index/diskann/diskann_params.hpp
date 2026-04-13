@@ -43,7 +43,7 @@ struct DiskANNBuildParams {
   float alpha_first_pass_{1.0F};   ///< Alpha for pass 1 (strict pruning, builds k-NN connectivity)
   uint32_t ef_construction_{128};  ///< L: Search list size during construction
   uint32_t num_threads_{0};        ///< Number of threads (0 = hardware concurrency)
-  uint32_t num_iterations_{2};     ///< Number of Vamana iterations (typically 2)
+  uint32_t num_iterations_{1};     ///< Number of Vamana iterations (1 = matches official DiskANN)
   size_t max_memory_mb_{4096};     ///< Memory budget for out-of-core partitioned build
   float sample_rate_{0.02F};       ///< KMeans sample rate for partitioning (fraction in (0,1])
   uint32_t overlap_factor_{2};     ///< Number of shard assignments per vector during partitioning
