@@ -144,6 +144,24 @@ class QuantizedGraph {
 
   size_t nthreads_ = 1;
 
+  struct ThreadDataGuard {
+    alaya::ConcurrentQueue<ThreadData> &pool_;
+    ThreadData data_;
+
+    ThreadDataGuard(alaya::ConcurrentQueue<ThreadData> &pool, ThreadData &&data)
+        : pool_(pool), data_(std::move(data)) {}
+
+    ~ThreadDataGuard() {
+      pool_.push(std::move(data_));
+      pool_.push_notify_one();
+    }
+
+    ThreadDataGuard(const ThreadDataGuard &) = delete;
+    auto operator=(const ThreadDataGuard &) -> ThreadDataGuard & = delete;
+    ThreadDataGuard(ThreadDataGuard &&) = delete;
+    auto operator=(ThreadDataGuard &&) -> ThreadDataGuard & = delete;
+  };
+
   size_t res_dim_offset_ = 0;
   size_t code_offset_ = 0;
   size_t factor_offset_ = 0;
@@ -206,7 +224,6 @@ class QuantizedGraph {
   [[nodiscard]] auto load_cache_nodes_standard(std::ifstream &cache_vectors_input,
                                                size_t cache_bytes) -> bool;
   auto acquire_thread_data() -> ThreadData;
-  void release_thread_data(ThreadData &&data);
   void rebuild_cache_lookup(char *cache_base, size_t cache_count);
 #ifdef LASER_USE_NUMA
   auto try_load_cache_with_numa(std::ifstream &cache_vectors_input, size_t cache_bytes) -> bool;
@@ -368,9 +385,8 @@ inline void QuantizedGraph::destroy_thread_data() {
 inline void QuantizedGraph::search(const float *__restrict__ query,
                                    uint32_t knn,
                                    uint32_t *__restrict__ results) {
-  ThreadData data = acquire_thread_data();
-  disk_search_qg(query, knn, results, data);
-  release_thread_data(std::move(data));
+  ThreadDataGuard guard(thread_data_, acquire_thread_data());
+  disk_search_qg(query, knn, results, guard.data_);
 }
 
 inline void QuantizedGraph::batch_search(const float *__restrict__ query,
@@ -381,15 +397,13 @@ inline void QuantizedGraph::batch_search(const float *__restrict__ query,
   int num_threads = static_cast<int>(nthreads_);
 #pragma omp parallel num_threads(num_threads)
   {
-    ThreadData data = acquire_thread_data();
+    ThreadDataGuard guard(thread_data_, acquire_thread_data());
 
     size_t full_dim = full_dimension();
 #pragma omp for schedule(dynamic)
     for (size_t i = 0; i < num_queries; ++i) {
-      disk_search_qg(query + i * full_dim, knn, results + i * knn, data);
+      disk_search_qg(query + i * full_dim, knn, results + i * knn, guard.data_);
     }
-
-    release_thread_data(std::move(data));
   }
 }
 
@@ -400,11 +414,6 @@ inline auto QuantizedGraph::acquire_thread_data() -> ThreadData {
     data = thread_data_.pop();
   }
   return data;
-}
-
-inline void QuantizedGraph::release_thread_data(ThreadData &&data) {
-  thread_data_.push(std::move(data));
-  thread_data_.push_notify_all();
 }
 
 inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
