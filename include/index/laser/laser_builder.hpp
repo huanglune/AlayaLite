@@ -121,6 +121,9 @@ class VamanaFormatWriter {
     output_.write(reinterpret_cast<const char *>(&header_degree), sizeof(header_degree));
     output_.write(reinterpret_cast<const char *>(&entry_point), sizeof(entry_point));
     output_.write(reinterpret_cast<const char *>(&frozen_points), sizeof(frozen_points));
+    if (!output_.good()) {
+      throw std::runtime_error("Failed to write Vamana graph (disk full?): " + path_.string());
+    }
     output_.close();
   }
 
@@ -456,6 +459,10 @@ class LaserBuilder {
       output.write(reinterpret_cast<const char *>(output_batch.data()),
                    static_cast<std::streamsize>(static_cast<size_t>(count) * full_dim_ *
                                                 sizeof(float)));
+    }
+    if (!output.good()) {
+      throw std::runtime_error("Failed to write PCA-transformed base (disk full?): " +
+                               pca_base_path().string());
     }
   }
 
