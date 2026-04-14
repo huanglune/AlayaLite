@@ -16,7 +16,8 @@
 
 /**
  * @file fbin_file_reader.hpp
- * @brief Compatibility forwarding header. Use `utils/vector_file_reader.hpp`.
+ * @brief Deprecated compatibility forwarding header. Use `utils/vector_file_reader.hpp`.
+ * @deprecated Include `utils/vector_file_reader.hpp` directly.
  */
 
 #pragma once

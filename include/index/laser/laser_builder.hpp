@@ -40,6 +40,7 @@
 #include "index/diskann/cross_shard_merger.hpp"
 #include "index/diskann/kmeans_partitioner.hpp"
 #include "index/diskann/shard_vamana_builder.hpp"
+#include "index/diskann/vamana_build_stages.hpp"
 #include "index/laser/laser_build_params.hpp"
 #include "index/laser/laser_build_state.hpp"
 #include "index/laser/medoid_generator.hpp"
@@ -194,15 +195,7 @@ class LaserBuilder {
   }
 
  private:
-  struct PartitionArtifacts {
-    uint32_t num_shards_{0};
-    std::vector<std::vector<uint32_t>> shard_members_;
-    std::vector<uint64_t> shuffle_offsets_;
-    std::vector<uint64_t> shuffle_counts_;
-    std::filesystem::path shuffle_path_;
-    std::filesystem::path node_to_shards_path_;
-    std::filesystem::path shard_members_path_;
-  };
+  using PartitionArtifacts = PartitionResult<float, uint32_t>;
 
   LaserBuildParams params_;
   BuildState state_{std::filesystem::path{}};
@@ -371,8 +364,8 @@ class LaserBuilder {
   void run_partition() {
     typename KMeansPartitioner<float, uint32_t>::Config config;
     config.max_memory_mb_ = params_.max_memory_mb_;
-    KMeansPartitioner<float, uint32_t> partitioner(config);
-    (void)partitioner.partition(pca_base_path(), params_.max_degree_, output_prefix_);
+    (void)run_partition_stage<float, uint32_t>(
+        pca_base_path(), params_.max_degree_, output_prefix_, config);
   }
 
   void run_shard_builds() {
@@ -387,32 +380,19 @@ class LaserBuilder {
     config.num_threads_ = num_threads_;
 
     for (uint32_t shard_id = 0; shard_id < partition.num_shards_; ++shard_id) {
-      if (partition.shard_members_[shard_id].empty() || state_.is_shard_completed(shard_id)) {
-        continue;
+      if (state_.is_shard_completed(shard_id)) {
+        partition.shard_members_[shard_id].clear();
       }
-
-      auto vectors = ShardVamanaBuilder<float, uint32_t>::
-          load_vectors_from_shuffle(partition.shuffle_path_,
-                                    partition.shuffle_offsets_[shard_id],
-                                    partition.shuffle_counts_[shard_id],
-                                    full_dim_);
-      ShardVamanaBuilder<float, uint32_t> builder(std::move(vectors),
-                                                  full_dim_,
-                                                  partition.shard_members_[shard_id],
-                                                  simd::l2_sqr<float, float>,
-                                                  config);
-      uint64_t total_work =
-          static_cast<uint64_t>(partition.shard_members_[shard_id].size()) * config.num_iterations_;
-      std::string label =
-          "Shard " + std::to_string(shard_id + 1) + "/" + std::to_string(partition.num_shards_);
-      auto bar = std::make_shared<ProgressBar>(label, total_work);
-      builder.build([bar]() {
-        bar->tick();
-      });
-      auto summary = builder.export_graph(shard_id, shard_graph_path(shard_id));
-      (void)summary;
-      state_.mark_shard_completed(shard_id);
     }
+
+    (void)run_shard_build_stage<float, uint32_t>(
+        partition,
+        full_dim_,
+        simd::l2_sqr<float, float>,
+        config,
+        [this](uint32_t shard_id, const auto &) {
+          state_.mark_shard_completed(shard_id);
+        });
   }
 
   void run_merge() {
@@ -425,14 +405,13 @@ class LaserBuilder {
       }
     }
 
-    CrossShardMerger merger({params_.max_degree_, params_.alpha_});
-    merger.open(shard_paths);
-
     VamanaFormatWriter writer(vamana_path(), params_.max_degree_, num_points_);
     writer.open();
-    merger.merge_all([&writer](const CrossShardMerger::MergedNode &node) {
-      writer.write_node(node);
-    });
+    run_merge_stage(shard_paths,
+                    CrossShardMerger::Config{params_.max_degree_, params_.alpha_},
+                    [&writer](const CrossShardMerger::MergedNode &node) {
+                      writer.write_node(node);
+                    });
     writer.finalize();
   }
 
@@ -532,8 +511,7 @@ class LaserBuilder {
     artifacts.shuffle_offsets_.assign(artifacts.num_shards_, 0);
     artifacts.shuffle_counts_.assign(artifacts.num_shards_, 0);
     artifacts.shuffle_path_ = shuffle_path();
-    artifacts.node_to_shards_path_ = node_to_shards_path();
-    artifacts.shard_members_path_ = shard_members_path();
+    artifacts.cleanup_paths_ = {node_to_shards_path(), shard_members_path(), shuffle_path()};
 
     uint64_t offset = 0;
     auto row_bytes = static_cast<uint64_t>(full_dim_) * sizeof(float);

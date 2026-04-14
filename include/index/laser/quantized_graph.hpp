@@ -47,8 +47,7 @@
 #include "index/laser/thread_data.hpp"
 #include "index/laser/transform/fht_rotator.hpp"
 #include "index/laser/transform/pca_transform.hpp"
-#include "index/laser/utils/concurrent_queue.hpp"
-#include "index/laser/utils/io.hpp"
+#include "utils/concurrent_queue.hpp"
 #include "simd/distance_l2.hpp"
 #include "utils/aligned_array.hpp"
 #include "utils/candidate_list.hpp"
@@ -123,7 +122,7 @@ class QuantizedGraph {
   FHTRotator rotator_;
   PCATransform pca_transform_;
   LinuxAlignedFileReader aligned_file_reader_;
-  ConcurrentQueue<ThreadData> thread_data_;
+  alaya::ConcurrentQueue<ThreadData> thread_data_;
   size_t ef_search_ = 200;
 
   size_t node_len_ = 0;

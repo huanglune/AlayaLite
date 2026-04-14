@@ -31,6 +31,7 @@
 #include "diskann_params.hpp"
 #include "kmeans_partitioner.hpp"
 #include "shard_vamana_builder.hpp"
+#include "vamana_build_stages.hpp"
 #include "space/space_concepts.hpp"
 #include "storage/buffer/buffer_pool.hpp"
 #include "storage/diskann/data_file.hpp"
@@ -120,94 +121,60 @@ struct DiskANNBuilder {
       partition_config.sample_rate_ = params_.sample_rate_;
       partition_config.overlap_factor_ = params_.overlap_factor_;
 
-      KMeansPartitioner<DataType, IDType> partitioner(partition_config);
-      auto layout = partitioner.partition(*space_, params_.max_degree_, intermediate_prefix);
-
-      // Register partitioning intermediate files for cleanup
-      if (!layout.node_to_shards_path_.empty()) {
-        cleanup_paths.push_back(layout.node_to_shards_path_);
-      }
-      if (!layout.shard_members_path_.empty()) {
-        cleanup_paths.push_back(layout.shard_members_path_);
-      }
-      if (!layout.shuffle_path_.empty()) {
-        cleanup_paths.push_back(layout.shuffle_path_);
-      }
+      auto partition = run_partition_stage(*space_,
+                                           params_.max_degree_,
+                                           intermediate_prefix,
+                                           partition_config);
+      cleanup_paths.insert(cleanup_paths.end(),
+                           partition.cleanup_paths_.begin(),
+                           partition.cleanup_paths_.end());
+      auto shard_capacity = KMeansPartitioner<DataType, IDType>::compute_shard_capacity(
+          dim_,
+          params_.max_degree_,
+          params_.max_memory_mb_);
 
       console::phase_done("KMeans partitioning", phase_timer.elapsed_s());
       LOG_INFO("DiskANN: Phase 1 - {} shards, capacity {}",
-               layout.num_shards_,
-               layout.shard_capacity_);
+               partition.num_shards_,
+               shard_capacity);
 
       // ---- Phase 2: Per-Shard Vamana Build ----
       phase_timer.reset();
       console::phase_start("Phase 2", "Per-shard Vamana build");
 
-      std::vector<std::filesystem::path> shard_graph_paths;
-      shard_graph_paths.reserve(layout.num_shards_);
-
       auto dist_fn = space_->get_dist_func();
 
-      for (uint32_t shard_id = 0; shard_id < layout.num_shards_; ++shard_id) {
-        auto &members = layout.shard_members_[shard_id];
-        if (members.empty()) {
-          continue;
-        }
+      typename ShardVamanaBuilder<DataType, IDType>::Config shard_config;
+      // Reduce per-shard degree so that after merge (each node appears in
+      // ~overlap_factor shards) the combined degree is ~R.
+      // Formula: shard_degree = 2*R / (overlap_factor + 1).
+      // overlap=2 → 2R/3, overlap=1 → R (no reduction), overlap=3 → R/2.
+      shard_config.max_degree_ =
+          std::max(1U, 2 * params_.max_degree_ / (params_.overlap_factor_ + 1));
+      shard_config.ef_construction_ = params_.ef_construction_;
+      shard_config.num_iterations_ = params_.num_iterations_;
+      shard_config.alpha_ = params_.alpha_;
+      shard_config.alpha_first_pass_ = params_.alpha_first_pass_;
+      shard_config.max_memory_mb_ = params_.max_memory_mb_;
+      shard_config.num_threads_ = params_.num_threads_;
 
-        LOG_INFO("DiskANN: Building shard {}/{} ({} vectors)",
-                 shard_id + 1,
-                 layout.num_shards_,
-                 members.size());
-
-        // Create ProgressBar early so the spinner shows during vector loading I/O.
-        uint64_t shard_total = static_cast<uint64_t>(members.size()) * params_.num_iterations_;
-        std::string shard_prefix =
-            "Shard " + std::to_string(shard_id + 1) + "/" + std::to_string(layout.num_shards_);
-        ProgressBar shard_bar(shard_prefix, shard_total);
-
-        auto shard_vectors =
-            ShardVamanaBuilder<DataType,
-                               IDType>::load_vectors_from_shuffle(layout.shuffle_path_,
-                                                                  layout.shuffle_offsets_[shard_id],
-                                                                  layout.shuffle_counts_[shard_id],
-                                                                  dim_);
-
-        typename ShardVamanaBuilder<DataType, IDType>::Config shard_config;
-        // Reduce per-shard degree so that after merge (each node appears in
-        // ~overlap_factor shards) the combined degree is ~R.
-        // Formula: shard_degree = 2*R / (overlap_factor + 1).
-        // overlap=2 → 2R/3, overlap=1 → R (no reduction), overlap=3 → R/2.
-        shard_config.max_degree_ =
-            std::max(1U, 2 * params_.max_degree_ / (params_.overlap_factor_ + 1));
-        shard_config.ef_construction_ = params_.ef_construction_;
-        shard_config.num_iterations_ = params_.num_iterations_;
-        shard_config.alpha_ = params_.alpha_;
-        shard_config.alpha_first_pass_ = params_.alpha_first_pass_;
-        shard_config.max_memory_mb_ = params_.max_memory_mb_;
-        shard_config.num_threads_ = params_.num_threads_;
-
-        ShardVamanaBuilder<DataType, IDType> shard_builder(std::move(shard_vectors),
-                                                           dim_,
-                                                           members,
-                                                           dist_fn,
-                                                           shard_config);
-
-        shard_builder.build([&shard_bar]() {
-          shard_bar.tick();
-        });
-        shard_bar.finish();
-
-        auto graph_path = intermediate_prefix + ".shard_" + std::to_string(shard_id) + ".graph";
-        auto summary = shard_builder.export_graph(shard_id, graph_path);
-        shard_graph_paths.push_back(summary.graph_path_);
-        cleanup_paths.push_back(summary.graph_path_);  // Register for cleanup
-
-        LOG_INFO("DiskANN: Shard {}/{} complete, {} nodes exported, peak ~{}MB",
-                 shard_id + 1,
-                 layout.num_shards_,
-                 summary.num_nodes_,
-                 summary.estimated_peak_memory_bytes_ / (1024 * 1024));
-      }
+      auto shard_graph_paths =
+          run_shard_build_stage(partition,
+                                dim_,
+                                dist_fn,
+                                shard_config,
+                                [&](uint32_t shard_id,
+                                    const typename ShardVamanaBuilder<
+                                        DataType,
+                                        IDType>::ShardExportSummary &summary) {
+                                  cleanup_paths.push_back(summary.graph_path_);
+                                  LOG_INFO("DiskANN: Shard {}/{} complete, {} nodes exported, "
+                                           "peak ~{}MB",
+                                           shard_id + 1,
+                                           partition.num_shards_,
+                                           summary.num_nodes_,
+                                           summary.estimated_peak_memory_bytes_ / (1024 * 1024));
+                                });
 
       console::phase_done("Per-shard Vamana build", phase_timer.elapsed_s());
 
@@ -218,9 +185,6 @@ struct DiskANNBuilder {
       CrossShardMerger::Config merge_config;
       merge_config.max_degree_ = params_.max_degree_;
       merge_config.alpha_ = params_.alpha_;
-
-      CrossShardMerger merger(merge_config);
-      merger.open(shard_graph_paths);
 
       BufferPool<IDType> buffer_pool(256, kDataBlockSize);
       DiskANNStorage<DataType, IDType> storage(&buffer_pool);
@@ -233,23 +197,24 @@ struct DiskANNBuilder {
 
       uint32_t nodes_written = 0;
       ProgressBar merge_bar("Cross-shard merge", vec_num);
-      merger.merge_all([&](const CrossShardMerger::MergedNode &node) {
-        auto node_id = static_cast<IDType>(node.global_id_);
-        const auto *vec = space_->get_data_by_id(node_id);
+      run_merge_stage(
+          shard_graph_paths, merge_config, [&](const CrossShardMerger::MergedNode &node) {
+            auto node_id = static_cast<IDType>(node.global_id_);
+            const auto *vec = space_->get_data_by_id(node_id);
 
-        storage.meta().set_valid(node_id);
-        storage.meta().insert_mapping(static_cast<uint32_t>(node_id),
-                                      static_cast<uint32_t>(node_id));
+            storage.meta().set_valid(node_id);
+            storage.meta().insert_mapping(static_cast<uint32_t>(node_id),
+                                          static_cast<uint32_t>(node_id));
 
-        auto ref = storage.data().get_node(node_id);
-        ref.set_vector(std::span<const DataType>(vec, dim_));
+            auto ref = storage.data().get_node(node_id);
+            ref.set_vector(std::span<const DataType>(vec, dim_));
 
-        std::vector<IDType> neighbor_ids(node.neighbor_ids_.begin(), node.neighbor_ids_.end());
-        ref.set_neighbors(std::span<const IDType>(neighbor_ids.data(), neighbor_ids.size()));
+            std::vector<IDType> neighbor_ids(node.neighbor_ids_.begin(), node.neighbor_ids_.end());
+            ref.set_neighbors(std::span<const IDType>(neighbor_ids.data(), neighbor_ids.size()));
 
-        ++nodes_written;
-        merge_bar.tick();
-      });
+            ++nodes_written;
+            merge_bar.tick();
+          });
       merge_bar.finish();
 
       console::phase_done("Cross-shard merge", phase_timer.elapsed_s());
@@ -259,7 +224,7 @@ struct DiskANNBuilder {
       phase_timer.reset();
       console::phase_start("Phase 4", "Finalization");
 
-      auto entry_point = select_entry_point(layout);
+      auto entry_point = select_entry_point(partition);
       LOG_INFO("DiskANN: Entry point = {}", entry_point);
 
       storage.set_entry_point(static_cast<uint32_t>(entry_point));
@@ -293,21 +258,22 @@ struct DiskANNBuilder {
 
  private:
   /**
-   * @brief Select global entry point: nearest vector to weighted mean of centroids.
+   * @brief Select global entry point: nearest vector to weighted mean of shard vectors.
    *
-   * Centroids are weighted by the number of primary members in each shard.
+   * Each shard contributes proportionally to its member count.
    */
-  auto select_entry_point(const PartitionedShardLayout<DataType, IDType> &layout) -> IDType {
+  auto select_entry_point(const PartitionResult<DataType, IDType> &partition) -> IDType {
     std::vector<double> weighted_centroid(dim_, 0.0);
     uint64_t total_weight = 0;
 
-    for (uint32_t k = 0; k < layout.num_shards_; ++k) {
-      auto weight = layout.shard_members_[k].size();
-      total_weight += weight;
-      for (uint32_t d = 0; d < dim_; ++d) {
-        weighted_centroid[d] +=
-            static_cast<double>(layout.centroids_[static_cast<size_t>(k) * dim_ + d]) *
-            static_cast<double>(weight);
+    for (uint32_t shard_id = 0; shard_id < partition.num_shards_; ++shard_id) {
+      const auto &members = partition.shard_members_[shard_id];
+      total_weight += members.size();
+      for (auto node_id : members) {
+        const auto *vec = space_->get_data_by_id(node_id);
+        for (uint32_t d = 0; d < dim_; ++d) {
+          weighted_centroid[d] += static_cast<double>(vec[d]);
+        }
       }
     }
 

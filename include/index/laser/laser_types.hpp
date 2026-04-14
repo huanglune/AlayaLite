@@ -20,6 +20,7 @@
 #include "index/laser/laser_common.hpp"
 #include "utils/math.hpp"
 #include "utils/memory.hpp"
+#include "utils/visited_set.hpp"
 
 namespace symqg {
 
@@ -113,73 +114,7 @@ class OngoingTable {
   std::vector<OngoingSlot> slots_;
 };
 
-// ============================================================================
-// TaggedVisitedSet: generation-tagged visited set with O(1) reset
-// Replaces HashBasedBooleanSet on the hot path.
-// ============================================================================
-
-class TaggedVisitedSet {
- public:
-  struct Entry {
-    PID id;        // NOLINT(readability-identifier-naming)
-    uint32_t gen;  // NOLINT(readability-identifier-naming)
-  };
-  static_assert(sizeof(Entry) == 8, "Entry must be 8 bytes");
-
-  TaggedVisitedSet() = default;
-
-  explicit TaggedVisitedSet(size_t capacity) {
-    capacity_ = size_t{1} << alaya::math::ceil_log2(capacity);
-    mask_ = capacity_ - 1;
-    table_.resize(capacity_);
-    std::memset(table_.data(), 0, capacity_ * sizeof(Entry));
-  }
-
-  auto reset() -> void {
-    ++gen_;
-    if (UNLIKELY(gen_ == 0)) {
-      std::memset(table_.data(), 0, capacity_ * sizeof(Entry));
-      gen_ = 1;
-    }
-  }
-
-  [[nodiscard]] auto get(PID data_id) const -> bool {
-    size_t idx = data_id & mask_;
-    // Linear probe
-    for (size_t i = 0; i < capacity_; ++i) {
-      size_t probe = (idx + i) & mask_;
-      auto &entry = table_[probe];
-      if (entry.gen != gen_) {
-        return false;
-      }
-      if (entry.id == data_id) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  auto set(PID data_id) -> void {
-    size_t idx = data_id & mask_;
-    for (size_t i = 0; i < capacity_; ++i) {
-      size_t probe = (idx + i) & mask_;
-      auto &entry = table_[probe];
-      if (entry.gen != gen_) {
-        entry = {data_id, gen_};
-        return;
-      }
-      if (entry.id == data_id) {
-        return;  // already present
-      }
-    }
-  }
-
- private:
-  size_t capacity_ = 0;
-  size_t mask_ = 0;
-  uint32_t gen_ = 1;
-  std::vector<Entry> table_;
-};
+using TaggedVisitedSet = alaya::SparseVisitedSet;
 
 // ============================================================================
 // FixedRingBuffer: fixed-size FIFO for prepared_nodes (replaces std::deque)
