@@ -888,12 +888,15 @@ inline void QuantizedGraph::load_medoids(const char *prefix) {
 
   if (!load_medoid_ids_from_disk(medoids_indices_file) ||
       !load_medoid_vectors_from_disk(medoids_file)) {
+    std::cerr << "[WARN] Failed to load medoid data from: " << medoids_file
+              << "; falling back to entry point only\n";
     medoids_.clear();
     medoids_vector_.clear();
     return;
   }
   size_t full_dim = full_dimension();
   if (medoids_.size() * full_dim != medoids_vector_.size()) {
+    std::cerr << "[WARN] Medoid data size mismatch; falling back to entry point only\n";
     medoids_.clear();
     medoids_vector_.clear();
   }
@@ -973,6 +976,8 @@ inline void QuantizedGraph::load_cache(const std::string &cache_ids_file,
     return;
   }
   if (stored_node_len != node_len_) {
+    std::cerr << "[WARN] Cache node_len mismatch (stored=" << stored_node_len
+              << " expected=" << node_len_ << "); skipping cache\n";
     cache_ids_.clear();
     return;
   }
@@ -981,6 +986,7 @@ inline void QuantizedGraph::load_cache(const std::string &cache_ids_file,
   cache_ids_.resize(cache_count);
   size_t cache_bytes = cache_count * node_len_;
   if (cache_bytes == 0) {
+    std::cerr << "[WARN] Cache has 0 loadable nodes; skipping cache\n";
     cache_ids_.clear();
     return;
   }
@@ -992,6 +998,7 @@ inline void QuantizedGraph::load_cache(const std::string &cache_ids_file,
 #endif
 
   if (!load_cache_nodes_standard(cache_vectors_input, cache_bytes)) {
+    std::cerr << "[WARN] Failed to read cache nodes from: " << cache_nodes_file << "\n";
     cache_ids_.clear();
     return;
   }
