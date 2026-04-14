@@ -494,9 +494,20 @@ inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
   auto collect_events = [&](io_event *evts, int ret) {
     for (int i = 0; i < ret; i++) {
       auto id = static_cast<PID>(reinterpret_cast<uintptr_t>(evts[i].data));
+      // Check AIO completion status: res < 0 means I/O error,
+      // res != page_size_ means short read (partial page)
+      if (evts[i].res < 0 ||
+          static_cast<size_t>(evts[i].res) < page_size_) {
+        // I/O failed or short read: reclaim slot, skip this node
+        char *buf = ongoing.find(id);
+        if (buf != nullptr) {
+          ongoing.erase(id);
+          free_slots.push(buf);
+        }
+        continue;
+      }
       char *buf = ongoing.find(id);
       if (buf != nullptr) {
-        // Prefetch the node data into L2 cache while it's being queued
         const char *node_ptr = buf + offset_to_node(id);
         alaya::mem_prefetch_l2(node_ptr, prefetch_lines);
         prepared.push_back({id, buf});
