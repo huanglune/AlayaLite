@@ -25,6 +25,7 @@
 #include "index/diskann/cross_shard_merger.hpp"
 #include "index/laser/laser_builder.hpp"
 #include "index/laser/qg_builder.hpp"
+#include "index/laser/utils/vamana_graph_reader.hpp"
 
 namespace alaya {
 namespace {
@@ -91,7 +92,9 @@ TEST(VamanaFormatWriterTest, WritesGraphQGBuilderCanParse) {
 
   symqg::QuantizedGraph graph(kNumPoints, kDegree, 64, 128);
   symqg::QGBuilder builder(graph, 32, 1);
-  builder.init_from_vamana(vamana_path.string());
+  VamanaGraphReader vamana_reader;
+  vamana_reader.open(vamana_path.string());
+  builder.init_from_vamana(vamana_reader);
   EXPECT_EQ(graph.entry_point(), 1U);
 }
 

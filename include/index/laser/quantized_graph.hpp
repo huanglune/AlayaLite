@@ -179,6 +179,8 @@ class QuantizedGraph {
                       TaggedVisitedSet &visited,
                       LaserSearchContext &ctx) const -> float;
 
+  void init_thread_pool();
+
  public:
   explicit QuantizedGraph(size_t num, size_t max_deg, size_t main_dim, size_t dim);
   ~QuantizedGraph();
@@ -255,17 +257,7 @@ inline void QuantizedGraph::initialize() {
   row_offset_ = neighbor_offset_ + degree_bound_;
 }
 
-inline void QuantizedGraph::set_params(size_t ef_search, size_t num_threads, int beam_width) {
-  nthreads_ = num_threads;
-  max_beam_width_ = static_cast<size_t>(beam_width);
-  ef_search_ = ef_search;
-
-  destroy_thread_data();
-
-  if (index_file_name_.empty()) {
-    throw std::runtime_error("Laser: load index before calling set_params()");
-  }
-
+inline void QuantizedGraph::init_thread_pool() {
   check_omp_affinity();
 
   size_t aio_events = 2 * max_beam_width_;
@@ -292,6 +284,20 @@ inline void QuantizedGraph::set_params(size_t ef_search, size_t num_threads, int
       thread_data_.push(std::move(data));
     }
   }
+}
+
+inline void QuantizedGraph::set_params(size_t ef_search, size_t num_threads, int beam_width) {
+  nthreads_ = num_threads;
+  max_beam_width_ = static_cast<size_t>(beam_width);
+  ef_search_ = ef_search;
+
+  destroy_thread_data();
+
+  if (index_file_name_.empty()) {
+    throw std::runtime_error("Laser: load index before calling set_params()");
+  }
+
+  init_thread_pool();
 }
 
 inline void QuantizedGraph::destroy_thread_data() {
@@ -628,28 +634,8 @@ inline void QuantizedGraph::load_disk_index(const char *prefix, float search_dra
   }
   rotator_.load(rotator_input);
 
-  // Initialize workspace
-  aligned_file_reader_.open(index_file_name_);
-  size_t aio_events = 2 * max_beam_width_;
-  size_t full_dim = dimension_ + residual_dimension_;
-
-#pragma omp parallel for num_threads(static_cast<int>(nthreads_))
-  for (size_t thread = 0; thread < nthreads_; thread++) {
-#pragma omp critical
-    {
-      aligned_file_reader_.register_thread(aio_events);
-      ThreadData data;
-      data.ctx_ = aligned_file_reader_.get_ctx();
-      data.allocate(padded_dim_,
-                    degree_bound_,
-                    max_beam_width_,
-                    page_size_,
-                    ef_search_,
-                    full_dim,
-                    num_points_);
-      thread_data_.push(std::move(data));
-    }
-  }
+  // Initialize thread pool and workspace
+  init_thread_pool();
 
   // Load medoids
   load_medoids(prefix);

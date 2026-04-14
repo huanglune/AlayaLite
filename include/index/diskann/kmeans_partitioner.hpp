@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "space/space_concepts.hpp"
+#include "utils/vector_file_reader.hpp"
 #include "utils/kmeans.hpp"
 
 namespace alaya {
@@ -160,10 +161,10 @@ class KMeansPartitioner {
   }
 
   template <typename DistanceSpaceType>
-    requires Space<DistanceSpaceType> &&
-             requires(DistanceSpaceType &space, typename DistanceSpaceType::IDTypeAlias id) {
-               space.get_data_by_id(id);
-             }
+  requires Space<DistanceSpaceType> &&
+      requires(DistanceSpaceType &space, typename DistanceSpaceType::IDTypeAlias id) {
+    space.get_data_by_id(id);
+  }
   auto partition(DistanceSpaceType &space,
                  uint32_t max_degree,
                  const std::filesystem::path &output_prefix) const
@@ -175,6 +176,53 @@ class KMeansPartitioner {
 
     auto num_nodes = static_cast<uint32_t>(space.get_data_num());
     auto dim = static_cast<uint32_t>(space.get_dim());
+    auto layout = initialize_layout<SpaceLayout>(num_nodes, dim, max_degree);
+
+    auto read_by_ids_fn = [&space, dim](const uint32_t *ids, uint32_t count, SpaceDataType *out) {
+      for (uint32_t i = 0; i < count; ++i) {
+        const auto *vec = space.get_data_by_id(ids[i]);
+        std::copy_n(vec, dim, out + static_cast<size_t>(i) * dim);
+      }
+    };
+    auto read_sequential_fn = [&space, dim](uint32_t start, uint32_t count, SpaceDataType *out) {
+      for (uint32_t i = 0; i < count; ++i) {
+        const auto *vec = space.get_data_by_id(start + i);
+        std::copy_n(vec, dim, out + static_cast<size_t>(i) * dim);
+      }
+    };
+
+    run_partition_pipeline<SpaceDataType>(
+        layout, output_prefix, read_by_ids_fn, read_sequential_fn);
+
+    return layout;
+  }
+
+  auto partition(const std::filesystem::path &fbin_path,
+                 uint32_t max_degree,
+                 const std::filesystem::path &output_prefix) const
+      -> PartitionedShardLayout<DataType, IDType> {
+    FbinFileReader reader;
+    reader.open(fbin_path.string());
+    auto num_nodes = reader.num_vectors();
+    auto dim = reader.dim();
+    auto layout = initialize_layout<Layout>(num_nodes, dim, max_degree);
+
+    auto read_by_ids_fn = [&reader](const uint32_t *ids, uint32_t count, DataType *out) {
+      reader.read_by_ids(ids, count, out);
+    };
+    auto read_sequential_fn = [&reader](uint32_t start, uint32_t count, DataType *out) {
+      reader.read_sequential(start, count, out);
+    };
+
+    run_partition_pipeline<DataType>(layout, output_prefix, read_by_ids_fn, read_sequential_fn);
+
+    return layout;
+  }
+
+ private:
+  template <typename SpaceLayout>
+  auto initialize_layout(uint32_t num_nodes, uint32_t dim, uint32_t max_degree) const
+      -> SpaceLayout {
     if (num_nodes == 0) {
       throw std::invalid_argument("KMeansPartitioner requires at least one vector");
     }
@@ -190,8 +238,7 @@ class KMeansPartitioner {
     layout.dim_ = dim;
     layout.max_assignments_ = config_.overlap_factor_;
     layout.shard_capacity_ = compute_shard_capacity(dim, max_degree, config_.max_memory_mb_);
-    // Each node appears in ~overlap_factor shards, so effective node count per shard
-    // is num_nodes * overlap_factor / num_shards. Account for this when sizing.
+
     auto effective_nodes = static_cast<uint64_t>(num_nodes) * config_.overlap_factor_;
     layout.num_shards_ =
         compute_num_shards(static_cast<uint32_t>(std::min<uint64_t>(effective_nodes, UINT32_MAX)),
@@ -201,26 +248,32 @@ class KMeansPartitioner {
                                                              config_.overlap_factor_,
                                                              config_.shard_overflow_factor_),
                                       layout.shard_capacity_);
+    return layout;
+  }
 
-    auto sample = build_sample(space, layout.num_shards_);
-    KMeans<SpaceDataType> kmeans(
-        typename KMeans<SpaceDataType>::Config{layout.num_shards_,
-                                               config_.kmeans_max_iter_,
-                                               config_.kmeans_num_trials_});
-    auto kmeans_result = kmeans.fit(sample.data(), sample.size() / dim, dim);
+  template <typename ValueType, typename SpaceLayout, typename ReadByIdsFn, typename ReadSequentialFn>
+  void run_partition_pipeline(SpaceLayout &layout,
+                              const std::filesystem::path &output_prefix,
+                              ReadByIdsFn &&read_by_ids_fn,
+                              ReadSequentialFn &&read_sequential_fn) const {
+    auto sample = build_sample<ValueType>(
+        layout.dim_, layout.num_nodes_, layout.num_shards_, read_by_ids_fn);
+    KMeans<ValueType> kmeans(typename KMeans<ValueType>::Config{layout.num_shards_,
+                                                                config_.kmeans_max_iter_,
+                                                                config_.kmeans_num_trials_});
+    auto kmeans_result = kmeans.fit(sample.data(), sample.size() / layout.dim_, layout.dim_);
     layout.centroids_ = std::move(kmeans_result.centroids_);
 
-    assign_top_l(space, layout);
+    assign_top_l<ValueType>(layout, read_sequential_fn);
     rebuild_shard_members(layout);
     apply_shard_size_cap(layout);
     rebuild_shard_members(layout);
 
     persist(layout, output_prefix);
-    write_shuffle_file(space, layout, output_prefix);
-
-    return layout;
+    write_shuffle_file<ValueType>(layout, output_prefix, read_by_ids_fn);
   }
 
+ public:
   [[nodiscard]] static auto load_node_to_shards(const std::filesystem::path &path) ->
       typename Layout::PersistedNodeToShards {
     struct Header {
@@ -275,13 +328,14 @@ class KMeansPartitioner {
     return loaded;
   }
 
- private:
+private:
   Config config_;
 
-  template <typename DistanceSpaceType>
-  auto build_sample(DistanceSpaceType &space, uint32_t num_shards) const -> std::vector<DataType> {
-    auto num_nodes = static_cast<uint32_t>(space.get_data_num());
-    auto dim = static_cast<uint32_t>(space.get_dim());
+  template <typename ValueType, typename ReadByIdsFn>
+  auto build_sample(uint32_t dim,
+                    uint32_t num_nodes,
+                    uint32_t num_shards,
+                    ReadByIdsFn &&read_by_ids_fn) const -> std::vector<ValueType> {
     auto requested =
         static_cast<uint32_t>(std::ceil(static_cast<double>(num_nodes) * config_.sample_rate_));
     auto sample_size = std::clamp<uint32_t>(requested, std::max(1U, num_shards), num_nodes);
@@ -290,17 +344,15 @@ class KMeansPartitioner {
     std::iota(ids.begin(), ids.end(), 0U);
     std::mt19937 rng(config_.sample_seed_);
     std::shuffle(ids.begin(), ids.end(), rng);
+    ids.resize(sample_size);
 
-    std::vector<DataType> sample(static_cast<size_t>(sample_size) * dim);
-    for (uint32_t i = 0; i < sample_size; ++i) {
-      const auto *vec = space.get_data_by_id(ids[i]);
-      std::copy_n(vec, dim, sample.data() + static_cast<size_t>(i) * dim);
-    }
+    std::vector<ValueType> sample(static_cast<size_t>(sample_size) * dim);
+    read_by_ids_fn(ids.data(), sample_size, sample.data());
     return sample;
   }
 
-  template <typename DistanceSpaceType, typename SpaceLayout>
-  void assign_top_l(DistanceSpaceType &space, SpaceLayout &layout) const {
+  template <typename ValueType, typename SpaceLayout, typename ReadSequentialFn>
+  void assign_top_l(SpaceLayout &layout, ReadSequentialFn &&read_sequential_fn) const {
     auto num_nodes = layout.num_nodes_;
     auto dim = layout.dim_;
     auto num_shards = layout.num_shards_;
@@ -312,31 +364,43 @@ class KMeansPartitioner {
     layout.assignment_distances_.assign(static_cast<size_t>(num_nodes) * max_assignments,
                                         std::numeric_limits<float>::max());
 
+    auto vec_bytes = static_cast<size_t>(dim) * sizeof(ValueType);
+    auto budget = config_.max_memory_mb_ * 1024UL * 1024UL * 9UL / 10UL;
+    auto block_size =
+        std::max(1000U, std::min(num_nodes, static_cast<uint32_t>(budget / std::max<size_t>(1, vec_bytes))));
+    std::vector<ValueType> block(static_cast<size_t>(block_size) * dim);
     std::vector<std::pair<float, uint32_t>> distances(num_shards);
-    for (uint32_t node_id = 0; node_id < num_nodes; ++node_id) {
-      const auto *vec = space.get_data_by_id(node_id);
-      for (uint32_t shard = 0; shard < num_shards; ++shard) {
-        distances[shard] = {KMeans<DataType>::compute_l2_sqr(vec,
-                                                             layout.centroids_.data() +
-                                                                 static_cast<size_t>(shard) * dim,
-                                                             dim),
-                            shard};
-      }
 
-      auto take = std::min<uint32_t>(max_assignments, num_shards);
-      std::partial_sort(distances.begin(),
-                        distances.begin() + static_cast<std::ptrdiff_t>(take),
-                        distances.end(),
-                        [](const auto &lhs, const auto &rhs) {
-                          return lhs.first < rhs.first;
-                        });
+    for (uint32_t start = 0; start < num_nodes; start += block_size) {
+      auto count = std::min(block_size, num_nodes - start);
+      read_sequential_fn(start, count, block.data());
 
-      layout.primary_shards_[node_id] = distances[0].second;
-      for (uint32_t slot = 0; slot < take; ++slot) {
-        layout.node_to_shards_[static_cast<size_t>(node_id) * max_assignments + slot] =
-            distances[slot].second;
-        layout.assignment_distances_[static_cast<size_t>(node_id) * max_assignments + slot] =
-            distances[slot].first;
+      for (uint32_t offset = 0; offset < count; ++offset) {
+        auto node_id = start + offset;
+        const auto *vec = block.data() + static_cast<size_t>(offset) * dim;
+        for (uint32_t shard = 0; shard < num_shards; ++shard) {
+          distances[shard] = {KMeans<ValueType>::compute_l2_sqr(
+                                  vec,
+                                  layout.centroids_.data() + static_cast<size_t>(shard) * dim,
+                                  dim),
+                              shard};
+        }
+
+        auto take = std::min<uint32_t>(max_assignments, num_shards);
+        std::partial_sort(distances.begin(),
+                          distances.begin() + static_cast<std::ptrdiff_t>(take),
+                          distances.end(),
+                          [](const auto &lhs, const auto &rhs) {
+                            return lhs.first < rhs.first;
+                          });
+
+        layout.primary_shards_[node_id] = distances[0].second;
+        for (uint32_t slot = 0; slot < take; ++slot) {
+          layout.node_to_shards_[static_cast<size_t>(node_id) * max_assignments + slot] =
+              distances[slot].second;
+          layout.assignment_distances_[static_cast<size_t>(node_id) * max_assignments + slot] =
+              distances[slot].first;
+        }
       }
     }
   }
@@ -448,10 +512,10 @@ class KMeansPartitioner {
     const_cast<SpaceLayout &>(layout).shard_members_path_ = shard_members_path;
   }
 
-  template <typename DistanceSpaceType, typename SpaceLayout>
-  static void write_shuffle_file(DistanceSpaceType &space,
-                                 SpaceLayout &layout,
-                                 const std::filesystem::path &output_prefix) {
+  template <typename ValueType, typename SpaceLayout, typename ReadByIdsFn>
+  static void write_shuffle_file(SpaceLayout &layout,
+                                 const std::filesystem::path &output_prefix,
+                                 ReadByIdsFn &&read_by_ids_fn) {
     auto shuffle_path = output_prefix.string() + ".shuffle.bin";
     std::ofstream shuffle_out(shuffle_path, std::ios::binary | std::ios::trunc);
     if (!shuffle_out) {
@@ -462,13 +526,14 @@ class KMeansPartitioner {
     layout.shuffle_counts_.assign(layout.num_shards_, 0);
 
     uint64_t offset = 0;
-    auto row_bytes = static_cast<uint64_t>(layout.dim_) * sizeof(DataType);
+    auto row_bytes = static_cast<uint64_t>(layout.dim_) * sizeof(ValueType);
+    std::vector<ValueType> vec_buf(layout.dim_);
     for (uint32_t shard = 0; shard < layout.num_shards_; ++shard) {
       layout.shuffle_offsets_[shard] = offset;
       layout.shuffle_counts_[shard] = layout.shard_members_[shard].size();
       for (uint32_t node_id : layout.shard_members_[shard]) {
-        const auto *vec = space.get_data_by_id(node_id);
-        shuffle_out.write(reinterpret_cast<const char *>(vec),
+        read_by_ids_fn(&node_id, 1, vec_buf.data());
+        shuffle_out.write(reinterpret_cast<const char *>(vec_buf.data()),
                           static_cast<std::streamsize>(row_bytes));
         offset += row_bytes;
       }

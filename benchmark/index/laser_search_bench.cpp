@@ -19,7 +19,6 @@
  *       1000000 64 256 960
  */
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -33,7 +32,10 @@
 #include <thread>
 #include <vector>
 
+#include "bench_utils.hpp"
 #include "index/laser/laser_index.hpp"
+#include "utils/evaluate.hpp"
+#include "utils/io_utils.hpp"
 #include "utils/timer.hpp"
 
 // ============================================================================
@@ -145,80 +147,6 @@ class RssMonitor {
 };
 
 // ============================================================================
-// Binary file I/O (compatible with Laser's .fbin/.ibin format)
-// ============================================================================
-
-struct FbinHeader {
-    int32_t num_vectors_;
-    int32_t dimension_;
-};
-
-static auto read_fbin(const std::string& path, int32_t& n, int32_t& d) -> std::vector<float> {
-    std::ifstream fin(path, std::ios::binary);
-    if (!fin.is_open()) {
-        throw std::runtime_error("Cannot open file: " + path);
-    }
-    fin.read(reinterpret_cast<char*>(&n), sizeof(int32_t));
-    fin.read(reinterpret_cast<char*>(&d), sizeof(int32_t));
-    std::vector<float> data(static_cast<size_t>(n) * d);
-    fin.read(reinterpret_cast<char*>(data.data()),
-             static_cast<std::streamsize>(sizeof(float) * n * d));
-    return data;
-}
-
-static auto read_ibin(const std::string& path, int32_t& n, int32_t& d) -> std::vector<int32_t> {
-    std::ifstream fin(path, std::ios::binary);
-    if (!fin.is_open()) {
-        throw std::runtime_error("Cannot open file: " + path);
-    }
-    fin.read(reinterpret_cast<char*>(&n), sizeof(int32_t));
-    fin.read(reinterpret_cast<char*>(&d), sizeof(int32_t));
-    std::vector<int32_t> data(static_cast<size_t>(n) * d);
-    fin.read(reinterpret_cast<char*>(data.data()),
-             static_cast<std::streamsize>(sizeof(int32_t) * n * d));
-    return data;
-}
-
-// ============================================================================
-// Recall computation
-// ============================================================================
-
-static auto compute_recall(
-    const uint32_t* results, const int32_t* gt,
-    size_t num_queries, size_t k, size_t gt_k
-)-> double {
-    size_t total_correct = 0;
-    for (size_t i = 0; i < num_queries; ++i) {
-        for (size_t j = 0; j < k; ++j) {
-            uint32_t res_id = results[i * k + j];
-            for (size_t g = 0; g < std::min(k, gt_k); ++g) {
-                if (static_cast<int32_t>(res_id) == gt[i * gt_k + g]) {
-                    ++total_correct;
-                    break;
-                }
-            }
-        }
-    }
-    return static_cast<double>(total_correct) / (num_queries * k) * 100.0;
-}
-
-// ============================================================================
-// Percentile computation
-// ============================================================================
-
-static auto percentile(std::vector<double>& data, double p) -> double {
-    std::sort(data.begin(), data.end());
-    double idx = p / 100.0 * (data.size() - 1);
-    auto lo = static_cast<size_t>(idx);
-    auto hi = lo + 1;
-    if (hi >= data.size()) {
-        return data.back();
-    }
-    double frac = idx - lo;
-    return data[lo] * (1.0 - frac) + data[hi] * frac;
-}
-
-// ============================================================================
 // Main benchmark
 // ============================================================================
 
@@ -251,18 +179,17 @@ auto main(int argc, char* argv[]) -> int {
     std::vector<size_t> ef_values = {80, 90, 100, 110, 130, 150, 200, 250, 300, 400, 500};
 
     // Load query vectors
-    int32_t nq = 0;
-    int32_t qd = 0;
     std::cout << "Loading queries: " << query_file << '\n';
-    auto queries = read_fbin(query_file, nq, qd);
+    auto qvecs = alaya::load_float_vectors(query_file);
+    auto nq = qvecs.num_;
+    auto qd = qvecs.dim_;
     std::cout << "  Queries: " << nq << " x " << qd << '\n';
 
     // Load ground truth
-    int32_t gt_n = 0;
-    int32_t gt_k = 0;
     std::cout << "Loading ground truth: " << gt_file << '\n';
-    auto gt = read_ibin(gt_file, gt_n, gt_k);
-    std::cout << "  Ground truth: " << gt_n << " x " << gt_k << '\n';
+    auto gtvecs = alaya::load_int_vectors(gt_file);
+    auto gt_k = gtvecs.dim_;
+    std::cout << "  Ground truth: " << gtvecs.num_ << " x " << gt_k << '\n';
 
     // Load Laser index
     std::cout << "\n=== Loading Laser Index ===" << '\n';
@@ -322,7 +249,7 @@ auto main(int argc, char* argv[]) -> int {
         size_t warmup_count = std::min(kWarmupQueries, static_cast<size_t>(nq));
         for (size_t w = 0; w < warmup_count; ++w) {
             uint32_t tmp[kTopK];
-            index.search(queries.data() + w * qd, kTopK, tmp);
+            index.search(qvecs.data_.data() + w * qd, kTopK, tmp);
         }
 
         // Multi-run: collect kRuns measurements and average
@@ -337,10 +264,10 @@ auto main(int argc, char* argv[]) -> int {
 
             if (single_search) {
                 latencies.reserve(nq);
-                for (int32_t i = 0; i < nq; ++i) {
+                for (uint32_t i = 0; i < nq; ++i) {
                     alaya::Timer query_timer;
                     index.search(
-                        queries.data() + i * qd, kTopK,
+                        qvecs.data_.data() + i * qd, kTopK,
                         results.data() + i * kTopK
                     );
                     double us = query_timer.elapsed_us();
@@ -351,7 +278,7 @@ auto main(int argc, char* argv[]) -> int {
             } else {
                 alaya::Timer batch_timer;
                 index.batch_search(
-                    queries.data(), static_cast<size_t>(nq), kTopK, results.data()
+                    qvecs.data_.data(), static_cast<size_t>(nq), kTopK, results.data()
                 );
                 total_time = batch_timer.elapsed_s();
             }
@@ -359,14 +286,14 @@ auto main(int argc, char* argv[]) -> int {
             sum_qps += nq / total_time;
             if (single_search) {
                 sum_mean_lat += std::accumulate(latencies.begin(), latencies.end(), 0.0) / nq;
-                sum_p99_9_lat += percentile(latencies, 99.9);
+                sum_p99_9_lat += alaya::bench::percentile(latencies, 99.9);
             }
 
             // Recall from last run (deterministic, same across runs)
-            last_recall = compute_recall(
-                results.data(), gt.data(),
-                static_cast<size_t>(nq), kTopK, static_cast<size_t>(gt_k)
-            );
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+            auto *gt_u32 = reinterpret_cast<const uint32_t *>(gtvecs.data_.data());
+            last_recall =
+                alaya::calc_recall(results.data(), gt_u32, nq, gt_k, kTopK) * 100.0;
         }
 
         double avg_qps = sum_qps / kRuns;

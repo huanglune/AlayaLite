@@ -17,12 +17,13 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <vector>
 
 #include "index/laser/laser_builder.hpp"
 #include "index/laser/laser_index.hpp"
-#include "space/raw_space.hpp"
 
 namespace alaya {
 namespace {
@@ -46,14 +47,27 @@ auto make_vectors(uint32_t num_points, uint32_t dim) -> std::vector<float> {
   return vectors;
 }
 
+void write_fvecs(const std::filesystem::path &path,
+                 const std::vector<float> &data,
+                 uint32_t num_vectors,
+                 uint32_t dim) {
+  std::ofstream out(path, std::ios::binary);
+  for (uint32_t i = 0; i < num_vectors; ++i) {
+    auto d = static_cast<int32_t>(dim);
+    out.write(reinterpret_cast<const char *>(&d), sizeof(d));
+    out.write(reinterpret_cast<const char *>(data.data() + static_cast<size_t>(i) * dim),
+              static_cast<std::streamsize>(dim * sizeof(float)));
+  }
+}
+
 TEST(LaserBuilderTest, BuildsSearchableIndexAndWritesExpectedFiles) {
   constexpr uint32_t kNumPoints = 256;
   constexpr uint32_t kDim = 128;
 
   auto prefix = make_temp_prefix("laser");
   auto vectors = make_vectors(kNumPoints, kDim);
-  auto space = std::make_shared<RawSpace<>>(kNumPoints, kDim, MetricType::L2);
-  space->fit(vectors.data(), kNumPoints);
+  auto fvecs_path = prefix.string() + ".fvecs";
+  write_fvecs(fvecs_path, vectors, kNumPoints, kDim);
 
   LaserBuildParams params;
   params.max_degree_ = 64;
@@ -62,8 +76,8 @@ TEST(LaserBuilderTest, BuildsSearchableIndexAndWritesExpectedFiles) {
   params.ef_build_ = 32;
   params.max_memory_mb_ = 16;
 
-  LaserBuilder<RawSpace<>> builder(space, params);
-  builder.build(prefix);
+  LaserBuilder builder(params);
+  builder.build(fvecs_path, prefix);
 
   EXPECT_TRUE(std::filesystem::exists(prefix.string() + "_pca.bin"));
   EXPECT_TRUE(std::filesystem::exists(prefix.string() + "_medoids_indices"));
@@ -93,8 +107,8 @@ TEST(LaserBuilderTest, ResumesCompletedPcaAndRestartsWhenParamsChange) {
 
   auto prefix = make_temp_prefix("resume");
   auto vectors = make_vectors(kNumPoints, kDim);
-  auto space = std::make_shared<RawSpace<>>(kNumPoints, kDim, MetricType::L2);
-  space->fit(vectors.data(), kNumPoints);
+  auto fvecs_path = prefix.string() + ".fvecs";
+  write_fvecs(fvecs_path, vectors, kNumPoints, kDim);
 
   LaserBuildParams params;
   params.max_degree_ = 32;
@@ -104,30 +118,33 @@ TEST(LaserBuilderTest, ResumesCompletedPcaAndRestartsWhenParamsChange) {
   params.max_memory_mb_ = 16;
   params.keep_intermediates_ = true;
 
-  LaserBuilder<RawSpace<>> interrupted_builder(space, params);
+  LaserBuilder interrupted_builder(params);
   interrupted_builder.set_phase_hook_for_test([](LaserBuildPhase phase) {
     if (phase == LaserBuildPhase::kPartition) {
       throw std::runtime_error("interrupt after pca");
     }
   });
-  EXPECT_THROW(interrupted_builder.build(prefix), std::runtime_error);
+  EXPECT_THROW(interrupted_builder.build(fvecs_path, prefix), std::runtime_error);
 
   auto pca_time_before = std::filesystem::last_write_time(prefix.string() + "_pca_base.fbin");
 
-  LaserBuilder<RawSpace<>> resumed_builder(space, params);
-  resumed_builder.build(prefix);
+  LaserBuilder resumed_builder(params);
+  resumed_builder.build(fvecs_path, prefix);
   auto pca_time_after_resume = std::filesystem::last_write_time(prefix.string() + "_pca_base.fbin");
   EXPECT_EQ(pca_time_after_resume, pca_time_before);
 
-  auto final_index_time_before = std::filesystem::last_write_time(prefix.string() + "_R32_MD64.index");
+  auto final_index_time_before =
+      std::filesystem::last_write_time(prefix.string() + "_R32_MD64.index");
 
   auto changed_params = params;
   changed_params.max_degree_ = 64;
-  LaserBuilder<RawSpace<>> restart_builder(space, changed_params);
-  restart_builder.build(prefix);
+  LaserBuilder restart_builder(changed_params);
+  restart_builder.build(fvecs_path, prefix);
 
-  auto pca_time_after_restart = std::filesystem::last_write_time(prefix.string() + "_pca_base.fbin");
-  auto final_index_time_after = std::filesystem::last_write_time(prefix.string() + "_R64_MD64.index");
+  auto pca_time_after_restart =
+      std::filesystem::last_write_time(prefix.string() + "_pca_base.fbin");
+  auto final_index_time_after =
+      std::filesystem::last_write_time(prefix.string() + "_R64_MD64.index");
   EXPECT_GT(pca_time_after_restart, pca_time_after_resume);
   EXPECT_GT(final_index_time_after, final_index_time_before);
 }

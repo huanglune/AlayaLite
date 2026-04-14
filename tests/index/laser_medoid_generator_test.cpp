@@ -17,12 +17,15 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <numeric>
 #include <vector>
 
 #include "index/laser/medoid_generator.hpp"
 #include "index/laser/quantized_graph.hpp"
+#include "utils/vector_file_reader.hpp"
 
 namespace alaya {
 namespace {
@@ -32,6 +35,17 @@ auto make_temp_prefix(const char *label) -> std::filesystem::path {
   auto dir = std::filesystem::temp_directory_path() / ("laser_medoid_generator_test_" + suffix);
   std::filesystem::create_directories(dir);
   return dir / label;
+}
+
+void write_fbin(const std::filesystem::path &path,
+                const std::vector<float> &data,
+                uint32_t num_vectors,
+                uint32_t dim) {
+  std::ofstream out(path, std::ios::binary);
+  int32_t hdr[2] = {static_cast<int32_t>(num_vectors), static_cast<int32_t>(dim)};
+  out.write(reinterpret_cast<const char *>(hdr), sizeof(hdr));
+  out.write(reinterpret_cast<const char *>(data.data()),
+            static_cast<std::streamsize>(static_cast<size_t>(num_vectors) * dim * sizeof(float)));
 }
 
 TEST(MedoidGeneratorTest, WritesLoadableMedoidFiles) {
@@ -48,16 +62,20 @@ TEST(MedoidGeneratorTest, WritesLoadableMedoidFiles) {
   }
 
   auto prefix = make_temp_prefix("medoids");
+  auto fbin_path = prefix.parent_path() / "vectors.fbin";
+  write_fbin(fbin_path, vectors, kNumPoints, kDim);
+
   MedoidGenerator generator({.num_medoids_ = kNumMedoids,
                              .sample_ratio_ = 0.5F,
                              .sample_cap_ = kNumPoints,
                              .num_threads_ = 2,
                              .random_seed_ = 42});
-  auto result = generator.generate(vectors, kNumPoints, kDim, prefix);
+  auto result = generator.generate(fbin_path, prefix);
 
   ASSERT_EQ(result.medoid_ids_.size(), kNumMedoids);
   ASSERT_EQ(result.medoid_vectors_.size(), static_cast<size_t>(kNumMedoids) * kDim);
 
+  // Verify medoid vectors match original data
   for (size_t medoid_idx = 0; medoid_idx < result.medoid_ids_.size(); ++medoid_idx) {
     auto medoid_id = result.medoid_ids_[medoid_idx];
     EXPECT_LT(medoid_id, kNumPoints);
@@ -71,6 +89,8 @@ TEST(MedoidGeneratorTest, WritesLoadableMedoidFiles) {
 
   symqg::QuantizedGraph graph(kNumPoints, 16, 64, kDim);
   graph.load_medoids(prefix.string().c_str());
+
+  std::filesystem::remove_all(prefix.parent_path());
 }
 
 }  // namespace

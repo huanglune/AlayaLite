@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "index/laser/laser_common.hpp"
+#include "utils/math.hpp"
 #include "utils/memory.hpp"
 
 namespace symqg {
@@ -48,7 +49,9 @@ class OngoingTable {
   OngoingTable() = default;
 
   explicit OngoingTable(size_t capacity)
-      : capacity_(next_pow2(capacity)), mask_(capacity_ - 1), slots_(capacity_) {
+      : capacity_(size_t{1} << alaya::math::ceil_log2(capacity)),
+        mask_(capacity_ - 1),
+        slots_(capacity_) {
     std::memset(slots_.data(), 0, capacity_ * sizeof(OngoingSlot));
   }
 
@@ -104,21 +107,6 @@ class OngoingTable {
   }
 
  private:
-  /// Round up to the next power of two (open-addressing requires power-of-two capacity).
-  static constexpr auto next_pow2(size_t v) -> size_t {
-    if (v == 0) {
-      return 1;
-    }
-    --v;
-    v |= v >> 1;
-    v |= v >> 2;
-    v |= v >> 4;
-    v |= v >> 8;
-    v |= v >> 16;
-    v |= v >> 32;
-    return v + 1;
-  }
-
   size_t capacity_ = kDefaultCapacity;
   size_t mask_ = kDefaultCapacity - 1;
   uint32_t gen_ = 1;
@@ -141,15 +129,10 @@ class TaggedVisitedSet {
   TaggedVisitedSet() = default;
 
   explicit TaggedVisitedSet(size_t capacity) {
-    // Round up to power of 2
-    size_t actual = 1;
-    while (actual < capacity) {
-      actual <<= 1;
-    }
-    capacity_ = actual;
-    mask_ = actual - 1;
-    table_.resize(actual);
-    std::memset(table_.data(), 0, actual * sizeof(Entry));
+    capacity_ = size_t{1} << alaya::math::ceil_log2(capacity);
+    mask_ = capacity_ - 1;
+    table_.resize(capacity_);
+    std::memset(table_.data(), 0, capacity_ * sizeof(Entry));
   }
 
   auto reset() -> void {

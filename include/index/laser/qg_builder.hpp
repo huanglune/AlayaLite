@@ -20,43 +20,24 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <mutex>
 #include <numeric>
-#include <random>
 #include <stdexcept>
 #include <string>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "utils/progress_bar.hpp"
 #include "utils/timer.hpp"
 
 #include "index/laser/laser_common.hpp"
 #include "index/laser/quantized_graph.hpp"
 #include "index/laser/utils/partitioner.hpp"
+#include "index/laser/utils/vamana_graph_reader.hpp"
 #include "simd/distance_l2.hpp"
 #include "utils/math.hpp"
-#include "utils/random.hpp"
 
 namespace symqg {
 constexpr size_t kMaxBsIter = 5;
-using CandidateList = std::vector<Candidate<float>>;
-
-inline void print_progress(size_t current, size_t total) {
-  constexpr int kBarWidth = 50;
-  float progress = static_cast<float>(current) * 100 / total;
-  int pos = static_cast<int>(kBarWidth * progress / 100);
-  std::cout << "\r[";
-  for (int j = 0; j < kBarWidth; ++j) {
-    if (j < pos)
-      std::cout << "=";
-    else if (j == pos)
-      std::cout << ">";
-    else
-      std::cout << " ";
-  }
-  std::cout << "] " << std::fixed << std::setprecision(1) << progress << "%" << std::flush;
-}
 
 class QGBuilder {
  private:
@@ -66,12 +47,14 @@ class QGBuilder {
   size_t num_nodes_;
   size_t dim_;
   size_t degree_bound_;
+  size_t max_memory_mb_;
   DistFunc<float> dist_func_;
-  std::vector<CandidateList> new_neighbors_;
-  std::vector<uint32_t> degrees_;
 
  public:
-  explicit QGBuilder(QuantizedGraph &index, uint32_t ef_build, size_t num_threads)
+  explicit QGBuilder(QuantizedGraph &index,
+                     uint32_t ef_build,
+                     size_t num_threads,
+                     size_t max_memory_mb = 4096)
       : qg_{index},
         ef_build_{ef_build},
         num_threads_{
@@ -79,15 +62,14 @@ class QGBuilder {
         num_nodes_{qg_.num_vertices()},
         dim_{qg_.dimension()},
         degree_bound_(qg_.degree_bound()),
-        dist_func_{alaya::simd::l2_sqr<float, float>},
-        new_neighbors_(qg_.num_vertices()),
-        degrees_(qg_.num_vertices(), static_cast<uint32_t>(degree_bound_)) {}
+        max_memory_mb_(max_memory_mb),
+        dist_func_{alaya::simd::l2_sqr<float, float>} {}
 
-  void init_from_vamana(const std::string &filename);
+  void init_from_vamana(alaya::VamanaGraphReader &vamana);
 
-  void build(const char *vamana_file, const char *filename) {
+  void build(alaya::VamanaGraphReader &vamana, const char *filename) {
     alaya::Timer timer;
-    init_from_vamana(std::string(vamana_file));
+    init_from_vamana(vamana);
     std::cout << "  [QG] load vamana: " << std::fixed << std::setprecision(1) << timer.elapsed_s()
               << " s" << std::endl;
     timer.reset();
@@ -106,7 +88,7 @@ class QGBuilder {
     std::cout << "\n  [QG] phase1 copy vectors: " << timer.elapsed_s() << " s" << std::endl;
     timer.reset();
 
-    parallel_build_index(tmp_path, output_fd);
+    parallel_build_index(vamana, tmp_path, output_fd);
     ::close(output_fd);
     std::cout << "\n  [QG] phase2 parallel build: " << timer.elapsed_s() << " s" << std::endl;
     timer.reset();
@@ -158,30 +140,39 @@ class QGBuilder {
     size_t vector_tmp_page_size = (d * sizeof(float) + kSectorLen - 1) / kSectorLen * kSectorLen;
     std::vector<char> buffer(vector_tmp_page_size);
 
-    constexpr size_t kProgressInterval = 10000;
-    std::cout << "copy vectors..." << std::endl;
+    alaya::ProgressBar copy_bar("Copy vectors", qg_.num_points_);
     for (size_t i = 0; i < qg_.num_points_; i++) {
-      if (i % kProgressInterval == 0) {
-        print_progress(i, qg_.num_points_);
-      }
       std::memset(buffer.data(), 0, buffer.size());
       vector_input.read(reinterpret_cast<char *>(buffer.data()), d * sizeof(float));
       tmp_output.write(buffer.data(), static_cast<std::streamsize>(vector_tmp_page_size));
+      copy_bar.tick();
     }
   }
 
-  void parallel_build_index(const std::string &tmp_path, int output_fd) {
+  void parallel_build_index(alaya::VamanaGraphReader &vamana,
+                            const std::string &tmp_path,
+                            int output_fd) {
     LinuxAlignedFileReader vector_reader;
     vector_reader.open(tmp_path, /*direct_io=*/false);
 
     size_t full_dim = qg_.dimension_ + qg_.residual_dimension_;
     size_t full_page_size = (full_dim * sizeof(float) + kSectorLen - 1) / kSectorLen * kSectorLen;
     size_t neighbor_buf_size = qg_.degree_bound_ * full_page_size;
+    constexpr size_t kEdgeBytes = 64 * sizeof(uint32_t) + 40;
+    if (num_nodes_ == 0) {
+      vector_reader.close();
+      return;
+    }
+    size_t memory_budget_bytes = max_memory_mb_ * 1024 * 1024;
+    size_t chunk_size = memory_budget_bytes / kEdgeBytes;
+    chunk_size = std::max<size_t>(chunk_size, 1000);
+    chunk_size = std::min(chunk_size, num_nodes_);
 
-    constexpr size_t kProgressInterval = 10000;
-    std::cout << "\nupdate qg..." << std::endl;
+    alaya::ProgressBar build_bar("Build QG index", qg_.num_points_);
+    std::vector<std::vector<uint32_t>> nbrs;
+    size_t cc = 0;
 
-#pragma omp parallel num_threads(static_cast<int>(num_threads_))
+#pragma omp parallel num_threads(static_cast <int>(num_threads_))
     {
       IOContext ctx{};
 #pragma omp critical
@@ -200,34 +191,42 @@ class QGBuilder {
       std::vector<AlignedRead> reqs;
       reqs.reserve(qg_.degree_bound_ + 1);
 
+      for (size_t cs = 0; cs < num_nodes_; cs += chunk_size) {
+#pragma omp single
+        {
+          cc = std::min(chunk_size, num_nodes_ - cs);
+          vamana.read_chunk(static_cast<uint32_t>(cs), static_cast<uint32_t>(cc), nbrs);
+        }
+
+#pragma omp barrier
 #pragma omp for schedule(dynamic)
-      for (size_t i = 0; i < qg_.num_points_; ++i) {
-        if (i % kProgressInterval == 0) {
-          print_progress(i, qg_.num_points_);
+        for (size_t i = 0; i < cc; ++i) {
+          build_bar.tick();
+          const size_t node_id = cs + i;
+          const auto &neighbors = nbrs[i];
+          if (neighbors.empty()) {
+            continue;
+          }
+
+          std::memset(cur_page, 0, qg_.page_size_);
+          build_node(node_id,
+                     neighbors,
+                     cur_page,
+                     neighbor_buf,
+                     c_pad,
+                     c_rotated,
+                     reqs,
+                     full_dim,
+                     full_page_size,
+                     vector_reader,
+                     ctx);
+
+          size_t page_id = node_id / qg_.node_per_page_;
+          size_t node_offset = (node_id % qg_.node_per_page_) * qg_.node_len_;
+          auto write_off = static_cast<off_t>(kSectorLen + page_id * qg_.page_size_ + node_offset);
+          ::pwrite(output_fd, cur_page, qg_.node_len_, write_off);
         }
-
-        std::memset(cur_page, 0, qg_.page_size_);
-        size_t cur_degree = new_neighbors_[i].size();
-        if (cur_degree == 0) {
-          continue;
-        }
-
-        build_node(i,
-                   cur_degree,
-                   cur_page,
-                   neighbor_buf,
-                   c_pad,
-                   c_rotated,
-                   reqs,
-                   full_dim,
-                   full_page_size,
-                   vector_reader,
-                   ctx);
-
-        size_t page_id = i / qg_.node_per_page_;
-        size_t node_offset = (i % qg_.node_per_page_) * qg_.node_len_;
-        auto write_off = static_cast<off_t>(kSectorLen + page_id * qg_.page_size_ + node_offset);
-        ::pwrite(output_fd, cur_page, qg_.node_len_, write_off);
+#pragma omp barrier
       }
 
       std::free(cur_page);
@@ -239,7 +238,7 @@ class QGBuilder {
   }
 
   void build_node(size_t node_id,
-                  size_t cur_degree,
+                  const std::vector<uint32_t> &neighbors,
                   char *cur_page,
                   char *neighbor_buf,
                   RowMatrix<float> &c_pad,
@@ -249,9 +248,10 @@ class QGBuilder {
                   size_t full_page_size,
                   LinuxAlignedFileReader &vector_reader,
                   IOContext &ctx) {
+    size_t cur_degree = neighbors.size();
     PID *neighbor_ptr = reinterpret_cast<PID *>(cur_page + qg_.neighbor_offset_ * 4);
     for (size_t j = 0; j < cur_degree; ++j) {
-      neighbor_ptr[j] = new_neighbors_[node_id][j].id;
+      neighbor_ptr[j] = neighbors[j];
     }
 
     RowMatrix<float> x_pad(cur_degree, qg_.padded_dim_);
@@ -260,7 +260,7 @@ class QGBuilder {
 
     reqs.clear();
     for (size_t j = 0; j < cur_degree; ++j) {
-      auto nid = new_neighbors_[node_id][j].id;
+      auto nid = neighbors[j];
       reqs.emplace_back(nid * full_page_size,
                         full_page_size,
                         nid,
@@ -374,55 +374,18 @@ class QGBuilder {
   }
 };
 
-inline void QGBuilder::init_from_vamana(const std::string &filename) {
-  size_t expected_file_size = 0;
-  size_t file_frozen_pts = 0;
-  uint32_t start = 0;
-  uint32_t max_observed_degree = 0;
-  uint32_t max_range_of_graph = 0;
-
-  std::ifstream in;
-  in.exceptions(std::ios::badbit | std::ios::failbit);
-  in.open(filename, std::ios::binary);
-  in.read(reinterpret_cast<char *>(&expected_file_size), sizeof(size_t));
-  in.read(reinterpret_cast<char *>(&max_observed_degree), sizeof(uint32_t));
-  in.read(reinterpret_cast<char *>(&start), sizeof(uint32_t));
-  in.read(reinterpret_cast<char *>(&file_frozen_pts), sizeof(size_t));
-
-  size_t vamana_metadata_size =
-      sizeof(size_t) + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(size_t);
-
-  if (max_observed_degree != qg_.degree_bound()) {
+inline void QGBuilder::init_from_vamana(alaya::VamanaGraphReader &vamana) {
+  if (vamana.max_degree() != qg_.degree_bound()) {
     throw std::runtime_error("Vamana degree mismatch: expected " +
                              std::to_string(qg_.degree_bound()) + ", got " +
-                             std::to_string(max_observed_degree));
+                             std::to_string(vamana.max_degree()));
   }
-  qg_.set_ep(start);
+  qg_.set_ep(vamana.entry_point());
 
-  std::vector<uint32_t> in_degrees(num_nodes_, 0);
-  size_t bytes_read = vamana_metadata_size;
-  size_t cc = 0;
-  uint32_t nodes_read = 0;
-
-  while (bytes_read != expected_file_size) {
-    uint32_t k = 0;
-    in.read(reinterpret_cast<char *>(&k), sizeof(uint32_t));
-
-    ++nodes_read;
-    std::vector<uint32_t> tmp(k);
-    in.read(reinterpret_cast<char *>(tmp.data()),
-            static_cast<std::streamsize>(k * sizeof(uint32_t)));
-
-    for (PID cur_neigh : tmp) {
-      in_degrees[cur_neigh]++;
-      new_neighbors_[nodes_read - 1].emplace_back(cur_neigh, 0.0F);
-    }
-
-    cc += k;
-    bytes_read += sizeof(uint32_t) * (static_cast<uint32_t>(k) + 1);
-    if (k > max_range_of_graph) {
-      max_range_of_graph = k;
-    }
+  std::vector<uint32_t> in_degrees = vamana.compute_in_degrees();
+  if (in_degrees.size() != num_nodes_) {
+    throw std::runtime_error("Vamana node count mismatch: expected " + std::to_string(num_nodes_) +
+                             ", got " + std::to_string(in_degrees.size()));
   }
 
   qg_.cache_ids_.resize(num_nodes_);
@@ -430,11 +393,6 @@ inline void QGBuilder::init_from_vamana(const std::string &filename) {
   std::sort(qg_.cache_ids_.begin(), qg_.cache_ids_.end(), [&](PID a, PID b) {
     return in_degrees[a] > in_degrees[b];
   });
-
-  if (nodes_read != num_nodes_) {
-    throw std::runtime_error("Vamana node count mismatch: expected " + std::to_string(num_nodes_) +
-                             ", got " + std::to_string(nodes_read));
-  }
 }
 
 }  // namespace symqg

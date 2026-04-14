@@ -66,6 +66,7 @@ class PyLaserIndex : public BasePyIndex {
       build_params_.num_threads_ = num_threads;
     }
 
+    // Retain data_space_ for search-time reranking
     data_space_ =
         std::make_shared<RawSpace<float, float, uint32_t>>(num_points, dim, MetricType::L2);
     data_space_->fit(data, num_points);
@@ -73,8 +74,12 @@ class PyLaserIndex : public BasePyIndex {
 
     auto build_dir = make_temp_dir();
     auto prefix = (build_dir / "laser").string();
-    LaserBuilder<RawSpace<float, float, uint32_t>> builder(data_space_, build_params_);
-    builder.build(prefix);
+
+    // Dump numpy array to temp fbin, build via file-driven LaserBuilder
+    auto fbin_path = dump_to_fbin(data, num_points, dim, build_dir);
+    LaserBuilder builder(build_params_);
+    builder.build(fbin_path, prefix);
+    std::filesystem::remove(fbin_path);
 
     num_points_ = num_points;
     full_dimension_ = dim;
@@ -227,6 +232,25 @@ class PyLaserIndex : public BasePyIndex {
     auto dir = std::filesystem::temp_directory_path() / ("alayalite_laser_" + stamp);
     std::filesystem::create_directories(dir);
     return dir;
+  }
+
+  /// Writes a numpy float array to a temporary fbin file. Returns the file path.
+  static auto dump_to_fbin(const float *data,
+                           uint32_t num_points,
+                           uint32_t dim,
+                           const std::filesystem::path &dir) -> std::filesystem::path {
+    auto path = dir / "input_vectors.fbin";
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+      throw std::runtime_error("Failed to create temp fbin file: " + path.string());
+    }
+    auto rows = static_cast<int32_t>(num_points);
+    auto cols = static_cast<int32_t>(dim);
+    out.write(reinterpret_cast<const char *>(&rows), sizeof(rows));
+    out.write(reinterpret_cast<const char *>(&cols), sizeof(cols));
+    out.write(reinterpret_cast<const char *>(data),
+              static_cast<std::streamsize>(static_cast<size_t>(num_points) * dim * sizeof(float)));
+    return path;
   }
 
   void ensure_loaded() const {

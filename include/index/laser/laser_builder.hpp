@@ -32,7 +32,6 @@
 #include <random>
 #include <stdexcept>
 #include <string>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -46,44 +45,13 @@
 #include "index/laser/medoid_generator.hpp"
 #include "index/laser/qg_builder.hpp"
 #include "index/laser/transform/pca_transform.hpp"
+#include "index/laser/utils/vamana_graph_reader.hpp"
 #include "simd/distance_l2.hpp"
-#include "space/raw_space.hpp"
-#include "space/space_concepts.hpp"
+#include "utils/io_utils.hpp"
 #include "utils/progress_bar.hpp"
+#include "utils/vector_file_reader.hpp"
 
 namespace alaya {
-
-struct FbinData {
-  uint32_t num_points_{0};
-  uint32_t dimension_{0};
-  std::vector<float> data_;
-};
-
-inline auto load_fbin(const std::filesystem::path &path) -> FbinData {
-  std::ifstream input(path, std::ios::binary);
-  if (!input) {
-    throw std::runtime_error("Failed to open .fbin file: " + path.string());
-  }
-
-  int32_t num_points = 0;
-  int32_t dim = 0;
-  input.read(reinterpret_cast<char *>(&num_points), sizeof(num_points));
-  input.read(reinterpret_cast<char *>(&dim), sizeof(dim));
-  if (!input || num_points <= 0 || dim <= 0) {
-    throw std::runtime_error("Invalid .fbin header: " + path.string());
-  }
-
-  FbinData result;
-  result.num_points_ = static_cast<uint32_t>(num_points);
-  result.dimension_ = static_cast<uint32_t>(dim);
-  result.data_.resize(static_cast<size_t>(result.num_points_) * result.dimension_);
-  input.read(reinterpret_cast<char *>(result.data_.data()),
-             static_cast<std::streamsize>(result.data_.size() * sizeof(float)));
-  if (!input) {
-    throw std::runtime_error("Failed to read .fbin payload: " + path.string());
-  }
-  return result;
-}
 
 class VamanaFormatWriter {
  public:
@@ -164,29 +132,14 @@ class VamanaFormatWriter {
   std::ofstream output_;
 };
 
-template <typename DistanceSpaceType>
-  requires Space<DistanceSpaceType> &&
-           std::is_same_v<typename DistanceSpaceType::DataTypeAlias, float> &&
-           requires(DistanceSpaceType &space, typename DistanceSpaceType::IDTypeAlias id) {
-             space.get_data_by_id(id);
-             space.get_data_num();
-             space.get_dim();
-           }
 class LaserBuilder {
  public:
-  using DataType = typename DistanceSpaceType::DataTypeAlias;
-  using IDType = typename DistanceSpaceType::IDTypeAlias;
+  explicit LaserBuilder(LaserBuildParams params = LaserBuildParams{})
+      : params_(std::move(params)) {}
 
-  explicit LaserBuilder(std::shared_ptr<DistanceSpaceType> space,
-                        LaserBuildParams params = LaserBuildParams{})
-      : space_(std::move(space)), params_(std::move(params)) {
-    if (space_ == nullptr) {
-      throw std::invalid_argument("LaserBuilder requires a non-null distance space");
-    }
-  }
-
-  void build(const std::filesystem::path &output_path) {
-    initialize_build_context(output_path);
+  void build(const std::filesystem::path &base_vectors_path,
+             const std::filesystem::path &output_path) {
+    initialize_build_context(base_vectors_path, output_path);
 
     if (state_.all_completed()) {
       if (!params_.keep_intermediates_) {
@@ -251,9 +204,9 @@ class LaserBuilder {
     std::filesystem::path shard_members_path_;
   };
 
-  std::shared_ptr<DistanceSpaceType> space_;
   LaserBuildParams params_;
   BuildState state_{std::filesystem::path{}};
+  std::filesystem::path base_vectors_path_;
   std::filesystem::path output_prefix_;
   std::filesystem::path build_dir_;
   uint32_t num_points_{0};
@@ -262,9 +215,12 @@ class LaserBuilder {
   uint32_t num_threads_{0};
   std::function<void(LaserBuildPhase)> phase_hook_for_test_;
 
-  void initialize_build_context(const std::filesystem::path &output_path) {
-    num_points_ = static_cast<uint32_t>(space_->get_data_num());
-    full_dim_ = static_cast<uint32_t>(space_->get_dim());
+  void initialize_build_context(const std::filesystem::path &base_vectors_path,
+                                const std::filesystem::path &output_path) {
+    FloatVectorFileReader reader;
+    reader.open(base_vectors_path);
+    num_points_ = reader.num_vectors();
+    full_dim_ = reader.dim();
     if (num_points_ == 0 || full_dim_ == 0) {
       throw std::invalid_argument("LaserBuilder requires a non-empty float dataset");
     }
@@ -272,6 +228,7 @@ class LaserBuilder {
       throw std::invalid_argument("LASER max_degree must be a positive multiple of 32");
     }
 
+    base_vectors_path_ = base_vectors_path;
     output_prefix_ = output_path;
     build_dir_ = output_prefix_.parent_path().empty() ? std::filesystem::current_path()
                                                       : output_prefix_.parent_path();
@@ -311,55 +268,100 @@ class LaserBuilder {
   }
 
   void run_pca() {
-    // Scope Eigen thread count to match requested num_threads_
     int prev_eigen_threads = Eigen::nbThreads();
     Eigen::setNbThreads(static_cast<int>(num_threads_));
 
     auto sample_size = params_.resolved_pca_sample_count(num_points_);
+    size_t vec_bytes = static_cast<size_t>(full_dim_) * sizeof(float);
+    size_t budget = params_.max_memory_mb_ * 1024UL * 1024UL * 9UL / 10UL;
+    uint32_t batch_size =
+        std::max(1000U, std::min(sample_size, static_cast<uint32_t>(budget / vec_bytes)));
+
     std::vector<uint32_t> ids(num_points_);
     std::iota(ids.begin(), ids.end(), 0U);
     std::mt19937 rng(42);
     std::shuffle(ids.begin(), ids.end(), rng);
+    ids.resize(sample_size);
+    std::sort(ids.begin(), ids.end());
 
-    std::vector<float> sample(static_cast<size_t>(sample_size) * full_dim_);
-    for (uint32_t sample_idx = 0; sample_idx < sample_size; ++sample_idx) {
-      std::copy_n(space_->get_data_by_id(static_cast<IDType>(ids[sample_idx])),
-                  full_dim_,
-                  sample.data() + static_cast<size_t>(sample_idx) * full_dim_);
-    }
+    FloatVectorFileReader vector_reader;
+    vector_reader.open(base_vectors_path_);
 
     symqg::PCATransform pca(full_dim_, full_dim_);
-    pca.train(sample.data(), sample_size);
+    auto edim = static_cast<Eigen::Index>(full_dim_);
+    std::vector<float> batch(static_cast<size_t>(batch_size) * full_dim_);
+
+    Eigen::Map<Eigen::VectorXf> mean(pca.mean_data(), edim);
+    mean.setZero();
+    for (uint32_t s = 0; s < sample_size; s += batch_size) {
+      uint32_t cnt = std::min(batch_size, sample_size - s);
+      vector_reader.read_by_ids(ids.data() + s, cnt, batch.data());
+      Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
+          block(batch.data(), static_cast<Eigen::Index>(cnt), edim);
+      mean += block.colwise().sum();
+    }
+    mean /= static_cast<float>(sample_size);
+
+    Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> cov(edim, edim);
+    cov.setZero();
+    for (uint32_t s = 0; s < sample_size; s += batch_size) {
+      uint32_t cnt = std::min(batch_size, sample_size - s);
+      vector_reader.read_by_ids(ids.data() + s, cnt, batch.data());
+      auto bcnt = static_cast<Eigen::Index>(cnt);
+      Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
+          block(batch.data(), bcnt, edim);
+      block.rowwise() -= mean.transpose();
+      cov.noalias() += block.transpose() * block;
+    }
+    if (sample_size <= 1) {
+      throw std::invalid_argument("PCA requires at least 2 sample vectors");
+    }
+    cov /= static_cast<float>(sample_size - 1);
+
+    ids.clear();
+    ids.shrink_to_fit();
+    batch.clear();
+    batch.shrink_to_fit();
+
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXf> solver(cov);
+    if (solver.info() != Eigen::Success) {
+      throw std::runtime_error("PCA eigen decomposition failed");
+    }
+    cov.resize(0, 0);
+
+    const auto &evecs = solver.eigenvectors();
+    Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
+        pca_mat(pca.pca_matrix_data(), edim, edim);
+    for (Eigen::Index i = 0; i < edim; ++i) {
+      for (Eigen::Index j = 0; j < edim; ++j) {
+        pca_mat(i, j) = evecs(j, edim - 1 - i);
+      }
+    }
+
+    pca.mark_loaded();
     if (!pca.save(pca_path().string())) {
       throw std::runtime_error("Failed to save PCA parameters");
     }
 
+    // Batch transform all vectors to fbin
     std::ofstream output(pca_base_path(), std::ios::binary | std::ios::trunc);
     if (!output) {
       throw std::runtime_error("Failed to create PCA base file: " + pca_base_path().string());
     }
+    auto num_pts = static_cast<int32_t>(num_points_);
+    auto dim_out = static_cast<int32_t>(full_dim_);
+    output.write(reinterpret_cast<const char *>(&num_pts), sizeof(num_pts));
+    output.write(reinterpret_cast<const char *>(&dim_out), sizeof(dim_out));
 
-    auto num_points = static_cast<int32_t>(num_points_);
-    auto dim = static_cast<int32_t>(full_dim_);
-    output.write(reinterpret_cast<const char *>(&num_points), sizeof(num_points));
-    output.write(reinterpret_cast<const char *>(&dim), sizeof(dim));
-
-    constexpr uint32_t kBatchSize = 10000;
-    std::vector<float> batch_in(static_cast<size_t>(kBatchSize) * full_dim_);
-    std::vector<float> batch_out(static_cast<size_t>(kBatchSize) * full_dim_);
-
-    for (uint32_t start = 0; start < num_points_; start += kBatchSize) {
-      uint32_t count = std::min(kBatchSize, num_points_ - start);
-
-      for (uint32_t i = 0; i < count; ++i) {
-        std::copy_n(space_->get_data_by_id(static_cast<IDType>(start + i)),
-                    full_dim_,
-                    batch_in.data() + static_cast<size_t>(i) * full_dim_);
-      }
-
-      pca.transform_batch(batch_in.data(), batch_out.data(), count);
-      output.write(reinterpret_cast<const char *>(batch_out.data()),
-                   static_cast<std::streamsize>(static_cast<size_t>(count) * full_dim_ *
+    constexpr uint32_t kTransformBatch = 10000;
+    std::vector<float> buf_in(static_cast<size_t>(kTransformBatch) * full_dim_);
+    std::vector<float> buf_out(static_cast<size_t>(kTransformBatch) * full_dim_);
+    for (uint32_t s = 0; s < num_points_; s += kTransformBatch) {
+      uint32_t cnt = std::min(kTransformBatch, num_points_ - s);
+      vector_reader.read_sequential(s, cnt, buf_in.data());
+      pca.transform_batch(buf_in.data(), buf_out.data(), cnt);
+      output.write(reinterpret_cast<const char *>(buf_out.data()),
+                   static_cast<std::streamsize>(static_cast<size_t>(cnt) * full_dim_ *
                                                 sizeof(float)));
     }
 
@@ -367,16 +369,10 @@ class LaserBuilder {
   }
 
   void run_partition() {
-    auto pca_vectors = load_fbin(pca_base_path());
-    RawSpace<float, float, uint32_t> pca_space(pca_vectors.num_points_,
-                                               pca_vectors.dimension_,
-                                               MetricType::L2);
-    pca_space.fit(pca_vectors.data_.data(), pca_vectors.num_points_);
-
     typename KMeansPartitioner<float, uint32_t>::Config config;
     config.max_memory_mb_ = params_.max_memory_mb_;
     KMeansPartitioner<float, uint32_t> partitioner(config);
-    (void)partitioner.partition(pca_space, params_.max_degree_, output_prefix_);
+    (void)partitioner.partition(pca_base_path(), params_.max_degree_, output_prefix_);
   }
 
   void run_shard_builds() {
@@ -441,7 +437,7 @@ class LaserBuilder {
   }
 
   void run_single_shard_vamana() {
-    auto pca_vectors = load_fbin(pca_base_path());
+    auto pca_vectors = load_bin_all<float>(pca_base_path());
 
     std::vector<uint32_t> all_ids(num_points_);
     std::iota(all_ids.begin(), all_ids.end(), 0U);
@@ -482,28 +478,20 @@ class LaserBuilder {
   }
 
   void run_medoid() {
-    Timer load_timer;
-    auto pca_vectors = load_fbin(pca_base_path());
-    std::cout << "  [Medoid] load PCA vectors: " << std::fixed << std::setprecision(1)
-              << load_timer.elapsed_s() << " s (" << pca_vectors.num_points_ << " x "
-              << pca_vectors.dimension_ << ")" << '\n';
-
     MedoidGenerator generator({.num_medoids_ = params_.num_medoids_,
                                .sample_ratio_ = params_.medoid_sample_ratio_,
                                .sample_cap_ = params_.medoid_sample_cap_,
-                               .num_threads_ = num_threads_});
-    (void)generator.generate(pca_vectors.data_,
-                             pca_vectors.num_points_,
-                             pca_vectors.dimension_,
-                             output_prefix_);
+                               .num_threads_ = num_threads_,
+                               .max_memory_mb_ = params_.max_memory_mb_});
+    (void)generator.generate(pca_base_path(), output_prefix_);
   }
 
   void run_qg_build() {
     symqg::QuantizedGraph graph(num_points_, params_.max_degree_, main_dim_, full_dim_);
-    symqg::QGBuilder builder(graph, params_.ef_build_, num_threads_);
-    auto vamana = vamana_path().string();
-    auto prefix = output_prefix_.string();
-    builder.build(vamana.c_str(), prefix.c_str());
+    symqg::QGBuilder builder(graph, params_.ef_build_, num_threads_, params_.max_memory_mb_);
+    VamanaGraphReader vamana_reader;
+    vamana_reader.open(vamana_path().string());
+    builder.build(vamana_reader, output_prefix_.string().c_str());
   }
 
   void cleanup_intermediates() const {

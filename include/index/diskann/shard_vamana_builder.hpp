@@ -87,9 +87,7 @@ class CompactNeighborTable {
     degrees_[node_id] = count;
   }
 
-  [[nodiscard]] auto degree(uint32_t node_id) const -> uint32_t {
-    return degrees_[node_id];
-  }
+  [[nodiscard]] auto degree(uint32_t node_id) const -> uint32_t { return degrees_[node_id]; }
 
   [[nodiscard]] auto neighbors_view(uint32_t node_id) const -> std::span<const IDType> {
     return {data(node_id), degrees_[node_id]};
@@ -145,13 +143,13 @@ class ShardVamanaBuilder {
   struct Config {
     uint32_t max_degree_{64};
     uint32_t ef_construction_{128};
-    uint32_t num_iterations_{1};        ///< Matching official DiskANN (1 pass)
+    uint32_t num_iterations_{1};  ///< Matching official DiskANN (1 pass)
     float alpha_{1.2F};
     float alpha_first_pass_{1.0F};
     uint32_t max_occlusion_size_{750};  ///< Max candidates for pruning (DiskANN maxc)
     size_t max_memory_mb_{4096};
-    uint32_t num_threads_{0};           ///< 0 = hardware concurrency, 1 = single-threaded
-    bool saturate_graph_{false};        ///< Backfill under-connected nodes to max_degree
+    uint32_t num_threads_{0};     ///< 0 = hardware concurrency, 1 = single-threaded
+    bool saturate_graph_{false};  ///< Backfill under-connected nodes to max_degree
   };
 
   static constexpr float kGraphSlackFactor = 1.3F;
@@ -238,8 +236,9 @@ class ShardVamanaBuilder {
     for (uint32_t pass = 0; pass < config_.num_iterations_; ++pass) {
       // Single-pass: use alpha_ directly (matching official DiskANN).
       // Multi-pass: pass 0 uses alpha_first_pass_ (strict), subsequent passes use alpha_.
-      auto alpha =
-          (config_.num_iterations_ == 1) ? config_.alpha_ : (pass == 0 ? config_.alpha_first_pass_ : config_.alpha_);
+      auto alpha = (config_.num_iterations_ == 1)
+                       ? config_.alpha_
+                       : (pass == 0 ? config_.alpha_first_pass_ : config_.alpha_);
       build_pass(alpha, on_progress);
     }
     // Final cleanup: prune any over-provisioned nodes back to max_degree
@@ -623,8 +622,10 @@ class ShardVamanaBuilder {
     std::sort(expanded_nodes.begin(), expanded_nodes.end(), [](const auto &a, const auto &b) {
       return a.id_ < b.id_ || (a.id_ == b.id_ && a.distance_ < b.distance_);
     });
-    auto last = std::unique(expanded_nodes.begin(), expanded_nodes.end(),
-                            [](const auto &a, const auto &b) { return a.id_ == b.id_; });
+    auto last =
+        std::unique(expanded_nodes.begin(), expanded_nodes.end(), [](const auto &a, const auto &b) {
+          return a.id_ == b.id_;
+        });
     expanded_nodes.erase(last, expanded_nodes.end());
     std::sort(expanded_nodes.begin(), expanded_nodes.end());
   }

@@ -11,13 +11,11 @@
 
 // NOLINTBEGIN
 
-#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
-#include <iostream>
 #include <iomanip>
+#include <iostream>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -26,27 +24,8 @@
 #include "index/diskann/shard_vamana_builder.hpp"
 #include "index/laser/laser_builder.hpp"
 #include "simd/distance_l2.hpp"
+#include "utils/io_utils.hpp"
 #include "utils/timer.hpp"
-
-static auto read_fvecs(const std::string& path)
-    -> std::pair<std::vector<float>, std::pair<uint32_t, uint32_t>> {
-    std::ifstream fin(path, std::ios::binary);
-    if (!fin) throw std::runtime_error("Cannot open: " + path);
-    int32_t dim = 0;
-    fin.read(reinterpret_cast<char*>(&dim), sizeof(int32_t));
-    fin.seekg(0, std::ios::end);
-    size_t vec_sz = sizeof(int32_t) + static_cast<size_t>(dim) * sizeof(float);
-    auto num = static_cast<uint32_t>(static_cast<size_t>(fin.tellg()) / vec_sz);
-    std::vector<float> data(static_cast<size_t>(num) * dim);
-    fin.seekg(0);
-    for (uint32_t i = 0; i < num; ++i) {
-        int32_t d = 0;
-        fin.read(reinterpret_cast<char*>(&d), sizeof(int32_t));
-        fin.read(reinterpret_cast<char*>(data.data() + static_cast<size_t>(i) * dim),
-                 static_cast<std::streamsize>(dim * sizeof(float)));
-    }
-    return {data, {num, static_cast<uint32_t>(dim)}};
-}
 
 auto main(int argc, char* argv[]) -> int {
     if (argc < 3) {
@@ -76,8 +55,9 @@ auto main(int argc, char* argv[]) -> int {
     alaya::Timer t_total;
     alaya::Timer t_load;
     std::cout << "\n--- Loading vectors ---" << std::endl;
-    auto [data, shape] = read_fvecs(base_path);
-    auto [num_vecs, dim] = shape;
+    auto vecs = alaya::load_float_vectors(base_path);
+    auto num_vecs = vecs.num_;
+    auto dim = vecs.dim_;
     std::cout << "  " << num_vecs << " x " << dim << " loaded in "
               << std::fixed << std::setprecision(1) << t_load.elapsed_s() << "s" << std::endl;
 
@@ -96,7 +76,7 @@ auto main(int argc, char* argv[]) -> int {
     config.num_threads_ = num_threads;
 
     alaya::ShardVamanaBuilder<float, uint32_t> builder(
-        std::move(data), dim, std::move(all_ids),
+        std::move(vecs.data_), dim, std::move(all_ids),
         alaya::simd::l2_sqr<float, float>, config);
 
     builder.build(nullptr);

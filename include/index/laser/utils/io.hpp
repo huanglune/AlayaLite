@@ -13,10 +13,13 @@
 #include <sys/stat.h>
 
 #include <cassert>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <stdexcept>
 #include <type_traits>
+#include <vector>
 
 namespace symqg {
 
