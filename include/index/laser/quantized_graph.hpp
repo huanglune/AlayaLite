@@ -9,7 +9,7 @@
  * - batch_search uses thread-affine context (one acquire per thread)
  * - OMP affinity check added in set_params()
  */
-// NOLINTBEGIN
+// NOLINTBEGIN(performance-no-int-to-ptr,google-runtime-references,modernize-use-trailing-return-type)
 
 #pragma once
 
@@ -1024,4 +1024,4 @@ inline void QuantizedGraph::load_cache(const std::string &cache_ids_file,
 }
 
 }  // namespace symqg
-// NOLINTEND
+// NOLINTEND(performance-no-int-to-ptr,google-runtime-references,modernize-use-trailing-return-type)
