@@ -329,6 +329,16 @@ inline void QuantizedGraph::init_thread_pool() {
 }
 
 inline void QuantizedGraph::set_params(size_t ef_search, size_t num_threads, int beam_width) {
+  if (ef_search == 0) {
+    throw std::invalid_argument("set_params: ef_search must be > 0");
+  }
+  if (num_threads == 0) {
+    throw std::invalid_argument("set_params: num_threads must be > 0");
+  }
+  if (beam_width <= 0) {
+    throw std::invalid_argument("set_params: beam_width must be > 0");
+  }
+
   nthreads_ = num_threads;
   max_beam_width_ = static_cast<size_t>(beam_width);
   ef_search_ = ef_search;

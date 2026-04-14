@@ -255,3 +255,27 @@ TEST(QuantizedGraphTest, ConstructorRejectsNonPowerOf2Dim) {
 TEST(QuantizedGraphTest, ConstructorAcceptsValidParams) {
   EXPECT_NO_THROW(symqg::QuantizedGraph(100, 64, 128, 256));
 }
+
+// ==========================================================================
+// Task 2: set_params validation
+// ==========================================================================
+
+TEST(QuantizedGraphTest, SetParamsRejectsZeroThreads) {
+  symqg::QuantizedGraph qg(100, 64, 128, 256);
+  EXPECT_THROW(qg.set_params(200, 0, 4), std::invalid_argument);
+}
+
+TEST(QuantizedGraphTest, SetParamsRejectsNegativeBeamWidth) {
+  symqg::QuantizedGraph qg(100, 64, 128, 256);
+  EXPECT_THROW(qg.set_params(200, 4, -1), std::invalid_argument);
+}
+
+TEST(QuantizedGraphTest, SetParamsRejectsZeroBeamWidth) {
+  symqg::QuantizedGraph qg(100, 64, 128, 256);
+  EXPECT_THROW(qg.set_params(200, 4, 0), std::invalid_argument);
+}
+
+TEST(QuantizedGraphTest, SetParamsRejectsZeroEfSearch) {
+  symqg::QuantizedGraph qg(100, 64, 128, 256);
+  EXPECT_THROW(qg.set_params(0, 4, 4), std::invalid_argument);
+}
