@@ -15,35 +15,37 @@
 #pragma once
 
 #include <cassert>
-#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <iostream>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
-
-#include <atomic>
+#include <thread>
 #include <vector>
 
-#include <malloc.h>
-#include <iostream>
-#include <mutex>
-#include <thread>
-// #include "tsl/robin_map.h"
 #include <fcntl.h>
 #include <libaio.h>
 #include <unistd.h>
-#include <map>
+
+namespace symqg::aio {
 
 constexpr size_t kDefaultAioEventsPerThread = 128;
-
-#ifndef ROUND_UP
-  #define ROUND_UP(X, Y) \
-    ((static_cast<uint64_t>(X) / (Y)) + (static_cast<uint64_t>(X) % (Y) != 0)) * (Y)
-#endif  // !ROUND_UP
-
-// alignment tests
-#define IS_ALIGNED(X, Y) (static_cast<uint64_t>(X) % static_cast<uint64_t>(Y) == 0)
-#define IS_512_ALIGNED(X) IS_ALIGNED(X, 512)
-
 constexpr size_t kMaxIoDepth = 128;
+constexpr size_t kSectorAlignment = 512;
+
+[[nodiscard]] constexpr auto round_up(uint64_t value, uint64_t alignment) -> uint64_t {
+  return ((value / alignment) + static_cast<uint64_t>(value % alignment != 0)) * alignment;
+}
+
+[[nodiscard]] constexpr auto is_aligned(uint64_t value, uint64_t alignment) -> bool {
+  return value % alignment == 0;
+}
+
+[[nodiscard]] constexpr auto is_sector_aligned(uint64_t value) -> bool {
+  return is_aligned(value, kSectorAlignment);
+}
 
 using IOContext = io_context_t;
 
@@ -51,384 +53,237 @@ using IOContext = io_context_t;
  * @brief Represents a single aligned read request for O_DIRECT I/O.
  *
  * All fields must be 512-byte aligned to satisfy O_DIRECT requirements.
- * This alignment constraint comes from the Linux kernel's direct I/O path,
- * which bypasses the page cache and requires sector-aligned access.
  */
 struct AlignedRead {
-  uint64_t offset_{0};  // File offset to read from (must be 512-aligned)
-  uint64_t len_{0};     // Number of bytes to read (must be 512-aligned)
-  uint64_t id_{0};      // User-defined ID for tracking this request
-  void *buf_{nullptr};  // Destination buffer (must be 512-aligned)
+  uint64_t offset_{0};
+  uint64_t len_{0};
+  uint64_t id_{0};
+  void *buf_{nullptr};
 
   AlignedRead() = default;
 
   AlignedRead(uint64_t offset, uint64_t len, uint64_t id, void *buf)
       : offset_(offset), len_(len), id_(id), buf_(buf) {
-    assert(IS_512_ALIGNED(offset_));
-    assert(IS_512_ALIGNED(len_));
-    assert(IS_512_ALIGNED(buf_));
+    assert(is_sector_aligned(offset_));
+    assert(is_sector_aligned(len_));
+    assert(is_sector_aligned(reinterpret_cast<uint64_t>(buf_)));  // NOLINT
   }
 };
 
-class AlignedFileReader {
- protected:
-  std::map<std::thread::id, IOContext> ctx_map_;
-  std::mutex ctx_mut_;
+namespace detail {
 
- public:
-  // returns the thread-specific context
-  // returns (io_context_t)(-1) if thread is not registered
-  virtual auto get_ctx() -> IOContext & = 0;
-
-  virtual ~AlignedFileReader() = default;
-
-  // register thread-id for a context
-  virtual auto register_thread() -> void = 0;
-  virtual auto register_thread(size_t max_events) -> void = 0;
-  // de-register thread-id for a context
-  virtual auto deregister_thread() -> void = 0;
-  virtual auto deregister_all_threads() -> void = 0;
-
-  // Open & close ops
-  // Blocking calls
-  virtual auto open(const std::string &fname) -> void = 0;
-  virtual auto close() -> void = 0;
-
-  // process batch of aligned requests in parallel
-  // NOTE :: blocking call
-  virtual auto read(std::vector<AlignedRead> &read_reqs, IOContext &ctx, bool async) -> void = 0;
-  auto read(std::vector<AlignedRead> &read_reqs, IOContext &ctx) -> void {
-    read(read_reqs, ctx, false);
+inline void prepare_iocbs(int fd,
+                          AlignedRead *reqs,
+                          size_t count,
+                          iocb *cb_buf,
+                          iocb **cbs_buf) {
+  for (size_t j = 0; j < count; ++j) {
+    io_prep_pread(&cb_buf[j], fd, reqs[j].buf_, reqs[j].len_,
+                  static_cast<off_t>(reqs[j].offset_));
+    cb_buf[j].data = reinterpret_cast<void *>(static_cast<uintptr_t>(reqs[j].id_));  // NOLINT
+    cbs_buf[j] = &cb_buf[j];
   }
-  virtual auto submit_reqs(std::vector<AlignedRead> &read_reqs, IOContext &ctx) -> int = 0;
-  virtual auto get_events(IOContext &ctx, int n_ops) -> void = 0;
-};
+}
 
-class LinuxAlignedFileReader : public AlignedFileReader {
- private:
-  int file_desc_;
-  io_context_t bad_ctx_ = nullptr;
+inline auto submit_and_check(io_context_t ctx, size_t count, iocb **cbs) -> int {
+  int ret = io_submit(ctx, static_cast<int64_t>(count), cbs);
+  if (ret != static_cast<int>(count)) {
+    throw std::runtime_error(
+        std::string("io_submit() failed; returned ") + std::to_string(ret) +
+        ", expected=" + std::to_string(count) +
+        ", errno=" + std::to_string(errno) + "=" + ::strerror(errno));
+  }
+  return ret;
+}
 
+}  // namespace detail
+
+class LinuxAlignedFileReader {
  public:
-  LinuxAlignedFileReader();
-  ~LinuxAlignedFileReader() override;
+  LinuxAlignedFileReader() = default;
 
-  auto get_ctx() -> IOContext & override;
+  ~LinuxAlignedFileReader() {
+    int64_t ret = ::fcntl(file_desc_, F_GETFD);
+    if (ret == -1) {
+      if (errno != EBADF) {
+        ::close(file_desc_);
+      }
+    }
+  }
 
-  // register thread-id for a context
-  auto register_thread() -> void override;
-  auto register_thread(size_t max_events) -> void override;
+  LinuxAlignedFileReader(const LinuxAlignedFileReader &) = delete;
+  auto operator=(const LinuxAlignedFileReader &) -> LinuxAlignedFileReader & = delete;
+  LinuxAlignedFileReader(LinuxAlignedFileReader &&) = delete;
+  auto operator=(LinuxAlignedFileReader &&) -> LinuxAlignedFileReader & = delete;
 
-  // de-register thread-id for a context
-  auto deregister_thread() -> void override;
-  auto deregister_all_threads() -> void override;
+  auto get_ctx() -> IOContext & {
+    std::unique_lock<std::mutex> lk(ctx_mut_);
+    auto it = ctx_map_.find(std::this_thread::get_id());
+    if (it == ctx_map_.end()) {
+      return bad_ctx_;
+    }
+    return it->second;
+  }
 
-  // Open & close ops
-  // Blocking calls
-  auto open(const std::string &fname) -> void override;
-  auto open(const std::string &fname, bool direct_io) -> void;
-  auto close() -> void override;
+  void register_thread() { register_thread(kDefaultAioEventsPerThread); }
 
-  // process batch of aligned requests in parallel
-  // NOTE :: blocking call
-  auto read(std::vector<AlignedRead> &read_reqs, IOContext &ctx, bool async) -> void override;
+  void register_thread(size_t max_events) {
+    auto my_id = std::this_thread::get_id();
+    std::unique_lock<std::mutex> lk(ctx_mut_);
+    if (ctx_map_.find(my_id) != ctx_map_.end()) {
+      return;
+    }
+    io_context_t ctx = nullptr;
+    int ret = io_setup(static_cast<int>(max_events), &ctx);
+    if (ret != 0) {
+      lk.unlock();
+      if (errno == EAGAIN) {
+        throw std::runtime_error(
+            "io_setup() failed with EAGAIN: AIO context limit reached. "
+            "Check: cat /proc/sys/fs/aio-nr /proc/sys/fs/aio-max-nr. "
+            "Fix: sudo sysctl -w fs.aio-max-nr=1048576");
+      }
+      if (errno == ENOMEM) {
+        throw std::runtime_error("io_setup() failed: insufficient kernel memory for AIO context");
+      }
+      throw std::runtime_error(std::string("io_setup() failed; returned ") + std::to_string(ret) +
+                               ", errno=" + std::to_string(errno) + ":" + ::strerror(errno));
+    }
+    ctx_map_[my_id] = ctx;
+  }
 
-  auto submit_reqs(std::vector<AlignedRead> &read_reqs, IOContext &ctx) -> int override;
-  auto submit_reqs(AlignedRead *read_reqs, size_t count, IOContext &ctx) -> int;
+  void deregister_thread() {
+    auto my_id = std::this_thread::get_id();
+    std::unique_lock<std::mutex> lk(ctx_mut_);
+    auto it = ctx_map_.find(my_id);
+    assert(it != ctx_map_.end());
+    io_context_t ctx = it->second;
+    ctx_map_.erase(it);
+    lk.unlock();
+    io_destroy(ctx);
+  }
+
+  void deregister_all_threads() {
+    std::unique_lock<std::mutex> lk(ctx_mut_);
+    for (auto &[tid, ctx] : ctx_map_) {
+      io_destroy(ctx);
+    }
+    ctx_map_.clear();
+  }
+
+  void open(const std::string &fname) { open(fname, /*direct_io=*/true); }
+
+  void open(const std::string &fname, bool direct_io) {
+    int flags = O_RDONLY;
+    if (direct_io) {
+      flags |= O_DIRECT;
+    }
+    file_desc_ = ::open(fname.c_str(), flags);
+    if (file_desc_ == -1) {
+      throw std::runtime_error("Failed to open file: " + fname +
+                               ", errno=" + std::to_string(errno) + ":" + ::strerror(errno));
+    }
+  }
+
+  void close() {
+    if (file_desc_ != -1) {
+      ::close(file_desc_);
+      file_desc_ = -1;
+    }
+  }
+
+  void read(std::vector<AlignedRead> &read_reqs, IOContext &ctx, bool /*async*/ = false) {
+    assert(file_desc_ != -1);
+    execute_io(ctx, read_reqs);
+  }
+
+  /**
+   * @brief Submit read requests asynchronously using pre-allocated iocb buffers (zero-alloc).
+   *
+   * This is the hot-path overload used during beam search. The caller provides
+   * pre-allocated iocb arrays to avoid any heap allocation.
+   */
   auto submit_reqs(AlignedRead *read_reqs,
                    size_t count,
                    IOContext &ctx,
                    iocb *cb_buf,
-                   iocb **cbs_buf) -> int;
-  auto get_events(IOContext &ctx, int n_ops) -> void override;
-};
-
-using io_event_t = struct io_event;
-using iocb_t = struct iocb;
-
-inline auto execute_io(io_context_t ctx,
-                       int fd,
-                       std::vector<AlignedRead> &read_reqs,
-                       size_t max_events = kDefaultAioEventsPerThread,
-                       uint64_t n_retries = 0) -> void {
-#ifdef DEBUG
-  for (auto &req : read_reqs) {
-    assert(IS_ALIGNED(req.len_, 512));
-    assert(IS_ALIGNED(req.offset_, 512));
-    assert(IS_ALIGNED(req.buf_, 512));
+                   iocb **cbs_buf) -> int {
+    assert(file_desc_ != -1);
+    detail::prepare_iocbs(file_desc_, read_reqs, count, cb_buf, cbs_buf);
+    return detail::submit_and_check(ctx, count, cbs_buf);
   }
+
+  /**
+   * @brief Submit read requests asynchronously (allocates temporary iocb arrays).
+   *
+   * Non-hot-path overload for convenience when pre-allocated buffers aren't available.
+   */
+  auto submit_reqs(AlignedRead *read_reqs, size_t count, IOContext &ctx) -> int {
+    assert(file_desc_ != -1);
+    std::vector<iocb> cb(count);
+    std::vector<iocb *> cbs(count);
+    detail::prepare_iocbs(file_desc_, read_reqs, count, cb.data(), cbs.data());
+    return detail::submit_and_check(ctx, count, cbs.data());
+  }
+
+  auto submit_reqs(std::vector<AlignedRead> &read_reqs, IOContext &ctx) -> int {
+    return submit_reqs(read_reqs.data(), read_reqs.size(), ctx);
+  }
+
+  void get_events(IOContext &ctx, int n_ops) {
+    std::vector<io_event> evts(n_ops);
+    auto ret = io_getevents(ctx, static_cast<int64_t>(n_ops), static_cast<int64_t>(n_ops),
+                            evts.data(), nullptr);
+    if (ret != static_cast<int64_t>(n_ops)) {
+      throw std::runtime_error(
+          std::string("io_getevents() failed; returned ") + std::to_string(ret) +
+          ", expected=" + std::to_string(n_ops));
+    }
+  }
+
+ private:
+  int file_desc_{-1};
+  io_context_t bad_ctx_{nullptr};
+  std::map<std::thread::id, IOContext> ctx_map_;
+  std::mutex ctx_mut_;
+
+  void execute_io(io_context_t ctx, std::vector<AlignedRead> &read_reqs) {
+#ifdef DEBUG
+    for (auto &req : read_reqs) {
+      assert(is_sector_aligned(req.len_));
+      assert(is_sector_aligned(req.offset_));
+      assert(is_sector_aligned(reinterpret_cast<uint64_t>(req.buf_)));  // NOLINT
+    }
 #endif
 
-  // break-up requests into chunks of size max_events each
-  uint64_t n_iters = ROUND_UP(read_reqs.size(), max_events) / max_events;
-  for (uint64_t iter = 0; iter < n_iters; iter++) {
-    uint64_t n_ops = std::min(static_cast<uint64_t>(read_reqs.size()) - (iter * max_events),
-                              static_cast<uint64_t>(max_events));
-    std::vector<iocb_t *> cbs(n_ops, nullptr);
-    std::vector<io_event_t> evts(n_ops);
-    std::vector<struct iocb> cb(n_ops);
-    for (uint64_t j = 0; j < n_ops; j++) {
-      io_prep_pread(cb.data() + j,
-                    fd,
-                    read_reqs[j + iter * max_events].buf_,
-                    read_reqs[j + iter * max_events].len_,
-                    static_cast<off_t>(read_reqs[j + iter * max_events].offset_));
-    }
+    uint64_t n_iters = round_up(read_reqs.size(), kDefaultAioEventsPerThread) /
+                        kDefaultAioEventsPerThread;
+    for (uint64_t iter = 0; iter < n_iters; ++iter) {
+      uint64_t n_ops = std::min(
+          static_cast<uint64_t>(read_reqs.size()) - (iter * kDefaultAioEventsPerThread),
+          static_cast<uint64_t>(kDefaultAioEventsPerThread));
 
-    // initialize `cbs` using `cb` array
-    for (uint64_t i = 0; i < n_ops; i++) {
-      cbs[i] = cb.data() + i;
-    }
+      std::vector<iocb> cb(n_ops);
+      std::vector<iocb *> cbs(n_ops);
+      auto *batch_start = read_reqs.data() + iter * kDefaultAioEventsPerThread;
+      detail::prepare_iocbs(file_desc_, batch_start, n_ops, cb.data(), cbs.data());
+      detail::submit_and_check(ctx, n_ops, cbs.data());
 
-    uint64_t n_tries = 0;
-    while (n_tries <= n_retries) {
-      // issue reads
-      int64_t ret = io_submit(ctx, static_cast<int64_t>(n_ops), cbs.data());
-      // if requests didn't get accepted
+      std::vector<io_event> evts(n_ops);
+      auto ret = io_getevents(ctx, static_cast<int64_t>(n_ops), static_cast<int64_t>(n_ops),
+                              evts.data(), nullptr);
       if (ret != static_cast<int64_t>(n_ops)) {
-        std::cerr << "io_submit() failed; returned " << ret << ", expected=" << n_ops
-                  << ", ernno=" << errno << "=" << ::strerror(static_cast<int>(-ret)) << ", try #"
-                  << n_tries + 1;
-        std::cout << "ctx: " << ctx << "\n";
-        exit(-1);
-      } else {
-        // wait on io_getevents
-        ret = io_getevents(ctx,
-                           static_cast<int64_t>(n_ops),
-                           static_cast<int64_t>(n_ops),
-                           evts.data(),
-                           nullptr);
-        // if requests didn't complete
-        if (ret != static_cast<int64_t>(n_ops)) {
-          std::cerr << "io_getevents() failed; returned " << ret << ", expected=" << n_ops
-                    << ", ernno=" << errno << "=" << ::strerror(static_cast<int>(-ret)) << ", try #"
-                    << n_tries + 1;
-          exit(-1);
-        } else {
-          break;
-        }
+        throw std::runtime_error(
+            std::string("io_getevents() failed; returned ") + std::to_string(ret) +
+            ", expected=" + std::to_string(n_ops));
       }
     }
   }
-}
+};
 
-inline LinuxAlignedFileReader::LinuxAlignedFileReader() { this->file_desc_ = -1; }
+}  // namespace symqg::aio
 
-inline LinuxAlignedFileReader::~LinuxAlignedFileReader() {
-  int64_t ret;
-  // check to make sure file_desc is closed
-  ret = ::fcntl(this->file_desc_, F_GETFD);
-  if (ret == -1) {
-    if (errno != EBADF) {
-      std::cerr << "close() not called" << '\n';
-      // close file desc
-      ret = ::close(this->file_desc_);
-      // error checks
-      if (ret == -1) {
-        std::cerr << "close() failed; returned " << ret << ", errno=" << errno << ":"
-                  << ::strerror(errno) << '\n';
-      }
-    }
-  }
-}
-
-inline auto LinuxAlignedFileReader::get_ctx() -> IOContext & {
-  std::unique_lock<std::mutex> lk(ctx_mut_);
-  // perform checks only in DEBUG mode
-  if (ctx_map_.find(std::this_thread::get_id()) == ctx_map_.end()) {
-    std::cerr << "bad thread access; returning -1 as io_context_t" << '\n';
-    return this->bad_ctx_;
-  }
-  return ctx_map_[std::this_thread::get_id()];
-}
-
-inline auto LinuxAlignedFileReader::register_thread() -> void {
-  register_thread(kDefaultAioEventsPerThread);
-}
-
-inline auto LinuxAlignedFileReader::register_thread(size_t max_events) -> void {
-  auto my_id = std::this_thread::get_id();
-  std::unique_lock<std::mutex> lk(ctx_mut_);
-  if (ctx_map_.find(my_id) != ctx_map_.end()) {
-    std::cerr << "multiple calls to register_thread from the same thread" << '\n';
-    return;
-  }
-  io_context_t ctx = nullptr;
-  int ret = io_setup(static_cast<int>(max_events), &ctx);
-  if (ret != 0) {
-    lk.unlock();
-    if (errno == EAGAIN) {
-      throw std::runtime_error(
-          "io_setup() failed with EAGAIN: AIO context limit reached. "
-          "Check: cat /proc/sys/fs/aio-nr /proc/sys/fs/aio-max-nr. "
-          "Fix: sudo sysctl -w fs.aio-max-nr=1048576");
-    }
-    if (errno == ENOMEM) {
-      throw std::runtime_error("io_setup() failed: insufficient kernel memory for AIO context");
-    }
-    throw std::runtime_error(std::string("io_setup() failed; returned ") + std::to_string(ret) +
-                             ", errno=" + std::to_string(errno) + ":" + ::strerror(errno));
-  }
-  ctx_map_[my_id] = ctx;
-  lk.unlock();
-}
-
-inline auto LinuxAlignedFileReader::deregister_thread() -> void {
-  auto my_id = std::this_thread::get_id();
-  std::unique_lock<std::mutex> lk(ctx_mut_);
-  assert(ctx_map_.find(my_id) != ctx_map_.end());
-
-  lk.unlock();
-  io_context_t ctx = this->get_ctx();
-  io_destroy(ctx);
-  lk.lock();
-  ctx_map_.erase(my_id);
-  lk.unlock();
-}
-
-inline auto LinuxAlignedFileReader::deregister_all_threads() -> void {
-  std::unique_lock<std::mutex> lk(ctx_mut_);
-  for (auto &x : ctx_map_) {
-    io_context_t ctx = x.second;
-    io_destroy(ctx);
-  }
-  ctx_map_.clear();
-}
-
-inline auto LinuxAlignedFileReader::open(const std::string &fname) -> void {
-  open(fname, /*direct_io=*/true);
-}
-
-inline auto LinuxAlignedFileReader::open(const std::string &fname, bool direct_io) -> void {
-  int flags = O_RDONLY;
-  if (direct_io) {
-    flags |= O_DIRECT;
-  }
-  this->file_desc_ = ::open(fname.c_str(), flags);
-  assert(this->file_desc_ != -1);
-}
-
-inline auto LinuxAlignedFileReader::close() -> void {
-  ::fcntl(this->file_desc_, F_GETFD);
-  ::close(this->file_desc_);
-}
-
-inline auto LinuxAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
-                                         IOContext &ctx,
-                                         bool async) -> void {
-  if (async) {
-    std::cout << "Async currently not supported in linux." << '\n';
-  }
-  assert(this->file_desc_ != -1);
-  execute_io(ctx, this->file_desc_, read_reqs);
-}
-
-/**
- * @brief Submit read requests asynchronously (non-blocking).
- *
- * Submits I/O requests to the kernel AIO queue and returns immediately
- * without waiting for completion. Use io_getevents() to check for completion.
- * This enables overlapping disk I/O with CPU computation for better throughput.
- *
- * @param read_reqs Vector of aligned read requests to submit
- * @param ctx       Thread-local AIO context
- * @return Number of requests successfully submitted
- */
-inline auto LinuxAlignedFileReader::submit_reqs(std::vector<AlignedRead> &read_reqs, IOContext &ctx)
-    -> int {
-  assert(this->file_desc_ != -1);
-
-  size_t n_ops = read_reqs.size();
-  std::vector<struct iocb *> cbs(n_ops, nullptr);
-  std::vector<io_event> evts(n_ops);
-  std::vector<struct iocb> cb(n_ops);
-  for (size_t j = 0; j < n_ops; j++) {
-    io_prep_pread(cb.data() + j,
-                  this->file_desc_,
-                  read_reqs[j].buf_,
-                  read_reqs[j].len_,
-                  static_cast<off_t>(read_reqs[j].offset_));
-  }
-  for (size_t i = 0; i < n_ops; i++) {
-    cbs[i] = cb.data() + i;
-    cbs[i]->data = reinterpret_cast<void *>(static_cast<uintptr_t>(read_reqs[i].id_));  // NOLINT
-  }
-
-  int ret = io_submit(ctx, static_cast<int64_t>(n_ops), cbs.data());
-  if (ret != static_cast<int>(n_ops)) {
-    std::cerr << "io_submit() failed; returned " << ret << ", expected=" << n_ops
-              << ", ernno=" << errno << "=" << ::strerror(-ret) << '\n';
-    std::cout << "ctx: " << ctx << "\n";
-    exit(-1);
-  }
-  return static_cast<int>(n_ops);
-}
-
-inline auto LinuxAlignedFileReader::submit_reqs(AlignedRead *read_reqs,
-                                                size_t count,
-                                                IOContext &ctx) -> int {
-  assert(this->file_desc_ != -1);
-
-  std::vector<struct iocb *> cbs(count, nullptr);
-  std::vector<struct iocb> cb(count);
-  for (size_t j = 0; j < count; j++) {
-    io_prep_pread(cb.data() + j,
-                  this->file_desc_,
-                  read_reqs[j].buf_,
-                  read_reqs[j].len_,
-                  static_cast<off_t>(read_reqs[j].offset_));
-  }
-  for (size_t i = 0; i < count; i++) {
-    cbs[i] = cb.data() + i;
-    cbs[i]->data = reinterpret_cast<void *>(static_cast<uintptr_t>(read_reqs[i].id_));  // NOLINT
-  }
-
-  int ret = io_submit(ctx, static_cast<int64_t>(count), cbs.data());
-  if (ret != static_cast<int>(count)) {
-    std::cerr << "io_submit() failed; returned " << ret << ", expected=" << count
-              << ", errno=" << errno << "=" << ::strerror(-ret) << '\n';
-    std::cout << "ctx: " << ctx << "\n";
-    exit(-1);
-  }
-  return static_cast<int>(count);
-}
-
-inline auto LinuxAlignedFileReader::submit_reqs(AlignedRead *read_reqs,
-                                                size_t count,
-                                                IOContext &ctx,
-                                                iocb *cb_buf,
-                                                iocb **cbs_buf) -> int {
-  assert(this->file_desc_ != -1);
-
-  for (size_t j = 0; j < count; j++) {
-    io_prep_pread(&cb_buf[j],
-                  this->file_desc_,
-                  read_reqs[j].buf_,
-                  read_reqs[j].len_,
-                  static_cast<off_t>(read_reqs[j].offset_));
-    cb_buf[j].data = reinterpret_cast<void *>(static_cast<uintptr_t>(read_reqs[j].id_));  // NOLINT
-    cbs_buf[j] = &cb_buf[j];
-  }
-
-  int ret = io_submit(ctx, static_cast<int64_t>(count), cbs_buf);
-  if (ret != static_cast<int>(count)) {
-    std::cerr << "io_submit() failed; returned " << ret << ", expected=" << count
-              << ", errno=" << errno << "=" << ::strerror(-ret) << '\n';
-    std::cout << "ctx: " << ctx << "\n";
-    exit(-1);
-  }
-  return static_cast<int>(count);
-}
-
-inline auto LinuxAlignedFileReader::get_events(IOContext &ctx, int n_ops) -> void {
-  std::vector<io_event> evts(n_ops);
-  auto ret = io_getevents(ctx,
-                          static_cast<int64_t>(n_ops),
-                          static_cast<int64_t>(n_ops),
-                          evts.data(),
-                          nullptr);
-  if (ret != static_cast<int64_t>(n_ops)) {
-    std::cerr << "io_getevents() failed; returned " << ret << '\n';
-    exit(-1);
-  }
-}
+// Backward-compatible aliases in global scope for existing callers
+using AlignedRead = symqg::aio::AlignedRead;
+using LinuxAlignedFileReader = symqg::aio::LinuxAlignedFileReader;
+using IOContext = symqg::aio::IOContext;

@@ -4,7 +4,6 @@
  *
  * Defines fundamental types used throughout the codebase:
  * - PID: Point/node identifier type (uint32_t)
- * - Candidate: Distance-sorted candidate for k-NN search
  * - RowMatrix/ColMatrix: Eigen matrix wrappers for vector data
  * - DistFunc: Distance function type alias
  */
@@ -37,20 +36,4 @@ using ColMatrix = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMaj
 template <typename T>
 using DistFunc = std::function<T(const T *, const T *, size_t)>;
 
-/**
- * @brief Represents a candidate node in k-NN search with its distance to query.
- * @tparam T Distance type (typically float)
- */
-template <typename T>
-struct Candidate {
-  PID id;      // Node identifier  // NOLINT(readability-identifier-naming)
-  T distance;  // Distance to query vector  // NOLINT(readability-identifier-naming)
-
-  Candidate() = default;
-  explicit Candidate(PID vec_id, T dis) : id(vec_id), distance(dis) {}
-
-  auto operator<(const Candidate &other) const -> bool { return distance < other.distance; }
-
-  auto operator>(const Candidate &other) const -> bool { return !(*this < other); }
-};
 }  // namespace symqg
