@@ -231,3 +231,27 @@ TEST(AioCheckTest, CheckAioCapacityDoesNotCrash) {
 TEST(OmpAffinityTest, CheckOmpAffinityDoesNotCrash) {
     symqg::check_omp_affinity();
 }
+
+// ==========================================================================
+// QuantizedGraph constructor validation
+// ==========================================================================
+
+TEST(QuantizedGraphTest, ConstructorRejectsMainDimGreaterThanDim) {
+  EXPECT_THROW(symqg::QuantizedGraph(100, 64, 256, 128), std::invalid_argument);
+}
+
+TEST(QuantizedGraphTest, ConstructorRejectsZeroMaxDegree) {
+  EXPECT_THROW(symqg::QuantizedGraph(100, 0, 128, 256), std::invalid_argument);
+}
+
+TEST(QuantizedGraphTest, ConstructorRejectsZeroNumPoints) {
+  EXPECT_THROW(symqg::QuantizedGraph(0, 64, 128, 256), std::invalid_argument);
+}
+
+TEST(QuantizedGraphTest, ConstructorRejectsNonPowerOf2Dim) {
+  EXPECT_THROW(symqg::QuantizedGraph(100, 64, 96, 256), std::runtime_error);
+}
+
+TEST(QuantizedGraphTest, ConstructorAcceptsValidParams) {
+  EXPECT_NO_THROW(symqg::QuantizedGraph(100, 64, 128, 256));
+}

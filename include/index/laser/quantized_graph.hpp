@@ -47,10 +47,10 @@
 #include "index/laser/thread_data.hpp"
 #include "index/laser/transform/fht_rotator.hpp"
 #include "index/laser/transform/pca_transform.hpp"
-#include "utils/concurrent_queue.hpp"
 #include "simd/distance_l2.hpp"
 #include "utils/aligned_array.hpp"
 #include "utils/candidate_list.hpp"
+#include "utils/concurrent_queue.hpp"
 #include "utils/memory.hpp"
 #include "utils/prefetch.hpp"
 
@@ -150,6 +150,13 @@ class QuantizedGraph {
   size_t neighbor_offset_ = 0;
   size_t row_offset_ = 0;
 
+  static constexpr size_t kMetaNumPointsIdx = 0;
+  static constexpr size_t kMetaMainDimIdx = 1;
+  static constexpr size_t kMetaEntryPointIdx = 2;
+  static constexpr size_t kMetaNodeLenIdx = 3;
+  static constexpr size_t kMetaNodePerPageIdx = 4;
+  static constexpr size_t kMetaFileSizeIdx = 8;
+
   void initialize();
 
   void disk_search_qg(const float *__restrict__ query,
@@ -165,6 +172,8 @@ class QuantizedGraph {
     return (node_id % node_per_page_) * node_len_;
   }
 
+  [[nodiscard]] auto full_dimension() const -> size_t { return dimension_ + residual_dimension_; }
+
   [[nodiscard]] auto gen_index_path(const char *prefix) const -> std::string {
     return std::string(prefix) + "_R" + std::to_string(degree_bound_) + "_MD" +
            std::to_string(dimension_) + ".index";
@@ -179,6 +188,30 @@ class QuantizedGraph {
                       LaserSearchContext &ctx) const -> float;
 
   void init_thread_pool();
+  [[nodiscard]] auto read_index_metadata() const -> std::vector<uint64_t>;
+  void validate_index_metadata_or_throw(const std::vector<uint64_t> &metadata) const;
+  void load_rotator_from_disk();
+  void load_optional_pca_from_disk(const char *prefix);
+  [[nodiscard]] auto compute_online_cache_num(float search_dram_budget) const -> size_t;
+  void load_optional_cache_from_disk(size_t online_cache_num);
+  [[nodiscard]] static auto read_binary_exact(std::ifstream &input, void *dst, size_t bytes)
+      -> bool;
+  [[nodiscard]] auto load_medoid_ids_from_disk(const std::string &medoids_indices_file) -> bool;
+  [[nodiscard]] auto load_medoid_vectors_from_disk(const std::string &medoids_file) -> bool;
+  [[nodiscard]] auto load_cache_ids_from_disk(std::ifstream &cache_ids_input,
+                                              size_t online_cache_num) -> size_t;
+  [[nodiscard]] auto read_cache_nodes_header(std::ifstream &cache_vectors_input,
+                                             size_t &cache_nodes_num,
+                                             size_t &node_len) const -> bool;
+  [[nodiscard]] auto load_cache_nodes_standard(std::ifstream &cache_vectors_input,
+                                               size_t cache_bytes) -> bool;
+  auto acquire_thread_data() -> ThreadData;
+  void release_thread_data(ThreadData &&data);
+  void rebuild_cache_lookup(char *cache_base, size_t cache_count);
+#ifdef LASER_USE_NUMA
+  auto try_load_cache_with_numa(std::ifstream &cache_vectors_input, size_t cache_bytes) -> bool;
+#endif
+  void reset_loaded_state_before_reload();
 
  public:
   explicit QuantizedGraph(size_t num, size_t max_deg, size_t main_dim, size_t dim);
@@ -194,8 +227,8 @@ class QuantizedGraph {
   void load_disk_index(const char *prefix, float search_dram_budget);
   void set_params(size_t ef_search, size_t num_threads, int beam_width);
   void load_medoids(const char *prefix);
-  void load_cache(std::string &cache_ids_file,
-                  std::string &cache_nodes_file,
+  void load_cache(const std::string &cache_ids_file,
+                  const std::string &cache_nodes_file,
                   size_t online_cache_num);
 
   void search(const float *__restrict__ query, uint32_t knn, uint32_t *__restrict__ results);
@@ -225,6 +258,15 @@ inline QuantizedGraph::QuantizedGraph(size_t num, size_t max_deg, size_t main_di
       rotator_(main_dim),
       node_len_((32 * main_dim + 32 * (dim - main_dim) + 128 * max_deg + max_deg * padded_dim_) /
                 8) {
+  if (num == 0) {
+    throw std::invalid_argument("QuantizedGraph: num_points must be > 0");
+  }
+  if (max_deg == 0) {
+    throw std::invalid_argument("QuantizedGraph: max_degree must be > 0");
+  }
+  if (main_dim == 0 || main_dim > dim) {
+    throw std::invalid_argument("QuantizedGraph: main_dim must be in (0, dim]");
+  }
   node_per_page_ = std::max(static_cast<size_t>(1), kSectorLen / node_len_);
   page_size_ = (node_per_page_ * node_len_ + kSectorLen - 1) / kSectorLen * kSectorLen;
 
@@ -264,9 +306,10 @@ inline void QuantizedGraph::init_thread_pool() {
 
   aligned_file_reader_.open(index_file_name_);
 
-  size_t full_dim = dimension_ + residual_dimension_;
+  size_t full_dim = full_dimension();
 
-#pragma omp parallel for num_threads(static_cast<int>(nthreads_))
+  int num_threads = static_cast<int>(nthreads_);
+#pragma omp parallel for num_threads(num_threads)
   for (size_t thread = 0; thread < nthreads_; thread++) {
 #pragma omp critical
     {
@@ -315,14 +358,9 @@ inline void QuantizedGraph::destroy_thread_data() {
 inline void QuantizedGraph::search(const float *__restrict__ query,
                                    uint32_t knn,
                                    uint32_t *__restrict__ results) {
-  ThreadData data = thread_data_.pop();
-  while (data.sector_scratch_ == nullptr) {
-    thread_data_.wait_for_push_notify();
-    data = thread_data_.pop();
-  }
+  ThreadData data = acquire_thread_data();
   disk_search_qg(query, knn, results, data);
-  thread_data_.push(std::move(data));
-  thread_data_.push_notify_all();
+  release_thread_data(std::move(data));
 }
 
 inline void QuantizedGraph::batch_search(const float *__restrict__ query,
@@ -330,23 +368,33 @@ inline void QuantizedGraph::batch_search(const float *__restrict__ query,
                                          uint32_t *__restrict__ results,
                                          size_t num_queries) {
   // Thread-affine context: each thread acquires once, reuses across queries
-#pragma omp parallel num_threads(static_cast<int>(nthreads_))
+  int num_threads = static_cast<int>(nthreads_);
+#pragma omp parallel num_threads(num_threads)
   {
-    ThreadData data = thread_data_.pop();
-    while (data.sector_scratch_ == nullptr) {
-      thread_data_.wait_for_push_notify();
-      data = thread_data_.pop();
-    }
+    ThreadData data = acquire_thread_data();
 
-    size_t full_dim = dimension_ + residual_dimension_;
+    size_t full_dim = full_dimension();
 #pragma omp for schedule(dynamic)
     for (size_t i = 0; i < num_queries; ++i) {
       disk_search_qg(query + i * full_dim, knn, results + i * knn, data);
     }
 
-    thread_data_.push(std::move(data));
-    thread_data_.push_notify_all();
+    release_thread_data(std::move(data));
   }
+}
+
+inline auto QuantizedGraph::acquire_thread_data() -> ThreadData {
+  ThreadData data = thread_data_.pop();
+  while (data.sector_scratch_ == nullptr) {
+    thread_data_.wait_for_push_notify();
+    data = thread_data_.pop();
+  }
+  return data;
+}
+
+inline void QuantizedGraph::release_thread_data(ThreadData &&data) {
+  thread_data_.push(std::move(data));
+  thread_data_.push_notify_all();
 }
 
 inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
@@ -378,7 +426,7 @@ inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
   if (!medoids_.empty()) {
     PID best_medoid = 0;
     float best_dist = FLT_MAX;
-    size_t full_dim = dimension_ + residual_dimension_;
+    size_t full_dim = full_dimension();
     for (size_t cur_m = 0; cur_m < medoids_.size(); cur_m++) {
       float cur_dist = alaya::simd::l2_sqr<float, float>(transformed_query,
                                                          medoids_vector_.data() + full_dim * cur_m,
@@ -594,68 +642,207 @@ inline auto QuantizedGraph::scan_neighbors(const QGQuery &q_obj,
   return sqr_y;
 }
 
-inline void QuantizedGraph::load_disk_index(const char *prefix, float search_dram_budget) {
-  index_file_name_ = gen_index_path(prefix);
-  if (!std::filesystem::exists(index_file_name_)) {
-    throw std::runtime_error("Index file not found: " + index_file_name_);
+inline auto QuantizedGraph::read_binary_exact(std::ifstream &input, void *dst, size_t bytes)
+    -> bool {
+  if (bytes == 0) {
+    return true;
   }
+  input.read(reinterpret_cast<char *>(dst), static_cast<std::streamsize>(bytes));
+  return static_cast<size_t>(input.gcount()) == bytes;
+}
+
+inline auto QuantizedGraph::read_index_metadata() const -> std::vector<uint64_t> {
   std::ifstream input(index_file_name_, std::ios::binary);
   if (!input.is_open()) {
     throw std::runtime_error("Failed to open index file: " + index_file_name_);
   }
 
-  std::vector<uint64_t> metas(kSectorLen / sizeof(uint64_t), 0);
-  input.read(reinterpret_cast<char *>(metas.data()), kSectorLen);
+  std::vector<uint64_t> metadata(kSectorLen / sizeof(uint64_t), 0);
+  input.read(reinterpret_cast<char *>(metadata.data()), kSectorLen);
+  if (!input) {
+    throw std::runtime_error("Failed to read index metadata header: " + index_file_name_);
+  }
+  return metadata;
+}
 
-  // Metadata validation
-  if (metas[0] != num_points_ || metas[1] != dimension_ || metas[3] != node_len_ ||
-      metas[4] != node_per_page_) {
+inline void QuantizedGraph::validate_index_metadata_or_throw(
+    const std::vector<uint64_t> &metadata) const {
+  if (metadata[kMetaNumPointsIdx] != num_points_ || metadata[kMetaMainDimIdx] != dimension_ ||
+      metadata[kMetaNodeLenIdx] != node_len_ || metadata[kMetaNodePerPageIdx] != node_per_page_) {
     throw std::runtime_error(
         "Index metadata mismatch. Expected: num_points=" + std::to_string(num_points_) +
         " dim=" + std::to_string(dimension_) + " node_len=" + std::to_string(node_len_) +
-        " node_per_page=" + std::to_string(node_per_page_) + ". Got: " + std::to_string(metas[0]) +
-        "/" + std::to_string(metas[1]) + "/" + std::to_string(metas[3]) + "/" +
-        std::to_string(metas[4]));
-  }
-  auto expected_size = std::filesystem::file_size(index_file_name_);
-  if (metas[8] != expected_size) {
-    throw std::runtime_error("Index file size mismatch: header says " + std::to_string(metas[8]) +
-                             " but file is " + std::to_string(expected_size) + " bytes");
+        " node_per_page=" + std::to_string(node_per_page_) +
+        ". Got: " + std::to_string(metadata[kMetaNumPointsIdx]) + "/" +
+        std::to_string(metadata[kMetaMainDimIdx]) + "/" +
+        std::to_string(metadata[kMetaNodeLenIdx]) + "/" +
+        std::to_string(metadata[kMetaNodePerPageIdx]));
   }
 
-  entry_point_ = static_cast<PID>(metas[2]);
+  auto file_size = std::filesystem::file_size(index_file_name_);
+  if (metadata[kMetaFileSizeIdx] != file_size) {
+    throw std::runtime_error("Index file size mismatch: header says " +
+                             std::to_string(metadata[kMetaFileSizeIdx]) + " but file is " +
+                             std::to_string(file_size) + " bytes");
+  }
+}
 
-  // Load rotator
+inline void QuantizedGraph::load_rotator_from_disk() {
   std::string rotator_path = index_file_name_ + "_rotator";
   std::ifstream rotator_input(rotator_path, std::ios::binary);
   if (!rotator_input.is_open()) {
     throw std::runtime_error("Missing rotator file: " + rotator_path);
   }
   rotator_.load(rotator_input);
+}
 
-  // Initialize thread pool and workspace
-  init_thread_pool();
-
-  // Load medoids
-  load_medoids(prefix);
-
-  // Load PCA
+inline void QuantizedGraph::load_optional_pca_from_disk(const char *prefix) {
   std::string pca_path = std::string(prefix) + "_pca.bin";
   if (std::filesystem::exists(pca_path)) {
     pca_transform_.load(pca_path);
   } else {
     std::cerr << "[WARN] PCA file not found: " << pca_path << '\n';
   }
+}
 
-  // Load cache
+inline auto QuantizedGraph::compute_online_cache_num(float search_dram_budget) const -> size_t {
   auto cache_space = static_cast<size_t>(search_dram_budget * 1000 * 1000 * 1000 * 0.8);
-  size_t online_cache_num =
-      std::min(cache_space / node_len_, static_cast<size_t>(kCacheRatio * num_points_));
+  return std::min(cache_space / node_len_, static_cast<size_t>(kCacheRatio * num_points_));
+}
+
+inline void QuantizedGraph::load_optional_cache_from_disk(size_t online_cache_num) {
   std::string cache_ids_file = index_file_name_ + "_cache_ids";
   std::string cache_nodes_file = index_file_name_ + "_cache_nodes";
   if (std::filesystem::exists(cache_ids_file) && std::filesystem::exists(cache_nodes_file)) {
     load_cache(cache_ids_file, cache_nodes_file, online_cache_num);
   }
+}
+
+inline void QuantizedGraph::reset_loaded_state_before_reload() {
+  if (!index_file_name_.empty()) {
+    destroy_thread_data();
+  }
+
+  entry_point_ = 0;
+  medoids_.clear();
+  medoids_vector_.clear();
+  cache_ids_.clear();
+  cache_nodes_.clear();
+  caches_.clear();
+
+#ifdef LASER_USE_NUMA
+  if (numa_mmap_ptr_ != nullptr) {
+    munmap(numa_mmap_ptr_, numa_mmap_size_);
+    numa_mmap_ptr_ = nullptr;
+    numa_mmap_size_ = 0;
+  }
+#endif
+}
+
+inline void QuantizedGraph::load_disk_index(const char *prefix, float search_dram_budget) {
+  reset_loaded_state_before_reload();
+  index_file_name_ = gen_index_path(prefix);
+  if (!std::filesystem::exists(index_file_name_)) {
+    throw std::runtime_error("Index file not found: " + index_file_name_);
+  }
+
+  auto metadata = read_index_metadata();
+  validate_index_metadata_or_throw(metadata);
+  entry_point_ = static_cast<PID>(metadata[kMetaEntryPointIdx]);
+
+  load_rotator_from_disk();
+  init_thread_pool();
+
+  load_medoids(prefix);
+  load_optional_pca_from_disk(prefix);
+  load_optional_cache_from_disk(compute_online_cache_num(search_dram_budget));
+}
+
+inline auto QuantizedGraph::load_medoid_ids_from_disk(const std::string &medoids_indices_file)
+    -> bool {
+  std::ifstream medoid_input(medoids_indices_file, std::ios::binary);
+  if (!medoid_input.is_open()) {
+    return false;
+  }
+
+  int32_t medoid_num = 0;
+  int32_t columns = 0;
+  if (!read_binary_exact(medoid_input, &medoid_num, sizeof(medoid_num)) ||
+      !read_binary_exact(medoid_input, &columns, sizeof(columns))) {
+    return false;
+  }
+  if (medoid_num <= 0 || columns != 1) {
+    return false;
+  }
+
+  medoids_.resize(static_cast<size_t>(medoid_num));
+  if (!read_binary_exact(medoid_input, medoids_.data(), medoids_.size() * sizeof(PID))) {
+    medoids_.clear();
+    return false;
+  }
+  return true;
+}
+
+inline auto QuantizedGraph::load_medoid_vectors_from_disk(const std::string &medoids_file) -> bool {
+  std::ifstream medoid_vec_input(medoids_file, std::ios::binary);
+  if (!medoid_vec_input.is_open()) {
+    return false;
+  }
+
+  int32_t medoid_num = 0;
+  int32_t dim = 0;
+  if (!read_binary_exact(medoid_vec_input, &medoid_num, sizeof(medoid_num)) ||
+      !read_binary_exact(medoid_vec_input, &dim, sizeof(dim))) {
+    return false;
+  }
+
+  size_t full_dim = full_dimension();
+  if (medoid_num <= 0 || dim <= 0 || static_cast<size_t>(dim) != full_dim) {
+    return false;
+  }
+
+  medoids_vector_.resize(static_cast<size_t>(medoid_num) * full_dim);
+  if (!read_binary_exact(medoid_vec_input,
+                         medoids_vector_.data(),
+                         medoids_vector_.size() * sizeof(float))) {
+    medoids_vector_.clear();
+    return false;
+  }
+  return true;
+}
+
+inline auto QuantizedGraph::load_cache_ids_from_disk(std::ifstream &cache_ids_input,
+                                                     size_t online_cache_num) -> size_t {
+  size_t cache_ids_num = 0;
+  if (!read_binary_exact(cache_ids_input, &cache_ids_num, sizeof(size_t))) {
+    return 0;
+  }
+
+  auto load_count = std::min(online_cache_num, cache_ids_num);
+  cache_ids_.resize(load_count);
+  if (!read_binary_exact(cache_ids_input, cache_ids_.data(), load_count * sizeof(PID))) {
+    cache_ids_.clear();
+    return 0;
+  }
+
+  return load_count;
+}
+
+inline auto QuantizedGraph::read_cache_nodes_header(std::ifstream &cache_vectors_input,
+                                                    size_t &cache_nodes_num,
+                                                    size_t &node_len) const -> bool {
+  return read_binary_exact(cache_vectors_input, &cache_nodes_num, sizeof(size_t)) &&
+         read_binary_exact(cache_vectors_input, &node_len, sizeof(size_t));
+}
+
+inline auto QuantizedGraph::load_cache_nodes_standard(std::ifstream &cache_vectors_input,
+                                                      size_t cache_bytes) -> bool {
+  cache_nodes_.resize(cache_bytes);
+  if (!read_binary_exact(cache_vectors_input, cache_nodes_.data(), cache_bytes)) {
+    cache_nodes_.clear();
+    return false;
+  }
+  return true;
 }
 
 inline void QuantizedGraph::load_medoids(const char *prefix) {
@@ -666,88 +853,119 @@ inline void QuantizedGraph::load_medoids(const char *prefix) {
     return;
   }
 
-  std::ifstream medoid_input(medoids_indices_file, std::ios::binary);
-  if (!medoid_input.is_open()) {
+  medoids_.clear();
+  medoids_vector_.clear();
+
+  if (!load_medoid_ids_from_disk(medoids_indices_file) ||
+      !load_medoid_vectors_from_disk(medoids_file)) {
+    medoids_.clear();
+    medoids_vector_.clear();
     return;
   }
-  int medoid_num = 0;
-  int tmp = 0;
-  medoid_input.read(reinterpret_cast<char *>(&medoid_num), sizeof(int));
-  medoid_input.read(reinterpret_cast<char *>(&tmp), sizeof(int));
-  medoids_.resize(static_cast<size_t>(medoid_num) * static_cast<size_t>(tmp));
-  medoid_input.read(reinterpret_cast<char *>(medoids_.data()),
-                    static_cast<std::streamsize>(sizeof(int) * medoid_num * tmp));
-
-  std::ifstream medoid_vec_input(medoids_file, std::ios::binary);
-  if (!medoid_vec_input.is_open()) {
-    return;
+  size_t full_dim = full_dimension();
+  if (medoids_.size() * full_dim != medoids_vector_.size()) {
+    medoids_.clear();
+    medoids_vector_.clear();
   }
-  int dim = 0;
-  medoid_vec_input.read(reinterpret_cast<char *>(&medoid_num), sizeof(int));
-  medoid_vec_input.read(reinterpret_cast<char *>(&dim), sizeof(int));
-
-  size_t full_dim = dimension_ + residual_dimension_;
-  medoids_vector_.resize(static_cast<size_t>(medoid_num) * full_dim);
-  medoid_vec_input.read(reinterpret_cast<char *>(medoids_vector_.data()),
-                        static_cast<std::streamsize>(sizeof(float) * medoid_num * full_dim));
 }
 
-inline void QuantizedGraph::load_cache(std::string &cache_ids_file,
-                                       std::string &cache_nodes_file,
+inline void QuantizedGraph::rebuild_cache_lookup(char *cache_base, size_t cache_count) {
+  for (size_t i = 0; i < cache_count; ++i) {
+    caches_[cache_ids_[i]] = cache_base + i * node_len_;
+  }
+}
+
+#ifdef LASER_USE_NUMA
+inline auto QuantizedGraph::try_load_cache_with_numa(std::ifstream &cache_vectors_input,
+                                                     size_t cache_bytes) -> bool {
+  if (cache_bytes == 0) {
+    return false;
+  }
+
+  void *numa_ptr =
+      mmap(nullptr, cache_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (numa_ptr == MAP_FAILED) {
+    return false;
+  }
+
+  unsigned long nodemask = ~0UL;  // all nodes
+  long ret = mbind(numa_ptr, cache_bytes, MPOL_INTERLEAVE, &nodemask, sizeof(nodemask) * 8, 0);
+  if (ret != 0) {
+    munmap(numa_ptr, cache_bytes);
+    return false;
+  }
+
+  cache_vectors_input.read(reinterpret_cast<char *>(numa_ptr),
+                           static_cast<std::streamsize>(cache_bytes));
+  if (!cache_vectors_input) {
+    munmap(numa_ptr, cache_bytes);
+    return false;
+  }
+
+  // Track mmap allocation for cleanup in destructor.
+  numa_mmap_ptr_ = numa_ptr;
+  numa_mmap_size_ = cache_bytes;
+  cache_nodes_.clear();
+  rebuild_cache_lookup(reinterpret_cast<char *>(numa_ptr), cache_ids_.size());
+  return true;
+}
+#endif
+
+inline void QuantizedGraph::load_cache(const std::string &cache_ids_file,
+                                       const std::string &cache_nodes_file,
                                        size_t online_cache_num) {
+#ifdef LASER_USE_NUMA
+  if (numa_mmap_ptr_ != nullptr) {
+    munmap(numa_mmap_ptr_, numa_mmap_size_);
+    numa_mmap_ptr_ = nullptr;
+    numa_mmap_size_ = 0;
+  }
+#endif
+  cache_ids_.clear();
+  cache_nodes_.clear();
+  caches_.clear();
+
   std::ifstream cache_ids_input(cache_ids_file, std::ios::binary);
   std::ifstream cache_vectors_input(cache_nodes_file, std::ios::binary);
   if (!cache_ids_input.is_open() || !cache_vectors_input.is_open()) {
     return;
   }
 
-  size_t cache_ids_num = 0;
+  size_t cache_count = load_cache_ids_from_disk(cache_ids_input, online_cache_num);
+  if (cache_count == 0) {
+    return;
+  }
+
   size_t cache_nodes_num = 0;
-  size_t tmp_node_len = 0;
-  cache_ids_input.read(reinterpret_cast<char *>(&cache_ids_num), sizeof(size_t));
-  online_cache_num = std::min(online_cache_num, cache_ids_num);
+  size_t stored_node_len = 0;
+  if (!read_cache_nodes_header(cache_vectors_input, cache_nodes_num, stored_node_len)) {
+    cache_ids_.clear();
+    return;
+  }
+  if (stored_node_len != node_len_) {
+    cache_ids_.clear();
+    return;
+  }
 
-  cache_ids_.resize(online_cache_num);
-  cache_ids_input.read(reinterpret_cast<char *>(cache_ids_.data()),
-                       static_cast<std::streamsize>(sizeof(PID) * online_cache_num));
-
-  cache_vectors_input.read(reinterpret_cast<char *>(&cache_nodes_num), sizeof(size_t));
-  cache_vectors_input.read(reinterpret_cast<char *>(&tmp_node_len), sizeof(size_t));
-
-  size_t cache_bytes = online_cache_num * node_len_;
+  cache_count = std::min(cache_count, cache_nodes_num);
+  cache_ids_.resize(cache_count);
+  size_t cache_bytes = cache_count * node_len_;
+  if (cache_bytes == 0) {
+    cache_ids_.clear();
+    return;
+  }
 
 #ifdef LASER_USE_NUMA
-  // NUMA-interleaved allocation: distribute cache pages across NUMA nodes
-  void *numa_ptr =
-      mmap(nullptr, cache_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-  if (numa_ptr != MAP_FAILED) {
-    unsigned long nodemask = ~0UL;  // all nodes
-    long ret = mbind(numa_ptr, cache_bytes, MPOL_INTERLEAVE, &nodemask, sizeof(nodemask) * 8, 0);
-    if (ret == 0) {
-      cache_vectors_input.read(reinterpret_cast<char *>(numa_ptr),
-                               static_cast<std::streamsize>(cache_bytes));
-      // Track mmap allocation for cleanup in destructor.
-      numa_mmap_ptr_ = numa_ptr;
-      numa_mmap_size_ = cache_bytes;
-      cache_nodes_.resize(0);
-      for (size_t i = 0; i < cache_ids_.size(); i++) {
-        caches_[cache_ids_[i]] = reinterpret_cast<char *>(numa_ptr) + i * node_len_;
-      }
-      return;
-    }
-    // mbind failed, fall back to standard allocation
-    munmap(numa_ptr, cache_bytes);
+  if (try_load_cache_with_numa(cache_vectors_input, cache_bytes)) {
+    return;
   }
 #endif
-  // Standard fallback
-  cache_nodes_.resize(cache_bytes);
-  cache_vectors_input.read(reinterpret_cast<char *>(cache_nodes_.data()),
-                           static_cast<std::streamsize>(cache_bytes));
 
-  for (size_t i = 0; i < cache_ids_.size(); i++) {
-    PID cur_id = cache_ids_[i];
-    caches_[cur_id] = cache_nodes_.data() + i * node_len_;
+  if (!load_cache_nodes_standard(cache_vectors_input, cache_bytes)) {
+    cache_ids_.clear();
+    return;
   }
+  rebuild_cache_lookup(cache_nodes_.data(), cache_count);
 }
 
 }  // namespace symqg

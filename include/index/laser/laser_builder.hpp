@@ -32,6 +32,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -143,41 +144,14 @@ class LaserBuilder {
     initialize_build_context(base_vectors_path, output_path);
 
     if (state_.all_completed()) {
-      if (!params_.keep_intermediates_) {
-        cleanup_intermediates();
-      }
+      maybe_cleanup_intermediates();
       return;
     }
 
     run_phase(LaserBuildPhase::kPca, [this]() {
       run_pca();
     });
-    if (!params_.external_vamana_.empty()) {
-      // Use externally-built Vamana graph (e.g. from DiskANN)
-      run_phase(LaserBuildPhase::kPartition, []() {});
-      run_phase(LaserBuildPhase::kShardBuilds, []() {});
-      run_phase(LaserBuildPhase::kMerge, [this]() {
-        std::filesystem::copy_file(params_.external_vamana_,
-                                   vamana_path(),
-                                   std::filesystem::copy_options::overwrite_existing);
-      });
-    } else if (params_.single_shard_) {
-      run_phase(LaserBuildPhase::kPartition, []() {});
-      run_phase(LaserBuildPhase::kShardBuilds, []() {});
-      run_phase(LaserBuildPhase::kMerge, [this]() {
-        run_single_shard_vamana();
-      });
-    } else {
-      run_phase(LaserBuildPhase::kPartition, [this]() {
-        run_partition();
-      });
-      run_phase(LaserBuildPhase::kShardBuilds, [this]() {
-        run_shard_builds();
-      });
-      run_phase(LaserBuildPhase::kMerge, [this]() {
-        run_merge();
-      });
-    }
+    run_vamana_pipeline();
     run_phase(LaserBuildPhase::kMedoids, [this]() {
       run_medoid();
     });
@@ -185,9 +159,7 @@ class LaserBuilder {
       run_qg_build();
     });
 
-    if (!params_.keep_intermediates_) {
-      cleanup_intermediates();
-    }
+    maybe_cleanup_intermediates();
   }
 
   void set_phase_hook_for_test(std::function<void(LaserBuildPhase)> hook) {
@@ -196,6 +168,24 @@ class LaserBuilder {
 
  private:
   using PartitionArtifacts = PartitionResult<float, uint32_t>;
+  using RowMajorMatrixXf = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+
+  class ScopedEigenThreads {
+   public:
+    explicit ScopedEigenThreads(uint32_t num_threads) : previous_threads_(Eigen::nbThreads()) {
+      Eigen::setNbThreads(static_cast<int>(num_threads));
+    }
+
+    ~ScopedEigenThreads() { Eigen::setNbThreads(previous_threads_); }
+
+    ScopedEigenThreads(const ScopedEigenThreads &) = delete;
+    auto operator=(const ScopedEigenThreads &) -> ScopedEigenThreads & = delete;
+    ScopedEigenThreads(ScopedEigenThreads &&) = delete;
+    auto operator=(ScopedEigenThreads &&) -> ScopedEigenThreads & = delete;
+
+   private:
+    int previous_threads_;
+  };
 
   LaserBuildParams params_;
   BuildState state_{std::filesystem::path{}};
@@ -207,6 +197,115 @@ class LaserBuilder {
   uint32_t main_dim_{0};
   uint32_t num_threads_{0};
   std::function<void(LaserBuildPhase)> phase_hook_for_test_;
+
+  static void no_op_phase() {}
+
+  void maybe_cleanup_intermediates() const {
+    if (!params_.keep_intermediates_) {
+      cleanup_intermediates();
+    }
+  }
+
+  void run_vamana_pipeline() {
+    if (!params_.external_vamana_.empty()) {
+      run_external_vamana_pipeline();
+      return;
+    }
+    if (params_.single_shard_) {
+      run_single_shard_pipeline();
+      return;
+    }
+    run_multi_shard_pipeline();
+  }
+
+  void run_external_vamana_pipeline() {
+    // Use externally-built Vamana graph (e.g. from DiskANN)
+    run_phase(LaserBuildPhase::kPartition, no_op_phase);
+    run_phase(LaserBuildPhase::kShardBuilds, no_op_phase);
+    run_phase(LaserBuildPhase::kMerge, [this]() {
+      copy_external_vamana();
+    });
+  }
+
+  void run_single_shard_pipeline() {
+    run_phase(LaserBuildPhase::kPartition, no_op_phase);
+    run_phase(LaserBuildPhase::kShardBuilds, no_op_phase);
+    run_phase(LaserBuildPhase::kMerge, [this]() {
+      run_single_shard_vamana();
+    });
+  }
+
+  void run_multi_shard_pipeline() {
+    run_phase(LaserBuildPhase::kPartition, [this]() {
+      run_partition();
+    });
+    run_phase(LaserBuildPhase::kShardBuilds, [this]() {
+      run_shard_builds();
+    });
+    run_phase(LaserBuildPhase::kMerge, [this]() {
+      run_merge();
+    });
+  }
+
+  void copy_external_vamana() const {
+    std::filesystem::copy_file(params_.external_vamana_,
+                               vamana_path(),
+                               std::filesystem::copy_options::overwrite_existing);
+  }
+
+  [[nodiscard]] auto build_checkpoint_hash(const LaserBuildParams &effective_params) const
+      -> std::string {
+    return effective_params.params_hash() + "|" + std::to_string(num_points_) + "|" +
+           std::to_string(full_dim_);
+  }
+
+  [[nodiscard]] auto prefixed_path(std::string_view suffix) const -> std::filesystem::path {
+    return output_prefix_.string() + std::string(suffix);
+  }
+
+  [[nodiscard]] auto collect_non_empty_shard_graph_paths(const PartitionArtifacts &partition) const
+      -> std::vector<std::filesystem::path> {
+    std::vector<std::filesystem::path> shard_paths;
+    shard_paths.reserve(partition.num_shards_);
+    for (uint32_t shard_id = 0; shard_id < partition.num_shards_; ++shard_id) {
+      if (!partition.shard_members_[shard_id].empty()) {
+        shard_paths.push_back(shard_graph_path(shard_id));
+      }
+    }
+    return shard_paths;
+  }
+
+  void cleanup_shard_graph_files(uint32_t shard_count) const {
+    for (uint32_t shard_id = 0; shard_id < shard_count; ++shard_id) {
+      cleanup_path(shard_graph_path(shard_id));
+    }
+  }
+
+  [[nodiscard]] auto make_partition_config() const ->
+      typename KMeansPartitioner<float, uint32_t>::Config {
+    typename KMeansPartitioner<float, uint32_t>::Config config;
+    config.max_memory_mb_ = params_.max_memory_mb_;
+    return config;
+  }
+
+  [[nodiscard]] auto make_shard_builder_config() const ->
+      typename ShardVamanaBuilder<float, uint32_t>::Config {
+    typename ShardVamanaBuilder<float, uint32_t>::Config config;
+    config.max_degree_ = params_.max_degree_;
+    config.ef_construction_ = params_.ef_construction_;
+    config.alpha_ = params_.alpha_;
+    config.max_memory_mb_ = params_.max_memory_mb_;
+    config.num_threads_ = num_threads_;
+    return config;
+  }
+
+  [[nodiscard]] auto make_medoid_config() const -> MedoidGenerator::Config {
+    return MedoidGenerator::Config{.num_medoids_ = params_.num_medoids_,
+                                   .sample_ratio_ = params_.medoid_sample_ratio_,
+                                   .sample_cap_ = params_.medoid_sample_cap_,
+                                   .num_threads_ = num_threads_,
+                                   .max_memory_mb_ = params_.max_memory_mb_};
+  }
 
   void initialize_build_context(const std::filesystem::path &base_vectors_path,
                                 const std::filesystem::path &output_path) {
@@ -235,8 +334,7 @@ class LaserBuilder {
     effective_params.num_threads_ = num_threads_;
 
     state_ = BuildState(build_dir_ / "build_state.json");
-    std::string checkpoint_hash = effective_params.params_hash() + "|" +
-                                  std::to_string(num_points_) + "|" + std::to_string(full_dim_);
+    std::string checkpoint_hash = build_checkpoint_hash(effective_params);
     state_.load_or_reset(checkpoint_hash);
   }
 
@@ -260,74 +358,73 @@ class LaserBuilder {
               << std::fixed << std::setprecision(1) << phase_timer.elapsed_s() << " s" << '\n';
   }
 
-  void run_pca() {
-    int prev_eigen_threads = Eigen::nbThreads();
-    Eigen::setNbThreads(static_cast<int>(num_threads_));
+  [[nodiscard]] auto resolve_pca_batch_size(uint32_t sample_size) const -> uint32_t {
+    size_t vector_bytes = static_cast<size_t>(full_dim_) * sizeof(float);
+    size_t budget_bytes = params_.max_memory_mb_ * 1024UL * 1024UL * 9UL / 10UL;
+    return std::max(1000U,
+                    std::min(sample_size, static_cast<uint32_t>(budget_bytes / vector_bytes)));
+  }
 
-    auto sample_size = params_.resolved_pca_sample_count(num_points_);
-    size_t vec_bytes = static_cast<size_t>(full_dim_) * sizeof(float);
-    size_t budget = params_.max_memory_mb_ * 1024UL * 1024UL * 9UL / 10UL;
-    uint32_t batch_size =
-        std::max(1000U, std::min(sample_size, static_cast<uint32_t>(budget / vec_bytes)));
-
-    std::vector<uint32_t> ids(num_points_);
-    std::iota(ids.begin(), ids.end(), 0U);
+  [[nodiscard]] auto sample_pca_ids(uint32_t sample_size) const -> std::vector<uint32_t> {
+    std::vector<uint32_t> sample_ids(num_points_);
+    std::iota(sample_ids.begin(), sample_ids.end(), 0U);
     std::mt19937 rng(42);
-    std::shuffle(ids.begin(), ids.end(), rng);
-    ids.resize(sample_size);
-    std::sort(ids.begin(), ids.end());
+    std::shuffle(sample_ids.begin(), sample_ids.end(), rng);
+    sample_ids.resize(sample_size);
+    std::sort(sample_ids.begin(), sample_ids.end());
+    return sample_ids;
+  }
 
-    FloatVectorFileReader vector_reader;
-    vector_reader.open(base_vectors_path_);
+  auto compute_pca_covariance(FloatVectorFileReader &vector_reader,
+                              symqg::PCATransform &pca,
+                              const std::vector<uint32_t> &sample_ids,
+                              uint32_t batch_size) const -> RowMajorMatrixXf {
+    auto sample_size = static_cast<uint32_t>(sample_ids.size());
+    if (sample_size <= 1) {
+      throw std::invalid_argument("PCA requires at least 2 sample vectors");
+    }
 
-    symqg::PCATransform pca(full_dim_, full_dim_);
-    auto edim = static_cast<Eigen::Index>(full_dim_);
+    auto eigen_dim = static_cast<Eigen::Index>(full_dim_);
     std::vector<float> batch(static_cast<size_t>(batch_size) * full_dim_);
 
-    Eigen::Map<Eigen::VectorXf> mean(pca.mean_data(), edim);
+    Eigen::Map<Eigen::VectorXf> mean(pca.mean_data(), eigen_dim);
     mean.setZero();
-    for (uint32_t s = 0; s < sample_size; s += batch_size) {
-      uint32_t cnt = std::min(batch_size, sample_size - s);
-      vector_reader.read_by_ids(ids.data() + s, cnt, batch.data());
-      Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
-          block(batch.data(), static_cast<Eigen::Index>(cnt), edim);
+    for (uint32_t offset = 0; offset < sample_size; offset += batch_size) {
+      uint32_t count = std::min(batch_size, sample_size - offset);
+      vector_reader.read_by_ids(sample_ids.data() + offset, count, batch.data());
+      Eigen::Map<const RowMajorMatrixXf> block(batch.data(),
+                                               static_cast<Eigen::Index>(count),
+                                               eigen_dim);
       mean += block.colwise().sum();
     }
     mean /= static_cast<float>(sample_size);
 
-    Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> cov(edim, edim);
-    cov.setZero();
-    for (uint32_t s = 0; s < sample_size; s += batch_size) {
-      uint32_t cnt = std::min(batch_size, sample_size - s);
-      vector_reader.read_by_ids(ids.data() + s, cnt, batch.data());
-      auto bcnt = static_cast<Eigen::Index>(cnt);
-      Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
-          block(batch.data(), bcnt, edim);
+    RowMajorMatrixXf covariance(eigen_dim, eigen_dim);
+    covariance.setZero();
+    for (uint32_t offset = 0; offset < sample_size; offset += batch_size) {
+      uint32_t count = std::min(batch_size, sample_size - offset);
+      vector_reader.read_by_ids(sample_ids.data() + offset, count, batch.data());
+      auto eigen_count = static_cast<Eigen::Index>(count);
+      Eigen::Map<RowMajorMatrixXf> block(batch.data(), eigen_count, eigen_dim);
       block.rowwise() -= mean.transpose();
-      cov.noalias() += block.transpose() * block;
+      covariance.noalias() += block.transpose() * block;
     }
-    if (sample_size <= 1) {
-      throw std::invalid_argument("PCA requires at least 2 sample vectors");
-    }
-    cov /= static_cast<float>(sample_size - 1);
+    covariance /= static_cast<float>(sample_size - 1);
+    return covariance;
+  }
 
-    ids.clear();
-    ids.shrink_to_fit();
-    batch.clear();
-    batch.shrink_to_fit();
-
-    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXf> solver(cov);
+  void decompose_and_save_pca(symqg::PCATransform &pca, const RowMajorMatrixXf &covariance) const {
+    auto eigen_dim = static_cast<Eigen::Index>(full_dim_);
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXf> solver(covariance);
     if (solver.info() != Eigen::Success) {
       throw std::runtime_error("PCA eigen decomposition failed");
     }
-    cov.resize(0, 0);
 
-    const auto &evecs = solver.eigenvectors();
-    Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>
-        pca_mat(pca.pca_matrix_data(), edim, edim);
-    for (Eigen::Index i = 0; i < edim; ++i) {
-      for (Eigen::Index j = 0; j < edim; ++j) {
-        pca_mat(i, j) = evecs(j, edim - 1 - i);
+    const auto &eigenvectors = solver.eigenvectors();
+    Eigen::Map<RowMajorMatrixXf> pca_matrix(pca.pca_matrix_data(), eigen_dim, eigen_dim);
+    for (Eigen::Index i = 0; i < eigen_dim; ++i) {
+      for (Eigen::Index j = 0; j < eigen_dim; ++j) {
+        pca_matrix(i, j) = eigenvectors(j, eigen_dim - 1 - i);
       }
     }
 
@@ -335,49 +432,61 @@ class LaserBuilder {
     if (!pca.save(pca_path().string())) {
       throw std::runtime_error("Failed to save PCA parameters");
     }
+  }
 
-    // Batch transform all vectors to fbin
+  void write_pca_transformed_base(FloatVectorFileReader &vector_reader,
+                                  const symqg::PCATransform &pca) const {
     std::ofstream output(pca_base_path(), std::ios::binary | std::ios::trunc);
     if (!output) {
       throw std::runtime_error("Failed to create PCA base file: " + pca_base_path().string());
     }
-    auto num_pts = static_cast<int32_t>(num_points_);
-    auto dim_out = static_cast<int32_t>(full_dim_);
-    output.write(reinterpret_cast<const char *>(&num_pts), sizeof(num_pts));
-    output.write(reinterpret_cast<const char *>(&dim_out), sizeof(dim_out));
+
+    auto num_points = static_cast<int32_t>(num_points_);
+    auto output_dim = static_cast<int32_t>(full_dim_);
+    output.write(reinterpret_cast<const char *>(&num_points), sizeof(num_points));
+    output.write(reinterpret_cast<const char *>(&output_dim), sizeof(output_dim));
 
     constexpr uint32_t kTransformBatch = 10000;
-    std::vector<float> buf_in(static_cast<size_t>(kTransformBatch) * full_dim_);
-    std::vector<float> buf_out(static_cast<size_t>(kTransformBatch) * full_dim_);
-    for (uint32_t s = 0; s < num_points_; s += kTransformBatch) {
-      uint32_t cnt = std::min(kTransformBatch, num_points_ - s);
-      vector_reader.read_sequential(s, cnt, buf_in.data());
-      pca.transform_batch(buf_in.data(), buf_out.data(), cnt);
-      output.write(reinterpret_cast<const char *>(buf_out.data()),
-                   static_cast<std::streamsize>(static_cast<size_t>(cnt) * full_dim_ *
+    std::vector<float> input_batch(static_cast<size_t>(kTransformBatch) * full_dim_);
+    std::vector<float> output_batch(static_cast<size_t>(kTransformBatch) * full_dim_);
+    for (uint32_t offset = 0; offset < num_points_; offset += kTransformBatch) {
+      uint32_t count = std::min(kTransformBatch, num_points_ - offset);
+      vector_reader.read_sequential(offset, count, input_batch.data());
+      pca.transform_batch(input_batch.data(), output_batch.data(), count);
+      output.write(reinterpret_cast<const char *>(output_batch.data()),
+                   static_cast<std::streamsize>(static_cast<size_t>(count) * full_dim_ *
                                                 sizeof(float)));
     }
+  }
 
-    Eigen::setNbThreads(prev_eigen_threads);
+  void run_pca() {
+    ScopedEigenThreads thread_guard(num_threads_);
+    auto sample_size = params_.resolved_pca_sample_count(num_points_);
+    auto batch_size = resolve_pca_batch_size(sample_size);
+    auto sample_ids = sample_pca_ids(sample_size);
+
+    FloatVectorFileReader vector_reader;
+    vector_reader.open(base_vectors_path_);
+
+    symqg::PCATransform pca(full_dim_, full_dim_);
+    auto covariance = compute_pca_covariance(vector_reader, pca, sample_ids, batch_size);
+    decompose_and_save_pca(pca, covariance);
+    write_pca_transformed_base(vector_reader, pca);
   }
 
   void run_partition() {
-    typename KMeansPartitioner<float, uint32_t>::Config config;
-    config.max_memory_mb_ = params_.max_memory_mb_;
-    (void)run_partition_stage<float, uint32_t>(
-        pca_base_path(), params_.max_degree_, output_prefix_, config);
+    auto config = make_partition_config();
+    (void)run_partition_stage<float, uint32_t>(pca_base_path(),
+                                               params_.max_degree_,
+                                               output_prefix_,
+                                               config);
   }
 
   void run_shard_builds() {
     auto partition = load_partition_artifacts();
     state_.ensure_shard_count(partition.num_shards_);
 
-    typename ShardVamanaBuilder<float, uint32_t>::Config config;
-    config.max_degree_ = params_.max_degree_;
-    config.ef_construction_ = params_.ef_construction_;
-    config.alpha_ = params_.alpha_;
-    config.max_memory_mb_ = params_.max_memory_mb_;
-    config.num_threads_ = num_threads_;
+    auto config = make_shard_builder_config();
 
     for (uint32_t shard_id = 0; shard_id < partition.num_shards_; ++shard_id) {
       if (state_.is_shard_completed(shard_id)) {
@@ -385,25 +494,18 @@ class LaserBuilder {
       }
     }
 
-    (void)run_shard_build_stage<float, uint32_t>(
-        partition,
-        full_dim_,
-        simd::l2_sqr<float, float>,
-        config,
-        [this](uint32_t shard_id, const auto &) {
-          state_.mark_shard_completed(shard_id);
-        });
+    (void)run_shard_build_stage<float, uint32_t>(partition,
+                                                 full_dim_,
+                                                 simd::l2_sqr<float, float>,
+                                                 config,
+                                                 [this](uint32_t shard_id, const auto &) {
+                                                   state_.mark_shard_completed(shard_id);
+                                                 });
   }
 
   void run_merge() {
     auto partition = load_partition_artifacts();
-    std::vector<std::filesystem::path> shard_paths;
-    shard_paths.reserve(partition.num_shards_);
-    for (uint32_t shard_id = 0; shard_id < partition.num_shards_; ++shard_id) {
-      if (!partition.shard_members_[shard_id].empty()) {
-        shard_paths.push_back(shard_graph_path(shard_id));
-      }
-    }
+    auto shard_paths = collect_non_empty_shard_graph_paths(partition);
 
     VamanaFormatWriter writer(vamana_path(), params_.max_degree_, num_points_);
     writer.open();
@@ -421,12 +523,7 @@ class LaserBuilder {
     std::vector<uint32_t> all_ids(num_points_);
     std::iota(all_ids.begin(), all_ids.end(), 0U);
 
-    typename ShardVamanaBuilder<float, uint32_t>::Config config;
-    config.max_degree_ = params_.max_degree_;
-    config.ef_construction_ = params_.ef_construction_;
-    config.alpha_ = params_.alpha_;
-    config.max_memory_mb_ = params_.max_memory_mb_;
-    config.num_threads_ = num_threads_;
+    auto config = make_shard_builder_config();
 
     ShardVamanaBuilder<float, uint32_t> builder(std::move(pca_vectors.data_),
                                                 full_dim_,
@@ -457,11 +554,7 @@ class LaserBuilder {
   }
 
   void run_medoid() {
-    MedoidGenerator generator({.num_medoids_ = params_.num_medoids_,
-                               .sample_ratio_ = params_.medoid_sample_ratio_,
-                               .sample_cap_ = params_.medoid_sample_cap_,
-                               .num_threads_ = num_threads_,
-                               .max_memory_mb_ = params_.max_memory_mb_});
+    MedoidGenerator generator(make_medoid_config());
     (void)generator.generate(pca_base_path(), output_prefix_);
   }
 
@@ -483,15 +576,11 @@ class LaserBuilder {
 
     auto partition = try_load_partition_artifacts();
     if (!partition.has_value()) {
-      for (uint32_t shard_id = 0; shard_id < state_.shard_count(); ++shard_id) {
-        cleanup_path(shard_graph_path(shard_id));
-      }
+      cleanup_shard_graph_files(state_.shard_count());
       return;
     }
 
-    for (uint32_t shard_id = 0; shard_id < partition->num_shards_; ++shard_id) {
-      cleanup_path(shard_graph_path(shard_id));
-    }
+    cleanup_shard_graph_files(partition->num_shards_);
   }
 
   [[nodiscard]] auto try_load_partition_artifacts() const -> std::optional<PartitionArtifacts> {
@@ -523,36 +612,34 @@ class LaserBuilder {
     return artifacts;
   }
 
-  [[nodiscard]] auto pca_path() const -> std::filesystem::path {
-    return output_prefix_.string() + "_pca.bin";
-  }
+  [[nodiscard]] auto pca_path() const -> std::filesystem::path { return prefixed_path("_pca.bin"); }
 
   [[nodiscard]] auto pca_base_path() const -> std::filesystem::path {
-    return output_prefix_.string() + "_pca_base.fbin";
+    return prefixed_path("_pca_base.fbin");
   }
 
   [[nodiscard]] auto node_to_shards_path() const -> std::filesystem::path {
-    return output_prefix_.string() + ".node_to_shards.bin";
+    return prefixed_path(".node_to_shards.bin");
   }
 
   [[nodiscard]] auto shard_members_path() const -> std::filesystem::path {
-    return output_prefix_.string() + ".shard_members.bin";
+    return prefixed_path(".shard_members.bin");
   }
 
   [[nodiscard]] auto shuffle_path() const -> std::filesystem::path {
-    return output_prefix_.string() + ".shuffle.bin";
+    return prefixed_path(".shuffle.bin");
   }
 
   [[nodiscard]] auto shard_graph_path(uint32_t shard_id) const -> std::filesystem::path {
-    return output_prefix_.string() + ".shard_" + std::to_string(shard_id) + ".graph";
+    return prefixed_path(".shard_" + std::to_string(shard_id) + ".graph");
   }
 
   [[nodiscard]] auto vamana_path() const -> std::filesystem::path {
-    return output_prefix_.string() + ".vamana.index";
+    return prefixed_path(".vamana.index");
   }
 
   [[nodiscard]] auto tmp_fbin_path() const -> std::filesystem::path {
-    return output_prefix_.string() + "_tmp.fbin";
+    return prefixed_path("_tmp.fbin");
   }
 
   static void cleanup_path(const std::filesystem::path &path) {
