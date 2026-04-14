@@ -10,48 +10,68 @@
  *       <vamana_index> <output_dir>
  *       [max_memory_mib=1024] [max_degree=64] [main_dim=256]
  *       [num_medoids=300] [num_threads=0] [dram_budget_gb=1.0]
+ *       [--force-build] [--search-only]
  */
 
 // NOLINTBEGIN
 
 #include <cstdint>
+#include <exception>
 #include <filesystem>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <numeric>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
-#include "bench_utils.hpp"
 #include "index/laser/laser_builder.hpp"
 #include "index/laser/laser_index.hpp"
-#include "utils/evaluate.hpp"
+#include "laser_bench_common.hpp"
 #include "utils/io_utils.hpp"
 #include "utils/timer.hpp"
 #include "utils/vector_file_reader.hpp"
 
 // ============================================================================
-// RSS measurement
+// Helpers
 // ============================================================================
 
-static auto get_rss_mib() -> double {
-  std::ifstream ifs("/proc/self/status");
-  std::string line;
-  while (std::getline(ifs, line)) {
-    if (line.starts_with("VmRSS:")) {
-      size_t pos = line.find_first_of("0123456789");
-      if (pos != std::string::npos) return std::stod(line.substr(pos)) / 1024.0;
-    }
-  }
-  return 0.0;
+namespace {
+
+auto get_index_file_path(const std::filesystem::path &prefix,
+                         uint32_t max_degree,
+                         uint32_t main_dim) -> std::filesystem::path {
+  return prefix.string() + "_R" + std::to_string(max_degree) + "_MD" + std::to_string(main_dim) +
+         ".index";
 }
 
-static void print_rss(const char *label) {
-  std::cout << "  [RSS] " << std::left << std::setw(35) << label << std::fixed
-            << std::setprecision(1) << get_rss_mib() << " MiB\n"
-            << std::flush;
+auto get_required_index_files(const std::filesystem::path &prefix,
+                              uint32_t max_degree,
+                              uint32_t main_dim) -> std::vector<std::filesystem::path> {
+  auto index_file = get_index_file_path(prefix, max_degree, main_dim);
+  return {
+      index_file,
+      index_file.string() + "_rotator",
+      prefix.string() + "_medoids",
+      prefix.string() + "_medoids_indices",
+      prefix.string() + "_pca.bin",
+  };
 }
+
+auto has_reusable_index(const std::filesystem::path &prefix,
+                        uint32_t max_degree,
+                        uint32_t main_dim,
+                        std::vector<std::filesystem::path> &missing_files) -> bool {
+  missing_files.clear();
+  for (const auto &path : get_required_index_files(prefix, max_degree, main_dim)) {
+    if (!std::filesystem::exists(path)) {
+      missing_files.push_back(path);
+    }
+  }
+  return missing_files.empty();
+}
+
+}  // namespace
 
 // ============================================================================
 // Main
@@ -62,51 +82,130 @@ auto main(int argc, char *argv[]) -> int {
     std::cerr << "Usage: " << argv[0] << " <base_fvecs> <query_fvecs> <gt_ivecs>"
               << " <vamana_index> <output_dir>"
               << " [max_memory_mib=1024] [max_degree=64] [main_dim=256]"
-              << " [num_medoids=300] [num_threads=0] [dram_budget_gb=1.0]\n";
+              << " [num_medoids=300] [num_threads=0] [dram_budget_gb=1.0]"
+              << " [--force-build] [--search-only]\n";
     return 1;
   }
 
+  enum class BuildMode : uint8_t {
+    kAuto,
+    kForceBuild,
+    kSearchOnly,
+  };
+
+  BuildMode build_mode = BuildMode::kAuto;
   std::string base_path = argv[1];
   std::string query_path = argv[2];
   std::string gt_path = argv[3];
   std::string vamana_path = argv[4];
   std::string output_dir = argv[5];
-  uint32_t max_memory_mib = (argc > 6) ? static_cast<uint32_t>(std::stoul(argv[6])) : 1024;
-  uint32_t max_degree = (argc > 7) ? static_cast<uint32_t>(std::stoul(argv[7])) : 64;
-  uint32_t main_dim = (argc > 8) ? static_cast<uint32_t>(std::stoul(argv[8])) : 256;
-  uint32_t num_medoids = (argc > 9) ? static_cast<uint32_t>(std::stoul(argv[9])) : 300;
-  uint32_t num_threads = (argc > 10) ? static_cast<uint32_t>(std::stoul(argv[10])) : 0;
-  float dram_budget = (argc > 11) ? std::stof(argv[11]) : 1.0F;
+
+  std::vector<std::string> numeric_args;
+  numeric_args.reserve(static_cast<size_t>(argc));
+  for (int i = 6; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--force-build") {
+      if (build_mode == BuildMode::kSearchOnly) {
+        std::cerr << "Invalid arguments: --force-build and --search-only cannot be used together\n";
+        return 1;
+      }
+      build_mode = BuildMode::kForceBuild;
+      continue;
+    }
+    if (arg == "--search-only") {
+      if (build_mode == BuildMode::kForceBuild) {
+        std::cerr << "Invalid arguments: --force-build and --search-only cannot be used together\n";
+        return 1;
+      }
+      build_mode = BuildMode::kSearchOnly;
+      continue;
+    }
+    numeric_args.push_back(std::move(arg));
+  }
+
+  uint32_t max_memory_mib =
+      (numeric_args.size() > 0) ? static_cast<uint32_t>(std::stoul(numeric_args[0])) : 1024;
+  uint32_t max_degree =
+      (numeric_args.size() > 1) ? static_cast<uint32_t>(std::stoul(numeric_args[1])) : 64;
+  uint32_t main_dim =
+      (numeric_args.size() > 2) ? static_cast<uint32_t>(std::stoul(numeric_args[2])) : 256;
+  uint32_t num_medoids =
+      (numeric_args.size() > 3) ? static_cast<uint32_t>(std::stoul(numeric_args[3])) : 300;
+  uint32_t num_threads =
+      (numeric_args.size() > 4) ? static_cast<uint32_t>(std::stoul(numeric_args[4])) : 0;
+  float dram_budget = (numeric_args.size() > 5) ? std::stof(numeric_args[5]) : 1.0F;
   if (num_threads == 0) num_threads = std::thread::hardware_concurrency();
 
   constexpr uint32_t kTopK = 10;
   constexpr size_t kWarmup = 2;
   constexpr size_t kRuns = 5;
-  std::vector<size_t> ef_values = {80, 100, 150, 200, 300, 500};
+  const std::vector<size_t> ef_values = {80, 100, 150, 200, 300, 500};
 
   std::filesystem::create_directories(output_dir);
   auto prefix = std::filesystem::path(output_dir) / "dsqg_gist";
 
-  print_rss("initial");
+  auto run_build = [&]() {
+    std::cout << "\n=== Build ===" << '\n' << std::flush;
+    alaya::Timer build_timer;
+    alaya::LaserBuildParams build_params;
+    build_params.main_dim_ = main_dim;
+    build_params.max_degree_ = max_degree;
+    build_params.num_medoids_ = num_medoids;
+    build_params.max_memory_mb_ = max_memory_mib;
+    build_params.num_threads_ = num_threads;
+    build_params.external_vamana_ = vamana_path;
+    build_params.keep_intermediates_ = true;
+
+    alaya::LaserBuilder builder(build_params);
+    builder.build(base_path, prefix.string());
+
+    std::cout << "\n=== Build Summary ===" << '\n';
+    std::cout << "  Total: " << std::fixed << std::setprecision(1) << build_timer.elapsed_s()
+              << " s\n";
+    std::cout << "  Budget: " << max_memory_mib << " MiB\n";
+    alaya::bench::print_rss("after build");
+  };
+
+  alaya::bench::print_rss("initial");
   std::cout << "\n=== Configuration ===" << '\n';
-  std::cout << "  max_memory: " << max_memory_mib << " MiB, threads: " << num_threads << '\n';
-  std::cout << "  max_degree: " << max_degree << ", main_dim: " << main_dim
-            << ", medoids: " << num_medoids << '\n';
+  std::cout << "  max_memory_mib : " << max_memory_mib << '\n';
+  std::cout << "  build_threads  : " << num_threads << '\n';
+  std::cout << "  max_degree     : " << max_degree << '\n';
+  std::cout << "  main_dim       : " << main_dim << '\n';
+  std::cout << "  num_medoids    : " << num_medoids << '\n';
+  std::cout << "  build_mode     : "
+            << (build_mode == BuildMode::kForceBuild
+                    ? "force-build"
+                    : (build_mode == BuildMode::kSearchOnly ? "search-only" : "auto"))
+            << '\n';
 
-  std::cout << "\n=== Build ===" << '\n' << std::flush;
-  alaya::Timer t_build;
-
-  alaya::LaserBuildParams build_params;
-  build_params.main_dim_ = main_dim;
-  build_params.max_degree_ = max_degree;
-  build_params.num_medoids_ = num_medoids;
-  build_params.max_memory_mb_ = max_memory_mib;
-  build_params.num_threads_ = num_threads;
-  build_params.external_vamana_ = vamana_path;
-  build_params.keep_intermediates_ = true;
-
-  alaya::LaserBuilder builder(build_params);
-  builder.build(base_path, prefix.string());
+  std::vector<std::filesystem::path> missing_files;
+  bool has_index = has_reusable_index(prefix, max_degree, main_dim, missing_files);
+  bool reused_existing_index = false;
+  if (build_mode == BuildMode::kForceBuild) {
+    std::cout << "\n=== Build ===\n";
+    std::cout << "  Force build mode enabled.\n";
+    run_build();
+  } else if (has_index) {
+    reused_existing_index = true;
+    std::cout << "\n=== Build ===\n";
+    std::cout << "  Reuse existing index artifacts. Skip build.\n";
+    alaya::bench::print_rss("reuse existing index");
+  } else if (build_mode == BuildMode::kSearchOnly) {
+    std::cout << "\n=== Build ===\n";
+    std::cout << "  Search-only mode requires a ready index, but files are missing:\n";
+    for (const auto &path : missing_files) {
+      std::cout << "    - " << path.string() << '\n';
+    }
+    return 1;
+  } else {
+    std::cout << "\n=== Build ===\n";
+    std::cout << "  Existing index not complete, missing files:\n";
+    for (const auto &path : missing_files) {
+      std::cout << "    - " << path.string() << '\n';
+    }
+    run_build();
+  }
 
   // Read dimensions from the base file for search
   uint32_t num_base = 0;
@@ -115,12 +214,6 @@ auto main(int argc, char *argv[]) -> int {
   base_reader.open(base_path);
   num_base = base_reader.num_vectors();
   full_dim = base_reader.dim();
-
-  double build_s = t_build.elapsed_s();
-  std::cout << "\n=== Build Summary ===" << '\n';
-  std::cout << "  Total: " << std::fixed << std::setprecision(1) << build_s << " s\n";
-  std::cout << "  Budget: " << max_memory_mib << " MiB\n";
-  print_rss("after build");
 
   // ================================================================
   // Search Phase
@@ -133,72 +226,58 @@ auto main(int argc, char *argv[]) -> int {
   auto gt_k = gtvecs.dim_;
   std::cout << "  Queries: " << nq << " x " << qdim << ", GT: " << gtvecs.num_ << " x " << gt_k
             << '\n';
+  auto gt_u32 = alaya::bench::to_u32_ground_truth(gtvecs);
 
   std::cout << "\n=== Loading Index ===" << '\n' << std::flush;
   alaya::LaserIndex index;
-  symqg::LaserSearchParams sp;
-  sp.ef_search = 200;
-  sp.num_threads = 1;
-  sp.beam_width = 16;
-  sp.search_dram_budget_gb = dram_budget;
-  alaya::Timer t_load;
-  index.load(prefix.string(), num_base, max_degree, main_dim, full_dim, sp);
-  std::cout << "  Load: " << std::setprecision(1) << t_load.elapsed_ms() << " ms, "
-            << "cache: " << index.cached_node_count() << " nodes ("
-            << (index.cache_size_bytes() / (1024 * 1024)) << " MB)\n";
-  print_rss("after index load");
+  symqg::LaserSearchParams search_params;
+  search_params.ef_search = 200;
+  search_params.num_threads = 1;
+  search_params.beam_width = 16;
+  search_params.search_dram_budget_gb = dram_budget;
+  auto load_index = [&]() {
+    alaya::Timer load_timer;
+    index.load(prefix.string(), num_base, max_degree, main_dim, full_dim, search_params);
+    std::cout << "  Load: " << std::setprecision(1) << load_timer.elapsed_ms() << " ms, "
+              << "cache: " << index.cached_node_count() << " nodes ("
+              << (index.cache_size_bytes() / (1024 * 1024)) << " MB)\n";
+  };
 
-  std::cout << "\n" << std::string(90, '=') << '\n';
-  std::cout << std::left << std::setw(10) << "EF" << std::setw(15) << "QPS" << std::setw(15)
-            << "Recall(%)" << std::setw(18) << "Mean(us)" << std::setw(18) << "P99.9(us)" << '\n';
-  std::cout << std::string(90, '-') << '\n' << std::flush;
-
-  for (size_t ef : ef_values) {
-    sp.ef_search = ef;
-    sp.num_threads = 1;
-    sp.beam_width = 16;
-    index.set_search_params(sp);
-
-    std::vector<uint32_t> results(static_cast<size_t>(nq) * kTopK);
-
-    // Warmup
-    for (size_t w = 0; w < std::min(kWarmup, static_cast<size_t>(nq)); ++w) {
-      uint32_t tmp[kTopK];
-      index.search(qvecs.data_.data() + w * qdim, kTopK, tmp);
+  try {
+    load_index();
+  } catch (const std::exception &error) {
+    if (build_mode == BuildMode::kSearchOnly) {
+      std::cerr << "  Search-only mode failed to load index: " << error.what() << '\n';
+      return 1;
     }
-
-    double sum_qps = 0, sum_lat = 0, sum_p99 = 0;
-    double last_recall = 0;
-    for (size_t run = 0; run < kRuns; ++run) {
-      std::vector<double> lats;
-      lats.reserve(nq);
-      double total = 0;
-      for (uint32_t i = 0; i < nq; ++i) {
-        alaya::Timer qt;
-        index.search(qvecs.data_.data() + static_cast<size_t>(i) * qdim,
-                     kTopK,
-                     results.data() + static_cast<size_t>(i) * kTopK);
-        double us = qt.elapsed_us();
-        lats.push_back(us);
-        total += us;
-      }
-      total /= 1e6;
-      sum_qps += nq / total;
-      sum_lat += std::accumulate(lats.begin(), lats.end(), 0.0) / nq;
-      sum_p99 += alaya::bench::percentile(lats, 99.9);
-      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-      auto *gt_u32 = reinterpret_cast<const uint32_t *>(gtvecs.data_.data());
-      last_recall = alaya::calc_recall(results.data(), gt_u32, nq, gt_k, kTopK) * 100.0;
+    if (!reused_existing_index) {
+      throw;
     }
-
-    std::cout << std::left << std::setw(10) << ef << std::setw(15) << std::fixed
-              << std::setprecision(1) << (sum_qps / kRuns) << std::setw(15) << std::setprecision(2)
-              << last_recall << std::setw(18) << std::setprecision(1) << (sum_lat / kRuns)
-              << std::setw(18) << (sum_p99 / kRuns) << '\n'
-              << std::flush;
+    std::cout << "  Reused index load failed: " << error.what() << '\n';
+    std::cout << "  Fallback to rebuild, then retry load.\n";
+    run_build();
+    load_index();
   }
-  std::cout << std::string(90, '=') << '\n';
-  print_rss("final");
+  alaya::bench::print_rss("after index load");
+
+  alaya::bench::SearchSweepOptions sweep_options;
+  sweep_options.top_k = kTopK;
+  sweep_options.warmup_queries = kWarmup;
+  sweep_options.runs = kRuns;
+  sweep_options.ef_values = ef_values;
+  sweep_options.num_threads = 1;
+  sweep_options.beam_width = 16;
+  sweep_options.allow_batch_search = false;
+
+  alaya::bench::print_search_table_header();
+  auto rows =
+      alaya::bench::run_search_sweep(index, qvecs, gt_u32, gt_k, search_params, sweep_options);
+  for (const auto &row : rows) {
+    alaya::bench::print_search_table_row(row);
+  }
+  alaya::bench::print_search_table_footer();
+
+  alaya::bench::print_rss("final");
   return 0;
 }
 
