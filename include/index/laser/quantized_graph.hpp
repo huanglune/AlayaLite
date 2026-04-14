@@ -230,6 +230,13 @@ class QuantizedGraph {
 #endif
   void reset_loaded_state_before_reload();
 
+  template <typename ProcessFn, typename WaitFn>
+  void process_prepared_nodes(size_t &remaining,
+                              ProcessFn &&process_node,
+                              WaitFn &&wait_for_nodes,
+                              LaserSearchContext &ctx,
+                              size_t prefetch_lines);
+
  public:
   explicit QuantizedGraph(size_t num, size_t max_deg, size_t main_dim, size_t dim);
   ~QuantizedGraph();
@@ -600,39 +607,11 @@ inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
     size_t need_process_num = n_ops + previous_remain_num - remain_num;
     previous_remain_num = remain_num;
 
-    while (need_process_num > 0) {
-      if (!prepared.empty()) {
-        auto node = prepared.pop_front();
-        // L1 prefetch the next node while processing current
-        if (!prepared.empty()) {
-          auto &next = prepared.front();
-          alaya::mem_prefetch_l1(next.second + offset_to_node(next.first), prefetch_lines);
-        }
-        process_node(node.first,
-                     reinterpret_cast<float *>(node.second + offset_to_node(node.first)));
-        --need_process_num;
-        free_slots.push(node.second);
-      } else {
-        wait_for_nodes();
-      }
-    }
+    process_prepared_nodes(need_process_num, process_node, wait_for_nodes, ctx, prefetch_lines);
   }
 
   // Drain remaining
-  while (previous_remain_num > 0) {
-    if (!prepared.empty()) {
-      auto node = prepared.pop_front();
-      if (!prepared.empty()) {
-        auto &next = prepared.front();
-        alaya::mem_prefetch_l1(next.second + offset_to_node(next.first), prefetch_lines);
-      }
-      process_node(node.first, reinterpret_cast<float *>(node.second + offset_to_node(node.first)));
-      --previous_remain_num;
-      free_slots.push(node.second);
-    } else {
-      wait_for_nodes();
-    }
-  }
+  process_prepared_nodes(previous_remain_num, process_node, wait_for_nodes, ctx, prefetch_lines);
 
   res_pool.copy_results(results);
 }
@@ -670,6 +649,32 @@ inline auto QuantizedGraph::scan_neighbors(const QGQuery &q_obj,
   }
 
   return sqr_y;
+}
+
+template <typename ProcessFn, typename WaitFn>
+inline void QuantizedGraph::process_prepared_nodes(size_t &remaining,
+                                                   ProcessFn &&process_node,
+                                                   WaitFn &&wait_for_nodes,
+                                                   LaserSearchContext &ctx,
+                                                   size_t prefetch_lines) {
+  auto &prepared = ctx.prepared_ring();
+  auto &free_slots = ctx.free_slot_stack();
+
+  while (remaining > 0) {
+    if (!prepared.empty()) {
+      auto node = prepared.pop_front();
+      if (!prepared.empty()) {
+        auto &next = prepared.front();
+        alaya::mem_prefetch_l1(next.second + offset_to_node(next.first), prefetch_lines);
+      }
+      process_node(node.first,
+                   reinterpret_cast<float *>(node.second + offset_to_node(node.first)));
+      --remaining;
+      free_slots.push(node.second);
+    } else {
+      wait_for_nodes();
+    }
+  }
 }
 
 inline auto QuantizedGraph::read_binary_exact(std::ifstream &input, void *dst, size_t bytes)
