@@ -127,20 +127,20 @@ struct ThreadData {
     // A smaller hash table silently drops inserts when full, which can cause
     // repeated revisits and effectively unbounded query time on larger graphs.
     SearchContextBuffers bufs;
-    bufs.lut = lut_buf_;
-    bufs.rotated_query = rotated_query_buf_;
-    bufs.byte_query = byte_query_buf_;
-    bufs.scan_result = scan_result_buf_;
-    bufs.scan_float = scan_float_buf_;
-    bufs.appro_dist = appro_dist_buf_;
-    bufs.io_events = io_events_buf_;
-    bufs.frontier_reqs = frontier_reqs_buf_;
-    bufs.iocb_buf = iocb_buf_;
-    bufs.iocb_ptrs = iocb_ptrs_buf_;
-    bufs.padded_dim = padded_dim;
-    bufs.degree_bound = degree_bound;
-    bufs.max_beam_width = max_beam_width;
-    bufs.visited_capacity = num_points;
+    bufs.lut_ = lut_buf_;
+    bufs.rotated_query_ = rotated_query_buf_;
+    bufs.byte_query_ = byte_query_buf_;
+    bufs.scan_result_ = scan_result_buf_;
+    bufs.scan_float_ = scan_float_buf_;
+    bufs.appro_dist_ = appro_dist_buf_;
+    bufs.io_events_ = io_events_buf_;
+    bufs.frontier_reqs_ = frontier_reqs_buf_;
+    bufs.iocb_buf_ = iocb_buf_;
+    bufs.iocb_ptrs_ = iocb_ptrs_buf_;
+    bufs.padded_dim_ = padded_dim;
+    bufs.degree_bound_ = degree_bound;
+    bufs.max_beam_width_ = max_beam_width;
+    bufs.visited_capacity_ = num_points;
     search_ctx_.init(bufs);
   }
 

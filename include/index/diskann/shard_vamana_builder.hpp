@@ -242,9 +242,10 @@ class ShardVamanaBuilder {
     for (uint32_t pass = 0; pass < config_.num_iterations_; ++pass) {
       // Single-pass: use alpha_ directly (matching official DiskANN).
       // Multi-pass: pass 0 uses alpha_first_pass_ (strict), subsequent passes use alpha_.
-      auto alpha = (config_.num_iterations_ == 1)
-                       ? config_.alpha_
-                       : (pass == 0 ? config_.alpha_first_pass_ : config_.alpha_);
+      float alpha = config_.alpha_;
+      if (config_.num_iterations_ != 1 && pass == 0) {
+        alpha = config_.alpha_first_pass_;
+      }
       build_pass(alpha, on_progress);
     }
     // Final cleanup: prune any over-provisioned nodes back to max_degree

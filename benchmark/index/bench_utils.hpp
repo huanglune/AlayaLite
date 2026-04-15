@@ -21,7 +21,9 @@ inline auto percentile(std::vector<double> &v, double p) -> double {
   double idx = p / 100.0 * static_cast<double>(v.size() - 1);
   auto lo = static_cast<size_t>(idx);
   auto hi = lo + 1;
-  if (hi >= v.size()) return v.back();
+  if (hi >= v.size()) {
+    return v.back();
+  }
   double frac = idx - static_cast<double>(lo);
   return v[lo] * (1.0 - frac) + v[hi] * frac;
 }

@@ -144,14 +144,12 @@ class MedoidGenerator {
     std::vector<uint32_t> best_ids(medoid_count, 0);
 
     std::vector<float> block(static_cast<size_t>(scan_block) * dim);
-    auto thread_count =
-        static_cast<int>(config_.num_threads_ == 0 ? omp_get_max_threads() : config_.num_threads_);
 
     for (uint32_t start = 0; start < num_points; start += scan_block) {
       auto count = std::min(scan_block, num_points - start);
       reader.read_sequential(start, count, block.data());
 
-#pragma omp parallel num_threads(thread_count)
+#pragma omp parallel num_threads(static_cast<int>(config_.num_threads_ == 0 ? omp_get_max_threads() : config_.num_threads_))
       {
         std::vector<float> local_best_dists(medoid_count, std::numeric_limits<float>::max());
         std::vector<uint32_t> local_best_ids(medoid_count, 0);

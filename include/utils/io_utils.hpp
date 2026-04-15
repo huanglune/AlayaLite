@@ -192,7 +192,9 @@ inline auto load_bin_all(const std::filesystem::path &filepath) -> VecFileData<T
  * @brief Auto-detect format and load float vectors (.fbin or .fvecs).
  */
 inline auto load_float_vectors(const std::filesystem::path &filepath) -> VecFileData<float> {
-  if (filepath.extension() == ".fbin") return load_bin_all<float>(filepath);
+  if (filepath.extension() == ".fbin") {
+    return load_bin_all<float>(filepath);
+  }
   return load_fvecs_all<float>(filepath);
 }
 
@@ -200,7 +202,9 @@ inline auto load_float_vectors(const std::filesystem::path &filepath) -> VecFile
  * @brief Auto-detect format and load int32 vectors (.ibin or .ivecs).
  */
 inline auto load_int_vectors(const std::filesystem::path &filepath) -> VecFileData<int32_t> {
-  if (filepath.extension() == ".ibin") return load_bin_all<int32_t>(filepath);
+  if (filepath.extension() == ".ibin") {
+    return load_bin_all<int32_t>(filepath);
+  }
   return load_fvecs_all<int32_t>(filepath);
 }
 

@@ -41,7 +41,9 @@ inline auto read_current_rss_kb() -> size_t {
   size_t value_kb = 0;
   std::string unit;
   while (status >> key >> value_kb >> unit) {
-    if (key == "VmRSS:") return value_kb;
+    if (key == "VmRSS:") {
+      return value_kb;
+    }
   }
   return 0;
 }
@@ -141,22 +143,22 @@ class RssMonitor {
 };
 
 struct SearchSweepOptions {
-  uint32_t top_k = 10;
-  size_t warmup_queries = 3;
-  size_t runs = 5;
-  std::vector<size_t> ef_values;
-  size_t num_threads = 1;
-  size_t beam_width = 16;
-  bool allow_batch_search = true;
+  uint32_t top_k_ = 10;
+  size_t warmup_queries_ = 3;
+  size_t runs_ = 5;
+  std::vector<size_t> ef_values_;
+  size_t num_threads_ = 1;
+  size_t beam_width_ = 16;
+  bool allow_batch_search_ = true;
 };
 
 struct SearchBenchRow {
-  size_t ef = 0;
-  double qps = 0;
-  double recall_pct = 0;
-  bool has_latency = false;
-  double mean_latency_us = 0;
-  double p99_9_latency_us = 0;
+  size_t ef_ = 0;
+  double qps_ = 0;
+  double recall_pct_ = 0;
+  bool has_latency_ = false;
+  double mean_latency_us_ = 0;
+  double p99_9_latency_us_ = 0;
 };
 
 inline auto to_u32_ground_truth(const VecFileData<int32_t> &gtvecs) -> std::vector<uint32_t> {
@@ -175,13 +177,13 @@ inline void print_search_table_header() {
 }
 
 inline void print_search_table_row(const SearchBenchRow &row) {
-  std::cout << std::left << std::setw(8) << row.ef << std::setw(14) << std::fixed
-            << std::setprecision(1) << row.qps << std::setw(14) << std::setprecision(2)
-            << row.recall_pct;
+  std::cout << std::left << std::setw(8) << row.ef_ << std::setw(14) << std::fixed
+            << std::setprecision(1) << row.qps_ << std::setw(14) << std::setprecision(2)
+            << row.recall_pct_;
 
-  if (row.has_latency) {
-    std::cout << std::setw(16) << std::setprecision(1) << row.mean_latency_us << std::setw(16)
-              << std::setprecision(1) << row.p99_9_latency_us;
+  if (row.has_latency_) {
+    std::cout << std::setw(16) << std::setprecision(1) << row.mean_latency_us_ << std::setw(16)
+              << std::setprecision(1) << row.p99_9_latency_us_;
   } else {
     std::cout << std::setw(16) << "N/A" << std::setw(16) << "N/A";
   }
@@ -199,31 +201,31 @@ inline auto run_search_sweep(LaserIndex &index,
                              const std::function<void(const SearchBenchRow &)> &on_ef_complete = {})
     -> std::vector<SearchBenchRow> {
   std::vector<SearchBenchRow> rows;
-  rows.reserve(options.ef_values.size());
+  rows.reserve(options.ef_values_.size());
 
   auto nq = qvecs.num_;
   auto qdim = qvecs.dim_;
-  if (nq == 0 || qdim == 0 || gt_dim == 0 || options.top_k == 0 || options.runs == 0 ||
-      options.ef_values.empty()) {
+  if (nq == 0 || qdim == 0 || gt_dim == 0 || options.top_k_ == 0 || options.runs_ == 0 ||
+      options.ef_values_.empty()) {
     return rows;
   }
   if (gt_u32.size() < static_cast<size_t>(nq) * gt_dim) {
     return rows;
   }
 
-  const bool single_query_mode = (options.num_threads == 1) || !options.allow_batch_search;
-  std::vector<uint32_t> results(static_cast<size_t>(nq) * options.top_k);
-  std::vector<uint32_t> warmup_result(options.top_k);
+  const bool kSingleQueryMode = (options.num_threads_ == 1) || !options.allow_batch_search_;
+  std::vector<uint32_t> results(static_cast<size_t>(nq) * options.top_k_);
+  std::vector<uint32_t> warmup_result(options.top_k_);
 
-  for (size_t ef : options.ef_values) {
+  for (size_t ef : options.ef_values_) {
     base_params.ef_search = ef;
-    base_params.num_threads = options.num_threads;
-    base_params.beam_width = options.beam_width;
+    base_params.num_threads = options.num_threads_;
+    base_params.beam_width = options.beam_width_;
     index.set_search_params(base_params);
 
-    auto warmup_count = std::min(options.warmup_queries, static_cast<size_t>(nq));
+    auto warmup_count = std::min(options.warmup_queries_, static_cast<size_t>(nq));
     for (size_t warmup = 0; warmup < warmup_count; ++warmup) {
-      index.search(qvecs.data_.data() + warmup * qdim, options.top_k, warmup_result.data());
+      index.search(qvecs.data_.data() + warmup * qdim, options.top_k_, warmup_result.data());
     }
 
     double sum_qps = 0;
@@ -231,18 +233,18 @@ inline auto run_search_sweep(LaserIndex &index,
     double sum_p99_9_latency = 0;
     double last_recall = 0;
 
-    for (size_t run = 0; run < options.runs; ++run) {
+    for (size_t run = 0; run < options.runs_; ++run) {
       double total_time_s = 0;
 
-      if (single_query_mode) {
+      if (kSingleQueryMode) {
         std::vector<double> latencies;
         latencies.reserve(nq);
         double total_latency_us = 0;
         for (uint32_t i = 0; i < nq; ++i) {
           alaya::Timer query_timer;
           index.search(qvecs.data_.data() + static_cast<size_t>(i) * qdim,
-                       options.top_k,
-                       results.data() + static_cast<size_t>(i) * options.top_k);
+                       options.top_k_,
+                       results.data() + static_cast<size_t>(i) * options.top_k_);
           double latency_us = query_timer.elapsed_us();
           latencies.push_back(latency_us);
           total_latency_us += latency_us;
@@ -254,7 +256,7 @@ inline auto run_search_sweep(LaserIndex &index,
         alaya::Timer batch_timer;
         index.batch_search(qvecs.data_.data(),
                            static_cast<size_t>(nq),
-                           options.top_k,
+                           options.top_k_,
                            results.data());
         total_time_s = batch_timer.elapsed_s();
       }
@@ -264,16 +266,16 @@ inline auto run_search_sweep(LaserIndex &index,
       }
       sum_qps += static_cast<double>(nq) / total_time_s;
       last_recall =
-          alaya::calc_recall(results.data(), gt_u32.data(), nq, gt_dim, options.top_k) * 100.0;
+          alaya::calc_recall(results.data(), gt_u32.data(), nq, gt_dim, options.top_k_) * 100.0;
     }
 
     rows.push_back(
-        {.ef = ef,
-         .qps = sum_qps / options.runs,
-         .recall_pct = last_recall,
-         .has_latency = single_query_mode,
-         .mean_latency_us = single_query_mode ? (sum_mean_latency / options.runs) : 0.0,
-         .p99_9_latency_us = single_query_mode ? (sum_p99_9_latency / options.runs) : 0.0});
+        {.ef_ = ef,
+         .qps_ = sum_qps / options.runs_,
+         .recall_pct_ = last_recall,
+         .has_latency_ = kSingleQueryMode,
+         .mean_latency_us_ = kSingleQueryMode ? (sum_mean_latency / options.runs_) : 0.0,
+         .p99_9_latency_us_ = kSingleQueryMode ? (sum_p99_9_latency / options.runs_) : 0.0});
 
     if (on_ef_complete) {
       on_ef_complete(rows.back());

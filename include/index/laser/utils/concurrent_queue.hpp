@@ -22,5 +22,3 @@
 #pragma once
 
 #include "utils/concurrent_queue.hpp"
-
-using ::alaya::ConcurrentQueue;

@@ -27,22 +27,22 @@ namespace symqg {
  */
 struct SearchContextBuffers {
   // Buffer pointers (borrowed from ThreadData — no ownership)
-  uint8_t *lut = nullptr;
-  float *rotated_query = nullptr;
-  uint8_t *byte_query = nullptr;
-  uint16_t *scan_result = nullptr;
-  float *scan_float = nullptr;
-  float *appro_dist = nullptr;
-  io_event *io_events = nullptr;
-  AlignedRead *frontier_reqs = nullptr;
-  iocb *iocb_buf = nullptr;
-  iocb **iocb_ptrs = nullptr;
+  uint8_t *lut_ = nullptr;
+  float *rotated_query_ = nullptr;
+  uint8_t *byte_query_ = nullptr;
+  uint16_t *scan_result_ = nullptr;
+  float *scan_float_ = nullptr;
+  float *appro_dist_ = nullptr;
+  io_event *io_events_ = nullptr;
+  AlignedRead *frontier_reqs_ = nullptr;
+  iocb *iocb_buf_ = nullptr;
+  iocb **iocb_ptrs_ = nullptr;
 
   // Dimension and capacity config
-  size_t padded_dim = 0;
-  size_t degree_bound = 0;
-  size_t max_beam_width = 0;
-  size_t visited_capacity = 0;
+  size_t padded_dim_ = 0;
+  size_t degree_bound_ = 0;
+  size_t max_beam_width_ = 0;
+  size_t visited_capacity_ = 0;
 };
 
 class LaserSearchContext {
@@ -54,26 +54,26 @@ class LaserSearchContext {
    * All pointers are borrowed from ThreadData — no ownership.
    */
   void init(const SearchContextBuffers &bufs) {
-    lut_ = bufs.lut;
-    rotated_query_ = bufs.rotated_query;
-    byte_query_ = bufs.byte_query;
-    scan_result_ = bufs.scan_result;
-    scan_float_ = bufs.scan_float;
-    appro_dist_ = bufs.appro_dist;
-    io_events_ = bufs.io_events;
-    frontier_reqs_ = bufs.frontier_reqs;
-    iocb_buf_ = bufs.iocb_buf;
-    iocb_ptrs_buf_ = bufs.iocb_ptrs;
+    lut_ = bufs.lut_;
+    rotated_query_ = bufs.rotated_query_;
+    byte_query_ = bufs.byte_query_;
+    scan_result_ = bufs.scan_result_;
+    scan_float_ = bufs.scan_float_;
+    appro_dist_ = bufs.appro_dist_;
+    io_events_ = bufs.io_events_;
+    frontier_reqs_ = bufs.frontier_reqs_;
+    iocb_buf_ = bufs.iocb_buf_;
+    iocb_ptrs_buf_ = bufs.iocb_ptrs_;
 
-    padded_dim_ = bufs.padded_dim;
-    degree_bound_ = bufs.degree_bound;
-    max_beam_width_ = bufs.max_beam_width;
+    padded_dim_ = bufs.padded_dim_;
+    degree_bound_ = bufs.degree_bound_;
+    max_beam_width_ = bufs.max_beam_width_;
 
-    ongoing_table_ = OngoingTable(2 * bufs.max_beam_width);
-    visited_set_ = TaggedVisitedSet(bufs.visited_capacity);
-    prepared_ring_ = FixedRingBuffer<std::pair<PID, char *>>(2 * bufs.max_beam_width);
-    free_slot_stack_ = FixedStack<char *>(2 * bufs.max_beam_width);
-    cache_nhoods_.reserve(bufs.max_beam_width);
+    ongoing_table_ = OngoingTable(2 * bufs.max_beam_width_);
+    visited_set_ = TaggedVisitedSet(bufs.visited_capacity_);
+    prepared_ring_ = FixedRingBuffer<std::pair<PID, char *>>(2 * bufs.max_beam_width_);
+    free_slot_stack_ = FixedStack<char *>(2 * bufs.max_beam_width_);
+    cache_nhoods_.reserve(bufs.max_beam_width_);
   }
 
   /**

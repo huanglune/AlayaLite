@@ -322,13 +322,13 @@ auto main(int argc, char *argv[]) -> int {
   alaya::bench::print_rss("after index load");
 
   alaya::bench::SearchSweepOptions sweep_options;
-  sweep_options.top_k = kTopK;
-  sweep_options.warmup_queries = kWarmup;
-  sweep_options.runs = kRuns;
-  sweep_options.ef_values = ef_values;
-  sweep_options.num_threads = 1;
-  sweep_options.beam_width = 16;
-  sweep_options.allow_batch_search = false;
+  sweep_options.top_k_ = kTopK;
+  sweep_options.warmup_queries_ = kWarmup;
+  sweep_options.runs_ = kRuns;
+  sweep_options.ef_values_ = ef_values;
+  sweep_options.num_threads_ = 1;
+  sweep_options.beam_width_ = 16;
+  sweep_options.allow_batch_search_ = false;
 
   alaya::bench::print_search_table_header();
   auto rows = alaya::bench::run_search_sweep(

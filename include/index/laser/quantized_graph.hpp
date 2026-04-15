@@ -345,8 +345,7 @@ inline void QuantizedGraph::init_thread_pool() {
 
   size_t full_dim = full_dimension();
 
-  int num_threads = static_cast<int>(nthreads_);
-#pragma omp parallel for num_threads(num_threads)
+#pragma omp parallel for num_threads(static_cast<int>(nthreads_))
   for (size_t thread = 0; thread < nthreads_; thread++) {
 #pragma omp critical
     {
@@ -414,8 +413,7 @@ inline void QuantizedGraph::batch_search(const float *__restrict__ query,
                                          uint32_t *__restrict__ results,
                                          size_t num_queries) {
   // Thread-affine context: each thread acquires once, reuses across queries
-  int num_threads = static_cast<int>(nthreads_);
-#pragma omp parallel num_threads(num_threads)
+#pragma omp parallel num_threads(static_cast<int>(nthreads_))
   {
     ThreadDataGuard guard(thread_data_, acquire_thread_data());
 
@@ -467,9 +465,9 @@ inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
     float best_dist = FLT_MAX;
     size_t full_dim = full_dimension();
     for (size_t cur_m = 0; cur_m < medoids_.size(); cur_m++) {
-      float cur_dist = alaya::simd::l2_sqr<float, float>(transformed_query,
-                                                         medoids_vector_.data() + full_dim * cur_m,
-                                                         dimension_);
+      auto cur_dist = alaya::simd::l2_sqr<float, float>(transformed_query,
+                                                        medoids_vector_.data() + full_dim * cur_m,
+                                                        dimension_);
       if (cur_dist < best_dist) {
         best_medoid = medoids_[cur_m];
         best_dist = cur_dist;
@@ -636,7 +634,7 @@ inline auto QuantizedGraph::scan_neighbors(const QGQuery &q_obj,
                                            uint32_t cur_degree,
                                            TaggedVisitedSet &visited,
                                            LaserSearchContext &ctx) const -> float {
-  float sqr_y = alaya::simd::l2_sqr<float, float>(q_obj.query_data(), cur_data, dimension_);
+  auto sqr_y = alaya::simd::l2_sqr<float, float>(q_obj.query_data(), cur_data, dimension_);
 
   const auto *packed_code = reinterpret_cast<const uint8_t *>(&cur_data[code_offset_]);
   const auto *factor = &cur_data[factor_offset_];

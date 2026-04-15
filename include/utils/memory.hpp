@@ -134,7 +134,7 @@ auto operator==(const AlignedAlloc<T, A1, HP1> & /*unused*/,
 template <typename T, size_t A1, bool HP1, typename U, size_t A2, bool HP2>
 auto operator!=(const AlignedAlloc<T, A1, HP1> & /*unused*/,
                 const AlignedAlloc<U, A2, HP2> & /*unused*/) noexcept -> bool {
-  return !(A1 == A2 && HP1 == HP2);
+  return A1 != A2 || HP1 != HP2;
 }
 
 // =====================================================================

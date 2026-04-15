@@ -153,7 +153,7 @@ class BasicVectorFileReader {
   size_t vector_stride_{0};
   size_t vector_bytes_{0};
   uint64_t vector_offset_base_{0};
-  std::unique_ptr<IOUringEngine> engine_{};
+  std::unique_ptr<IOUringEngine> engine_;
   static constexpr uint32_t kQueueDepth = 256;
 
   void close_fd() noexcept {
@@ -277,8 +277,8 @@ class FloatVectorFileReader {
     kFvecs,
   };
 
-  FbinFileReader fbin_{};
-  FvecsFileReader fvecs_{};
+  FbinFileReader fbin_;
+  FvecsFileReader fvecs_;
   ActiveReader active_reader_{ActiveReader::kNone};
 };
 

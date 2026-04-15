@@ -18,14 +18,16 @@ class VamanaGraphReader {
   VamanaGraphReader() = default;
 
   VamanaGraphReader(const VamanaGraphReader &) = delete;
-  VamanaGraphReader &operator=(const VamanaGraphReader &) = delete;
+  auto operator=(const VamanaGraphReader &) -> VamanaGraphReader & = delete;
   VamanaGraphReader(VamanaGraphReader &&) = default;
-  VamanaGraphReader &operator=(VamanaGraphReader &&) = default;
+  auto operator=(VamanaGraphReader &&) -> VamanaGraphReader & = default;
 
   void open(const std::string &path) {
     path_ = path;
     std::ifstream in(path, std::ios::binary);
-    if (!in) throw std::runtime_error("Cannot open vamana: " + path);
+    if (!in) {
+      throw std::runtime_error("Cannot open vamana: " + path);
+    }
 
     in.read(reinterpret_cast<char *>(&file_size_), sizeof(size_t));
     in.read(reinterpret_cast<char *>(&max_degree_), sizeof(uint32_t));
@@ -65,7 +67,9 @@ class VamanaGraphReader {
       std::vector<uint32_t> nbrs(degrees_[nid]);
       in.read(reinterpret_cast<char *>(nbrs.data()),
               static_cast<std::streamsize>(degrees_[nid] * sizeof(uint32_t)));
-      for (auto id : nbrs) in_deg[id]++;
+      for (auto id : nbrs) {
+        in_deg[id]++;
+      }
     }
     return in_deg;
   }

@@ -42,7 +42,7 @@ void write_fvecs(const std::filesystem::path &path,
                  uint32_t dim) {
   std::ofstream out(path, std::ios::binary);
   for (uint32_t i = 0; i < num_vectors; ++i) {
-    int32_t d = static_cast<int32_t>(dim);
+    auto d = static_cast<int32_t>(dim);
     out.write(reinterpret_cast<const char *>(&d), sizeof(d));
     out.write(reinterpret_cast<const char *>(data.data() + static_cast<size_t>(i) * dim),
               static_cast<std::streamsize>(dim * sizeof(float)));
@@ -65,7 +65,9 @@ void write_vamana(const std::filesystem::path &path,
                   uint32_t entry_point,
                   const std::vector<std::vector<uint32_t>> &adj) {
   size_t body_size = 0;
-  for (const auto &nbrs : adj) body_size += sizeof(uint32_t) + nbrs.size() * sizeof(uint32_t);
+  for (const auto &nbrs : adj) {
+    body_size += sizeof(uint32_t) + nbrs.size() * sizeof(uint32_t);
+  }
   constexpr size_t kHdrSz = sizeof(size_t) + 2 * sizeof(uint32_t) + sizeof(size_t);
   size_t file_size = kHdrSz + body_size;
   size_t frozen = 0;
