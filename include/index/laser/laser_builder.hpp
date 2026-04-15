@@ -317,6 +317,7 @@ class LaserBuilder {
     config.alpha_ = params_.alpha_;
     config.max_memory_mb_ = params_.max_memory_mb_;
     config.num_threads_ = num_threads_;
+    config.bootstrap_medoid_ = true;
     return config;
   }
 

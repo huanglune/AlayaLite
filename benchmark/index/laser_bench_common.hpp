@@ -339,6 +339,7 @@ inline auto build_vamana_from_raw(const std::filesystem::path &base_fvecs_path,
   config.alpha_ = options.alpha_;
   config.max_memory_mb_ = options.max_memory_mb_;
   config.num_threads_ = num_threads;
+  config.bootstrap_medoid_ = true;
 
   alaya::ShardVamanaBuilder<float, uint32_t> builder(std::move(vecs.data_),
                                                      stats.dim_,
