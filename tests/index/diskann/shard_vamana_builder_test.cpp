@@ -177,7 +177,7 @@ TEST_F(ShardVamanaBuilderTest, AddReverseEdgeSkipsDuplicatesAndAppendsUnderSlack
             (std::vector<uint32_t>{1U, 2U}));
 }
 
-TEST_F(ShardVamanaBuilderTest, RandomGraphInitializationIsDeterministicAcrossThreadCounts) {
+TEST_F(ShardVamanaBuilderTest, ZeroIterationBuildIsDeterministicAcrossThreadCounts) {
   constexpr uint32_t kSmallDim = 4;
   constexpr uint32_t kSmallNumPoints = 8;
   constexpr uint32_t kSmallMaxDegree = 3;
@@ -210,12 +210,7 @@ TEST_F(ShardVamanaBuilderTest, RandomGraphInitializationIsDeterministicAcrossThr
   EXPECT_EQ(single_thread, multi_thread);
   for (uint32_t node_id = 0; node_id < kSmallNumPoints; ++node_id) {
     auto &neighbors = single_thread[node_id];
-    EXPECT_EQ(neighbors.size(), kSmallMaxDegree);
-    EXPECT_TRUE(std::find(neighbors.begin(), neighbors.end(), node_id) == neighbors.end());
-
-    auto sorted = neighbors;
-    std::sort(sorted.begin(), sorted.end());
-    EXPECT_TRUE(std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end());
+    EXPECT_TRUE(neighbors.empty());
   }
 }
 

@@ -60,6 +60,13 @@ class VamanaFormatWriter {
   VamanaFormatWriter(std::filesystem::path path, uint32_t degree_bound, uint32_t num_nodes)
       : path_(std::move(path)), degree_bound_(degree_bound), in_degree_(num_nodes, 0) {}
 
+  void set_entry_point(uint32_t entry_point) {
+    explicit_entry_point_ = entry_point;
+    has_explicit_entry_point_ = true;
+  }
+
+  void set_frozen_points(size_t frozen_points) { frozen_points_ = frozen_points; }
+
   void open() {
     auto dir = path_.parent_path();
     if (!dir.empty()) {
@@ -73,11 +80,10 @@ class VamanaFormatWriter {
     size_t placeholder_size = 0;
     uint32_t max_degree = degree_bound_;
     uint32_t entry_point = 0;
-    size_t frozen_points = 0;
     output_.write(reinterpret_cast<const char *>(&placeholder_size), sizeof(placeholder_size));
     output_.write(reinterpret_cast<const char *>(&max_degree), sizeof(max_degree));
     output_.write(reinterpret_cast<const char *>(&entry_point), sizeof(entry_point));
-    output_.write(reinterpret_cast<const char *>(&frozen_points), sizeof(frozen_points));
+    output_.write(reinterpret_cast<const char *>(&frozen_points_), sizeof(frozen_points_));
   }
 
   void write_node(const CrossShardMerger::MergedNode &node) {
@@ -106,21 +112,24 @@ class VamanaFormatWriter {
     }
 
     uint32_t entry_point = 0;
-    for (uint32_t node_id = 1; node_id < in_degree_.size(); ++node_id) {
-      if (in_degree_[node_id] > in_degree_[entry_point]) {
-        entry_point = node_id;
+    if (has_explicit_entry_point_) {
+      entry_point = explicit_entry_point_;
+    } else {
+      for (uint32_t node_id = 1; node_id < in_degree_.size(); ++node_id) {
+        if (in_degree_[node_id] > in_degree_[entry_point]) {
+          entry_point = node_id;
+        }
       }
     }
 
     output_.flush();
     auto file_size = static_cast<size_t>(std::filesystem::file_size(path_));
     output_.seekp(0);
-    size_t frozen_points = 0;
     auto header_degree = std::max<uint32_t>(degree_bound_, max_observed_degree_);
     output_.write(reinterpret_cast<const char *>(&file_size), sizeof(file_size));
     output_.write(reinterpret_cast<const char *>(&header_degree), sizeof(header_degree));
     output_.write(reinterpret_cast<const char *>(&entry_point), sizeof(entry_point));
-    output_.write(reinterpret_cast<const char *>(&frozen_points), sizeof(frozen_points));
+    output_.write(reinterpret_cast<const char *>(&frozen_points_), sizeof(frozen_points_));
     if (!output_.good()) {
       throw std::runtime_error("Failed to write Vamana graph (disk full?): " + path_.string());
     }
@@ -134,6 +143,9 @@ class VamanaFormatWriter {
   uint32_t degree_bound_{0};
   uint32_t max_observed_degree_{0};
   std::vector<uint32_t> in_degree_;
+  uint32_t explicit_entry_point_{0};
+  bool has_explicit_entry_point_{false};
+  size_t frozen_points_{0};
   std::ofstream output_;
 };
 
@@ -251,8 +263,14 @@ class LaserBuilder {
   }
 
   void copy_external_vamana() const {
+    auto target = vamana_path();
+    std::error_code ec;
+    if (std::filesystem::exists(target, ec) &&
+        std::filesystem::equivalent(params_.external_vamana_, target, ec)) {
+      return;
+    }
     std::filesystem::copy_file(params_.external_vamana_,
-                               vamana_path(),
+                               target,
                                std::filesystem::copy_options::overwrite_existing);
   }
 
@@ -546,6 +564,7 @@ class LaserBuilder {
 
     // Export directly to Vamana format
     VamanaFormatWriter writer(vamana_path(), params_.max_degree_, num_points_);
+    writer.set_entry_point(builder.medoid_global_id());
     writer.open();
     auto exported = builder.export_nodes();
     for (const auto &node : exported) {

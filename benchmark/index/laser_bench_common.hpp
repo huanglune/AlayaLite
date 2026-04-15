@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -17,11 +18,17 @@
 #include <mutex>
 #include <numeric>
 #include <string>
+#include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "bench_utils.hpp"
+#include "index/diskann/cross_shard_merger.hpp"
+#include "index/diskann/shard_vamana_builder.hpp"
+#include "index/laser/laser_builder.hpp"
 #include "index/laser/laser_index.hpp"
+#include "simd/distance_l2.hpp"
 #include "utils/evaluate.hpp"
 #include "utils/io_utils.hpp"
 #include "utils/timer.hpp"
@@ -189,7 +196,7 @@ inline auto run_search_sweep(LaserIndex &index,
                              uint32_t gt_dim,
                              symqg::LaserSearchParams base_params,
                              const SearchSweepOptions &options,
-                             const std::function<void(size_t)> &on_ef_complete = {})
+                             const std::function<void(const SearchBenchRow &)> &on_ef_complete = {})
     -> std::vector<SearchBenchRow> {
   std::vector<SearchBenchRow> rows;
   rows.reserve(options.ef_values.size());
@@ -269,11 +276,132 @@ inline auto run_search_sweep(LaserIndex &index,
          .p99_9_latency_us = single_query_mode ? (sum_p99_9_latency / options.runs) : 0.0});
 
     if (on_ef_complete) {
-      on_ef_complete(ef);
+      on_ef_complete(rows.back());
     }
   }
 
   return rows;
+}
+
+struct VamanaBuildOptions {
+  uint32_t max_degree_{64};
+  uint32_t ef_construction_{128};
+  float alpha_{1.2F};
+  uint32_t num_threads_{0};
+  size_t max_memory_mb_{8192};
+};
+
+struct VamanaBuildStats {
+  uint32_t num_vectors_{0};
+  uint32_t dim_{0};
+  double load_time_s_{0};
+  double build_time_s_{0};
+  double export_time_s_{0};
+  double avg_degree_{0};
+  uint32_t min_observed_degree_{0};
+  uint32_t max_observed_degree_{0};
+  uint32_t entry_point_{0};
+  size_t output_bytes_{0};
+};
+
+inline auto build_vamana_from_raw(const std::filesystem::path &base_fvecs_path,
+                                  const std::filesystem::path &output_vamana_path,
+                                  const VamanaBuildOptions &options) -> VamanaBuildStats {
+  VamanaBuildStats stats;
+  uint32_t num_threads = options.num_threads_;
+  if (num_threads == 0) {
+    num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) {
+      num_threads = 1;
+    }
+  }
+
+  std::cout << "[vamana] R=" << options.max_degree_ << " L=" << options.ef_construction_
+            << " alpha=" << std::fixed << std::setprecision(2) << options.alpha_
+            << " threads=" << num_threads << " mem=" << options.max_memory_mb_ << " MiB\n"
+            << std::flush;
+
+  alaya::Timer load_timer;
+  auto vecs = alaya::load_float_vectors(base_fvecs_path);
+  stats.num_vectors_ = vecs.num_;
+  stats.dim_ = vecs.dim_;
+  stats.load_time_s_ = load_timer.elapsed_s();
+  std::cout << "[vamana] load " << stats.num_vectors_ << " x " << stats.dim_ << " in "
+            << std::fixed << std::setprecision(1) << stats.load_time_s_ << " s\n"
+            << std::flush;
+
+  std::vector<uint32_t> all_ids(stats.num_vectors_);
+  std::iota(all_ids.begin(), all_ids.end(), 0U);
+
+  typename alaya::ShardVamanaBuilder<float, uint32_t>::Config config;
+  config.max_degree_ = options.max_degree_;
+  config.ef_construction_ = options.ef_construction_;
+  config.alpha_ = options.alpha_;
+  config.max_memory_mb_ = options.max_memory_mb_;
+  config.num_threads_ = num_threads;
+
+  alaya::ShardVamanaBuilder<float, uint32_t> builder(std::move(vecs.data_),
+                                                     stats.dim_,
+                                                     std::move(all_ids),
+                                                     alaya::simd::l2_sqr<float, float>,
+                                                     config);
+
+  alaya::Timer build_timer;
+  builder.build(nullptr);
+  stats.build_time_s_ = build_timer.elapsed_s();
+  std::cout << "[vamana] build " << std::fixed << std::setprecision(1) << stats.build_time_s_
+            << " s ("
+            << static_cast<double>(stats.num_vectors_) / std::max(stats.build_time_s_, 1e-9)
+            << " vec/s)\n"
+            << std::flush;
+
+  alaya::Timer export_timer;
+  alaya::VamanaFormatWriter writer(output_vamana_path, options.max_degree_, stats.num_vectors_);
+  stats.entry_point_ = builder.medoid_global_id();
+  writer.set_entry_point(stats.entry_point_);
+  writer.open();
+
+  auto exported = builder.export_nodes();
+  uint64_t total_degree = 0;
+  uint32_t min_deg = options.max_degree_;
+  uint32_t max_deg = 0;
+  for (const auto &node : exported) {
+    auto deg = static_cast<uint32_t>(node.neighbors_.size());
+    total_degree += deg;
+    min_deg = std::min(min_deg, deg);
+    max_deg = std::max(max_deg, deg);
+
+    alaya::CrossShardMerger::MergedNode merged;
+    merged.global_id_ = node.global_id_;
+    merged.neighbor_ids_.reserve(node.neighbors_.size());
+    for (const auto &nbr : node.neighbors_) {
+      merged.neighbor_ids_.push_back(nbr.id_);
+    }
+    writer.write_node(merged);
+  }
+  writer.finalize();
+  stats.export_time_s_ = export_timer.elapsed_s();
+  stats.avg_degree_ = stats.num_vectors_ > 0
+                          ? static_cast<double>(total_degree) / stats.num_vectors_
+                          : 0.0;
+  stats.min_observed_degree_ = min_deg;
+  stats.max_observed_degree_ = max_deg;
+
+  std::error_code ec;
+  stats.output_bytes_ = std::filesystem::file_size(output_vamana_path, ec);
+  if (ec) {
+    stats.output_bytes_ = 0;
+  }
+
+  std::cout << "[vamana] export " << std::fixed << std::setprecision(1) << stats.export_time_s_
+            << " s, avg_deg=" << std::setprecision(2) << stats.avg_degree_
+            << " (min=" << stats.min_observed_degree_ << ", max=" << stats.max_observed_degree_
+            << "), entry=" << stats.entry_point_ << ", "
+            << (stats.output_bytes_ / (1024UL * 1024UL)) << " MiB -> "
+            << output_vamana_path.string() << '\n'
+            << std::flush;
+
+  return stats;
 }
 
 }  // namespace alaya::bench

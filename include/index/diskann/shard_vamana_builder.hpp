@@ -150,6 +150,7 @@ class ShardVamanaBuilder {
     size_t max_memory_mb_{4096};
     uint32_t num_threads_{0};     ///< 0 = hardware concurrency, 1 = single-threaded
     bool saturate_graph_{false};  ///< Backfill under-connected nodes to max_degree
+    bool bootstrap_medoid_{false};  ///< Non-official warm-start; disabled by default
   };
 
   static constexpr float kGraphSlackFactor = 1.3F;
@@ -228,11 +229,16 @@ class ShardVamanaBuilder {
   [[nodiscard]] auto vectors_loaded() const -> bool { return !vectors_.empty(); }
 
   [[nodiscard]] auto medoid_local_id() const -> LocalIDType { return medoid_local_id_; }
+  [[nodiscard]] auto medoid_global_id() const -> GlobalIDType {
+    return id_map_.local_to_global_[medoid_local_id_];
+  }
 
   void build(ProgressCallback on_progress = nullptr) {
     enforce_memory_budget();
     medoid_local_id_ = compute_medoid();
-    bootstrap_medoid();
+    if (config_.bootstrap_medoid_) {
+      bootstrap_medoid();
+    }
     for (uint32_t pass = 0; pass < config_.num_iterations_; ++pass) {
       // Single-pass: use alpha_ directly (matching official DiskANN).
       // Multi-pass: pass 0 uses alpha_first_pass_ (strict), subsequent passes use alpha_.

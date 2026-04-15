@@ -98,5 +98,42 @@ TEST(VamanaFormatWriterTest, WritesGraphQGBuilderCanParse) {
   EXPECT_EQ(graph.entry_point(), 1U);
 }
 
+TEST(VamanaFormatWriterTest, UsesExplicitEntryPointWhenProvided) {
+  constexpr uint32_t kNumPoints = 4;
+  constexpr uint32_t kDegree = 3;
+  auto vamana_path = make_temp_path("graph_explicit_ep.vamana");
+
+  std::vector<CrossShardMerger::MergedNode> nodes = {
+      {0, {1, 2}},
+      {1, {0, 2, 3}},
+      {2, {1, 3}},
+      {3, {1}},
+  };
+
+  VamanaFormatWriter writer(vamana_path, kDegree, kNumPoints);
+  writer.set_entry_point(2U);
+  writer.open();
+  for (const auto &node : nodes) {
+    writer.write_node(node);
+  }
+  writer.finalize();
+
+  std::ifstream input(vamana_path, std::ios::binary);
+  ASSERT_TRUE(input.is_open());
+  size_t file_size = 0;
+  uint32_t degree_bound = 0;
+  uint32_t entry_point = 0;
+  size_t frozen_points = 0;
+  input.read(reinterpret_cast<char *>(&file_size), sizeof(file_size));
+  input.read(reinterpret_cast<char *>(&degree_bound), sizeof(degree_bound));
+  input.read(reinterpret_cast<char *>(&entry_point), sizeof(entry_point));
+  input.read(reinterpret_cast<char *>(&frozen_points), sizeof(frozen_points));
+
+  EXPECT_EQ(file_size, std::filesystem::file_size(vamana_path));
+  EXPECT_EQ(degree_bound, kDegree);
+  EXPECT_EQ(entry_point, 2U);
+  EXPECT_EQ(frozen_points, 0U);
+}
+
 }  // namespace
 }  // namespace alaya

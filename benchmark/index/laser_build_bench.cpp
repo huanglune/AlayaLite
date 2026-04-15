@@ -2,25 +2,28 @@
  * @file laser_build_bench.cpp
  * @brief End-to-end LASER build + search benchmark with memory budget control.
  *
- * Runs PCA → Medoid → QG using io_uring disk-based access, then benchmarks
- * search QPS/recall/latency. Peak RSS stays within the max_memory budget.
+ * Runs Vamana → PCA → Medoid → QG internally using the shared in-process Vamana
+ * builder, then benchmarks search QPS/recall/latency. Peak RSS stays within the
+ * LASER-phase max_memory budget (the Vamana build has its own separate budget).
  *
  * Usage:
- *   ./laser_build_bench <base_fvecs> <query_fvecs> <gt_ivecs>
- *       <vamana_index> <output_dir>
+ *   ./laser_build_bench <base_fvecs> <query_fvecs> <gt_ivecs> <output_dir>
  *       [max_memory_mib=1024] [max_degree=64] [main_dim=256]
  *       [num_medoids=300] [num_threads=0] [dram_budget_gb=1.0]
  *       [--force-build] [--search-only]
+ *       [--vamana-mem-mib=8192] [--vamana-ef=200] [--vamana-alpha=1.2]
  */
 
 // NOLINTBEGIN
 
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -78,12 +81,12 @@ auto has_reusable_index(const std::filesystem::path &prefix,
 // ============================================================================
 
 auto main(int argc, char *argv[]) -> int {
-  if (argc < 6) {
-    std::cerr << "Usage: " << argv[0] << " <base_fvecs> <query_fvecs> <gt_ivecs>"
-              << " <vamana_index> <output_dir>"
+  if (argc < 5) {
+    std::cerr << "Usage: " << argv[0] << " <base_fvecs> <query_fvecs> <gt_ivecs> <output_dir>"
               << " [max_memory_mib=1024] [max_degree=64] [main_dim=256]"
               << " [num_medoids=300] [num_threads=0] [dram_budget_gb=1.0]"
-              << " [--force-build] [--search-only]\n";
+              << " [--force-build] [--search-only]"
+              << " [--vamana-mem-mib=8192] [--vamana-ef=200] [--vamana-alpha=1.2]\n";
     return 1;
   }
 
@@ -97,12 +100,14 @@ auto main(int argc, char *argv[]) -> int {
   std::string base_path = argv[1];
   std::string query_path = argv[2];
   std::string gt_path = argv[3];
-  std::string vamana_path = argv[4];
-  std::string output_dir = argv[5];
+  std::string output_dir = argv[4];
 
+  size_t vamana_mem_mib = 8192;
+  uint32_t vamana_ef = 200;
+  float vamana_alpha = 1.2F;
   std::vector<std::string> numeric_args;
   numeric_args.reserve(static_cast<size_t>(argc));
-  for (int i = 6; i < argc; ++i) {
+  for (int i = 5; i < argc; ++i) {
     std::string arg = argv[i];
     if (arg == "--force-build") {
       if (build_mode == BuildMode::kSearchOnly) {
@@ -118,6 +123,36 @@ auto main(int argc, char *argv[]) -> int {
         return 1;
       }
       build_mode = BuildMode::kSearchOnly;
+      continue;
+    }
+    constexpr std::string_view kVamanaMemFlag = "--vamana-mem-mib=";
+    if (arg.starts_with(kVamanaMemFlag)) {
+      try {
+        vamana_mem_mib = static_cast<size_t>(std::stoull(arg.substr(kVamanaMemFlag.size())));
+      } catch (const std::exception &e) {
+        std::cerr << "Invalid --vamana-mem-mib value: " << arg << " (" << e.what() << ")\n";
+        return 1;
+      }
+      continue;
+    }
+    constexpr std::string_view kVamanaEfFlag = "--vamana-ef=";
+    if (arg.starts_with(kVamanaEfFlag)) {
+      try {
+        vamana_ef = static_cast<uint32_t>(std::stoul(arg.substr(kVamanaEfFlag.size())));
+      } catch (const std::exception &e) {
+        std::cerr << "Invalid --vamana-ef value: " << arg << " (" << e.what() << ")\n";
+        return 1;
+      }
+      continue;
+    }
+    constexpr std::string_view kVamanaAlphaFlag = "--vamana-alpha=";
+    if (arg.starts_with(kVamanaAlphaFlag)) {
+      try {
+        vamana_alpha = std::stof(arg.substr(kVamanaAlphaFlag.size()));
+      } catch (const std::exception &e) {
+        std::cerr << "Invalid --vamana-alpha value: " << arg << " (" << e.what() << ")\n";
+        return 1;
+      }
       continue;
     }
     numeric_args.push_back(std::move(arg));
@@ -143,17 +178,38 @@ auto main(int argc, char *argv[]) -> int {
 
   std::filesystem::create_directories(output_dir);
   auto prefix = std::filesystem::path(output_dir) / "dsqg_gist";
+  std::filesystem::path internal_vamana_path(prefix.string() + ".vamana.index");
 
-  auto run_build = [&]() {
+  auto run_build = [&](bool force_vamana_rebuild) {
     std::cout << "\n=== Build ===" << '\n' << std::flush;
     alaya::Timer build_timer;
+
+    bool need_vamana = force_vamana_rebuild || !std::filesystem::exists(internal_vamana_path);
+    if (need_vamana) {
+      std::cout << "\n--- Vamana build ---\n" << std::flush;
+      alaya::Timer vamana_timer;
+      alaya::bench::VamanaBuildOptions vamana_opts;
+      vamana_opts.max_degree_ = max_degree;
+      vamana_opts.ef_construction_ = vamana_ef;
+      vamana_opts.alpha_ = vamana_alpha;
+      vamana_opts.num_threads_ = num_threads;
+      vamana_opts.max_memory_mb_ = vamana_mem_mib;
+      alaya::bench::build_vamana_from_raw(base_path, internal_vamana_path, vamana_opts);
+      std::cout << "  Vamana total: " << std::fixed << std::setprecision(1)
+                << vamana_timer.elapsed_s() << " s\n";
+      alaya::bench::print_rss("after vamana build");
+    } else {
+      std::cout << "  Reuse existing Vamana: " << internal_vamana_path.string() << '\n';
+    }
+
+    std::cout << "\n--- LASER build ---\n" << std::flush;
     alaya::LaserBuildParams build_params;
     build_params.main_dim_ = main_dim;
     build_params.max_degree_ = max_degree;
     build_params.num_medoids_ = num_medoids;
     build_params.max_memory_mb_ = max_memory_mib;
     build_params.num_threads_ = num_threads;
-    build_params.external_vamana_ = vamana_path;
+    build_params.external_vamana_ = internal_vamana_path.string();
     build_params.keep_intermediates_ = true;
 
     alaya::LaserBuilder builder(build_params);
@@ -162,17 +218,22 @@ auto main(int argc, char *argv[]) -> int {
     std::cout << "\n=== Build Summary ===" << '\n';
     std::cout << "  Total: " << std::fixed << std::setprecision(1) << build_timer.elapsed_s()
               << " s\n";
-    std::cout << "  Budget: " << max_memory_mib << " MiB\n";
+    std::cout << "  LASER budget: " << max_memory_mib << " MiB\n";
+    std::cout << "  Vamana budget: " << vamana_mem_mib << " MiB\n";
     alaya::bench::print_rss("after build");
   };
 
   alaya::bench::print_rss("initial");
   std::cout << "\n=== Configuration ===" << '\n';
   std::cout << "  max_memory_mib : " << max_memory_mib << '\n';
+  std::cout << "  vamana_mem_mib : " << vamana_mem_mib << '\n';
+  std::cout << "  vamana_ef      : " << vamana_ef << '\n';
+  std::cout << "  vamana_alpha   : " << std::fixed << std::setprecision(2) << vamana_alpha << '\n';
   std::cout << "  build_threads  : " << num_threads << '\n';
   std::cout << "  max_degree     : " << max_degree << '\n';
   std::cout << "  main_dim       : " << main_dim << '\n';
   std::cout << "  num_medoids    : " << num_medoids << '\n';
+  std::cout << "  vamana_path    : " << internal_vamana_path.string() << '\n';
   std::cout << "  build_mode     : "
             << (build_mode == BuildMode::kForceBuild
                     ? "force-build"
@@ -185,7 +246,7 @@ auto main(int argc, char *argv[]) -> int {
   if (build_mode == BuildMode::kForceBuild) {
     std::cout << "\n=== Build ===\n";
     std::cout << "  Force build mode enabled.\n";
-    run_build();
+    run_build(/*force_vamana_rebuild=*/true);
   } else if (has_index) {
     reused_existing_index = true;
     std::cout << "\n=== Build ===\n";
@@ -204,7 +265,7 @@ auto main(int argc, char *argv[]) -> int {
     for (const auto &path : missing_files) {
       std::cout << "    - " << path.string() << '\n';
     }
-    run_build();
+    run_build(/*force_vamana_rebuild=*/false);
   }
 
   // Read dimensions from the base file for search
@@ -255,7 +316,7 @@ auto main(int argc, char *argv[]) -> int {
     }
     std::cout << "  Reused index load failed: " << error.what() << '\n';
     std::cout << "  Fallback to rebuild, then retry load.\n";
-    run_build();
+    run_build(/*force_vamana_rebuild=*/true);
     load_index();
   }
   alaya::bench::print_rss("after index load");
@@ -270,11 +331,9 @@ auto main(int argc, char *argv[]) -> int {
   sweep_options.allow_batch_search = false;
 
   alaya::bench::print_search_table_header();
-  auto rows =
-      alaya::bench::run_search_sweep(index, qvecs, gt_u32, gt_k, search_params, sweep_options);
-  for (const auto &row : rows) {
-    alaya::bench::print_search_table_row(row);
-  }
+  auto rows = alaya::bench::run_search_sweep(
+      index, qvecs, gt_u32, gt_k, search_params, sweep_options,
+      [](const alaya::bench::SearchBenchRow &row) { alaya::bench::print_search_table_row(row); });
   alaya::bench::print_search_table_footer();
 
   alaya::bench::print_rss("final");
