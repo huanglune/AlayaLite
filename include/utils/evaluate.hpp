@@ -73,10 +73,14 @@ auto calc_recall(const IDType *res,
                  uint32_t query_num,
                  uint32_t gt_dim,
                  uint32_t topk) -> float {
+  if (query_num == 0 || topk == 0) {
+    return 0.0F;
+  }
+  uint32_t gt_topk = std::min(gt_dim, topk);
   uint32_t cnt = 0;
   for (uint32_t i = 0; i < query_num; i++) {
     for (uint32_t j = 0; j < topk; j++) {
-      for (uint32_t k = 0; k < gt_dim; k++) {
+      for (uint32_t k = 0; k < gt_topk; k++) {
         if (res[i * topk + j] == gt[i * gt_dim + k]) {
           cnt++;
           break;
@@ -93,10 +97,14 @@ auto calc_recall(const std::vector<std::vector<IDType>> &res,
                  uint32_t query_num,
                  uint32_t gt_dim,
                  uint32_t topk) -> float {
+  if (query_num == 0 || topk == 0) {
+    return 0.0F;
+  }
+  uint32_t gt_topk = std::min(gt_dim, topk);
   uint32_t cnt = 0;
   for (uint32_t i = 0; i < query_num; i++) {
     for (uint32_t j = 0; j < topk; j++) {
-      for (uint32_t k = 0; k < gt_dim; k++) {
+      for (uint32_t k = 0; k < gt_topk; k++) {
         if (res[i][j] == gt[i * gt_dim + k]) {
           cnt++;
           break;

@@ -76,11 +76,15 @@ def load_ivecs(file_path):
 
 
 def calc_recall(result, gt_data):
+    if result.size == 0:
+        return 0.0
     cnt = 0
     row = result.shape[0]
     col = result.shape[1]
+    gt_col = gt_data.shape[1] if gt_data.ndim > 1 else 0
+    gt_k = min(col, gt_col)
     for i in range(row):
-        cnt += len(set(result[i]) & set(gt_data[i]))
+        cnt += len(set(result[i]) & set(gt_data[i][:gt_k]))
     return 1.0 * cnt / (row * col)
 
 

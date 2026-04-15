@@ -126,4 +126,20 @@ TEST(CalcRecallVectorTest, LargerGtDim) {
   EXPECT_FLOAT_EQ(recall, 1.0);  // Both 0 and 5 are in their respective GT
 }
 
+TEST(CalcRecallVectorTest, UsesOnlyTopKGroundTruthWhenGtDimExceedsTopK) {
+  std::vector<std::vector<uint32_t>> res = {{2, 3}};
+  std::vector<uint32_t> gt = {0, 1, 2, 3, 4};  // gt_dim = 5
+  uint32_t topk = 2;
+  float recall = calc_recall(res, gt.data(), 1, 5, topk);
+  EXPECT_FLOAT_EQ(recall, 0.0F);
+}
+
+TEST(CalcRecallTest, UsesOnlyTopKGroundTruthWhenGtDimExceedsTopK) {
+  std::vector<uint32_t> res = {2, 3};
+  std::vector<uint32_t> gt = {0, 1, 2, 3, 4};  // gt_dim = 5
+  uint32_t topk = 2;
+  float recall = calc_recall(res.data(), gt.data(), 1, 5, topk);
+  EXPECT_FLOAT_EQ(recall, 0.0F);
+}
+
 }  // namespace alaya
