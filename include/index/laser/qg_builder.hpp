@@ -172,7 +172,7 @@ class QGBuilder {
     std::vector<std::vector<uint32_t>> nbrs;
     size_t cc = 0;
 
-#pragma omp parallel num_threads(static_cast <int>(num_threads_))
+#pragma omp parallel num_threads(static_cast<int>(num_threads_))
     {
       IOContext ctx{};
 #pragma omp critical

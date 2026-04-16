@@ -31,8 +31,8 @@
 #include <vector>
 
 #include "space/space_concepts.hpp"
-#include "utils/vector_file_reader.hpp"
 #include "utils/kmeans.hpp"
+#include "utils/vector_file_reader.hpp"
 
 namespace alaya {
 
@@ -120,11 +120,14 @@ class KMeansPartitioner {
   [[nodiscard]] auto config() const -> const Config & { return config_; }
 
   /// Must match ShardVamanaBuilder::estimate_peak_memory_bytes per-node cost
-  /// (vectors + neighbor_table + scratch).
+  /// (vectors + neighbor_table + scratch), including the graph slack factor.
+  static constexpr float kGraphSlackFactor = 1.3F;
+
   [[nodiscard]] static auto estimate_per_node_memory(uint32_t dim, uint32_t max_degree) -> size_t {
+    auto slack_degree = static_cast<uint32_t>(static_cast<float>(max_degree) * kGraphSlackFactor);
     auto vectors_bytes = static_cast<size_t>(dim) * sizeof(DataType);
-    auto neighbor_table_bytes = static_cast<size_t>(max_degree) * sizeof(IDType);
-    auto scratch_bytes = static_cast<size_t>(max_degree) * sizeof(float);
+    auto neighbor_table_bytes = static_cast<size_t>(slack_degree) * sizeof(IDType);
+    auto scratch_bytes = static_cast<size_t>(slack_degree) * sizeof(float);
     return vectors_bytes + neighbor_table_bytes + scratch_bytes;
   }
 
@@ -161,10 +164,10 @@ class KMeansPartitioner {
   }
 
   template <typename DistanceSpaceType>
-  requires Space<DistanceSpaceType> &&
-      requires(DistanceSpaceType &space, typename DistanceSpaceType::IDTypeAlias id) {
-    space.get_data_by_id(id);
-  }
+    requires Space<DistanceSpaceType> &&
+             requires(DistanceSpaceType &space, typename DistanceSpaceType::IDTypeAlias id) {
+               space.get_data_by_id(id);
+             }
   auto partition(DistanceSpaceType &space,
                  uint32_t max_degree,
                  const std::filesystem::path &output_prefix) const
@@ -191,8 +194,10 @@ class KMeansPartitioner {
       }
     };
 
-    run_partition_pipeline<SpaceDataType>(
-        layout, output_prefix, read_by_ids_fn, read_sequential_fn);
+    run_partition_pipeline<SpaceDataType>(layout,
+                                          output_prefix,
+                                          read_by_ids_fn,
+                                          read_sequential_fn);
 
     return layout;
   }
@@ -251,26 +256,57 @@ class KMeansPartitioner {
     return layout;
   }
 
-  template <typename ValueType, typename SpaceLayout, typename ReadByIdsFn, typename ReadSequentialFn>
+  template <typename ValueType,
+            typename SpaceLayout,
+            typename ReadByIdsFn,
+            typename ReadSequentialFn>
   void run_partition_pipeline(SpaceLayout &layout,
                               const std::filesystem::path &output_prefix,
                               ReadByIdsFn &&read_by_ids_fn,
                               ReadSequentialFn &&read_sequential_fn) const {
-    auto sample = build_sample<ValueType>(
-        layout.dim_, layout.num_nodes_, layout.num_shards_, read_by_ids_fn);
-    KMeans<ValueType> kmeans(typename KMeans<ValueType>::Config{layout.num_shards_,
-                                                                config_.kmeans_max_iter_,
-                                                                config_.kmeans_num_trials_});
-    auto kmeans_result = kmeans.fit(sample.data(), sample.size() / layout.dim_, layout.dim_);
-    layout.centroids_ = std::move(kmeans_result.centroids_);
+    auto sample =
+        build_sample<ValueType>(layout.dim_, layout.num_nodes_, layout.num_shards_, read_by_ids_fn);
 
-    assign_top_l<ValueType>(layout, read_sequential_fn);
-    rebuild_shard_members(layout);
-    apply_shard_size_cap(layout);
-    rebuild_shard_members(layout);
+    // Iteratively increase shard count until the largest shard fits in budget
+    // (matching official DiskANN's partition_with_ram_budget approach).
+    constexpr uint32_t kMaxRepartitionAttempts = 20;
+    for (uint32_t attempt = 0; attempt < kMaxRepartitionAttempts; ++attempt) {
+      KMeans<ValueType> kmeans(typename KMeans<ValueType>::Config{layout.num_shards_,
+                                                                  config_.kmeans_max_iter_,
+                                                                  config_.kmeans_num_trials_});
+      auto kmeans_result = kmeans.fit(sample.data(), sample.size() / layout.dim_, layout.dim_);
+      layout.centroids_ = std::move(kmeans_result.centroids_);
+
+      assign_top_l<ValueType>(layout, read_sequential_fn);
+      rebuild_shard_members(layout);
+      apply_shard_size_cap(layout);
+      rebuild_shard_members(layout);
+
+      auto max_shard_size = max_shard_member_count(layout);
+      if (max_shard_size <= layout.shard_capacity_) {
+        break;
+      }
+
+      // Largest shard exceeds capacity — increase shard count and retry
+      layout.num_shards_ += 2;
+      layout.shard_size_cap_ = std::min(compute_shard_size_cap(layout.num_nodes_,
+                                                                layout.num_shards_,
+                                                                config_.overlap_factor_,
+                                                                config_.shard_overflow_factor_),
+                                         layout.shard_capacity_);
+    }
 
     persist(layout, output_prefix);
     write_shuffle_file<ValueType>(layout, output_prefix, read_by_ids_fn);
+  }
+
+  template <typename SpaceLayout>
+  [[nodiscard]] static auto max_shard_member_count(const SpaceLayout &layout) -> uint32_t {
+    uint32_t max_size = 0;
+    for (const auto &members : layout.shard_members_) {
+      max_size = std::max(max_size, static_cast<uint32_t>(members.size()));
+    }
+    return max_size;
   }
 
  public:
@@ -328,7 +364,7 @@ class KMeansPartitioner {
     return loaded;
   }
 
-private:
+ private:
   Config config_;
 
   template <typename ValueType, typename ReadByIdsFn>
@@ -367,7 +403,9 @@ private:
     auto vec_bytes = static_cast<size_t>(dim) * sizeof(ValueType);
     auto budget = config_.max_memory_mb_ * 1024UL * 1024UL * 9UL / 10UL;
     auto block_size =
-        std::max(1000U, std::min(num_nodes, static_cast<uint32_t>(budget / std::max<size_t>(1, vec_bytes))));
+        std::max(1000U,
+                 std::min(num_nodes,
+                          static_cast<uint32_t>(budget / std::max<size_t>(1, vec_bytes))));
     std::vector<ValueType> block(static_cast<size_t>(block_size) * dim);
     std::vector<std::pair<float, uint32_t>> distances(num_shards);
 
@@ -379,10 +417,11 @@ private:
         auto node_id = start + offset;
         const auto *vec = block.data() + static_cast<size_t>(offset) * dim;
         for (uint32_t shard = 0; shard < num_shards; ++shard) {
-          distances[shard] = {KMeans<ValueType>::compute_l2_sqr(
-                                  vec,
-                                  layout.centroids_.data() + static_cast<size_t>(shard) * dim,
-                                  dim),
+          distances[shard] = {KMeans<ValueType>::compute_l2_sqr(vec,
+                                                                layout.centroids_.data() +
+                                                                    static_cast<size_t>(shard) *
+                                                                        dim,
+                                                                dim),
                               shard};
         }
 
@@ -459,10 +498,8 @@ private:
         ++remove_idx;
       }
 
-      if (members.size() > layout.shard_size_cap_) {
-        throw std::runtime_error(
-            "Shard size cap cannot be satisfied without dropping primary assignments");
-      }
+      // If still over cap after removing secondary assignments, the iterative
+      // repartition loop in run_partition_pipeline will increase shard count.
     }
   }
 

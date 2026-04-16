@@ -148,8 +148,8 @@ class ShardVamanaBuilder {
     float alpha_first_pass_{1.0F};
     uint32_t max_occlusion_size_{750};  ///< Max candidates for pruning (DiskANN maxc)
     size_t max_memory_mb_{4096};
-    uint32_t num_threads_{0};     ///< 0 = hardware concurrency, 1 = single-threaded
-    bool saturate_graph_{false};  ///< Backfill under-connected nodes to max_degree
+    uint32_t num_threads_{0};       ///< 0 = hardware concurrency, 1 = single-threaded
+    bool saturate_graph_{false};    ///< Backfill under-connected nodes to max_degree
     bool bootstrap_medoid_{false};  ///< Non-official warm-start; disabled by default
   };
 

@@ -42,8 +42,12 @@ struct LaserBuildParams {
   uint32_t num_threads_{0};
   size_t max_memory_mb_{4096};
   bool keep_intermediates_{false};
-  bool single_shard_{false};     ///< Skip partitioning; build one full Vamana graph
-  std::string external_vamana_;  ///< If set, use this Vamana file instead of building
+  size_t vamana_max_memory_mb_{0};  ///< 0 = inherit from max_memory_mb_
+  std::string external_vamana_;     ///< If set, use this Vamana file instead of building
+
+  [[nodiscard]] auto resolved_vamana_memory_mb() const -> size_t {
+    return vamana_max_memory_mb_ > 0 ? vamana_max_memory_mb_ : max_memory_mb_;
+  }
 
   [[nodiscard]] static auto auto_main_dim(uint32_t full_dim) -> uint32_t {
     if (full_dim == 0) {
@@ -115,7 +119,7 @@ struct LaserBuildParams {
            << ef_construction_ << '|' << ef_build_ << '|' << alpha_ << '|' << num_medoids_ << '|'
            << pca_sample_ratio_ << '|' << pca_sample_cap_ << '|' << medoid_sample_ratio_ << '|'
            << medoid_sample_cap_ << '|' << num_threads_ << '|' << max_memory_mb_ << '|'
-           << keep_intermediates_ << '|' << single_shard_;
+           << keep_intermediates_ << '|' << vamana_max_memory_mb_;
 
     constexpr uint64_t kFnvOffset = 1469598103934665603ULL;
     constexpr uint64_t kFnvPrime = 1099511628211ULL;

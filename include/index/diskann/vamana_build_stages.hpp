@@ -99,18 +99,17 @@ auto run_partition_stage(
 
 template <typename DistanceSpaceType>
   requires Space<DistanceSpaceType> &&
-      requires(DistanceSpaceType &space, typename DistanceSpaceType::IDTypeAlias id) {
-    space.get_data_by_id(id);
-  }
+           requires(DistanceSpaceType &space, typename DistanceSpaceType::IDTypeAlias id) {
+             space.get_data_by_id(id);
+           }
 auto run_partition_stage(
     DistanceSpaceType &space,
     uint32_t max_degree,
     const std::filesystem::path &output_prefix,
     const typename KMeansPartitioner<typename DistanceSpaceType::DataTypeAlias,
                                      typename DistanceSpaceType::IDTypeAlias>::Config
-        &partition_config)
-    -> PartitionResult<typename DistanceSpaceType::DataTypeAlias,
-                       typename DistanceSpaceType::IDTypeAlias> {
+        &partition_config) -> PartitionResult<typename DistanceSpaceType::DataTypeAlias,
+                                              typename DistanceSpaceType::IDTypeAlias> {
   using DataType = typename DistanceSpaceType::DataTypeAlias;
   using IDType = typename DistanceSpaceType::IDTypeAlias;
   KMeansPartitioner<DataType, IDType> partitioner(partition_config);
@@ -155,10 +154,11 @@ auto run_shard_build_stage(
         "Shard " + std::to_string(shard_id + 1) + "/" + std::to_string(partition.num_shards_);
     ProgressBar shard_bar(shard_prefix, shard_total);
 
-    auto shard_vectors = ShardBuilder::load_vectors_from_shuffle(partition.shuffle_path_,
-                                                                 partition.shuffle_offsets_[shard_id],
-                                                                 partition.shuffle_counts_[shard_id],
-                                                                 dim);
+    auto shard_vectors =
+        ShardBuilder::load_vectors_from_shuffle(partition.shuffle_path_,
+                                                partition.shuffle_offsets_[shard_id],
+                                                partition.shuffle_counts_[shard_id],
+                                                dim);
 
     ShardBuilder shard_builder(std::move(shard_vectors), dim, members, dist_fn, shard_config);
     shard_builder.build([&shard_bar]() {

@@ -145,6 +145,7 @@ class RssMonitor {
 struct SearchSweepOptions {
   uint32_t top_k_ = 10;
   size_t warmup_queries_ = 3;
+  size_t warmup_batches_ = 0;
   size_t runs_ = 5;
   std::vector<size_t> ef_values_;
   size_t num_threads_ = 1;
@@ -226,6 +227,21 @@ inline auto run_search_sweep(LaserIndex &index,
     auto warmup_count = std::min(options.warmup_queries_, static_cast<size_t>(nq));
     for (size_t warmup = 0; warmup < warmup_count; ++warmup) {
       index.search(qvecs.data_.data() + warmup * qdim, options.top_k_, warmup_result.data());
+    }
+
+    for (size_t wb = 0; wb < options.warmup_batches_; ++wb) {
+      if (kSingleQueryMode) {
+        for (uint32_t i = 0; i < nq; ++i) {
+          index.search(qvecs.data_.data() + static_cast<size_t>(i) * qdim,
+                       options.top_k_,
+                       results.data() + static_cast<size_t>(i) * options.top_k_);
+        }
+      } else {
+        index.batch_search(qvecs.data_.data(),
+                           static_cast<size_t>(nq),
+                           options.top_k_,
+                           results.data());
+      }
     }
 
     double sum_qps = 0;

@@ -12,6 +12,7 @@
  *       [num_medoids=300] [num_threads=0] [dram_budget_gb=1.0]
  *       [--force-build] [--search-only]
  *       [--vamana-mem-mib=8192] [--vamana-ef=200] [--vamana-alpha=1.2]
+ *       [--search-threads=1] [--search-batch]
  */
 
 // NOLINTBEGIN
@@ -86,7 +87,8 @@ auto main(int argc, char *argv[]) -> int {
               << " [max_memory_mib=1024] [max_degree=64] [main_dim=256]"
               << " [num_medoids=300] [num_threads=0] [dram_budget_gb=1.0]"
               << " [--force-build] [--search-only]"
-              << " [--vamana-mem-mib=8192] [--vamana-ef=200] [--vamana-alpha=1.2]\n";
+              << " [--vamana-mem-mib=8192] [--vamana-ef=200] [--vamana-alpha=1.2]"
+              << " [--search-threads=1] [--search-batch]\n";
     return 1;
   }
 
@@ -105,6 +107,9 @@ auto main(int argc, char *argv[]) -> int {
   size_t vamana_mem_mib = 8192;
   uint32_t vamana_ef = 200;
   float vamana_alpha = 1.2F;
+  uint32_t search_threads = 1;
+  bool search_batch = false;
+  bool builtin_vamana = false;
   std::vector<std::string> numeric_args;
   numeric_args.reserve(static_cast<size_t>(argc));
   for (int i = 5; i < argc; ++i) {
@@ -155,6 +160,30 @@ auto main(int argc, char *argv[]) -> int {
       }
       continue;
     }
+    constexpr std::string_view kSearchThreadsFlag = "--search-threads=";
+    if (arg.starts_with(kSearchThreadsFlag)) {
+      try {
+        auto value = static_cast<uint32_t>(std::stoul(arg.substr(kSearchThreadsFlag.size())));
+        if (value == 0) {
+          std::cerr << "Invalid --search-threads value: " << arg
+                    << " (must be >= 1, explicit thread count required)\n";
+          return 1;
+        }
+        search_threads = value;
+      } catch (const std::exception &e) {
+        std::cerr << "Invalid --search-threads value: " << arg << " (" << e.what() << ")\n";
+        return 1;
+      }
+      continue;
+    }
+    if (arg == "--search-batch") {
+      search_batch = true;
+      continue;
+    }
+    if (arg == "--builtin-vamana") {
+      builtin_vamana = true;
+      continue;
+    }
     numeric_args.push_back(std::move(arg));
   }
 
@@ -173,7 +202,8 @@ auto main(int argc, char *argv[]) -> int {
 
   constexpr uint32_t kTopK = 10;
   constexpr size_t kWarmup = 2;
-  constexpr size_t kRuns = 5;
+  constexpr size_t kWarmupBatches = 5;
+  constexpr size_t kRuns = 10;
   const std::vector<size_t> ef_values = {80, 100, 150, 200, 300, 500};
 
   std::filesystem::create_directories(output_dir);
@@ -184,34 +214,40 @@ auto main(int argc, char *argv[]) -> int {
     std::cout << "\n=== Build ===" << '\n' << std::flush;
     alaya::Timer build_timer;
 
-    bool need_vamana = force_vamana_rebuild || !std::filesystem::exists(internal_vamana_path);
-    if (need_vamana) {
-      std::cout << "\n--- Vamana build ---\n" << std::flush;
-      alaya::Timer vamana_timer;
-      alaya::bench::VamanaBuildOptions vamana_opts;
-      vamana_opts.max_degree_ = max_degree;
-      vamana_opts.ef_construction_ = vamana_ef;
-      vamana_opts.alpha_ = vamana_alpha;
-      vamana_opts.num_threads_ = num_threads;
-      vamana_opts.max_memory_mb_ = vamana_mem_mib;
-      alaya::bench::build_vamana_from_raw(base_path, internal_vamana_path, vamana_opts);
-      std::cout << "  Vamana total: " << std::fixed << std::setprecision(1)
-                << vamana_timer.elapsed_s() << " s\n";
-      alaya::bench::print_rss("after vamana build");
-    } else {
-      std::cout << "  Reuse existing Vamana: " << internal_vamana_path.string() << '\n';
-    }
-
-    std::cout << "\n--- LASER build ---\n" << std::flush;
     alaya::LaserBuildParams build_params;
     build_params.main_dim_ = main_dim;
     build_params.max_degree_ = max_degree;
+    build_params.ef_construction_ = vamana_ef;
+    build_params.alpha_ = vamana_alpha;
     build_params.num_medoids_ = num_medoids;
     build_params.max_memory_mb_ = max_memory_mib;
     build_params.num_threads_ = num_threads;
-    build_params.external_vamana_ = internal_vamana_path.string();
     build_params.keep_intermediates_ = true;
 
+    if (builtin_vamana) {
+      build_params.vamana_max_memory_mb_ = vamana_mem_mib;
+    } else {
+      bool need_vamana = force_vamana_rebuild || !std::filesystem::exists(internal_vamana_path);
+      if (need_vamana) {
+        std::cout << "\n--- Vamana build (external) ---\n" << std::flush;
+        alaya::Timer vamana_timer;
+        alaya::bench::VamanaBuildOptions vamana_opts;
+        vamana_opts.max_degree_ = max_degree;
+        vamana_opts.ef_construction_ = vamana_ef;
+        vamana_opts.alpha_ = vamana_alpha;
+        vamana_opts.num_threads_ = num_threads;
+        vamana_opts.max_memory_mb_ = vamana_mem_mib;
+        alaya::bench::build_vamana_from_raw(base_path, internal_vamana_path, vamana_opts);
+        std::cout << "  Vamana total: " << std::fixed << std::setprecision(1)
+                  << vamana_timer.elapsed_s() << " s\n";
+        alaya::bench::print_rss("after vamana build");
+      } else {
+        std::cout << "  Reuse existing Vamana: " << internal_vamana_path.string() << '\n';
+      }
+      build_params.external_vamana_ = internal_vamana_path.string();
+    }
+
+    std::cout << "\n--- LASER build ---\n" << std::flush;
     alaya::LaserBuilder builder(build_params);
     builder.build(base_path, prefix.string());
 
@@ -220,6 +256,7 @@ auto main(int argc, char *argv[]) -> int {
               << " s\n";
     std::cout << "  LASER budget: " << max_memory_mib << " MiB\n";
     std::cout << "  Vamana budget: " << vamana_mem_mib << " MiB\n";
+    std::cout << "  Builtin vamana: " << (builtin_vamana ? "true" : "false") << '\n';
     alaya::bench::print_rss("after build");
   };
 
@@ -230,10 +267,13 @@ auto main(int argc, char *argv[]) -> int {
   std::cout << "  vamana_ef      : " << vamana_ef << '\n';
   std::cout << "  vamana_alpha   : " << std::fixed << std::setprecision(2) << vamana_alpha << '\n';
   std::cout << "  build_threads  : " << num_threads << '\n';
+  std::cout << "  search_threads : " << search_threads << '\n';
+  std::cout << "  search_batch   : " << (search_batch ? "true" : "false") << '\n';
   std::cout << "  max_degree     : " << max_degree << '\n';
   std::cout << "  main_dim       : " << main_dim << '\n';
   std::cout << "  num_medoids    : " << num_medoids << '\n';
   std::cout << "  vamana_path    : " << internal_vamana_path.string() << '\n';
+  std::cout << "  builtin_vamana : " << (builtin_vamana ? "true" : "false") << '\n';
   std::cout << "  build_mode     : "
             << (build_mode == BuildMode::kForceBuild
                     ? "force-build"
@@ -293,7 +333,7 @@ auto main(int argc, char *argv[]) -> int {
   alaya::LaserIndex index;
   symqg::LaserSearchParams search_params;
   search_params.ef_search = 200;
-  search_params.num_threads = 1;
+  search_params.num_threads = search_threads;
   search_params.beam_width = 16;
   search_params.search_dram_budget_gb = dram_budget;
   auto load_index = [&]() {
@@ -324,11 +364,12 @@ auto main(int argc, char *argv[]) -> int {
   alaya::bench::SearchSweepOptions sweep_options;
   sweep_options.top_k_ = kTopK;
   sweep_options.warmup_queries_ = kWarmup;
+  sweep_options.warmup_batches_ = kWarmupBatches;
   sweep_options.runs_ = kRuns;
   sweep_options.ef_values_ = ef_values;
-  sweep_options.num_threads_ = 1;
+  sweep_options.num_threads_ = search_threads;
   sweep_options.beam_width_ = 16;
-  sweep_options.allow_batch_search_ = false;
+  sweep_options.allow_batch_search_ = search_batch;
 
   alaya::bench::print_search_table_header();
   auto rows = alaya::bench::run_search_sweep(

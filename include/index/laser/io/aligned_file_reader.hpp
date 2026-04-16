@@ -72,14 +72,9 @@ struct AlignedRead {
 
 namespace detail {
 
-inline void prepare_iocbs(int fd,
-                          AlignedRead *reqs,
-                          size_t count,
-                          iocb *cb_buf,
-                          iocb **cbs_buf) {
+inline void prepare_iocbs(int fd, AlignedRead *reqs, size_t count, iocb *cb_buf, iocb **cbs_buf) {
   for (size_t j = 0; j < count; ++j) {
-    io_prep_pread(&cb_buf[j], fd, reqs[j].buf_, reqs[j].len_,
-                  static_cast<off_t>(reqs[j].offset_));
+    io_prep_pread(&cb_buf[j], fd, reqs[j].buf_, reqs[j].len_, static_cast<off_t>(reqs[j].offset_));
     cb_buf[j].data = reinterpret_cast<void *>(static_cast<uintptr_t>(reqs[j].id_));  // NOLINT
     cbs_buf[j] = &cb_buf[j];
   }
@@ -88,10 +83,9 @@ inline void prepare_iocbs(int fd,
 inline auto submit_and_check(io_context_t ctx, size_t count, iocb **cbs) -> int {
   int ret = io_submit(ctx, static_cast<int64_t>(count), cbs);
   if (ret != static_cast<int>(count)) {
-    throw std::runtime_error(
-        std::string("io_submit() failed; returned ") + std::to_string(ret) +
-        ", expected=" + std::to_string(count) +
-        ", errno=" + std::to_string(errno) + "=" + ::strerror(errno));
+    throw std::runtime_error(std::string("io_submit() failed; returned ") + std::to_string(ret) +
+                             ", expected=" + std::to_string(count) +
+                             ", errno=" + std::to_string(errno) + "=" + ::strerror(errno));
   }
   return ret;
 }
@@ -232,12 +226,14 @@ class LinuxAlignedFileReader {
 
   void get_events(IOContext &ctx, int n_ops) {
     std::vector<io_event> evts(n_ops);
-    auto ret = io_getevents(ctx, static_cast<int64_t>(n_ops), static_cast<int64_t>(n_ops),
-                            evts.data(), nullptr);
+    auto ret = io_getevents(ctx,
+                            static_cast<int64_t>(n_ops),
+                            static_cast<int64_t>(n_ops),
+                            evts.data(),
+                            nullptr);
     if (ret != static_cast<int64_t>(n_ops)) {
-      throw std::runtime_error(
-          std::string("io_getevents() failed; returned ") + std::to_string(ret) +
-          ", expected=" + std::to_string(n_ops));
+      throw std::runtime_error(std::string("io_getevents() failed; returned ") +
+                               std::to_string(ret) + ", expected=" + std::to_string(n_ops));
     }
   }
 
@@ -256,12 +252,12 @@ class LinuxAlignedFileReader {
     }
 #endif
 
-    uint64_t n_iters = round_up(read_reqs.size(), kDefaultAioEventsPerThread) /
-                        kDefaultAioEventsPerThread;
+    uint64_t n_iters =
+        round_up(read_reqs.size(), kDefaultAioEventsPerThread) / kDefaultAioEventsPerThread;
     for (uint64_t iter = 0; iter < n_iters; ++iter) {
-      uint64_t n_ops = std::min(
-          static_cast<uint64_t>(read_reqs.size()) - (iter * kDefaultAioEventsPerThread),
-          static_cast<uint64_t>(kDefaultAioEventsPerThread));
+      uint64_t n_ops =
+          std::min(static_cast<uint64_t>(read_reqs.size()) - (iter * kDefaultAioEventsPerThread),
+                   static_cast<uint64_t>(kDefaultAioEventsPerThread));
 
       std::vector<iocb> cb(n_ops);
       std::vector<iocb *> cbs(n_ops);
@@ -270,12 +266,14 @@ class LinuxAlignedFileReader {
       detail::submit_and_check(ctx, n_ops, cbs.data());
 
       std::vector<io_event> evts(n_ops);
-      auto ret = io_getevents(ctx, static_cast<int64_t>(n_ops), static_cast<int64_t>(n_ops),
-                              evts.data(), nullptr);
+      auto ret = io_getevents(ctx,
+                              static_cast<int64_t>(n_ops),
+                              static_cast<int64_t>(n_ops),
+                              evts.data(),
+                              nullptr);
       if (ret != static_cast<int64_t>(n_ops)) {
-        throw std::runtime_error(
-            std::string("io_getevents() failed; returned ") + std::to_string(ret) +
-            ", expected=" + std::to_string(n_ops));
+        throw std::runtime_error(std::string("io_getevents() failed; returned ") +
+                                 std::to_string(ret) + ", expected=" + std::to_string(n_ops));
       }
     }
   }

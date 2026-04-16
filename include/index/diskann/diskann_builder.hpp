@@ -31,7 +31,6 @@
 #include "diskann_params.hpp"
 #include "kmeans_partitioner.hpp"
 #include "shard_vamana_builder.hpp"
-#include "vamana_build_stages.hpp"
 #include "space/space_concepts.hpp"
 #include "storage/buffer/buffer_pool.hpp"
 #include "storage/diskann/data_file.hpp"
@@ -41,6 +40,7 @@
 #include "utils/macros.hpp"
 #include "utils/progress_bar.hpp"
 #include "utils/timer.hpp"
+#include "vamana_build_stages.hpp"
 
 namespace alaya {
 
@@ -121,22 +121,18 @@ struct DiskANNBuilder {
       partition_config.sample_rate_ = params_.sample_rate_;
       partition_config.overlap_factor_ = params_.overlap_factor_;
 
-      auto partition = run_partition_stage(*space_,
-                                           params_.max_degree_,
-                                           intermediate_prefix,
-                                           partition_config);
+      auto partition =
+          run_partition_stage(*space_, params_.max_degree_, intermediate_prefix, partition_config);
       cleanup_paths.insert(cleanup_paths.end(),
                            partition.cleanup_paths_.begin(),
                            partition.cleanup_paths_.end());
-      auto shard_capacity = KMeansPartitioner<DataType, IDType>::compute_shard_capacity(
-          dim_,
-          params_.max_degree_,
-          params_.max_memory_mb_);
+      auto shard_capacity =
+          KMeansPartitioner<DataType, IDType>::compute_shard_capacity(dim_,
+                                                                      params_.max_degree_,
+                                                                      params_.max_memory_mb_);
 
       console::phase_done("KMeans partitioning", phase_timer.elapsed_s());
-      LOG_INFO("DiskANN: Phase 1 - {} shards, capacity {}",
-               partition.num_shards_,
-               shard_capacity);
+      LOG_INFO("DiskANN: Phase 1 - {} shards, capacity {}", partition.num_shards_, shard_capacity);
 
       // ---- Phase 2: Per-Shard Vamana Build ----
       phase_timer.reset();
@@ -164,16 +160,16 @@ struct DiskANNBuilder {
                                 dist_fn,
                                 shard_config,
                                 [&](uint32_t shard_id,
-                                    const typename ShardVamanaBuilder<
-                                        DataType,
-                                        IDType>::ShardExportSummary &summary) {
+                                    const typename ShardVamanaBuilder<DataType, IDType>::
+                                        ShardExportSummary &summary) {
                                   cleanup_paths.push_back(summary.graph_path_);
-                                  LOG_INFO("DiskANN: Shard {}/{} complete, {} nodes exported, "
-                                           "peak ~{}MB",
-                                           shard_id + 1,
-                                           partition.num_shards_,
-                                           summary.num_nodes_,
-                                           summary.estimated_peak_memory_bytes_ / (1024 * 1024));
+                                  LOG_INFO(
+                                      "DiskANN: Shard {}/{} complete, {} nodes exported, "
+                                      "peak ~{}MB",
+                                      shard_id + 1,
+                                      partition.num_shards_,
+                                      summary.num_nodes_,
+                                      summary.estimated_peak_memory_bytes_ / (1024 * 1024));
                                 });
 
       console::phase_done("Per-shard Vamana build", phase_timer.elapsed_s());
@@ -197,24 +193,27 @@ struct DiskANNBuilder {
 
       uint32_t nodes_written = 0;
       ProgressBar merge_bar("Cross-shard merge", vec_num);
-      run_merge_stage(
-          shard_graph_paths, merge_config, [&](const CrossShardMerger::MergedNode &node) {
-            auto node_id = static_cast<IDType>(node.global_id_);
-            const auto *vec = space_->get_data_by_id(node_id);
+      run_merge_stage(shard_graph_paths,
+                      merge_config,
+                      [&](const CrossShardMerger::MergedNode &node) {
+                        auto node_id = static_cast<IDType>(node.global_id_);
+                        const auto *vec = space_->get_data_by_id(node_id);
 
-            storage.meta().set_valid(node_id);
-            storage.meta().insert_mapping(static_cast<uint32_t>(node_id),
-                                          static_cast<uint32_t>(node_id));
+                        storage.meta().set_valid(node_id);
+                        storage.meta().insert_mapping(static_cast<uint32_t>(node_id),
+                                                      static_cast<uint32_t>(node_id));
 
-            auto ref = storage.data().get_node(node_id);
-            ref.set_vector(std::span<const DataType>(vec, dim_));
+                        auto ref = storage.data().get_node(node_id);
+                        ref.set_vector(std::span<const DataType>(vec, dim_));
 
-            std::vector<IDType> neighbor_ids(node.neighbor_ids_.begin(), node.neighbor_ids_.end());
-            ref.set_neighbors(std::span<const IDType>(neighbor_ids.data(), neighbor_ids.size()));
+                        std::vector<IDType> neighbor_ids(node.neighbor_ids_.begin(),
+                                                         node.neighbor_ids_.end());
+                        ref.set_neighbors(
+                            std::span<const IDType>(neighbor_ids.data(), neighbor_ids.size()));
 
-            ++nodes_written;
-            merge_bar.tick();
-          });
+                        ++nodes_written;
+                        merge_bar.tick();
+                      });
       merge_bar.finish();
 
       console::phase_done("Cross-shard merge", phase_timer.elapsed_s());

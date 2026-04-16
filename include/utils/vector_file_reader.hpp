@@ -23,12 +23,12 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>  // NOLINT(build/c++17)
 #include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include <filesystem>  // NOLINT(build/c++17)
 
 #include "storage/io/io_uring_engine.hpp"
 
@@ -76,7 +76,7 @@ struct FvecsVectorFormat {
     vector_stride = sizeof(int32_t) + vector_bytes;
     vector_offset_base = sizeof(int32_t);
 
-    struct stat st {};
+    struct stat st{};
     if (::fstat(fd, &st) != 0) {
       throw std::runtime_error("Failed to stat fvecs file: " + path);
     }
@@ -94,9 +94,7 @@ template <typename Format>
 class BasicVectorFileReader {
  public:
   BasicVectorFileReader() = default;
-  ~BasicVectorFileReader() {
-    close_fd();
-  }
+  ~BasicVectorFileReader() { close_fd(); }
 
   BasicVectorFileReader(const BasicVectorFileReader &) = delete;
   auto operator=(const BasicVectorFileReader &) -> BasicVectorFileReader & = delete;
@@ -111,8 +109,13 @@ class BasicVectorFileReader {
     }
 
     try {
-      Format::init(
-          fd_, path, dim_, num_vectors_, vector_stride_, vector_bytes_, vector_offset_base_);
+      Format::init(fd_,
+                   path,
+                   dim_,
+                   num_vectors_,
+                   vector_stride_,
+                   vector_bytes_,
+                   vector_offset_base_);
     } catch (...) {
       close_fd();
       throw;
@@ -200,9 +203,7 @@ using FvecsFileReader = BasicVectorFileReader<detail::FvecsVectorFormat>;
 
 class FloatVectorFileReader {
  public:
-  void open(const std::filesystem::path &path) {
-    open(path.string());
-  }
+  void open(const std::filesystem::path &path) { open(path.string()); }
 
   void open(const std::string &path) {
     auto ext = std::filesystem::path(path).extension().string();

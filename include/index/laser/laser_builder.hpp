@@ -226,11 +226,23 @@ class LaserBuilder {
       run_external_vamana_pipeline();
       return;
     }
-    if (params_.single_shard_) {
+    if (needs_sharding()) {
+      run_multi_shard_pipeline();
+    } else {
       run_single_shard_pipeline();
-      return;
     }
-    run_multi_shard_pipeline();
+  }
+
+  [[nodiscard]] auto needs_sharding() const -> bool {
+    constexpr double kBudgetFraction = 0.9;
+    auto vamana_mem = params_.resolved_vamana_memory_mb();
+    auto budget_bytes =
+        static_cast<size_t>(static_cast<double>(vamana_mem) * 1024.0 * 1024.0 * kBudgetFraction);
+    auto peak =
+        ShardVamanaBuilder<float, uint32_t>::estimate_peak_memory_bytes(num_points_,
+                                                                        full_dim_,
+                                                                        params_.max_degree_);
+    return peak > budget_bytes;
   }
 
   void run_external_vamana_pipeline() {
@@ -305,7 +317,7 @@ class LaserBuilder {
   [[nodiscard]] auto make_partition_config() const ->
       typename KMeansPartitioner<float, uint32_t>::Config {
     typename KMeansPartitioner<float, uint32_t>::Config config;
-    config.max_memory_mb_ = params_.max_memory_mb_;
+    config.max_memory_mb_ = params_.resolved_vamana_memory_mb();
     return config;
   }
 
@@ -315,7 +327,7 @@ class LaserBuilder {
     config.max_degree_ = params_.max_degree_;
     config.ef_construction_ = params_.ef_construction_;
     config.alpha_ = params_.alpha_;
-    config.max_memory_mb_ = params_.max_memory_mb_;
+    config.max_memory_mb_ = params_.resolved_vamana_memory_mb();
     config.num_threads_ = num_threads_;
     config.bootstrap_medoid_ = true;
     return config;

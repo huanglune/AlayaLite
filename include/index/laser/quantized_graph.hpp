@@ -276,12 +276,14 @@ class QuantizedGraph {
 //
 //   [0 .. dimension_)                    main PCA-rotated vector    (32 bits/dim)
 //   [dimension_ .. code_offset_)         residual vector            (32 bits/dim)
-//   [code_offset_ .. factor_offset_)     RaBitQ packed codes        (padded_dim/64 * 2 * degree uint8s)
-//   [factor_offset_ .. neighbor_offset_) correction factors         (3 floats per neighbor: triple_x, factor_dq, factor_vq)
-//   [neighbor_offset_ .. row_offset_)    neighbor PIDs              (1 uint32 per neighbor)
+//   [code_offset_ .. factor_offset_)     RaBitQ packed codes        (padded_dim/64 * 2 * degree
+//   uint8s) [factor_offset_ .. neighbor_offset_) correction factors         (3 floats per neighbor:
+//   triple_x, factor_dq, factor_vq) [neighbor_offset_ .. row_offset_)    neighbor PIDs (1 uint32
+//   per neighbor)
 //
 // node_len_ in bytes = (32*main_dim + 32*residual_dim + 128*degree + degree*padded_dim) / 8
-//                    = main_vec_bytes + residual_bytes + factor_bytes(12*deg) + code_bytes(padded*deg/8) + neighbor_bytes(4*deg)
+//                    = main_vec_bytes + residual_bytes + factor_bytes(12*deg) +
+//                    code_bytes(padded*deg/8) + neighbor_bytes(4*deg)
 //
 // Nodes are packed into pages for Direct I/O. node_per_page_ = floor(kSectorLen / node_len_).
 // page_size_ is rounded up to kSectorLen (4096) alignment for O_DIRECT.
@@ -328,11 +330,12 @@ inline void QuantizedGraph::initialize() {
   assert(padded_dim_ % 64 == 0);
   assert(padded_dim_ >= dimension_);
 
-  res_dim_offset_ = dimension_;                                           // residual vector start (float units)
-  code_offset_ = dimension_ + residual_dimension_;                        // RaBitQ codes start
+  res_dim_offset_ = dimension_;                     // residual vector start (float units)
+  code_offset_ = dimension_ + residual_dimension_;  // RaBitQ codes start
   factor_offset_ = code_offset_ + padded_dim_ / 64 * 2 * degree_bound_;  // correction factors start
-  neighbor_offset_ = factor_offset_ + sizeof(Factor) * degree_bound_ / sizeof(float);  // neighbor PIDs start
-  row_offset_ = neighbor_offset_ + degree_bound_;                         // end of node (float units)
+  neighbor_offset_ =
+      factor_offset_ + sizeof(Factor) * degree_bound_ / sizeof(float);  // neighbor PIDs start
+  row_offset_ = neighbor_offset_ + degree_bound_;                       // end of node (float units)
 }
 
 inline void QuantizedGraph::init_thread_pool() {
@@ -523,8 +526,7 @@ inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
       auto id = static_cast<PID>(reinterpret_cast<uintptr_t>(evts[i].data));
       // Check AIO completion status: res < 0 means I/O error,
       // res != page_size_ means short read (partial page)
-      if (evts[i].res < 0 ||
-          static_cast<size_t>(evts[i].res) < page_size_) {
+      if (evts[i].res < 0 || static_cast<size_t>(evts[i].res) < page_size_) {
         // I/O failed or short read: reclaim slot, skip this node
         char *buf = ongoing.find(id);
         if (buf != nullptr) {
@@ -546,14 +548,7 @@ inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
   auto wait_for_nodes = [&]() {
     io_event *evts = ctx.io_events();
     auto max_nr = static_cast<int64_t>(cur_beam_size);
-    // Fast path: non-blocking poll
     int ret = io_getevents(data.ctx_, 0, max_nr, evts, nullptr);
-    if (ret > 0) {
-      collect_events(evts, ret);
-      return;
-    }
-    // Slow path: block until at least 1 event
-    ret = io_getevents(data.ctx_, 1, max_nr, evts, nullptr);
     if (ret > 0) {
       collect_events(evts, ret);
     }
@@ -678,8 +673,7 @@ inline void QuantizedGraph::process_prepared_nodes(size_t &remaining,
         auto &next = prepared.front();
         alaya::mem_prefetch_l1(next.second + offset_to_node(next.first), prefetch_lines);
       }
-      process_node(node.first,
-                   reinterpret_cast<float *>(node.second + offset_to_node(node.first)));
+      process_node(node.first, reinterpret_cast<float *>(node.second + offset_to_node(node.first)));
       --remaining;
       free_slots.push(node.second);
     } else {

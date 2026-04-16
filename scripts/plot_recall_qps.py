@@ -15,30 +15,24 @@ b_ef = [80, 100, 150, 200, 300, 500]
 
 fig, ax = plt.subplots(figsize=(9, 6))
 
-ax.plot(a_recall, a_qps, "o-", color="#2196F3", linewidth=2,
-        markersize=8, label="A (Baseline)", zorder=3)
-ax.plot(b_recall, b_qps, "s-", color="#FF5722", linewidth=2,
-        markersize=8, label="B (Refactored)", zorder=3)
+ax.plot(a_recall, a_qps, "o-", color="#2196F3", linewidth=2, markersize=8, label="A (Baseline)", zorder=3)
+ax.plot(b_recall, b_qps, "s-", color="#FF5722", linewidth=2, markersize=8, label="B (Refactored)", zorder=3)
 
 # Annotate EF values
 for r, q, ef in zip(a_recall, a_qps, a_ef):
-    ax.annotate(f"ef={ef}", (r, q), textcoords="offset points",
-                xytext=(8, 8), fontsize=8, color="#2196F3", alpha=0.8)
+    ax.annotate(f"ef={ef}", (r, q), textcoords="offset points", xytext=(8, 8), fontsize=8, color="#2196F3", alpha=0.8)
 for r, q, ef in zip(b_recall, b_qps, b_ef):
-    ax.annotate(f"ef={ef}", (r, q), textcoords="offset points",
-                xytext=(8, -12), fontsize=8, color="#FF5722", alpha=0.8)
+    ax.annotate(f"ef={ef}", (r, q), textcoords="offset points", xytext=(8, -12), fontsize=8, color="#FF5722", alpha=0.8)
 
 ax.set_xlabel("Recall (%)", fontsize=13)
 ax.set_ylabel("QPS", fontsize=13)
-ax.set_title("LASER gist1m — Recall vs QPS\nA (Baseline) vs B (Refactored)",
-             fontsize=14)
+ax.set_title("LASER gist1m — Recall vs QPS\nA (Baseline) vs B (Refactored)", fontsize=14)
 ax.legend(fontsize=11, loc="upper right")
 ax.grid(True, alpha=0.3)
 ax.set_xlim(88, 100)
 ax.set_ylim(300, 1200)
 
 plt.tight_layout()
-plt.savefig("/home/huangliang/alaya-dev/AlayaLite/recall_qps_comparison.png",
-            dpi=150)
+plt.savefig("/home/huangliang/alaya-dev/AlayaLite/recall_qps_comparison.png", dpi=150)
 plt.savefig("/home/huangliang/alaya-dev/AlayaLite/recall_qps_comparison.svg")
 print("Saved: recall_qps_comparison.png / .svg")
