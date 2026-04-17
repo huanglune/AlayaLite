@@ -27,6 +27,7 @@
 #include "utils/rabitq_utils/search_utils/buffer.hpp"
 #include "utils/rabitq_utils/search_utils/hashset.hpp"
 #include "utils/random.hpp"
+#include "utils/thread_config.hpp"
 
 namespace alaya {
 template <typename DistanceSpaceType>
@@ -56,9 +57,9 @@ class QGBuilder {
 
     new_neighbors_.resize(num_nodes_);
     pruned_neighbors_.resize(num_nodes_);
+    degrees_.resize(num_nodes_, static_cast<uint32_t>(degree_bound_));
 
-    const size_t sys_threads_num = std::thread::hardware_concurrency();  // NOLINT
-    num_threads_ = std::min(num_threads, sys_threads_num == 0 ? 1 : sys_threads_num);
+    num_threads_ = std::min(num_threads, static_cast<size_t>(configured_thread_limit()));
     omp_set_num_threads(static_cast<int>(num_threads_));
 
     size_t pool_capacity = std::min(ef_build_ * ef_build_, num_nodes_ / 10);
@@ -81,6 +82,13 @@ class QGBuilder {
     iter(true);
   }
 
+  void set_ef_build(size_t ef_build) {
+    if (ef_build == 0) {
+      throw std::invalid_argument("ef_build must be > 0");
+    }
+    ef_build_ = ef_build;
+  }
+
  private:
   static constexpr size_t kMaxBsIter = 5;  ///< max iter for binary search of pruning bar
   static constexpr size_t kMaxCandidatePoolSize = 750;  ///< max num of candidates for indexing
@@ -96,6 +104,7 @@ class QGBuilder {
   std::vector<CandidateList> new_neighbors_;       ///< new neighbors for current iteration
   std::vector<CandidateList> pruned_neighbors_;    ///< recorded pruned neighbors
   std::vector<HashBasedBooleanSet> visited_list_;  // list of visited hash set
+  std::vector<uint32_t> degrees_;                  ///< current degree of each vertex during build
 
   // std::unique_ptr<Graph<DataType, IDType>> final_graph_;
   std::shared_ptr<DistanceSpaceType> space_;
@@ -124,6 +133,7 @@ class QGBuilder {
         LOG_ERROR("After supplement, node_{} only has {} neighbors.", i, new_neighbors_[i].size());
       }
       space_->update_nei(i, new_neighbors_[i]);
+      degrees_[i] = static_cast<uint32_t>(new_neighbors_[i].size());
     }
   }
 
@@ -298,7 +308,8 @@ class QGBuilder {
 
       // scan cur_candi's neighbors
       auto *nei_ptr = space_->get_edges(cur_candi);
-      for (size_t i = 0; i < degree_bound_; ++i) {
+      auto cur_degree = degrees_[cur_candi];
+      for (size_t i = 0; i < cur_degree; ++i) {
         auto cur_nei = nei_ptr[i];
         auto dist = q_computer(i);
         if (tmp_pool.is_full(dist) || vis.get(cur_nei)) {
@@ -406,6 +417,8 @@ class QGBuilder {
 
       // duplicate check
       if (nei_set.find(cur.id_) != nei_set.end()) {
+        // occlude = true;
+        // break;
         ++start;
         continue;
       }
@@ -515,6 +528,7 @@ class QGBuilder {
       }
 
       // record in space
+      degrees_[i] = static_cast<uint32_t>(new_neighbors_[i].size());
       space_->update_nei(i, new_neighbors_[i]);
     }
   }

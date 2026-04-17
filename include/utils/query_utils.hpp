@@ -17,8 +17,10 @@
 #pragma once
 
 #include <sys/types.h>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 #include <unordered_set>
 #include <vector>
 #include "../index/neighbor.hpp"
@@ -112,6 +114,61 @@ class DynamicBitset {
    * @param pos The position of the bit to reset
    */
   void reset(size_t pos) { data_[pos / 64] &= ~(1ULL << (pos % 64)); }
+
+  /**
+   * @brief Set all bits to 1 (mark all as visited)
+   */
+  void set_all() { std::ranges::fill(data_, ~0ULL); }
+
+  /**
+   * @brief Clear all bits to 0 (mark all as unvisited)
+   */
+  void clear() { std::ranges::fill(data_, 0ULL); }
+
+  /**
+   * @brief Get the number of bits in the bitset
+   */
+  [[nodiscard]] auto size() const -> size_t { return size_; }
+};
+
+/**
+ * @brief A visited-set implementation backed by epoch tags.
+ *
+ * Similar to DynamicBitset, this stores one marker per element and supports an
+ * O(1) logical clear by advancing the current epoch.
+ */
+template <typename TagType = uint32_t>
+class EpochVisitedSet {
+ private:
+  using PID = uint32_t;
+
+  std::vector<TagType, AlignedAlloc<TagType>> tags_;
+  TagType epoch_ = 1;
+
+ public:
+  static_assert(std::is_unsigned_v<TagType>, "TagType must be an unsigned integer type.");
+
+  EpochVisitedSet() = default;
+  explicit EpochVisitedSet(size_t size) : tags_(size, TagType{0}) {}
+
+  void resize(size_t size) {
+    tags_.assign(size, TagType{0});
+    epoch_ = 1;
+  }
+
+  void clear() {
+    ++epoch_;
+    if (epoch_ == TagType{0}) {
+      std::fill(tags_.begin(), tags_.end(), TagType{0});
+      epoch_ = 1;
+    }
+  }
+
+  [[nodiscard]] auto get(PID id) const -> bool { return tags_[id] == epoch_; }
+
+  void set(PID id) { tags_[id] = epoch_; }
+
+  [[nodiscard]] auto size() const -> size_t { return tags_.size(); }
 };
 
 /**
@@ -232,7 +289,7 @@ class HierarchicalBitset {
   }
 };
 
-// todo test this class.
+/// todo test this class.
 template <typename DistanceType, typename IDType>
 struct LinearPool {
   LinearPool(IDType n, int capacity) : nb_(n), capacity_(capacity), data_(capacity_ + 1), vis_(n) {}
@@ -281,15 +338,19 @@ struct LinearPool {
   }
 
   auto top() -> IDType { return data_[cur_].id_; }
-  auto pop() -> IDType {
+  auto pop(DistanceType &dist) -> IDType {
     set_checked(data_[cur_].id_);
     int pre = cur_;
     while (cur_ < size_ && is_checked(data_[cur_].id_)) {
       cur_++;
     }
-
-    // LOG_INFO("pop idx is {} , {}",data_[pre].id_, get_id(data_[pre].id_));
+    dist = data_[pre].distance_;
     return get_id(data_[pre].id_);
+  }
+
+  auto pop() -> IDType {
+    DistanceType dummy;
+    return pop(dummy);
   }
 
   auto has_next() const -> bool { return cur_ < size_; }

@@ -28,6 +28,7 @@
 #include "space/raw_space.hpp"
 #include "utils/dataset_utils.hpp"
 #include "utils/evaluate.hpp"
+#include "utils/thread_config.hpp"
 #include "utils/timer.hpp"
 
 namespace alaya {
@@ -112,15 +113,18 @@ TEST_F(NnDescentSearchTest, SimpleSearchTest) {
 
   Timer timer{};
   std::vector<std::vector<IDType>> res_pool(ds_.query_num_, std::vector<IDType>(topk));
-  const size_t kSearchThreadNum = std::min(static_cast<size_t>(16), static_cast<size_t>(ds_.query_num_));
+  const size_t kSearchThreadNum =
+      std::min<size_t>(cap_thread_count(16), static_cast<size_t>(ds_.query_num_));
   std::vector<std::thread> tasks(kSearchThreadNum);
 
   auto search_knn = [&](uint32_t i) {
     for (; i < ds_.query_num_; i += kSearchThreadNum) {
-      std::vector<uint32_t> ids(topk);
+      std::vector<uint32_t> ids(topk);  // Now returns topk directly
       auto cur_query = ds_.queries_.data() + i * ds_.dim_;
-      task_generator->search_solo(cur_query, topk, ids.data(), ef);
+      // New interface: search_solo(query, ids, topk, ef) returns topk results
+      task_generator->search_solo(cur_query, ids.data(), topk, ef);
 
+      // search_solo now returns topk results directly
       auto id_set = std::set(ids.begin(), ids.end());
 
       if (id_set.size() < topk) {

@@ -16,6 +16,10 @@
 Unit tests for the AlayaLite Client class.
 """
 
+import gc
+import os
+import shutil
+import tempfile
 import unittest
 
 import numpy as np
@@ -26,7 +30,22 @@ class TestClient(unittest.TestCase):
     """Test suite for client operations like creating, getting, and deleting collections and indices."""
 
     def setUp(self):
+        # Create temp directory for RocksDB isolation
+        self.tmp_dir = tempfile.mkdtemp()
+        self._original_rocksdb_dir = os.environ.get("ALAYALITE_ROCKSDB_DIR")
+        os.environ["ALAYALITE_ROCKSDB_DIR"] = os.path.join(self.tmp_dir, "RocksDB")
         self.client = Client()
+
+    def tearDown(self):
+        """Clean up temp directories after each test."""
+        del self.client
+        gc.collect()
+        if self._original_rocksdb_dir is None:
+            os.environ.pop("ALAYALITE_ROCKSDB_DIR", None)
+        else:
+            os.environ["ALAYALITE_ROCKSDB_DIR"] = self._original_rocksdb_dir
+        if os.path.exists(self.tmp_dir):
+            shutil.rmtree(self.tmp_dir)
 
     def test_create_collection(self):
         collection = self.client.create_collection("test_collection")
