@@ -17,6 +17,7 @@ include(cmake/PrintSummary.cmake)
 include(cmake/Codecov.cmake)
 
 option(ENABLE_COVERAGE "Enable code coverage instrumentation" OFF)
+option(BUILD_PYTHON "Build Python extension module" ON)
 option(BUILD_TESTING "Build tests" OFF)
 
 # ============================================================================
@@ -31,7 +32,13 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if(MSVC)
   add_compile_options(/EHsc /utf-8 /O2)
 else()
-  add_compile_options(-Wall -Ofast)
+  add_compile_options(
+    -Wall
+    -Ofast
+    -march=native
+    -funroll-loops
+    -fopenmp
+  )
 endif()
 
 # ============================================================================
@@ -45,16 +52,26 @@ if(APPLE)
   list(APPEND CMAKE_PREFIX_PATH ${OPENMP_BREW_PATHS})
 endif()
 find_package(concurrentqueue REQUIRED)
-find_package(pybind11 REQUIRED)
 find_package(spdlog REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenMP REQUIRED)
+find_package(RocksDB REQUIRED)
+if(BUILD_PYTHON)
+  find_package(pybind11 REQUIRED)
+endif()
 
-set(THIRD_PARTY_LIBS spdlog::spdlog_header_only concurrentqueue::concurrentqueue Eigen3::Eigen OpenMP::OpenMP_CXX)
+set(THIRD_PARTY_LIBS
+    spdlog::spdlog_header_only
+    concurrentqueue::concurrentqueue
+    Eigen3::Eigen
+    OpenMP::OpenMP_CXX
+    RocksDB::rocksdb
+)
 
 if(UNIX AND NOT APPLE)
   find_package(libcoro REQUIRED)
-  list(APPEND THIRD_PARTY_LIBS libcoro::libcoro)
+  find_package(liburing REQUIRED)
+  list(APPEND THIRD_PARTY_LIBS libcoro::libcoro liburing::liburing)
 endif()
 
 # ============================================================================
@@ -79,5 +96,7 @@ if(BUILD_TESTING)
   add_subdirectory(tests)
 endif()
 
-add_subdirectory(python)
+if(BUILD_PYTHON)
+  add_subdirectory(python)
+endif()
 print_build_summary()

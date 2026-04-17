@@ -16,8 +16,11 @@
 
 #pragma once
 #include <pybind11/numpy.h>
+#include <pybind11/stl.h>
 #include <sys/types.h>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 #include "index/index_type.hpp"
 #include "utils/metric_type.hpp"
@@ -34,6 +37,11 @@ struct IndexParams {
   MetricType metric_ = MetricType::L2;
   uint32_t capacity_ = 100000;
   uint32_t max_nbrs_ = 32;
+  uint32_t build_threads_ = 0;
+  uint32_t materialized_view_build_threads_ = 0;
+  std::string rocksdb_path_ = "";            // Path for RocksDB storage (for scalar data)
+  bool has_scalar_data_ = false;             // Whether to enable scalar data storage
+  std::vector<std::string> indexed_fields_;  // Fields to create secondary indexes for
 
   IndexParams(IndexType index_type = IndexType::HNSW,  // NOLINT
               py::dtype data_type = py::dtype::of<float>(),
@@ -41,13 +49,23 @@ struct IndexParams {
               QuantizationType quantization_type = QuantizationType::NONE,
               MetricType metric = MetricType::L2,
               uint32_t capacity = 100000,
-              uint32_t max_nbrs = 32)
+              uint32_t max_nbrs = 32,
+              uint32_t build_threads = 0,
+              uint32_t materialized_view_build_threads = 0,
+              std::string rocksdb_path = "",
+              bool has_scalar_data = false,
+              std::vector<std::string> indexed_fields = {})
       : index_type_(index_type),
         data_type_(std::move(data_type)),
         id_type_(std::move(id_type)),
         quantization_type_(quantization_type),
         metric_(metric),
         capacity_(capacity),
-        max_nbrs_(max_nbrs) {}
+        max_nbrs_(max_nbrs),
+        build_threads_(build_threads),
+        materialized_view_build_threads_(materialized_view_build_threads),
+        rocksdb_path_(std::move(rocksdb_path)),
+        has_scalar_data_(has_scalar_data),
+        indexed_fields_(std::move(indexed_fields)) {}
 };
 }  // namespace alaya
