@@ -329,7 +329,7 @@ class LaserBuilder {
     config.alpha_ = params_.alpha_;
     config.max_memory_mb_ = params_.resolved_vamana_memory_mb();
     config.num_threads_ = num_threads_;
-    config.bootstrap_medoid_ = true;
+    config.saturate_graph_ = true;
     return config;
   }
 
@@ -498,6 +498,21 @@ class LaserBuilder {
   }
 
   void run_pca() {
+    // Reuse externally-prepared PCA transformed base if already present. The
+    // PCA matrix (_pca.bin) is optional here: search-time query transform will
+    // warn+skip when absent, which is fine if callers supply pre-transformed
+    // queries (Laser official pipeline does this).
+    if (std::filesystem::exists(pca_base_path())) {
+      std::cout << "[LaserBuilder] PCA: reuse external " << pca_base_path().string();
+      if (std::filesystem::exists(pca_path())) {
+        std::cout << " (+ matrix " << pca_path().string() << ")";
+      } else {
+        std::cout << " (no matrix; queries must be PCA-transformed)";
+      }
+      std::cout << '\n';
+      return;
+    }
+
     ScopedEigenThreads thread_guard(num_threads_);
     auto sample_size = params_.resolved_pca_sample_count(num_points_);
     auto batch_size = resolve_pca_batch_size(sample_size);
@@ -599,10 +614,25 @@ class LaserBuilder {
 
   void run_qg_build() {
     symqg::QuantizedGraph graph(num_points_, params_.max_degree_, main_dim_, full_dim_);
+    if (!params_.external_rotator_.empty()) {
+      std::cout << "[LaserBuilder] QG: loading external rotator from "
+                << params_.external_rotator_ << '\n';
+      graph.load_rotator_from_file(params_.external_rotator_);
+    }
     symqg::QGBuilder builder(graph, params_.ef_build_, num_threads_, params_.max_memory_mb_);
     VamanaGraphReader vamana_reader;
     vamana_reader.open(vamana_path().string());
     builder.build(vamana_reader, output_prefix_.string().c_str());
+
+    if (!params_.external_rotator_.empty()) {
+      auto target_rotator_path = output_prefix_.string() + "_R" +
+                                 std::to_string(params_.max_degree_) + "_MD" +
+                                 std::to_string(main_dim_) + ".index_rotator";
+      std::filesystem::copy_file(params_.external_rotator_, target_rotator_path,
+                                 std::filesystem::copy_options::overwrite_existing);
+      std::cout << "[LaserBuilder] QG: copied external rotator to " << target_rotator_path
+                << " (bypass save_rotator 0-byte bug)\n";
+    }
   }
 
   void cleanup_intermediates() const {

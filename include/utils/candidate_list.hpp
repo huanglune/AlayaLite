@@ -85,6 +85,12 @@ struct CandidateList {
   }
 
   auto has_next() const -> bool { return cur_ < size_; }
+  // Short-circuit check: caller can skip insert() + its internal bookkeeping entirely.
+  // Matches Laser symqglib SearchBuffer::is_full(float) — a measurable win in scan_neighbors
+  // where 64 candidates per node get rejected when the pool is saturated.
+  auto is_full(DistanceType dist) const -> bool {
+    return size_ == capacity_ && dist >= data_[size_ - 1].distance_;
+  }
   auto next_id() const -> IDType { return get_id(data_[cur_].id_); }
   auto id(IDType i) const -> IDType { return get_id(data_[i].id_); }
   auto dist(IDType i) const -> DistanceType { return data_[i].distance_; }

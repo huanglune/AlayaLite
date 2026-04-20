@@ -82,6 +82,7 @@ data/
 benchmark/results/
 benchmark_results
 benchmark/index/*.png
+results/
 
 # ============================================================
 # Tooling

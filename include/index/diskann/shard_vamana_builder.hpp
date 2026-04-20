@@ -143,14 +143,13 @@ class ShardVamanaBuilder {
   struct Config {
     uint32_t max_degree_{64};
     uint32_t ef_construction_{128};
-    uint32_t num_iterations_{1};  ///< Matching official DiskANN (1 pass)
+    uint32_t num_iterations_{1};  ///< Single pass (2-pass empirically hurt Lite recall; keep internal alpha escalation in robust_prune)
     float alpha_{1.2F};
     float alpha_first_pass_{1.0F};
     uint32_t max_occlusion_size_{750};  ///< Max candidates for pruning (DiskANN maxc)
     size_t max_memory_mb_{4096};
     uint32_t num_threads_{0};       ///< 0 = hardware concurrency, 1 = single-threaded
     bool saturate_graph_{false};    ///< Backfill under-connected nodes to max_degree
-    bool bootstrap_medoid_{false};  ///< Non-official warm-start; disabled by default
   };
 
   static constexpr float kGraphSlackFactor = 1.3F;
@@ -236,20 +235,17 @@ class ShardVamanaBuilder {
   void build(ProgressCallback on_progress = nullptr) {
     enforce_memory_budget();
     medoid_local_id_ = compute_medoid();
-    if (config_.bootstrap_medoid_) {
-      bootstrap_medoid();
-    }
     for (uint32_t pass = 0; pass < config_.num_iterations_; ++pass) {
-      // Single-pass: use alpha_ directly (matching official DiskANN).
-      // Multi-pass: pass 0 uses alpha_first_pass_ (strict), subsequent passes use alpha_.
-      float alpha = config_.alpha_;
-      if (config_.num_iterations_ != 1 && pass == 0) {
-        alpha = config_.alpha_first_pass_;
-      }
+      // Match DiskANN Index::build: pass 0 uses alpha=1.0, subsequent passes use alpha_.
+      float alpha = (config_.num_iterations_ != 1 && pass == 0)
+                        ? config_.alpha_first_pass_
+                        : config_.alpha_;
       build_pass(alpha, on_progress);
+      // DiskANN runs cleanup at the end of each link() call (index.cpp:1355).
+      // Without this, Pass 2's greedy_search runs on a graph whose nodes may have
+      // up to R * slack neighbors, polluting the candidate pool.
+      cleanup_overprovisioned();
     }
-    // Final cleanup: prune any over-provisioned nodes back to max_degree
-    cleanup_overprovisioned();
   }
 
   [[nodiscard]] auto export_nodes() const -> std::vector<ExportedNode> {
@@ -424,38 +420,9 @@ class ShardVamanaBuilder {
     return dist_fn_(vector_ptr(lhs), vector_ptr(rhs), dim_);
   }
 
-  void initialize_random_graph() {
-    auto degree_limit = std::min(config_.max_degree_, num_nodes() - 1);
-    std::vector<LocalIDType> candidates;
-    candidates.reserve(degree_limit);
-    std::vector<LocalIDType> permutation(num_nodes());
-    std::iota(permutation.begin(), permutation.end(), 0U);
-    std::vector<std::pair<uint32_t, uint32_t>> swaps;
-    swaps.reserve(degree_limit + 1);
-    for (LocalIDType node_id = 0; node_id < num_nodes(); ++node_id) {
-      std::minstd_rand rng(node_id + 1U);
-      candidates.clear();
-      swaps.clear();
-      for (uint32_t i = 0; i < num_nodes() && candidates.size() < degree_limit; ++i) {
-        std::uniform_int_distribution<uint32_t> dist(i, num_nodes() - 1);
-        auto picked = dist(rng);
-        if (picked != i) {
-          swaps.emplace_back(i, picked);
-        }
-        std::swap(permutation[i], permutation[picked]);
-        auto candidate = permutation[i];
-        if (candidate != node_id) {
-          candidates.push_back(candidate);
-        }
-      }
-      for (const auto &swap : std::views::reverse(swaps)) {
-        std::swap(permutation[swap.first], permutation[swap.second]);
-      }
-      neighbor_table_.update_ids(node_id, candidates);
-    }
-  }
-
   [[nodiscard]] auto compute_medoid() const -> LocalIDType {
+    // Use double accumulation: for N=10.4M, single-precision sum loses resolution
+    // after the running total saturates the 24-bit mantissa, biasing the medoid.
     std::vector<double> centroid(dim_, 0.0);
     for (LocalIDType i = 0; i < num_nodes(); ++i) {
       const auto *vec = vector_ptr(i);
@@ -479,26 +446,6 @@ class ShardVamanaBuilder {
       }
     }
     return medoid;
-  }
-
-  /// Bootstrap the medoid with its nearest neighbors so greedy_search on
-  /// the empty graph can immediately find reachable nodes. Equivalent to
-  /// official DiskANN's "frozen point" mechanism.
-  void bootstrap_medoid() {
-    auto degree_limit = std::min(config_.max_degree_, num_nodes() - 1);
-    std::vector<NeighborType> candidates;
-    candidates.reserve(num_nodes());
-    for (LocalIDType i = 0; i < num_nodes(); ++i) {
-      if (i == medoid_local_id_) {
-        continue;
-      }
-      candidates.emplace_back(i, distance(medoid_local_id_, i));
-    }
-    std::sort(candidates.begin(), candidates.end());
-    if (candidates.size() > degree_limit) {
-      candidates.resize(degree_limit);
-    }
-    neighbor_table_.update(medoid_local_id_, candidates);
   }
 
   [[nodiscard]] auto effective_threads() const -> uint32_t {
@@ -616,8 +563,9 @@ class ShardVamanaBuilder {
       }
     }
 
-    // Include unexpanded candidates from the search frontier in the pruning pool.
-    // Official DiskANN prunes from the full pool (expanded + unexpanded).
+    // Include unexpanded candidates from the best_L_nodes frontier in the pruning
+    // pool. Empirically this gives Lite's prune better diversity and ~0.5pp recall
+    // at low ef; DiskANN's pool omits these but its prune is already sharper.
     for (size_t idx = 0; idx < candidates.size(); ++idx) {
       auto nid = candidates.id(static_cast<LocalIDType>(idx));
       if (nid != query_id) {
@@ -625,7 +573,6 @@ class ShardVamanaBuilder {
       }
     }
 
-    // Dedup (expanded nodes may overlap with candidate list entries)
     std::sort(expanded_nodes.begin(), expanded_nodes.end(), [](const auto &a, const auto &b) {
       return a.id_ < b.id_ || (a.id_ == b.id_ && a.distance_ < b.distance_);
     });

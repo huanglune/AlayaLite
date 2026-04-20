@@ -36,7 +36,7 @@ struct LaserBuildParams {
   float alpha_{1.2F};
   uint32_t num_medoids_{300};
   float pca_sample_ratio_{0.25F};
-  uint32_t pca_sample_cap_{500000};
+  uint32_t pca_sample_cap_{5000000};
   float medoid_sample_ratio_{0.1F};
   uint32_t medoid_sample_cap_{500000};
   uint32_t num_threads_{0};
@@ -44,6 +44,7 @@ struct LaserBuildParams {
   bool keep_intermediates_{false};
   size_t vamana_max_memory_mb_{0};  ///< 0 = inherit from max_memory_mb_
   std::string external_vamana_;     ///< If set, use this Vamana file instead of building
+  std::string external_rotator_;    ///< If set, load this rotator file instead of random init
 
   [[nodiscard]] auto resolved_vamana_memory_mb() const -> size_t {
     return vamana_max_memory_mb_ > 0 ? vamana_max_memory_mb_ : max_memory_mb_;

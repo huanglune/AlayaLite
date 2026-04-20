@@ -248,6 +248,21 @@ class QuantizedGraph {
   [[nodiscard]] auto entry_point() const { return entry_point_; }
   void set_ep(PID entry) { entry_point_ = entry; }
 
+  void load_rotator_from_file(const std::string &path) {
+    std::ifstream rotator_in(path, std::ios::binary);
+    if (!rotator_in.is_open()) {
+      throw std::runtime_error("Failed to open external rotator: " + path);
+    }
+    rotator_in.seekg(0, std::ios::end);
+    auto file_size = rotator_in.tellg();
+    rotator_in.seekg(0, std::ios::beg);
+    std::cout << "[DEBUG load_rotator] file_size=" << file_size << "\n";
+    rotator_.load(rotator_in);
+    std::cout << "[DEBUG load_rotator] after load good=" << rotator_in.good()
+              << " eof=" << rotator_in.eof() << " fail=" << rotator_in.fail()
+              << " gcount=" << rotator_in.gcount() << "\n";
+  }
+
   void load_disk_index(const char *prefix, float search_dram_budget);
   void set_params(size_t ef_search, size_t num_threads, int beam_width);
   void load_medoids(const char *prefix);
@@ -518,8 +533,9 @@ inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
   // I/O completion handler: non-blocking probe first, then blocking fallback.
   // Non-blocking catches already-completed events without syscall overhead.
   // Blocking fallback avoids infinite spin when events are still in-flight.
-  // Prefetch node data into L2 when I/O completes, so it's warm by process time
-  size_t prefetch_lines = std::min(node_len_ / 64, static_cast<size_t>(20));
+  // NOTE: removed aggressive L2 prefetch (was 20 cache lines per completed I/O).
+  // It caused L1 cache pollution at beam=16 and hurt QPS ~5% vs Laser baseline.
+  [[maybe_unused]] size_t prefetch_lines = std::min(node_len_ / 64, static_cast<size_t>(20));
 
   auto collect_events = [&](io_event *evts, int ret) {
     for (int i = 0; i < ret; i++) {
@@ -537,8 +553,6 @@ inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
       }
       char *buf = ongoing.find(id);
       if (buf != nullptr) {
-        const char *node_ptr = buf + offset_to_node(id);
-        alaya::mem_prefetch_l2(node_ptr, prefetch_lines);
         prepared.push_back({id, buf});
         ongoing.erase(id);
       }
@@ -599,12 +613,8 @@ inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
                                                ctx.iocb_ptrs_buf());
     }
 
-    // Process cached nodes with look-ahead prefetch (no double lookup)
+    // Process cached nodes (no look-ahead prefetch; matches Laser baseline).
     for (size_t ci = 0; ci < cache_nhoods.size(); ++ci) {
-      if (ci + 1 < cache_nhoods.size()) {
-        alaya::mem_prefetch_l1(reinterpret_cast<const char *>(cache_nhoods[ci + 1].second),
-                               prefetch_lines);
-      }
       process_node(cache_nhoods[ci].first, reinterpret_cast<float *>(cache_nhoods[ci].second));
     }
 
@@ -648,7 +658,8 @@ inline auto QuantizedGraph::scan_neighbors(const QGQuery &q_obj,
   for (uint32_t i = 0; i < cur_degree; ++i) {
     PID cur_neighbor = ptr_nb[i];
     float tmp_dist = appro_dist[i];
-    if (visited.get(cur_neighbor)) {
+    // Short-circuit: pool-full-and-worse OR already-visited — matches Laser's scan_neighbors.
+    if (search_pool.is_full(tmp_dist) || visited.get(cur_neighbor)) {
       continue;
     }
     search_pool.insert(cur_neighbor, tmp_dist);
@@ -666,13 +677,10 @@ inline void QuantizedGraph::process_prepared_nodes(size_t &remaining,
   auto &prepared = ctx.prepared_ring();
   auto &free_slots = ctx.free_slot_stack();
 
+  (void)prefetch_lines;
   while (remaining > 0) {
     if (!prepared.empty()) {
       auto node = prepared.pop_front();
-      if (!prepared.empty()) {
-        auto &next = prepared.front();
-        alaya::mem_prefetch_l1(next.second + offset_to_node(next.first), prefetch_lines);
-      }
       process_node(node.first, reinterpret_cast<float *>(node.second + offset_to_node(node.first)));
       --remaining;
       free_slots.push(node.second);

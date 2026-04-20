@@ -2,9 +2,9 @@
  * @file laser_build_bench.cpp
  * @brief End-to-end LASER build + search benchmark with memory budget control.
  *
- * Runs Vamana → PCA → Medoid → QG internally using the shared in-process Vamana
- * builder, then benchmarks search QPS/recall/latency. Peak RSS stays within the
- * LASER-phase max_memory budget (the Vamana build has its own separate budget).
+ * Runs PCA → Vamana → Medoid → QG internally. By default the Vamana graph is
+ * built on the PCA-transformed base (matches the Laser official pipeline).
+ * Use --external-vamana to fall back to building on raw vectors instead.
  *
  * Usage:
  *   ./laser_build_bench <base_fvecs> <query_fvecs> <gt_ivecs> <output_dir>
@@ -13,6 +13,7 @@
  *       [--force-build] [--search-only]
  *       [--vamana-mem-mib=8192] [--vamana-ef=200] [--vamana-alpha=1.2]
  *       [--search-threads=1] [--search-batch]
+ *       [--builtin-vamana | --external-vamana]
  */
 
 // NOLINTBEGIN
@@ -53,12 +54,13 @@ auto get_required_index_files(const std::filesystem::path &prefix,
                               uint32_t max_degree,
                               uint32_t main_dim) -> std::vector<std::filesystem::path> {
   auto index_file = get_index_file_path(prefix, max_degree, main_dim);
+  // _pca.bin is treated as optional at load time (load_optional_pca_from_disk),
+  // so keep it out of the required-files check so pre-PCA indices also load.
   return {
       index_file,
       index_file.string() + "_rotator",
       prefix.string() + "_medoids",
       prefix.string() + "_medoids_indices",
-      prefix.string() + "_pca.bin",
   };
 }
 
@@ -88,7 +90,8 @@ auto main(int argc, char *argv[]) -> int {
               << " [num_medoids=300] [num_threads=0] [dram_budget_gb=1.0]"
               << " [--force-build] [--search-only]"
               << " [--vamana-mem-mib=8192] [--vamana-ef=200] [--vamana-alpha=1.2]"
-              << " [--search-threads=1] [--search-batch]\n";
+              << " [--search-threads=1] [--search-batch]"
+              << " [--builtin-vamana|--external-vamana]\n";
     return 1;
   }
 
@@ -109,7 +112,13 @@ auto main(int argc, char *argv[]) -> int {
   float vamana_alpha = 1.2F;
   uint32_t search_threads = 1;
   bool search_batch = false;
-  bool builtin_vamana = false;
+  // Default to PCA-space Vamana (matches Laser official pipeline). Use
+  // --external-vamana to fall back to building on raw vectors.
+  bool builtin_vamana = true;
+  std::string external_vamana_path;  // --vamana-index=<path>: skip build, reuse
+  std::string external_pca_base_path;    // --pca-base=<path>: Laser's _pca_base.fbin
+  std::string external_pca_matrix_path;  // --pca-matrix=<path>: Laser's _pca.bin
+  std::string external_rotator_path;     // --rotator=<path>: reuse prebuilt QG rotator
   std::vector<std::string> numeric_args;
   numeric_args.reserve(static_cast<size_t>(argc));
   for (int i = 5; i < argc; ++i) {
@@ -184,6 +193,31 @@ auto main(int argc, char *argv[]) -> int {
       builtin_vamana = true;
       continue;
     }
+    if (arg == "--external-vamana") {
+      builtin_vamana = false;
+      continue;
+    }
+    constexpr std::string_view kVamanaIndexFlag = "--vamana-index=";
+    if (arg.starts_with(kVamanaIndexFlag)) {
+      external_vamana_path = arg.substr(kVamanaIndexFlag.size());
+      builtin_vamana = false;  // force external path
+      continue;
+    }
+    constexpr std::string_view kPcaBaseFlag = "--pca-base=";
+    if (arg.starts_with(kPcaBaseFlag)) {
+      external_pca_base_path = arg.substr(kPcaBaseFlag.size());
+      continue;
+    }
+    constexpr std::string_view kPcaMatrixFlag = "--pca-matrix=";
+    if (arg.starts_with(kPcaMatrixFlag)) {
+      external_pca_matrix_path = arg.substr(kPcaMatrixFlag.size());
+      continue;
+    }
+    constexpr std::string_view kRotatorFlag = "--rotator=";
+    if (arg.starts_with(kRotatorFlag)) {
+      external_rotator_path = arg.substr(kRotatorFlag.size());
+      continue;
+    }
     numeric_args.push_back(std::move(arg));
   }
 
@@ -201,10 +235,12 @@ auto main(int argc, char *argv[]) -> int {
   if (num_threads == 0) num_threads = std::thread::hardware_concurrency();
 
   constexpr uint32_t kTopK = 10;
-  constexpr size_t kWarmup = 2;
-  constexpr size_t kWarmupBatches = 5;
-  constexpr size_t kRuns = 10;
-  const std::vector<size_t> ef_values = {80, 100, 150, 200, 300, 500};
+  // Match Laser baseline methodology (see /tmp/dataset_sweep_20260415/laser_baselines.json):
+  // 10 warmup iterations + 30 measurement runs -> tighter QPS estimate, fair compare.
+  constexpr size_t kWarmup = 10;
+  constexpr size_t kWarmupBatches = 10;
+  constexpr size_t kRuns = 30;
+  const std::vector<size_t> ef_values = {80, 90, 100, 110, 130, 150, 200, 250, 300, 400, 500};
 
   std::filesystem::create_directories(output_dir);
   auto prefix = std::filesystem::path(output_dir) / "dsqg_gist";
@@ -213,6 +249,27 @@ auto main(int argc, char *argv[]) -> int {
   auto run_build = [&](bool force_vamana_rebuild) {
     std::cout << "\n=== Build ===" << '\n' << std::flush;
     alaya::Timer build_timer;
+
+    // Optionally stage externally-provided PCA artifacts into output_dir so
+    // LaserBuilder.run_pca() detects them and skips retraining. Both files
+    // must be present (matrix + transformed base) for the skip to trigger.
+    if (!external_pca_base_path.empty()) {
+      std::filesystem::path target_pca_base(prefix.string() + "_pca_base.fbin");
+      std::cout << "\n--- PCA (external) ---\n"
+                << "  Base:   " << external_pca_base_path << " -> "
+                << target_pca_base.string() << '\n';
+      std::filesystem::copy_file(external_pca_base_path, target_pca_base,
+                                 std::filesystem::copy_options::overwrite_existing);
+      if (!external_pca_matrix_path.empty()) {
+        std::filesystem::path target_pca_matrix(prefix.string() + "_pca.bin");
+        std::cout << "  Matrix: " << external_pca_matrix_path << " -> "
+                  << target_pca_matrix.string() << '\n';
+        std::filesystem::copy_file(external_pca_matrix_path, target_pca_matrix,
+                                   std::filesystem::copy_options::overwrite_existing);
+      } else {
+        std::cout << "  [WARN] no --pca-matrix provided; queries must be PCA-transformed\n";
+      }
+    }
 
     alaya::LaserBuildParams build_params;
     build_params.main_dim_ = main_dim;
@@ -224,8 +281,25 @@ auto main(int argc, char *argv[]) -> int {
     build_params.num_threads_ = num_threads;
     build_params.keep_intermediates_ = true;
 
+    if (!external_rotator_path.empty()) {
+      std::cout << "\n--- QG rotator (external) ---\n"
+                << "  Source: " << external_rotator_path << '\n';
+      if (!std::filesystem::exists(external_rotator_path)) {
+        throw std::runtime_error("--rotator path not found: " + external_rotator_path);
+      }
+      build_params.external_rotator_ = external_rotator_path;
+    }
+
     if (builtin_vamana) {
       build_params.vamana_max_memory_mb_ = vamana_mem_mib;
+    } else if (!external_vamana_path.empty()) {
+      std::cout << "\n--- Vamana (preconstructed) ---\n"
+                << "  Source: " << external_vamana_path << "\n" << std::flush;
+      if (!std::filesystem::exists(external_vamana_path)) {
+        throw std::runtime_error("--vamana-index path not found: " + external_vamana_path);
+      }
+      // Let LaserBuilder's copy_external_vamana handle the copy into output_dir
+      build_params.external_vamana_ = external_vamana_path;
     } else {
       bool need_vamana = force_vamana_rebuild || !std::filesystem::exists(internal_vamana_path);
       if (need_vamana) {

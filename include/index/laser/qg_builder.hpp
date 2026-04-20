@@ -311,7 +311,11 @@ class QGBuilder {
     if (!rotator_output.is_open()) {
       throw std::runtime_error("Failed to create rotator file: " + rotator_path);
     }
+    std::cout << "[DEBUG save_rotator] good_before=" << rotator_output.good() << "\n";
     qg_.rotator_.save(rotator_output);
+    rotator_output.flush();
+    std::cout << "[DEBUG save_rotator] good_after=" << rotator_output.good()
+              << " tellp=" << rotator_output.tellp() << "\n";
   }
 
   void write_cache(const std::string &index_path) {

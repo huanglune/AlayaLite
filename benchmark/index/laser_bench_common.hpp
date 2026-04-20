@@ -357,7 +357,8 @@ inline auto build_vamana_from_raw(const std::filesystem::path &base_fvecs_path,
   config.alpha_ = options.alpha_;
   config.max_memory_mb_ = options.max_memory_mb_;
   config.num_threads_ = num_threads;
-  config.bootstrap_medoid_ = true;
+  // Use Config default num_iterations_=2 (two-pass: Pass 1 alpha=1.0, Pass 2 alpha_).
+  config.saturate_graph_ = true;
 
   alaya::ShardVamanaBuilder<float, uint32_t> builder(std::move(vecs.data_),
                                                      stats.dim_,
