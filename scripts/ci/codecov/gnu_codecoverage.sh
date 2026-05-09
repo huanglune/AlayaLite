@@ -10,6 +10,10 @@ CTEST_JOBS="${CTEST_JOBS:-4}"
 CTEST_LABELS="${CTEST_LABELS:-unit|storage|recovery|simd|space|utils}"
 CTEST_EXCLUDE_REGEX="${CTEST_EXCLUDE_REGEX:-^utils_test_dataset_utils$}"
 GCOV_TOOL="${GCOV_TOOL:-/usr/bin/gcov-13}"
+CMAKE_LAUNCHER_ARGS=()
+if [[ -n "${CMAKE_CXX_COMPILER_LAUNCHER:-}" ]]; then
+  CMAKE_LAUNCHER_ARGS+=("-DCMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER}")
+fi
 
 COVERAGE_TARGETS=(
   recovery_test
@@ -44,9 +48,11 @@ cmake .. \
   -DBUILD_TESTING=ON \
   -DBUILD_PYTHON=OFF \
   -DENABLE_COVERAGE=ON \
+  -DALAYA_NATIVE_ARCH=OFF \
   -DCMAKE_BUILD_TYPE=Debug \
   -DCMAKE_C_COMPILER=gcc-13 \
-  -DCMAKE_CXX_COMPILER=g++-13
+  -DCMAKE_CXX_COMPILER=g++-13 \
+  "${CMAKE_LAUNCHER_ARGS[@]}"
 cmake --build "${BUILD_DIR}" --parallel "${BUILD_JOBS}" --target "${COVERAGE_TARGETS[@]}"
 
 # run the tests in parallel

@@ -1,0 +1,60 @@
+# gist.toml — canonical example for `uv run examples/laser/main.py`.
+#
+# This is the ONLY config tracked in git under examples/laser/configs/.
+# Other files in this directory are .gitignored because their [paths]
+# entries are machine-specific. To run the pipeline on your own data:
+#
+#   cp examples/laser/configs/gist.toml examples/laser/configs/my.toml
+#   $EDITOR examples/laser/configs/my.toml      # edit [paths] below
+#   uv run examples/laser/main.py -c examples/laser/configs/my.toml all
+#
+# Field contract lives in docs/LASER.md.
+
+[dataset]
+name = "gist"
+metric = "l2"
+degree = 64          # Vamana build R; also the Laser degree_bound
+main_dimension = 256 # PCA-reduced dim fed to Laser; residual = dim - main_dim
+
+[paths]
+# Required — edit to point at the gist1m files on your machine.
+# gist1m is the Jégou 2011 ANN_GIST dataset (1M × 960 float32 vectors);
+# the .fbin format is `<int32 N><int32 dim>` header + row-major data.
+base  = "/path/to/gist1m/gist_base.fbin"
+query = "/path/to/gist1m/gist_query.fbin"
+gt    = "/path/to/gist1m/gist_gt.ibin"
+
+# Required — all pipeline artefacts land under this directory.
+output = "/path/to/build_graph/gist1m/laser_port"
+
+# Optional unified build seed. This drives PCA, medoid, Vamana, and
+# LASER rotator randomness through `Index.fit(...)`.
+# seed = 42
+
+# Optional Vamana build parameters still exposed by the unified wrapper.
+# Thread count is controlled by [build].build_threads; seed is the
+# top-level `seed` above.
+#
+# R is NOT listed here — it is read from [dataset].degree to enforce the
+# three-way contract (Vamana build R = written max_observed_degree =
+# Laser degree_bound). Setting [build_vamana].R raises a config-load error.
+# [build_vamana]
+# L = 200
+# alpha = 1.2
+# dram_budget_gb = 32.0
+
+# Optional unified build parameters.
+# [build]
+# build_threads = 48   # threads for Vamana and QG construction
+# ef_indexing = 200    # ef parameter for QG index construction
+
+# Optional search sweep parameters.
+# [search]
+# topk = 10
+# threads = 1
+# beam_width = 16
+# dram_budget = 1.0
+# ep_num = 300
+# warmup = 10
+# runs = 30
+# efs = [80, 90, 100, 110, 130, 150, 200, 250, 300, 400, 500]
