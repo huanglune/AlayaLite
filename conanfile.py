@@ -38,10 +38,11 @@ class AlayaLiteConan(ConanFile):
         # OpenMP support
         if self.settings.os == "Linux":
             if self.settings.compiler in ["clang", "apple-clang"]:
-                self.requires("libomp/18.1.8")
+                self.requires("llvm-openmp/17.0.6")
         # GCC: assume libgomp is system-provided
-        elif self.settings.os == "Macos":
-            self.requires("libomp/18.1.8")
+        # macOS wheel builds use Homebrew libomp from cibuildwheel before-all.
+        # ConanCenter's llvm-openmp/17 runtime lacks symbols emitted by the
+        # hosted AppleClang 17 OpenMP lowering path.
 
     def configure(self):
         # Static link all dependencies
@@ -55,11 +56,11 @@ class AlayaLiteConan(ConanFile):
         self.options["rocksdb"].with_lz4 = True
         self.options["rocksdb"].with_zstd = True
 
-        if self.settings.os == "Linux":
-            self.options["libcoro"].feature_networking = False
-            self.options["libcoro"].feature_tls = False
-            self.options["libcoro"].build_examples = False
-            self.options["libcoro"].build_tests = False
+        # The project uses libcoro task/mutex primitives, not its networking/TLS
+        # layer. ConanCenter's libcoro networking option pulls in epoll-only
+        # sources that do not build on macOS.
+        self.options["libcoro"].with_networking = False
+        self.options["libcoro"].with_ssl = False
 
     def generate(self):
         tc = CMakeToolchain(self)

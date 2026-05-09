@@ -1,54 +1,79 @@
-CMakeLists.txt.user
-CMakeCache.txt
-CMakeFiles
-CMakeScripts
-Testing
-# Makefile
-cmake_install.cmake
-install_manifest.txt
-compile_commands.json
-CTestTestfile.cmake
-_deps
-CMakeUserPresets.json
-build
-**/__pycache__
-.cache
-.vscode/*
-*.so
+# Build artifacts
+/CMakeLists.txt.user
+/CMakeCache.txt
+/CMakeFiles/
+/CMakeScripts/
+/Testing/
+/TEST*
+/cmake_install.cmake
+/install_manifest.txt
+/compile_commands.json
+/CTestTestfile.cmake
+/_deps/
+/CMakeUserPresets.json
+/build/
+/build_asan/
+/build_tsan/
+/build-tidy
 
-
-
-#python extension module ignores
+# Python artifacts
+__pycache__/
 *.py[cod]
 *$py.class
-wheels/
-python/alayalite.egg-info/
-python/dist/
+*.so
+*.egg-info/
+*.whl
+/wheels/
+/wheelhouse/
+/dist/
+/python/dist/
+/python/alayalite.egg-info/
+/.venv*/
+/venv*/
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
+/.uv-cache/
+/.cache/
 
-**/*.egg-info
-wheelhouse/*
-**/*.whl
-dist/*
-venv*/**
+# Research / experiments (machine-local exploratory scripts)
+/experiments/
+
+# Data / generated outputs
+/data/
+/logs/
+/results/
+
+# Config overrides (Laser reproduce configs: paths are machine-specific)
+# Only canonical examples + alignment-contract configs are tracked;
+# copy + edit locally for your own runs.
+/examples/laser/configs/*.toml
+!/examples/laser/configs/gist.toml
+!/examples/laser/configs/synth_20k_768d_alayaP.toml
+!/examples/laser/configs/synth_100k_512d_alayaP.toml
+
+# Dev tooling
+/.vscode/
+/.claude/
+/.codex/
+/.superpowers/
+/.worktree/
+/.worktrees/
+/openspec/
+/docs/superpowers/
 *.swp
-**/__pycache__
 
-# data
-data/*
+# Profiling & coverage
+/perf.data
+/perf.data.old
+/flamegraph.svg
+/.coverage
+/coverage.xml
+/coverage_c++.info
 
-# codecov
-.coverage
-coverage.xml
-coverage_c++.info
+# Package managers
+/package-lock.json
 
-# perf
-perf.data
-perf.data.old
-flamegraph.svg
-
-# claude code
-CLAUDE.md
-
-# codex
-AGENTS.md
-.codex
+# Tool memory files
+/CLAUDE.md
+/AGENTS.md
