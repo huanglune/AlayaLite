@@ -14,13 +14,7 @@
 
 """Tests for benchmark provenance helpers."""
 
-# pylint: disable=wrong-import-position  # importorskip must run before bench imports
-
 import subprocess
-
-import pytest
-
-pytest.importorskip("alayalite._alayalitepy", reason="bench tests require built alayalite extension")
 
 from alayalite.bench import _provenance
 from alayalite.bench._metrics import render_summary_json
@@ -37,8 +31,7 @@ flags       : avx2 sse4_2 fma avx512f avx sse4_1 avx2
 
 
 def test_collect_provenance_fields_and_git_fallback(monkeypatch):
-    def fake_run(args, check=False, capture_output=False, text=False):
-        del args, check, capture_output, text
+    def fake_run(*_args, **_kwargs):
         return subprocess.CompletedProcess([], 1, "", "no git")
 
     def fake_read_text(path):
@@ -69,10 +62,7 @@ def test_summary_provenance_aggregates_multiple_dataset_hashes():
     other = {**base, "dataset_sha256_prefix": "bbbbbbbbbbbbbbbb"}
 
     summary = render_summary_json(
-        [
-            {"provenance": base},
-            {"provenance": other},
-        ],
+        [{"provenance": base}, {"provenance": other}],
         "run",
         base,
     )
