@@ -68,12 +68,13 @@ jobs:
           codecov-python-portable-v2-${{ runner.os }}-${{ runner.arch }}-Release-
 
     - name: Install system dependencies
-      run: sudo apt-get install -y libaio-dev
+      run: sudo apt-get install -y gdb libaio-dev
 
     - name: Build Python coverage environment
       run: |
         export CMAKE_ARGS="-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DALAYA_NATIVE_ARCH=OFF"
-        uv sync --dev --locked
+        export CXXFLAGS="${CXXFLAGS:-} -g1 -fno-omit-frame-pointer"
+        uv sync --dev --locked -Cinstall.strip=false
 
     - name: Save Conan cache
       if: steps.conan-cache.outputs.cache-hit != 'true'
@@ -85,8 +86,22 @@ jobs:
         target-arch: ${{ runner.arch }}
 
     - name: Run python code coverage
-      run: |
-        uv run pytest --cov --cov-branch --cov-report=xml
+      env:
+        PYTHONFAULTHANDLER: '1'
+      run: bash scripts/ci/codecov/python_coverage_with_crash_diagnostics.sh
+
+    - name: Upload Python crash diagnostics
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: python-crash-diagnostics
+        path: |
+          core.*
+          pytest-crash.log
+          coverage.xml
+          .venv/lib/python*/site-packages/alayalite/_alayalitepy*.so
+        if-no-files-found: ignore
+        retention-days: 7
 
     - name: Upload Python coverage to Codecov
       uses: codecov/codecov-action@v5

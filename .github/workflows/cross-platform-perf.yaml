@@ -1,0 +1,150 @@
+---
+name       : cross-platform-perf
+
+on         :
+  workflow_dispatch:
+    inputs:
+      query_num:
+        description: Number of query vectors to benchmark
+        required: false
+        default: '100'
+      topk:
+        description: Top-k per query
+        required: false
+        default: '50'
+      ef_search:
+        description: ef_search for hybrid_query
+        required: false
+        default: '100'
+      rounds:
+        description: Number of benchmark rounds
+        required: false
+        default: '3'
+      selectivity:
+        description: Target filter selectivity
+        required: false
+        default: '0.01'
+      build_threads:
+        description: Build threads (0 = auto)
+        required: false
+        default: '0'
+      query_threads:
+        description: Batch hybrid query threads
+        required: false
+        default: '1'
+
+permissions:
+  contents: read
+
+jobs       :
+  benchmark:
+    name: Benchmark on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: ubuntu-latest
+          label: ubuntu-latest
+        - os: ubuntu-24.04-arm
+          label: ubuntu-24.04-arm
+        - os: macos-15-intel
+          label: macos-15-intel
+        - os: macos-14
+          label: macos-14
+        - os: windows-2022
+          label: windows-2022
+
+    env:
+      CONAN_NON_INTERACTIVE: 1
+      UV_CACHE_DIR: ./.github-tmp/uv-cache
+      ALAYALITE_BENCH_DATA_ROOT: ./.github-tmp/alayalite-bench-data
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v5
+
+    - name: Restore Conan cache
+      id: conan-cache
+      uses: ./.github/actions/cache-restore
+      with:
+        build-type: Release
+        target-arch: ${{ runner.arch }}
+
+    - name: Install project dependencies
+      shell: bash
+      run: uv sync --dev
+
+    - name: Save Conan cache
+      if: steps.conan-cache.outputs.cache-hit != 'true'
+      continue-on-error: true
+      uses: ./.github/actions/cache-restore
+      with:
+        mode: save
+        build-type: Release
+        target-arch: ${{ runner.arch }}
+
+    - name: Download qdrant_random_ints_1m
+      shell: bash
+      run: uv run python scripts/cross_platform_perf/cross_platform_perf.py download-dataset
+
+    - name: Run Collection.hybrid_query benchmark
+      shell: bash
+      env:
+        BENCHMARK_LABEL: ${{ matrix.label }}
+        BENCHMARK_QUERY_NUM: ${{ github.event.inputs.query_num }}
+        BENCHMARK_TOPK: ${{ github.event.inputs.topk }}
+        BENCHMARK_EF_SEARCH: ${{ github.event.inputs.ef_search }}
+        BENCHMARK_ROUNDS: ${{ github.event.inputs.rounds }}
+        BENCHMARK_SELECTIVITY: ${{ github.event.inputs.selectivity }}
+        BENCHMARK_BUILD_THREADS: ${{ github.event.inputs.build_threads }}
+        BENCHMARK_QUERY_THREADS: ${{ github.event.inputs.query_threads }}
+      run: uv run python scripts/cross_platform_perf/cross_platform_perf.py run-benchmark
+
+    - name: Upload benchmark artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: raw-hybrid-collection-benchmark-${{ matrix.label }}
+        path: artifacts/raw-hybrid-collection-${{ matrix.label }}.json
+
+    - name: Append benchmark summary
+      shell: bash
+      env:
+        BENCHMARK_LABEL: ${{ matrix.label }}
+      run: uv run python scripts/cross_platform_perf/cross_platform_perf.py append-summary
+
+  aggregate-summary:
+    name: Aggregate benchmark summary
+    runs-on: ubuntu-latest
+    if: always()
+    needs: benchmark
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v5
+
+    - name: Download benchmark artifacts
+      uses: actions/download-artifact@v4
+      continue-on-error: true
+      with:
+        pattern: raw-hybrid-collection-benchmark-*
+        path: artifacts/benchmarks
+        merge-multiple: true
+
+    - name: Append aggregated benchmark summary
+      shell: bash
+      run: uv run --no-project python scripts/cross_platform_perf/cross_platform_perf.py aggregate-summary
