@@ -4,7 +4,6 @@
 
 #pragma once
 
-#include <sys/types.h>
 #include <array>
 #include <cassert>
 #include <cstddef>
@@ -26,6 +25,7 @@
 #include "utils/math.hpp"
 #include "utils/metadata_filter.hpp"
 #include "utils/metric_type.hpp"
+#include "utils/openmp.hpp"
 #include "utils/prefetch.hpp"
 #include "utils/rabitq_utils/fastscan.hpp"
 #include "utils/rabitq_utils/lut.hpp"
@@ -288,7 +288,8 @@ class RaBitQSpace {
 
     // We don't fit after loading , so loaded storage_ would not be overwritten.
     storage_ = StaticStorage<>(std::vector<size_t>{item_cnt_, data_chunk_size_});
-#pragma omp parallel for schedule(dynamic)
+    platform::log_openmp_fallback_once();
+    ALAYA_OMP_PARALLEL_FOR_DYNAMIC
     for (int64_t i = 0; i < static_cast<int64_t>(item_cnt); i++) {
       const auto *src = data + (dim_ * i);
       auto *dst = get_data_by_id(i);
@@ -481,8 +482,8 @@ class RaBitQSpace {
     DataType lut_delta_ = 0;
     DataType lut_bias_ = 0;
 
-    // alignas(64) std::array<uint16_t, fastscan::kBatchSize> accu_res_{};
-    alignas(64) std::array<DataType, kDegreeBound> est_dists_{};
+    // Keep QueryComputer at natural alignment; coroutine search stores it in coroutine frames.
+    std::array<DataType, kDegreeBound> est_dists_{};
 
     void batch_est_dist() {
       const char *base = storage_ptr_ + data_chunk_size_ * c_;
