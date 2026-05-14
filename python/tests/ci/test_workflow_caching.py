@@ -105,25 +105,73 @@ def test_workflow_conan_cache_calls_are_arch_scoped_and_nonfatal_on_save_race() 
     )
 
 
-def test_cpp_heavy_jobs_enable_ccache() -> None:
-    unit_steps = _steps("code-checker.yaml", "py-unit-test")
+def test_coverage_jobs_enable_ccache() -> None:
+    python_steps = _steps("codecov.yaml", "codecov-python")
     cpp_steps = _steps("codecov.yaml", "codecov-cpp")
 
-    assert _uses(unit_steps, "hendrikmuhs/ccache-action@v1")
+    assert _uses(python_steps, "hendrikmuhs/ccache-action@v1")
     assert _uses(cpp_steps, "hendrikmuhs/ccache-action@v1")
-    assert "CMAKE_CXX_COMPILER_LAUNCHER=ccache" in _named_step(unit_steps, "Build Python test environment")["run"]
+    assert "CMAKE_CXX_COMPILER_LAUNCHER=ccache" in _named_step(python_steps, "Build Python coverage environment")["run"]
     assert "CMAKE_CXX_COMPILER_LAUNCHER=ccache" in _named_step(cpp_steps, "Run c++ code coverage")["run"]
+
+
+def test_ci_workflow_does_not_run_duplicate_python_unit_job() -> None:
+    workflow = _yaml(WORKFLOWS / "code-checker.yaml")
+
+    assert "py-unit-test" not in workflow["jobs"]
+
+
+def test_codecov_python_replaces_unit_test_gate_without_upload_flakes() -> None:
+    coverage_steps = _steps("codecov.yaml", "codecov-python")
+    run_step = _named_step(coverage_steps, "Run python code coverage")
+    upload_step = _named_step(coverage_steps, "Upload Python coverage to Codecov")
+
+    assert "python_coverage_with_crash_diagnostics.sh" in run_step["run"]
+    assert upload_step["continue-on-error"] is True
+    assert upload_step["uses"] == "codecov/codecov-action@v5"
+
+
+def test_codecov_python_build_uses_unit_build_configuration() -> None:
+    coverage_build = _named_step(_steps("codecov.yaml", "codecov-python"), "Build Python coverage environment")["run"]
+
+    assert "CMAKE_CXX_COMPILER_LAUNCHER=ccache" in coverage_build
+    assert "-DALAYA_NATIVE_ARCH=OFF" in coverage_build
+    assert "uv sync --dev --locked" in coverage_build
+    assert "CXXFLAGS" not in coverage_build
+    assert "install.strip" not in coverage_build
+
+
+def test_codecov_workflow_keeps_coverage_trigger_scope() -> None:
+    workflow = _yaml(WORKFLOWS / "codecov.yaml")
+    triggers = workflow.get("on", workflow.get(True))
+    coverage_paths = [
+        "include/**",
+        "tests/**",
+        "python/src/**",
+        "python/tests/**",
+        "app/**",
+        "app/tests/**",
+        "CMakeLists.txt",
+        "Makefile",
+        "pyproject.toml",
+        "python/CMakeLists.txt",
+        "cmake/**",
+        "scripts/ci/codecov/**",
+        "scripts/conan_build/**",
+    ]
+
+    assert triggers is not None
+    assert triggers["pull_request"] == {"paths": coverage_paths}
+    assert triggers["push"] == {"branches": ["main"], "paths": coverage_paths}
 
 
 def test_ccache_builds_disable_native_arch() -> None:
     """Do not cache -march=native objects across heterogeneous GitHub runners."""
 
-    unit_steps = _steps("code-checker.yaml", "py-unit-test")
     coverage_steps = _steps("codecov.yaml", "codecov-python")
     wheel_env = _yaml(WORKFLOWS / "cibuildwheel.yaml")["jobs"]["build_wheels"]["env"]
     codecov_script = (ROOT / "scripts" / "ci" / "codecov" / "gnu_codecoverage.sh").read_text(encoding="utf-8")
 
-    assert "-DALAYA_NATIVE_ARCH=OFF" in _named_step(unit_steps, "Build Python test environment")["run"]
     assert "-DALAYA_NATIVE_ARCH=OFF" in _named_step(coverage_steps, "Build Python coverage environment")["run"]
     assert "-DALAYA_NATIVE_ARCH=OFF" in wheel_env["CMAKE_ARGS"]
     assert "-DALAYA_NATIVE_ARCH=OFF" in codecov_script
@@ -139,13 +187,20 @@ def test_cibuildwheel_builds_portable_package_targets() -> None:
 
 def test_ccache_keys_are_versioned_for_portable_isa_reset() -> None:
     ccache_steps = [
-        _uses(_steps("code-checker.yaml", "py-unit-test"), "hendrikmuhs/ccache-action@v1")[0],
         _uses(_steps("codecov.yaml", "codecov-python"), "hendrikmuhs/ccache-action@v1")[0],
         _uses(_steps("codecov.yaml", "codecov-cpp"), "hendrikmuhs/ccache-action@v1")[0],
     ]
 
-    assert all("portable-v2" in step["with"]["key"] for step in ccache_steps)
-    assert all("portable-v2" in step["with"]["restore-keys"] for step in ccache_steps)
+    assert "portable-v3" in ccache_steps[0]["with"]["key"]
+    assert "portable-v2" in ccache_steps[1]["with"]["key"]
+    assert all("portable-v" in step["with"]["restore-keys"] for step in ccache_steps)
+
+
+def test_codecov_python_restores_legacy_unit_test_cache() -> None:
+    ccache_step = _uses(_steps("codecov.yaml", "codecov-python"), "hendrikmuhs/ccache-action@v1")[0]
+
+    assert "codecov-python-portable-v3" in ccache_step["with"]["key"]
+    assert "py-unit-portable-v2" in ccache_step["with"]["restore-keys"]
 
 
 def test_cmake_defaults_to_portable_native_arch_and_guards_packages() -> None:
