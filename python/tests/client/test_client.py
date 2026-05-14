@@ -187,13 +187,13 @@ class TestClient(unittest.TestCase):
             (
                 1,
                 "Document 1",
-                np.array([0.1, 0.2, 0.3], dtype=float),
+                np.array([0.1, 0.2, 0.3], dtype=np.float32),
                 {"category": "A"},
             ),
             (
                 2,
                 "Document 2",
-                np.array([0.4, 0.5, 0.6], dtype=float),
+                np.array([0.4, 0.5, 0.6], dtype=np.float32),
                 {"category": "B"},
             ),
         ]

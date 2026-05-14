@@ -6,18 +6,39 @@ find_package(
   REQUIRED
 )
 
+set(ALAYA_CODEGEN_DIR ${CMAKE_SOURCE_DIR}/tools/codegen)
+set(ALAYA_CODEGEN_INPUTS
+    ${ALAYA_CODEGEN_DIR}/dispatch.yaml ${ALAYA_CODEGEN_DIR}/gen.py
+    ${ALAYA_CODEGEN_DIR}/templates/dispatch_factory.hpp.j2 ${ALAYA_CODEGEN_DIR}/templates/test_matrix_params.py.j2
+)
+set(ALAYA_CODEGEN_OUTPUTS ${CMAKE_SOURCE_DIR}/python/include/dispatch_generated.hpp
+                          ${CMAKE_SOURCE_DIR}/python/tests/client/_dispatch_matrix_params.py
+)
+
+add_custom_command(
+  OUTPUT ${ALAYA_CODEGEN_OUTPUTS}
+  COMMAND ${Python3_EXECUTABLE} ${ALAYA_CODEGEN_DIR}/gen.py
+  DEPENDS ${ALAYA_CODEGEN_INPUTS}
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  COMMENT "Generating python dispatch header from dispatch.yaml"
+  VERBATIM
+)
+
+add_custom_target(codegen DEPENDS ${ALAYA_CODEGEN_OUTPUTS})
+
 # Automatically process various attributes (such as suffixes, visibility, etc.)
 pybind11_add_module(${PYTHON_MODULE_NAME} MODULE NO_EXTRAS src/pybind.cpp)
+add_dependencies(${PYTHON_MODULE_NAME} codegen)
 target_include_directories(${PYTHON_MODULE_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(${PYTHON_MODULE_NAME} PRIVATE AlayaLite pybind11::module)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   target_compile_options(${PYTHON_MODULE_NAME} PRIVATE -Wno-nonnull)
 endif()
 
-# Precompile pybind11 + Eigen + STL headers. _alayalitepy is a single-TU module whose dispatch.hpp expansion drags in
-# pybind11/numpy.h, Eigen, and the bulk of <vector>/<string>/<memory>/<unordered_map> hundreds of times through template
-# instantiation. A PCH cuts the parse+template-instantiation cost on the recurring header surface and is the single
-# biggest lever for this TU's compile time. Requires CMake >= 3.16; gate accordingly.
+# Precompile pybind11 + Eigen + STL headers. _alayalitepy is a single-TU module whose index/dispatch-generated templates
+# drag in pybind11/numpy.h, Eigen, and the bulk of <vector>/<string>/<memory>/<unordered_map> hundreds of times through
+# template instantiation. A PCH cuts the parse+template-instantiation cost on the recurring header surface and is the
+# single biggest lever for this TU's compile time. Requires CMake >= 3.16; gate accordingly.
 if(NOT CMAKE_VERSION VERSION_LESS 3.16)
   target_precompile_headers(
     ${PYTHON_MODULE_NAME}

@@ -5,6 +5,8 @@ requires = [
     "wheel",
     "conan>=2.0",
     "scikit-build-core",
+    "jinja2>=3.1",
+    "pyyaml>=6.0",
 ]
 build-backend = "scikit_build_core.build"
 
@@ -75,6 +77,8 @@ dev = [
     { include-group = "lint" },
     { include-group = "api" },
     { include-group = "laser" },
+    "jinja2>=3.1",
+    "pyyaml>=6.0",
     "reuse>=5.1.1",
 ]
 

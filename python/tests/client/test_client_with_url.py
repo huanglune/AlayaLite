@@ -20,8 +20,8 @@ class TestClientWithURL(unittest.TestCase):
     def setUp(self):
         self.ind_vectors = np.random.rand(1000, 128).astype(np.float32)
         self.coll_items = [
-            (1, "Document 1", np.array([0.1, 0.2, 0.3]), {"category": "A"}),
-            (2, "Document 2", np.array([0.4, 0.5, 0.6]), {"category": "B"}),
+            (1, "Document 1", np.array([0.1, 0.2, 0.3], dtype=np.float32), {"category": "A"}),
+            (2, "Document 2", np.array([0.4, 0.5, 0.6], dtype=np.float32), {"category": "B"}),
         ]
         # Create temp directory for test isolation
         self.temp_dir = tempfile.mkdtemp()

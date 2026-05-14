@@ -38,19 +38,18 @@ class Client {
   Client() = default;
 
   auto create_index(const std::string &name, const IndexParams &params)
-      -> std::shared_ptr<PyIndexInterface> {
-    auto index = std::make_shared<PyIndexInterface>(params);
-
-    return index;
+      -> std::unique_ptr<BasePyIndex> {
+    (void)name;
+    return IndexFactory::create(params);
   }
 
   auto load_index(const std::string &name,
                   const IndexParams &params,
                   const std::string &index_path,
                   const std::string &data_path = std::string(),
-                  const std::string &quant_path = std::string())
-      -> std::shared_ptr<PyIndexInterface> {
-    auto index = std::make_shared<PyIndexInterface>(params);
+                  const std::string &quant_path = std::string()) -> std::unique_ptr<BasePyIndex> {
+    (void)name;
+    auto index = IndexFactory::create(params);
     index->load(index_path, data_path, quant_path);
 
     return index;

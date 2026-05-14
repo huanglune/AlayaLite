@@ -33,11 +33,8 @@ VectorDType: TypeAlias = Union[
     Type[np.float32],
     Type[np.int8],
     Type[np.uint8],
-    Type[np.float64],
-    Type[np.int32],
-    Type[np.uint32],
 ]
-""" Type alias for one of {`numpy.float32`, `numpy.int8`, `numpy.uint8`} """
+""" Type alias for one of {`numpy.float32`, `numpy.int8`, `numpy.uint8`}. """
 DistanceMetric: TypeAlias = Literal["euclidean", "l2", "ip", "cosine", "cos"]
 """ Type alias for one of {"euclidean", "l2", "ip", "cosine", "cos"} """
 QuantizationType: TypeAlias = Literal[None, "none", "sq8", "sq4", "rabitq"]
@@ -50,7 +47,7 @@ VectorLikeBatch: TypeAlias = npt.NDArray[VectorDType]  # type: ignore
 """ Type alias for a batch of VectorLikes """
 
 _VALID_IDTYPES = [np.uint64, np.uint32]
-_VALID_DTYPES = [np.float32, np.int8, np.uint8, np.float64, np.int32, np.uint32]
+_VALID_DTYPES = [np.dtype(np.float32), np.dtype(np.int8), np.dtype(np.uint8)]
 _VALID_METRIC_TYPES = ["euclidean", "l2", "ip", "cosine", "cos"]
 _VALID_INDEX_TYPES = ["hnsw", "nsg", "fusion"]
 _VALID_SQ_TYPES = [None, "none", "sq8", "sq4", "rabitq"]
@@ -111,12 +108,12 @@ def normalize_filter_execution_hint(filter_execution_hint: Optional[str]) -> str
 
 
 def valid_dtype(dtype) -> np.dtype:
+    np_dtype = np.dtype(dtype)
     _assert(
-        any(np.can_cast(dtype, dtype_) for dtype_ in _VALID_DTYPES),
-        "Vector dtype must be one of type {(np.single, np.float32), (np.byte, np.int8), "
-        "(np.ubyte, np.uint8), (np.double, np.float64), (np.int32, np.int32), (np.uint32, np.uint32)}",
+        np_dtype in _VALID_DTYPES,
+        "Vector dtype must be one of {(np.float32), (np.int8), (np.uint8)}",
     )
-    return np.dtype(dtype)
+    return np_dtype
 
 
 def valid_id_type(id_type) -> np.dtype:

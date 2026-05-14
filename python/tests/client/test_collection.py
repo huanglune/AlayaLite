@@ -57,8 +57,8 @@ class TestCollection(unittest.TestCase):
     def test_insert(self):
         """Test inserting items into the collection."""
         items = [
-            (1, "Document 1", np.array([0.1, 0.2, 0.3]), {"category": "A"}),
-            (2, "Document 2", np.array([0.4, 0.5, 0.6]), {"category": "B"}),
+            (1, "Document 1", np.array([0.1, 0.2, 0.3], dtype=np.float32), {"category": "A"}),
+            (2, "Document 2", np.array([0.4, 0.5, 0.6], dtype=np.float32), {"category": "B"}),
         ]
         self.collection.insert(items)
         result = self.collection.filter_query({})
@@ -72,8 +72,8 @@ class TestCollection(unittest.TestCase):
     def test_insert_uses_explicit_build_threads(self):
         """First-build fit should honor explicit build thread parameters."""
         items = [
-            (1, "Document 1", np.array([0.1, 0.2, 0.3]), {"category": "A"}),
-            (2, "Document 2", np.array([0.4, 0.5, 0.6]), {"category": "B"}),
+            (1, "Document 1", np.array([0.1, 0.2, 0.3], dtype=np.float32), {"category": "A"}),
+            (2, "Document 2", np.array([0.4, 0.5, 0.6], dtype=np.float32), {"category": "B"}),
         ]
         collection = self._create_collection("test_collection_threads", self._collection_params(build_threads=7))
         with patch.object(Index, "fit", autospec=True, return_value=None) as mock_fit:
@@ -83,15 +83,15 @@ class TestCollection(unittest.TestCase):
 
     def test_upsert_fit_and_concat(self):
         items = [
-            (1, "Document 1", np.array([0.1, 0.2, 0.3]), {"category": "A"}),
-            (2, "Document 2", np.array([0.4, 0.5, 0.6]), {"category": "B"}),
+            (1, "Document 1", np.array([0.1, 0.2, 0.3], dtype=np.float32), {"category": "A"}),
+            (2, "Document 2", np.array([0.4, 0.5, 0.6], dtype=np.float32), {"category": "B"}),
         ]
         self.collection.upsert(items)
         result = self.collection.filter_query({})
         self.assertEqual(len(result["id"]), 2)
         new_items = [
-            (3, "Document 3", np.array([0.1, 0.2, 0.3]), {"category": "A"}),
-            (4, "Document 4", np.array([0.4, 0.5, 0.6]), {"category": "B"}),
+            (3, "Document 3", np.array([0.1, 0.2, 0.3], dtype=np.float32), {"category": "A"}),
+            (4, "Document 4", np.array([0.4, 0.5, 0.6], dtype=np.float32), {"category": "B"}),
         ]
         self.collection.upsert(new_items)
         result = self.collection.filter_query({})
@@ -99,8 +99,8 @@ class TestCollection(unittest.TestCase):
 
     def test_batch_query(self):
         items = [
-            (1, "Document 1", np.array([0.1, 0.2, 0.3]), {}),
-            (2, "Document 2", np.array([0.4, 0.5, 0.6]), {}),
+            (1, "Document 1", np.array([0.1, 0.2, 0.3], dtype=np.float32), {}),
+            (2, "Document 2", np.array([0.4, 0.5, 0.6], dtype=np.float32), {}),
         ]
         self.collection.insert(items)
         result = self.collection.batch_query([[0.1, 0.2, 0.3]], limit=1, ef_search=10)
@@ -110,9 +110,9 @@ class TestCollection(unittest.TestCase):
     def test_batch_query_multiple_results(self):
         """Test a batch query with multiple queries and expected neighbors."""
         items = [
-            (1, "document1", [1.0, 2.0, 3.0], {}),
-            (2, "document2", [4.0, 5.0, 6.0], {"category": "B"}),
-            (3, "document3", [12.0, 32.0, 31.0], {"category": "C"}),
+            (1, "document1", np.array([1.0, 2.0, 3.0], dtype=np.float32), {}),
+            (2, "document2", np.array([4.0, 5.0, 6.0], dtype=np.float32), {"category": "B"}),
+            (3, "document3", np.array([12.0, 32.0, 31.0], dtype=np.float32), {"category": "C"}),
         ]
         self.collection.insert(items)
 
@@ -128,8 +128,8 @@ class TestCollection(unittest.TestCase):
 
     def test_cpp_batch_get_scalar_data_by_internal_ids(self):
         items = [
-            (1, "Document 1", np.array([0.1, 0.2, 0.3]), {"category": "A"}),
-            (2, "Document 2", np.array([0.4, 0.5, 0.6]), {"category": "B"}),
+            (1, "Document 1", np.array([0.1, 0.2, 0.3], dtype=np.float32), {"category": "A"}),
+            (2, "Document 2", np.array([0.4, 0.5, 0.6], dtype=np.float32), {"category": "B"}),
         ]
         self.collection.insert(items)
 
@@ -161,9 +161,9 @@ class TestCollection(unittest.TestCase):
 
     def test_upsert(self):
         """Test updating an existing item in the collection."""
-        items = [(1, "Old Doc", np.array([0.1, 0.2, 0.3]), {})]
+        items = [(1, "Old Doc", np.array([0.1, 0.2, 0.3], dtype=np.float32), {})]
         self.collection.insert(items)
-        update_items = [(1, "New Doc", np.array([0.2, 0.3, 0.4]), {})]
+        update_items = [(1, "New Doc", np.array([0.2, 0.3, 0.4], dtype=np.float32), {})]
         self.collection.upsert(update_items)
         result = self.collection.get_by_id([1])
         self.assertEqual(len(result["document"]), 1)
@@ -171,7 +171,7 @@ class TestCollection(unittest.TestCase):
 
     def test_delete_by_id(self):
         """Test deleting an item by its ID."""
-        items = [(1, "Document 1", np.array([0.1, 0.2, 0.3]), {})]
+        items = [(1, "Document 1", np.array([0.1, 0.2, 0.3], dtype=np.float32), {})]
         self.collection.insert(items)
         self.collection.delete_by_id([1])
         result = self.collection.get_by_id([1])
@@ -180,8 +180,8 @@ class TestCollection(unittest.TestCase):
     def test_get_by_id(self):
         """Test retrieving items by their IDs."""
         items = [
-            (1, "Document 1", np.array([0.1, 0.2, 0.3]), {"category": "A"}),
-            (2, "Document 2", np.array([0.4, 0.5, 0.6]), {"category": "B"}),
+            (1, "Document 1", np.array([0.1, 0.2, 0.3], dtype=np.float32), {"category": "A"}),
+            (2, "Document 2", np.array([0.4, 0.5, 0.6], dtype=np.float32), {"category": "B"}),
         ]
         self.collection.insert(items)
         result = self.collection.get_by_id([1])
@@ -191,9 +191,9 @@ class TestCollection(unittest.TestCase):
     def test_delete_by_filter(self):
         """Test deleting items based on a metadata filter."""
         items = [
-            (1, "Document 1", np.array([0.1, 0.2, 0.3]), {"category": "A"}),
-            (2, "Document 2", np.array([0.4, 0.5, 0.6]), {"category": "A"}),
-            (3, "Document 3", np.array([0.7, 0.8, 0.9]), {"category": "B"}),
+            (1, "Document 1", np.array([0.1, 0.2, 0.3], dtype=np.float32), {"category": "A"}),
+            (2, "Document 2", np.array([0.4, 0.5, 0.6], dtype=np.float32), {"category": "A"}),
+            (3, "Document 3", np.array([0.7, 0.8, 0.9], dtype=np.float32), {"category": "B"}),
         ]
         self.collection.insert(items)
         self.collection.delete_by_filter({"category": "A"})
@@ -204,8 +204,8 @@ class TestCollection(unittest.TestCase):
     def test_filter_query(self):
         """Test querying items based on a metadata filter."""
         items = [
-            (1, "Document 1", np.array([0.1, 0.2, 0.3]), {"category": "A"}),
-            (2, "Document 2", np.array([0.4, 0.5, 0.6]), {"category": "B"}),
+            (1, "Document 1", np.array([0.1, 0.2, 0.3], dtype=np.float32), {"category": "A"}),
+            (2, "Document 2", np.array([0.4, 0.5, 0.6], dtype=np.float32), {"category": "B"}),
         ]
         self.collection.insert(items)
         result = self.collection.filter_query({"category": "A"})
@@ -595,7 +595,7 @@ class TestCollection(unittest.TestCase):
         """Test a sequence of insert, delete, and query operations."""
         uuids = [f"id_{i}" for i in range(1, 1000)]
         documents = [f"Document {i}" for i in range(1, 1000)]
-        embeddings = [[random.random() for _ in range(100)] for _ in range(999)]
+        embeddings = [np.array([random.random() for _ in range(100)], dtype=np.float32) for _ in range(999)]
         # Ensure all lists have the same length
         self.collection.insert(list(zip(uuids, documents, embeddings, [{} for _ in range(999)])))
 

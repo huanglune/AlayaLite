@@ -3,12 +3,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 """
-Coverage tests for the C++ dispatch tree in `python/include/dispatch.hpp`.
+Coverage tests for the generated C++ dispatch support matrix.
 
-The dispatch macros translate runtime IndexParams into compile-time template
-specializations of ``PyIndex<GraphBuilderType, SearchSpaceType>``. These tests
-exist as a safety net for refactors of that translation: every leaf of the
-dispatch tree must remain reachable from the SDK.
+The runtime `IndexFactory::create` dispatch is generated from
+`tools/codegen/dispatch.yaml`. These tests are a safety net for that generated
+support matrix: every listed combination must remain reachable from the SDK.
 
 The tests assert behavioural smoke (operations do not raise) rather than
 numerical correctness; recall/precision are validated in dedicated tests
@@ -25,7 +24,6 @@ Two layers:
 
 # pylint: disable=redefined-outer-name
 
-import itertools
 import os
 import tempfile
 
@@ -34,11 +32,13 @@ import pytest
 from alayalite import Index
 from alayalite.schema import IndexParams
 
+from ._dispatch_matrix_params import _FULL_PARAMS
+
 # ---------------------------------------------------------------------------
 # Dispatch axes
 # ---------------------------------------------------------------------------
 
-DATA_TYPES = [np.float32, np.int8, np.uint8, np.int32, np.uint32, np.float64]
+DATA_TYPES = [np.float32, np.int8, np.uint8]
 ID_TYPES = [np.uint32, np.uint64]
 QUANT_TYPES = ["none", "sq8", "sq4", "rabitq"]
 INDEX_TYPES = ["hnsw", "nsg", "fusion"]
@@ -46,24 +46,6 @@ INDEX_TYPES = ["hnsw", "nsg", "fusion"]
 # RaBitQ's FhtKacRotator requires floor_log2(dim) in [6, 11], i.e. dim >= 64.
 DIM = 64
 N_VECTORS = 256
-
-
-def _is_valid_combo(data_type, id_type, quant) -> bool:
-    """Filter out combinations rejected at construct/fit time.
-
-    Constraints come from the C++ layer:
-
-    * RaBitQ space only supports float32 vectors
-      (``DISPATCH_BUILD_SPACE_TYPE`` / ``DISPATCH_SEARCH_SPACE_TYPE`` in
-      ``python/include/dispatch.hpp``).
-    * RaBitQ space requires a 32-bit ID type
-      (``include/space/rabitq_space.hpp::RaBitQSpace::fit``).
-    """
-    if quant == "rabitq" and data_type is not np.float32:
-        return False
-    if quant == "rabitq" and id_type is not np.uint32:
-        return False
-    return True
 
 
 def _random_vectors(rng, n, dim, dtype):
@@ -154,7 +136,7 @@ def test_axis_quantization(quant):
     result = index.search(vectors[0], topk=5)
     assert len(result) == 5
 
-    # Save + load round-trip exercises DISPATCH_AND_CAST for save/load.
+    # Save + load round-trip exercises the dispatch + serialization path.
     with tempfile.TemporaryDirectory() as tmp:
         index.save(tmp)
         # Load currently requires an existing Index with matching params;
@@ -181,13 +163,6 @@ def test_axis_index_type(index_type):
 # ---------------------------------------------------------------------------
 # Layer 2: Full Cartesian matrix (opt-in via @pytest.mark.extended)
 # ---------------------------------------------------------------------------
-
-
-_FULL_PARAMS = [
-    (dt, idt, q, ixt, sd)
-    for dt, idt, q, ixt, sd in itertools.product(DATA_TYPES, ID_TYPES, QUANT_TYPES, INDEX_TYPES, [False])
-    if _is_valid_combo(dt, idt, q)
-]
 
 
 def _full_param_id(case) -> str:
