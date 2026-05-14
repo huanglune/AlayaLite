@@ -18,678 +18,540 @@ namespace alaya {
 
 auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIndex> {
   // float / uint32_t / NONE / HNSW
-  if (params.data_type_.is(py::dtype::of<float>()) &&
-      params.id_type_.is(py::dtype::of<uint32_t>()) &&
-      params.quantization_type_ == QuantizationType::NONE &&
-      params.index_type_ == IndexType::HNSW) {
+  if (params.data_type_.is(py::dtype::of<float>())
+      && params.id_type_.is(py::dtype::of<uint32_t>())
+      && params.quantization_type_ == QuantizationType::NONE
+      && params.index_type_ == IndexType::HNSW) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, ScalarData>;
-      using SearchSpaceType =
-          RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, ScalarData>;
+      using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,ScalarData>;
+      using SearchSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,ScalarData>;
       using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, EmptyScalarData>;
+    using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
+    using SearchSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint32_t / NONE / NSG
-  if (params.data_type_.is(py::dtype::of<float>()) &&
-      params.id_type_.is(py::dtype::of<uint32_t>()) &&
-      params.quantization_type_ == QuantizationType::NONE && params.index_type_ == IndexType::NSG) {
+  if (params.data_type_.is(py::dtype::of<float>())
+      && params.id_type_.is(py::dtype::of<uint32_t>())
+      && params.quantization_type_ == QuantizationType::NONE
+      && params.index_type_ == IndexType::NSG) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, ScalarData>;
-      using SearchSpaceType =
-          RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, ScalarData>;
+      using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,ScalarData>;
+      using SearchSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,ScalarData>;
       using GraphBuilderType = NSGBuilder<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, EmptyScalarData>;
+    using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
+    using SearchSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = NSGBuilder<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint32_t / NONE / FUSION
-  if (params.data_type_.is(py::dtype::of<float>()) &&
-      params.id_type_.is(py::dtype::of<uint32_t>()) &&
-      params.quantization_type_ == QuantizationType::NONE &&
-      params.index_type_ == IndexType::FUSION) {
+  if (params.data_type_.is(py::dtype::of<float>())
+      && params.id_type_.is(py::dtype::of<uint32_t>())
+      && params.quantization_type_ == QuantizationType::NONE
+      && params.index_type_ == IndexType::FUSION) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, ScalarData>;
-      using SearchSpaceType =
-          RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, ScalarData>;
-      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,
-                                                  HNSWBuilder<BuildSpaceType>,
-                                                  NSGBuilder<BuildSpaceType>>;
+      using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,ScalarData>;
+      using SearchSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,ScalarData>;
+      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, EmptyScalarData>;
-    using GraphBuilderType =
-        FusionGraphBuilder<BuildSpaceType, HNSWBuilder<BuildSpaceType>, NSGBuilder<BuildSpaceType>>;
+    using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
+    using SearchSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
+    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint32_t / SQ8 / HNSW
-  if (params.data_type_.is(py::dtype::of<float>()) &&
-      params.id_type_.is(py::dtype::of<uint32_t>()) &&
-      params.quantization_type_ == QuantizationType::SQ8 && params.index_type_ == IndexType::HNSW) {
+  if (params.data_type_.is(py::dtype::of<float>())
+      && params.id_type_.is(py::dtype::of<uint32_t>())
+      && params.quantization_type_ == QuantizationType::SQ8
+      && params.index_type_ == IndexType::HNSW) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, EmptyScalarData>;
-      using SearchSpaceType =
-          SQ8Space<float, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, ScalarData>;
+      using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
+      using SearchSpaceType = SQ8Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
       using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        SQ8Space<float, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, EmptyScalarData>;
+    using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
+    using SearchSpaceType = SQ8Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint32_t / SQ8 / NSG
-  if (params.data_type_.is(py::dtype::of<float>()) &&
-      params.id_type_.is(py::dtype::of<uint32_t>()) &&
-      params.quantization_type_ == QuantizationType::SQ8 && params.index_type_ == IndexType::NSG) {
+  if (params.data_type_.is(py::dtype::of<float>())
+      && params.id_type_.is(py::dtype::of<uint32_t>())
+      && params.quantization_type_ == QuantizationType::SQ8
+      && params.index_type_ == IndexType::NSG) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, EmptyScalarData>;
-      using SearchSpaceType =
-          SQ8Space<float, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, ScalarData>;
+      using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
+      using SearchSpaceType = SQ8Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
       using GraphBuilderType = NSGBuilder<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        SQ8Space<float, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, EmptyScalarData>;
+    using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
+    using SearchSpaceType = SQ8Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = NSGBuilder<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint32_t / SQ8 / FUSION
-  if (params.data_type_.is(py::dtype::of<float>()) &&
-      params.id_type_.is(py::dtype::of<uint32_t>()) &&
-      params.quantization_type_ == QuantizationType::SQ8 &&
-      params.index_type_ == IndexType::FUSION) {
+  if (params.data_type_.is(py::dtype::of<float>())
+      && params.id_type_.is(py::dtype::of<uint32_t>())
+      && params.quantization_type_ == QuantizationType::SQ8
+      && params.index_type_ == IndexType::FUSION) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, EmptyScalarData>;
-      using SearchSpaceType =
-          SQ8Space<float, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, ScalarData>;
-      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,
-                                                  HNSWBuilder<BuildSpaceType>,
-                                                  NSGBuilder<BuildSpaceType>>;
+      using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
+      using SearchSpaceType = SQ8Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
+      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        SQ8Space<float, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, EmptyScalarData>;
-    using GraphBuilderType =
-        FusionGraphBuilder<BuildSpaceType, HNSWBuilder<BuildSpaceType>, NSGBuilder<BuildSpaceType>>;
+    using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
+    using SearchSpaceType = SQ8Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
+    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint32_t / SQ4 / HNSW
-  if (params.data_type_.is(py::dtype::of<float>()) &&
-      params.id_type_.is(py::dtype::of<uint32_t>()) &&
-      params.quantization_type_ == QuantizationType::SQ4 && params.index_type_ == IndexType::HNSW) {
+  if (params.data_type_.is(py::dtype::of<float>())
+      && params.id_type_.is(py::dtype::of<uint32_t>())
+      && params.quantization_type_ == QuantizationType::SQ4
+      && params.index_type_ == IndexType::HNSW) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, EmptyScalarData>;
-      using SearchSpaceType =
-          SQ4Space<float, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, ScalarData>;
+      using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
+      using SearchSpaceType = SQ4Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
       using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        SQ4Space<float, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, EmptyScalarData>;
+    using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
+    using SearchSpaceType = SQ4Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint32_t / SQ4 / NSG
-  if (params.data_type_.is(py::dtype::of<float>()) &&
-      params.id_type_.is(py::dtype::of<uint32_t>()) &&
-      params.quantization_type_ == QuantizationType::SQ4 && params.index_type_ == IndexType::NSG) {
+  if (params.data_type_.is(py::dtype::of<float>())
+      && params.id_type_.is(py::dtype::of<uint32_t>())
+      && params.quantization_type_ == QuantizationType::SQ4
+      && params.index_type_ == IndexType::NSG) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, EmptyScalarData>;
-      using SearchSpaceType =
-          SQ4Space<float, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, ScalarData>;
+      using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
+      using SearchSpaceType = SQ4Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
       using GraphBuilderType = NSGBuilder<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        SQ4Space<float, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, EmptyScalarData>;
+    using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
+    using SearchSpaceType = SQ4Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = NSGBuilder<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint32_t / SQ4 / FUSION
-  if (params.data_type_.is(py::dtype::of<float>()) &&
-      params.id_type_.is(py::dtype::of<uint32_t>()) &&
-      params.quantization_type_ == QuantizationType::SQ4 &&
-      params.index_type_ == IndexType::FUSION) {
+  if (params.data_type_.is(py::dtype::of<float>())
+      && params.id_type_.is(py::dtype::of<uint32_t>())
+      && params.quantization_type_ == QuantizationType::SQ4
+      && params.index_type_ == IndexType::FUSION) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, EmptyScalarData>;
-      using SearchSpaceType =
-          SQ4Space<float, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, ScalarData>;
-      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,
-                                                  HNSWBuilder<BuildSpaceType>,
-                                                  NSGBuilder<BuildSpaceType>>;
+      using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
+      using SearchSpaceType = SQ4Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
+      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        SQ4Space<float, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, EmptyScalarData>;
-    using GraphBuilderType =
-        FusionGraphBuilder<BuildSpaceType, HNSWBuilder<BuildSpaceType>, NSGBuilder<BuildSpaceType>>;
+    using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
+    using SearchSpaceType = SQ4Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
+    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint32_t / RABITQ / HNSW
-  if (params.data_type_.is(py::dtype::of<float>()) &&
-      params.id_type_.is(py::dtype::of<uint32_t>()) &&
-      params.quantization_type_ == QuantizationType::RABITQ &&
-      params.index_type_ == IndexType::HNSW) {
+  if (params.data_type_.is(py::dtype::of<float>())
+      && params.id_type_.is(py::dtype::of<uint32_t>())
+      && params.quantization_type_ == QuantizationType::RABITQ
+      && params.index_type_ == IndexType::HNSW) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType = RaBitQSpace<float, float, uint32_t, ScalarData>;
-      using SearchSpaceType = RaBitQSpace<float, float, uint32_t, ScalarData>;
+      using BuildSpaceType = RaBitQSpace<float,float,uint32_t,ScalarData>;
+      using SearchSpaceType = RaBitQSpace<float,float,uint32_t,ScalarData>;
       using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType = RaBitQSpace<float, float, uint32_t, EmptyScalarData>;
-    using SearchSpaceType = RaBitQSpace<float, float, uint32_t, EmptyScalarData>;
+    using BuildSpaceType = RaBitQSpace<float,float,uint32_t,EmptyScalarData>;
+    using SearchSpaceType = RaBitQSpace<float,float,uint32_t,EmptyScalarData>;
     using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint32_t / RABITQ / NSG
-  if (params.data_type_.is(py::dtype::of<float>()) &&
-      params.id_type_.is(py::dtype::of<uint32_t>()) &&
-      params.quantization_type_ == QuantizationType::RABITQ &&
-      params.index_type_ == IndexType::NSG) {
+  if (params.data_type_.is(py::dtype::of<float>())
+      && params.id_type_.is(py::dtype::of<uint32_t>())
+      && params.quantization_type_ == QuantizationType::RABITQ
+      && params.index_type_ == IndexType::NSG) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType = RaBitQSpace<float, float, uint32_t, ScalarData>;
-      using SearchSpaceType = RaBitQSpace<float, float, uint32_t, ScalarData>;
+      using BuildSpaceType = RaBitQSpace<float,float,uint32_t,ScalarData>;
+      using SearchSpaceType = RaBitQSpace<float,float,uint32_t,ScalarData>;
       using GraphBuilderType = NSGBuilder<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType = RaBitQSpace<float, float, uint32_t, EmptyScalarData>;
-    using SearchSpaceType = RaBitQSpace<float, float, uint32_t, EmptyScalarData>;
+    using BuildSpaceType = RaBitQSpace<float,float,uint32_t,EmptyScalarData>;
+    using SearchSpaceType = RaBitQSpace<float,float,uint32_t,EmptyScalarData>;
     using GraphBuilderType = NSGBuilder<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint32_t / RABITQ / FUSION
-  if (params.data_type_.is(py::dtype::of<float>()) &&
-      params.id_type_.is(py::dtype::of<uint32_t>()) &&
-      params.quantization_type_ == QuantizationType::RABITQ &&
-      params.index_type_ == IndexType::FUSION) {
+  if (params.data_type_.is(py::dtype::of<float>())
+      && params.id_type_.is(py::dtype::of<uint32_t>())
+      && params.quantization_type_ == QuantizationType::RABITQ
+      && params.index_type_ == IndexType::FUSION) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType = RaBitQSpace<float, float, uint32_t, ScalarData>;
-      using SearchSpaceType = RaBitQSpace<float, float, uint32_t, ScalarData>;
-      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,
-                                                  HNSWBuilder<BuildSpaceType>,
-                                                  NSGBuilder<BuildSpaceType>>;
+      using BuildSpaceType = RaBitQSpace<float,float,uint32_t,ScalarData>;
+      using SearchSpaceType = RaBitQSpace<float,float,uint32_t,ScalarData>;
+      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType = RaBitQSpace<float, float, uint32_t, EmptyScalarData>;
-    using SearchSpaceType = RaBitQSpace<float, float, uint32_t, EmptyScalarData>;
-    using GraphBuilderType =
-        FusionGraphBuilder<BuildSpaceType, HNSWBuilder<BuildSpaceType>, NSGBuilder<BuildSpaceType>>;
+    using BuildSpaceType = RaBitQSpace<float,float,uint32_t,EmptyScalarData>;
+    using SearchSpaceType = RaBitQSpace<float,float,uint32_t,EmptyScalarData>;
+    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint64_t / NONE / HNSW
-  if (params.data_type_.is(py::dtype::of<float>()) &&
-      params.id_type_.is(py::dtype::of<uint64_t>()) &&
-      params.quantization_type_ == QuantizationType::NONE &&
-      params.index_type_ == IndexType::HNSW) {
+  if (params.data_type_.is(py::dtype::of<float>())
+      && params.id_type_.is(py::dtype::of<uint64_t>())
+      && params.quantization_type_ == QuantizationType::NONE
+      && params.index_type_ == IndexType::HNSW) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, ScalarData>;
-      using SearchSpaceType =
-          RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, ScalarData>;
+      using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,ScalarData>;
+      using SearchSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,ScalarData>;
       using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, EmptyScalarData>;
+    using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
+    using SearchSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint64_t / NONE / NSG
-  if (params.data_type_.is(py::dtype::of<float>()) &&
-      params.id_type_.is(py::dtype::of<uint64_t>()) &&
-      params.quantization_type_ == QuantizationType::NONE && params.index_type_ == IndexType::NSG) {
+  if (params.data_type_.is(py::dtype::of<float>())
+      && params.id_type_.is(py::dtype::of<uint64_t>())
+      && params.quantization_type_ == QuantizationType::NONE
+      && params.index_type_ == IndexType::NSG) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, ScalarData>;
-      using SearchSpaceType =
-          RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, ScalarData>;
+      using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,ScalarData>;
+      using SearchSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,ScalarData>;
       using GraphBuilderType = NSGBuilder<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, EmptyScalarData>;
+    using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
+    using SearchSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = NSGBuilder<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint64_t / NONE / FUSION
-  if (params.data_type_.is(py::dtype::of<float>()) &&
-      params.id_type_.is(py::dtype::of<uint64_t>()) &&
-      params.quantization_type_ == QuantizationType::NONE &&
-      params.index_type_ == IndexType::FUSION) {
+  if (params.data_type_.is(py::dtype::of<float>())
+      && params.id_type_.is(py::dtype::of<uint64_t>())
+      && params.quantization_type_ == QuantizationType::NONE
+      && params.index_type_ == IndexType::FUSION) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, ScalarData>;
-      using SearchSpaceType =
-          RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, ScalarData>;
-      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,
-                                                  HNSWBuilder<BuildSpaceType>,
-                                                  NSGBuilder<BuildSpaceType>>;
+      using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,ScalarData>;
+      using SearchSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,ScalarData>;
+      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, EmptyScalarData>;
-    using GraphBuilderType =
-        FusionGraphBuilder<BuildSpaceType, HNSWBuilder<BuildSpaceType>, NSGBuilder<BuildSpaceType>>;
+    using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
+    using SearchSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
+    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint64_t / SQ8 / HNSW
-  if (params.data_type_.is(py::dtype::of<float>()) &&
-      params.id_type_.is(py::dtype::of<uint64_t>()) &&
-      params.quantization_type_ == QuantizationType::SQ8 && params.index_type_ == IndexType::HNSW) {
+  if (params.data_type_.is(py::dtype::of<float>())
+      && params.id_type_.is(py::dtype::of<uint64_t>())
+      && params.quantization_type_ == QuantizationType::SQ8
+      && params.index_type_ == IndexType::HNSW) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, EmptyScalarData>;
-      using SearchSpaceType =
-          SQ8Space<float, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, ScalarData>;
+      using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
+      using SearchSpaceType = SQ8Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
       using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        SQ8Space<float, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, EmptyScalarData>;
+    using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
+    using SearchSpaceType = SQ8Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint64_t / SQ8 / NSG
-  if (params.data_type_.is(py::dtype::of<float>()) &&
-      params.id_type_.is(py::dtype::of<uint64_t>()) &&
-      params.quantization_type_ == QuantizationType::SQ8 && params.index_type_ == IndexType::NSG) {
+  if (params.data_type_.is(py::dtype::of<float>())
+      && params.id_type_.is(py::dtype::of<uint64_t>())
+      && params.quantization_type_ == QuantizationType::SQ8
+      && params.index_type_ == IndexType::NSG) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, EmptyScalarData>;
-      using SearchSpaceType =
-          SQ8Space<float, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, ScalarData>;
+      using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
+      using SearchSpaceType = SQ8Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
       using GraphBuilderType = NSGBuilder<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        SQ8Space<float, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, EmptyScalarData>;
+    using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
+    using SearchSpaceType = SQ8Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = NSGBuilder<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint64_t / SQ8 / FUSION
-  if (params.data_type_.is(py::dtype::of<float>()) &&
-      params.id_type_.is(py::dtype::of<uint64_t>()) &&
-      params.quantization_type_ == QuantizationType::SQ8 &&
-      params.index_type_ == IndexType::FUSION) {
+  if (params.data_type_.is(py::dtype::of<float>())
+      && params.id_type_.is(py::dtype::of<uint64_t>())
+      && params.quantization_type_ == QuantizationType::SQ8
+      && params.index_type_ == IndexType::FUSION) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, EmptyScalarData>;
-      using SearchSpaceType =
-          SQ8Space<float, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, ScalarData>;
-      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,
-                                                  HNSWBuilder<BuildSpaceType>,
-                                                  NSGBuilder<BuildSpaceType>>;
+      using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
+      using SearchSpaceType = SQ8Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
+      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        SQ8Space<float, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, EmptyScalarData>;
-    using GraphBuilderType =
-        FusionGraphBuilder<BuildSpaceType, HNSWBuilder<BuildSpaceType>, NSGBuilder<BuildSpaceType>>;
+    using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
+    using SearchSpaceType = SQ8Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
+    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint64_t / SQ4 / HNSW
-  if (params.data_type_.is(py::dtype::of<float>()) &&
-      params.id_type_.is(py::dtype::of<uint64_t>()) &&
-      params.quantization_type_ == QuantizationType::SQ4 && params.index_type_ == IndexType::HNSW) {
+  if (params.data_type_.is(py::dtype::of<float>())
+      && params.id_type_.is(py::dtype::of<uint64_t>())
+      && params.quantization_type_ == QuantizationType::SQ4
+      && params.index_type_ == IndexType::HNSW) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, EmptyScalarData>;
-      using SearchSpaceType =
-          SQ4Space<float, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, ScalarData>;
+      using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
+      using SearchSpaceType = SQ4Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
       using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        SQ4Space<float, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, EmptyScalarData>;
+    using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
+    using SearchSpaceType = SQ4Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint64_t / SQ4 / NSG
-  if (params.data_type_.is(py::dtype::of<float>()) &&
-      params.id_type_.is(py::dtype::of<uint64_t>()) &&
-      params.quantization_type_ == QuantizationType::SQ4 && params.index_type_ == IndexType::NSG) {
+  if (params.data_type_.is(py::dtype::of<float>())
+      && params.id_type_.is(py::dtype::of<uint64_t>())
+      && params.quantization_type_ == QuantizationType::SQ4
+      && params.index_type_ == IndexType::NSG) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, EmptyScalarData>;
-      using SearchSpaceType =
-          SQ4Space<float, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, ScalarData>;
+      using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
+      using SearchSpaceType = SQ4Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
       using GraphBuilderType = NSGBuilder<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        SQ4Space<float, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, EmptyScalarData>;
+    using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
+    using SearchSpaceType = SQ4Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = NSGBuilder<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint64_t / SQ4 / FUSION
-  if (params.data_type_.is(py::dtype::of<float>()) &&
-      params.id_type_.is(py::dtype::of<uint64_t>()) &&
-      params.quantization_type_ == QuantizationType::SQ4 &&
-      params.index_type_ == IndexType::FUSION) {
+  if (params.data_type_.is(py::dtype::of<float>())
+      && params.id_type_.is(py::dtype::of<uint64_t>())
+      && params.quantization_type_ == QuantizationType::SQ4
+      && params.index_type_ == IndexType::FUSION) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, EmptyScalarData>;
-      using SearchSpaceType =
-          SQ4Space<float, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, ScalarData>;
-      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,
-                                                  HNSWBuilder<BuildSpaceType>,
-                                                  NSGBuilder<BuildSpaceType>>;
+      using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
+      using SearchSpaceType = SQ4Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
+      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<float, float, uint64_t, SequentialStorage<float, uint64_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        SQ4Space<float, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, EmptyScalarData>;
-    using GraphBuilderType =
-        FusionGraphBuilder<BuildSpaceType, HNSWBuilder<BuildSpaceType>, NSGBuilder<BuildSpaceType>>;
+    using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
+    using SearchSpaceType = SQ4Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
+    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // int8_t / uint32_t / NONE / HNSW
-  if (params.data_type_.is(py::dtype::of<int8_t>()) &&
-      params.id_type_.is(py::dtype::of<uint32_t>()) &&
-      params.quantization_type_ == QuantizationType::NONE &&
-      params.index_type_ == IndexType::HNSW) {
+  if (params.data_type_.is(py::dtype::of<int8_t>())
+      && params.id_type_.is(py::dtype::of<uint32_t>())
+      && params.quantization_type_ == QuantizationType::NONE
+      && params.index_type_ == IndexType::HNSW) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<int8_t, float, uint32_t, SequentialStorage<int8_t, uint32_t>, ScalarData>;
-      using SearchSpaceType =
-          RawSpace<int8_t, float, uint32_t, SequentialStorage<int8_t, uint32_t>, ScalarData>;
+      using BuildSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,ScalarData>;
+      using SearchSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,ScalarData>;
       using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<int8_t, float, uint32_t, SequentialStorage<int8_t, uint32_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        RawSpace<int8_t, float, uint32_t, SequentialStorage<int8_t, uint32_t>, EmptyScalarData>;
+    using BuildSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,EmptyScalarData>;
+    using SearchSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // int8_t / uint32_t / NONE / NSG
-  if (params.data_type_.is(py::dtype::of<int8_t>()) &&
-      params.id_type_.is(py::dtype::of<uint32_t>()) &&
-      params.quantization_type_ == QuantizationType::NONE && params.index_type_ == IndexType::NSG) {
+  if (params.data_type_.is(py::dtype::of<int8_t>())
+      && params.id_type_.is(py::dtype::of<uint32_t>())
+      && params.quantization_type_ == QuantizationType::NONE
+      && params.index_type_ == IndexType::NSG) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<int8_t, float, uint32_t, SequentialStorage<int8_t, uint32_t>, ScalarData>;
-      using SearchSpaceType =
-          RawSpace<int8_t, float, uint32_t, SequentialStorage<int8_t, uint32_t>, ScalarData>;
+      using BuildSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,ScalarData>;
+      using SearchSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,ScalarData>;
       using GraphBuilderType = NSGBuilder<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<int8_t, float, uint32_t, SequentialStorage<int8_t, uint32_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        RawSpace<int8_t, float, uint32_t, SequentialStorage<int8_t, uint32_t>, EmptyScalarData>;
+    using BuildSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,EmptyScalarData>;
+    using SearchSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = NSGBuilder<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // int8_t / uint32_t / NONE / FUSION
-  if (params.data_type_.is(py::dtype::of<int8_t>()) &&
-      params.id_type_.is(py::dtype::of<uint32_t>()) &&
-      params.quantization_type_ == QuantizationType::NONE &&
-      params.index_type_ == IndexType::FUSION) {
+  if (params.data_type_.is(py::dtype::of<int8_t>())
+      && params.id_type_.is(py::dtype::of<uint32_t>())
+      && params.quantization_type_ == QuantizationType::NONE
+      && params.index_type_ == IndexType::FUSION) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<int8_t, float, uint32_t, SequentialStorage<int8_t, uint32_t>, ScalarData>;
-      using SearchSpaceType =
-          RawSpace<int8_t, float, uint32_t, SequentialStorage<int8_t, uint32_t>, ScalarData>;
-      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,
-                                                  HNSWBuilder<BuildSpaceType>,
-                                                  NSGBuilder<BuildSpaceType>>;
+      using BuildSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,ScalarData>;
+      using SearchSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,ScalarData>;
+      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<int8_t, float, uint32_t, SequentialStorage<int8_t, uint32_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        RawSpace<int8_t, float, uint32_t, SequentialStorage<int8_t, uint32_t>, EmptyScalarData>;
-    using GraphBuilderType =
-        FusionGraphBuilder<BuildSpaceType, HNSWBuilder<BuildSpaceType>, NSGBuilder<BuildSpaceType>>;
+    using BuildSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,EmptyScalarData>;
+    using SearchSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,EmptyScalarData>;
+    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // int8_t / uint64_t / NONE / HNSW
-  if (params.data_type_.is(py::dtype::of<int8_t>()) &&
-      params.id_type_.is(py::dtype::of<uint64_t>()) &&
-      params.quantization_type_ == QuantizationType::NONE &&
-      params.index_type_ == IndexType::HNSW) {
+  if (params.data_type_.is(py::dtype::of<int8_t>())
+      && params.id_type_.is(py::dtype::of<uint64_t>())
+      && params.quantization_type_ == QuantizationType::NONE
+      && params.index_type_ == IndexType::HNSW) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<int8_t, float, uint64_t, SequentialStorage<int8_t, uint64_t>, ScalarData>;
-      using SearchSpaceType =
-          RawSpace<int8_t, float, uint64_t, SequentialStorage<int8_t, uint64_t>, ScalarData>;
+      using BuildSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,ScalarData>;
+      using SearchSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,ScalarData>;
       using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<int8_t, float, uint64_t, SequentialStorage<int8_t, uint64_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        RawSpace<int8_t, float, uint64_t, SequentialStorage<int8_t, uint64_t>, EmptyScalarData>;
+    using BuildSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,EmptyScalarData>;
+    using SearchSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // int8_t / uint64_t / NONE / NSG
-  if (params.data_type_.is(py::dtype::of<int8_t>()) &&
-      params.id_type_.is(py::dtype::of<uint64_t>()) &&
-      params.quantization_type_ == QuantizationType::NONE && params.index_type_ == IndexType::NSG) {
+  if (params.data_type_.is(py::dtype::of<int8_t>())
+      && params.id_type_.is(py::dtype::of<uint64_t>())
+      && params.quantization_type_ == QuantizationType::NONE
+      && params.index_type_ == IndexType::NSG) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<int8_t, float, uint64_t, SequentialStorage<int8_t, uint64_t>, ScalarData>;
-      using SearchSpaceType =
-          RawSpace<int8_t, float, uint64_t, SequentialStorage<int8_t, uint64_t>, ScalarData>;
+      using BuildSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,ScalarData>;
+      using SearchSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,ScalarData>;
       using GraphBuilderType = NSGBuilder<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<int8_t, float, uint64_t, SequentialStorage<int8_t, uint64_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        RawSpace<int8_t, float, uint64_t, SequentialStorage<int8_t, uint64_t>, EmptyScalarData>;
+    using BuildSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,EmptyScalarData>;
+    using SearchSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = NSGBuilder<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // int8_t / uint64_t / NONE / FUSION
-  if (params.data_type_.is(py::dtype::of<int8_t>()) &&
-      params.id_type_.is(py::dtype::of<uint64_t>()) &&
-      params.quantization_type_ == QuantizationType::NONE &&
-      params.index_type_ == IndexType::FUSION) {
+  if (params.data_type_.is(py::dtype::of<int8_t>())
+      && params.id_type_.is(py::dtype::of<uint64_t>())
+      && params.quantization_type_ == QuantizationType::NONE
+      && params.index_type_ == IndexType::FUSION) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<int8_t, float, uint64_t, SequentialStorage<int8_t, uint64_t>, ScalarData>;
-      using SearchSpaceType =
-          RawSpace<int8_t, float, uint64_t, SequentialStorage<int8_t, uint64_t>, ScalarData>;
-      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,
-                                                  HNSWBuilder<BuildSpaceType>,
-                                                  NSGBuilder<BuildSpaceType>>;
+      using BuildSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,ScalarData>;
+      using SearchSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,ScalarData>;
+      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<int8_t, float, uint64_t, SequentialStorage<int8_t, uint64_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        RawSpace<int8_t, float, uint64_t, SequentialStorage<int8_t, uint64_t>, EmptyScalarData>;
-    using GraphBuilderType =
-        FusionGraphBuilder<BuildSpaceType, HNSWBuilder<BuildSpaceType>, NSGBuilder<BuildSpaceType>>;
+    using BuildSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,EmptyScalarData>;
+    using SearchSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,EmptyScalarData>;
+    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // uint8_t / uint32_t / NONE / HNSW
-  if (params.data_type_.is(py::dtype::of<uint8_t>()) &&
-      params.id_type_.is(py::dtype::of<uint32_t>()) &&
-      params.quantization_type_ == QuantizationType::NONE &&
-      params.index_type_ == IndexType::HNSW) {
+  if (params.data_type_.is(py::dtype::of<uint8_t>())
+      && params.id_type_.is(py::dtype::of<uint32_t>())
+      && params.quantization_type_ == QuantizationType::NONE
+      && params.index_type_ == IndexType::HNSW) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<uint8_t, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, ScalarData>;
-      using SearchSpaceType =
-          RawSpace<uint8_t, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, ScalarData>;
+      using BuildSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
+      using SearchSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
       using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<uint8_t, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        RawSpace<uint8_t, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, EmptyScalarData>;
+    using BuildSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
+    using SearchSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // uint8_t / uint32_t / NONE / NSG
-  if (params.data_type_.is(py::dtype::of<uint8_t>()) &&
-      params.id_type_.is(py::dtype::of<uint32_t>()) &&
-      params.quantization_type_ == QuantizationType::NONE && params.index_type_ == IndexType::NSG) {
+  if (params.data_type_.is(py::dtype::of<uint8_t>())
+      && params.id_type_.is(py::dtype::of<uint32_t>())
+      && params.quantization_type_ == QuantizationType::NONE
+      && params.index_type_ == IndexType::NSG) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<uint8_t, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, ScalarData>;
-      using SearchSpaceType =
-          RawSpace<uint8_t, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, ScalarData>;
+      using BuildSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
+      using SearchSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
       using GraphBuilderType = NSGBuilder<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<uint8_t, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        RawSpace<uint8_t, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, EmptyScalarData>;
+    using BuildSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
+    using SearchSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = NSGBuilder<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // uint8_t / uint32_t / NONE / FUSION
-  if (params.data_type_.is(py::dtype::of<uint8_t>()) &&
-      params.id_type_.is(py::dtype::of<uint32_t>()) &&
-      params.quantization_type_ == QuantizationType::NONE &&
-      params.index_type_ == IndexType::FUSION) {
+  if (params.data_type_.is(py::dtype::of<uint8_t>())
+      && params.id_type_.is(py::dtype::of<uint32_t>())
+      && params.quantization_type_ == QuantizationType::NONE
+      && params.index_type_ == IndexType::FUSION) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<uint8_t, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, ScalarData>;
-      using SearchSpaceType =
-          RawSpace<uint8_t, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, ScalarData>;
-      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,
-                                                  HNSWBuilder<BuildSpaceType>,
-                                                  NSGBuilder<BuildSpaceType>>;
+      using BuildSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
+      using SearchSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
+      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<uint8_t, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        RawSpace<uint8_t, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, EmptyScalarData>;
-    using GraphBuilderType =
-        FusionGraphBuilder<BuildSpaceType, HNSWBuilder<BuildSpaceType>, NSGBuilder<BuildSpaceType>>;
+    using BuildSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
+    using SearchSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
+    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // uint8_t / uint64_t / NONE / HNSW
-  if (params.data_type_.is(py::dtype::of<uint8_t>()) &&
-      params.id_type_.is(py::dtype::of<uint64_t>()) &&
-      params.quantization_type_ == QuantizationType::NONE &&
-      params.index_type_ == IndexType::HNSW) {
+  if (params.data_type_.is(py::dtype::of<uint8_t>())
+      && params.id_type_.is(py::dtype::of<uint64_t>())
+      && params.quantization_type_ == QuantizationType::NONE
+      && params.index_type_ == IndexType::HNSW) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<uint8_t, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, ScalarData>;
-      using SearchSpaceType =
-          RawSpace<uint8_t, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, ScalarData>;
+      using BuildSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
+      using SearchSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
       using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<uint8_t, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        RawSpace<uint8_t, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, EmptyScalarData>;
+    using BuildSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
+    using SearchSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // uint8_t / uint64_t / NONE / NSG
-  if (params.data_type_.is(py::dtype::of<uint8_t>()) &&
-      params.id_type_.is(py::dtype::of<uint64_t>()) &&
-      params.quantization_type_ == QuantizationType::NONE && params.index_type_ == IndexType::NSG) {
+  if (params.data_type_.is(py::dtype::of<uint8_t>())
+      && params.id_type_.is(py::dtype::of<uint64_t>())
+      && params.quantization_type_ == QuantizationType::NONE
+      && params.index_type_ == IndexType::NSG) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<uint8_t, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, ScalarData>;
-      using SearchSpaceType =
-          RawSpace<uint8_t, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, ScalarData>;
+      using BuildSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
+      using SearchSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
       using GraphBuilderType = NSGBuilder<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<uint8_t, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        RawSpace<uint8_t, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, EmptyScalarData>;
+    using BuildSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
+    using SearchSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = NSGBuilder<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // uint8_t / uint64_t / NONE / FUSION
-  if (params.data_type_.is(py::dtype::of<uint8_t>()) &&
-      params.id_type_.is(py::dtype::of<uint64_t>()) &&
-      params.quantization_type_ == QuantizationType::NONE &&
-      params.index_type_ == IndexType::FUSION) {
+  if (params.data_type_.is(py::dtype::of<uint8_t>())
+      && params.id_type_.is(py::dtype::of<uint64_t>())
+      && params.quantization_type_ == QuantizationType::NONE
+      && params.index_type_ == IndexType::FUSION) {
     if (params.has_scalar_data_) {
-      using BuildSpaceType =
-          RawSpace<uint8_t, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, ScalarData>;
-      using SearchSpaceType =
-          RawSpace<uint8_t, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, ScalarData>;
-      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,
-                                                  HNSWBuilder<BuildSpaceType>,
-                                                  NSGBuilder<BuildSpaceType>>;
+      using BuildSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
+      using SearchSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
+      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
-    using BuildSpaceType =
-        RawSpace<uint8_t, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, EmptyScalarData>;
-    using SearchSpaceType =
-        RawSpace<uint8_t, float, uint64_t, SequentialStorage<uint8_t, uint64_t>, EmptyScalarData>;
-    using GraphBuilderType =
-        FusionGraphBuilder<BuildSpaceType, HNSWBuilder<BuildSpaceType>, NSGBuilder<BuildSpaceType>>;
+    using BuildSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
+    using SearchSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
+    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
-  throw std::runtime_error(std::string("Unsupported dispatch combination: data_type=") +
-                           py::repr(params.data_type_).cast<std::string>() + ", id_type=" +
-                           py::repr(params.id_type_).cast<std::string>() + ", quantization_type=" +
-                           std::string(kQuantizationType2str[params.quantization_type_]) +
-                           ", index_type=" + std::string(kIndexType2str[params.index_type_]) +
-                           " (see tools/codegen/dispatch.yaml for supported combinations)");
+  throw std::runtime_error(
+      std::string("Unsupported dispatch combination: data_type=")
+      + py::repr(params.data_type_).cast<std::string>()
+      + ", id_type=" + py::repr(params.id_type_).cast<std::string>()
+      + ", quantization_type=" + std::string(kQuantizationType2str[params.quantization_type_])
+      + ", index_type=" + std::string(kIndexType2str[params.index_type_])
+      + " (see tools/codegen/dispatch.yaml for supported combinations)");
 }
 
 }  // namespace alaya

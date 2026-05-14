@@ -6,8 +6,6 @@
 
 from __future__ import annotations
 
-import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -173,21 +171,6 @@ def _render(config: dict[str, Any]) -> tuple[str, str]:
     return dispatch_rendered, matrix_rendered
 
 
-def _format_cpp_in_place(path: Path) -> None:
-    """Run clang-format in-place so generator output matches what pre-commit will produce.
-
-    Without this, dispatch_generated.hpp committed via pre-commit (clang-format applied)
-    diverges from raw gen.py output, breaking the CI drift check.
-    """
-    clang_format = shutil.which("clang-format")
-    if clang_format is None:
-        raise RuntimeError(
-            "clang-format not found on PATH. Install it (apt: clang-format, brew: clang-format) "
-            "so generated headers match the style pre-commit enforces."
-        )
-    subprocess.run([clang_format, "-i", "--style=file", str(path)], check=True)
-
-
 def main() -> None:
     config = _load_config()
     _validate(config)
@@ -195,7 +178,6 @@ def main() -> None:
     dispatch_rendered, matrix_rendered = _render(config)
     OUTPUT_PATH.write_text(dispatch_rendered, encoding="utf-8")
     MATRIX_PARAMS_OUTPUT_PATH.write_text(matrix_rendered, encoding="utf-8")
-    _format_cpp_in_place(OUTPUT_PATH)
 
 
 if __name__ == "__main__":
