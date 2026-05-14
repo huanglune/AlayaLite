@@ -26,8 +26,15 @@ add_custom_command(
 
 add_custom_target(codegen DEPENDS ${ALAYA_CODEGEN_OUTPUTS})
 
-# Automatically process various attributes (such as suffixes, visibility, etc.)
-pybind11_add_module(${PYTHON_MODULE_NAME} MODULE NO_EXTRAS src/pybind.cpp)
+# Automatically process various attributes (such as suffixes, visibility, etc.) index_factory.cpp owns the dispatch-tree
+# template instantiations so pybind.cpp doesn't pay for re-instantiating 33 PyIndex<...> specializations.
+pybind11_add_module(
+  ${PYTHON_MODULE_NAME}
+  MODULE
+  NO_EXTRAS
+  src/pybind.cpp
+  src/index_factory.cpp
+)
 add_dependencies(${PYTHON_MODULE_NAME} codegen)
 target_include_directories(${PYTHON_MODULE_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(${PYTHON_MODULE_NAME} PRIVATE AlayaLite pybind11::module)

@@ -1349,5 +1349,3 @@ class PyIndex : public BasePyIndex {
 };
 
 }  // namespace alaya
-
-#include "dispatch_generated.hpp"
