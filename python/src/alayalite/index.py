@@ -109,7 +109,6 @@ class Index:
         self.__is_initialized = True
 
         vectors = normalize_vectors_for_cosine_metric(vectors, self.__params.metric)
-        vectors = vectors.astype(self.__params.data_type, copy=False)
 
         print(
             f"fitting index with the following parameters: \n"
