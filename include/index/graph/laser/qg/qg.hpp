@@ -755,11 +755,6 @@ inline void QuantizedGraph::update_qg_out_of_memory(
   char *vector_buf = thread_data.neighbor_vector_scratch_;
   char *page_buf = thread_data.cur_page_scratch_;
 
-  PID *neighbor_ptr = reinterpret_cast<PID *>(page_buf + neighbor_offset_ * 4);
-  for (size_t i = 0; i < cur_degree; ++i) {
-    neighbor_ptr[i] = new_neighbors[i].id;
-    // std::cout << new_neighbors[i].id << " ";
-  }
   size_t full_page_size = ((dimension_ + residual_dimension_) * sizeof(float) + kSectorLen - 1) /
                           kSectorLen * kSectorLen;
   size_t main_page_size = (dimension_ * sizeof(float) + kSectorLen - 1) / kSectorLen * kSectorLen;
@@ -789,6 +784,15 @@ inline void QuantizedGraph::update_qg_out_of_memory(
 
   // Execute batch read operation to fetch all neighbor vectors and centroid in one I/O call
   vector_reader.read(frontier_read_reqs, thread_data.ctx_);
+
+  // Write neighbor IDs into the node payload AFTER the read, since the read
+  // request above lands `full_page_size` bytes at `page_buf[0..full_page_size]`
+  // and would clobber any write made before it. Neighbor IDs live at
+  // `neighbor_offset_ * sizeof(float)` within the per-node payload.
+  PID *neighbor_ptr = reinterpret_cast<PID *>(page_buf + neighbor_offset_ * 4);
+  for (size_t i = 0; i < cur_degree; ++i) {
+    neighbor_ptr[i] = new_neighbors[i].id;
+  }
 
   /* Copy data */
   for (size_t i = 0; i < cur_degree; ++i) {
