@@ -376,8 +376,12 @@ TEST_F(DiskCollectionLaserTest, import_laser_segment_writes_segment) {
   auto reopened = DiskCollection::open(coll);
   EXPECT_EQ(reopened.size(), kLaserFixtureCount);
 
-  const auto hits = reopened.search(query_row(vectors, 0), search_options());
+  const auto *query = query_row(vectors, 0);
+  const auto segment_hits = searcher->search(query, search_options());
+  const auto hits = reopened.search(query, search_options());
   ASSERT_FALSE(hits.empty());
+  ASSERT_FALSE(segment_hits.empty());
+  EXPECT_EQ(labels_from_hits(hits), labels_from_hits(segment_hits));
   EXPECT_EQ(hits.front().label, 0u);
   EXPECT_TRUE(is_nan_bits(hits.front().distance));
 }

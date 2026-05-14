@@ -873,6 +873,12 @@ class DiskCollection {
 
     if (segments_.size() == 1) {
       auto hits = segments_[0]->search(query, opts);
+      if (segments_[0]->type() == DiskIndexType::Laser) {
+        if (hits.size() > opts.top_k) {
+          hits.resize(opts.top_k);
+        }
+        return hits;
+      }
       std::sort(hits.begin(), hits.end(), [](const DiskSearchHit &a, const DiskSearchHit &b) {
         if (!detail::disk_search_distance_equal_for_order(a.distance, b.distance)) {
           return detail::disk_search_distance_less(a.distance, b.distance);
