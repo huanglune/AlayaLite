@@ -269,7 +269,7 @@ def _resolve_linux_compiler_alias(compiler_path: str, *, compiler_var: str) -> s
     if resolved_path is None:
         return None
 
-    real_name = os.path.basename(os.path.realpath(resolved_path))
+    real_name = Path(resolved_path).resolve().name
     match = _LINUX_COMPILER_RE.search(real_name)
     if match is None:
         return None
