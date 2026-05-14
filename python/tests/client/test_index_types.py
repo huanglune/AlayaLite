@@ -39,25 +39,13 @@ class TestAlayaLiteIndex(unittest.TestCase):
         recall = calc_recall(result, gt)
         self.assertGreaterEqual(recall, 0.9)
 
-    def test_int32_vectors(self):
-        index = self.client.create_index("IntVectors", data_type=np.int32)
-        vectors = np.random.randint(0, 100, (1000, 128), dtype=np.int32)
-        queries = np.random.randint(0, 100, (10, 128), dtype=np.int32)
-        index.fit(vectors)
-        result = index.batch_search(queries, 10)
-        gt = calc_gt(vectors, queries, 10)
-        recall = calc_recall(result, gt)
-        self.assertGreaterEqual(recall, 0.9)
+    def test_int32_vectors_are_rejected(self):
+        with self.assertRaises(ValueError):
+            _ = self.client.create_index("IntVectors", data_type=np.int32)
 
-    def test_uint32_vectors(self):
-        index = self.client.create_index("UInt32Vectors", data_type=np.uint32)
-        vectors = np.random.randint(0, 255, (50, 128), dtype=np.uint32)
-        queries = np.random.randint(0, 255, (1, 128), dtype=np.uint32)
-        index.fit(vectors)
-        result = index.batch_search(queries, 10)
-        gt = calc_gt(vectors, queries, 10)
-        recall = calc_recall(result, gt)
-        self.assertGreaterEqual(recall, 0.9)
+    def test_uint32_vectors_are_rejected(self):
+        with self.assertRaises(ValueError):
+            _ = self.client.create_index("UInt32Vectors", data_type=np.uint32)
 
     def test_uint8_vectors(self):
         index = self.client.create_index("UInt8Vectors", data_type=np.uint8)

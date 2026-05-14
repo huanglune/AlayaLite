@@ -18,6 +18,7 @@ from .common import (
     VectorLikeBatch,
     _assert,
     _validate_query_vectors,
+    valid_dtype,
 )
 from .schema import IndexParams, load_schema
 from .utils import normalize_vectors_for_cosine_metric
@@ -91,11 +92,16 @@ class Index:
 
         vectors = np.asarray(vectors)
         _assert(vectors.ndim == 2, "vectors must be a 2D array")
-        data_type = vectors.dtype
+        data_type = valid_dtype(vectors.dtype)
         if self.__params.data_type is None:
             self.__params.data_type = data_type
-        elif self.__params.data_type != data_type:
+        else:
+            self.__params.data_type = valid_dtype(self.__params.data_type)
+
+        if self.__params.data_type != data_type:
             raise ValueError(f"Data type mismatch: {self.__params.data_type} vs {data_type}")
+
+        vectors = vectors.astype(self.__params.data_type, copy=False)
 
         self.__params.fill_none_values()
         self.__dim = vectors.shape[1]
