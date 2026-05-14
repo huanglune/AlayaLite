@@ -17,7 +17,7 @@ include(cmake/PrintSummary.cmake)
 include(cmake/Codecov.cmake)
 
 option(ENABLE_COVERAGE "Enable code coverage instrumentation" OFF)
-option(BUILD_PYTHON "Build Python extension module" OFF)
+option(BUILD_PYTHON "Build Python extension module" ON)
 option(BUILD_TESTING "Build tests" OFF)
 option(ALAYA_NATIVE_ARCH "Compile with -march=native for host-specific builds" OFF)
 option(ALAYA_ALLOW_NATIVE_PACKAGE "Allow BUILD_PYTHON with host-specific -march=native" OFF)
