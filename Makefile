@@ -4,7 +4,7 @@
 .PHONY: help build build-debug build-release build-san build-coverage \
         test test-cpp test-cpp-debug test-san test-py test-py-integration test-py-cov \
         lint format configure conan-install conan-install-debug \
-        install dev-install wheel clean clean-release clean-debug clean-all
+        install dev-install wheel clean clean-release clean-debug clean-all codegen
 
 # Configuration
 BUILD_RELEASE_DIR := build/Release
@@ -104,6 +104,9 @@ lint: ## Run all pre-commit checks
 format: ## Auto-format C++ sources with clang-format
 	@find include tests tools python/src -name '*.h' -o -name '*.cpp' -o -name '*.cc' \
 		| xargs clang-format -i --style=file
+
+codegen: ## Regenerate Python-binding dispatch header from tools/codegen/dispatch.yaml
+	@uv run python tools/codegen/gen.py
 
 # ============================================================================
 # Install & Package

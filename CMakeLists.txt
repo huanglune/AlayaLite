@@ -43,6 +43,50 @@ option(ALAYA_ENABLE_LASER "Build the Laser disk-index module (requires Linux x86
 )
 
 # ============================================================================
+# Build accelerators: ccache + fast linker (auto-detected)
+#
+# The pybind11 module (_alayalitepy) is a single translation unit that expands dispatch.hpp's nested macros into ~288
+# template instantiations. Single-TU means Ninja's -j N cannot parallelize it, so we lean on ccache to make repeat
+# builds cheap and on mold/lld to shrink the link phase.
+# ============================================================================
+option(ALAYA_USE_CCACHE "Use ccache as compiler launcher when available" ON)
+if(ALAYA_USE_CCACHE)
+  find_program(CCACHE_PROGRAM ccache)
+  if(CCACHE_PROGRAM)
+    # `cmake -E env` wraps each compile so CCACHE_SLOPPINESS is in scope for ccache itself, not just CMake's configure
+    # step. pch_defines + time/ mtime/ctime sloppiness is required for PCH to actually hit cache.
+    set(CMAKE_C_COMPILER_LAUNCHER
+        ${CMAKE_COMMAND}
+        -E
+        env
+        CCACHE_SLOPPINESS=pch_defines,time_macros,include_file_mtime,include_file_ctime
+        ${CCACHE_PROGRAM}
+    )
+    set(CMAKE_CXX_COMPILER_LAUNCHER
+        ${CMAKE_COMMAND}
+        -E
+        env
+        CCACHE_SLOPPINESS=pch_defines,time_macros,include_file_mtime,include_file_ctime
+        ${CCACHE_PROGRAM}
+    )
+    message(STATUS "ccache enabled: ${CCACHE_PROGRAM}")
+  endif()
+endif()
+
+option(ALAYA_USE_FAST_LINKER "Use mold or lld when available" ON)
+if(ALAYA_USE_FAST_LINKER AND NOT MSVC)
+  find_program(MOLD_PROGRAM mold)
+  find_program(LLD_PROGRAM ld.lld)
+  if(MOLD_PROGRAM)
+    add_link_options(-fuse-ld=mold)
+    message(STATUS "Fast linker: mold (${MOLD_PROGRAM})")
+  elseif(LLD_PROGRAM)
+    add_link_options(-fuse-ld=lld)
+    message(STATUS "Fast linker: lld (${LLD_PROGRAM})")
+  endif()
+endif()
+
+# ============================================================================
 # 1. C++ STANDARD AND COMPILER CONFIGURATION
 # ============================================================================
 

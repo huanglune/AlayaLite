@@ -16,7 +16,7 @@ import numpy as np
 from ._alayalitepy import LogicOp as _LogicOp
 from ._alayalitepy import MetadataFilter as _MetadataFilter
 from ._alayalitepy import PyIndexInterface as _PyIndexInterface
-from .common import _assert, _validate_query_vectors, normalize_filter_execution_hint
+from .common import _assert, _validate_query_vectors, normalize_filter_execution_hint, valid_dtype
 from .index import Index
 from .schema import IndexParams, load_schema, save_schema
 from .utils import normalize_vectors_for_cosine_metric
@@ -248,7 +248,7 @@ class Collection:
         if self.__index_py is None:
             # First insert - initialize index with batch fit
             _, _, first_embedding, _ = items[0]
-            dt = np.array(first_embedding).dtype
+            dt = valid_dtype(np.asarray(first_embedding).dtype)
             self.__index_params.data_type = dt
 
             self.__index_params.fill_none_values()

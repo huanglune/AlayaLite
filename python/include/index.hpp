@@ -31,7 +31,7 @@
 #include <utility>
 #include <variant>
 #include <vector>
-#include "dispatch.hpp"
+#include "base_py_index.hpp"
 #include "executor/jobs/graph_hybrid_search_job.hpp"
 #include "executor/jobs/graph_search_job.hpp"
 #include "executor/jobs/graph_update_job.hpp"
@@ -41,6 +41,7 @@
 #include "index/graph/hnsw/hnsw_builder.hpp"
 #include "index/graph/nsg/nsg_builder.hpp"
 #include "index/graph/qg/qg_builder.hpp"
+#include "index_factory.hpp"
 #include "materialized_view.hpp"
 #include "params.hpp"
 #include "parse.hpp"
@@ -63,13 +64,6 @@ namespace py = pybind11;
 
 namespace alaya {
 
-class BasePyIndex {
- public:
-  uint32_t data_dim_{0};
-  BasePyIndex() = default;
-  ~BasePyIndex() = default;
-};
-
 template <typename GraphBuilderType, typename SearchSpaceType>
 class PyIndex : public BasePyIndex {
  public:
@@ -82,8 +76,8 @@ class PyIndex : public BasePyIndex {
   PyIndex() = delete;
   explicit PyIndex(IndexParams params) : params_(std::move(params)) { initialize_recovery(); }
 
-  auto to_string() const -> std::string { return "PyIndex"; }
-  auto get_materialized_view_partition_count() const -> uint32_t {
+  auto to_string() const -> std::string override { return "PyIndex"; }
+  auto get_materialized_view_partition_count() const -> uint32_t override {
     return materialized_view_manager_.get_partition_count();
   }
 
@@ -494,14 +488,14 @@ class PyIndex : public BasePyIndex {
 
   auto save(const std::string &index_path,
             const std::string &data_path = std::string(),
-            const std::string &quant_path = std::string()) -> void {
+            const std::string &quant_path = std::string()) -> void override {
     save_state(index_path, data_path, quant_path);
     checkpoint_recovery_snapshot("manual_save");
   }
 
   auto load(const std::string &index_path,
             const std::string &data_path = std::string(),
-            const std::string &quant_path = std::string()) -> void {
+            const std::string &quant_path = std::string()) -> void override {
     std::string resolved_index_path = index_path;
     std::string resolved_data_path = data_path;
     std::string resolved_quant_path = quant_path;
@@ -876,13 +870,13 @@ class PyIndex : public BasePyIndex {
    * @brief Get the number of vectors in the index
    * @return Number of vectors
    */
-  auto get_data_num() -> IDType {
+  auto get_data_num() -> std::variant<uint32_t, uint64_t> override {
     if (build_space_ != nullptr) {
       return build_space_->get_data_num();
     } else if (search_space_ != nullptr) {
       return search_space_->get_data_num();
     }
-    return 0;
+    return uint32_t{0};
   }
 
   auto search(py::array_t<DataType> query, uint32_t topk, uint32_t ef) -> py::array_t<IDType> {
@@ -1046,7 +1040,7 @@ class PyIndex : public BasePyIndex {
    * @param limit Maximum number of results
    * @return Tuple of (ids_list, scalar_data_list)
    */
-  auto filter_query(const MetadataFilter &filter, uint32_t limit) -> py::object {
+  auto filter_query(const MetadataFilter &filter, uint32_t limit) -> py::object override {
     if constexpr (!SearchSpaceType::has_scalar_data) {
       throw std::runtime_error("filter_query requires a space that supports scalar data");
     } else {
@@ -1207,11 +1201,124 @@ class PyIndex : public BasePyIndex {
   /**
    * @brief Close the RocksDB storage explicitly
    */
-  auto close_db() -> void {
+  auto close_db() -> void override {
     if (search_space_ != nullptr) {
       search_space_->close_db();
     }
   }
+
+  auto fit(py::array vectors,  // NOLINT
+           uint32_t ef_construction,
+           uint32_t num_threads,
+           const py::object &item_ids = py::none(),
+           const py::object &documents = py::none(),
+           const py::object &metadata_list = py::none()) -> void override {
+    auto typed_vectors = vectors.cast<py::array_t<DataType>>();
+    fit(typed_vectors, ef_construction, num_threads, item_ids, documents, metadata_list);
+  }
+
+  auto search(py::array query, uint32_t topk, uint32_t ef) -> py::array override {  // NOLINT
+    auto typed_query = query.cast<py::array_t<DataType>>();
+    return search(typed_query, topk, ef);
+  }
+
+  auto get_data_by_id(const py::object &id_obj) -> py::array override {  // NOLINT
+    return get_data_by_id(id_obj.cast<IDType>());
+  }
+
+  auto insert(py::array insert_data,  // NOLINT
+              uint32_t ef,
+              const py::object &item_id_obj = py::none(),
+              const std::string &document = "",
+              const py::dict &metadata = py::dict()) -> std::variant<uint32_t, uint64_t> override {
+    auto typed_insert_data = insert_data.cast<py::array_t<DataType>>();
+    std::string item_id = item_id_obj.is_none() ? "" : py::str(item_id_obj).cast<std::string>();
+    return insert(typed_insert_data, ef, item_id, document, metadata);
+  }
+
+  auto upsert(py::array insert_data,  // NOLINT
+              uint32_t ef,
+              const py::object &item_id_obj = py::none(),
+              const std::string &document = "",
+              const py::dict &metadata = py::dict()) -> std::variant<uint32_t, uint64_t> override {
+    auto typed_insert_data = insert_data.cast<py::array_t<DataType>>();
+    std::string item_id = item_id_obj.is_none() ? "" : py::str(item_id_obj).cast<std::string>();
+    return upsert(typed_insert_data, ef, item_id, document, metadata);
+  }
+
+  auto remove(const py::object &id_obj) -> void override {  // NOLINT
+    remove(id_obj.cast<IDType>());
+  }
+
+  auto remove_by_item_id(const py::object &item_id_obj) -> void override {  // NOLINT
+    remove(py::str(item_id_obj).cast<std::string>());
+  }
+
+  auto get_scalar_data_by_item_id(const py::object &item_id_obj) -> py::dict override {  // NOLINT
+    return get_scalar_data_by_item_id(py::str(item_id_obj).cast<std::string>());
+  }
+
+  auto get_scalar_data_by_internal_id(const py::object &internal_id_obj)
+      -> py::dict override {  // NOLINT
+    return get_scalar_data_by_internal_id(internal_id_obj.cast<IDType>());
+  }
+
+  auto batch_get_scalar_data_by_internal_ids(py::array internal_ids)
+      -> py::list override {  // NOLINT
+    auto typed_ids = internal_ids.cast<py::array_t<IDType>>();
+    return batch_get_scalar_data_by_internal_ids(typed_ids);
+  }
+
+  auto batch_get_item_ids_by_internal_ids(py::array internal_ids) -> py::list override {  // NOLINT
+    auto typed_ids = internal_ids.cast<py::array_t<IDType>>();
+    return batch_get_item_ids_by_internal_ids(typed_ids);
+  }
+
+  auto contains(const py::object &item_id_obj) -> bool override {  // NOLINT
+    return contains(py::str(item_id_obj).cast<std::string>());
+  }
+
+  auto batch_search(py::array queries,
+                    uint32_t topk,
+                    uint32_t ef,  // NOLINT
+                    uint32_t num_threads) -> py::array override {
+    auto typed_queries = queries.cast<py::array_t<DataType>>();
+    return batch_search(typed_queries, topk, ef, num_threads);
+  }
+
+  auto batch_search_with_distance(py::array queries,
+                                  uint32_t topk,
+                                  uint32_t ef,  // NOLINT
+                                  uint32_t num_threads) -> py::object override {
+    auto typed_queries = queries.cast<py::array_t<DataType>>();
+    return batch_search_with_distance(typed_queries, topk, ef, num_threads);
+  }
+
+  auto hybrid_search(py::array query,
+                     uint32_t topk,
+                     uint32_t ef,
+                     const MetadataFilter &filter,
+                     bool bf = false,
+                     const std::string &filter_exec_hint = std::string()) -> py::object override {
+    auto typed_query = query.cast<py::array_t<DataType>>();
+    return hybrid_search(typed_query, topk, ef, filter, bf, filter_exec_hint);
+  }
+
+  auto batch_hybrid_search(py::array queries,
+                           uint32_t topk,
+                           uint32_t ef,
+                           const MetadataFilter &filter,
+                           uint32_t num_threads,
+                           bool bf = false,
+                           const std::string &filter_exec_hint = std::string())
+      -> py::object override {
+    auto typed_queries = queries.cast<py::array_t<DataType>>();
+    return batch_hybrid_search(typed_queries, topk, ef, filter, num_threads, bf, filter_exec_hint);
+  }
+
+  auto get_data_dim() -> uint32_t override { return data_dim_; }
+
+  auto has_scalar_data() const -> bool override { return params_.has_scalar_data_; }
 
  private:
   // MetricType metric_{MetricType::L2};
@@ -1241,203 +1348,4 @@ class PyIndex : public BasePyIndex {
   uint64_t last_seen_recovery_op_id_{0};
 };
 
-class PyIndexInterface {
- public:
-  explicit PyIndexInterface(const IndexParams &params) : params_(params) {  // NOLINT
-    DISPATCH_AND_CREATE(params);
-  }
-
-  auto to_string() -> std::string { return "PyIndexInterface"; }
-
-  auto fit(py::array &vectors,  // NOLINT
-           uint32_t ef_construction,
-           uint32_t num_threads,
-           const py::object &item_ids = py::none(),
-           const py::object &documents = py::none(),
-           const py::object &metadata_list = py::none()) -> void {
-    DISPATCH_AND_CAST_WITH_ARR(vectors,
-                               typed_vectors,
-                               index,
-                               index->fit(typed_vectors,
-                                          ef_construction,
-                                          num_threads,
-                                          item_ids,
-                                          documents,
-                                          metadata_list););
-  }
-
-  auto search(py::array &query, uint32_t topk, uint32_t ef) -> py::array {  // NOLINT
-    DISPATCH_AND_CAST_WITH_ARR(query,
-                               typed_query,
-                               index,
-                               return index->search(typed_query, topk, ef););
-  }
-
-  auto get_data_by_id(const py::object &id_obj) -> py::array {  // NOLINT
-    DISPATCH_AND_CAST(index, return index->get_data_by_id(id_obj.cast<IDType>()););
-  }
-
-  auto insert(py::array &insert_data,
-              uint32_t ef,
-              const py::object &item_id_obj = py::none(),
-              const std::string &document = "",
-              const py::dict &metadata = py::dict())
-      -> std::variant<uint32_t, uint64_t> {  // NOLINT
-    // Convert item_id to string using Python's str() for any type
-    std::string item_id = item_id_obj.is_none() ? "" : py::str(item_id_obj).cast<std::string>();
-    DISPATCH_AND_CAST_WITH_ARR(insert_data,
-                               typed_insert_data,
-                               index,
-                               return index
-                                   ->insert(typed_insert_data, ef, item_id, document, metadata););
-  }
-
-  auto upsert(py::array &insert_data,
-              uint32_t ef,
-              const py::object &item_id_obj = py::none(),
-              const std::string &document = "",
-              const py::dict &metadata = py::dict())
-      -> std::variant<uint32_t, uint64_t> {  // NOLINT
-    std::string item_id = item_id_obj.is_none() ? "" : py::str(item_id_obj).cast<std::string>();
-    DISPATCH_AND_CAST_WITH_ARR(insert_data,
-                               typed_insert_data,
-                               index,
-                               return index
-                                   ->upsert(typed_insert_data, ef, item_id, document, metadata););
-  }
-
-  auto remove(const py::object &id_obj) -> void {  // NOLINT
-    DISPATCH_AND_CAST(index, index->remove(id_obj.cast<IDType>()););
-  }
-
-  auto remove_by_item_id(const py::object &item_id_obj) -> void {  // NOLINT
-    std::string item_id = py::str(item_id_obj).cast<std::string>();
-    DISPATCH_AND_CAST(index, index->remove(item_id););
-  }
-
-  auto get_scalar_data_by_item_id(const py::object &item_id_obj) -> py::dict {  // NOLINT
-    std::string item_id = py::str(item_id_obj).cast<std::string>();
-    DISPATCH_AND_CAST(index, return index->get_scalar_data_by_item_id(item_id););
-  }
-
-  auto contains(const py::object &item_id_obj) -> bool {  // NOLINT
-    std::string item_id = py::str(item_id_obj).cast<std::string>();
-    DISPATCH_AND_CAST(index, return index->contains(item_id););
-  }
-
-  auto get_scalar_data_by_internal_id(const py::object &internal_id_obj) -> py::dict {  // NOLINT
-    DISPATCH_AND_CAST(index,
-                      return index->get_scalar_data_by_internal_id(
-                          internal_id_obj.cast<IDType>()););
-  }
-
-  auto batch_get_scalar_data_by_internal_ids(py::array internal_ids) -> py::list {  // NOLINT
-    DISPATCH_AND_CAST(index, {
-      auto typed_ids = internal_ids.cast<py::array_t<IDType>>();
-      return index->batch_get_scalar_data_by_internal_ids(typed_ids);
-    });
-  }
-
-  auto batch_get_item_ids_by_internal_ids(py::array internal_ids) -> py::list {  // NOLINT
-    DISPATCH_AND_CAST(index, {
-      auto typed_ids = internal_ids.cast<py::array_t<IDType>>();
-      return index->batch_get_item_ids_by_internal_ids(typed_ids);
-    });
-  }
-
-  auto filter_query(const MetadataFilter &filter, uint32_t limit) -> py::object {  // NOLINT
-    DISPATCH_AND_CAST(index, return index->filter_query(filter, limit););
-  }
-
-  auto get_data_num() -> std::variant<uint32_t, uint64_t> {  // NOLINT
-    DISPATCH_AND_CAST(index, return index->get_data_num(););
-  }
-
-  auto get_materialized_view_partition_count() -> uint32_t {  // NOLINT
-    DISPATCH_AND_CAST(index, return index->get_materialized_view_partition_count(););
-  }
-
-  auto batch_search(py::array &queries,
-                    uint32_t topk,
-                    uint32_t ef,  // NOLINT
-                    uint32_t num_threads) -> py::array {
-    DISPATCH_AND_CAST_WITH_ARR(queries,
-                               typed_queries,
-                               index,
-                               return index->batch_search(typed_queries, topk, ef, num_threads););
-  }
-
-  auto batch_search_with_distance(py::array &queries,
-                                  uint32_t topk,
-                                  uint32_t ef,  // NOLINT
-                                  uint32_t num_threads) -> py::object {
-    DISPATCH_AND_CAST_WITH_ARR(queries,
-                               typed_queries,
-                               index,
-                               return index->batch_search_with_distance(typed_queries,
-                                                                        topk,
-                                                                        ef,
-                                                                        num_threads););
-  }
-
-  auto load(const std::string &index_path,  // NOLINT
-            const std::string &data_path = std::string(),
-            const std::string &quant_path = std::string()) -> void {
-    DISPATCH_AND_CAST(index, index->load(index_path, data_path, quant_path););
-  }
-
-  auto save(const std::string &index_path,  // NOLINT
-            const std::string &data_path = std::string(),
-            const std::string &quant_path = std::string()) -> void {
-    DISPATCH_AND_CAST(index, index->save(index_path, data_path, quant_path););
-  }
-
-  auto get_data_dim() -> uint32_t { return index_->data_dim_; }
-
-  auto hybrid_search(py::array &query,
-                     uint32_t topk,
-                     uint32_t ef,
-                     const MetadataFilter &filter,
-                     bool bf = false,
-                     const std::string &filter_exec_hint = std::string()) -> py::object {
-    DISPATCH_AND_CAST_WITH_ARR(query,
-                               typed_query,
-                               index,
-                               return index->hybrid_search(typed_query,
-                                                           topk,
-                                                           ef,
-                                                           filter,
-                                                           bf,
-                                                           filter_exec_hint););
-  }
-
-  auto batch_hybrid_search(py::array &queries,
-                           uint32_t topk,
-                           uint32_t ef,
-                           const MetadataFilter &filter,
-                           uint32_t num_threads,
-                           bool bf = false,
-                           const std::string &filter_exec_hint = std::string()) -> py::object {
-    DISPATCH_AND_CAST_WITH_ARR(queries,
-                               typed_queries,
-                               index,
-                               return index->batch_hybrid_search(typed_queries,
-                                                                 topk,
-                                                                 ef,
-                                                                 filter,
-                                                                 num_threads,
-                                                                 bf,
-                                                                 filter_exec_hint););
-  }
-
-  auto close_db() -> void {  // NOLINT
-    DISPATCH_AND_CAST(index, index->close_db(););
-  }
-
-  auto has_scalar_data() const -> bool { return params_.has_scalar_data_; }
-
-  virtual ~PyIndexInterface() = default;
-  IndexParams params_;
-  std::shared_ptr<BasePyIndex> index_;
-};
 }  // namespace alaya
