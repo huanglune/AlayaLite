@@ -202,6 +202,46 @@ configurations, including SIFT-1M-style `main_dim=64` builds, construction
 is no longer refused for the historical write/read mismatch. PR reference:
 pending for `fix-laser-low-dim-page-layout`.
 
+### SIFT-1M Acceptance Configuration
+
+SIFT-1M (`raw_dim=128`) is the canonical `node_per_page_ > 1` workload
+unlocked by `fix-laser-low-dim-page-layout`. The reference build
+configuration is borrowed from gist1m / synth_20k_768d (the other
+paper-aligned LASER targets in this tree), with `main_dim` lowered to
+64 to trigger the `npp > 1` codepath:
+
+| Param          | Value                | Source                          |
+| -------------- | -------------------- | ------------------------------- |
+| `raw_dim`      | 128                  | SIFT-1M                         |
+| `main_dim`     | 64                   | smallest FHT helper (2^6)       |
+| `R`            | 64                   | gist1m / synth_20k_768d         |
+| `L`            | 100                  | matches archived Vamana graph   |
+| `alpha`        | 1.2                  | matches archived Vamana graph   |
+| `ef_indexing`  | 200                  | gist1m / synth_20k_768d         |
+| `seed`         | 42                   | repo-wide default               |
+
+Geometry under this configuration:
+`node_len_ = (32*64 + 32*64 + 128*64 + 64*64) / 8 = 2048` bytes;
+`node_per_page_ = max(1, 4096/2048) = 2`; `page_size_ = 4096`.
+
+Upstream LASER (the paper / `symqglib`) did not publish a SIFT-1M
+result, so this change uses an absolute acceptance bar instead of a
+±0.5pp paper-relative one: recall@10 SHALL be reported in
+`results/laser_sift1m_recall.{md,json}` along with the build params,
+dataset shas, CPU model, and compiler flags, so future regressions
+are detectable by direct comparison. A `recall@10 >= 0.95` smoke bar
+is recorded as the default; the harness only soft-fails below it
+(returns nonzero exit) so the make target stays opt-in.
+
+Datasets and shas (lab path
+`/md1/huangliang/alaya-dev/data/sift1m/`):
+
+| File                  | sha256                                                             |
+| --------------------- | ------------------------------------------------------------------ |
+| `sift_base.fbin`      | `8c7b3d999ba3133f865af72df078f77c2d248fdb80571d7ea1f1bb8e1750658e` |
+| `sift_query.fbin`     | `9b0082b67d0ac55b4c7d42216560344567ad87ce3e75a9d5214a0762f1c15d65` |
+| `sift_gt.ibin`        | `4c06dd3d1539b1de50f1b7e98a116833ed5c2f1571d0ef81f383a04541e797e7` |
+
 ### Relationship To AlayaLite QG
 
 AlayaLite also has a separate QG builder under
