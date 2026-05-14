@@ -49,7 +49,6 @@ __pycache__/
 # copy + edit locally for your own runs.
 /examples/laser/configs/*.toml
 !/examples/laser/configs/gist.toml
-!/examples/laser/configs/sift1m.toml
 !/examples/laser/configs/synth_20k_768d_alayaP.toml
 !/examples/laser/configs/synth_100k_512d_alayaP.toml
 
