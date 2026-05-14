@@ -3,7 +3,7 @@
 
 .PHONY: help build build-debug build-release build-san build-coverage \
         test test-cpp test-cpp-debug test-san test-py test-py-integration test-py-cov \
-        laser-npp1-byte-equality laser-sift1m-recall \
+        laser-npp1-byte-equality \
         lint format configure conan-install conan-install-debug \
         install dev-install wheel clean clean-release clean-debug clean-all codegen
 
@@ -97,9 +97,6 @@ test-py-cov: ## Run Python tests with HTML coverage report
 
 laser-npp1-byte-equality: ## Opt-in LASER npp==1 byte-equality gate against archived synth_20k baseline
 	@uv run python scripts/laser_alignment/npp1_byte_equality.py
-
-laser-sift1m-recall: ## Opt-in LASER SIFT-1M recall acceptance harness (npp>1 codepath, ~15-30min)
-	@uv run python scripts/laser_alignment/sift_recall.py
 
 # ============================================================================
 # Code Quality
