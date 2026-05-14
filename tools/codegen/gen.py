@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +30,9 @@ NUMPY_DTYPE_MAP = {
     "uint32_t": "np.uint32",
     "uint64_t": "np.uint64",
 }
+
+VALID_DATA_TYPES = frozenset(NUMPY_DTYPE_MAP.keys())
+VALID_ID_TYPES = frozenset({"uint32_t", "uint64_t"})
 
 QUANTIZATION_MAP = {
     "NONE": "none",
@@ -68,13 +73,20 @@ def _validate(config: dict[str, Any]) -> None:
         if missing:
             raise ValueError(f"Combination missing keys {sorted(missing)}: {combo}")
 
-        key = (str(combo["data"]), str(combo["id"]), str(combo["quant"]), str(combo["index"]))
+        data = str(combo["data"])
+        id_type = str(combo["id"])
+        quant = str(combo["quant"])
+        index = str(combo["index"])
+
+        key = (data, id_type, quant, index)
         if key in seen:
             raise ValueError(f"Duplicate combination: {combo}")
         seen.add(key)
 
-        quant = str(combo["quant"])
-        index = str(combo["index"])
+        if data not in VALID_DATA_TYPES:
+            raise ValueError(f"Unknown data type '{data}' in {combo}; valid: {sorted(VALID_DATA_TYPES)}")
+        if id_type not in VALID_ID_TYPES:
+            raise ValueError(f"Unknown id type '{id_type}' in {combo}; valid: {sorted(VALID_ID_TYPES)}")
         if quant not in valid_quants:
             raise ValueError(f"Unknown quantization type '{quant}' in {combo}")
         if quant not in config.get("build_spaces", {}):
@@ -83,9 +95,9 @@ def _validate(config: dict[str, Any]) -> None:
             raise ValueError(f"Unknown index type '{index}' in {combo}")
 
         if quant == "RABITQ":
-            if str(combo["data"]) != "float":
+            if data != "float":
                 raise ValueError(f"RaBitQ only supports float data: {combo}")
-            if str(combo["id"]) != "uint32_t":
+            if id_type != "uint32_t":
                 raise ValueError(f"RaBitQ only supports uint32_t id: {combo}")
 
 
@@ -161,6 +173,21 @@ def _render(config: dict[str, Any]) -> tuple[str, str]:
     return dispatch_rendered, matrix_rendered
 
 
+def _format_cpp_in_place(path: Path) -> None:
+    """Run clang-format in-place so generator output matches what pre-commit will produce.
+
+    Without this, dispatch_generated.hpp committed via pre-commit (clang-format applied)
+    diverges from raw gen.py output, breaking the CI drift check.
+    """
+    clang_format = shutil.which("clang-format")
+    if clang_format is None:
+        raise RuntimeError(
+            "clang-format not found on PATH. Install it (apt: clang-format, brew: clang-format) "
+            "so generated headers match the style pre-commit enforces."
+        )
+    subprocess.run([clang_format, "-i", "--style=file", str(path)], check=True)
+
+
 def main() -> None:
     config = _load_config()
     _validate(config)
@@ -168,6 +195,7 @@ def main() -> None:
     dispatch_rendered, matrix_rendered = _render(config)
     OUTPUT_PATH.write_text(dispatch_rendered, encoding="utf-8")
     MATRIX_PARAMS_OUTPUT_PATH.write_text(matrix_rendered, encoding="utf-8")
+    _format_cpp_in_place(OUTPUT_PATH)
 
 
 if __name__ == "__main__":

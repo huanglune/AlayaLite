@@ -677,8 +677,12 @@ inline auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<B
         FusionGraphBuilder<BuildSpaceType, HNSWBuilder<BuildSpaceType>, NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
-  throw std::runtime_error(
-      "Unsupported (data_type, id_type, quantization_type, index_type) combination");
+  throw std::runtime_error(std::string("Unsupported dispatch combination: data_type=") +
+                           py::repr(params.data_type_).cast<std::string>() + ", id_type=" +
+                           py::repr(params.id_type_).cast<std::string>() + ", quantization_type=" +
+                           std::string(kQuantizationType2str[params.quantization_type_]) +
+                           ", index_type=" + std::string(kIndexType2str[params.index_type_]) +
+                           " (see tools/codegen/dispatch.yaml for supported combinations)");
 }
 
 }  // namespace alaya

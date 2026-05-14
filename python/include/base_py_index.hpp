@@ -92,6 +92,9 @@ class BasePyIndex {
                                    const std::string &filter_exec_hint) -> py::object = 0;
 
   virtual auto close_db() -> void = 0;
+
+ protected:
+  uint32_t data_dim_{0};
 };
 
 }  // namespace alaya
