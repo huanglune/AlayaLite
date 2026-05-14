@@ -14,6 +14,27 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   target_compile_options(${PYTHON_MODULE_NAME} PRIVATE -Wno-nonnull)
 endif()
 
+# Precompile pybind11 + Eigen + STL headers. _alayalitepy is a single-TU module whose dispatch.hpp expansion drags in
+# pybind11/numpy.h, Eigen, and the bulk of <vector>/<string>/<memory>/<unordered_map> hundreds of times through template
+# instantiation. A PCH cuts the parse+template-instantiation cost on the recurring header surface and is the single
+# biggest lever for this TU's compile time. Requires CMake >= 3.16; gate accordingly.
+if(NOT CMAKE_VERSION VERSION_LESS 3.16)
+  target_precompile_headers(
+    ${PYTHON_MODULE_NAME}
+    PRIVATE
+    <pybind11/pybind11.h>
+    <pybind11/numpy.h>
+    <pybind11/stl.h>
+    <pybind11/cast.h>
+    <pybind11/pytypes.h>
+    <Eigen/Core>
+    <vector>
+    <string>
+    <memory>
+    <unordered_map>
+  )
+endif()
+
 # The Laser on-disk QG pybind is compiled as a submodule of _alayalitepy. SIMD-dependent flags (-march=native, etc.) are
 # applied PRIVATE so they don't leak to anything else that might link the Laser INTERFACE target downstream.
 if(ALAYA_ENABLE_LASER)
