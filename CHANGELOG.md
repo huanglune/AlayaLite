@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Disk LASER index now supports `node_per_page_ > 1` (low-dim datasets like
+  SIFT-1M); previously refused at construction. Fixes the upstream
+  `qg_builder.hpp:256` write/read page-layout mismatch.
+
 ### Changed
 - `pybind-dispatch-codegen`: replaced the hand-written
   `python/include/dispatch.hpp` macro dispatch chain with a codegen-driven

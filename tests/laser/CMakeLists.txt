@@ -35,3 +35,19 @@ target_compile_options(
 )
 
 add_test(NAME laser_test_rotator_dump COMMAND $<TARGET_FILE:test_rotator_dump>)
+
+add_executable(test_laser_page_layout_round_trip ${CMAKE_CURRENT_SOURCE_DIR}/qg/test_page_layout_round_trip.cpp)
+target_link_libraries(test_laser_page_layout_round_trip PRIVATE alaya_laser ${GTEST_LIBS})
+target_compile_features(test_laser_page_layout_round_trip PRIVATE cxx_std_20)
+target_compile_definitions(test_laser_page_layout_round_trip PRIVATE ALAYA_LASER_TESTING)
+target_compile_options(
+  test_laser_page_layout_round_trip
+  PRIVATE -O3
+          -DNDEBUG
+          -Wall
+          -Wextra
+          ${_ALAYA_LASER_CONSUMER_OPTIONS}
+)
+
+add_test(NAME laser_test_page_layout_round_trip COMMAND $<TARGET_FILE:test_laser_page_layout_round_trip>)
+set_tests_properties(laser_test_page_layout_round_trip PROPERTIES LABELS laser)
