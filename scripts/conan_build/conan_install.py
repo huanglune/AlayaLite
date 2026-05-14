@@ -22,6 +22,7 @@ import os
 import platform
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -249,6 +250,34 @@ def get_default_profile_compiler_overrides(env: dict[str, str]) -> list[tuple[st
     return overrides
 
 
+_LINUX_COMPILER_RE = re.compile(r"(g\+\+|gcc|clang\+\+|clang)(?:-\d+(?:\.\d+)*)?$")
+_LINUX_VALID_DRIVERS = {"CC": {"gcc", "clang"}, "CXX": {"g++", "clang++"}}
+
+
+def _resolve_linux_compiler_alias(compiler_path: str, *, compiler_var: str) -> str | None:
+    """
+    Resolve a Linux generic compiler driver (`cc`/`c++`) to its canonical name.
+
+    Follows symlinks fully (e.g. `cc -> /etc/alternatives/cc -> /usr/bin/gcc ->
+    /usr/bin/x86_64-linux-gnu-gcc-11`) and extracts the compiler family name
+    from the resolved basename, tolerating GNU multiarch prefixes and version
+    suffixes. Returns None if the resolved binary isn't a recognized C/C++
+    driver — the caller keeps the original name in that case so Conan's own
+    probing still gets a chance.
+    """
+    resolved_path = shutil.which(compiler_path)
+    if resolved_path is None:
+        return None
+
+    real_name = os.path.basename(os.path.realpath(resolved_path))
+    match = _LINUX_COMPILER_RE.search(real_name)
+    if match is None:
+        return None
+
+    canonical = match.group(1)
+    return canonical if canonical in _LINUX_VALID_DRIVERS.get(compiler_var, set()) else None
+
+
 def get_conan_env() -> dict[str, str]:
     """
     Normalize compiler-related environment variables for Conan invocations.
@@ -279,6 +308,14 @@ def get_conan_env() -> dict[str, str]:
                 },
             }
             compiler_name = alias_map.get(compiler_var, {}).get(compiler_name, compiler_name)
+        elif platform.system() == "Linux" and compiler_name in {"cc", "c++"}:
+            # Conan's profile detect can't identify a compiler family from the
+            # generic `cc`/`c++` aliases that update-alternatives installs.
+            # Resolve the symlink chain to whichever canonical driver it points
+            # at (gcc/g++ or clang/clang++).
+            resolved = _resolve_linux_compiler_alias(parts[0], compiler_var=compiler_var)
+            if resolved is not None:
+                compiler_name = resolved
 
         return compiler_name, " ".join(parts[1:])
 
