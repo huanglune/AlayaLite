@@ -17,9 +17,11 @@ Two layers:
 
 * **Smoke (default)** -- each dispatch axis (DataType / IDType / Quantization /
   IndexType / has_scalar_data) is varied independently. Roughly 17 cases.
-* **Extended (opt-in via ``-m extended``)** -- full Cartesian product of legal
-  combinations. Verifies that every reachable PyIndex specialization can be
-  constructed and fitted.
+* **Extended (opt-in via ``-m extended``)** -- every (data_type, id_type,
+  quantization, index_type) combination listed in ``dispatch.yaml``
+  (``has_scalar_data=False``). The ``has_scalar_data=True`` branch is
+  exercised by a single dedicated test rather than multiplied across the
+  matrix, since each scalar-data case needs its own RocksDB temp dir.
 """
 
 # pylint: disable=redefined-outer-name

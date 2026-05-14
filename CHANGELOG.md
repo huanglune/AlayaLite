@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- `pybind-dispatch-codegen`: replaced the hand-written
+  `python/include/dispatch.hpp` macro dispatch chain with a codegen-driven
+  pipeline. Single source of truth lives in `tools/codegen/dispatch.yaml`,
+  expanded by `tools/codegen/gen.py` into
+  `python/include/dispatch_generated.hpp` (out-of-line `IndexFactory::create`
+  body) and `python/tests/client/_dispatch_matrix_params.py` (parametrized
+  test inputs). `IndexFactory::create` lives in its own translation unit
+  (`python/src/index_factory.cpp`) so the 33 template specializations land in
+  one `.o`; `_alayalitepy.so` drops from ~43M to ~26M (-40%). New
+  `make codegen` target regenerates both files. The two generated files are
+  excluded from pre-commit format/lint hooks (clang-format / ruff / pylint /
+  cpplint) so `gen.py` has no build-time dependency on clang-format.
+  **Breaking**: the supported vector dtype matrix is narrowed to
+  `{np.float32, np.int8, np.uint8}` — `np.float64`, `np.int32`, `np.uint32`
+  are no longer accepted at the engine boundary (`alayalite.common.valid_dtype`
+  raises `ValueError`). The previous wider matrix was declared in macros but
+  rarely exercised end-to-end; downstream callers must cast to `np.float32`
+  (the recommended default) before `fit` / `insert` / `search`.
 - `disk-collection-single-writer-lock`: `DiskCollection` now holds a
   process-level single-writer lock at `<collection>/.lock`; concurrent opens
   of the same collection raise with a stable dual-substring error containing
