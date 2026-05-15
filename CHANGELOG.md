@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Disk LASER index now supports `node_per_page_ > 1` (low-dim datasets like
+  SIFT-1M); previously refused at construction. Fixes the upstream
+  `qg_builder.hpp` write/read page-layout mismatch.
+- Disk LASER build no longer zero-clobbers per-node neighbor IDs. The
+  `update_qg_out_of_memory` path used to write neighbor IDs into the per-node
+  payload **before** the `read()` that pulled the centroid vector into the
+  same `page_buf`; for any `node_len_` that fit inside a single sector
+  (SIFT-1M `main_dim=64`), the read overwrote the neighbor region with the
+  zero-padded tail of the temporary vector file, leaving every node with
+  `neighbors[*] = 0` and collapsing recall to random level. Lifts SIFT-1M
+  `recall@10` from 0.0009 to 0.9984 at `ef_search=800`. `main_dim=256`
+  configurations (gist1m, bigcode, synth_20k_768d) were never affected, since
+  `neighbor_offset_ > full_page_size` there.
+
 ### Changed
 - `pybind-dispatch-codegen`: replaced the hand-written
   `python/include/dispatch.hpp` macro dispatch chain with a codegen-driven

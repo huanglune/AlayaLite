@@ -188,22 +188,19 @@ entry point is not part of the `examples/laser` CLI contract.
 
 ## Known Issues
 
-### Preserved Upstream Page-Layout Bug
+### Fixed: Low-Dimensional Page Layout
 
-`include/index/graph/laser/qg/qg_builder.hpp` writes pages using the
-upstream layout that only agrees with the read path when
-`node_per_page_ == 1`. This holds for the paper-style high-dimensional
-datasets used by the port (`main_dim=256`, raw dimension at least 512),
-but not for SIFT-1M-style small dimensions. Do not use this port on
-SIFT-1M until the follow-up page-layout fix lands.
+`fix-laser-low-dim-page-layout` fixes the upstream LASER page-layout
+mismatch in `include/index/graph/laser/qg/qg_builder.hpp`: the build path
+now packs up to `node_per_page_` consecutive node payloads into each
+`page_size_` page, matching the `qg.hpp` read formulas
+`get_page_offset(id)` and `offset_to_node(id)`.
 
-The relevant code is annotated at:
-
-```text
-include/index/graph/laser/qg/qg_builder.hpp
-  // TODO(port-laser-disk-index followup): write/read page-layout mismatch;
-  // see proposal D8
-```
+For `node_per_page_ == 1` configurations, the layout reduces to the
+original one-node-per-page output. For `node_per_page_ > 1`
+configurations, including SIFT-1M-style `main_dim=64` builds, construction
+is no longer refused for the historical write/read mismatch. This fix is
+tracked by PR #88.
 
 ### Relationship To AlayaLite QG
 

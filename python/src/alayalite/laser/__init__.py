@@ -56,7 +56,14 @@ class BuildParams:
         Distance metric used by the underlying graph and quantizer.
     main_dim : int | None
         PCA target dimension. ``None`` means "no PCA"; the raw dimension is used.
-        Must be a power of two ``>= 128`` and ``<= raw_dim`` when set.
+        Must be a power of two ``>= 64`` and ``<= raw_dim`` when set. The floor
+        matches the smallest FHT helper table in
+        ``include/index/graph/laser/utils/rotator.hpp`` (``helper_float_6``,
+        i.e. log2(64)). Small projected dimensions can make the computed
+        bytes-per-node fit more than once in a 4 KiB sector, which triggers the
+        ``node_per_page_ > 1`` layout unlocked by
+        ``fix-laser-low-dim-page-layout``; SIFT-1M (raw_dim=128, main_dim=64)
+        is the canonical example.
     R : int
         Vamana out-degree bound (also the LASER graph degree).
     L : int
@@ -149,8 +156,8 @@ def _validate_main_dim(main_dim: int, raw_dim: int) -> None:
         raise ValueError(f"main_dim must be positive, got {main_dim}")
     if main_dim & (main_dim - 1) != 0:
         raise ValueError(f"main_dim must be a power of two, got {main_dim}")
-    if main_dim < 128:
-        raise ValueError(f"main_dim must be >= 128 (LASER floor), got {main_dim}")
+    if main_dim < 64:
+        raise ValueError(f"main_dim must be >= 64 (LASER FHT helper_float_6 floor), got {main_dim}")
     if main_dim > raw_dim:
         raise ValueError(f"main_dim ({main_dim}) must be <= raw_dim ({raw_dim})")
 
