@@ -273,25 +273,31 @@ inline QuantizedGraph::QuantizedGraph(size_t num,
     rotator_.dump_signs(rotator_dump_path);
   }
 
-  node_per_page_ = std::max(1, static_cast<int>(kSectorLen / node_len_));
+  if (node_len_ == 0) {
+    throw std::invalid_argument("QuantizedGraph: node_len_ must be > 0");
+  }
+  node_per_page_ = std::max<size_t>(1, kSectorLen / node_len_);
   page_size_ = (node_per_page_ * node_len_ + kSectorLen - 1) / kSectorLen * kSectorLen;
 
   if (dimension_ != padded_dim_) {  // Currently only supports dimension that is a power of 2
                                     // (dimension_ must equal padded_dim_)
     throw std::invalid_argument("QuantizedGraph: dimension must be a power of two");
   }
-  // See docs/LASER.md (Known Issues): the on-disk write path in qg_builder
-  // uses `i * page_size_ + kSectorLen` while the read path here uses
-  // `page_size_ * (id/npp) + (id%npp) * node_len_`. They only agree when
-  // node_per_page_ == 1, otherwise recall collapses (SIFT-1M → ~0.08%).
-  // Fail at construction until the follow-up fix (proposal D8) lands.
-  if (node_per_page_ > 1) {
-    throw std::invalid_argument(
-        "QuantizedGraph: node_per_page_ > 1 is not supported by the current port "
-        "(write/read page layout mismatch; see docs/LASER.md Known Issues). "
-        "Use a configuration with node_len_ >= kSectorLen (typically main_dim=256 "
-        "and raw dim >= 768) until the follow-up fix lands.");
+  // The disk write path packs node_per_page_ nodes per page in id order, matching
+  // get_page_offset() and offset_to_node().
+  if (page_size_ % kSectorLen != 0) {
+    throw std::invalid_argument("QuantizedGraph: page_size_ must be sector aligned");
   }
+  if (node_per_page_ * node_len_ > page_size_) {
+    throw std::invalid_argument("QuantizedGraph: node_per_page_ * node_len_ must be <= page_size_");
+  }
+  if (node_per_page_ != std::max<size_t>(1, kSectorLen / node_len_)) {
+    throw std::invalid_argument("QuantizedGraph: node_per_page_ geometry mismatch");
+  }
+  assert(node_len_ > 0);
+  assert(page_size_ % kSectorLen == 0);
+  assert(node_per_page_ * node_len_ <= page_size_);
+  assert(node_per_page_ == std::max<size_t>(1, kSectorLen / node_len_));
   std::cout << "main_dim: " << main_dim << ", dim: " << dim << ", dimension_: " << dimension_
             << ", residual_dimension_: " << residual_dimension_ << std::endl;
   initialize();
@@ -749,11 +755,6 @@ inline void QuantizedGraph::update_qg_out_of_memory(
   char *vector_buf = thread_data.neighbor_vector_scratch_;
   char *page_buf = thread_data.cur_page_scratch_;
 
-  PID *neighbor_ptr = reinterpret_cast<PID *>(page_buf + neighbor_offset_ * 4);
-  for (size_t i = 0; i < cur_degree; ++i) {
-    neighbor_ptr[i] = new_neighbors[i].id;
-    // std::cout << new_neighbors[i].id << " ";
-  }
   size_t full_page_size = ((dimension_ + residual_dimension_) * sizeof(float) + kSectorLen - 1) /
                           kSectorLen * kSectorLen;
   size_t main_page_size = (dimension_ * sizeof(float) + kSectorLen - 1) / kSectorLen * kSectorLen;
@@ -783,6 +784,15 @@ inline void QuantizedGraph::update_qg_out_of_memory(
 
   // Execute batch read operation to fetch all neighbor vectors and centroid in one I/O call
   vector_reader.read(frontier_read_reqs, thread_data.ctx_);
+
+  // Write neighbor IDs into the node payload AFTER the read, since the read
+  // request above lands `full_page_size` bytes at `page_buf[0..full_page_size]`
+  // and would clobber any write made before it. Neighbor IDs live at
+  // `neighbor_offset_ * sizeof(float)` within the per-node payload.
+  PID *neighbor_ptr = reinterpret_cast<PID *>(page_buf + neighbor_offset_ * 4);
+  for (size_t i = 0; i < cur_degree; ++i) {
+    neighbor_ptr[i] = new_neighbors[i].id;
+  }
 
   /* Copy data */
   for (size_t i = 0; i < cur_degree; ++i) {

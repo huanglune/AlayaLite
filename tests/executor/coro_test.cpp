@@ -42,7 +42,9 @@ class HNSWCoroutineTest : public ::testing::Test {
   }
 
   void TearDown() override {
-    scheduler_->join();  // Ensure all tasks are processed
+    if (scheduler_) {
+      scheduler_->join();  // Ensure all tasks are processed
+    }
   }
 
   std::filesystem::path dir_name_ = "/home/zijian/zijian/AlayaLite/build/bin/siftsmall";

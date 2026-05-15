@@ -9,7 +9,9 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -30,6 +32,47 @@ namespace alaya::laser {
 constexpr size_t kMaxBsIter = 5;
 using CandidateList = std::vector<Candidate<float>>;
 
+class PageAssembler {
+ public:
+  PageAssembler(size_t page_size, size_t node_per_page, size_t node_len)
+      : page_(page_size, 0),
+        populated_(node_per_page, 0),
+        node_per_page_(node_per_page),
+        node_len_(node_len) {}
+
+  void insert(size_t slot, const char *bytes, size_t len) {
+    assert(slot < node_per_page_);
+    assert(len == node_len_);
+    assert((slot + 1) * node_len_ <= page_.size());
+    assert(populated_[slot] == 0);
+
+    std::memcpy(page_.data() + slot * node_len_, bytes, len);
+    populated_[slot] = 1;
+    ++populated_count_;
+  }
+
+  [[nodiscard]] bool is_full() const { return populated_count_ == node_per_page_; }
+
+  void flush(std::ostream &output, size_t page_index) const {
+    output.seekp(static_cast<std::streamoff>(kSectorLen + page_index * page_.size()),
+                 std::ios::beg);
+    output.write(page_.data(), static_cast<std::streamsize>(page_.size()));
+  }
+
+  void reset() {
+    std::fill(page_.begin(), page_.end(), 0);
+    std::fill(populated_.begin(), populated_.end(), 0);
+    populated_count_ = 0;
+  }
+
+ private:
+  std::vector<char> page_;
+  std::vector<uint8_t> populated_;
+  size_t populated_count_ = 0;
+  size_t node_per_page_;
+  size_t node_len_;
+};
+
 class QGBuilder {
  private:
   QuantizedGraph &qg_;
@@ -45,6 +88,7 @@ class QGBuilder {
   std::vector<CandidateList> pruned_neighbors_;
   std::vector<HashBasedBooleanSet> visited_list_;
   std::vector<uint32_t> degrees_;
+  std::function<void(PID, const char *, size_t)> node_payload_observer_;
   void random_init();
   void init_from_vamana(const std::string &filename);
   void search_new_neighbors(bool refine);
@@ -68,6 +112,10 @@ class QGBuilder {
         visited_list_(num_threads_,
                       HashBasedBooleanSet(std::min(ef_build_ * ef_build_, num_nodes_ / 10))),
         degrees_(qg_.num_vertices(), degree_bound_) {}
+
+  void set_node_payload_observer(std::function<void(PID, const char *, size_t)> observer) {
+    node_payload_observer_ = std::move(observer);
+  }
 
   /**
    * @brief Builds a disk-based quantized graph index from a Vamana graph and vector data.
@@ -213,6 +261,7 @@ class QGBuilder {
     }
 
     std::cout << "\nupdate qg..." << std::endl;
+    std::unordered_map<size_t, PageAssembler> page_assemblers;
 
     // Process all nodes in parallel with dynamic scheduling.
     // Each iteration processes ONE node: reads its neighbors, computes quantization, writes to
@@ -249,18 +298,47 @@ class QGBuilder {
       // then computes quantization codes without holding vectors in memory permanently
       qg_.update_qg_out_of_memory(i, new_neighbors_[i], vector_reader, data);
 
-      // Write completed node directly to output file (sequential I/O pattern)
+      // Pack completed node bytes into the read-path page layout.
 #pragma omp critical
       {
-        // TODO(port-laser-disk-index followup): write/read page-layout mismatch; see proposal D8
-        output.seekp(i * qg_.page_size_ + kSectorLen, std::ios::beg);
-        output.write(reinterpret_cast<const char *>(data.cur_page_scratch_), qg_.page_size_);
+        const size_t page_index = i / qg_.node_per_page_;
+        const size_t slot = i % qg_.node_per_page_;
+        auto assembler =
+            page_assemblers
+                .try_emplace(page_index, qg_.page_size_, qg_.node_per_page_, qg_.node_len_)
+                .first;
+        if (node_payload_observer_) {
+          node_payload_observer_(i,
+                                 reinterpret_cast<const char *>(data.cur_page_scratch_),
+                                 qg_.node_len_);
+        }
+        assembler->second.insert(slot,
+                                 reinterpret_cast<const char *>(data.cur_page_scratch_),
+                                 qg_.node_len_);
+        if (assembler->second.is_full()) {
+          assembler->second.flush(output, page_index);
+          page_assemblers.erase(assembler);
+        }
       }
 
       // Return scratch buffer to pool for reuse by other threads
       thread_data.push(data);
       thread_data.push_notify_all();
     }
+    for (auto &[page_index, assembler] : page_assemblers) {
+      assembler.flush(output, page_index);
+    }
+    for (size_t thread = 0; thread < num_threads_; ++thread) {
+      ThreadData data = thread_data.pop();
+      while (data.cur_page_scratch_ == nullptr) {
+        thread_data.wait_for_push_notify();
+        data = thread_data.pop();
+      }
+      std::free(data.cur_page_scratch_);
+      std::free(data.neighbor_vector_scratch_);
+    }
+    vector_reader.deregister_all_threads();
+    vector_reader.close();
     output.close();
 
     // ==================== Save Rotation Matrix ====================
@@ -319,7 +397,7 @@ class QGBuilder {
       size_t cur_batch_size = std::min(cache_num - i, batch_size);
       // Build batch read requests for this chunk
       for (size_t j = 0; j < cur_batch_size; ++j) {
-        frontier_read_reqs.emplace_back(kSectorLen + (qg_.cache_ids_[i + j] * qg_.page_size_),
+        frontier_read_reqs.emplace_back(qg_.get_page_offset(qg_.cache_ids_[i + j]),
                                         qg_.page_size_,
                                         qg_.cache_ids_[i + j],
                                         cache_buffer + (j * qg_.page_size_));
@@ -330,13 +408,16 @@ class QGBuilder {
 
       // Write each node's data (only node_len_ bytes, not full page)
       for (size_t j = 0; j < cur_batch_size; ++j) {
-        cache_vectors_output.write(reinterpret_cast<const char *>(cache_buffer +
-                                                                  (j * qg_.page_size_)),
+        cache_vectors_output.write(reinterpret_cast<const char *>(
+                                       cache_buffer + (j * qg_.page_size_) +
+                                       qg_.offset_to_node(qg_.cache_ids_[i + j])),
                                    static_cast<std::streamsize>(sizeof(char) * qg_.node_len_));
       }
     }
     cache_vectors_output.close();
+    cache_reader.deregister_all_threads();
     cache_reader.close();
+    std::free(cache_buffer);
     std::cout << "Done. \n";
   }
 };

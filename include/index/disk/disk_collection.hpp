@@ -873,6 +873,12 @@ class DiskCollection {
 
     if (segments_.size() == 1) {
       auto hits = segments_[0]->search(query, opts);
+      if (segments_[0]->type() == DiskIndexType::Laser) {
+        if (hits.size() > opts.top_k) {
+          hits.resize(opts.top_k);
+        }
+        return hits;
+      }
       std::sort(hits.begin(), hits.end(), [](const DiskSearchHit &a, const DiskSearchHit &b) {
         if (!detail::disk_search_distance_equal_for_order(a.distance, b.distance)) {
           return detail::disk_search_distance_less(a.distance, b.distance);
@@ -888,19 +894,30 @@ class DiskCollection {
     struct Tagged {
       DiskSearchHit hit;
       uint32_t segment_index;
+      size_t rank;
     };
 
+    const bool preserve_laser_rank = segments_[0]->type() == DiskIndexType::Laser;
     std::vector<Tagged> all;
     all.reserve(segments_.size() * opts.top_k);
     for (uint32_t s = 0; s < segments_.size(); ++s) {
       auto seg_hits = segments_[s]->search(query, opts);
-      for (auto &h : seg_hits) {
-        all.push_back(Tagged{h, s});
+      for (size_t rank = 0; rank < seg_hits.size(); ++rank) {
+        all.push_back(Tagged{seg_hits[rank], s, rank});
       }
     }
-    std::sort(all.begin(), all.end(), [](const Tagged &a, const Tagged &b) {
+    // LASER segment hits use NaN distances today; keep segment-local rank as the
+    // equal-distance tie-break so multi-segment search matches the single-segment
+    // raw engine ordering contract.
+    std::sort(all.begin(), all.end(), [preserve_laser_rank](const Tagged &a, const Tagged &b) {
       if (!detail::disk_search_distance_equal_for_order(a.hit.distance, b.hit.distance)) {
         return detail::disk_search_distance_less(a.hit.distance, b.hit.distance);
+      }
+      if (preserve_laser_rank) {
+        if (a.rank != b.rank) {
+          return a.rank < b.rank;
+        }
+        return a.segment_index < b.segment_index;
       }
       if (a.hit.label != b.hit.label) {
         return a.hit.label < b.hit.label;
