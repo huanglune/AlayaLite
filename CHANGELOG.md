@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Disk LASER index now supports `node_per_page_ > 1` (low-dim datasets like
   SIFT-1M); previously refused at construction. Fixes the upstream
-  `qg_builder.hpp:256` write/read page-layout mismatch.
+  `qg_builder.hpp` write/read page-layout mismatch.
 - Disk LASER build no longer zero-clobbers per-node neighbor IDs. The
   `update_qg_out_of_memory` path used to write neighbor IDs into the per-node
   payload **before** the `read()` that pulled the centroid vector into the

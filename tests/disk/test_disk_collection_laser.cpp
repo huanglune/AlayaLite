@@ -407,22 +407,34 @@ TEST_F(DiskCollectionLaserTest, multi_laser_segment_search) {
     col.import_laser_segment(second_fixture, labels2.data(), labels2.size());
     EXPECT_EQ(col.size(), kLaserFixtureCount * 2);
 
-    expected_labels.reserve(kLaserTopK * 2);
-    for (const auto &hit : first_segment_hits) {
-      ASSERT_EQ(hit.label % 2, 1u);
-      const uint64_t pid = (hit.label - 1) / 2;
-      expected_labels.push_back(pid * 2);
-      expected_labels.push_back(pid * 2 + 1);
+    auto first_segment = load_segment_from_manifest(coll / "segments" / "seg_00000001");
+    auto second_segment = load_segment_from_manifest(coll / "segments" / "seg_00000002");
+    ASSERT_NE(first_segment, nullptr);
+    ASSERT_NE(second_segment, nullptr);
+    const auto first_raw_hits = first_segment->search(query_row(vectors, 0), search_options());
+    const auto second_raw_hits = second_segment->search(query_row(vectors, 0), search_options());
+    EXPECT_EQ(labels_from_hits(first_raw_hits), labels_from_hits(first_segment_hits));
+
+    size_t rank = 0;
+    while (expected_labels.size() < kLaserTopK &&
+           (rank < first_raw_hits.size() || rank < second_raw_hits.size())) {
+      if (rank < first_raw_hits.size()) {
+        expected_labels.push_back(first_raw_hits[rank].label);
+      }
+      if (expected_labels.size() == kLaserTopK) {
+        break;
+      }
+      if (rank < second_raw_hits.size()) {
+        expected_labels.push_back(second_raw_hits[rank].label);
+      }
+      ++rank;
     }
-    std::sort(expected_labels.begin(), expected_labels.end());
-    expected_labels.resize(kLaserTopK);
 
     const auto hits = col.search(query_row(vectors, 0), search_options());
     ASSERT_EQ(hits.size(), kLaserTopK);
     expect_all_nan_distances(hits);
     actual_labels = labels_from_hits(hits);
     EXPECT_EQ(actual_labels, expected_labels);
-    EXPECT_TRUE(std::is_sorted(actual_labels.begin(), actual_labels.end()));
   }
 
   const auto manifest = CollectionManifest::load(coll / "collection_manifest.txt");

@@ -88,6 +88,20 @@ class LaserPageLayoutRoundTripTest : public ::testing::Test {
       }
     }
   }
+
+  static auto open_fd_count() -> size_t {
+#ifdef __linux__
+    std::error_code ec;
+    size_t count = 0;
+    for (const auto &entry : std::filesystem::directory_iterator("/proc/self/fd", ec)) {
+      (void)entry;
+      ++count;
+    }
+    return ec ? 0 : count;
+#else
+    return 0;
+#endif
+  }
 };
 
 TEST_F(LaserPageLayoutRoundTripTest, BuilderPacksLowDimNodesPerReadPathLayout) {
@@ -99,7 +113,11 @@ TEST_F(LaserPageLayoutRoundTripTest, BuilderPacksLowDimNodesPerReadPathLayout) {
         expected_payloads.at(id).assign(payload, payload + payload_len);
       });
 
+  (void)open_fd_count();
+  const size_t fds_before = open_fd_count();
   builder.build(vamana_path_.string().c_str(), prefix_.string().c_str());
+  const size_t fds_after = open_fd_count();
+  EXPECT_LE(fds_after, fds_before) << "QGBuilder leaked file descriptors";
 
   const std::filesystem::path index_path = prefix_.string() + "_R" + std::to_string(kDegree) +
                                            "_MD" + std::to_string(kMainDim) + ".index";

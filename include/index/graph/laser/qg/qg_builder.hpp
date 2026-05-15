@@ -88,9 +88,7 @@ class QGBuilder {
   std::vector<CandidateList> pruned_neighbors_;
   std::vector<HashBasedBooleanSet> visited_list_;
   std::vector<uint32_t> degrees_;
-#ifdef ALAYA_LASER_TESTING
   std::function<void(PID, const char *, size_t)> node_payload_observer_;
-#endif
   void random_init();
   void init_from_vamana(const std::string &filename);
   void search_new_neighbors(bool refine);
@@ -115,11 +113,9 @@ class QGBuilder {
                       HashBasedBooleanSet(std::min(ef_build_ * ef_build_, num_nodes_ / 10))),
         degrees_(qg_.num_vertices(), degree_bound_) {}
 
-#ifdef ALAYA_LASER_TESTING
   void set_node_payload_observer(std::function<void(PID, const char *, size_t)> observer) {
     node_payload_observer_ = std::move(observer);
   }
-#endif
 
   /**
    * @brief Builds a disk-based quantized graph index from a Vamana graph and vector data.
@@ -311,13 +307,11 @@ class QGBuilder {
             page_assemblers
                 .try_emplace(page_index, qg_.page_size_, qg_.node_per_page_, qg_.node_len_)
                 .first;
-#ifdef ALAYA_LASER_TESTING
         if (node_payload_observer_) {
           node_payload_observer_(i,
                                  reinterpret_cast<const char *>(data.cur_page_scratch_),
                                  qg_.node_len_);
         }
-#endif
         assembler->second.insert(slot,
                                  reinterpret_cast<const char *>(data.cur_page_scratch_),
                                  qg_.node_len_);
@@ -343,6 +337,8 @@ class QGBuilder {
       std::free(data.cur_page_scratch_);
       std::free(data.neighbor_vector_scratch_);
     }
+    vector_reader.deregister_all_threads();
+    vector_reader.close();
     output.close();
 
     // ==================== Save Rotation Matrix ====================
@@ -419,6 +415,7 @@ class QGBuilder {
       }
     }
     cache_vectors_output.close();
+    cache_reader.deregister_all_threads();
     cache_reader.close();
     std::free(cache_buffer);
     std::cout << "Done. \n";

@@ -67,6 +67,14 @@ def test_batch_search_rejects_wrong_width_before_native_call() -> None:
     assert not raw.calls
 
 
+def test_validate_main_dim_accepts_64_floor_and_rejects_below() -> None:
+    from alayalite import laser  # pylint: disable=import-outside-toplevel
+
+    laser._validate_main_dim(64, 128)  # pylint: disable=protected-access
+    with pytest.raises(ValueError, match=">= 64"):
+        laser._validate_main_dim(32, 128)  # pylint: disable=protected-access
+
+
 def test_fit_resolves_zero_threads_before_raw_build(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     import alayalite  # pylint: disable=import-outside-toplevel
     from alayalite import laser  # pylint: disable=import-outside-toplevel

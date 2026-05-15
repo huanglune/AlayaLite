@@ -59,8 +59,9 @@ class BuildParams:
         Must be a power of two ``>= 64`` and ``<= raw_dim`` when set. The floor
         matches the smallest FHT helper table in
         ``include/index/graph/laser/utils/rotator.hpp`` (``helper_float_6``,
-        i.e. log2(64)). ``main_dim < kSectorLen / quant-bytes`` triggers the
-        ``node_per_page_ > 1`` codepath unlocked by
+        i.e. log2(64)). Small projected dimensions can make the computed
+        bytes-per-node fit more than once in a 4 KiB sector, which triggers the
+        ``node_per_page_ > 1`` layout unlocked by
         ``fix-laser-low-dim-page-layout``; SIFT-1M (raw_dim=128, main_dim=64)
         is the canonical example.
     R : int

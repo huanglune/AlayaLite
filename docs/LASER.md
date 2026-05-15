@@ -199,8 +199,8 @@ now packs up to `node_per_page_` consecutive node payloads into each
 For `node_per_page_ == 1` configurations, the layout reduces to the
 original one-node-per-page output. For `node_per_page_ > 1`
 configurations, including SIFT-1M-style `main_dim=64` builds, construction
-is no longer refused for the historical write/read mismatch. PR reference:
-pending for `fix-laser-low-dim-page-layout`.
+is no longer refused for the historical write/read mismatch. This fix is
+tracked by PR #88.
 
 ### Relationship To AlayaLite QG
 
