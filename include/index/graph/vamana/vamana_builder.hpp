@@ -370,11 +370,24 @@ class VamanaBuilder {
   // the percentage crosses the next kVamanaProgressStepPct boundary OR
   // kVamanaProgressStepUs has elapsed since the last print, emit one
   // LOG_INFO line with elapsed / rate / ETA. CAS on `last_print_us`
-  // serializes the print: whoever wins the CAS also gets to update
-  // `last_pct`, so each trigger produces exactly one line under load.
-  // The CAS approach (vs the prior pct-only loop) is necessary because
-  // the time-trigger can fire with a stale `last_pct` — we must guard
-  // both watermarks together.
+  // serializes the print: whoever wins the CAS gets to update `last_pct`
+  // and emit the line. After printing, explicitly flush the default
+  // logger so the heartbeat reaches the user without depending on
+  // spdlog's global flush policy (which we deliberately do not touch).
+  //
+  // Concurrency invariants:
+  //  - `now_us <= prev_us` early-return prevents the C++ atomics quirk
+  //    where compare_exchange "succeeds" when expected == desired
+  //    without actually swapping — under µs-precision timers in a fast
+  //    loop multiple threads could otherwise all "win" the same tick.
+  //  - The pct trigger compares bucket indices (pct / step) rather than
+  //    `pct >= prev + step`, so a time-trigger firing at e.g. 5% does
+  //    not push the next pct print to 15% — boundaries stay at fixed
+  //    multiples of `kVamanaProgressStepPct` regardless of heartbeats.
+  //  - The pct math casts to uint64_t before multiplying by 100 so
+  //    builds with N > 42M can't overflow `size_t * 100` on platforms
+  //    where size_t happens to be 32-bit (defensive — vamana is
+  //    Linux/macOS-only today, so this is belt-and-suspenders).
   static void log_progress_tick(std::atomic<size_t> &done,
                                 std::atomic<uint32_t> &last_pct,
                                 std::atomic<uint64_t> &last_print_us,
@@ -384,12 +397,20 @@ class VamanaBuilder {
                                 uint64_t step_us = kVamanaProgressStepUs) {
     const size_t cur = done.fetch_add(1, std::memory_order_relaxed) + 1;
     const uint64_t now_us = t.elapsed();
-    const uint32_t pct = static_cast<uint32_t>((cur * 100UL) / total);
+    const uint32_t pct = static_cast<uint32_t>((static_cast<uint64_t>(cur) * 100ULL) / total);
     const uint32_t prev_pct_snap = last_pct.load(std::memory_order_relaxed);
     uint64_t prev_us = last_print_us.load(std::memory_order_relaxed);
-    const bool pct_trigger = pct >= prev_pct_snap + kVamanaProgressStepPct && pct <= 100;
+    const bool pct_trigger =
+        (pct / kVamanaProgressStepPct) > (prev_pct_snap / kVamanaProgressStepPct);
     const bool time_trigger = (now_us - prev_us) >= step_us;
     if (!pct_trigger && !time_trigger) {
+      return;
+    }
+    // Drop ticks where the µs-precision timer has not advanced since
+    // the last print; otherwise compare_exchange_strong below could
+    // succeed with prev_us == now_us (no actual swap) and let multiple
+    // threads in the same tick print duplicate lines.
+    if (now_us <= prev_us) {
       return;
     }
     // CAS-as-lock: only the thread that flips last_print_us prints.
@@ -410,6 +431,10 @@ class VamanaBuilder {
              format_hms(elapsed_s),
              rate,
              format_hms(remain_s));
+    // Explicit flush keeps the heartbeat visible without forcing
+    // spdlog::flush_on(info) globally. Cost is one flush per progress
+    // line — at most ~once per kVamanaProgressStepUs (default 60s).
+    spdlog::default_logger()->flush();
   }
 
   void link(float alpha) {
@@ -462,57 +487,65 @@ class VamanaBuilder {
 #pragma omp parallel for schedule(dynamic, 2048) num_threads(static_cast<int>(params_.num_threads))
     for (int64_t node_ctr = 0; node_ctr < static_cast<int64_t>(num_points_); ++node_ctr) {
       uint32_t node = static_cast<uint32_t>(node_ctr);
-      // Tick first so nodes that hit the `size <= R` fast-skip below still
-      // count toward progress; otherwise an early-out-heavy run would appear
-      // to stall even though it's making progress.
+      // Decide fast-skip vs prune under the lock, but do the prune work
+      // (and the tick) outside it. The tick MUST run at the end of the
+      // iteration regardless of which branch ran: putting it at the top
+      // let fast-skip-heavy chunks race the cleanup_done counter to 100%
+      // while prune-heavy chunks on other threads were still mid-prune,
+      // producing a "100% but still working" report under dynamic
+      // scheduling. The current shape ticks only after the node is
+      // actually done.
+      std::vector<uint32_t> snapshot;
+      bool prune_needed = false;
+      {
+        std::lock_guard<std::mutex> guard(locks_[node]);
+        if (graph_[node].size() > params_.R) {
+          snapshot = graph_[node];
+          prune_needed = true;
+        }
+      }
+      if (prune_needed) {
+        Scratch &s = scratches_[static_cast<size_t>(omp_get_thread_num())];
+        s.pool.clear();
+        s.occlude_factor.clear();
+        s.pool.reserve(snapshot.size());
+        for (uint32_t cur_nbr : snapshot) {
+          if (cur_nbr == node) {
+            continue;
+          }
+          bool already_seen = false;
+          for (const auto &prev : s.pool) {
+            if (prev.id == cur_nbr) {
+              already_seen = true;
+              break;
+            }
+          }
+          if (!already_seen) {
+            s.pool.emplace_back(cur_nbr, l2_dist(node, cur_nbr));
+          }
+        }
+        std::vector<uint32_t> new_neighbors;
+        prune_neighbors(node,
+                        s.pool,
+                        alpha,
+                        params_.R,
+                        params_.maxc,
+                        new_neighbors,
+                        s.occlude_factor,
+                        [this](uint32_t a, uint32_t b) {
+                          return l2_dist(a, b);
+                        });
+        {
+          std::lock_guard<std::mutex> guard(locks_[node]);
+          graph_[node] = std::move(new_neighbors);
+        }
+      }
       log_progress_tick(cleanup_done,
                         cleanup_last_pct,
                         cleanup_last_print_us,
                         num_points_,
                         "cleanup",
                         cleanup_timer);
-      std::vector<uint32_t> snapshot;
-      {
-        std::lock_guard<std::mutex> guard(locks_[node]);
-        if (graph_[node].size() <= params_.R) {
-          continue;
-        }
-        snapshot = graph_[node];
-      }
-      Scratch &s = scratches_[static_cast<size_t>(omp_get_thread_num())];
-      s.pool.clear();
-      s.occlude_factor.clear();
-      s.pool.reserve(snapshot.size());
-      for (uint32_t cur_nbr : snapshot) {
-        if (cur_nbr == node) {
-          continue;
-        }
-        bool already_seen = false;
-        for (const auto &prev : s.pool) {
-          if (prev.id == cur_nbr) {
-            already_seen = true;
-            break;
-          }
-        }
-        if (!already_seen) {
-          s.pool.emplace_back(cur_nbr, l2_dist(node, cur_nbr));
-        }
-      }
-      std::vector<uint32_t> new_neighbors;
-      prune_neighbors(node,
-                      s.pool,
-                      alpha,
-                      params_.R,
-                      params_.maxc,
-                      new_neighbors,
-                      s.occlude_factor,
-                      [this](uint32_t a, uint32_t b) {
-                        return l2_dist(a, b);
-                      });
-      {
-        std::lock_guard<std::mutex> guard(locks_[node]);
-        graph_[node] = std::move(new_neighbors);
-      }
     }
 
     LOG_INFO("link(alpha={}) done in {}s", alpha, link_timer.elapsed_s());
