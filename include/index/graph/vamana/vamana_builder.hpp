@@ -6,6 +6,7 @@
 
 #include <omp.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -27,6 +28,18 @@ namespace alaya::vamana {
 // `defaults::GRAPH_SLACK_FACTOR`; see spec requirement
 // "Inter-insert with GRAPH_SLACK_FACTOR".
 inline constexpr float GRAPH_SLACK_FACTOR = 1.3f;
+
+// Progress log thresholds for VamanaBuilder::link. A new line lands when
+// EITHER:
+//   - the completed fraction crosses the next kVamanaProgressStepPct
+//     boundary (so small datasets get ~10 progress lines, no spam), OR
+//   - kVamanaProgressStepUs has elapsed since the last print (so long
+//     builds get a 60s heartbeat even when 10% is hours away — a 24h
+//     build at 10%-only would silently sit for ~2.4h between lines).
+// The OR-trigger pattern mirrors what tqdm / DiskANN progress do: take
+// whichever of {count-based, time-based} fires more often.
+inline constexpr uint32_t kVamanaProgressStepPct = 10;
+inline constexpr uint64_t kVamanaProgressStepUs = 60ULL * 1000000ULL;
 
 struct VamanaBuildParams {
   uint32_t R = 64;           // graph degree bound
@@ -342,10 +355,75 @@ class VamanaBuilder {
     }
   }
 
+  // format_hms — render seconds as H:MM:SS. "1:18:42" reads cleaner than
+  // "4722.0s" in long-build progress lines and lets the user mentally
+  // schedule around an ETA at a glance.
+  static std::string format_hms(double seconds) {
+    const auto total_s = static_cast<int64_t>(seconds);
+    const auto h = total_s / 3600;
+    const auto m = (total_s % 3600) / 60;
+    const auto s = total_s % 60;
+    return ::fmt::format("{}:{:02d}:{:02d}", h, m, s);
+  }
+
+  // log_progress_tick — atomic-increment the done-count, then if either
+  // the percentage crosses the next kVamanaProgressStepPct boundary OR
+  // kVamanaProgressStepUs has elapsed since the last print, emit one
+  // LOG_INFO line with elapsed / rate / ETA. CAS on `last_print_us`
+  // serializes the print: whoever wins the CAS also gets to update
+  // `last_pct`, so each trigger produces exactly one line under load.
+  // The CAS approach (vs the prior pct-only loop) is necessary because
+  // the time-trigger can fire with a stale `last_pct` — we must guard
+  // both watermarks together.
+  static void log_progress_tick(std::atomic<size_t> &done,
+                                std::atomic<uint32_t> &last_pct,
+                                std::atomic<uint64_t> &last_print_us,
+                                size_t total,
+                                const char *phase,
+                                const alaya::Timer &t,
+                                uint64_t step_us = kVamanaProgressStepUs) {
+    const size_t cur = done.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t now_us = t.elapsed();
+    const uint32_t pct = static_cast<uint32_t>((cur * 100UL) / total);
+    const uint32_t prev_pct_snap = last_pct.load(std::memory_order_relaxed);
+    uint64_t prev_us = last_print_us.load(std::memory_order_relaxed);
+    const bool pct_trigger = pct >= prev_pct_snap + kVamanaProgressStepPct && pct <= 100;
+    const bool time_trigger = (now_us - prev_us) >= step_us;
+    if (!pct_trigger && !time_trigger) {
+      return;
+    }
+    // CAS-as-lock: only the thread that flips last_print_us prints.
+    if (!last_print_us.compare_exchange_strong(prev_us, now_us, std::memory_order_relaxed)) {
+      return;
+    }
+    last_pct.store(pct, std::memory_order_relaxed);
+
+    const double elapsed_s = static_cast<double>(now_us) / 1e6;
+    const double rate = (elapsed_s > 1e-6) ? static_cast<double>(cur) / elapsed_s : 0.0;
+    const double remain_s =
+        (rate > 0.0 && cur < total) ? static_cast<double>(total - cur) / rate : 0.0;
+    LOG_INFO("Vamana {}: {}/{} ({}%) elapsed={} rate={:.0f}/s ETA={}",
+             phase,
+             cur,
+             total,
+             pct,
+             format_hms(elapsed_s),
+             rate,
+             format_hms(remain_s));
+  }
+
   void link(float alpha) {
     init_scratches();
     alaya::Timer link_timer;
     link_timer.reset();
+
+    std::atomic<size_t> link_done{0};
+    std::atomic<uint32_t> link_last_pct{0};
+    std::atomic<uint64_t> link_last_print_us{0};
+    LOG_INFO("Vamana link: starting {} nodes (progress every {}% or {}s)",
+             num_points_,
+             kVamanaProgressStepPct,
+             kVamanaProgressStepUs / 1000000);
 
 #pragma omp parallel for schedule(dynamic, 2048) num_threads(static_cast<int>(params_.num_threads))
     for (int64_t node_ctr = 0; node_ctr < static_cast<int64_t>(num_points_); ++node_ctr) {
@@ -360,14 +438,39 @@ class VamanaBuilder {
       }
 
       inter_insert(node, pruned_list, s, alpha);
+      log_progress_tick(link_done,
+                        link_last_pct,
+                        link_last_print_us,
+                        num_points_,
+                        "link",
+                        link_timer);
     }
 
     // Cleanup: any node whose in-flight degree exceeds R (via inter-insert
     // fast path) gets a fresh prune. Mirrors DiskANN's "final cleanup" loop
     // (src/index.cpp:1355).
+    alaya::Timer cleanup_timer;
+    cleanup_timer.reset();
+    std::atomic<size_t> cleanup_done{0};
+    std::atomic<uint32_t> cleanup_last_pct{0};
+    std::atomic<uint64_t> cleanup_last_print_us{0};
+    LOG_INFO("Vamana cleanup: scanning {} nodes (progress every {}% or {}s)",
+             num_points_,
+             kVamanaProgressStepPct,
+             kVamanaProgressStepUs / 1000000);
+
 #pragma omp parallel for schedule(dynamic, 2048) num_threads(static_cast<int>(params_.num_threads))
     for (int64_t node_ctr = 0; node_ctr < static_cast<int64_t>(num_points_); ++node_ctr) {
       uint32_t node = static_cast<uint32_t>(node_ctr);
+      // Tick first so nodes that hit the `size <= R` fast-skip below still
+      // count toward progress; otherwise an early-out-heavy run would appear
+      // to stall even though it's making progress.
+      log_progress_tick(cleanup_done,
+                        cleanup_last_pct,
+                        cleanup_last_print_us,
+                        num_points_,
+                        "cleanup",
+                        cleanup_timer);
       std::vector<uint32_t> snapshot;
       {
         std::lock_guard<std::mutex> guard(locks_[node]);

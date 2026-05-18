@@ -416,6 +416,15 @@ inline void run_partition_merge(const BuildVamanaParams &args, uint32_t num, uin
 // Callers MUST keep storage backing `params.data_path` and
 // `params.output_path` alive for the duration of the call.
 inline void build_vamana(const BuildVamanaParams &params_in) {
+  // Force INFO-level logs to flush immediately. Without this, progress /
+  // heartbeat lines from VamanaBuilder::link can sit in spdlog's buffer
+  // for many seconds (the default flush policy only flushes on warn+),
+  // which defeats the whole point of a heartbeat on multi-hour builds.
+  // This is a global spdlog setting and stays in effect after the call —
+  // acceptable because vamana long-build progress is the only INFO-flush-
+  // sensitive site in the tree (verified via grep at write time).
+  spdlog::flush_on(spdlog::level::info);
+
   BuildVamanaParams params = params_in;
 
   if (params.data_path.empty()) {
