@@ -2,19 +2,35 @@
 name       : laser-cross-platform-perf
 
 on         :
-  push:
-    branches:
-    - test/ci
+  pull_request:
+    paths:
+    - include/index/graph/laser/**
+    - include/simd/laser_dispatch.hpp
+    - CMakeLists.txt
+    - python/CMakeLists.txt
+    - scripts/laser_perf/**
+    - python/tests/ci/test_laser_cross_platform_perf.py
+    - .github/workflows/laser-cross-platform-perf.yaml
+  schedule:
+  - cron: 0 6 * * 1
   workflow_dispatch:
     inputs:
       n:
         description: Number of base vectors to build into the LASER fixture
         required: false
-        default: '10000'
+        default: '1000000'
       dim:
         description: Vector dimension; paired disk_laser comparison currently requires main_dim == dim
         required: false
-        default: '128'
+        default: '768'
+      n_clusters:
+        description: Number of synthetic GMM clusters
+        required: false
+        default: '64'
+      cluster_std:
+        description: Standard deviation of per-cluster Gaussian noise
+        required: false
+        default: '0.35'
       query_num:
         description: Number of query vectors to benchmark
         required: false
@@ -60,25 +76,32 @@ jobs       :
       fail-fast: false
       matrix:
         include:
+        - os: ubuntu-latest
+          label: linux-libaio-x86_64
+          backend: libaio
+          cmake_args: -DALAYA_ENABLE_LASER=ON -DALAYA_LASER_USE_THREADPOOL=OFF -DALAYA_NATIVE_ARCH=OFF
+          dram_budget_gb: '4.0'
+          install_libomp: false
+          install_libaio: true
         - os: macos-14
-          label: macos-14
+          label: macos-threadpool-arm64
+          backend: threadpool
+          cmake_args: -DALAYA_ENABLE_LASER=ON -DALAYA_LASER_USE_THREADPOOL=ON -DALAYA_NATIVE_ARCH=OFF
+          dram_budget_gb: '3.0'
+          install_libomp: true
+          install_libaio: false
         - os: macos-15-intel
-          label: macos-15-intel
-          # Future backend targets can be added here once supported:
-          # - os: windows-2022
-          #   label: windows-2022
-          # - os: ubuntu-latest
-          #   label: ubuntu-latest
-          # - os: ubuntu-24.04-arm
-          #   label: ubuntu-24.04-arm
+          label: macos-threadpool-x86_64
+          backend: threadpool
+          cmake_args: -DALAYA_ENABLE_LASER=ON -DALAYA_LASER_USE_THREADPOOL=ON -DALAYA_NATIVE_ARCH=OFF
+          dram_budget_gb: '4.0'
+          install_libomp: true
+          install_libaio: false
 
     env:
       CONAN_NON_INTERACTIVE: 1
       UV_CACHE_DIR: ./.github-tmp/uv-cache
-      CMAKE_ARGS: >-
-        -DALAYA_ENABLE_LASER=ON
-        -DALAYA_LASER_USE_THREADPOOL=ON
-        -DALAYA_NATIVE_ARCH=OFF
+      CMAKE_ARGS: ${{ matrix.cmake_args }}
       LASER_PERF_WORK_DIR: ./.github-tmp/laser-perf
 
     steps:
@@ -92,7 +115,13 @@ jobs       :
     - name: Set up uv
       uses: astral-sh/setup-uv@v5
 
+    - name: Install Linux libaio
+      if: matrix.install_libaio
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y libaio-dev
+
     - name: Install macOS OpenMP runtime
+      if: matrix.install_libomp
       shell: bash
       run: brew install libomp
 
@@ -131,9 +160,13 @@ jobs       :
       shell: bash
       env:
         BENCHMARK_LABEL: ${{ matrix.label }}
+        LASER_PERF_BACKEND: ${{ matrix.backend }}
         LASER_PERF_N: ${{ github.event.inputs.n }}
         LASER_PERF_DIM: ${{ github.event.inputs.dim }}
         LASER_PERF_MAIN_DIM: ${{ github.event.inputs.dim }}
+        LASER_PERF_N_CLUSTERS: ${{ github.event.inputs.n_clusters }}
+        LASER_PERF_CLUSTER_STD: ${{ github.event.inputs.cluster_std }}
+        LASER_PERF_DRAM_BUDGET_GB: ${{ matrix.dram_budget_gb }}
         BENCHMARK_QUERY_NUM: ${{ github.event.inputs.query_num }}
         BENCHMARK_TOPK: ${{ github.event.inputs.topk }}
         BENCHMARK_EF_SEARCH: ${{ github.event.inputs.ef_search }}
@@ -187,5 +220,7 @@ jobs       :
       shell: bash
       run: >-
         uv run --no-project python scripts/laser_perf/laser_cross_platform_perf.py aggregate-summary
-        --expected-label macos-14
-        --expected-label macos-15-intel
+        --expected-label linux-libaio-x86_64
+        --expected-label macos-threadpool-arm64
+        --expected-label macos-threadpool-x86_64
+        --baseline-label linux-libaio-x86_64

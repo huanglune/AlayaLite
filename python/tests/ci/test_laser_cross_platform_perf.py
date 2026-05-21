@@ -37,21 +37,37 @@ def test_laser_perf_workflow_is_manual_macos_first_and_artifacted() -> None:
     triggers = workflow.get("on", workflow.get(True))
 
     assert "workflow_dispatch" in triggers
+    assert "pull_request" in triggers
+    assert "schedule" in triggers
+    assert "push" not in triggers
     benchmark = workflow["jobs"]["benchmark"]
     matrix = benchmark["strategy"]["matrix"]["include"]
     enabled_labels = {entry["label"] for entry in matrix if entry.get("enabled", True)}
-    assert {"macos-14", "macos-15-intel"}.issubset(enabled_labels)
-    assert "windows-2022" in WORKFLOW.read_text(encoding="utf-8")
+    assert {
+        "linux-libaio-x86_64",
+        "macos-threadpool-arm64",
+        "macos-threadpool-x86_64",
+    }.issubset(enabled_labels)
+    backends_by_label = {entry["label"]: entry["backend"] for entry in matrix}
+    assert backends_by_label["linux-libaio-x86_64"] == "libaio"
+    assert backends_by_label["macos-threadpool-arm64"] == "threadpool"
+    assert backends_by_label["macos-threadpool-x86_64"] == "threadpool"
 
     steps = benchmark["steps"]
     run_blocks = "\n".join(step.get("run", "") for step in steps)
     assert "brew install libomp" in run_blocks
+    assert "libaio-dev" in run_blocks
     assert "laser_cross_platform_perf.py run-benchmark" in run_blocks
 
     upload = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v4")
     assert upload["with"]["name"] == "laser-perf-${{ matrix.label }}"
     assert "artifacts/laser-perf-${{ matrix.label }}.json" in upload["with"]["path"]
     assert "results/laser_*" in upload["with"]["path"]
+
+    aggregate_step = next(
+        step for step in workflow["jobs"]["aggregate-summary"]["steps"] if "aggregate-summary" in step.get("run", "")
+    )
+    assert "--baseline-label linux-libaio-x86_64" in aggregate_step["run"]
 
 
 def test_laser_portable_headers_avoid_macos_compile_traps() -> None:
@@ -82,26 +98,62 @@ def test_laser_portable_headers_avoid_macos_compile_traps() -> None:
 
 def test_laser_perf_summary_and_aggregate_lines(tmp_path: Path) -> None:
     helper = _load_helper()
-    result = {
-        "label": "macos-14",
-        "platform": {"system": "Darwin", "machine": "arm64", "python": "3.11.0"},
-        "backend": "threadpool",
-        "dataset": {"n": 256, "dim": 128, "seed": 42},
-        "params": {"queries": 8, "top_k": 10, "ef": 64, "beam_width": 4, "rounds": 2},
-        "benchmark": {
-            "median_native_qps": 120.0,
-            "median_disk_laser_qps": 60.0,
-            "median_qps_ratio": 0.5,
-            "median_recall_delta": 0.0,
-            "max_abs_recall_delta": 0.01,
-        },
-        "round_results": [
-            {"round": 1, "native_qps": 100.0, "disk_laser_qps": 50.0, "qps_ratio": 0.5, "recall_delta": 0.0},
-            {"round": 2, "native_qps": 120.0, "disk_laser_qps": 60.0, "qps_ratio": 0.5, "recall_delta": 0.01},
-        ],
-    }
 
-    single_lines = helper._single_summary_lines(result)  # pylint: disable=protected-access
+    def _build_result(label: str, platform_info: dict, backend: str, disk_qps: float) -> dict:
+        return {
+            "label": label,
+            "platform": platform_info,
+            "backend": backend,
+            "dataset": {
+                "distribution": "synthetic_gmm_l2norm",
+                "n": 256,
+                "dim": 128,
+                "main_dim": 128,
+                "seed": 42,
+                "n_clusters": 8,
+                "cluster_std": 0.35,
+            },
+            "params": {
+                "queries": 8,
+                "top_k": 10,
+                "ef": 64,
+                "beam_width": 4,
+                "rounds": 2,
+                "build_threads": 0,
+                "query_threads": 1,
+            },
+            "benchmark": {
+                "median_native_qps": 2 * disk_qps,
+                "median_disk_laser_qps": disk_qps,
+                "median_qps_ratio": 0.5,
+                "median_recall_delta": 0.0,
+                "max_abs_recall_delta": 0.01,
+            },
+            "round_results": [
+                {
+                    "round": 1,
+                    "native_qps": 2 * disk_qps,
+                    "disk_laser_qps": disk_qps,
+                    "qps_ratio": 0.5,
+                    "recall_delta": 0.0,
+                },
+            ],
+        }
+
+    macos_result = _build_result(
+        "macos-threadpool-arm64",
+        {"system": "Darwin", "machine": "arm64", "python": "3.11.0"},
+        "threadpool",
+        60.0,
+    )
+    linux_result = _build_result(
+        "linux-libaio-x86_64",
+        {"system": "Linux", "machine": "x86_64", "python": "3.11.0"},
+        "libaio",
+        120.0,
+    )
+
+    single_lines = helper._single_summary_lines(macos_result)  # pylint: disable=protected-access
     assert "## LASER Cross-platform Benchmark (Darwin / arm64)" in single_lines
     assert "| Backend | `threadpool` |" in single_lines
     assert any("Median disk_laser QPS" in line and "60.000" in line for line in single_lines)
@@ -109,14 +161,21 @@ def test_laser_perf_summary_and_aggregate_lines(tmp_path: Path) -> None:
 
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir()
-    result_path = artifact_dir / "laser-perf-macos-14.json"
-    result_path.write_text(json.dumps(result), encoding="utf-8")
+    macos_path = artifact_dir / "laser-perf-macos-threadpool-arm64.json"
+    linux_path = artifact_dir / "laser-perf-linux-libaio-x86_64.json"
+    macos_path.write_text(json.dumps(macos_result), encoding="utf-8")
+    linux_path.write_text(json.dumps(linux_result), encoding="utf-8")
     result_paths = helper._aggregate_result_paths(tmp_path)  # pylint: disable=protected-access
-    assert result_paths == [result_path]
+    assert set(result_paths) == {macos_path, linux_path}
     aggregate_lines = helper._aggregate_summary_lines(  # pylint: disable=protected-access
         result_paths,
-        ["macos-14", "windows-2022"],
+        ["linux-libaio-x86_64", "macos-threadpool-arm64", "macos-threadpool-x86_64"],
+        "linux-libaio-x86_64",
     )
     assert "## LASER Cross-platform Benchmark Summary" in aggregate_lines
-    assert any("| Darwin / arm64 | `macos-14` | `threadpool` |" in line for line in aggregate_lines)
-    assert any("`windows-2022`" in line for line in aggregate_lines)
+    assert any("`linux-libaio-x86_64`" in line and "`libaio`" in line for line in aggregate_lines)
+    assert any("`macos-threadpool-arm64`" in line and "`threadpool`" in line for line in aggregate_lines)
+    assert any("`macos-threadpool-x86_64`" in line for line in aggregate_lines)
+    assert any("vs libaio baseline" in line for line in aggregate_lines)
+    # macos disk_qps 60.0 vs linux baseline 120.0 → ratio 0.5
+    assert any("0.500" in line and "`macos-threadpool-arm64`" in line for line in aggregate_lines)

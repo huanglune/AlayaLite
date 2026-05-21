@@ -15,11 +15,9 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_LABELS = [
-    "macos-14",
-    "macos-15-intel",
-    "windows-2022",
-    "ubuntu-latest",
-    "ubuntu-24.04-arm",
+    "linux-libaio-x86_64",
+    "macos-threadpool-arm64",
+    "macos-threadpool-x86_64",
 ]
 
 
@@ -69,11 +67,14 @@ def _fmt(value: object, digits: int = 3) -> str:
     return str(value)
 
 
-def _generate_vectors(n: int, dim: int, seed: int):
+def _generate_vectors(n: int, dim: int, seed: int, n_clusters: int, cluster_std: float):
     import numpy as np  # pylint: disable=import-outside-toplevel
 
     rng = np.random.default_rng(seed)
-    vectors = rng.normal(loc=0.0, scale=1.0, size=(n, dim)).astype(np.float32)
+    centers = rng.normal(loc=0.0, scale=1.0, size=(n_clusters, dim)).astype(np.float32)
+    assignments = rng.integers(low=0, high=n_clusters, size=n)
+    noise = rng.normal(loc=0.0, scale=cluster_std, size=(n, dim)).astype(np.float32)
+    vectors = centers[assignments] + noise
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
     vectors /= np.maximum(norms, np.float32(1e-6))
     return vectors
@@ -90,7 +91,7 @@ def _build_laser_fixture(args: argparse.Namespace, fixture_dir: Path) -> Path:
 
     shutil.rmtree(fixture_dir, ignore_errors=True)
     fixture_dir.mkdir(parents=True, exist_ok=True)
-    vectors = _generate_vectors(args.n, args.dim, args.seed)
+    vectors = _generate_vectors(args.n, args.dim, args.seed, args.n_clusters, args.cluster_std)
     qg_name = "dsqg_seg_00000001"
     laser_module.Index.fit(
         vectors,
@@ -195,10 +196,13 @@ def _build_result(args: argparse.Namespace, summaries: list[dict], backend: str)
         },
         "backend": backend,
         "dataset": {
+            "distribution": "synthetic_gmm_l2norm",
             "n": args.n,
             "dim": args.dim,
             "main_dim": args.main_dim,
             "seed": args.seed,
+            "n_clusters": args.n_clusters,
+            "cluster_std": args.cluster_std,
         },
         "params": {
             "queries": args.query_num,
@@ -303,7 +307,7 @@ def append_summary(args: argparse.Namespace) -> int:
     return 0
 
 
-def _aggregate_summary_lines(result_paths: list[Path], expected_labels: list[str]) -> list[str]:
+def _aggregate_summary_lines(result_paths: list[Path], expected_labels: list[str], baseline_label: str) -> list[str]:
     if not result_paths:
         raise SystemExit("No LASER benchmark artifacts found to aggregate.")
 
@@ -336,28 +340,38 @@ def _aggregate_summary_lines(result_paths: list[Path], expected_labels: list[str
         )
 
     results.sort(key=lambda item: label_order.get(item["label"], len(label_order)))
-    missing_labels = [label for label in expected_labels if label not in {item["label"] for item in results}]
-    baseline = results[0]
+    present_labels = {item["label"] for item in results}
+    missing_labels = [label for label in expected_labels if label not in present_labels]
+    baseline = next((item for item in results if item["label"] == baseline_label), None)
+    baseline_qps = baseline["disk_laser_qps"] if baseline is not None else None
+    summary_baseline = baseline if baseline is not None else results[0]
     lines = [
         "## LASER Cross-platform Benchmark Summary",
         "",
         "| Metric | Value |",
         "| --- | --- |",
-        f"| Data size | `{baseline['n']}` |",
-        f"| Dimension | `{baseline['dim']}` |",
-        f"| Queries | `{baseline['queries']}` |",
-        f"| Top-k | `{baseline['top_k']}` |",
-        f"| ef_search | `{baseline['ef']}` |",
-        f"| Beam width | `{baseline['beam_width']}` |",
-        f"| Rounds | `{baseline['rounds']}` |",
+        f"| Data size | `{summary_baseline['n']}` |",
+        f"| Dimension | `{summary_baseline['dim']}` |",
+        f"| Queries | `{summary_baseline['queries']}` |",
+        f"| Top-k | `{summary_baseline['top_k']}` |",
+        f"| ef_search | `{summary_baseline['ef']}` |",
+        f"| Beam width | `{summary_baseline['beam_width']}` |",
+        f"| Rounds | `{summary_baseline['rounds']}` |",
+        f"| libaio baseline | `{baseline_label}{'' if baseline is not None else ' (missing)'}` |",
         "",
-        "| Platform | Label | Backend | Native QPS | disk_laser QPS | QPS Ratio | Recall Delta | Max abs recall delta |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| Platform | Label | Backend | Native QPS | disk_laser QPS | QPS Ratio | "
+        "vs libaio baseline | Recall Delta | Max abs recall delta |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for item in results:
+        if baseline_qps and item["disk_laser_qps"]:
+            vs_baseline = float(item["disk_laser_qps"]) / float(baseline_qps)
+        else:
+            vs_baseline = None
         lines.append(
             f"| {item['platform']} | `{item['label']}` | `{item['backend']}` | "
-            f"{_fmt(item['native_qps'])} | {_fmt(item['disk_laser_qps'])} | {_fmt(item['qps_ratio'])} | "
+            f"{_fmt(item['native_qps'])} | {_fmt(item['disk_laser_qps'])} | "
+            f"{_fmt(item['qps_ratio'])} | {_fmt(vs_baseline)} | "
             f"{_fmt(item['recall_delta'], 4)} | {_fmt(item['max_abs_recall_delta'], 4)} |"
         )
     if missing_labels:
@@ -373,7 +387,7 @@ def aggregate_summary(args: argparse.Namespace) -> int:
     result_paths = _aggregate_result_paths(args.results_dir)
     expected_labels = args.expected_label or DEFAULT_LABELS
     with _summary_path().open("a", encoding="utf-8") as summary:
-        summary.write("\n".join(_aggregate_summary_lines(result_paths, expected_labels)))
+        summary.write("\n".join(_aggregate_summary_lines(result_paths, expected_labels, args.baseline_label)))
         summary.write("\n")
     return 0
 
@@ -384,9 +398,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser("run-benchmark")
     run.add_argument("--label", default=_env("BENCHMARK_LABEL", "local"))
-    run.add_argument("--n", type=int, default=int(_env("LASER_PERF_N", "10000")))
-    run.add_argument("--dim", type=int, default=int(_env("LASER_PERF_DIM", "128")))
-    run.add_argument("--main-dim", type=int, default=int(_env("LASER_PERF_MAIN_DIM", "128")))
+    run.add_argument("--n", type=int, default=int(_env("LASER_PERF_N", "1000000")))
+    run.add_argument("--dim", type=int, default=int(_env("LASER_PERF_DIM", "768")))
+    run.add_argument("--main-dim", type=int, default=int(_env("LASER_PERF_MAIN_DIM", "768")))
+    run.add_argument("--n-clusters", type=int, default=int(_env("LASER_PERF_N_CLUSTERS", "64")))
+    run.add_argument("--cluster-std", type=float, default=float(_env("LASER_PERF_CLUSTER_STD", "0.35")))
     run.add_argument("--degree", type=int, default=int(_env("LASER_PERF_DEGREE", "64")))
     run.add_argument("--ef-indexing", type=int, default=int(_env("LASER_PERF_EF_INDEXING", "200")))
     run.add_argument("--query-num", type=int, default=int(_env("BENCHMARK_QUERY_NUM", "100")))
@@ -398,7 +414,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--build-threads", type=int, default=int(_env("BENCHMARK_BUILD_THREADS", "0")))
     run.add_argument("--query-threads", type=int, default=int(_env("BENCHMARK_QUERY_THREADS", "1")))
     run.add_argument("--seed", type=int, default=int(_env("LASER_PERF_SEED", "42")))
-    run.add_argument("--dram-budget-gb", type=float, default=float(_env("LASER_PERF_DRAM_BUDGET_GB", "0.5")))
+    run.add_argument("--dram-budget-gb", type=float, default=float(_env("LASER_PERF_DRAM_BUDGET_GB", "4.0")))
     run.add_argument("--backend", default=_env("LASER_PERF_BACKEND", "auto"))
     run.add_argument("--work-dir", type=Path, default=Path(_env("LASER_PERF_WORK_DIR", ".github-tmp/laser-perf")))
     run.add_argument("--results-dir", type=Path, default=Path("results"))
@@ -414,6 +430,7 @@ def build_parser() -> argparse.ArgumentParser:
     aggregate = subparsers.add_parser("aggregate-summary")
     aggregate.add_argument("--results-dir", type=Path, default=Path("artifacts/benchmarks"))
     aggregate.add_argument("--expected-label", action="append", default=None)
+    aggregate.add_argument("--baseline-label", default="linux-libaio-x86_64")
     aggregate.set_defaults(func=aggregate_summary)
 
     return parser
