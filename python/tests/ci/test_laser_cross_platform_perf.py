@@ -37,8 +37,9 @@ def test_laser_perf_workflow_is_manual_macos_first_and_artifacted() -> None:
     triggers = workflow.get("on", workflow.get(True))
 
     assert "workflow_dispatch" in triggers
-    assert "pull_request" in triggers
-    assert "schedule" in triggers
+    # Manual-only while params / dataset are still being tuned.
+    assert "pull_request" not in triggers
+    assert "schedule" not in triggers
     assert "push" not in triggers
     benchmark = workflow["jobs"]["benchmark"]
     matrix = benchmark["strategy"]["matrix"]["include"]

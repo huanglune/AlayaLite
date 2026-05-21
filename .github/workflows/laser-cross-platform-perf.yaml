@@ -2,17 +2,8 @@
 name       : laser-cross-platform-perf
 
 on         :
-  pull_request:
-    paths:
-    - include/index/graph/laser/**
-    - include/simd/laser_dispatch.hpp
-    - CMakeLists.txt
-    - python/CMakeLists.txt
-    - scripts/laser_perf/**
-    - python/tests/ci/test_laser_cross_platform_perf.py
-    - .github/workflows/laser-cross-platform-perf.yaml
-  schedule:
-  - cron: 0 6 * * 1
+  # Manual-only while perf params / dataset are still being tuned; PR and
+  # schedule triggers can be re-enabled once the matrix proves stable.
   workflow_dispatch:
     inputs:
       # Defaults aligned with examples/laser/configs/gist1m_run01.toml; v1 paired
