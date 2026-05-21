@@ -104,7 +104,7 @@ def test_laser_portable_headers_avoid_macos_compile_traps() -> None:
 def test_laser_perf_summary_and_aggregate_lines(tmp_path: Path) -> None:
     helper = _load_helper()
 
-    def _build_result(label: str, platform_info: dict, backend: str, disk_qps: float) -> dict:
+    def _build_result(label: str, platform_info: dict, backend: str, dc_qps: float) -> dict:
         return {
             "label": label,
             "platform": platform_info,
@@ -128,18 +128,34 @@ def test_laser_perf_summary_and_aggregate_lines(tmp_path: Path) -> None:
                 "query_threads": 1,
             },
             "benchmark": {
-                "median_native_qps": 2 * disk_qps,
-                "median_disk_laser_qps": disk_qps,
-                "median_qps_ratio": 0.5,
+                "median_laser_api_qps": 2 * dc_qps,
+                "median_disk_collection_qps": dc_qps,
+                "median_dc_vs_laser_qps_ratio": 0.5,
+                "median_adapter_overhead_pct": 1.5,
+                "median_disk_collection_p50_us": 500.0,
+                "median_disk_collection_p95_us": 800.0,
+                "median_disk_collection_p99_us": 900.0,
+                "median_laser_api_p50_us": 250.0,
+                "median_laser_api_p95_us": 400.0,
                 "median_recall_delta": 0.0,
                 "max_abs_recall_delta": 0.01,
             },
             "round_results": [
                 {
                     "round": 1,
-                    "native_qps": 2 * disk_qps,
-                    "disk_laser_qps": disk_qps,
-                    "qps_ratio": 0.5,
+                    "laser_api_qps": 2 * dc_qps,
+                    "disk_collection_qps": dc_qps,
+                    "dc_vs_laser_qps_ratio": 0.5,
+                    "adapter_overhead_pct": 1.5,
+                    "disk_collection_p50_us": 500.0,
+                    "disk_collection_p95_us": 800.0,
+                    "disk_collection_p99_us": 900.0,
+                    "laser_api_p50_us": 250.0,
+                    "laser_api_p95_us": 400.0,
+                    "laser_api_p99_us": 450.0,
+                    "p50_delta_us": 250.0,
+                    "p95_delta_us": 400.0,
+                    "p99_delta_us": 450.0,
                     "recall_delta": 0.0,
                 },
             ],
@@ -161,7 +177,12 @@ def test_laser_perf_summary_and_aggregate_lines(tmp_path: Path) -> None:
     single_lines = helper._single_summary_lines(macos_result)  # pylint: disable=protected-access
     assert "## LASER Cross-platform Benchmark (Darwin / arm64)" in single_lines
     assert "| Backend | `threadpool` |" in single_lines
-    assert any("Median disk_laser QPS" in line and "60.000" in line for line in single_lines)
+    assert any("LASER Python API" in line and "60.000" not in line for line in single_lines)
+    # The 60.0 dc_qps surfaces in the DiskCollection row.
+    assert any("DiskCollection" in line and "60.000" in line for line in single_lines)
+    # p50 / p95 latency rendered.
+    assert any("p50" in line and "500" in line for line in single_lines)
+    assert any("p95" in line and "800" in line for line in single_lines)
     assert any("Max abs recall delta" in line and "0.0100" in line for line in single_lines)
 
     artifact_dir = tmp_path / "artifacts"
@@ -181,9 +202,13 @@ def test_laser_perf_summary_and_aggregate_lines(tmp_path: Path) -> None:
     assert any("`linux-libaio-x86_64`" in line and "`libaio`" in line for line in aggregate_lines)
     assert any("`macos-threadpool-arm64`" in line and "`threadpool`" in line for line in aggregate_lines)
     assert any("`macos-threadpool-x86_64`" in line for line in aggregate_lines)
-    assert any("vs libaio baseline" in line for line in aggregate_lines)
-    # macos disk_qps 60.0 vs linux baseline 120.0 → ratio 0.5
+    assert any("DC vs libaio baseline" in line for line in aggregate_lines)
+    # macos dc_qps 60.0 vs linux baseline 120.0 → ratio 0.5
     assert any("0.500" in line and "`macos-threadpool-arm64`" in line for line in aggregate_lines)
+    # Latency columns surface.
+    assert any("DC p50" in line for line in aggregate_lines)
+    # Caveat must be present so the reader doesn't misread cross-CPU ratios.
+    assert any("Caveat" in line and "page cache" in line for line in aggregate_lines)
 
 
 def test_generate_vectors_shape_and_l2_norm_and_reproducibility() -> None:
@@ -284,14 +309,57 @@ def test_build_result_aggregates_rounds_and_records_recipe() -> None:
         ]
     )
     summaries = [
-        {"comparison": {"qps_native": 100.0, "qps_disk_laser": 50.0, "qps_ratio": 0.5, "recall_delta": 0.0}},
-        {"comparison": {"qps_native": 200.0, "qps_disk_laser": 80.0, "qps_ratio": 0.4, "recall_delta": 0.01}},
-        {"comparison": {"qps_native": 150.0, "qps_disk_laser": 60.0, "qps_ratio": 0.4, "recall_delta": -0.02}},
+        {
+            "comparison": {
+                "qps_native": 100.0,
+                "qps_disk_laser": 50.0,
+                "qps_ratio": 0.5,
+                "adapter_overhead_pct": 1.0,
+                "recall_delta": 0.0,
+                "latency_us": {
+                    "native": {"p50": 200, "p95": 300, "p99": 400},
+                    "disk_laser": {"p50": 400, "p95": 600, "p99": 700},
+                },
+                "latency_us_delta": {"p50": 200, "p95": 300, "p99": 300},
+            }
+        },
+        {
+            "comparison": {
+                "qps_native": 200.0,
+                "qps_disk_laser": 80.0,
+                "qps_ratio": 0.4,
+                "adapter_overhead_pct": 2.0,
+                "recall_delta": 0.01,
+                "latency_us": {
+                    "native": {"p50": 100, "p95": 200, "p99": 250},
+                    "disk_laser": {"p50": 250, "p95": 400, "p99": 500},
+                },
+                "latency_us_delta": {"p50": 150, "p95": 200, "p99": 250},
+            }
+        },
+        {
+            "comparison": {
+                "qps_native": 150.0,
+                "qps_disk_laser": 60.0,
+                "qps_ratio": 0.4,
+                "adapter_overhead_pct": 1.5,
+                "recall_delta": -0.02,
+                "latency_us": {
+                    "native": {"p50": 150, "p95": 250, "p99": 300},
+                    "disk_laser": {"p50": 300, "p95": 500, "p99": 600},
+                },
+                "latency_us_delta": {"p50": 150, "p95": 250, "p99": 300},
+            }
+        },
     ]
     result = helper._build_result(args, summaries, "threadpool")  # pylint: disable=protected-access
     # Medians.
-    assert result["benchmark"]["median_native_qps"] == 150.0
-    assert result["benchmark"]["median_disk_laser_qps"] == 60.0
+    assert result["benchmark"]["median_laser_api_qps"] == 150.0
+    assert result["benchmark"]["median_disk_collection_qps"] == 60.0
+    # Latency medians surface so cross-platform trend can compare actual us numbers.
+    assert result["benchmark"]["median_disk_collection_p50_us"] == 300
+    assert result["benchmark"]["median_disk_collection_p95_us"] == 500
+    assert result["benchmark"]["median_disk_collection_p99_us"] == 600
     # max_abs_recall_delta = max(|0.0|, |0.01|, |-0.02|) = 0.02
     assert result["benchmark"]["max_abs_recall_delta"] == 0.02
     # Recipe fields surface through dataset + params so trend artifacts stay interpretable.
@@ -337,14 +405,30 @@ def test_write_result_files_creates_expected_artifacts(tmp_path: Path) -> None:
             "search_dram_budget_gb": 0.5,
         },
         "benchmark": {
-            "median_native_qps": 10.0,
-            "median_disk_laser_qps": 5.0,
-            "median_qps_ratio": 0.5,
+            "median_laser_api_qps": 10.0,
+            "median_disk_collection_qps": 5.0,
+            "median_dc_vs_laser_qps_ratio": 0.5,
+            "median_adapter_overhead_pct": 1.5,
+            "median_disk_collection_p50_us": 300.0,
+            "median_disk_collection_p95_us": 500.0,
+            "median_disk_collection_p99_us": 600.0,
+            "median_laser_api_p50_us": 150.0,
+            "median_laser_api_p95_us": 250.0,
             "median_recall_delta": 0.0,
             "max_abs_recall_delta": 0.0,
         },
         "round_results": [
-            {"round": 1, "native_qps": 10.0, "disk_laser_qps": 5.0, "qps_ratio": 0.5, "recall_delta": 0.0},
+            {
+                "round": 1,
+                "laser_api_qps": 10.0,
+                "disk_collection_qps": 5.0,
+                "dc_vs_laser_qps_ratio": 0.5,
+                "adapter_overhead_pct": 1.5,
+                "disk_collection_p50_us": 300.0,
+                "disk_collection_p95_us": 500.0,
+                "disk_collection_p99_us": 600.0,
+                "recall_delta": 0.0,
+            },
         ],
     }
     output_path = tmp_path / "artifact.json"

@@ -173,13 +173,34 @@ def _run_laser_compare(args: argparse.Namespace, fixture_dir: Path, vectors_path
 
 
 def _round_result(round_index: int, summary: dict) -> dict[str, float | int | None]:
+    """Extract the per-round numbers we surface in the trend artifact.
+
+    Field naming mirrors laser_compare's comparison block (`qps_native` =
+    direct `alayalite.laser.Index` API, `qps_disk_laser` = DiskCollection
+    wrapper) but the markdown templates rename these to "LASER Python API"
+    and "DiskCollection" to avoid the "native = in-memory" misreading.
+    """
     comparison = summary["comparison"]
+    latency = comparison.get("latency_us") or {}
+    lat_delta = comparison.get("latency_us_delta") or {}
+    laser_lat = latency.get("native") or {}
+    dc_lat = latency.get("disk_laser") or {}
     return {
         "round": round_index,
-        "native_qps": comparison.get("qps_native"),
-        "disk_laser_qps": comparison.get("qps_disk_laser"),
-        "qps_ratio": comparison.get("qps_ratio"),
+        "laser_api_qps": comparison.get("qps_native"),
+        "disk_collection_qps": comparison.get("qps_disk_laser"),
+        "dc_vs_laser_qps_ratio": comparison.get("qps_ratio"),
+        "adapter_overhead_pct": comparison.get("adapter_overhead_pct"),
         "recall_delta": comparison.get("recall_delta"),
+        "laser_api_p50_us": laser_lat.get("p50"),
+        "laser_api_p95_us": laser_lat.get("p95"),
+        "laser_api_p99_us": laser_lat.get("p99"),
+        "disk_collection_p50_us": dc_lat.get("p50"),
+        "disk_collection_p95_us": dc_lat.get("p95"),
+        "disk_collection_p99_us": dc_lat.get("p99"),
+        "p50_delta_us": lat_delta.get("p50"),
+        "p95_delta_us": lat_delta.get("p95"),
+        "p99_delta_us": lat_delta.get("p99"),
     }
 
 
@@ -222,9 +243,15 @@ def _build_result(args: argparse.Namespace, summaries: list[dict], backend: str)
             "search_dram_budget_gb": args.search_dram_budget_gb,
         },
         "benchmark": {
-            "median_native_qps": _median([item["native_qps"] for item in round_results]),
-            "median_disk_laser_qps": _median([item["disk_laser_qps"] for item in round_results]),
-            "median_qps_ratio": _median([item["qps_ratio"] for item in round_results]),
+            "median_laser_api_qps": _median([item["laser_api_qps"] for item in round_results]),
+            "median_disk_collection_qps": _median([item["disk_collection_qps"] for item in round_results]),
+            "median_dc_vs_laser_qps_ratio": _median([item["dc_vs_laser_qps_ratio"] for item in round_results]),
+            "median_adapter_overhead_pct": _median([item["adapter_overhead_pct"] for item in round_results]),
+            "median_disk_collection_p50_us": _median([item["disk_collection_p50_us"] for item in round_results]),
+            "median_disk_collection_p95_us": _median([item["disk_collection_p95_us"] for item in round_results]),
+            "median_disk_collection_p99_us": _median([item["disk_collection_p99_us"] for item in round_results]),
+            "median_laser_api_p50_us": _median([item["laser_api_p50_us"] for item in round_results]),
+            "median_laser_api_p95_us": _median([item["laser_api_p95_us"] for item in round_results]),
             "median_recall_delta": _median([item["recall_delta"] for item in round_results]),
             "max_abs_recall_delta": max_abs_recall_delta,
         },
@@ -238,6 +265,12 @@ def _single_summary_lines(result: dict) -> list[str]:
     dataset = result["dataset"]
     params = result["params"]
     benchmark = result["benchmark"]
+    # Two paths under comparison:
+    #   - "LASER Python API"   = alayalite.laser.Index.search (direct binding)
+    #   - "DiskCollection"     = DiskCollection(index_type="disk_laser").search
+    # Both load the SAME on-disk LASER fixture through the SAME I/O backend
+    # (libaio or threadpool); the gap measures the DiskCollection wrapper
+    # overhead, NOT an in-memory vs disk comparison.
     lines = [
         f"## LASER Cross-platform Benchmark ({platform_info['system']} / {platform_info['machine']})",
         "",
@@ -245,29 +278,47 @@ def _single_summary_lines(result: dict) -> list[str]:
         "| --- | --- |",
         f"| Label | `{result['label']}` |",
         f"| Backend | `{result['backend']}` |",
-        f"| Data size | `{dataset['n']}` |",
-        f"| Dimension | `{dataset['dim']}` |",
-        f"| Main dimension | `{dataset.get('main_dim', dataset['dim'])}` |",
-        f"| Queries | `{params['queries']}` |",
-        f"| Top-k | `{params['top_k']}` |",
-        f"| ef_search | `{params['ef']}` |",
-        f"| Beam width | `{params['beam_width']}` |",
+        f"| Distribution | `{dataset.get('distribution', 'unknown')}` |",
+        f"| Data size (n / dim / main_dim) | `{dataset['n']}` / `{dataset['dim']}` / "
+        f"`{dataset.get('main_dim', dataset['dim'])}` |",
+        f"| Queries / Top-k / ef_search / Beam width | `{params['queries']}` / `{params['top_k']}` / "
+        f"`{params['ef']}` / `{params['beam_width']}` |",
         f"| Rounds | `{params['rounds']}` |",
-        f"| Median native QPS | `{_fmt(benchmark['median_native_qps'])}` |",
-        f"| Median disk_laser QPS | `{_fmt(benchmark['median_disk_laser_qps'])}` |",
-        f"| Median QPS ratio | `{_fmt(benchmark['median_qps_ratio'])}` |",
-        f"| Median recall delta | `{_fmt(benchmark['median_recall_delta'], 4)}` |",
-        f"| Max abs recall delta | `{_fmt(benchmark['max_abs_recall_delta'], 4)}` |",
+        "",
+        "### Throughput (queries per second, median across rounds)",
+        "",
+        "| Path | QPS |",
+        "| --- | --- |",
+        f"| LASER Python API (`alayalite.laser.Index.search`) | `{_fmt(benchmark['median_laser_api_qps'])}` |",
+        f"| DiskCollection (`DiskCollection(disk_laser).search`) | `{_fmt(benchmark['median_disk_collection_qps'])}` |",
+        f"| DC / LASER-API ratio (~1.0 if wrapper is cheap) | `{_fmt(benchmark['median_dc_vs_laser_qps_ratio'])}` |",
+        f"| DiskCollection adapter overhead at p50 (%) | `{_fmt(benchmark['median_adapter_overhead_pct'])}` |",
+        "",
+        "### DiskCollection latency (microseconds, median across rounds)",
+        "",
+        "| Percentile | DiskCollection | LASER Python API |",
+        "| --- | --- | --- |",
+        f"| p50 | `{_fmt(benchmark['median_disk_collection_p50_us'])}` | `{_fmt(benchmark['median_laser_api_p50_us'])}` |",
+        f"| p95 | `{_fmt(benchmark['median_disk_collection_p95_us'])}` | `{_fmt(benchmark['median_laser_api_p95_us'])}` |",
+        f"| p99 | `{_fmt(benchmark['median_disk_collection_p99_us'])}` | n/a |",
+        "",
+        "### Correctness",
+        "",
+        "| Metric | Value |",
+        "| --- | --- |",
+        f"| Recall delta (DC − LASER-API, ideally 0) | `{_fmt(benchmark['median_recall_delta'], 4)}` |",
+        f"| Max abs recall delta across rounds | `{_fmt(benchmark['max_abs_recall_delta'], 4)}` |",
         "",
         "### Per-round results",
         "",
-        "| Round | Native QPS | disk_laser QPS | QPS Ratio | Recall Delta |",
-        "| --- | --- | --- | --- | --- |",
+        "| Round | LASER-API QPS | DC QPS | DC p50 us | DC p95 us | Recall Δ |",
+        "| --- | --- | --- | --- | --- | --- |",
     ]
     for item in result["round_results"]:
         lines.append(
-            f"| {item['round']} | {_fmt(item['native_qps'])} | {_fmt(item['disk_laser_qps'])} | "
-            f"{_fmt(item['qps_ratio'])} | {_fmt(item['recall_delta'], 4)} |"
+            f"| {item['round']} | {_fmt(item['laser_api_qps'])} | {_fmt(item['disk_collection_qps'])} | "
+            f"{_fmt(item['disk_collection_p50_us'])} | {_fmt(item['disk_collection_p95_us'])} | "
+            f"{_fmt(item['recall_delta'], 4)} |"
         )
     return lines
 
@@ -339,9 +390,13 @@ def _aggregate_summary_lines(result_paths: list[Path], expected_labels: list[str
                 "ef": params["ef"],
                 "beam_width": params["beam_width"],
                 "rounds": params["rounds"],
-                "native_qps": benchmark["median_native_qps"],
-                "disk_laser_qps": benchmark["median_disk_laser_qps"],
-                "qps_ratio": benchmark["median_qps_ratio"],
+                "laser_api_qps": benchmark["median_laser_api_qps"],
+                "disk_collection_qps": benchmark["median_disk_collection_qps"],
+                "dc_vs_laser_qps_ratio": benchmark["median_dc_vs_laser_qps_ratio"],
+                "dc_p50_us": benchmark["median_disk_collection_p50_us"],
+                "dc_p95_us": benchmark["median_disk_collection_p95_us"],
+                "dc_p99_us": benchmark["median_disk_collection_p99_us"],
+                "adapter_overhead_pct": benchmark["median_adapter_overhead_pct"],
                 "recall_delta": benchmark["median_recall_delta"],
                 "max_abs_recall_delta": benchmark["max_abs_recall_delta"],
             }
@@ -351,37 +406,54 @@ def _aggregate_summary_lines(result_paths: list[Path], expected_labels: list[str
     present_labels = {item["label"] for item in results}
     missing_labels = [label for label in expected_labels if label not in present_labels]
     baseline = next((item for item in results if item["label"] == baseline_label), None)
-    baseline_qps = baseline["disk_laser_qps"] if baseline is not None else None
+    baseline_qps = baseline["disk_collection_qps"] if baseline is not None else None
     summary_baseline = baseline if baseline is not None else results[0]
     lines = [
         "## LASER Cross-platform Benchmark Summary",
         "",
-        "| Metric | Value |",
-        "| --- | --- |",
-        f"| Data size | `{summary_baseline['n']}` |",
-        f"| Dimension | `{summary_baseline['dim']}` |",
-        f"| Queries | `{summary_baseline['queries']}` |",
-        f"| Top-k | `{summary_baseline['top_k']}` |",
-        f"| ef_search | `{summary_baseline['ef']}` |",
-        f"| Beam width | `{summary_baseline['beam_width']}` |",
-        f"| Rounds | `{summary_baseline['rounds']}` |",
-        f"| libaio baseline | `{baseline_label}{'' if baseline is not None else ' (missing)'}` |",
+        "**Two paths benchmarked on the same LASER fixture:**",
+        "- `LASER-API QPS` = `alayalite.laser.Index.search` (direct LASER binding).",
+        '- `DC QPS` = `DiskCollection(index_type="disk_laser").search` (wrapper layer).',
         "",
-        "| Platform | Label | Backend | Native QPS | disk_laser QPS | QPS Ratio | "
-        "vs libaio baseline | Recall Delta | Max abs recall delta |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "Both paths use the *same* on-disk LASER fixture and the *same* I/O backend "
+        "(libaio or threadpool). `DC / LASER-API ratio` measures DiskCollection wrapper "
+        "overhead. It is **not** an in-memory vs disk comparison.",
+        "",
+        "| Run settings | Value |",
+        "| --- | --- |",
+        f"| Data size (n / dim) | `{summary_baseline['n']}` / `{summary_baseline['dim']}` |",
+        f"| Queries / Top-k / ef_search / Beam width | `{summary_baseline['queries']}` / "
+        f"`{summary_baseline['top_k']}` / `{summary_baseline['ef']}` / "
+        f"`{summary_baseline['beam_width']}` |",
+        f"| Rounds | `{summary_baseline['rounds']}` |",
+        f"| libaio baseline label | `{baseline_label}{'' if baseline is not None else ' (missing)'}` |",
+        "",
+        "| Platform | Label | Backend | DC QPS | DC p50 us | DC p95 us | "
+        "DC/LASER-API ratio | DC vs libaio baseline QPS | Recall Δ | |Δrecall|max |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for item in results:
-        if baseline_qps and item["disk_laser_qps"]:
-            vs_baseline = float(item["disk_laser_qps"]) / float(baseline_qps)
+        if baseline_qps and item["disk_collection_qps"]:
+            vs_baseline = float(item["disk_collection_qps"]) / float(baseline_qps)
         else:
             vs_baseline = None
         lines.append(
             f"| {item['platform']} | `{item['label']}` | `{item['backend']}` | "
-            f"{_fmt(item['native_qps'])} | {_fmt(item['disk_laser_qps'])} | "
-            f"{_fmt(item['qps_ratio'])} | {_fmt(vs_baseline)} | "
+            f"{_fmt(item['disk_collection_qps'])} | "
+            f"{_fmt(item['dc_p50_us'])} | {_fmt(item['dc_p95_us'])} | "
+            f"{_fmt(item['dc_vs_laser_qps_ratio'])} | {_fmt(vs_baseline)} | "
             f"{_fmt(item['recall_delta'], 4)} | {_fmt(item['max_abs_recall_delta'], 4)} |"
         )
+    lines.extend(
+        [
+            "",
+            "> **Caveat on `DC vs libaio baseline QPS`**: this ratio compares throughput "
+            "across runners with different CPUs. On cached datasets (e.g. smoke n=10k), "
+            "the dataset fits in page cache and the number mainly reflects CPU speed "
+            "rather than the ThreadPool vs libaio backend cost. For real backend perf, "
+            "run with n=1M via `workflow_dispatch`.",
+        ]
+    )
     if missing_labels:
         lines.extend(["", "### Missing results", "", ", ".join(f"`{label}`" for label in missing_labels)])
     return lines
