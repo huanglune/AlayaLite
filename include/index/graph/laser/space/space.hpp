@@ -14,7 +14,6 @@
 
 #pragma once
 
-#include <immintrin.h>
 #include <omp.h>
 
 #include <algorithm>

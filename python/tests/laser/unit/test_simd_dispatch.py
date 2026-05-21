@@ -16,5 +16,5 @@ def test_laser_selected_simd_allows_avx2_fallback() -> None:
 
     selected = laser.selected_simd()
     print(f"laser_simd={selected}")
-    assert selected in {"avx512", "avx2"}
+    assert selected in {"avx512", "avx2", "generic"}
     assert selected == LASER_SIMD

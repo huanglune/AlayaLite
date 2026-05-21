@@ -4,7 +4,6 @@
 
 #pragma once
 
-#include <libaio.h>
 #include <omp.h>
 
 #include <algorithm>
@@ -37,6 +36,7 @@
 #include "index/graph/laser/quantization/rabitq.hpp"
 #include "index/graph/laser/space/l2.hpp"
 #include "index/graph/laser/utils/aligned_file_reader.hpp"
+#include "index/graph/laser/utils/aligned_file_reader_factory.hpp"
 #include "index/graph/laser/utils/array.hpp"
 #include "index/graph/laser/utils/buffer.hpp"
 #include "index/graph/laser/utils/concurrent_queue.hpp"
@@ -62,7 +62,7 @@ struct Factor {
 struct ThreadData {
   HashBasedBooleanSet visited_;
   buffer::SearchBuffer search_pool_;
-  io_context_t ctx_;
+  IOContext ctx_;
   char *sector_scratch_ = nullptr;
   char *neighbor_vector_scratch_ = nullptr;
   char *cur_page_scratch_ = nullptr;
@@ -99,7 +99,7 @@ class QuantizedGraph {
   QGScanner scanner_;
   FHTRotator rotator_;
   PCATransform pca_transform_;  // PCA transform for online query transformation
-  LinuxAlignedFileReader aligned_file_reader_;
+  std::unique_ptr<AlignedFileReader> aligned_file_reader_;
   ConcurrentQueue<ThreadData> thread_data_;
   int dc_count_;
   size_t ef_search_ = 200;
@@ -176,7 +176,7 @@ class QuantizedGraph {
 
   void update_qg_out_of_memory(PID,
                                const std::vector<Candidate<float>> &,
-                               LinuxAlignedFileReader &,
+                               AlignedFileReader &,
                                ThreadData);
 
   float scan_neighbors(const QGQuery &q_obj,
@@ -236,15 +236,18 @@ class QuantizedGraph {
         data = this->thread_data_.pop();
       }
       if (data.sector_scratch_ != nullptr) {
-        free(data.sector_scratch_);
+        memory::align_free(data.sector_scratch_);
       }
       if (data.pca_query_scratch_ != nullptr) {
         data.pca_query_scratch_storage_.reset();
         data.pca_query_scratch_ = nullptr;
       }
     }
-    aligned_file_reader_.deregister_all_threads();
-    aligned_file_reader_.close();
+    // close() must run first: under the ThreadPool backend it joins worker
+    // threads, eliminating the use-after-free window where a worker can call
+    // notify_completion() with a ThreadPoolContext* that was already erased.
+    aligned_file_reader_->close();
+    aligned_file_reader_->deregister_all_threads();
   }
 };
 
@@ -263,6 +266,7 @@ inline QuantizedGraph::QuantizedGraph(size_t num,
       padded_dim_(1 << ceil_log2(dimension_)),
       scanner_(padded_dim_, degree_bound_),
       rotator_(dimension_, rotator_seed),
+      aligned_file_reader_(make_aligned_file_reader()),
       node_len_((32 * dimension_ + 32 * residual_dimension_ + 128 * degree_bound_ +
                  degree_bound_ * padded_dim_) /
                 8) {
@@ -313,15 +317,15 @@ inline void QuantizedGraph::set_params(size_t ef_search, size_t num_threads, int
   if (index_file_name_ == "") {
     throw std::logic_error("QuantizedGraph::set_params: call load_disk_index() first");
   }
-  aligned_file_reader_.open(index_file_name_);
+  aligned_file_reader_->open(index_file_name_);
 
 #pragma omp parallel for num_threads(static_cast<int>(nthreads_))
   for (size_t thread = 0; thread < nthreads_; thread++) {
 #pragma omp critical
     {
-      this->aligned_file_reader_.register_thread();
+      this->aligned_file_reader_->register_thread();
       ThreadData data;
-      data.ctx_ = aligned_file_reader_.get_ctx();
+      data.ctx_ = aligned_file_reader_->get_ctx();
       data.search_pool_.resize(ef_search_);
       data.visited_ =
           HashBasedBooleanSet(std::min(this->num_points_ / 10, ef_search_ * ef_search_));
@@ -486,8 +490,8 @@ inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
     free_slots.push_back(data.sector_scratch_ + i * page_size_);
   }
 
-  // AIO event buffer for collecting completed I/O operations
-  std::vector<io_event> evts(max_beam_width_);
+  // Backend-independent event buffer for collecting completed I/O operations.
+  std::vector<AlignedReadEvent> evts;
 
   // cache_nhoods: Nodes found in memory cache (no disk I/O needed)
   std::vector<PID> cache_nhoods;
@@ -519,17 +523,19 @@ inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
   };
 
   // ==================== I/O Completion Handler Lambda ====================
-  // Collects completed AIO events and moves nodes from ongoing to prepared queue.
-  // Uses non-blocking io_getevents to check for completed I/O without waiting.
+  // Collects completed I/O events and moves nodes from ongoing to prepared queue.
+  // Uses non-blocking reader polling to check for completed I/O without waiting.
   auto wait_for_nodes = [&]() {
-    // Non-blocking check: minimum events = 0, maximum = cur_beam_size
-    int ret = io_getevents(data.ctx_, 0, static_cast<int64_t>(cur_beam_size), evts.data(), nullptr);
+    const int ret =
+        aligned_file_reader_->poll_events(data.ctx_, static_cast<int>(cur_beam_size), evts);
 
     // Process each completed I/O event
-    for (unsigned int i = 0; i < ret; i++) {
-      int id = static_cast<int>(reinterpret_cast<uintptr_t>(evts[i].data));
+    for (int i = 0; i < ret; i++) {
+      int id = static_cast<int>(evts[i].id);
       if (ongoing_nodes.find(id) == ongoing_nodes.end()) {
-        throw std::runtime_error("QuantizedGraph::search: AIO completion id not in ongoing_nodes");
+        throw std::runtime_error(
+            "disk_search_qg: I/O completion id not in ongoing_nodes "
+            "(AlignedFileReader::poll_events returned an unexpected id)");
       }
       // Move from ongoing to prepared queue
       prepared_nodes.emplace_back(id, ongoing_nodes[id]);
@@ -596,7 +602,7 @@ inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
     if (!frontier_read_reqs.empty()) {
       n_hops++;  // Count as one I/O round
       auto submit_start = std::chrono::high_resolution_clock::now();
-      n_ops = aligned_file_reader_.submit_reqs(frontier_read_reqs, data.ctx_);
+      n_ops = aligned_file_reader_->submit_reqs(frontier_read_reqs, data.ctx_);
       io_num += n_ops;
       auto submit_end = std::chrono::high_resolution_clock::now();
       submit_time +=
@@ -719,15 +725,15 @@ inline void QuantizedGraph::initialize() {
 }
 
 inline void QuantizedGraph::init_workspace() {
-  aligned_file_reader_.open(index_file_name_);
+  aligned_file_reader_->open(index_file_name_);
 
 #pragma omp parallel for num_threads(static_cast<int>(nthreads_))
   for (size_t thread = 0; thread < nthreads_; thread++) {
 #pragma omp critical
     {
-      this->aligned_file_reader_.register_thread();
+      this->aligned_file_reader_->register_thread();
       ThreadData data;
-      data.ctx_ = aligned_file_reader_.get_ctx();
+      data.ctx_ = aligned_file_reader_->get_ctx();
       data.search_pool_.resize(ef_search_);
       data.visited_ =
           HashBasedBooleanSet(std::min(this->num_points_ / 10, ef_search_ * ef_search_));
@@ -745,7 +751,7 @@ inline void QuantizedGraph::init_workspace() {
 inline void QuantizedGraph::update_qg_out_of_memory(
     PID cur_id,
     const std::vector<Candidate<float>> &new_neighbors,
-    LinuxAlignedFileReader &vector_reader,
+    AlignedFileReader &vector_reader,
     ThreadData thread_data) {
   size_t cur_degree = new_neighbors.size();
   std::memset(thread_data.cur_page_scratch_, 0, page_size_);

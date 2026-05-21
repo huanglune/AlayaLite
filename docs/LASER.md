@@ -7,15 +7,20 @@ High-dimensional Vector Similarity Search"*. The in-tree code lives under
 `include/index/graph/laser/` and `python/src/alayalite/laser/`.
 
 Treat Laser as a vertical port: the SIMD-friendly disk layout, FastScan
-4-bit quantization, PCA-reduced coordinates, and `libaio` beam search are
+4-bit quantization, PCA-reduced coordinates, and asynchronous disk search are
 coupled. Changing one part can invalidate the paper-alignment assumptions.
 
 ## Platform
 
-Laser is Linux-only in v1. `libaio` wraps Linux kernel AIO syscalls, and
-macOS/Windows do not provide the same interface. Build support is gated by
-the CMake option `ALAYA_ENABLE_LASER` (ON by default on supported Linux
-builds, OFF elsewhere).
+Laser is supported on:
+
+- Linux x86_64, using the `libaio` backend by default.
+- macOS, using the portable thread-pool backend by default.
+
+Linux ARM and Windows are not supported yet. They remain explicitly gated by
+CMake, but the reader abstraction no longer blocks future backend work.
+Build support is gated by the CMake option `ALAYA_ENABLE_LASER` (ON by
+default on Linux x86_64 and macOS, OFF elsewhere).
 
 ```bash
 # Debian / Ubuntu
@@ -26,7 +31,8 @@ sudo dnf install libaio-devel
 ```
 
 If `libaio` is missing while Laser is enabled, CMake fails with a message
-that names the dependency and suggests `-DALAYA_ENABLE_LASER=OFF`.
+that names the dependency and suggests either `-DALAYA_ENABLE_LASER=OFF` or
+`-DALAYA_LASER_USE_THREADPOOL=ON`.
 
 ## Input
 
@@ -52,14 +58,46 @@ The `laser` dependency group installs the Python-side runtime needed for
 building/searching Laser indexes (`scikit-learn`, `faiss-cpu`, `psutil`,
 and supporting packages).
 
+On macOS, install OpenMP before configuring:
+
+```bash
+brew install libomp
+```
+
+CMake searches the standard Homebrew prefixes (`/opt/homebrew/opt/libomp` on
+Apple Silicon and `/usr/local/opt/libomp` on Intel Macs). If OpenMP is not
+found while `ALAYA_ENABLE_LASER=ON`, configuration fails with a message naming
+`brew install libomp`.
+
+Backend selection is automatic for normal builds:
+
+```bash
+# Linux x86_64 default
+cmake -B build/Release -DALAYA_ENABLE_LASER=ON
+# prints: LASER I/O backend: libaio (Linux x86_64)
+
+# macOS default
+cmake -B build/Release -DALAYA_ENABLE_LASER=ON
+# prints: LASER I/O backend: thread pool (macOS)
+
+# Linux fallback without libaio
+cmake -B build/Release -DALAYA_ENABLE_LASER=ON -DALAYA_LASER_USE_THREADPOOL=ON
+# prints: LASER I/O backend: thread pool (portable fallback)
+```
+
+The thread-pool backend uses buffered `pread` and worker threads. Override the
+worker count for local experiments with `ALAYA_LASER_IO_THREADS`; production
+Linux x86_64 builds should keep the default libaio backend unless the portable
+fallback is intentionally being tested.
+
 ## SIMD Dispatch
 
 LASER's handwritten SIMD kernels select their ISA at runtime. A single x86_64
 wheel carries AVX-512F+BW and AVX2+FMA implementations for FastScan,
 approximate-distance conversion, rotation, scalar range scans, and single-vector
 L2 norm. On CPUs with both AVX-512F and AVX-512BW, LASER selects the AVX-512
-path; otherwise it uses AVX2+FMA. AVX2+FMA remains the minimum x86 baseline and
-LASER does not provide a scalar fallback below that baseline.
+path; otherwise it uses AVX2+FMA. Non-x86 builds use the generic scalar LASER
+path; this is intended for macOS development portability, not throughput parity.
 
 The baseline `-mavx2 -mfma` flags are still used for Eigen and other
 non-handwritten code. Function-level target attributes do not change Eigen's

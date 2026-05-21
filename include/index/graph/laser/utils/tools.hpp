@@ -9,11 +9,22 @@
 
 #pragma once
 
+#include <cstddef>
 #include <ctime>
+#include <functional>
 #include <random>
 #include <thread>
 
 namespace alaya::laser {
+
+inline auto thread_local_random_seed() -> std::mt19937::result_type {
+  std::random_device random_device;
+  const std::hash<std::thread::id> thread_hasher;
+  const auto random_seed = static_cast<std::mt19937::result_type>(random_device());
+  const auto thread_seed =
+      static_cast<std::mt19937::result_type>(thread_hasher(std::this_thread::get_id()));
+  return static_cast<std::mt19937::result_type>(random_seed + thread_seed);
+}
 
 /** @brief Thread-safe random integer generator in range [min, max]. */
 template <typename T>
@@ -22,9 +33,7 @@ inline T rand_integer(T min, T max) {
   // the initializer as a function declarator and reads `std::random_device()()`
   // as "function returning function".
   // NOLINTNEXTLINE(whitespace/braces)
-  static thread_local std::mt19937 generator{
-      std::random_device{}() +  // NOLINT(whitespace/braces)
-      std::hash<std::thread::id>{}(std::this_thread::get_id())};
+  static thread_local std::mt19937 generator{thread_local_random_seed()};
   std::uniform_int_distribution<T> distribution(min, max);
   return distribution(generator);
 }

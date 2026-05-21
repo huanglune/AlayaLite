@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -29,9 +30,66 @@
 #include "index/graph/laser/utils/array.hpp"
 #include "index/graph/laser/utils/memory.hpp"
 #include "simd/laser_dispatch.hpp"
-#include "third_party/ffht/fht_avx.hpp"
+#include "utils/platform.hpp"
+
+#if defined(ALAYA_ARCH_X86)
+  #include "third_party/ffht/fht_avx.hpp"
+#endif
 
 namespace alaya::laser {
+
+namespace detail {
+
+inline void fht_float_portable(float *buf, size_t log_n) {
+  const size_t n = size_t{1} << log_n;
+  for (size_t half = 1; half < n; half <<= 1) {
+    const size_t block = half << 1;
+    for (size_t base = 0; base < n; base += block) {
+      for (size_t offset = 0; offset < half; ++offset) {
+        const size_t lhs = base + offset;
+        const size_t rhs = lhs + half;
+        const float u = buf[lhs];
+        const float v = buf[rhs];
+        buf[lhs] = u + v;
+        buf[rhs] = u - v;
+      }
+    }
+  }
+}
+
+inline auto select_fht_float(size_t log_b) -> std::function<void(float *)> {
+  switch (log_b) {
+#if defined(ALAYA_ARCH_X86)
+    case 6:
+      return helper_float_6;
+    case 7:
+      return helper_float_7;
+    case 8:
+      return helper_float_8;
+    case 9:
+      return helper_float_9;
+    case 10:
+      return helper_float_10;
+    case 11:
+      return helper_float_11;
+#else
+    case 6:
+    case 7:
+    case 8:
+    case 9:
+    case 10:
+    case 11:
+      return [log_b](float *buf) {
+        fht_float_portable(buf, log_b);
+      };
+#endif
+    default:
+      throw std::invalid_argument(
+          "FHTRotator: vector dimension larger than supported FHT tables (max 2^11)");
+  }
+}
+
+}  // namespace detail
 
 /**
  * @brief Applies randomized Fast Hadamard Transform rotation to vectors.
@@ -43,7 +101,7 @@ class FHTRotator {
   using data_type = data::Array<float, std::vector<size_t>, memory::AlignedAllocator<float>>;
 
  private:
-  std::function<void(float *)> fht_float_ = helper_float_6;
+  std::function<void(float *)> fht_float_ = detail::select_fht_float(6);
   size_t dimension_ = 0;
   size_t paded_dim_ = 0;
   data_type mat_;
@@ -66,29 +124,7 @@ class FHTRotator {
       mat_[i] =
           static_cast<float>((2 * bernoulli(gen)) - 1) / std::sqrt(static_cast<float>(paded_dim_));
     }
-    switch (log_b) {
-      case 6:
-        this->fht_float_ = helper_float_6;
-        break;
-      case 7:
-        this->fht_float_ = helper_float_7;
-        break;
-      case 8:
-        this->fht_float_ = helper_float_8;
-        break;
-      case 9:
-        this->fht_float_ = helper_float_9;
-        break;
-      case 10:
-        this->fht_float_ = helper_float_10;
-        break;
-      case 11:
-        this->fht_float_ = helper_float_11;
-        break;
-      default:
-        throw std::invalid_argument(
-            "FHTRotator: vector dimension larger than supported FHT tables (max 2^11)");
-    }
+    this->fht_float_ = detail::select_fht_float(log_b);
   }
 
   ~FHTRotator() = default;

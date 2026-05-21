@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <stdexcept>
 #include <system_error>
@@ -31,6 +32,12 @@ inline auto create_directories_if_needed(const fs::path &path) -> void {
     return;
   }
   fs::create_directories(path);
+}
+
+inline auto file_size_or(const fs::path &path, std::uintmax_t fallback) noexcept -> std::uintmax_t {
+  std::error_code ec;
+  const auto bytes = fs::file_size(path, ec);
+  return ec ? fallback : bytes;
 }
 
 inline auto sync_file(const fs::path &path) -> void {

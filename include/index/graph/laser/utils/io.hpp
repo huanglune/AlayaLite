@@ -13,23 +13,27 @@
 
 #pragma once
 
-#include <sys/stat.h>
-
 #include <cassert>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+
+#include "utils/platform_fs.hpp"
 
 namespace alaya::laser {
 
 /** @brief Returns file size in bytes, or -1 on error. */
 inline size_t get_filesize(const char *filename) {
-  struct stat64 stat_buf;
-  int tmp = stat64(filename, &stat_buf);
-  return tmp == 0 ? stat_buf.st_size : -1;
+  constexpr auto kError = std::numeric_limits<std::uintmax_t>::max();
+  const auto bytes = ::alaya::platform::file_size_or(filename, kError);
+  if (bytes > std::numeric_limits<size_t>::max()) {
+    return static_cast<size_t>(-1);
+  }
+  return static_cast<size_t>(bytes);
 }
 
 inline bool file_exists(const char *filename) { return std::filesystem::exists(filename); }
