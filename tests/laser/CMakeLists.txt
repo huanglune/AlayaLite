@@ -52,6 +52,29 @@ target_compile_options(
 add_test(NAME laser_test_page_layout_round_trip COMMAND $<TARGET_FILE:test_laser_page_layout_round_trip>)
 set_tests_properties(laser_test_page_layout_round_trip PROPERTIES LABELS laser)
 
+add_executable(test_threadpool_file_reader ${CMAKE_CURRENT_SOURCE_DIR}/utils/test_threadpool_file_reader.cpp)
+target_include_directories(test_threadpool_file_reader PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(
+  test_threadpool_file_reader PRIVATE ${GTEST_LIBS} Eigen3::Eigen concurrentqueue::concurrentqueue
+                                      spdlog::spdlog_header_only
+)
+if(TARGET OpenMP::OpenMP_CXX)
+  target_link_libraries(test_threadpool_file_reader PRIVATE OpenMP::OpenMP_CXX)
+endif()
+target_compile_features(test_threadpool_file_reader PRIVATE cxx_std_20)
+target_compile_definitions(test_threadpool_file_reader PRIVATE ALAYA_LASER_USE_THREADPOOL=1)
+target_compile_options(
+  test_threadpool_file_reader
+  PRIVATE -O3
+          -DNDEBUG
+          -Wall
+          -Wextra
+          ${_ALAYA_LASER_CONSUMER_OPTIONS}
+)
+
+add_test(NAME laser_test_threadpool_file_reader COMMAND $<TARGET_FILE:test_threadpool_file_reader>)
+set_tests_properties(laser_test_threadpool_file_reader PROPERTIES LABELS "laser;threadpool")
+
 add_executable(laser_simd_dispatch_test ${CMAKE_CURRENT_SOURCE_DIR}/simd_dispatch_test.cpp)
 target_link_libraries(laser_simd_dispatch_test PRIVATE alaya_laser ${GTEST_LIBS})
 target_compile_features(laser_simd_dispatch_test PRIVATE cxx_std_20)

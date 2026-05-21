@@ -40,6 +40,7 @@ auto has_avx512_bw() -> bool {
 
 TEST(LaserSimdDispatchTest, FactoriesSelectHighestSupportedIsa) {
   const auto &features = alaya::simd::get_cpu_features();
+#ifdef ALAYA_ARCH_X86
   if (features.avx512f_ && features.avx512bw_) {
     EXPECT_STREQ(simd::get_laser_simd_name(), "avx512");
     EXPECT_EQ(simd::get_accumulate_func(), simd::detail::accumulate_impl_avx512);
@@ -60,9 +61,92 @@ TEST(LaserSimdDispatchTest, FactoriesSelectHighestSupportedIsa) {
     EXPECT_EQ(simd::get_l2_sqr_single_func(), simd::detail::l2_sqr_single_avx2);
     return;
   }
-  EXPECT_THROW((void)simd::get_laser_simd_name(), std::runtime_error);
-  EXPECT_THROW((void)simd::get_accumulate_func(), std::runtime_error);
+  // x86 without AVX2+FMA: LASER refuses to fall back to scalar (the build adds
+  // -mavx2 -mfma; silent generic dispatch would mask a misconfigured runtime).
+  EXPECT_THROW(simd::detect_laser_simd_level(), std::runtime_error);
+#else
+  (void)features;
+  EXPECT_STREQ(simd::get_laser_simd_name(), "generic");
+  EXPECT_EQ(simd::get_accumulate_func(), simd::detail::accumulate_impl_generic);
+  EXPECT_EQ(simd::get_appro_dist_func(), simd::detail::appro_dist_impl_generic);
+  EXPECT_EQ(simd::get_convert_func(), simd::detail::convert_accum_to_float_generic);
+  EXPECT_EQ(simd::get_rotate_loop_func(), simd::detail::rotate_loop_generic);
+  EXPECT_EQ(simd::get_data_range_func(), simd::detail::data_range_generic);
+  EXPECT_EQ(simd::get_l2_sqr_single_func(), simd::detail::l2_sqr_single_generic);
+#endif
 }
+
+TEST(LaserSimdDispatchTest, GenericKernelsProduceScalarResults) {
+  constexpr size_t kDim = 16;
+  constexpr size_t kCodeLength = kDim << 2;
+  std::array<uint8_t, kCodeLength> codes{};
+  std::array<uint8_t, kCodeLength> lut{};
+  for (size_t i = 0; i < kCodeLength; ++i) {
+    codes[i] = static_cast<uint8_t>((i * 17U + 3U) & 0xFFU);
+    lut[i] = static_cast<uint8_t>((i * 11U + 5U) & 0xFFU);
+  }
+
+  std::array<uint16_t, kBatchSize> accum{};
+  simd::detail::accumulate_impl_generic(kDim, codes.data(), lut.data(), accum.data());
+
+  std::array<float, kBatchSize> converted{};
+  simd::detail::convert_accum_to_float_generic(kBatchSize, accum.data(), 37, converted.data());
+
+  std::array<float, kBatchSize> triple_x{};
+  std::array<float, kBatchSize> fac_dq{};
+  std::array<float, kBatchSize> fac_vq{};
+  std::array<float, kBatchSize> dist{};
+  for (size_t i = 0; i < kBatchSize; ++i) {
+    triple_x[i] = 0.25F + static_cast<float>(i) * 0.5F;
+    fac_dq[i] = 0.01F * static_cast<float>((i % 7) + 1);
+    fac_vq[i] = 0.02F * static_cast<float>((i % 5) + 1);
+  }
+  simd::detail::appro_dist_impl_generic(kBatchSize,
+                                        1.25F,
+                                        0.125F,
+                                        2.5F,
+                                        0.75F,
+                                        converted.data(),
+                                        triple_x.data(),
+                                        fac_dq.data(),
+                                        fac_vq.data(),
+                                        dist.data());
+  for (float value : dist) {
+    EXPECT_TRUE(std::isfinite(value));
+  }
+
+  std::array<float, 9> values = {-1.0F, -0.5F, 0.0F, 0.5F, 1.0F, 1.5F, 2.0F, -2.0F, 3.0F};
+  float lo = 0.0F;
+  float hi = 0.0F;
+  simd::detail::data_range_generic(values.data(), values.size(), lo, hi);
+  EXPECT_FLOAT_EQ(lo, -2.0F);
+  EXPECT_FLOAT_EQ(hi, 3.0F);
+  EXPECT_FLOAT_EQ(simd::detail::l2_sqr_single_generic(values.data(), values.size()), 21.75F);
+
+  std::array<float, values.size()> signs{};
+  std::array<float, values.size()> rotated{};
+  std::fill(signs.begin(), signs.end(), -1.0F);
+  EXPECT_EQ(simd::detail::rotate_loop_generic(values.data(),
+                                              signs.data(),
+                                              values.size(),
+                                              rotated.data()),
+            values.size());
+  for (size_t i = 0; i < values.size(); ++i) {
+    EXPECT_FLOAT_EQ(rotated[i], -values[i]);
+  }
+}
+
+TEST(LaserSimdDispatchTest, PortableFhtProducesHadamardOrder) {
+  std::array<float, 8> values = {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F};
+
+  detail::fht_float_portable(values.data(), 3);
+
+  const std::array<float, 8> expected = {36.0F, -4.0F, -8.0F, 0.0F,
+                                         -16.0F, 0.0F, 0.0F, 0.0F};
+  EXPECT_EQ(values, expected);
+}
+
+#ifdef ALAYA_ARCH_X86
 
 TEST(LaserSimdDispatchTest, AccumulateAvx512MatchesAvx2) {
   if (!has_avx512_bw()) {
@@ -188,6 +272,8 @@ TEST(LaserSimdDispatchTest, RotateLoopAvx512MatchesAvx2) {
     EXPECT_TRUE(bits_equal(dst512[i], dst2[i])) << i;
   }
 }
+
+#endif  // ALAYA_ARCH_X86
 
 }  // namespace
 }  // namespace alaya::laser

@@ -4,37 +4,54 @@
 
 /**
  * @file aligned_file_reader.hpp
- * @brief Linux AIO (Asynchronous I/O) wrapper for high-performance disk access.
+ * @brief Backend-neutral aligned file reader interface for LASER disk access.
  *
- * This module provides direct disk I/O capabilities using Linux kernel AIO,
- * which is essential for achieving predictable, low-latency disk reads in
- * disk-based vector search systems.
+ * This module provides the common reader interface used by LASER search and
+ * build code. Linux production builds use a libaio implementation; portable
+ * builds provide the same interface through a thread-pool backend.
  *
  * Key Design Decisions:
- * - Uses O_DIRECT to bypass the OS page cache
- * - Uses Linux AIO (libaio) for asynchronous, non-blocking I/O
+ * - Keeps concrete backend APIs out of QG consumer code
+ * - Preserves the 512-byte aligned read contract for all backends
  * - Requires 512-byte alignment for all buffers, offsets, and lengths
  */
 
 #pragma once
 
-#include <cassert>
-
+#include <algorithm>
 #include <atomic>
+#include <cassert>
+#include <cerrno>
+#include <cstdint>
+#include <cstring>
 #include <vector>
 
-#include <malloc.h>
 #include <cstdio>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
 // #include "tsl/robin_map.h"
-#include <fcntl.h>
-#include <libaio.h>
-#include <unistd.h>
-#include <map>
+#if defined(ALAYA_LASER_USE_LIBAIO) && defined(ALAYA_LASER_USE_THREADPOOL)
+  #error "Define only one LASER I/O backend macro"
+#endif
+
+#if !defined(ALAYA_LASER_USE_LIBAIO) && !defined(ALAYA_LASER_USE_THREADPOOL)
+  #if defined(__linux__)
+    #define ALAYA_LASER_USE_LIBAIO 1
+  #else
+    #define ALAYA_LASER_USE_THREADPOOL 1
+  #endif
+#endif
+
+#if defined(ALAYA_LASER_USE_LIBAIO)
+  #include <fcntl.h>
+  #include <libaio.h>
+  #include <unistd.h>
+#endif
+
 #define MAX_EVENTS 1024
 
 #ifndef ROUND_UP
@@ -51,7 +68,12 @@
 
 #define MAX_IO_DEPTH 128
 
+#if defined(ALAYA_LASER_USE_LIBAIO)
 using IOContext = io_context_t;
+#else
+struct ThreadPoolContext;
+using IOContext = ThreadPoolContext *;
+#endif
 
 /**
  * @brief Represents a single aligned read request for O_DIRECT I/O.
@@ -76,14 +98,19 @@ struct AlignedRead {
   }
 };
 
+struct AlignedReadEvent {
+  uint64_t id = 0;
+  int64_t result = 0;
+};
+
 class AlignedFileReader {
  protected:
   std::map<std::thread::id, IOContext> ctx_map_;
   std::mutex ctx_mut_;
 
  public:
-  // returns the thread-specific context
-  // returns (io_context_t)(-1) if thread is not registered
+  // Returns the thread-specific context owned by the reader. The returned
+  // reference is valid until the calling thread is deregistered.
   virtual IOContext &get_ctx() = 0;
 
   virtual ~AlignedFileReader() {}
@@ -103,8 +130,23 @@ class AlignedFileReader {
   // NOTE :: blocking call
   virtual void read(std::vector<AlignedRead> &read_reqs, IOContext &ctx, bool async = false) = 0;
   virtual int submit_reqs(std::vector<AlignedRead> &read_reqs, IOContext &ctx) = 0;
-  virtual void get_events(IOContext &ctx, int n_ops) = 0;
+  // Blocking completion wait. Returns after n_ops completions have been
+  // collected for ctx and appends backend-independent events to out.
+  virtual int get_events(IOContext &ctx, int n_ops, std::vector<AlignedReadEvent> &out) = 0;
+
+  void get_events(IOContext &ctx, int n_ops) {
+    std::vector<AlignedReadEvent> ignored;
+    (void)get_events(ctx, n_ops, ignored);
+  }
+
+  // Non-blocking completion poll. Returns immediately with up to max_events
+  // completions; zero is valid and means callers should try again later.
+  // Implementations must not throw when no completions are ready, but may throw
+  // for genuine backend errors such as an invalid context.
+  virtual int poll_events(IOContext &ctx, int max_events, std::vector<AlignedReadEvent> &out) = 0;
 };
+
+#if defined(ALAYA_LASER_USE_LIBAIO)
 
 class LinuxAlignedFileReader : public AlignedFileReader {
  private:
@@ -135,7 +177,8 @@ class LinuxAlignedFileReader : public AlignedFileReader {
   void read(std::vector<AlignedRead> &read_reqs, IOContext &ctx, bool async = false) override;
 
   int submit_reqs(std::vector<AlignedRead> &read_reqs, IOContext &ctx) override;
-  void get_events(IOContext &ctx, int n_ops) override;
+  int get_events(IOContext &ctx, int n_ops, std::vector<AlignedReadEvent> &out) override;
+  int poll_events(IOContext &ctx, int max_events, std::vector<AlignedReadEvent> &out) override;
 };
 
 using io_event_t = struct io_event;
@@ -145,13 +188,13 @@ inline void execute_io(io_context_t ctx,
                        int fd,
                        std::vector<AlignedRead> &read_reqs,
                        uint64_t n_retries = 0) {
-#ifdef DEBUG
+  #ifdef DEBUG
   for (auto &req : read_reqs) {
     assert(IS_ALIGNED(req.len, 512));
     assert(IS_ALIGNED(req.offset, 512));
     assert(IS_ALIGNED(req.buf, 512));
   }
-#endif
+  #endif
 
   // break-up requests into chunks of size MAX_EVENTS each
   uint64_t n_iters = ROUND_UP(read_reqs.size(), MAX_EVENTS) / MAX_EVENTS;
@@ -279,6 +322,7 @@ inline void LinuxAlignedFileReader::deregister_all_threads() {
 }
 
 inline void LinuxAlignedFileReader::open(const std::string &fname) {
+  close();
   // O_DIRECT: Bypass the OS page cache and read directly from disk.
   //   Why? For large-scale vector search, the working set far exceeds RAM.
   //   Without O_DIRECT, the OS would try to cache data, causing:
@@ -294,8 +338,12 @@ inline void LinuxAlignedFileReader::open(const std::string &fname) {
 }
 
 inline void LinuxAlignedFileReader::close() {
+  if (this->file_desc_ == -1) {
+    return;
+  }
   ::fcntl(this->file_desc_, F_GETFD);
   ::close(this->file_desc_);
+  this->file_desc_ = -1;
 }
 
 inline void LinuxAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
@@ -355,7 +403,9 @@ inline int LinuxAlignedFileReader::submit_reqs(std::vector<AlignedRead> &read_re
   return static_cast<int>(n_ops);
 }
 
-inline void LinuxAlignedFileReader::get_events(IOContext &ctx, int n_ops) {
+inline int LinuxAlignedFileReader::get_events(IOContext &ctx,
+                                              int n_ops,
+                                              std::vector<AlignedReadEvent> &out) {
   std::vector<io_event> evts(n_ops);
   auto ret = io_getevents(ctx,
                           static_cast<int64_t>(n_ops),
@@ -367,4 +417,37 @@ inline void LinuxAlignedFileReader::get_events(IOContext &ctx, int n_ops) {
         "LinuxAlignedFileReader::get_events: io_getevents() failed; returned " +
         std::to_string(ret));
   }
+  out.clear();
+  out.reserve(static_cast<size_t>(ret));
+  for (int64_t i = 0; i < ret; ++i) {
+    out.push_back({static_cast<uint64_t>(reinterpret_cast<uintptr_t>(evts[i].data)),
+                   static_cast<int64_t>(evts[i].res)});
+  }
+  return static_cast<int>(ret);
 }
+
+inline int LinuxAlignedFileReader::poll_events(IOContext &ctx,
+                                               int max_events,
+                                               std::vector<AlignedReadEvent> &out) {
+  out.clear();
+  if (max_events <= 0) {
+    return 0;
+  }
+
+  std::vector<io_event> evts(static_cast<size_t>(max_events));
+  auto ret = io_getevents(ctx, 0, static_cast<int64_t>(max_events), evts.data(), nullptr);
+  if (ret < 0) {
+    throw std::runtime_error(
+        "LinuxAlignedFileReader::poll_events: io_getevents() failed; returned " +
+        std::to_string(ret) + ", errno=" + std::to_string(-ret));
+  }
+
+  out.reserve(static_cast<size_t>(ret));
+  for (int64_t i = 0; i < ret; ++i) {
+    out.push_back({static_cast<uint64_t>(reinterpret_cast<uintptr_t>(evts[i].data)),
+                   static_cast<int64_t>(evts[i].res)});
+  }
+  return static_cast<int>(ret);
+}
+
+#endif  // defined(ALAYA_LASER_USE_LIBAIO)

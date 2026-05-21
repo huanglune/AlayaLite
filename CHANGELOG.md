@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- LASER on-disk index is now buildable and runnable on macOS (M-series and
+  Intel) using a portable thread-pool I/O backend. Linux x86_64 continues to
+  use the libaio backend with no behavior change.
+
 ### Fixed
 - LASER SIMD rotation and scalar range kernels now use unaligned load/store
   instructions in the runtime-dispatched paths, avoiding potential aligned

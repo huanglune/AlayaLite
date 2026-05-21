@@ -53,7 +53,7 @@ def _probe() -> tuple[bool, Optional[str]]:
         if "LASER requires AVX2+FMA" in str(exc):
             return False, None
         raise
-    if laser_simd not in {"avx512", "avx2"}:
+    if laser_simd not in {"avx512", "avx2", "generic"}:
         raise RuntimeError(f"unexpected LASER SIMD backend: {laser_simd!r}")
     return True, laser_simd
 

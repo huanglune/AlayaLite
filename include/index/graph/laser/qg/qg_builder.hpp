@@ -25,6 +25,7 @@
 #include "index/graph/laser/qg/qg.hpp"
 #include "index/graph/laser/space/space.hpp"
 #include "index/graph/laser/utils/aligned_file_reader.hpp"
+#include "index/graph/laser/utils/aligned_file_reader_factory.hpp"
 #include "index/graph/laser/utils/tools.hpp"
 #include "third_party/ngt/hashset.hpp"
 
@@ -238,8 +239,8 @@ class QGBuilder {
 
     // ==================== PHASE 2: Parallel Out-of-Core Index Construction ====================
     // Open the aligned vector file for direct I/O (bypasses page cache)
-    LinuxAlignedFileReader vector_reader;
-    vector_reader.open(tmp_path.c_str());
+    auto vector_reader = make_aligned_file_reader();
+    vector_reader->open(tmp_path.c_str());
 
     // Create a bounded pool of thread-local scratch buffers.
     ConcurrentQueue<ThreadData> thread_data;
@@ -247,9 +248,9 @@ class QGBuilder {
     for (size_t thread = 0; thread < num_threads_; thread++) {
 #pragma omp critical
       {
-        vector_reader.register_thread();
+        vector_reader->register_thread();
         ThreadData data;
-        data.ctx_ = vector_reader.get_ctx();
+        data.ctx_ = vector_reader->get_ctx();
         // Scratch for building one node's quantized representation
         data.cur_page_scratch_ =
             reinterpret_cast<char *>(memory::align_allocate<kSectorLen>(qg_.page_size_));
@@ -296,7 +297,7 @@ class QGBuilder {
       // Core processing: read vectors from disk, compute RaBitQ codes, prepare node data
       // This function reads the node's vector and all neighbor vectors via async I/O,
       // then computes quantization codes without holding vectors in memory permanently
-      qg_.update_qg_out_of_memory(i, new_neighbors_[i], vector_reader, data);
+      qg_.update_qg_out_of_memory(i, new_neighbors_[i], *vector_reader, data);
 
       // Pack completed node bytes into the read-path page layout.
 #pragma omp critical
@@ -334,11 +335,11 @@ class QGBuilder {
         thread_data.wait_for_push_notify();
         data = thread_data.pop();
       }
-      std::free(data.cur_page_scratch_);
-      std::free(data.neighbor_vector_scratch_);
+      memory::align_free(data.cur_page_scratch_);
+      memory::align_free(data.neighbor_vector_scratch_);
     }
-    vector_reader.deregister_all_threads();
-    vector_reader.close();
+    vector_reader->deregister_all_threads();
+    vector_reader->close();
     output.close();
 
     // ==================== Save Rotation Matrix ====================
@@ -386,9 +387,9 @@ class QGBuilder {
     size_t batch_size = 1024;
     char *cache_buffer =
         reinterpret_cast<char *>(memory::align_allocate<kSectorLen>(batch_size * qg_.page_size_));
-    LinuxAlignedFileReader cache_reader;
-    cache_reader.open(index_path);
-    cache_reader.register_thread();
+    auto cache_reader = make_aligned_file_reader();
+    cache_reader->open(index_path);
+    cache_reader->register_thread();
     std::vector<AlignedRead> frontier_read_reqs;
     frontier_read_reqs.reserve(batch_size + 1);
 
@@ -403,7 +404,7 @@ class QGBuilder {
                                         cache_buffer + (j * qg_.page_size_));
       }
       // Execute batch read
-      cache_reader.read(frontier_read_reqs, cache_reader.get_ctx());
+      cache_reader->read(frontier_read_reqs, cache_reader->get_ctx());
       frontier_read_reqs.clear();
 
       // Write each node's data (only node_len_ bytes, not full page)
@@ -415,9 +416,9 @@ class QGBuilder {
       }
     }
     cache_vectors_output.close();
-    cache_reader.deregister_all_threads();
-    cache_reader.close();
-    std::free(cache_buffer);
+    cache_reader->deregister_all_threads();
+    cache_reader->close();
+    memory::align_free(cache_buffer);
     std::cout << "Done. \n";
   }
 };
