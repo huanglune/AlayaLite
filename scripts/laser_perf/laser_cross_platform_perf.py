@@ -408,7 +408,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--label", default=_env("BENCHMARK_LABEL", "local"))
     # Defaults aligned with examples/laser/configs/gist1m_run01.toml; dim==main_dim
     # is enforced by the v1 LaserSegmentImporter (alayalite.bench.laser_compare).
-    run.add_argument("--n", type=int, default=int(_env("LASER_PERF_N", "1000000")))
+    # n defaults to 10k for PR/schedule (smoke validation of build+run flow);
+    # paper-grade perf numbers (n=1M) are obtained via workflow_dispatch.
+    run.add_argument("--n", type=int, default=int(_env("LASER_PERF_N", "10000")))
     run.add_argument("--dim", type=int, default=int(_env("LASER_PERF_DIM", "256")))
     run.add_argument("--main-dim", type=int, default=int(_env("LASER_PERF_MAIN_DIM", "256")))
     run.add_argument("--n-clusters", type=int, default=int(_env("LASER_PERF_N_CLUSTERS", "64")))

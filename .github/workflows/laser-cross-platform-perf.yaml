@@ -18,9 +18,9 @@ on         :
       # Defaults aligned with examples/laser/configs/gist1m_run01.toml; v1 paired
       # disk_laser comparison enforces main_dim == dim (LaserSegmentImporter).
       n:
-        description: Number of base vectors to build into the LASER fixture
+        description: Number of base vectors (smoke default 10k; paper-grade 1M)
         required: false
-        default: '1000000'
+        default: '10000'
       dim:
         description: Vector dimension; main_dim is bound to dim (v1 binding)
         required: false
