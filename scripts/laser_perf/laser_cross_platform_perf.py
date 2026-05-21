@@ -429,7 +429,7 @@ def _aggregate_summary_lines(result_paths: list[Path], expected_labels: list[str
         f"| libaio baseline label | `{baseline_label}{'' if baseline is not None else ' (missing)'}` |",
         "",
         "| Platform | Label | Backend | DC QPS | DC p50 us | DC p95 us | "
-        "DC/LASER-API ratio | DC vs libaio baseline QPS | Recall Δ | |Δrecall|max |",
+        "DC/LASER-API ratio | DC vs libaio baseline QPS | Recall Δ | Max abs Δrecall |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for item in results:
