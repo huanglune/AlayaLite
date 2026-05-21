@@ -58,8 +58,13 @@ inline auto detect_laser_simd_level() -> LaserSimdLevel {
   if (features.avx2_ && features.fma_) {
     return LaserSimdLevel::kAvx2;
   }
-#endif
+  // x86 build_system adds -mavx2 -mfma; silently dropping to scalar would mask
+  // a misconfigured runtime. Refuse to fall back here — generic is only for
+  // non-x86 targets where the AVX symbols don't exist.
+  throw std::runtime_error("LASER on x86 requires AVX2+FMA at minimum");
+#else
   return LaserSimdLevel::kGeneric;
+#endif
 }
 
 inline auto get_laser_simd_level() -> LaserSimdLevel {

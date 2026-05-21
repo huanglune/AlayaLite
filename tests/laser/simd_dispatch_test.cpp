@@ -61,9 +61,11 @@ TEST(LaserSimdDispatchTest, FactoriesSelectHighestSupportedIsa) {
     EXPECT_EQ(simd::get_l2_sqr_single_func(), simd::detail::l2_sqr_single_avx2);
     return;
   }
+  // x86 without AVX2+FMA: LASER refuses to fall back to scalar (the build adds
+  // -mavx2 -mfma; silent generic dispatch would mask a misconfigured runtime).
+  EXPECT_THROW(simd::detect_laser_simd_level(), std::runtime_error);
 #else
   (void)features;
-#endif
   EXPECT_STREQ(simd::get_laser_simd_name(), "generic");
   EXPECT_EQ(simd::get_accumulate_func(), simd::detail::accumulate_impl_generic);
   EXPECT_EQ(simd::get_appro_dist_func(), simd::detail::appro_dist_impl_generic);
@@ -71,6 +73,7 @@ TEST(LaserSimdDispatchTest, FactoriesSelectHighestSupportedIsa) {
   EXPECT_EQ(simd::get_rotate_loop_func(), simd::detail::rotate_loop_generic);
   EXPECT_EQ(simd::get_data_range_func(), simd::detail::data_range_generic);
   EXPECT_EQ(simd::get_l2_sqr_single_func(), simd::detail::l2_sqr_single_generic);
+#endif
 }
 
 TEST(LaserSimdDispatchTest, GenericKernelsProduceScalarResults) {

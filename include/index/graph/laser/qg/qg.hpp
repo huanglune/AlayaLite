@@ -236,15 +236,18 @@ class QuantizedGraph {
         data = this->thread_data_.pop();
       }
       if (data.sector_scratch_ != nullptr) {
-        free(data.sector_scratch_);
+        memory::align_free(data.sector_scratch_);
       }
       if (data.pca_query_scratch_ != nullptr) {
         data.pca_query_scratch_storage_.reset();
         data.pca_query_scratch_ = nullptr;
       }
     }
-    aligned_file_reader_->deregister_all_threads();
+    // close() must run first: under the ThreadPool backend it joins worker
+    // threads, eliminating the use-after-free window where a worker can call
+    // notify_completion() with a ThreadPoolContext* that was already erased.
     aligned_file_reader_->close();
+    aligned_file_reader_->deregister_all_threads();
   }
 };
 
@@ -530,7 +533,9 @@ inline void QuantizedGraph::disk_search_qg(const float *__restrict__ query,
     for (int i = 0; i < ret; i++) {
       int id = static_cast<int>(evts[i].id);
       if (ongoing_nodes.find(id) == ongoing_nodes.end()) {
-        throw std::runtime_error("QuantizedGraph::search: AIO completion id not in ongoing_nodes");
+        throw std::runtime_error(
+            "disk_search_qg: I/O completion id not in ongoing_nodes "
+            "(AlignedFileReader::poll_events returned an unexpected id)");
       }
       // Move from ongoing to prepared queue
       prepared_nodes.emplace_back(id, ongoing_nodes[id]);
