@@ -432,10 +432,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=float(_env("LASER_PERF_BUILD_DRAM_BUDGET_GB", "4.0")),
     )
+    # v1 paired comparison: alayalite.bench.laser_compare hard-rejects values
+    # other than 0.5 because the DiskCollection.import_laser_segment binding
+    # does not expose search_dram_budget_gb (paper toml's 1.0 only applies to
+    # single-side LASER benchmarks). See laser_compare.py finding 1.1.
     run.add_argument(
         "--search-dram-budget-gb",
         type=float,
-        default=float(_env("LASER_PERF_SEARCH_DRAM_BUDGET_GB", "1.0")),
+        default=float(_env("LASER_PERF_SEARCH_DRAM_BUDGET_GB", "0.5")),
     )
     run.add_argument("--backend", default=_env("LASER_PERF_BACKEND", "auto"))
     run.add_argument("--work-dir", type=Path, default=Path(_env("LASER_PERF_WORK_DIR", ".github-tmp/laser-perf")))

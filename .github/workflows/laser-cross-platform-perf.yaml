@@ -184,7 +184,9 @@ jobs       :
         LASER_PERF_EF_INDEXING: ${{ github.event.inputs.ef_indexing }}
         LASER_PERF_EP_NUM: ${{ github.event.inputs.ep_num }}
         LASER_PERF_BUILD_DRAM_BUDGET_GB: ${{ matrix.build_dram_budget_gb }}
-        LASER_PERF_SEARCH_DRAM_BUDGET_GB: '1.0'
+        # v1 paired comparison locks search to 0.5 (binding does not expose
+        # search_dram_budget_gb); see scripts/laser_perf/laser_cross_platform_perf.py.
+        LASER_PERF_SEARCH_DRAM_BUDGET_GB: '0.5'
         BENCHMARK_QUERY_NUM: ${{ github.event.inputs.query_num }}
         BENCHMARK_TOPK: ${{ github.event.inputs.topk }}
         BENCHMARK_EF_SEARCH: ${{ github.event.inputs.ef_search }}
