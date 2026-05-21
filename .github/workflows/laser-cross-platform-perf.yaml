@@ -15,14 +15,16 @@ on         :
   - cron: 0 6 * * 1
   workflow_dispatch:
     inputs:
+      # Defaults aligned with examples/laser/configs/gist1m_run01.toml; v1 paired
+      # disk_laser comparison enforces main_dim == dim (LaserSegmentImporter).
       n:
         description: Number of base vectors to build into the LASER fixture
         required: false
         default: '1000000'
       dim:
-        description: Vector dimension; paired disk_laser comparison currently requires main_dim == dim
+        description: Vector dimension; main_dim is bound to dim (v1 binding)
         required: false
-        default: '768'
+        default: '256'
       n_clusters:
         description: Number of synthetic GMM clusters
         required: false
@@ -31,6 +33,18 @@ on         :
         description: Standard deviation of per-cluster Gaussian noise
         required: false
         default: '0.35'
+      build_l:
+        description: Vamana build L (paper default 200)
+        required: false
+        default: '200'
+      ef_indexing:
+        description: ef_indexing for LASER build
+        required: false
+        default: '200'
+      ep_num:
+        description: LASER entry-point count (paper 300)
+        required: false
+        default: '300'
       query_num:
         description: Number of query vectors to benchmark
         required: false
@@ -40,21 +54,21 @@ on         :
         required: false
         default: '10'
       ef_search:
-        description: ef_search for LASER search
+        description: ef_search for LASER search (paper sweep midpoint)
         required: false
-        default: '128'
+        default: '200'
       beam_width:
-        description: LASER disk-search beam width
+        description: LASER disk-search beam width (paper 16)
         required: false
-        default: '4'
+        default: '16'
       rounds:
         description: Number of benchmark rounds
         required: false
         default: '3'
       warmup:
-        description: Warmup queries before each timed round
+        description: Warmup queries before each timed round (paper 2)
         required: false
-        default: '10'
+        default: '2'
       build_threads:
         description: LASER build threads (0 = auto)
         required: false
@@ -80,21 +94,21 @@ jobs       :
           label: linux-libaio-x86_64
           backend: libaio
           cmake_args: -DALAYA_ENABLE_LASER=ON -DALAYA_LASER_USE_THREADPOOL=OFF -DALAYA_NATIVE_ARCH=OFF
-          dram_budget_gb: '4.0'
+          build_dram_budget_gb: '6.0'
           install_libomp: false
           install_libaio: true
         - os: macos-14
           label: macos-threadpool-arm64
           backend: threadpool
           cmake_args: -DALAYA_ENABLE_LASER=ON -DALAYA_LASER_USE_THREADPOOL=ON -DALAYA_NATIVE_ARCH=OFF
-          dram_budget_gb: '3.0'
+          build_dram_budget_gb: '4.0'
           install_libomp: true
           install_libaio: false
         - os: macos-15-intel
           label: macos-threadpool-x86_64
           backend: threadpool
           cmake_args: -DALAYA_ENABLE_LASER=ON -DALAYA_LASER_USE_THREADPOOL=ON -DALAYA_NATIVE_ARCH=OFF
-          dram_budget_gb: '4.0'
+          build_dram_budget_gb: '4.0'
           install_libomp: true
           install_libaio: false
 
@@ -166,7 +180,11 @@ jobs       :
         LASER_PERF_MAIN_DIM: ${{ github.event.inputs.dim }}
         LASER_PERF_N_CLUSTERS: ${{ github.event.inputs.n_clusters }}
         LASER_PERF_CLUSTER_STD: ${{ github.event.inputs.cluster_std }}
-        LASER_PERF_DRAM_BUDGET_GB: ${{ matrix.dram_budget_gb }}
+        LASER_PERF_BUILD_L: ${{ github.event.inputs.build_l }}
+        LASER_PERF_EF_INDEXING: ${{ github.event.inputs.ef_indexing }}
+        LASER_PERF_EP_NUM: ${{ github.event.inputs.ep_num }}
+        LASER_PERF_BUILD_DRAM_BUDGET_GB: ${{ matrix.build_dram_budget_gb }}
+        LASER_PERF_SEARCH_DRAM_BUDGET_GB: '1.0'
         BENCHMARK_QUERY_NUM: ${{ github.event.inputs.query_num }}
         BENCHMARK_TOPK: ${{ github.event.inputs.topk }}
         BENCHMARK_EF_SEARCH: ${{ github.event.inputs.ef_search }}

@@ -101,17 +101,17 @@ def _build_laser_fixture(args: argparse.Namespace, fixture_dir: Path) -> Path:
             metric="l2",
             main_dim=args.main_dim,
             R=args.degree,
-            L=max(args.degree + 8, 100),
-            alpha=1.2,
+            L=args.build_l,
+            alpha=args.alpha,
             ef_indexing=args.ef_indexing,
-            ep_num=max(1, min(16, args.n)),
+            ep_num=min(args.ep_num, args.n),
             disable_medoid=True,
         ),
         num_threads=args.build_threads if args.build_threads > 0 else (os.cpu_count() or 1),
         seed=args.seed,
         skip_existing=False,
         auto_load=False,
-        dram_budget_gb=args.dram_budget_gb,
+        dram_budget_gb=args.build_dram_budget_gb,
     )
 
     vectors_path = fixture_dir / f"{qg_name}_pca_base.fbin"
@@ -150,7 +150,7 @@ def _run_laser_compare(args: argparse.Namespace, fixture_dir: Path, vectors_path
         "--seed",
         str(args.seed),
         "--dram-budget-gb",
-        str(args.dram_budget_gb),
+        str(args.search_dram_budget_gb),
         "--out",
         str(out_root),
         "--run-id",
@@ -210,8 +210,16 @@ def _build_result(args: argparse.Namespace, summaries: list[dict], backend: str)
             "ef": args.ef_search,
             "beam_width": args.beam_width,
             "rounds": args.rounds,
+            "warmup": args.warmup,
             "build_threads": args.build_threads,
             "query_threads": args.query_threads,
+            "degree": args.degree,
+            "build_l": args.build_l,
+            "alpha": args.alpha,
+            "ef_indexing": args.ef_indexing,
+            "ep_num": args.ep_num,
+            "build_dram_budget_gb": args.build_dram_budget_gb,
+            "search_dram_budget_gb": args.search_dram_budget_gb,
         },
         "benchmark": {
             "median_native_qps": _median([item["native_qps"] for item in round_results]),
@@ -398,23 +406,37 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser("run-benchmark")
     run.add_argument("--label", default=_env("BENCHMARK_LABEL", "local"))
+    # Defaults aligned with examples/laser/configs/gist1m_run01.toml; dim==main_dim
+    # is enforced by the v1 LaserSegmentImporter (alayalite.bench.laser_compare).
     run.add_argument("--n", type=int, default=int(_env("LASER_PERF_N", "1000000")))
-    run.add_argument("--dim", type=int, default=int(_env("LASER_PERF_DIM", "768")))
-    run.add_argument("--main-dim", type=int, default=int(_env("LASER_PERF_MAIN_DIM", "768")))
+    run.add_argument("--dim", type=int, default=int(_env("LASER_PERF_DIM", "256")))
+    run.add_argument("--main-dim", type=int, default=int(_env("LASER_PERF_MAIN_DIM", "256")))
     run.add_argument("--n-clusters", type=int, default=int(_env("LASER_PERF_N_CLUSTERS", "64")))
     run.add_argument("--cluster-std", type=float, default=float(_env("LASER_PERF_CLUSTER_STD", "0.35")))
     run.add_argument("--degree", type=int, default=int(_env("LASER_PERF_DEGREE", "64")))
+    run.add_argument("--build-l", type=int, default=int(_env("LASER_PERF_BUILD_L", "200")))
+    run.add_argument("--alpha", type=float, default=float(_env("LASER_PERF_ALPHA", "1.2")))
     run.add_argument("--ef-indexing", type=int, default=int(_env("LASER_PERF_EF_INDEXING", "200")))
+    run.add_argument("--ep-num", type=int, default=int(_env("LASER_PERF_EP_NUM", "300")))
     run.add_argument("--query-num", type=int, default=int(_env("BENCHMARK_QUERY_NUM", "100")))
     run.add_argument("--topk", type=int, default=int(_env("BENCHMARK_TOPK", "10")))
-    run.add_argument("--ef-search", type=int, default=int(_env("BENCHMARK_EF_SEARCH", "128")))
-    run.add_argument("--beam-width", type=int, default=int(_env("BENCHMARK_BEAM_WIDTH", "4")))
+    run.add_argument("--ef-search", type=int, default=int(_env("BENCHMARK_EF_SEARCH", "200")))
+    run.add_argument("--beam-width", type=int, default=int(_env("BENCHMARK_BEAM_WIDTH", "16")))
     run.add_argument("--rounds", type=int, default=int(_env("BENCHMARK_ROUNDS", "3")))
-    run.add_argument("--warmup", type=int, default=int(_env("BENCHMARK_WARMUP", "10")))
+    run.add_argument("--warmup", type=int, default=int(_env("BENCHMARK_WARMUP", "2")))
     run.add_argument("--build-threads", type=int, default=int(_env("BENCHMARK_BUILD_THREADS", "0")))
     run.add_argument("--query-threads", type=int, default=int(_env("BENCHMARK_QUERY_THREADS", "1")))
     run.add_argument("--seed", type=int, default=int(_env("LASER_PERF_SEED", "42")))
-    run.add_argument("--dram-budget-gb", type=float, default=float(_env("LASER_PERF_DRAM_BUDGET_GB", "4.0")))
+    run.add_argument(
+        "--build-dram-budget-gb",
+        type=float,
+        default=float(_env("LASER_PERF_BUILD_DRAM_BUDGET_GB", "4.0")),
+    )
+    run.add_argument(
+        "--search-dram-budget-gb",
+        type=float,
+        default=float(_env("LASER_PERF_SEARCH_DRAM_BUDGET_GB", "1.0")),
+    )
     run.add_argument("--backend", default=_env("LASER_PERF_BACKEND", "auto"))
     run.add_argument("--work-dir", type=Path, default=Path(_env("LASER_PERF_WORK_DIR", ".github-tmp/laser-perf")))
     run.add_argument("--results-dir", type=Path, default=Path("results"))
