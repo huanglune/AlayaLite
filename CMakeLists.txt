@@ -31,15 +31,23 @@ if(BUILD_PYTHON
   )
 endif()
 
-# Laser on-disk QG index module. It depends on Linux libaio and the current ported QG scanner includes x86 SIMD headers.
-# Non-Linux or non-x86_64 builds skip it silently by default.
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+# Laser on-disk QG index module. Linux x86_64 defaults to libaio; macOS defaults to the portable thread-pool backend.
+# Other platforms skip it silently by default.
+if((CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64") OR CMAKE_SYSTEM_NAME STREQUAL
+                                                                                             "Darwin"
+)
   set(ALAYA_ENABLE_LASER_DEFAULT ON)
 else()
   set(ALAYA_ENABLE_LASER_DEFAULT OFF)
 endif()
-option(ALAYA_ENABLE_LASER "Build the Laser disk-index module (requires Linux x86_64 + libaio)"
-       ${ALAYA_ENABLE_LASER_DEFAULT}
+option(ALAYA_ENABLE_LASER "Build the Laser disk-index module" ${ALAYA_ENABLE_LASER_DEFAULT})
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  set(ALAYA_LASER_USE_THREADPOOL_DEFAULT ON)
+else()
+  set(ALAYA_LASER_USE_THREADPOOL_DEFAULT OFF)
+endif()
+option(ALAYA_LASER_USE_THREADPOOL "Use the portable thread-pool LASER I/O backend"
+       ${ALAYA_LASER_USE_THREADPOOL_DEFAULT}
 )
 
 # ============================================================================
@@ -164,37 +172,66 @@ if(UNIX AND NOT APPLE)
 endif()
 
 # ============================================================================
-# Laser module: libaio system dependency (Linux-only, gated by ALAYA_ENABLE_LASER)
+# Laser module backend selection and system dependencies (gated by ALAYA_ENABLE_LASER)
 # ============================================================================
 if(ALAYA_ENABLE_LASER)
-  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "ALAYA_ENABLE_LASER=ON but this is not Linux. "
+  if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(ALAYA_LASER_USE_THREADPOOL
+        ON
+        CACHE BOOL "Use the portable thread-pool LASER I/O backend" FORCE
+    )
+  elseif(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    message(FATAL_ERROR "ALAYA_ENABLE_LASER=ON but this platform is not supported yet. "
                         "Configure with -DALAYA_ENABLE_LASER=OFF to skip the Laser module."
     )
   endif()
-  if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-    message(FATAL_ERROR "ALAYA_ENABLE_LASER=ON but the current Laser QG scanner requires x86_64 SIMD headers. "
-                        "Configure with -DALAYA_ENABLE_LASER=OFF to skip the Laser module."
-    )
-  endif()
+
   if(NOT TARGET OpenMP::OpenMP_CXX)
-    find_package(OpenMP REQUIRED)
+    if(APPLE)
+      message(FATAL_ERROR "Laser module requires OpenMP. On macOS install Homebrew libomp "
+                          "(brew install libomp) or configure with -DALAYA_ENABLE_LASER=OFF."
+      )
+    else()
+      find_package(OpenMP REQUIRED)
+    endif()
   endif()
-  find_library(AIO_LIBRARY aio)
-  find_path(AIO_INCLUDE_DIR libaio.h)
-  if(NOT AIO_LIBRARY OR NOT AIO_INCLUDE_DIR)
-    message(
-      FATAL_ERROR
-        "Laser module requires libaio. Install it via:\n" "  sudo apt-get install libaio-dev   (Debian / Ubuntu)\n"
-        "  sudo dnf install libaio-devel     (Fedora / RHEL)\n"
-        "or configure with -DALAYA_ENABLE_LASER=OFF to skip the Laser module."
-    )
+
+  if(ALAYA_LASER_USE_THREADPOOL)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+      set(_alaya_laser_backend_message "thread pool (macOS)")
+    else()
+      set(_alaya_laser_backend_message "thread pool (portable fallback)")
+    endif()
+  else()
+    find_library(AIO_LIBRARY aio)
+    find_path(AIO_INCLUDE_DIR libaio.h)
+    if(NOT AIO_LIBRARY OR NOT AIO_INCLUDE_DIR)
+      message(
+        FATAL_ERROR
+          "Laser module requires libaio for the default Linux backend. Install it via:\n"
+          "  sudo apt-get install libaio-dev   (Debian / Ubuntu)\n"
+          "  sudo dnf install libaio-devel     (Fedora / RHEL)\n"
+          "or configure with -DALAYA_ENABLE_LASER=OFF to skip the Laser module, or "
+          "-DALAYA_LASER_USE_THREADPOOL=ON to use the portable backend on Linux."
+      )
+    endif()
+    if(NOT TARGET AIO::aio)
+      add_library(AIO::aio UNKNOWN IMPORTED)
+      set_target_properties(
+        AIO::aio PROPERTIES IMPORTED_LOCATION "${AIO_LIBRARY}" INTERFACE_INCLUDE_DIRECTORIES "${AIO_INCLUDE_DIR}"
+      )
+    endif()
+    set(_alaya_laser_backend_message "libaio (Linux x86_64)")
   endif()
-  if(NOT TARGET AIO::aio)
-    add_library(AIO::aio UNKNOWN IMPORTED)
-    set_target_properties(
-      AIO::aio PROPERTIES IMPORTED_LOCATION "${AIO_LIBRARY}" INTERFACE_INCLUDE_DIRECTORIES "${AIO_INCLUDE_DIR}"
-    )
+
+  message(STATUS "LASER I/O backend: ${_alaya_laser_backend_message}")
+
+  if(ALAYA_LASER_USE_THREADPOOL)
+    set(_alaya_laser_backend_libs)
+    set(_alaya_laser_backend_definition ALAYA_LASER_USE_THREADPOOL=1)
+  else()
+    set(_alaya_laser_backend_libs AIO::aio)
+    set(_alaya_laser_backend_definition ALAYA_LASER_USE_LIBAIO=1)
   endif()
 
   # INTERFACE target that exposes the ported Laser header tree plus its runtime dependency surface. Consumers (pybind
@@ -205,12 +242,13 @@ if(ALAYA_ENABLE_LASER)
   )
   target_link_libraries(
     alaya_laser
-    INTERFACE AIO::aio
+    INTERFACE ${_alaya_laser_backend_libs}
               Eigen3::Eigen
               OpenMP::OpenMP_CXX
               concurrentqueue::concurrentqueue
               spdlog::spdlog_header_only
   )
+  target_compile_definitions(alaya_laser INTERFACE ${_alaya_laser_backend_definition})
   target_compile_features(alaya_laser INTERFACE cxx_std_20)
   # -mavx2 -mfma is the LASER baseline for Eigen and non-handwritten SIMD code; handwritten LASER kernels use
   # function-level target attributes for runtime AVX-512 dispatch.

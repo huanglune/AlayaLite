@@ -31,7 +31,6 @@
 #include "index/graph/laser/qg/qg_query.hpp"
 #include "index/graph/laser/qg/qg_scanner.hpp"
 #include "third_party/ngt/hashset.hpp"
-#include "third_party/ffht/fht_avx.hpp"
 #include "index/graph/laser/utils/array.hpp"
 
 int main() {

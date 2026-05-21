@@ -1,0 +1,191 @@
+---
+name       : laser-cross-platform-perf
+
+on         :
+  push:
+    branches:
+    - test/ci
+  workflow_dispatch:
+    inputs:
+      n:
+        description: Number of base vectors to build into the LASER fixture
+        required: false
+        default: '10000'
+      dim:
+        description: Vector dimension; paired disk_laser comparison currently requires main_dim == dim
+        required: false
+        default: '128'
+      query_num:
+        description: Number of query vectors to benchmark
+        required: false
+        default: '100'
+      topk:
+        description: Top-k per query
+        required: false
+        default: '10'
+      ef_search:
+        description: ef_search for LASER search
+        required: false
+        default: '128'
+      beam_width:
+        description: LASER disk-search beam width
+        required: false
+        default: '4'
+      rounds:
+        description: Number of benchmark rounds
+        required: false
+        default: '3'
+      warmup:
+        description: Warmup queries before each timed round
+        required: false
+        default: '10'
+      build_threads:
+        description: LASER build threads (0 = auto)
+        required: false
+        default: '0'
+      query_threads:
+        description: Query threads; v1 paired disk_laser comparison supports only 1
+        required: false
+        default: '1'
+
+permissions:
+  contents: read
+
+jobs       :
+  benchmark:
+    name: LASER benchmark on ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: macos-14
+          label: macos-14
+        - os: macos-15-intel
+          label: macos-15-intel
+          # Future backend targets can be added here once supported:
+          # - os: windows-2022
+          #   label: windows-2022
+          # - os: ubuntu-latest
+          #   label: ubuntu-latest
+          # - os: ubuntu-24.04-arm
+          #   label: ubuntu-24.04-arm
+
+    env:
+      CONAN_NON_INTERACTIVE: 1
+      UV_CACHE_DIR: ./.github-tmp/uv-cache
+      CMAKE_ARGS: >-
+        -DALAYA_ENABLE_LASER=ON
+        -DALAYA_LASER_USE_THREADPOOL=ON
+        -DALAYA_NATIVE_ARCH=OFF
+      LASER_PERF_WORK_DIR: ./.github-tmp/laser-perf
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v5
+
+    - name: Install macOS OpenMP runtime
+      shell: bash
+      run: brew install libomp
+
+    - name: Restore Conan cache
+      id: conan-cache
+      uses: ./.github/actions/cache-restore
+      with:
+        build-type: Release
+        target-arch: ${{ runner.arch }}
+
+    - name: Install project dependencies
+      shell: bash
+      run: uv sync --dev
+
+    - name: Save Conan cache
+      if: steps.conan-cache.outputs.cache-hit != 'true'
+      continue-on-error: true
+      uses: ./.github/actions/cache-restore
+      with:
+        mode: save
+        build-type: Release
+        target-arch: ${{ runner.arch }}
+
+    - name: Verify LASER import
+      shell: bash
+      run: |
+        uv run python - <<'PY'
+        from alayalite import laser
+
+        assert laser.Index is not None
+        print(f"laser_simd={laser.selected_simd()}")
+        print("laser_import=ok")
+        PY
+
+    - name: Run LASER benchmark
+      shell: bash
+      env:
+        BENCHMARK_LABEL: ${{ matrix.label }}
+        LASER_PERF_N: ${{ github.event.inputs.n }}
+        LASER_PERF_DIM: ${{ github.event.inputs.dim }}
+        LASER_PERF_MAIN_DIM: ${{ github.event.inputs.dim }}
+        BENCHMARK_QUERY_NUM: ${{ github.event.inputs.query_num }}
+        BENCHMARK_TOPK: ${{ github.event.inputs.topk }}
+        BENCHMARK_EF_SEARCH: ${{ github.event.inputs.ef_search }}
+        BENCHMARK_BEAM_WIDTH: ${{ github.event.inputs.beam_width }}
+        BENCHMARK_ROUNDS: ${{ github.event.inputs.rounds }}
+        BENCHMARK_WARMUP: ${{ github.event.inputs.warmup }}
+        BENCHMARK_BUILD_THREADS: ${{ github.event.inputs.build_threads }}
+        BENCHMARK_QUERY_THREADS: ${{ github.event.inputs.query_threads }}
+      run: uv run python scripts/laser_perf/laser_cross_platform_perf.py run-benchmark
+
+    - name: Upload benchmark artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: laser-perf-${{ matrix.label }}
+        path: |
+          artifacts/laser-perf-${{ matrix.label }}.json
+          artifacts/laser-perf-${{ matrix.label }}.md
+          results/laser_*
+
+    - name: Append benchmark summary
+      shell: bash
+      env:
+        BENCHMARK_LABEL: ${{ matrix.label }}
+      run: uv run python scripts/laser_perf/laser_cross_platform_perf.py append-summary
+
+  aggregate-summary:
+    name: Aggregate LASER benchmark summary
+    runs-on: ubuntu-latest
+    if: always()
+    needs: benchmark
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v5
+
+    - name: Download benchmark artifacts
+      uses: actions/download-artifact@v4
+      continue-on-error: true
+      with:
+        pattern: laser-perf-*
+        path: artifacts/benchmarks
+        merge-multiple: true
+
+    - name: Append aggregated benchmark summary
+      shell: bash
+      run: >-
+        uv run --no-project python scripts/laser_perf/laser_cross_platform_perf.py aggregate-summary
+        --expected-label macos-14
+        --expected-label macos-15-intel

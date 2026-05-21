@@ -69,6 +69,11 @@ if(ALAYA_ENABLE_LASER)
   target_link_libraries(${PYTHON_MODULE_NAME} PRIVATE alaya_laser)
   target_compile_definitions(${PYTHON_MODULE_NAME} PRIVATE ALAYA_ENABLE_LASER=1)
   target_compile_options(${PYTHON_MODULE_NAME} PRIVATE ${_ALAYA_LASER_CONSUMER_OPTIONS})
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # GCC 11 can ICE while auto-vectorizing the LASER-enabled pybind TU. The handwritten LASER kernels still use target
+    # attributes; this only disables generic tree vectorization for the binding translation unit.
+    target_compile_options(${PYTHON_MODULE_NAME} PRIVATE -fno-tree-vectorize)
+  endif()
 endif()
 
 install(

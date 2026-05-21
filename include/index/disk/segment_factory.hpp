@@ -17,7 +17,7 @@
 #include "index/disk/vamana_segment_builder.hpp"
 #include "index/disk/vamana_segment_searcher.hpp"
 
-#if defined(ALAYA_ENABLE_LASER) && (ALAYA_ENABLE_LASER + 0) != 0 && defined(__linux__)
+#if defined(ALAYA_ENABLE_LASER) && (ALAYA_ENABLE_LASER + 0) != 0
   #define ALAYA_DISK_SEGMENT_FACTORY_LASER_SUPPORTED 1
 #else
   #define ALAYA_DISK_SEGMENT_FACTORY_LASER_SUPPORTED 0

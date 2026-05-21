@@ -4,12 +4,12 @@
 
 #pragma once
 
-#include <immintrin.h>
-
+#include <algorithm>
 #include <array>
 #include <cfloat>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 
 #include "simd/cpu_features.hpp"
@@ -19,7 +19,7 @@
 namespace alaya::laser::simd {
 namespace detail {}
 
-enum class LaserSimdLevel : std::uint8_t { kAvx512, kAvx2 };
+enum class LaserSimdLevel : std::uint8_t { kGeneric, kAvx512, kAvx2 };
 
 using AccumulateFn = void (*)(size_t, const uint8_t *, const uint8_t *, uint16_t *);
 using AppDistFn = void (*)(size_t,
@@ -39,6 +39,8 @@ using L2SqrSingleFn = float (*)(const float *, size_t);
 
 inline auto get_laser_simd_name(LaserSimdLevel level) -> const char * {
   switch (level) {
+    case LaserSimdLevel::kGeneric:
+      return "generic";
     case LaserSimdLevel::kAvx512:
       return "avx512";
     case LaserSimdLevel::kAvx2:
@@ -48,6 +50,7 @@ inline auto get_laser_simd_name(LaserSimdLevel level) -> const char * {
 }
 
 inline auto detect_laser_simd_level() -> LaserSimdLevel {
+#ifdef ALAYA_ARCH_X86
   const auto &features = ::alaya::simd::get_cpu_features();
   if (features.avx512f_ && features.avx512bw_) {
     return LaserSimdLevel::kAvx512;
@@ -55,7 +58,8 @@ inline auto detect_laser_simd_level() -> LaserSimdLevel {
   if (features.avx2_ && features.fma_) {
     return LaserSimdLevel::kAvx2;
   }
-  throw std::runtime_error("LASER requires AVX2+FMA at minimum");
+#endif
+  return LaserSimdLevel::kGeneric;
 }
 
 inline auto get_laser_simd_level() -> LaserSimdLevel {
@@ -72,8 +76,10 @@ inline auto get_laser_simd_name() -> const char * {
 }
 
 template <typename Fn>
-inline auto select_laser_simd(Fn avx512_fn, Fn avx2_fn) -> Fn {
+inline auto select_laser_simd(Fn generic_fn, Fn avx512_fn, Fn avx2_fn) -> Fn {
   switch (get_laser_simd_level()) {
+    case LaserSimdLevel::kGeneric:
+      return generic_fn;
     case LaserSimdLevel::kAvx512:
       return avx512_fn;
     case LaserSimdLevel::kAvx2:
@@ -83,6 +89,96 @@ inline auto select_laser_simd(Fn avx512_fn, Fn avx2_fn) -> Fn {
 }
 
 namespace detail {
+
+constexpr std::array<int, 16> kPackedLaneOrder =
+    {0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15};
+
+inline void accumulate_impl_generic(size_t dim,
+                                    const uint8_t *__restrict__ codes,
+                                    const uint8_t *__restrict__ LUT,
+                                    uint16_t *__restrict__ result) {
+  std::fill(result, result + 32, static_cast<uint16_t>(0));
+  const size_t num_codebook = dim >> 2;
+  const uint8_t *packed = codes;
+  for (size_t codebook = 0; codebook < num_codebook; codebook += 2) {
+    const uint8_t *lut0 = LUT + codebook * 16;
+    const uint8_t *lut1 = lut0 + 16;
+    for (size_t lane = 0; lane < kPackedLaneOrder.size(); ++lane) {
+      const int low_id = kPackedLaneOrder[lane];
+      const int high_id = low_id + 16;
+
+      const uint8_t packed0 = packed[lane];
+      result[low_id] = static_cast<uint16_t>(result[low_id] + lut0[packed0 & 0x0FU]);
+      result[high_id] = static_cast<uint16_t>(result[high_id] + lut0[packed0 >> 4U]);
+
+      const uint8_t packed1 = packed[lane + 16];
+      result[low_id] = static_cast<uint16_t>(result[low_id] + lut1[packed1 & 0x0FU]);
+      result[high_id] = static_cast<uint16_t>(result[high_id] + lut1[packed1 >> 4U]);
+    }
+    packed += 32;
+  }
+}
+
+inline void appro_dist_impl_generic(size_t num_points,
+                                    float sqr_y,
+                                    float width,
+                                    float vl,
+                                    float sqr_qr,
+                                    const float *__restrict__ result,
+                                    const float *__restrict__ triple_x,
+                                    const float *__restrict__ fac_dq,
+                                    const float *__restrict__ fac_vq,
+                                    float *__restrict__ appro_dist) {
+  for (size_t i = 0; i < num_points; ++i) {
+    appro_dist[i] =
+        sqr_y + triple_x[i] + (fac_dq[i] * width * result[i]) + (fac_vq[i] * vl) + sqr_qr;
+  }
+}
+
+inline void convert_accum_to_float_generic(size_t count,
+                                           const uint16_t *__restrict__ result,
+                                           int32_t sumq,
+                                           float *__restrict__ result_float) {
+  for (size_t i = 0; i < count; ++i) {
+    result_float[i] = static_cast<float>((static_cast<int16_t>(result[i]) << 1) - sumq);
+  }
+}
+
+inline auto rotate_loop_generic(const float *__restrict__ src,
+                                const float *__restrict__ mat,
+                                size_t dim,
+                                float *__restrict__ dst) -> size_t {
+  for (size_t i = 0; i < dim; ++i) {
+    dst[i] = src[i] * mat[i];
+  }
+  return dim;
+}
+
+inline void data_range_generic(const float *__restrict__ vec, size_t dim, float &lo, float &hi) {
+  if (dim == 0) {
+    lo = 0.0F;
+    hi = 0.0F;
+    return;
+  }
+  lo = FLT_MAX;
+  hi = -FLT_MAX;
+  for (size_t i = 0; i < dim; ++i) {
+    const float value = vec[i];
+    lo = value < lo ? value : lo;
+    hi = value > hi ? value : hi;
+  }
+}
+
+inline float l2_sqr_single_generic(const float *__restrict__ vec0, size_t dim) {
+  float result = 0.0F;
+  for (size_t i = 0; i < dim; ++i) {
+    const float value = vec0[i];
+    result += value * value;
+  }
+  return result;
+}
+
+#ifdef ALAYA_ARCH_X86
 
 ALAYA_TARGET_AVX512_BW
 inline void accumulate_impl_avx512(size_t dim,
@@ -442,42 +538,74 @@ inline float l2_sqr_single_avx2(const float *__restrict__ vec0, size_t dim) {
   return result;
 }
 
+#endif  // ALAYA_ARCH_X86
+
 }  // namespace detail
 
 inline auto get_accumulate_func() -> AccumulateFn {
-  static const AccumulateFn kFunc =
-      select_laser_simd<AccumulateFn>(detail::accumulate_impl_avx512, detail::accumulate_impl_avx2);
+#ifdef ALAYA_ARCH_X86
+  static const AccumulateFn kFunc = select_laser_simd<AccumulateFn>(detail::accumulate_impl_generic,
+                                                                    detail::accumulate_impl_avx512,
+                                                                    detail::accumulate_impl_avx2);
+#else
+  static const AccumulateFn kFunc = detail::accumulate_impl_generic;
+#endif
   return kFunc;
 }
 
 inline auto get_appro_dist_func() -> AppDistFn {
-  static const AppDistFn kFunc =
-      select_laser_simd<AppDistFn>(detail::appro_dist_impl_avx512, detail::appro_dist_impl_avx2);
+#ifdef ALAYA_ARCH_X86
+  static const AppDistFn kFunc = select_laser_simd<AppDistFn>(detail::appro_dist_impl_generic,
+                                                              detail::appro_dist_impl_avx512,
+                                                              detail::appro_dist_impl_avx2);
+#else
+  static const AppDistFn kFunc = detail::appro_dist_impl_generic;
+#endif
   return kFunc;
 }
 
 inline auto get_convert_func() -> ConvertAccumFn {
+#ifdef ALAYA_ARCH_X86
   static const ConvertAccumFn kFunc =
-      select_laser_simd<ConvertAccumFn>(detail::convert_accum_to_float_avx512,
+      select_laser_simd<ConvertAccumFn>(detail::convert_accum_to_float_generic,
+                                        detail::convert_accum_to_float_avx512,
                                         detail::convert_accum_to_float_avx2);
+#else
+  static const ConvertAccumFn kFunc = detail::convert_accum_to_float_generic;
+#endif
   return kFunc;
 }
 
 inline auto get_rotate_loop_func() -> RotateLoopFn {
-  static const RotateLoopFn kFunc =
-      select_laser_simd<RotateLoopFn>(detail::rotate_loop_avx512, detail::rotate_loop_avx2);
+#ifdef ALAYA_ARCH_X86
+  static const RotateLoopFn kFunc = select_laser_simd<RotateLoopFn>(detail::rotate_loop_generic,
+                                                                    detail::rotate_loop_avx512,
+                                                                    detail::rotate_loop_avx2);
+#else
+  static const RotateLoopFn kFunc = detail::rotate_loop_generic;
+#endif
   return kFunc;
 }
 
 inline auto get_data_range_func() -> DataRangeFn {
-  static const DataRangeFn kFunc =
-      select_laser_simd<DataRangeFn>(detail::data_range_avx512, detail::data_range_avx2);
+#ifdef ALAYA_ARCH_X86
+  static const DataRangeFn kFunc = select_laser_simd<DataRangeFn>(detail::data_range_generic,
+                                                                  detail::data_range_avx512,
+                                                                  detail::data_range_avx2);
+#else
+  static const DataRangeFn kFunc = detail::data_range_generic;
+#endif
   return kFunc;
 }
 
 inline auto get_l2_sqr_single_func() -> L2SqrSingleFn {
-  static const L2SqrSingleFn kFunc =
-      select_laser_simd<L2SqrSingleFn>(detail::l2_sqr_single_avx512, detail::l2_sqr_single_avx2);
+#ifdef ALAYA_ARCH_X86
+  static const L2SqrSingleFn kFunc = select_laser_simd<L2SqrSingleFn>(detail::l2_sqr_single_generic,
+                                                                      detail::l2_sqr_single_avx512,
+                                                                      detail::l2_sqr_single_avx2);
+#else
+  static const L2SqrSingleFn kFunc = detail::l2_sqr_single_generic;
+#endif
   return kFunc;
 }
 
