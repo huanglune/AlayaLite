@@ -25,6 +25,8 @@
 #include <cstring>
 #include <vector>
 
+#include "utils/platform.hpp"
+
 namespace alaya::laser {
 
 #define LOWBIT(x) ((x) & (-(x)))
@@ -82,7 +84,7 @@ static inline void pack_codes_helper(size_t padded_dim,
                                      const uint8_t *codes,
                                      size_t ncode,
                                      uint8_t *blocks) {
-  size_t ncode_pad = (ncode + 31) & ~31;  // size_t ncode_pad = ((ncode + 31) / 32) * 32;
+  size_t ncode_pad = (ncode + 31) & ~31;
   size_t num_codebook = padded_dim / 4;
   std::memset(blocks, 0, ncode_pad * num_codebook / 2);
 
@@ -113,7 +115,7 @@ inline void pack_codes(size_t padded_dim,
                        const uint64_t *binary_code,
                        size_t ncode,
                        uint8_t *blocks) {
-  size_t ncode_pad = (ncode + 31) & ~31;  // size_t ncode_pad = ((ncode + 31) / 32) * 32;
+  size_t ncode_pad = (ncode + 31) & ~31;
   std::vector<uint8_t> binary_code_8bit(ncode_pad * padded_dim / 8);
   std::memcpy(binary_code_8bit.data(), binary_code, ncode * padded_dim / 64 * sizeof(uint64_t));
 
@@ -137,8 +139,8 @@ inline void pack_codes(size_t padded_dim,
 
 /** @brief Packs query bytes into lookup table format for SIMD accumulation. */
 inline void pack_lut_impl(size_t dim,
-                          const uint8_t *__restrict__ byte_query,
-                          uint8_t *__restrict__ LUT) {
+                          const uint8_t *ALAYA_RESTRICT byte_query,
+                          uint8_t *ALAYA_RESTRICT LUT) {
   size_t num_codebook = dim >> 2;
   for (size_t i = 0; i < num_codebook; ++i) {
     LUT[0] = 0;

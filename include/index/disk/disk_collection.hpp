@@ -4,10 +4,6 @@
 
 #pragma once
 
-#include <fcntl.h>
-#include <sys/file.h>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -31,12 +27,28 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
+  #include <io.h>
+  #include <windows.h>
+#else
+  #include <fcntl.h>
+  #include <sys/file.h>
+  #include <sys/stat.h>
+  #include <unistd.h>
+#endif
+
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
 #include "storage/mmap_file.hpp"
 #include "utils/log.hpp"
 #include "utils/metric_type.hpp"
+#include "utils/platform.hpp"
+#include "utils/platform_fs.hpp"
 
 namespace alaya::disk {
 
@@ -48,15 +60,16 @@ inline auto format_segment_id(uint64_t id) -> std::string {
   return std::string(buf);
 }
 
-// Standard POSIX rename: atomically replaces destination if it exists.
-// Used for collection_manifest.txt updates where the destination intentionally
-// exists (segment-publish uses RENAME_NOREPLACE in `disk_flat_builder.hpp`).
+// Standard atomic rename: replaces the destination if it exists. Used for
+// collection_manifest.txt updates where the destination intentionally exists
+// (segment-publish uses atomic_replace_no_overwrite in `disk_flat_builder.hpp`).
 inline auto rename_atomic_replace(const std::filesystem::path &from,
                                   const std::filesystem::path &to) -> void {
-  if (::rename(from.c_str(), to.c_str()) != 0) {
-    int saved = errno;
+  try {
+    ::alaya::platform::atomic_replace(from, to);
+  } catch (const std::exception &e) {
     throw std::runtime_error("collection_manifest rename failed: " + from.string() + " -> " +
-                             to.string() + ": " + std::strerror(saved));
+                             to.string() + ": " + e.what());
   }
 }
 
@@ -68,7 +81,7 @@ inline auto rename_atomic_replace(const std::filesystem::path &from,
 // as a soft step allows the in-memory state to commit on rename success.
 inline auto publish_collection_manifest_atomic_only(const std::filesystem::path &collection_dir,
                                                     const CollectionManifest &m) -> void {
-  const auto pid = static_cast<int64_t>(::getpid());
+  const auto pid = ::alaya::platform::get_pid();
   const auto ts = std::chrono::steady_clock::now().time_since_epoch().count();
   const std::string tmp_name =
       ".tmp_collection_manifest_" + std::to_string(pid) + "_" + std::to_string(ts);
@@ -89,6 +102,10 @@ struct SegmentIdsView {
   auto data() const -> const uint64_t * { return static_cast<const uint64_t *>(mmap.data()); }
 };
 
+// Per-platform collection lock handle. On POSIX, the int file-descriptor backs
+// `flock()`; on Windows, the HANDLE backs `LockFileEx()`. Both kernels release
+// the lock automatically on handle close, so close() doubles as release.
+#ifndef _WIN32
 struct LockFd {
   int fd = -1;
 
@@ -117,6 +134,36 @@ struct LockFd {
     }
   }
 };
+#else
+struct LockFd {
+  HANDLE handle = INVALID_HANDLE_VALUE;
+
+  LockFd() = default;
+  explicit LockFd(HANDLE h) : handle(h) {}
+  LockFd(const LockFd &) = delete;
+  auto operator=(const LockFd &) -> LockFd & = delete;
+  LockFd(LockFd &&other) noexcept : handle(other.handle) { other.handle = INVALID_HANDLE_VALUE; }
+  auto operator=(LockFd &&other) noexcept -> LockFd & {
+    if (this != &other) {
+      close();
+      handle = other.handle;
+      other.handle = INVALID_HANDLE_VALUE;
+    }
+    return *this;
+  }
+  ~LockFd() { close(); }
+
+  // LockFileEx auto-releases the kernel lock on handle close. We do not call
+  // UnlockFileEx explicitly because the open handle holds the lock for the
+  // duration of the file-handle lifetime.
+  void close() noexcept {
+    if (handle != INVALID_HANDLE_VALUE && handle != nullptr) {
+      ::CloseHandle(handle);
+      handle = INVALID_HANDLE_VALUE;
+    }
+  }
+};
+#endif
 
 inline auto absolute_lock_path_string(const std::filesystem::path &lock_path) -> std::string {
   std::error_code ec;
@@ -137,38 +184,43 @@ inline auto weakly_canonical_lock_path_string(const std::filesystem::path &lock_
   return absolute_lock_path_string(lock_path);
 }
 
-inline auto read_lock_holder_pid(int fd) -> std::optional<std::string> {
-  char buf[65] = {};
-  const ssize_t n = ::pread(fd, buf, sizeof(buf) - 1, 0);
-  if (n <= 0) {
-    return std::nullopt;
-  }
-  std::string content(buf, static_cast<size_t>(n));
+// Common pid-text parser. The lock-file format is `pid=<digits>\n`; the
+// reader returns the digit run as a string (no integer parsing — keeps the
+// "diagnostic only" contract intact).
+inline auto parse_pid_text(std::string_view content) -> std::optional<std::string> {
   const auto pos = content.find("pid=");
-  if (pos == std::string::npos) {
+  if (pos == std::string_view::npos) {
     return std::nullopt;
   }
-  size_t begin = pos + 4;
-  size_t end = begin;
+  std::size_t begin = pos + 4;
+  std::size_t end = begin;
   while (end < content.size() && content[end] >= '0' && content[end] <= '9') {
     ++end;
   }
   if (end == begin) {
     return std::nullopt;
   }
-  return content.substr(begin, end - begin);
+  return std::string(content.substr(begin, end - begin));
+}
+
+#ifndef _WIN32
+inline auto read_lock_holder_pid(int fd) -> std::optional<std::string> {
+  char buf[65] = {};
+  const ssize_t n = ::pread(fd, buf, sizeof(buf) - 1, 0);
+  if (n <= 0) {
+    return std::nullopt;
+  }
+  return parse_pid_text(std::string_view(buf, static_cast<size_t>(n)));
 }
 
 inline void write_lock_holder_pid_best_effort(int fd) noexcept {
   char content[64];
-  const int n = std::snprintf(content,
-                              sizeof(content),
-                              "pid=%" PRId64 "\n",
-                              static_cast<int64_t>(::getpid()));
+  const int n =
+      std::snprintf(content, sizeof(content), "pid=%" PRId64 "\n", ::alaya::platform::get_pid());
   if (n <= 0 || static_cast<size_t>(n) >= sizeof(content)) {
     return;
   }
-  (void)::ftruncate(fd, 0);
+  (void)::alaya::platform::truncate_open_file(fd, 0);
   (void)::pwrite(fd, content, static_cast<size_t>(n), 0);
 }
 
@@ -196,15 +248,70 @@ inline void write_lock_holder_pid_best_effort(int fd) noexcept {
 inline auto is_lock_contention_errno(int saved) -> bool {
   return saved == EWOULDBLOCK || saved == EAGAIN;
 }
+#else
+inline auto read_lock_holder_pid(HANDLE handle) -> std::optional<std::string> {
+  // Move file pointer to 0 and read first 64 bytes via OVERLAPPED. Using a
+  // local OVERLAPPED with Offset=0 leaves any concurrent position untouched.
+  OVERLAPPED ov{};
+  ov.Offset = 0;
+  ov.OffsetHigh = 0;
+  char buf[65] = {};
+  DWORD got = 0;
+  if (!::ReadFile(handle, buf, sizeof(buf) - 1, &got, &ov)) {
+    return std::nullopt;
+  }
+  if (got == 0) {
+    return std::nullopt;
+  }
+  return parse_pid_text(std::string_view(buf, got));
+}
 
-// Post-flock inode revalidation (KL3 closure). Compares the fd's
-// fstat-derived `(st_dev, st_ino)` (captured by the caller before flock)
-// against a fresh `stat(lock_path)`. Throws on mismatch or when
-// `lock_path` no longer exists (the file was unlinked while we hold the
-// fd open). The bounded detection contract: only swaps that happen
-// BETWEEN the caller's fstat and this stat are catchable. A swap that
-// completes before the caller's open is invisible because both
-// readings observe the post-swap inode.
+inline void write_lock_holder_pid_best_effort(HANDLE handle) noexcept {
+  char content[64];
+  const int n =
+      std::snprintf(content, sizeof(content), "pid=%" PRId64 "\n", ::alaya::platform::get_pid());
+  if (n <= 0 || static_cast<size_t>(n) >= sizeof(content)) {
+    return;
+  }
+  // Truncate then overwrite. Failure is best-effort (diagnostic data only).
+  if (!::alaya::platform::truncate_open_file(handle, 0)) {
+    return;
+  }
+  OVERLAPPED ov{};
+  ov.Offset = 0;
+  ov.OffsetHigh = 0;
+  DWORD written = 0;
+  (void)::WriteFile(handle, content, static_cast<DWORD>(n), &written, &ov);
+}
+
+[[noreturn]] inline void throw_lock_open_failed(const std::filesystem::path &lock_path,
+                                                DWORD saved) {
+  const auto path = absolute_lock_path_string(lock_path);
+  if (saved == ERROR_PATH_NOT_FOUND) {
+    throw std::runtime_error("DiskCollection: collection path does not exist for lock file: " +
+                             path);
+  }
+  if (saved == ERROR_ACCESS_DENIED) {
+    throw std::runtime_error("DiskCollection: lock path is not a regular file: " + path +
+                             ": Win32 error " + std::to_string(saved));
+  }
+  throw std::runtime_error("DiskCollection: lock open failed: " + path + ": Win32 error " +
+                           std::to_string(saved));
+}
+
+inline auto is_lock_contention_win32_error(DWORD err) -> bool {
+  return err == ERROR_LOCK_VIOLATION || err == ERROR_SHARING_VIOLATION;
+}
+#endif
+
+#ifndef _WIN32
+// Post-flock inode revalidation. Compares the fd's fstat-derived
+// `(st_dev, st_ino)` (captured by the caller before flock) against a fresh
+// `stat(lock_path)`. Throws on mismatch or when `lock_path` no longer exists
+// (the file was unlinked while we hold the fd open). Only swaps that happen
+// BETWEEN the caller's fstat and this stat are catchable — a swap that
+// completes before the caller's open is invisible because both readings
+// observe the post-swap inode.
 inline void revalidate_lock_inode_after_flock(const std::filesystem::path &lock_path,
                                               dev_t fd_st_dev,
                                               ino_t fd_st_ino) {
@@ -224,12 +331,14 @@ inline void revalidate_lock_inode_after_flock(const std::filesystem::path &lock_
                              weakly_canonical_lock_path_string(lock_path));
   }
 }
+#endif
 
 // AcquireMode selects between the open() entry (O_CREAT, tolerates an
 // existing `.lock` for legacy-collection compatibility) and the ctor entry
 // (O_CREAT|O_EXCL, atomic ownership of the freshly-created `.lock`).
 enum class AcquireMode { ForOpen, ForCreate };
 
+#ifndef _WIN32
 inline auto acquire_collection_lock_impl(const std::filesystem::path &collection_root,
                                          AcquireMode mode) -> LockFd {
   const auto lock_path = collection_root / ".lock";
@@ -298,15 +407,80 @@ inline auto acquire_collection_lock_impl(const std::filesystem::path &collection
         ": " + std::strerror(saved));
   }
 
-  // KL3 closure: post-flock inode revalidation (extracted for direct
-  // testability). See `revalidate_lock_inode_after_flock` for the bounded
-  // detection contract; the helper throws on `unlink+touch` swaps that
-  // happen between this acquire's `fstat` and `stat` calls.
+  // Post-flock inode revalidation. See `revalidate_lock_inode_after_flock`
+  // for the bounded detection contract; the helper throws on `unlink+touch`
+  // swaps that happen between this acquire's `fstat` and `stat` calls.
   revalidate_lock_inode_after_flock(lock_path, st.st_dev, st.st_ino);
 
   write_lock_holder_pid_best_effort(lock.fd);
   return lock;
 }
+#else
+inline auto acquire_collection_lock_impl(const std::filesystem::path &collection_root,
+                                         AcquireMode mode) -> LockFd {
+  const auto lock_path = collection_root / ".lock";
+  // Sharing intentionally excludes DELETE so the lock file cannot be unlinked
+  // / renamed while we hold the handle. This is the Win32 analogue of the
+  // POSIX inode-swap defense — preventing the swap, rather than detecting it
+  // post-acquire.
+  const DWORD share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE;
+  const DWORD creation = (mode == AcquireMode::ForCreate) ? static_cast<DWORD>(CREATE_NEW)
+                                                          : static_cast<DWORD>(OPEN_ALWAYS);
+  HANDLE handle = ::CreateFileW(lock_path.c_str(),
+                                GENERIC_READ | GENERIC_WRITE,
+                                share_mode,
+                                nullptr,
+                                creation,
+                                FILE_ATTRIBUTE_NORMAL,
+                                nullptr);
+  if (handle == INVALID_HANDLE_VALUE) {
+    const auto saved = ::GetLastError();
+    if (mode == AcquireMode::ForCreate &&
+        (saved == ERROR_FILE_EXISTS || saved == ERROR_ALREADY_EXISTS)) {
+      throw std::runtime_error(
+          "DiskCollection: target path already exists or is being created concurrently: " +
+          weakly_canonical_lock_path_string(lock_path));
+    }
+    if (saved == ERROR_SHARING_VIOLATION) {
+      // Another process opened the lock file without sharing delete — treat
+      // as contention (matches the POSIX contention message contract).
+      throw std::runtime_error("DiskCollection: collection is already open by another process: " +
+                               weakly_canonical_lock_path_string(lock_path));
+    }
+    throw_lock_open_failed(lock_path, saved);
+  }
+  LockFd lock(handle);
+
+  // Try-lock with LOCKFILE_FAIL_IMMEDIATELY. Lock the maximum byte range
+  // (UINT64_MAX) so any concurrent partial-range lock is rejected too.
+  OVERLAPPED ov{};
+  if (!::LockFileEx(lock.handle,
+                    LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                    0,
+                    MAXDWORD,
+                    MAXDWORD,
+                    &ov)) {
+    const auto saved = ::GetLastError();
+    if (is_lock_contention_win32_error(saved)) {
+      const auto holder_pid = read_lock_holder_pid(lock.handle);
+      std::string msg = "DiskCollection: collection is already open by another process: " +
+                        weakly_canonical_lock_path_string(lock_path);
+      if (holder_pid.has_value()) {
+        msg += " (pid=" + *holder_pid + ")";
+      }
+      throw std::runtime_error(msg);
+    }
+    throw std::runtime_error(
+        "DiskCollection: lock LockFileEx failed: " + weakly_canonical_lock_path_string(lock_path) +
+        ": Win32 error " + std::to_string(saved));
+  }
+
+  // Inode-swap revalidation has no Win32 analogue with these share flags —
+  // the kernel guarantees the file cannot be renamed/unlinked while open.
+  write_lock_holder_pid_best_effort(lock.handle);
+  return lock;
+}
+#endif
 
 // Open-entry acquire: tolerates an existing `.lock`. Used ONLY by
 // `DiskCollection::open(path)`. Backwards-compatible with legacy collections
@@ -497,7 +671,7 @@ inline auto disk_search_distance_equal_for_order(float a, float b) -> bool {
 
 class DiskCollection {
  public:
-  // Default soft cap: 512 MiB measured against the D6 formula.
+  // Default soft cap on in-memory pending bytes before forcing a publish.
   static constexpr size_t kDefaultMaxPendingBytes = 512ULL * 1024 * 1024;
 
   // Public constructor: create-only.
@@ -522,7 +696,7 @@ class DiskCollection {
     if (index_type == DiskIndexType::Vamana) {
       detail::validate_vamana_params(vamana_params, "DiskCollection");
     }
-    // Phase 2 reordered ctor (closes KL1 + KL2):
+    // Ctor ordering:
     //   exists(path) → mkdir(path) (root only) → _for_create (O_EXCL, atomic
     //   ownership) → mkdir(path/segments) → publish_manifest.
     // The O_EXCL acquire is the kernel-level serialization point. Anything
@@ -621,8 +795,8 @@ class DiskCollection {
     }
     DiskCollection col;
     col.path_ = path;
-    // See design.md D6: manifest load, listed segment open, and orphan scan
-    // must run while the collection-level writer lock is held.
+    // Manifest load, listed segment open, and orphan scan must run while the
+    // collection-level writer lock is held.
     col.lock_fd_ = detail::acquire_collection_lock_for_open(path);
     col.manifest_ = CollectionManifest::load(path / "collection_manifest.txt");
     // Same v1 capability gate as the constructor; delegated to the factory so
@@ -663,13 +837,11 @@ class DiskCollection {
         static_cast<uint64_t>(manifest_.dim) * sizeof(float) + sizeof(uint64_t);
     const uint64_t cap = max_pending_bytes_;
 
-    // Defense in depth: check n * per_row * 2 for overflow before any cap
-    // comparison. Without this, a hostile n could wrap to a small value
-    // and bypass the cap check. (Final Codex review flagged this as the
-    // first of two archive blockers.)
+    // Check n * per_row * 2 for overflow before any cap comparison. Without
+    // this, a hostile n could wrap to a small value and bypass the cap check.
     uint64_t single_batch_bytes = 0;
-    if (__builtin_mul_overflow(2ULL, n, &single_batch_bytes) ||
-        __builtin_mul_overflow(single_batch_bytes, per_row, &single_batch_bytes)) {
+    if (alaya_mul_overflow(uint64_t{2}, n, &single_batch_bytes) ||
+        alaya_mul_overflow(single_batch_bytes, per_row, &single_batch_bytes)) {
       throw std::runtime_error("DiskCollection: pending size arithmetic overflows uint64 (n=" +
                                std::to_string(n) + ", dim=" + std::to_string(manifest_.dim) + ")");
     }
@@ -684,9 +856,9 @@ class DiskCollection {
     const uint64_t current_total = 2ULL * current_rows * per_row;
     uint64_t total_rows = 0;
     uint64_t new_total = 0;
-    if (__builtin_add_overflow(current_rows, n, &total_rows) ||
-        __builtin_mul_overflow(2ULL, total_rows, &new_total) ||
-        __builtin_mul_overflow(new_total, per_row, &new_total)) {
+    if (alaya_add_overflow(current_rows, n, &total_rows) ||
+        alaya_mul_overflow(uint64_t{2}, total_rows, &new_total) ||
+        alaya_mul_overflow(new_total, per_row, &new_total)) {
       throw std::runtime_error(
           "DiskCollection: pending+batch arithmetic overflows uint64 (current_rows=" +
           std::to_string(current_rows) + ", n=" + std::to_string(n) + ")");
@@ -702,8 +874,7 @@ class DiskCollection {
 
     // Strong exception safety: reserve both buffers BEFORE any insert. If
     // reserve throws bad_alloc, no state has been mutated. After successful
-    // reserve, the inserts cannot allocate again so they can't throw
-    // (Codex section-7 med #5).
+    // reserve, the inserts cannot allocate again so they can't throw.
     pending_vectors_.reserve(pending_vectors_.size() + n * manifest_.dim);
     pending_labels_.reserve(pending_labels_.size() + n);
     pending_vectors_.insert(pending_vectors_.end(), vectors, vectors + n * manifest_.dim);
@@ -762,7 +933,7 @@ class DiskCollection {
     // Segment is now on disk. Any subsequent failure in this function leaves
     // an orphan segment that will be classified as kind=complete on next open.
     // Eagerly advance in-memory next_segment_id so a retried flush() uses a
-    // fresh id rather than colliding with the orphan (Codex section-7 high #1).
+    // fresh id rather than colliding with the orphan.
     manifest_.next_segment_id = seg_id + 1;
 
     // Atomic rename of the collection manifest. Once this returns, the segment
@@ -774,7 +945,7 @@ class DiskCollection {
 
     // From this point on, the on-disk state is consistent. Commit in-memory
     // state atomically. Pending is cleared LAST so any throw above leaves it
-    // intact for the caller (Codex section-7 high #3 — fsync below is soft).
+    // intact for the caller (the fsync below is best-effort, not load-bearing).
     manifest_ = std::move(new_manifest);
     segments_.push_back(std::move(searcher));
     segment_dirs_.push_back(seg_dir);
@@ -1010,13 +1181,12 @@ class DiskCollection {
 
     // Multi-thread: per-query parallelism. workers share an atomic counter
     // that doles out query indices; each worker invokes the existing
-    // single-query search() path on its slice. Per spec D3 we deliberately
-    // do NOT parallelize across segments inside a single search().
+    // single-query search() path on its slice. We deliberately do NOT
+    // parallelize across segments inside a single search().
     //
-    // Clamp workers to n_queries (Decision 5: optimization, not contract):
-    // a worker that immediately observes fetch_add >= n_queries returns
-    // without doing useful work, so spawning more than n_queries threads
-    // is wasted thread-spawn cost.
+    // Clamp workers to n_queries: a worker that immediately observes
+    // fetch_add >= n_queries returns without doing useful work, so spawning
+    // more than n_queries threads is wasted thread-spawn cost.
     const uint32_t worker_count = static_cast<uint32_t>(std::min<uint64_t>(num_threads, n_queries));
     std::atomic<uint64_t> next_query{0};
     std::atomic<bool> aborted{false};
@@ -1084,9 +1254,9 @@ class DiskCollection {
     segment_dirs_.reserve(manifest_.segment_ids.size());
     for (const auto &id : manifest_.segment_ids) {
       const auto seg_dir = path_ / "segments" / id;
-      // Reject segment directories that are themselves symlinks (D4: a
+      // Reject segment directories that are themselves symlinks: a
       // symlink-swap of seg_*/ would otherwise redirect reads outside the
-      // collection root — MMapFile's O_NOFOLLOW only protects leaf files).
+      // collection root — MMapFile's O_NOFOLLOW only protects leaf files.
       std::error_code ec;
       if (std::filesystem::is_symlink(seg_dir, ec)) {
         throw std::runtime_error("DiskCollection: segment directory is a symlink: " +
@@ -1143,37 +1313,24 @@ class DiskCollection {
   // or `std::nullopt` if the file is missing / unreadable / too short.
   static auto peek_graph_expected_size(const std::filesystem::path &graph_path)
       -> std::optional<uint64_t> {
-    int fd = ::open(graph_path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) {
+    std::string buf;
+    try {
+      buf = ::alaya::platform::read_file_prefix(graph_path, sizeof(uint64_t));
+    } catch (const std::exception &) {
       return std::nullopt;
     }
     uint64_t expected = 0;
-    ssize_t total = 0;
-    while (total < static_cast<ssize_t>(sizeof(expected))) {
-      ssize_t n = ::read(fd, reinterpret_cast<char *>(&expected) + total, sizeof(expected) - total);
-      if (n < 0) {
-        if (errno == EINTR) {
-          continue;
-        }
-        ::close(fd);
-        return std::nullopt;
-      }
-      if (n == 0) {
-        ::close(fd);
-        return std::nullopt;
-      }
-      total += n;
-    }
-    ::close(fd);
+    std::memcpy(&expected, buf.data(), sizeof(expected));
     return expected;
   }
 
   static auto stat_nonempty_regular_file(const std::filesystem::path &path) -> bool {
-    struct ::stat st{};
-    if (::stat(path.c_str(), &st) != 0) {
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec) || ec) {
       return false;
     }
-    return S_ISREG(st.st_mode) && st.st_size > 0;
+    const auto sz = std::filesystem::file_size(path, ec);
+    return !ec && sz > 0;
   }
 
   static void classify_and_log_orphan(const std::filesystem::path &orphan_dir) {
