@@ -29,10 +29,15 @@
   that do not fit in RAM.
 - **Ease of Use**: [Intuitive APIs](https://github.com/AlayaDB-AI/AlayaLite/blob/main/python/README.md) in Python.
 
+## Documentation
 
-## Getting Started!
+- [Client User Guide](https://github.com/AlayaDB-AI/AlayaLite/blob/main/docs/CLIENT_USER_MANUAL.md)
+- [LASER Guide](https://github.com/AlayaDB-AI/AlayaLite/blob/main/docs/LASER.md)
+
+## Quick Start
 
 Get started with just one command!
+
 ```bash
 pip install alayalite             # with pip
 # or
@@ -44,17 +49,12 @@ uv add alayalite                  # in a uv-managed project
 
 ### In-memory index: quick start
 
-Access your vectors using simple APIs.
 ```python
-from alayalite import Client, Index
-from alayalite.utils import calc_recall, calc_gt
 import numpy as np
+from alayalite import Client
 
-# Initialize the client and create an index. The client can manage multiple indices with distinct names.
 client = Client()
-index = client.create_index("default")
-
-# Generate random vectors and queries, then calculate the ground truth top-10 nearest neighbors for each query.
+index = client.create_index("ann")
 vectors = np.random.rand(1000, 128).astype(np.float32)
 queries = np.random.rand(10, 128).astype(np.float32)
 gt = calc_gt(vectors, queries, 10)
@@ -70,6 +70,27 @@ recall = calc_recall(result, gt)
 print(recall)
 ```
 
+### Hybrid search in Collection: quick start
+
+Use `Collection` when you want ANN results together with document IDs,
+documents, and metadata filters.
+
+```python
+collection = client.create_collection("docs", indexed_fields=["category"])
+collection.insert([
+    ("doc-1", "Vector database overview", vectors[0], {"category": "database"}),
+    ("doc-2", "Cooking notes", vectors[1], {"category": "life"}),
+])
+
+result = collection.hybrid_query(
+    vectors=[vectors[0]],
+    limit=1,
+    metadata_filter={"category": "database"},
+    ef_search=10,
+)
+print(result["id"][0])
+```
+
 ### LASER on-disk index: quick start
 
 For datasets that exceed RAM, the **LASER** on-disk Quantized Graph index keeps
@@ -77,9 +98,16 @@ hot data on SSD and only the search-time working set in memory. Vectors must be
 `float32` with `raw_dim >= 128`; L2 is the only supported metric in v1.
 
 LASER is available on Linux x86_64 (libaio backend, default), macOS
-(thread-pool backend), and Windows x64 (IOCP backend). Linux x86_64 builds
-need `libaio` headers — `sudo apt-get install libaio-dev` on Debian/Ubuntu.
-See [`docs/LASER.md`](https://github.com/AlayaDB-AI/AlayaLite/blob/main/docs/LASER.md) for build flags, tuning notes, and the
+(thread-pool backend), and Windows x64 (IOCP backend). Platform notes:
+
+- Linux x86_64 builds need `libaio` headers, for example
+  `sudo apt-get install libaio-dev` on Debian/Ubuntu.
+- macOS builds need OpenMP from Homebrew: `brew install libomp`.
+- Windows x64 builds should run from a Visual Studio 2022 developer shell with
+  the **Desktop development with C++** workload installed; MSVC provides the
+  OpenMP runtime used by LASER.
+
+See [LASER.md](https://github.com/AlayaDB-AI/AlayaLite/blob/main/docs/LASER.md) for build flags, tuning notes, and the
 TOML-driven CLI.
 
 LASER `Index.fit` pulls in PCA / k-means / progress-bar helpers (`scikit-learn`,
@@ -87,9 +115,9 @@ LASER `Index.fit` pulls in PCA / k-means / progress-bar helpers (`scikit-learn`,
 install stays lean. Install them on top of the base wheel:
 
 ```bash
-pip install 'alayalite[laser]'
+pip install "alayalite[laser]"
 # or, with uv:
-uv pip install 'alayalite[laser]'
+uv pip install "alayalite[laser]"
 ```
 
 ```python
@@ -101,7 +129,7 @@ from alayalite.laser import BuildParams, Index
 from alayalite.utils import calc_gt, calc_recall
 
 # Smoke-scale demo (~10-20s end-to-end on a modern laptop). Tuning details,
-# paper-aligned configs and the on-disk layout live in docs/LASER.md.
+# paper-aligned configs and the on-disk layout are covered in the LASER guide above.
 output_dir = "/tmp/alaya_laser"
 shutil.rmtree(output_dir, ignore_errors=True)
 
@@ -136,6 +164,8 @@ print(f"QPS:       {len(queries) / elapsed:.1f}  ({len(queries)} queries in {ela
 # idx = Index.from_prefix("/tmp/alaya_laser/demo", dram_budget_gb=2.0)
 ```
 
+LASER requires a LASER-enabled build. See the [LASER Guide](https://github.com/AlayaDB-AI/AlayaLite/blob/main/docs/LASER.md) for platform requirements and build options.
+
 ## Benchmark
 
 AlayaLite ships two complementary index paths. The benchmarks below cover both.
@@ -149,6 +179,17 @@ open `-march=native` in your `CMakeLists.txt` to reproduce the results).
 |     ![Fashion-MNIST	784 Euclidean](https://raw.githubusercontent.com/AlayaDB-AI/AlayaLite/main/.assets/fashion-mnist-784-euclidean.png)     |    ![Gist 960 Euclidean](https://raw.githubusercontent.com/AlayaDB-AI/AlayaLite/main/.assets/gist-960-euclidean.png)    |
 | :---------------------------------------------------------: | :-----------------------------------------------------------: |
 | <div style="text-align: center;">**Fashion-MNIST	784 Euclidean**</div> | <div style="text-align: center;">**Gist 960 Euclidean**</div> |
+
+### In-memory collection vs. other mainstream systems
+The same in-memory path powers `Collection` hybrid search when metadata filters
+are involved. We evaluate this filtered retrieval workflow using
+[VectorDBBench](https://github.com/zilliztech/VectorDBBench) on the
+**Medium Cohere** dataset (1M vectors, 768 dimensions). The following results
+report QPS under 0.1% selectivity filters at concurrency 1 and 80.
+
+![Integer filter 0.1% selectivity QPS](https://raw.githubusercontent.com/AlayaDB-AI/AlayaLite/main/.assets/int-0p1p_qps_c1_c80.png)
+
+![String equality filter 0.1% selectivity QPS](https://raw.githubusercontent.com/AlayaDB-AI/AlayaLite/main/.assets/strequ-0p1p_qps_c1_c80.png)
 
 ### On-disk LASER vs. other large-scale systems
 
