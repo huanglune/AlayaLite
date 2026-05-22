@@ -20,6 +20,13 @@ jobs       :
   commit-format-check:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Only meaningful on pull_request: it gates new contributions against the
+    # Conventional-Commits-with-scope rule. push events to main are typically
+    # squash-merge artifacts or maintainer force-pushes that already passed PR
+    # review; re-checking the full push range (which on force-push includes
+    # historical squash commits like `feat: ...(#67)` predating the scope
+    # rule) just blocks the merge without surfacing a real issue.
+    if: github.event_name == 'pull_request'
     steps:
     - uses: actions/checkout@v4
     - uses: gsactions/commit-message-checker@v2
