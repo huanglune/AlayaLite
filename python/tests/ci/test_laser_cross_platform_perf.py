@@ -52,11 +52,13 @@ def test_laser_perf_workflow_is_manual_macos_first_and_artifacted() -> None:
         "linux-libaio-x86_64",
         "macos-threadpool-arm64",
         "macos-threadpool-x86_64",
+        "windows-iocp-x64",
     }.issubset(enabled_labels)
     backends_by_label = {entry["label"]: entry["backend"] for entry in matrix}
     assert backends_by_label["linux-libaio-x86_64"] == "libaio"
     assert backends_by_label["macos-threadpool-arm64"] == "threadpool"
     assert backends_by_label["macos-threadpool-x86_64"] == "threadpool"
+    assert backends_by_label["windows-iocp-x64"] == "iocp"
 
     steps = benchmark["steps"]
     run_blocks = "\n".join(step.get("run", "") for step in steps)
@@ -109,6 +111,10 @@ def test_laser_perf_summary_and_aggregate_lines(tmp_path: Path) -> None:
             "label": label,
             "platform": platform_info,
             "backend": backend,
+            "build_phase": {
+                "build_wall_s": 1.5,
+                "build_rss_increment_kb": 8192,
+            },
             "dataset": {
                 "distribution": "synthetic_gmm_l2norm",
                 "n": 256,
@@ -137,6 +143,10 @@ def test_laser_perf_summary_and_aggregate_lines(tmp_path: Path) -> None:
                 "median_disk_collection_p99_us": 900.0,
                 "median_laser_api_p50_us": 250.0,
                 "median_laser_api_p95_us": 400.0,
+                "median_laser_api_p99_us": 450.0,
+                "median_laser_api_recall_at_10": 0.98,
+                "median_disk_collection_recall_at_10": 0.97,
+                "median_query_peak_rss_kb": 65536,
                 "median_recall_delta": 0.0,
                 "max_abs_recall_delta": 0.01,
             },
@@ -153,6 +163,9 @@ def test_laser_perf_summary_and_aggregate_lines(tmp_path: Path) -> None:
                     "laser_api_p50_us": 250.0,
                     "laser_api_p95_us": 400.0,
                     "laser_api_p99_us": 450.0,
+                    "laser_api_recall_at_10": 0.98,
+                    "disk_collection_recall_at_10": 0.97,
+                    "query_peak_rss_kb": 65536,
                     "p50_delta_us": 250.0,
                     "p95_delta_us": 400.0,
                     "p99_delta_us": 450.0,
@@ -176,14 +189,20 @@ def test_laser_perf_summary_and_aggregate_lines(tmp_path: Path) -> None:
 
     single_lines = helper._single_summary_lines(macos_result)  # pylint: disable=protected-access
     assert "## LASER Cross-platform Benchmark (Darwin / arm64)" in single_lines
-    assert "| Backend | `threadpool` |" in single_lines
-    assert any("LASER Python API" in line and "60.000" not in line for line in single_lines)
-    # The 60.0 dc_qps surfaces in the DiskCollection row.
-    assert any("DiskCollection" in line and "60.000" in line for line in single_lines)
-    # p50 / p95 latency rendered.
-    assert any("p50" in line and "500" in line for line in single_lines)
-    assert any("p95" in line and "800" in line for line in single_lines)
-    assert any("Max abs recall delta" in line and "0.0100" in line for line in single_lines)
+    # Header carries label/backend/dataset shape in one line.
+    assert any("macos-threadpool-arm64" in line and "threadpool" in line for line in single_lines)
+    # recall@10 row has `collection(native)` pair -- DC 0.97, native 0.98.
+    assert any("recall@10" in line and "0.970" in line and "0.980" in line for line in single_lines)
+    # QPS row: DC 60, native 120 (in `dc_qps * 2` pattern).
+    assert any(line.startswith("| QPS |") and "60.0" in line and "120.0" in line for line in single_lines)
+    # Latency p50/p95/p99 expressed in ms with collection(native).
+    assert any("p50 (ms)" in line and "0.50" in line and "0.25" in line for line in single_lines)
+    assert any("p95 (ms)" in line and "0.80" in line and "0.40" in line for line in single_lines)
+    assert any("p99 (ms)" in line and "0.90" in line and "0.45" in line for line in single_lines)
+    # Build + query memory rows.
+    assert any("build wall (s)" in line and "1.5" in line for line in single_lines)
+    assert any("build RSS" in line and "8.0" in line for line in single_lines)  # 8192 KB = 8.0 MB
+    assert any("query peak RSS" in line and "64.0" in line for line in single_lines)  # 65536 KB = 64.0 MB
 
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir()
@@ -202,13 +221,12 @@ def test_laser_perf_summary_and_aggregate_lines(tmp_path: Path) -> None:
     assert any("`linux-libaio-x86_64`" in line and "`libaio`" in line for line in aggregate_lines)
     assert any("`macos-threadpool-arm64`" in line and "`threadpool`" in line for line in aggregate_lines)
     assert any("`macos-threadpool-x86_64`" in line for line in aggregate_lines)
-    assert any("DC vs libaio baseline" in line for line in aggregate_lines)
-    # macos dc_qps 60.0 vs linux baseline 120.0 → ratio 0.5
-    assert any("0.500" in line and "`macos-threadpool-arm64`" in line for line in aggregate_lines)
-    # Latency columns surface.
-    assert any("DC p50" in line for line in aggregate_lines)
-    # Caveat must be present so the reader doesn't misread cross-CPU ratios.
-    assert any("Caveat" in line and "page cache" in line for line in aggregate_lines)
+    # Each row carries collection(native) pairs for recall + QPS + latency.
+    # macos: dc_qps=60, native_qps=120, dc_p50=500us=0.50ms, native_p50=250us=0.25ms.
+    assert any("`macos-threadpool-arm64`" in line and "60.0" in line and "120.0" in line for line in aggregate_lines)
+    assert any("`macos-threadpool-arm64`" in line and "0.50" in line and "0.25" in line for line in aggregate_lines)
+    # Build phase + query RSS columns surface in every row.
+    assert any("`macos-threadpool-arm64`" in line and "8.0" in line and "64.0" in line for line in aggregate_lines)
 
 
 def test_generate_vectors_shape_and_l2_norm_and_reproducibility() -> None:
@@ -352,7 +370,11 @@ def test_build_result_aggregates_rounds_and_records_recipe() -> None:
             }
         },
     ]
-    result = helper._build_result(args, summaries, "threadpool")  # pylint: disable=protected-access
+    build_stats = {"vectors_path": Path("/tmp/fake.fbin"), "build_wall_s": 1.5, "build_rss_increment_kb": 8192}
+    result = helper._build_result(args, summaries, "threadpool", build_stats)  # pylint: disable=protected-access
+    # Build phase surfaces alongside the search-phase benchmark medians.
+    assert result["build_phase"]["build_wall_s"] == 1.5
+    assert result["build_phase"]["build_rss_increment_kb"] == 8192
     # Medians.
     assert result["benchmark"]["median_laser_api_qps"] == 150.0
     assert result["benchmark"]["median_disk_collection_qps"] == 60.0

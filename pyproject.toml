@@ -100,7 +100,7 @@ skip = ["*-musllinux*", "*-manylinux_i686"]
 before-build = "python {project}/scripts/conan_build/conan_install.py --project-dir {project}"
 container-engine = "docker; create_args: -v ~/.conan2:/root/.conan2"
 test-requires = ["pytest", "pytest-asyncio", "httpx", "fastapi", "pyyaml"]
-test-command = "python -c \"import platform, sys, alayalite; from alayalite import laser, vamana; is_linux_x86 = sys.platform.startswith('linux') and platform.machine() in {'x86_64', 'AMD64'}; assert not (is_linux_x86 and laser.RawIndex is None); simd = laser.selected_simd() if is_linux_x86 else 'not-tested'; print(alayalite.__version__); print(f'laser_simd={simd}', flush=True); assert (not is_linux_x86) or simd in {'avx512', 'avx2'}\""
+test-command = "python -c \"import platform, sys, alayalite; from alayalite import laser, vamana; is_linux_x86 = sys.platform.startswith('linux') and platform.machine() in {'x86_64', 'AMD64'}; is_windows_x86 = sys.platform == 'win32' and platform.machine() in {'x86_64', 'AMD64'}; laser_expected = is_linux_x86 or is_windows_x86; assert not (laser_expected and laser.RawIndex is None), 'LASER should be available on this lane'; simd = laser.selected_simd() if is_linux_x86 else 'not-tested'; print(alayalite.__version__); print(f'laser_simd={simd}', flush=True); assert (not is_linux_x86) or simd in {'avx512', 'avx2'}\""
 
 [tool.cibuildwheel.linux]
 manylinux-x86_64-image = "manylinux_2_28"
@@ -113,7 +113,12 @@ environment = { MACOSX_DEPLOYMENT_TARGET = "15.0" }
 repair-wheel-command = "delocate-listdeps {wheel} && delocate-wheel -w {dest_dir} -v {wheel}"
 
 [tool.cibuildwheel.windows]
-before-all = ""
+# LASER only uses OpenMP 2.0 constructs (parallel for / critical / schedule),
+# so MSVC's default /openmp + vcomp140.dll runtime is sufficient. vcomp140.dll
+# is part of the VC Redist and delvewheel either bundles it from the VS install
+# or relies on the system VC Redist on the consumer machine.
+environment = { CMAKE_GENERATOR = "Visual Studio 17 2022", CMAKE_GENERATOR_PLATFORM = "x64" }
+repair-wheel-command = "delvewheel repair -w {dest_dir} {wheel}"
 # ----------------- build whl end ------------------
 
 [[tool.uv.index]]

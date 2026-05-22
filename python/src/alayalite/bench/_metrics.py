@@ -13,7 +13,6 @@
 from __future__ import annotations
 
 import json
-import resource
 import statistics
 import sys
 from copy import deepcopy
@@ -71,6 +70,17 @@ def segment_count(col_path: Path) -> int:
 
 
 def peak_rss_kb_and_unit() -> tuple[int, str]:
+    if sys.platform == "win32":  # pragma: no cover - Linux CI never enters this branch
+        # Lazy import: psutil lives in the optional `laser` extras, so importing
+        # at module scope would break `from alayalite.bench import _metrics` on
+        # a default Windows install.
+        import psutil  # pylint: disable=import-outside-toplevel
+
+        info = psutil.Process().memory_info()
+        peak_bytes = int(getattr(info, "peak_wset", info.rss))
+        return int((peak_bytes + 1023) // 1024), "bytes_converted_to_kb"
+    import resource  # pylint: disable=import-outside-toplevel
+
     rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
     if sys.platform == "darwin":
         return int((rss + 1023) // 1024), "bytes_converted_to_kb"
