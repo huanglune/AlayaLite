@@ -3,8 +3,9 @@ name: Build Wheels
 
 on  :
   workflow_dispatch:
-  #   tags:
-  #     - 'v*'
+  push:
+    tags:
+    - v*
 
 jobs:
   build_wheels:
@@ -71,20 +72,55 @@ jobs:
 
     - uses: actions/upload-artifact@v4
       with:
-        name: cibw-wheels-${{ matrix.os }}-${{ matrix.arch }}-${{ matrix.build_id }}
+        name: cibw-wheels-${{ matrix.os }}-${{ matrix.arch }}
         path: ./wheelhouse/*.whl
 
-  # upload_pypi:
-  #   needs: [build_wheels]
-  #   runs-on: ubuntu-latest
-  #   if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-  #   steps:
-  #     - uses: actions/download-artifact@v4
-  #       with:
-  #         pattern: cibw-wheels-*
-  #         path: dist
-  #         merge-multiple: true
+  # Attach all 25 wheels (5 platforms × 5 Python versions) to the GitHub Release
+  # that corresponds to the pushed tag. Runs only on `push.tags`; manual
+  # workflow_dispatch builds skip this step (use them for build-matrix smoke
+  # testing, not for cutting releases).
+  github_release:
+    name: Attach wheels to GitHub Release
+    needs: [build_wheels]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: cibw-wheels-*
+        path: dist
+        merge-multiple: true
 
-  #     - uses: pypa/gh-action-pypi-publish@release/v1
-  #       with:
-  #         password: ${{ secrets.PYPI_API_TOKEN }}
+    - name: Upload wheels to GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: dist/*.whl
+        fail_on_unmatched_files: true
+        generate_release_notes: true
+
+  # Publish to prod PyPI. Token-based auth via the PYPI_API_TOKEN secret
+  # (configure in repo Settings -> Secrets and variables -> Actions). For
+  # extra safety, attach an `environment: pypi-production` with a required
+  # reviewer in repo Settings -> Environments so this step waits for manual
+  # approval before the irreversible upload — recommended but not enforced.
+  upload_pypi:
+    name: Publish to PyPI
+    needs: [build_wheels]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    # Uncomment after configuring repo Settings -> Environments -> pypi-production
+    # environment: pypi-production
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: cibw-wheels-*
+        path: dist
+        merge-multiple: true
+
+    - name: Publish wheels to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        password: ${{ secrets.PYPI_API_TOKEN }}
+        skip-existing: true
