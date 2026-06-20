@@ -11,7 +11,7 @@ from conan.tools.files import copy
 
 class AlayaLiteConan(ConanFile):
     name = "AlayaLite"
-    version = "1.0.0"
+    version = "1.0.1"
     settings = "os", "compiler", "build_type", "arch"
     package_type = "header-library"
     exports_sources = "include/*"
