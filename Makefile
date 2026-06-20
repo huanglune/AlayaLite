@@ -4,7 +4,8 @@
 .PHONY: help build build-debug build-release build-san build-coverage \
         test test-cpp test-cpp-debug test-san test-py test-py-integration test-py-cov \
         lint format configure conan-install conan-install-debug \
-        install dev-install wheel clean clean-release clean-debug clean-all codegen
+        install dev-install wheel clean clean-release clean-debug clean-all codegen \
+        bump-version release-dry version
 
 # Configuration
 BUILD_RELEASE_DIR := build/Release
@@ -37,6 +38,8 @@ help: ## Show this help message
 	@echo "  make test                   # Run all tests (C++ release + Python)"
 	@echo "  make build-san test-san     # Sanitizer build + test"
 	@echo "  make configure BUILD_TYPE=Debug"
+	@echo "  make bump-version V=1.0.2   # Bump version + sync lockfile"
+	@echo "  make release-dry V=1.0.2    # Preview version bump (no write)"
 
 # ============================================================================
 # Build
@@ -120,6 +123,21 @@ dev-install: ## Install package with all dev dependencies
 
 wheel: ## Build wheel (PYTHON_VERSION=3.x to target a specific interpreter)
 	@uv build $(if $(PYTHON_VERSION),--python $(PYTHON_VERSION))
+
+# ============================================================================
+# Release
+# ============================================================================
+
+version: ## Show current project version
+	@grep -oP '(?<=^version = ")[^"]+' pyproject.toml | head -1
+
+bump-version: ## Bump version: make bump-version V=1.0.2
+	@test -n "$(V)" || { echo "Usage: make bump-version V=1.0.2"; exit 1; }
+	@scripts/bump_version.sh $(V)
+
+release-dry: ## Preview version bump without writing: make release-dry V=1.0.2
+	@test -n "$(V)" || { echo "Usage: make release-dry V=1.0.2"; exit 1; }
+	@scripts/bump_version.sh $(V) --dry
 
 # ============================================================================
 # Clean
