@@ -129,7 +129,7 @@ wheel: ## Build wheel (PYTHON_VERSION=3.x to target a specific interpreter)
 # ============================================================================
 
 version: ## Show current project version
-	@grep -oP '(?<=^version = ")[^"]+' pyproject.toml | head -1
+	@sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1
 
 bump-version: ## Bump version: make bump-version V=1.0.2
 	@test -n "$(V)" || { echo "Usage: make bump-version V=1.0.2"; exit 1; }

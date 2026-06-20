@@ -12,7 +12,7 @@ from conan.tools.files import copy
 
 def _read_version():
     pyproject = os.path.join(os.path.dirname(__file__), "pyproject.toml")
-    with open(pyproject) as f:
+    with open(pyproject, encoding="utf-8") as f:
         m = re.search(r'^version\s*=\s*"([^"]+)"', f.read(), re.MULTILINE)
     return m.group(1) if m else "0.0.0"
 
@@ -22,6 +22,7 @@ class AlayaLiteConan(ConanFile):
     version = _read_version()
     settings = "os", "compiler", "build_type", "arch"
     package_type = "header-library"
+    exports = "pyproject.toml"
     exports_sources = "include/*"
     platform_tool_requires = "cmake/3.23.5"  # cmake version
 

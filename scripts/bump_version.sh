@@ -29,7 +29,16 @@ fi
 ROOT="$(git rev-parse --show-toplevel)"
 PYPROJECT="$ROOT/pyproject.toml"
 
-OLD_VERSION=$(grep -oP '(?<=^version = ")[^"]+' "$PYPROJECT" | head -1)
+# Portable sed -i: GNU sed uses -i without arg, BSD sed requires -i ''
+_sed_i() {
+  if sed --version >/dev/null 2>&1; then
+    sed -i "$@"
+  else
+    sed -i '' "$@"
+  fi
+}
+
+OLD_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' "$PYPROJECT" | head -1)
 if [[ -z "$OLD_VERSION" ]]; then
   echo "Error: cannot read current version from $PYPROJECT"
   exit 1
@@ -49,7 +58,7 @@ if [[ "$DRY" == "--dry" ]]; then
   exit 0
 fi
 
-sed -i "s/^version = \"$OLD_VERSION\"/version = \"$VERSION\"/" "$PYPROJECT"
+_sed_i "s/^version = \"$OLD_VERSION\"/version = \"$VERSION\"/" "$PYPROJECT"
 
 if ! grep -q "version = \"$VERSION\"" "$PYPROJECT"; then
   echo "Error: version not updated in pyproject.toml"
