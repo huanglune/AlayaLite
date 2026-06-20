@@ -79,13 +79,23 @@ for f in "$PYPROJECT" "$INIT_PY" "$CONANFILE"; do
 done
 
 echo "Syncing uv.lock..."
-(cd "$ROOT" && uv lock --quiet 2>/dev/null || true)
+if ! (cd "$ROOT" && uv lock --quiet); then
+  echo "Error: uv lock failed — fix pyproject.toml and retry"
+  exit 1
+fi
 
 echo ""
 echo "Version updated to $VERSION in all files."
 echo ""
+echo "Files changed:"
+echo "  pyproject.toml"
+echo "  python/src/alayalite/__init__.py"
+echo "  conanfile.py"
+echo "  uv.lock"
+echo ""
 echo "Next steps:"
 echo "  1. Update CHANGELOG.md with the new [${VERSION}] section"
-echo "  2. git add -A && git commit -m 'chore(release): bump version to ${VERSION}'"
-echo "  3. git tag v${VERSION}"
-echo "  4. git push upstream main && git push upstream v${VERSION}"
+echo "  2. git add pyproject.toml python/src/alayalite/__init__.py conanfile.py uv.lock CHANGELOG.md"
+echo "  3. git commit -m 'chore(release): bump version to ${VERSION}'"
+echo "  4. git tag v${VERSION}"
+echo "  5. git push upstream main && git push upstream v${VERSION}"
