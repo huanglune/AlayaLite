@@ -49,24 +49,18 @@ jobs       :
         echo "version=$OLD" >> "$GITHUB_OUTPUT"
         echo "Current version: $OLD"
 
-    - name: Bump version in all files
+    - name: Bump version in pyproject.toml
       run: |
         VERSION="${{ inputs.version }}"
         OLD="${{ steps.current.outputs.version }}"
 
         echo "Bumping: $OLD → $VERSION"
-
         sed -i "s/^version = \"$OLD\"/version = \"$VERSION\"/" pyproject.toml
-        sed -i "s/^__version__ = \"$OLD\"/__version__ = \"$VERSION\"/" python/src/alayalite/__init__.py
-        sed -i "s/version = \"$OLD\"/version = \"$VERSION\"/" conanfile.py
 
-        # Verify all files were updated
-        for f in pyproject.toml python/src/alayalite/__init__.py conanfile.py; do
-          if ! grep -q "$VERSION" "$f"; then
-            echo "::error::Version not updated in $f"
-            exit 1
-          fi
-        done
+        if ! grep -q "version = \"$VERSION\"" pyproject.toml; then
+          echo "::error::Version not updated in pyproject.toml"
+          exit 1
+        fi
 
     - name: Sync uv.lock
       run: uv lock
@@ -137,7 +131,7 @@ jobs       :
         VERSION="${{ inputs.version }}"
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
-        git add pyproject.toml python/src/alayalite/__init__.py conanfile.py uv.lock CHANGELOG.md
+        git add pyproject.toml uv.lock CHANGELOG.md
         git commit -m "chore(release): bump version to ${VERSION}"
         git tag "v${VERSION}"
         git push origin main

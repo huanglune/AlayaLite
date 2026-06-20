@@ -2,17 +2,13 @@
 # SPDX-FileCopyrightText: 2025 AlayaDB.AI
 # SPDX-License-Identifier: AGPL-3.0-only
 #
-# Bump the project version across all source-of-truth files, update uv.lock,
-# commit, and create a git tag.
+# Bump the project version in pyproject.toml (the single source of truth)
+# and sync uv.lock. Other files (conanfile.py, __init__.py) read the version
+# dynamically at build/runtime — no manual sync needed.
 #
 # Usage:
-#   ./scripts/bump_version.sh 1.0.2          # bump + commit + tag
+#   ./scripts/bump_version.sh 1.0.2          # bump + sync lockfile
 #   ./scripts/bump_version.sh 1.0.2 --dry    # preview changes, don't write
-#
-# Files updated:
-#   pyproject.toml                       version = "X.Y.Z"
-#   python/src/alayalite/__init__.py     __version__ = "X.Y.Z"
-#   conanfile.py                         version = "X.Y.Z"
 
 set -euo pipefail
 
@@ -31,17 +27,7 @@ if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([ab][0-9]+)?$ ]]; then
 fi
 
 ROOT="$(git rev-parse --show-toplevel)"
-
 PYPROJECT="$ROOT/pyproject.toml"
-INIT_PY="$ROOT/python/src/alayalite/__init__.py"
-CONANFILE="$ROOT/conanfile.py"
-
-for f in "$PYPROJECT" "$INIT_PY" "$CONANFILE"; do
-  if [[ ! -f "$f" ]]; then
-    echo "Error: $f not found"
-    exit 1
-  fi
-done
 
 OLD_VERSION=$(grep -oP '(?<=^version = ")[^"]+' "$PYPROJECT" | head -1)
 if [[ -z "$OLD_VERSION" ]]; then
@@ -55,11 +41,7 @@ if [[ "$OLD_VERSION" == "$VERSION" ]]; then
 fi
 
 echo "Bumping: $OLD_VERSION → $VERSION"
-echo ""
-echo "Files:"
-echo "  $PYPROJECT"
-echo "  $INIT_PY"
-echo "  $CONANFILE"
+echo "  pyproject.toml (single source of truth)"
 
 if [[ "$DRY" == "--dry" ]]; then
   echo ""
@@ -68,15 +50,11 @@ if [[ "$DRY" == "--dry" ]]; then
 fi
 
 sed -i "s/^version = \"$OLD_VERSION\"/version = \"$VERSION\"/" "$PYPROJECT"
-sed -i "s/^__version__ = \"$OLD_VERSION\"/__version__ = \"$VERSION\"/" "$INIT_PY"
-sed -i "s/version = \"$OLD_VERSION\"/version = \"$VERSION\"/" "$CONANFILE"
 
-for f in "$PYPROJECT" "$INIT_PY" "$CONANFILE"; do
-  if ! grep -q "$VERSION" "$f"; then
-    echo "Error: version not updated in $f — check manually"
-    exit 1
-  fi
-done
+if ! grep -q "version = \"$VERSION\"" "$PYPROJECT"; then
+  echo "Error: version not updated in pyproject.toml"
+  exit 1
+fi
 
 echo "Syncing uv.lock..."
 if ! (cd "$ROOT" && uv lock --quiet); then
@@ -85,17 +63,15 @@ if ! (cd "$ROOT" && uv lock --quiet); then
 fi
 
 echo ""
-echo "Version updated to $VERSION in all files."
-echo ""
-echo "Files changed:"
+echo "Done. Files changed:"
 echo "  pyproject.toml"
-echo "  python/src/alayalite/__init__.py"
-echo "  conanfile.py"
 echo "  uv.lock"
 echo ""
 echo "Next steps:"
 echo "  1. Update CHANGELOG.md with the new [${VERSION}] section"
-echo "  2. git add pyproject.toml python/src/alayalite/__init__.py conanfile.py uv.lock CHANGELOG.md"
+echo "  2. git add pyproject.toml uv.lock CHANGELOG.md"
 echo "  3. git commit -m 'chore(release): bump version to ${VERSION}'"
 echo "  4. git tag v${VERSION}"
 echo "  5. git push upstream main && git push upstream v${VERSION}"
+echo ""
+echo "Or use: GitHub Actions → Prepare Release → version=${VERSION}"
