@@ -1,0 +1,147 @@
+---
+name       : Prepare Release
+
+# Manual trigger: input the target version, and this workflow will bump
+# pyproject.toml (single source of truth), update CHANGELOG.md, commit,
+# tag, and push. The tag push triggers cibuildwheel to build and publish.
+on         :
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version (e.g. 1.0.2)
+        required: true
+        type: string
+      dry_run:
+        description: Dry run — show changes without committing
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs       :
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v6
+      with:
+        enable-cache: true
+
+    - name: Validate version format
+      run: |
+        VERSION="${{ inputs.version }}"
+        if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+([ab][0-9]+)?$'; then
+          echo "::error::Invalid version format: $VERSION (expected X.Y.Z or X.Y.Za1/b1)"
+          exit 1
+        fi
+
+    - name: Read current version and fail-fast on no-op
+      id: current
+      run: |
+        OLD=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)
+        echo "version=$OLD" >> "$GITHUB_OUTPUT"
+        echo "Current version: $OLD"
+        VERSION="${{ inputs.version }}"
+        if [ "$OLD" = "$VERSION" ]; then
+          echo "::error::Version $VERSION is already current — nothing to bump"
+          exit 1
+        fi
+
+    - name: Bump version in pyproject.toml
+      run: |
+        VERSION="${{ inputs.version }}"
+        OLD="${{ steps.current.outputs.version }}"
+
+        echo "Bumping: $OLD → $VERSION"
+        sed -i "s/^version = \"$OLD\"/version = \"$VERSION\"/" pyproject.toml
+
+        if ! grep -q "version = \"$VERSION\"" pyproject.toml; then
+          echo "::error::Version not updated in pyproject.toml"
+          exit 1
+        fi
+
+    - name: Sync uv.lock
+      run: uv lock
+
+    - name: Generate CHANGELOG entry
+      run: |
+        VERSION="${{ inputs.version }}"
+        OLD="${{ steps.current.outputs.version }}"
+        DATE=$(date +%Y-%m-%d)
+
+        # Escape dots in OLD for safe use in sed regex
+        OLD_ESC=$(echo "$OLD" | sed 's/\./\\./g')
+
+        # Collect conventional commit summaries since last tag
+        LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+        if [ -n "$LAST_TAG" ]; then
+          RANGE="${LAST_TAG}..HEAD"
+        else
+          RANGE="HEAD"
+        fi
+
+        # Generate grouped entries from conventional commits
+        {
+          echo "## [$VERSION] - $DATE"
+          echo ""
+
+          ADDED=$(git log "$RANGE" --pretty=format:"%s" --no-merges | grep -iE "^feat" | sed 's/^/- /' || true)
+          if [ -n "$ADDED" ]; then
+            echo "### Added"
+            echo "$ADDED"
+            echo ""
+          fi
+
+          CHANGED=$(git log "$RANGE" --pretty=format:"%s" --no-merges | grep -iE "^(refactor|perf|chore)" | sed 's/^/- /' || true)
+          if [ -n "$CHANGED" ]; then
+            echo "### Changed"
+            echo "$CHANGED"
+            echo ""
+          fi
+
+          FIXED=$(git log "$RANGE" --pretty=format:"%s" --no-merges | grep -iE "^fix" | sed 's/^/- /' || true)
+          if [ -n "$FIXED" ]; then
+            echo "### Fixed"
+            echo "$FIXED"
+            echo ""
+          fi
+        } > /tmp/changelog_entry.md
+
+        echo "--- Generated CHANGELOG entry ---"
+        cat /tmp/changelog_entry.md
+        echo "---"
+
+        # Insert after "## [Unreleased]" line
+        sed -i "/^## \[Unreleased\]/r /tmp/changelog_entry.md" CHANGELOG.md
+
+        # Update footer links (dots in OLD_ESC are escaped for sed)
+        sed -i "s|\[Unreleased\]: \(.*\)/compare/v${OLD_ESC}\.\.\.HEAD|[Unreleased]: \1/compare/v${VERSION}...HEAD\n[${VERSION}]: \1/compare/v${OLD}...v${VERSION}|" CHANGELOG.md
+
+    - name: Show diff (dry run)
+      if: inputs.dry_run
+      run: |
+        echo "::notice::Dry run — showing changes without committing"
+        git diff
+        echo ""
+        echo "Files changed:"
+        git diff --stat
+
+    - name: Commit, tag, and push
+      if: '!inputs.dry_run'
+      run: |
+        VERSION="${{ inputs.version }}"
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git add pyproject.toml uv.lock CHANGELOG.md
+        git commit -m "chore(release): bump version to ${VERSION}"
+        git tag "v${VERSION}"
+        git push origin main
+        git push origin "v${VERSION}"
+        echo "::notice::Released v${VERSION} — cibuildwheel will build and publish automatically"

@@ -3,17 +3,26 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 import os
+import re
 
 from conan import ConanFile
 from conan.tools.cmake import CMakeDeps, CMakeToolchain, cmake_layout
 from conan.tools.files import copy
 
 
+def _read_version():
+    pyproject = os.path.join(os.path.dirname(__file__), "pyproject.toml")
+    with open(pyproject, encoding="utf-8") as f:
+        m = re.search(r'^version\s*=\s*"([^"]+)"', f.read(), re.MULTILINE)
+    return m.group(1) if m else "0.0.0"
+
+
 class AlayaLiteConan(ConanFile):
     name = "AlayaLite"
-    version = "1.0.0"
+    version = _read_version()
     settings = "os", "compiler", "build_type", "arch"
     package_type = "header-library"
+    exports = "pyproject.toml"
     exports_sources = "include/*"
     platform_tool_requires = "cmake/3.23.5"  # cmake version
 
