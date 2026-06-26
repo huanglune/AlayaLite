@@ -115,8 +115,9 @@ TEST_F(PQTableTest, PQDistanceEqualsTrueL2WhenLossless) {
   pq.encode(data.data(), n);
 
   std::vector<float> table(static_cast<size_t>(n_chunks) * kPQNumCentroids);
+  std::vector<float> qres(dim);
   for (uint64_t qi = 0; qi < n; ++qi) {
-    pq.preprocess_query(data.data() + qi * dim, table.data());
+    pq.preprocess_query(data.data() + qi * dim, table.data(), qres.data());
     for (uint64_t pi = 0; pi < n; ++pi) {
       const float approx = pq.pq_distance(pi, table.data());
       const float truth = exact_l2_sqr(data.data() + qi * dim, data.data() + pi * dim, dim);
@@ -144,7 +145,8 @@ TEST_F(PQTableTest, PreprocessQueryMatchesManualTable) {
 
   const std::vector<float> query = {3.0f, 3.0f, 5.0f, 5.0f};  // chunk0=(3,3) chunk1=(5,5)
   std::vector<float> table(static_cast<size_t>(n_chunks) * kPQNumCentroids);
-  pq.preprocess_query(query.data(), table.data());
+  std::vector<float> qres(dim);
+  pq.preprocess_query(query.data(), table.data(), qres.data());
 
   for (uint32_t k = 0; k < kPQNumCentroids; ++k) {
     const float e0 = 2.0f * (3.0f - k) * (3.0f - k);
@@ -163,7 +165,8 @@ TEST_F(PQTableTest, PQDistanceIsSumOfTableLookups) {
   pq.encode(data.data(), n);
 
   std::vector<float> table(static_cast<size_t>(n_chunks) * kPQNumCentroids);
-  pq.preprocess_query(data.data() + 5 * dim, table.data());
+  std::vector<float> qres(dim);
+  pq.preprocess_query(data.data() + 5 * dim, table.data(), qres.data());
   const auto &codes = pq.codes();
   for (uint64_t pi : {0ull, 1ull, 100ull, 399ull}) {
     float expected = 0.0f;
@@ -231,10 +234,13 @@ TEST_F(PQTableTest, FileRoundtripBitIdentical) {
   // And the loaded table produces identical distances.
   std::vector<float> t0(static_cast<size_t>(n_chunks) * kPQNumCentroids);
   std::vector<float> t1(static_cast<size_t>(n_chunks) * kPQNumCentroids);
-  pq.preprocess_query(data.data(), t0.data());
-  loaded.preprocess_query(data.data(), t1.data());
+  std::vector<float> qres0(dim);
+  std::vector<float> qres1(dim);
+  pq.preprocess_query(data.data(), t0.data(), qres0.data());
+  loaded.preprocess_query(data.data(), t1.data(), qres1.data());
   for (uint64_t pi : {0ull, 250ull, 499ull}) {
-    EXPECT_FLOAT_EQ(pq.pq_distance(pi, t0.data()), loaded.pq_distance(pi, t1.data())) << "pi=" << pi;
+    EXPECT_FLOAT_EQ(pq.pq_distance(pi, t0.data()), loaded.pq_distance(pi, t1.data()))
+        << "pi=" << pi;
   }
 }
 
@@ -261,9 +267,8 @@ TEST_F(PQTableTest, LoadRejectsWrongSize) {
 TEST_F(PQTableTest, FromCodebookRejectsBadShapes) {
   EXPECT_THROW(PQTable::from_codebook(4, 3, std::vector<float>(4), std::vector<float>(4)),
                std::invalid_argument);  // 4 % 3 != 0
-  EXPECT_THROW(
-      PQTable::from_codebook(4, 2, std::vector<float>(3), std::vector<float>(2 * 256 * 2)),
-      std::invalid_argument);  // global centroid wrong size
+  EXPECT_THROW(PQTable::from_codebook(4, 2, std::vector<float>(3), std::vector<float>(2 * 256 * 2)),
+               std::invalid_argument);  // global centroid wrong size
   EXPECT_THROW(PQTable::from_codebook(4, 2, std::vector<float>(4), std::vector<float>(10)),
                std::invalid_argument);  // codebook wrong size
 }

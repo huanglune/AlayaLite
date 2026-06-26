@@ -220,14 +220,17 @@ class PQTable {
    * @param table_out  Caller-owned buffer of @c n_chunks*256 float32. Entry
    *                   [c*256 + k] = squared L2 between the query's chunk-c
    *                   residual and centroid k of chunk c.
+   * @param scratch    Caller-owned buffer of @c dim float32 for the query residual.
    */
-  void preprocess_query(const float *query, float *table_out) const {
-    std::vector<float> qres(dim_);
+  void preprocess_query(const float *query, float *table_out, float *scratch) const {
+    if (scratch == nullptr) {
+      throw std::invalid_argument("PQTable::preprocess_query: scratch must not be null");
+    }
     for (uint64_t d = 0; d < dim_; ++d) {
-      qres[d] = query[d] - global_centroid_[d];
+      scratch[d] = query[d] - global_centroid_[d];
     }
     for (uint32_t c = 0; c < n_chunks_; ++c) {
-      const float *qchunk = qres.data() + static_cast<uint64_t>(c) * chunk_dim_;
+      const float *qchunk = scratch + static_cast<uint64_t>(c) * chunk_dim_;
       const float *cent = codebook_.data() + static_cast<size_t>(c) * kPQNumCentroids * chunk_dim_;
       float *trow = table_out + static_cast<size_t>(c) * kPQNumCentroids;
       for (uint32_t k = 0; k < kPQNumCentroids; ++k) {

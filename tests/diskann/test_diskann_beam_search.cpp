@@ -33,6 +33,8 @@ using alaya::diskann::SearchContext;
 using alaya::diskann::SearchParams;
 using alaya::diskann::SearchStats;
 using alaya::diskann::ThreadData;
+using alaya::diskann::ThreadDataScratchConfig;
+using alaya::diskann::VisitedBitset;
 using alaya::diskann::write_disk_layout;
 using alaya::vamana::Neighbor;
 using alaya::vamana::NeighborPriorityQueue;
@@ -82,8 +84,11 @@ uint32_t medoid_of(const std::vector<float> &v, uint64_t n, uint64_t dim) {
   return best;
 }
 
-std::vector<std::pair<uint32_t, float>> brute_force(const std::vector<float> &v, uint64_t n,
-                                                    uint64_t dim, const float *q, uint32_t k) {
+std::vector<std::pair<uint32_t, float>> brute_force(const std::vector<float> &v,
+                                                    uint64_t n,
+                                                    uint64_t dim,
+                                                    const float *q,
+                                                    uint32_t k) {
   std::vector<std::pair<uint32_t, float>> all;
   all.reserve(n);
   for (uint64_t i = 0; i < n; ++i) {
@@ -110,12 +115,14 @@ TEST(BeamScanInsert, SkipsVisitedAndInsertsRest) {
   pq.train(v.data(), n, dim, n_chunks);
   pq.encode(v.data(), n);
   std::vector<float> table(static_cast<size_t>(n_chunks) * 256);
-  pq.preprocess_query(v.data(), table.data());
+  std::vector<float> qres(dim);
+  pq.preprocess_query(v.data(), table.data(), qres.data());
 
   NeighborPriorityQueue retset(100);
-  std::unordered_set<uint32_t> visited;
+  VisitedBitset visited;
+  visited.resize(n);
   for (uint32_t id = 0; id < 10; ++id) {
-    visited.insert(id);  // 10 already visited
+    visited.set(id);  // 10 already visited
   }
   std::vector<uint32_t> nbrs(32);
   for (uint32_t i = 0; i < 32; ++i) {
@@ -134,13 +141,20 @@ TEST(BeamScanInsert, PQPrunesUncompetitiveNeighbors) {
   pq.encode(v.data(), n);
 
   std::vector<float> table(static_cast<size_t>(n_chunks) * 256);
-  pq.preprocess_query(v.data() + 0 * dim, table.data());  // query == point 0
+  std::vector<float> qres(dim);
+  pq.preprocess_query(v.data() + 0 * dim, table.data(), qres.data());  // query == point 0
 
   NeighborPriorityQueue retset(4);  // capacity 4
-  std::unordered_set<uint32_t> visited;
+  VisitedBitset visited;
+  visited.resize(n);
   std::vector<uint32_t> nbrs = {1, 2, 3, 4, 5, 6, 7, 8, 9};
-  scan_and_insert_neighbors(retset, visited, nbrs.data(),
-                            static_cast<uint32_t>(nbrs.size()), pq, table.data(), n);
+  scan_and_insert_neighbors(retset,
+                            visited,
+                            nbrs.data(),
+                            static_cast<uint32_t>(nbrs.size()),
+                            pq,
+                            table.data(),
+                            n);
   EXPECT_EQ(retset.size(), 4u);  // bounded
   // The globally farthest point from point 0 must have been pruned.
   const auto bf = brute_force(v, n, dim, v.data(), n);  // sorted ascending
@@ -154,11 +168,55 @@ TEST(BeamScanInsert, PQPrunesUncompetitiveNeighbors) {
   EXPECT_FALSE(present) << "farthest id=" << farthest << " should be pruned";
 }
 
+TEST(SearchScratch, ResetQueryClearsFlatPerQueryState) {
+  ThreadData td;
+  ThreadDataScratchConfig cfg;
+  cfg.n_page_slots = 2;
+  cfg.page_size = 4096;
+  cfg.pq_table_entries = 512;
+  cfg.max_slot_id = 130;
+  cfg.max_degree = 4;
+  cfg.search_list_size = 8;
+  cfg.query_dim = 16;
+  td.alloc_scratch(cfg);
+
+  EXPECT_EQ(td.visited_bits.word_count(), 3u);
+  EXPECT_EQ(td.exact_dists.size(), 130u);
+  EXPECT_EQ(td.nbrs_buf.size(), 32u);
+  EXPECT_EQ(td.nbrs_offsets.size(), 130u);
+  EXPECT_EQ(td.pq_qres.size(), 16u);
+  EXPECT_EQ(td.inflight.size(), 2u);
+
+  td.visited_bits.set(7);
+  td.set_exact_dist(7, 1.25f);
+  const std::vector<uint32_t> nbrs = {1, 2, 3};
+  td.cache_neighbors(7, nbrs.data(), static_cast<uint32_t>(nbrs.size()));
+
+  ASSERT_TRUE(td.visited_bits.test(7));
+  EXPECT_FLOAT_EQ(td.exact_dists[7], 1.25f);
+  EXPECT_EQ(td.exact_dirty.size(), 1u);
+  ASSERT_EQ(td.cached_neighbors(7).size(), nbrs.size());
+
+  td.reset_query(8);
+
+  EXPECT_FALSE(td.visited_bits.test(7));
+  EXPECT_TRUE(ThreadData::is_missing_exact(td.exact_dists[7]));
+  EXPECT_TRUE(td.exact_dirty.empty());
+  EXPECT_EQ(td.cached_neighbors(7).size(), 0u);
+  EXPECT_EQ(td.nbrs_buf_next, 0u);
+
+  td.free_scratch();
+}
+
 // ---- Beam search over a real (tiny) on-disk index --------------------------
 
 class BeamSearchTest : public ::testing::Test {
  protected:
-  void build(uint64_t n, uint64_t dim, uint32_t r, uint32_t n_chunks, double cache_ratio,
+  void build(uint64_t n,
+             uint64_t dim,
+             uint32_t r,
+             uint32_t n_chunks,
+             double cache_ratio,
              uint32_t beam = 4) {
     n_ = n;
     dim_ = dim;
@@ -183,7 +241,15 @@ class BeamSearchTest : public ::testing::Test {
     reader_->open(index_path_.string());
     reader_->register_thread();
     td_.ctx_ = reader_->get_ctx();
-    td_.alloc_scratch(2u * beam, geom_.page_size, has_pq_ ? n_chunks * 256u : 0u);
+    ThreadDataScratchConfig cfg;
+    cfg.n_page_slots = 2u * beam;
+    cfg.page_size = geom_.page_size;
+    cfg.pq_table_entries = has_pq_ ? n_chunks * 256u : 0u;
+    cfg.max_slot_id = n;
+    cfg.max_degree = r;
+    cfg.search_list_size = static_cast<uint32_t>(std::max<uint64_t>(n, 100));
+    cfg.query_dim = dim;
+    td_.alloc_scratch(cfg);
     beam_ = beam;
   }
 
@@ -197,8 +263,11 @@ class BeamSearchTest : public ::testing::Test {
     std::filesystem::remove(index_path_, ec);
   }
 
-  std::vector<std::pair<uint32_t, float>> search(const float *q, uint32_t top_k, bool use_pq,
-                                                 bool rerank, uint32_t L = 50) {
+  std::vector<std::pair<uint32_t, float>> search(const float *q,
+                                                 uint32_t top_k,
+                                                 bool use_pq,
+                                                 bool rerank,
+                                                 uint32_t L = 50) {
     SearchContext ctx;
     ctx.reader = reader_.get();
     ctx.geom = &geom_;
