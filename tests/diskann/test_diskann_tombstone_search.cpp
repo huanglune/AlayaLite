@@ -28,6 +28,7 @@ using alaya::diskann::SearchContext;
 using alaya::diskann::SearchParams;
 using alaya::diskann::SearchStats;
 using alaya::diskann::ThreadData;
+using alaya::diskann::ThreadDataScratchConfig;
 using alaya::diskann::TombstoneBitmap;
 using alaya::diskann::write_disk_layout;
 
@@ -72,7 +73,14 @@ class TombstoneSearchTest : public ::testing::Test {
     reader_->open(index_path_.string());
     reader_->register_thread();
     td_.ctx_ = reader_->get_ctx();
-    td_.alloc_scratch(/*n_page_slots=*/8, geom_.page_size, /*pq_table_entries=*/0);
+    ThreadDataScratchConfig cfg;
+    cfg.n_page_slots = 8;
+    cfg.page_size = geom_.page_size;
+    cfg.max_slot_id = n_;
+    cfg.max_degree = scn_.r;
+    cfg.search_list_size = 50;
+    cfg.query_dim = scn_.dim;
+    td_.alloc_scratch(cfg);
   }
 
   void TearDown() override {

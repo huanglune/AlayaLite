@@ -58,6 +58,8 @@
 
 namespace alaya::diskann {
 
+inline constexpr uint32_t kDefaultDiskANNScratchSearchListSize = 150;
+
 /// Build-time configuration.
 struct DiskANNBuildParams {
   uint32_t R = 64;            ///< graph degree bound
@@ -82,6 +84,9 @@ struct DiskANNLoadParams {
                                ///< deeper pipeline overlaps more I/O. Explicit values are floored
                                ///< at 2*beam_width and capped at the libaio context size (1024).
                                ///< Sizes the sector scratch to that many pages per thread.
+  uint32_t scratch_search_list_size = kDefaultDiskANNScratchSearchListSize;
+  ///< No-PQ neighbor scratch capacity, in search-list entries. Set this >= the
+  ///< largest DiskANNSearchParams::search_list_size used after load.
 
   // --- In-place update mode (No-PQ only; see disk-update specs) ---
   bool updatable = false;          ///< open O_RDWR + enable insert/remove/update_node/flush
@@ -287,16 +292,27 @@ class DiskANNIndex {
         params.nopq_io_depth == 0 ? kDefaultNoPQIoDepth : params.nopq_io_depth;
     const uint64_t scratch_slots =
         std::min<uint64_t>(1024, std::max<uint64_t>(2ull * beam_width_, nopq_depth));
+    const uint32_t scratch_list_size = std::max({DiskANNSearchParams{}.search_list_size,
+                                                 params.update_search_l,
+                                                 params.scratch_search_list_size});
+    ThreadDataScratchConfig scratch_config;
+    scratch_config.n_page_slots = scratch_slots;
+    scratch_config.page_size = geom_.page_size;
+    scratch_config.pq_table_entries = pq_table_entries;
+    scratch_config.max_slot_id = max_slot_id_;
+    scratch_config.max_degree = max_degree_;
+    scratch_config.search_list_size = scratch_list_size;
+    scratch_config.query_dim = dim_;
     thread_data_storage_.resize(pool);
     {
       std::vector<std::thread> regs;
       regs.reserve(pool);
       for (uint32_t t = 0; t < pool; ++t) {
-        regs.emplace_back([this, t, pq_table_entries, scratch_slots]() {
+        regs.emplace_back([this, t, scratch_config]() {
           reader_->register_thread();
           auto td = std::make_unique<ThreadData>();
           td->ctx_ = reader_->get_ctx();
-          td->alloc_scratch(scratch_slots, geom_.page_size, pq_table_entries);
+          td->alloc_scratch(scratch_config);
           thread_data_storage_[t] = std::move(td);
         });
       }
@@ -500,6 +516,7 @@ class DiskANNIndex {
     const uint32_t slot = slot_alloc_.alloc();
     update_ctx_.forget_slot(slot);
     max_slot_id_ = std::max<uint64_t>(max_slot_id_, slot_alloc_.next_fresh_id());
+    resize_thread_data_slot_capacity();
 
     page_io_->write_node(slot, query, static_cast<uint32_t>(pruned.size()), pruned.data());
 
@@ -654,6 +671,7 @@ class DiskANNIndex {
     if (std::filesystem::exists(slots_path)) {
       slot_alloc_.load(slots_path);  // restore free list + next id + tombstones
       max_slot_id_ = std::max<uint64_t>(max_slot_id_, slot_alloc_.next_fresh_id());
+      resize_thread_data_slot_capacity();
     } else {
       slot_alloc_.reset(static_cast<uint32_t>(max_slot_id_));
     }
@@ -850,6 +868,12 @@ class DiskANNIndex {
       labels_.resize(static_cast<size_t>(slot) + 1, kNoLabel);
     }
     labels_[slot] = label;
+  }
+
+  void resize_thread_data_slot_capacity() {
+    for (auto &td : thread_data_storage_) {
+      td->resize_slot_capacity(max_slot_id_);
+    }
   }
 
   /// Order-independent equality of two neighbor id lists.

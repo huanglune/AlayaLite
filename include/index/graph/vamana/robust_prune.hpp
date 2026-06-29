@@ -31,6 +31,12 @@ struct Neighbor {
   bool operator==(const Neighbor &other) const { return id == other.id; }
 };
 
+struct NeighborQueueInsertResult {
+  bool inserted = false;
+  bool evicted = false;
+  uint32_t evicted_id = 0;
+};
+
 // Bounded-capacity priority queue of Neighbors kept in ascending distance
 // order. Mirrors DiskANN's `NeighborPriorityQueue` (include/neighbor.h):
 // supports O(log n) insertion with dedup-by-id and a cursor (`cur_`) that
@@ -47,9 +53,15 @@ class NeighborPriorityQueue {
     capacity_ = capacity;
   }
 
-  void insert(const Neighbor &nbr) {
+  void insert(const Neighbor &nbr) { (void)insert_with_result(nbr); }
+
+  NeighborQueueInsertResult insert_with_result(const Neighbor &nbr) {
+    NeighborQueueInsertResult result;
+    if (capacity_ == 0) {
+      return result;
+    }
     if (size_ == capacity_ && data_[size_ - 1] < nbr) {
-      return;
+      return result;
     }
     size_t lo = 0;
     size_t hi = size_;
@@ -58,11 +70,13 @@ class NeighborPriorityQueue {
       if (nbr < data_[mid]) {
         hi = mid;
       } else if (data_[mid].id == nbr.id) {
-        return;  // dedup
+        return result;  // dedup
       } else {
         lo = mid + 1;
       }
     }
+    const bool full = size_ == capacity_;
+    const uint32_t evicted_id = full ? data_[capacity_ - 1].id : 0;
     if (lo < capacity_) {
       std::memmove(&data_[lo + 1], &data_[lo], (size_ - lo) * sizeof(Neighbor));
     }
@@ -73,6 +87,10 @@ class NeighborPriorityQueue {
     if (lo < cur_) {
       cur_ = lo;
     }
+    result.inserted = true;
+    result.evicted = full;
+    result.evicted_id = evicted_id;
+    return result;
   }
 
   Neighbor closest_unexpanded() {

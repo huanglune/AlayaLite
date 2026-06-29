@@ -50,8 +50,6 @@
 #include <deque>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -109,7 +107,7 @@ struct SearchStats {
  * Extracted as a free function so the contract is unit-testable in isolation.
  */
 inline void scan_and_insert_neighbors(alaya::vamana::NeighborPriorityQueue &retset,
-                                      std::unordered_set<uint32_t> &visited,
+                                      VisitedBitset &visited,
                                       const uint32_t *nbrs,
                                       uint32_t n_nbrs,
                                       const PQTable &pq,
@@ -120,7 +118,7 @@ inline void scan_and_insert_neighbors(alaya::vamana::NeighborPriorityQueue &rets
     if (m >= num_points) {
       continue;  // defensive: ignore corrupt neighbor ids
     }
-    if (!visited.insert(m).second) {
+    if (!visited.test_and_set(m)) {
       continue;
     }
     retset.insert(alaya::vamana::Neighbor(m, pq.pq_distance(m, pq_table)));
@@ -160,17 +158,20 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
   const size_t list_size = std::max<size_t>(params.search_list_size, top_k);
   td.reset_query(list_size);
   auto &frontier = td.retset;
-  auto &visited = td.visited;
-
-  // Neighbor lists of read nodes, needed when a node is later expanded.
-  std::unordered_map<uint32_t, std::vector<uint32_t>> nbrs_cache;
+  auto &visited = td.visited_bits;
 
   // Absorb a freshly-read node: cache its neighbor list and insert it into the
   // frontier with its exact L2 distance (coords are co-located in the record).
   auto absorb = [&](uint32_t id, const char *rec) {
     NodeRecordView view{rec, dim};
-    nbrs_cache[id].assign(view.nbrs(), view.nbrs() + view.n_nbrs());
-    frontier.insert(alaya::vamana::Neighbor(id, l2(query, view.coords(), dim)));
+    const float distance = l2(query, view.coords(), dim);
+    const auto insert_result = frontier.insert_with_result(alaya::vamana::Neighbor(id, distance));
+    if (insert_result.evicted) {
+      td.release_cached_neighbors(insert_result.evicted_id);
+    }
+    if (insert_result.inserted) {
+      td.cache_neighbors(id, view.nbrs(), view.n_nbrs());
+    }
     if (stats != nullptr) {
       stats->read_order.push_back(id);
       stats->n_nodes_processed++;
@@ -199,7 +200,7 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
   // IP-DiskANN: tombstoned nodes are skipped (graph repaired at delete time).
   const TombstoneBitmap *tomb = ctx.tombstone;
   auto consider = [&](uint32_t m, auto &&emit) {
-    if (m >= ctx.num_points || !visited.insert(m).second) {
+    if (m >= ctx.num_points || !visited.test_and_set(m)) {
       return;
     }
     if (tomb != nullptr && tomb->is_deleted(m)) {
@@ -208,7 +209,7 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
     emit(m);
   };
 
-  visited.insert(ctx.medoid);
+  visited.set(ctx.medoid);
   absorb(ctx.medoid, read_seed(ctx.medoid));
 
   std::vector<AlignedRead> reqs;
@@ -225,12 +226,7 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
     std::vector<const char *> chunk_recs;
     while (frontier.has_unexpanded_node()) {
       const uint32_t x = frontier.closest_unexpanded().id;
-      const auto it = nbrs_cache.find(x);
-      if (it == nbrs_cache.end()) {
-        continue;  // defensive: a frontier node is always absorbed (and so cached)
-      }
-      // Copy: absorb() below may rehash nbrs_cache and invalidate it->second.
-      const std::vector<uint32_t> nbrs = it->second;
+      const NeighborScratchView nbrs = td.cached_neighbors(x);
       todo.clear();
       for (const uint32_t m : nbrs) {
         consider(m, [&](uint32_t id) {
@@ -273,7 +269,7 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
   } else {
     // Async pipeline (default): keep up to n_slots reads in flight across
     // expansions. `pending` holds discovered (visited-marked) ids awaiting a slot;
-    // `inflight` maps an in-flight id to its (slot, record pointer). Processing
+    // ThreadData's inflight array tracks scratch slots and record pointers. Processing
     // follows I/O completion order, so the strict-greedy expansion order is
     // relaxed (results may differ only in tie-ordering of equally-distant nodes).
     std::vector<uint64_t> free_slots;
@@ -281,7 +277,6 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
     for (uint64_t s = 0; s < n_slots; ++s) {
       free_slots.push_back(s);
     }
-    std::unordered_map<uint32_t, std::pair<uint64_t, const char *>> inflight;
     std::deque<uint32_t> pending;
     std::vector<AlignedReadEvent> evts;
 
@@ -292,11 +287,8 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
     auto refill_pending = [&]() {
       while (pending.size() < free_slots.size() && frontier.has_unexpanded_node()) {
         const uint32_t x = frontier.closest_unexpanded().id;
-        const auto it = nbrs_cache.find(x);
-        if (it == nbrs_cache.end()) {
-          continue;
-        }
-        for (const uint32_t m : it->second) {
+        const NeighborScratchView nbrs = td.cached_neighbors(x);
+        for (const uint32_t m : nbrs) {
           consider(m, [&](uint32_t id) {
             pending.push_back(id);
           });
@@ -322,7 +314,7 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
         const uint64_t slot = free_slots.back();
         free_slots.pop_back();
         char *buf = td.sector_scratch + slot * page_size;
-        inflight.emplace(m, std::make_pair(slot, buf + geom.offset_to_node(m)));
+        td.set_inflight(slot, m, buf + geom.offset_to_node(m));
         reqs.emplace_back(geom.get_page_offset(m), page_size, m, buf);
       }
       if (!reqs.empty()) {
@@ -338,23 +330,20 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
     // Continue while any work remains: a read in flight, a queued read, or an
     // unexpanded frontier node (the latter matters when cache hits add nodes
     // without ever entering `inflight`).
-    while (!inflight.empty() || !pending.empty() || frontier.has_unexpanded_node()) {
-      if (!inflight.empty()) {
+    while (td.has_inflight() || !pending.empty() || frontier.has_unexpanded_node()) {
+      if (td.has_inflight()) {
         reader.get_events(td.ctx_, 1, evts);  // get_events clears + fills `evts`
         for (const auto &e : evts) {
           if (e.result != static_cast<int64_t>(page_size)) {
             throw std::runtime_error("disk_greedy_search: short/failed read, result=" +
                                      std::to_string(e.result));
           }
-          const auto it = inflight.find(static_cast<uint32_t>(e.id));
-          if (it == inflight.end()) {
+          InFlightSlot completed;
+          if (!td.remove_inflight(static_cast<uint32_t>(e.id), completed)) {
             continue;  // defensive: completion for an id we are not tracking
           }
-          const uint64_t slot = it->second.first;
-          const char *rec = it->second.second;
-          absorb(static_cast<uint32_t>(e.id), rec);
-          free_slots.push_back(slot);
-          inflight.erase(it);
+          absorb(static_cast<uint32_t>(e.id), completed.record);
+          free_slots.push_back(completed.page_slot);
         }
       }
       refill_pending();
@@ -404,14 +393,13 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
   const size_t list_size = std::max<size_t>(params.search_list_size, top_k);
   td.reset_query(list_size);
   auto &retset = td.retset;
-  auto &visited = td.visited;
-  auto &exact_by_id = td.exact_by_id;
+  auto &visited = td.visited_bits;
 
-  pq.preprocess_query(query, td.pq_table.data());
+  pq.preprocess_query(query, td.pq_table.data(), td.pq_qres.data());
   const float *pq_table = td.pq_table.data();
 
   // Seed from the medoid (first node expanded — spec scenario).
-  visited.insert(ctx.medoid);
+  visited.set(ctx.medoid);
   retset.insert(alaya::vamana::Neighbor(ctx.medoid, pq.pq_distance(ctx.medoid, pq_table)));
 
   const uint64_t beam = std::max<uint64_t>(1, params.beam_width);
@@ -421,7 +409,7 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
   // frontier with PQ approximate distances. Shared by both search paths.
   auto process_node = [&](uint32_t id, const char *rec) {
     NodeRecordView view{rec, dim};
-    exact_by_id[id] = l2(query, view.coords(), dim);
+    td.set_exact_dist(id, l2(query, view.coords(), dim));
     if (stats != nullptr) {
       stats->read_order.push_back(id);
       stats->n_nodes_processed++;
@@ -446,24 +434,24 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
     // (DiskANNSearchParams::deterministic) — it forgoes the cross-beam I/O/compute
     // overlap of the default path and so runs ~10-15% slower.
     std::vector<uint32_t> batch;
-    std::unordered_map<uint32_t, const char *> rec_of;
+    std::vector<const char *> batch_recs;
     while (retset.has_unexpanded_node()) {
       batch.clear();
+      batch_recs.clear();
       reqs.clear();
-      rec_of.clear();
       uint64_t slot = 0;
       while (retset.has_unexpanded_node() && reqs.size() < beam) {
         const uint32_t id = retset.closest_unexpanded().id;
         batch.push_back(id);
         const char *crec = cache.lookup(id);
         if (crec != nullptr) {
-          rec_of[id] = crec;
+          batch_recs.push_back(crec);
           if (stats != nullptr) {
             stats->n_cache_hits++;
           }
         } else {
           char *buf = td.sector_scratch + (slot++) * page_size;
-          rec_of[id] = buf + geom.offset_to_node(id);
+          batch_recs.push_back(buf + geom.offset_to_node(id));
           reqs.emplace_back(geom.get_page_offset(id), page_size, id, buf);
         }
       }
@@ -482,8 +470,8 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
         }
       }
 
-      for (const uint32_t id : batch) {
-        process_node(id, rec_of[id]);
+      for (size_t i = 0; i < batch.size(); ++i) {
+        process_node(batch[i], batch_recs[i]);
       }
     }
   } else {
@@ -498,9 +486,6 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
     for (uint64_t s = 0; s < beam; ++s) {
       free_slots.push_back(s);
     }
-    // In-flight reads: node id -> (scratch slot, record pointer within that page).
-    std::unordered_map<uint32_t, std::pair<uint64_t, const char *>> inflight;
-
     // Pop closest-unexpanded candidates, serving cache hits inline and submitting
     // cache misses into free scratch slots. Stops when the slots are full or the
     // frontier has no unexpanded node left.
@@ -519,7 +504,7 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
         const uint64_t slot = free_slots.back();
         free_slots.pop_back();
         char *buf = td.sector_scratch + slot * page_size;
-        inflight.emplace(id, std::make_pair(slot, buf + geom.offset_to_node(id)));
+        td.set_inflight(slot, id, buf + geom.offset_to_node(id));
         reqs.emplace_back(geom.get_page_offset(id), page_size, id, buf);
       }
       if (!reqs.empty()) {
@@ -531,7 +516,7 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
     };
 
     fill_pipe();
-    while (!inflight.empty()) {
+    while (td.has_inflight()) {
       // Wait for exactly one completion (get_events clears and fills `evts`). The
       // other in-flight reads keep the disk busy while we process this one — that
       // is the I/O/compute overlap. NOTE: poll_events/get_events both clear their
@@ -542,15 +527,12 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
           throw std::runtime_error("cached_beam_search: short/failed read, result=" +
                                    std::to_string(e.result));
         }
-        const auto it = inflight.find(static_cast<uint32_t>(e.id));
-        if (it == inflight.end()) {
+        InFlightSlot completed;
+        if (!td.remove_inflight(static_cast<uint32_t>(e.id), completed)) {
           continue;  // defensive: completion for an id we are not tracking
         }
-        const uint64_t slot = it->second.first;
-        const char *rec = it->second.second;
-        process_node(static_cast<uint32_t>(e.id), rec);
-        free_slots.push_back(slot);
-        inflight.erase(it);
+        process_node(static_cast<uint32_t>(e.id), completed.record);
+        free_slots.push_back(completed.page_slot);
       }
       fill_pipe();
     }
@@ -561,16 +543,16 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
   std::vector<AlignedRead> rerank_req(1);
 
   auto read_exact_sync = [&](uint32_t id) -> float {
-    const auto it = exact_by_id.find(id);
-    if (it != exact_by_id.end()) {
-      return it->second;
+    const float known = td.exact_dist(id);
+    if (!ThreadData::is_missing_exact(known)) {
+      return known;
     }
     char *buf = td.sector_scratch;
     rerank_req[0] = {geom.get_page_offset(id), page_size, id, buf};
     reader.read(rerank_req, td.ctx_);
     NodeRecordView view{buf + geom.offset_to_node(id), dim};
     const float ex = l2(query, view.coords(), dim);
-    exact_by_id[id] = ex;
+    td.set_exact_dist(id, ex);
     if (stats != nullptr) {
       stats->n_rerank_reads++;
     }
@@ -593,8 +575,8 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
     out.reserve(n_cand);
     for (size_t i = 0; i < n_cand; ++i) {
       const uint32_t id = retset[i].id;
-      const auto it = exact_by_id.find(id);
-      out.emplace_back(id, it != exact_by_id.end() ? it->second : retset[i].distance);
+      const float exact = td.exact_dist(id);
+      out.emplace_back(id, !ThreadData::is_missing_exact(exact) ? exact : retset[i].distance);
     }
   }
 
