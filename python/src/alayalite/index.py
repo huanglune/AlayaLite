@@ -8,6 +8,7 @@ and querying a single vector index.
 """
 
 import os
+import shutil
 from typing import List, Optional
 
 import numpy as np
@@ -24,6 +25,43 @@ from .schema import IndexParams, load_schema
 from .utils import normalize_vectors_for_cosine_metric
 
 
+def _record_cleanup_error(fit_error: Exception, cleanup_step: str, cleanup_error: Exception) -> None:
+    message = f"{cleanup_step} failed during failed fit cleanup: {cleanup_error}"
+    add_note = getattr(fit_error, "add_note", None)
+    if add_note is not None:
+        add_note(message)
+        return
+    fit_error.args = (*fit_error.args, message)
+
+
+def _can_remove_rocksdb_path_on_failed_fit(rocksdb_path: str) -> bool:
+    if not rocksdb_path:
+        return False
+    if not os.path.exists(rocksdb_path):
+        return True
+    return os.path.isdir(rocksdb_path) and not os.listdir(rocksdb_path)
+
+
+def _cleanup_failed_fit(
+    index: _PyIndexInterface,
+    rocksdb_path: str,
+    remove_rocksdb_path: bool,
+    fit_error: Exception,
+) -> None:
+    try:
+        index.close_db()
+    except Exception as cleanup_error:  # pylint: disable=broad-exception-caught
+        _record_cleanup_error(fit_error, "close_db", cleanup_error)
+
+    if not remove_rocksdb_path or not os.path.exists(rocksdb_path):
+        return
+
+    try:
+        shutil.rmtree(rocksdb_path)
+    except Exception as cleanup_error:  # pylint: disable=broad-exception-caught
+        _record_cleanup_error(fit_error, f"remove RocksDB path {rocksdb_path!r}", cleanup_error)
+
+
 # Pylint is incorrectly flagging used private members.
 # pylint: disable=unused-private-member
 class Index:
@@ -31,7 +69,7 @@ class Index:
     The Index class provides a Python interface for managing and querying vector indices.
     """
 
-    def __init__(self, name: str = "default", params: IndexParams = IndexParams()):
+    def __init__(self, name: str = "default", params: Optional[IndexParams] = None):
         """
         Initialize a new Index instance.
 
@@ -40,7 +78,7 @@ class Index:
             params (IndexParams): Configuration parameters for the index.
         """
         self.__name = name
-        self.__params = params
+        self.__params = params if params is not None else IndexParams()
         self.__index = None  # late initialization
         self.__is_initialized = False
         self.__dim = None  # It will be set when fitting the index
@@ -104,10 +142,7 @@ class Index:
         vectors = vectors.astype(self.__params.data_type, copy=False)
 
         self.__params.fill_none_values()
-        self.__dim = vectors.shape[1]
-        self.__index = _PyIndexInterface(self.__params.to_cpp_params())
-        self.__is_initialized = True
-
+        dim = vectors.shape[1]
         vectors = normalize_vectors_for_cosine_metric(vectors, self.__params.metric)
 
         print(
@@ -115,13 +150,28 @@ class Index:
             f"  vectors.shape: {vectors.shape}, num_threads: {num_threads}, ef_construction: {ef_construction}\n"
             f"start fitting index..."
         )
-        self.__index.fit(vectors, ef_construction, num_threads, item_ids, documents, metadata_list)
+        index = _PyIndexInterface(self.__params.to_cpp_params())
+        remove_rocksdb_path_on_failure = _can_remove_rocksdb_path_on_failed_fit(self.__params.rocksdb_path)
+        try:
+            index.fit(vectors, ef_construction, num_threads, item_ids, documents, metadata_list)
+        except Exception as fit_error:
+            _cleanup_failed_fit(
+                index,
+                self.__params.rocksdb_path,
+                remove_rocksdb_path_on_failure,
+                fit_error,
+            )
+            raise
+        self.__index = index
+        self.__dim = dim
+        self.__is_initialized = True
 
     def insert(self, vectors: VectorLike, ef: int = 100):
         """
         Insert a new vector into the index.
         """
         _assert(self.__index is not None, "Index is not init yet")
+        vectors = np.asarray(vectors, dtype=self.__params.data_type)
         _assert(vectors.ndim == 1, "vectors must be a 1D array")
         _assert(
             vectors.shape[0] == self.__dim,
