@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-06-30
+
+### Changed
+- perf(diskann): reduce search scratch allocations (#101)
+
+### Fixed
+- fix(python): preserve API state on failed operations (#102)
+
 ## [1.0.1] - 2026-06-20
 
 ### Added
@@ -299,7 +307,8 @@ First stable release of AlayaLite. Highlights since the 0.1.x alpha line:
 - RAG components (embedders, chunkers)
 - Basic CI/CD pipeline
 
-[Unreleased]: https://github.com/AlayaDB-AI/AlayaLite/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/AlayaDB-AI/AlayaLite/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/AlayaDB-AI/AlayaLite/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/AlayaDB-AI/AlayaLite/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/AlayaDB-AI/AlayaLite/compare/v0.1.1a1...v1.0.0
 [0.1.1-alpha1]: https://github.com/AlayaDB-AI/AlayaLite/compare/v0.1.0a3...v0.1.1a1
