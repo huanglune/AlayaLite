@@ -112,11 +112,15 @@ inline void scan_and_insert_neighbors(alaya::vamana::NeighborPriorityQueue &rets
                                       uint32_t n_nbrs,
                                       const PQTable &pq,
                                       const float *pq_table,
-                                      uint64_t num_points) {
+                                      uint64_t num_points,
+                                      const TombstoneBitmap *tombstone = nullptr) {
   for (uint32_t k = 0; k < n_nbrs; ++k) {
     const uint32_t m = nbrs[k];
     if (m >= num_points) {
       continue;  // defensive: ignore corrupt neighbor ids
+    }
+    if (tombstone != nullptr && tombstone->is_deleted(m)) {
+      continue;
     }
     if (!visited.test_and_set(m)) {
       continue;
@@ -420,7 +424,8 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
                               view.n_nbrs(),
                               pq,
                               pq_table,
-                              ctx.num_points);
+                              ctx.num_points,
+                              ctx.tombstone);
   };
 
   std::vector<AlignedRead> reqs;
@@ -541,6 +546,9 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
   // ---------------- Result extraction (PQ) ----------------
   std::vector<std::pair<uint32_t, float>> out;
   std::vector<AlignedRead> rerank_req(1);
+  auto is_live = [&](uint32_t id) {
+    return ctx.tombstone == nullptr || !ctx.tombstone->is_deleted(id);
+  };
 
   auto read_exact_sync = [&](uint32_t id) -> float {
     const float known = td.exact_dist(id);
@@ -563,18 +571,22 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
     // Re-score the top PQ candidates with exact L2.
     const size_t want =
         params.rerank_count > 0 ? params.rerank_count : static_cast<size_t>(top_k) * 3;
-    const size_t n_cand = std::min<size_t>(retset.size(), want);
-    out.reserve(n_cand);
-    for (size_t i = 0; i < n_cand; ++i) {
+    out.reserve(std::min<size_t>(retset.size(), want));
+    for (size_t i = 0; i < retset.size() && out.size() < want; ++i) {
       const uint32_t id = retset[i].id;
+      if (!is_live(id)) {
+        continue;
+      }
       out.emplace_back(id, read_exact_sync(id));
     }
   } else {
     // Top candidates ranked by PQ distance (exact where known during traversal).
-    const size_t n_cand = std::min<size_t>(retset.size(), static_cast<size_t>(top_k));
-    out.reserve(n_cand);
-    for (size_t i = 0; i < n_cand; ++i) {
+    out.reserve(std::min<size_t>(retset.size(), static_cast<size_t>(top_k)));
+    for (size_t i = 0; i < retset.size() && out.size() < top_k; ++i) {
       const uint32_t id = retset[i].id;
+      if (!is_live(id)) {
+        continue;
+      }
       const float exact = td.exact_dist(id);
       out.emplace_back(id, !ThreadData::is_missing_exact(exact) ? exact : retset[i].distance);
     }

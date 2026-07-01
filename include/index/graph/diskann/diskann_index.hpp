@@ -25,6 +25,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -35,12 +36,17 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_set>
 #include <vector>
 
+#include "coro/sync_wait.hpp"
+#include "coro/task.hpp"
+#include "coro/thread_pool.hpp"
+#include "coro/when_all.hpp"
 #include "index/graph/diskann/beam_search.hpp"
 #include "index/graph/diskann/disk_layout.hpp"
 #include "index/graph/diskann/disk_page_io.hpp"
@@ -59,6 +65,8 @@
 namespace alaya::diskann {
 
 inline constexpr uint32_t kDefaultDiskANNScratchSearchListSize = 150;
+inline constexpr uint32_t kDefaultDiskANNUpdateReconnectThreads = 4;
+inline constexpr uint32_t kDefaultDiskANNUpdateInsertThreads = 32;
 
 /// Build-time configuration.
 struct DiskANNBuildParams {
@@ -88,12 +96,17 @@ struct DiskANNLoadParams {
   ///< No-PQ neighbor scratch capacity, in search-list entries. Set this >= the
   ///< largest DiskANNSearchParams::search_list_size used after load.
 
-  // --- In-place update mode (No-PQ only; see disk-update specs) ---
-  bool updatable = false;          ///< open O_RDWR + enable insert/remove/update_node/flush
-  uint32_t update_search_l = 100;  ///< L for the insert NN-search (candidate pool before prune)
-  float update_alpha = 1.2f;       ///< alpha-RNG pruning for insert/reconnect (Vamana default)
-  double safety_net_ratio = 0.05;  ///< tombstone ratio that arms the safety-net reconnect
-  uint64_t safety_net_ops = 16;    ///< deletes without an insert before the safety net may fire
+  // --- In-place update mode ---
+  bool updatable = false;             ///< open O_RDWR + enable insert/remove/update_node/flush
+  uint32_t update_search_l = 100;     ///< L for the insert NN-search (candidate pool before prune)
+  float update_alpha = 1.2f;          ///< alpha-RNG pruning for insert/reconnect (Vamana default)
+  double safety_net_ratio = 0.05;     ///< tombstone ratio that arms the safety-net reconnect
+  uint64_t safety_net_ops = 16;       ///< deletes without an insert before the safety net may fire
+  size_t page_cache_capacity = 4096;  ///< update-path page LRU cache capacity; 0 disables it
+  uint32_t update_insert_threads = kDefaultDiskANNUpdateInsertThreads;
+  ///< Coroutine worker count for batch_insert's outer insert concurrency.
+  uint32_t update_reconnect_threads = kDefaultDiskANNUpdateReconnectThreads;
+  ///< Coroutine worker count for reconnecting a single insert's pruned neighbors.
 };
 
 /// Per-query search configuration.
@@ -282,7 +295,16 @@ class DiskANNIndex {
     reader_ = make_aligned_file_reader();
     reader_->open(path(index_dir, "diskann.index"));
     beam_width_ = std::max<uint32_t>(1, params.beam_width);
-    const uint32_t pool = std::max<uint32_t>(1, params.num_threads);
+    uint32_t pool = std::max<uint32_t>(1, params.num_threads);
+    if (params.updatable) {
+      if (params.update_insert_threads == 0) {
+        throw std::invalid_argument("DiskANNIndex::load: update_insert_threads must be > 0");
+      }
+      if (params.update_reconnect_threads == 0) {
+        throw std::invalid_argument("DiskANNIndex::load: update_reconnect_threads must be > 0");
+      }
+      pool = std::max({pool, params.update_insert_threads, params.update_reconnect_threads});
+    }
     const uint32_t pq_table_entries = has_pq_ ? pq_n_chunks_ * kPQNumCentroids : 0;
     // One page slot per concurrent read. nopq_io_depth = 0 resolves to the
     // benchmark-tuned default (kDefaultNoPQIoDepth = 32); No-PQ issues far more
@@ -357,9 +379,9 @@ class DiskANNIndex {
       throw std::invalid_argument("DiskANNIndex::search: null output buffers");
     }
 
-    std::unique_lock<std::mutex> serial_lock;
+    std::shared_lock<std::shared_mutex> search_lock;
     if (updatable_) {
-      serial_lock = std::unique_lock<std::mutex>(update_mutex_);
+      search_lock = std::shared_lock<std::shared_mutex>(update_mutex_);
     }
 
     ThreadData *td = acquire();
@@ -488,49 +510,78 @@ class DiskANNIndex {
     if (query == nullptr) {
       throw std::invalid_argument("DiskANNIndex::insert: null query");
     }
-    std::lock_guard<std::mutex> lock(update_mutex_);
+    std::unique_lock<std::shared_mutex> lock(update_mutex_);
     page_io_->clear_cache();
 
-    const auto cand = run_update_search(query, update_search_l_);
-
-    std::vector<alaya::vamana::Neighbor> pool;
-    pool.reserve(cand.size());
-    for (const auto &c : cand) {
-      pool.emplace_back(c.first, c.second);
+    const std::vector<uint32_t> pruned = select_insert_neighbors(query);
+    uint32_t slot = 0;
+    {
+      std::lock_guard<std::mutex> slot_lock(slot_mutex_);
+      slot = allocate_update_slot_unlocked(label);
+      resize_thread_data_slot_capacity();
     }
-    std::vector<uint32_t> pruned;
-    std::vector<float> occlude_scratch;
-    auto dist_fn = [this](uint32_t a, uint32_t b) -> float {
-      return cached_l2(a, b);
-    };
-    const uint32_t maxc = std::max<uint32_t>(max_degree_, static_cast<uint32_t>(pool.size()));
-    alaya::vamana::prune_neighbors(kNoSelf,
-                                   pool,
-                                   update_alpha_,
-                                   max_degree_,
-                                   maxc,
-                                   pruned,
-                                   occlude_scratch,
-                                   dist_fn);
-
-    const uint32_t slot = slot_alloc_.alloc();
-    update_ctx_.forget_slot(slot);
-    max_slot_id_ = std::max<uint64_t>(max_slot_id_, slot_alloc_.next_fresh_id());
-    resize_thread_data_slot_capacity();
-
-    page_io_->write_node(slot, query, static_cast<uint32_t>(pruned.size()), pruned.data());
-
-    set_label(slot, label);
-    ++live_count_;
-    ops_since_last_insert_ = 0;
-
-    for (const uint32_t n : pruned) {
-      update_ctx_.inserted_edges_[n].push_back(slot);
-    }
-    for (const uint32_t n : pruned) {
-      update_node_impl(n);
-    }
+    encode_pq_slot(query, slot);
+    write_inserted_node(slot, query, pruned);
+    reconnect_inserted_neighbors(pruned, slot);
+    page_io_->flush_dirty_pages();
     return slot;
+  }
+
+  /// Insert a batch of row-major vectors. The synchronous API is preserved, but
+  /// the work is scheduled as coroutine tasks in chunks of @p batch_size.
+  std::vector<uint32_t> batch_insert(const float *vectors,
+                                     const uint64_t *labels,
+                                     uint32_t count,
+                                     uint32_t batch_size = 32) {
+    if (!updatable_) {
+      throw std::runtime_error("DiskANNIndex::batch_insert: index not loaded in updatable mode");
+    }
+    if (count == 0) {
+      return {};
+    }
+    if (vectors == nullptr || labels == nullptr) {
+      throw std::invalid_argument("DiskANNIndex::batch_insert: null vectors/labels");
+    }
+    if (batch_size == 0) {
+      throw std::invalid_argument("DiskANNIndex::batch_insert: batch_size must be > 0");
+    }
+
+    std::unique_lock<std::shared_mutex> update_lock(update_mutex_);
+    page_io_->clear_cache();
+
+    std::vector<uint32_t> ids(count, 0);
+    std::vector<std::vector<uint32_t>> pruned(count);
+    const uint32_t workers = std::min({batch_size, count, update_insert_threads_});
+    coro::thread_pool pool{{.thread_count = workers,
+                            .on_thread_start_functor = nullptr,
+                            .on_thread_stop_functor = nullptr}};
+
+    auto plan_one = [this, &pool, vectors, &pruned](uint32_t i) -> coro::task<> {
+      co_await pool.schedule();
+      pruned[i] = select_insert_neighbors(vectors + static_cast<uint64_t>(i) * dim_);
+    };
+    auto write_one = [this, &pool, vectors, &ids, &pruned](uint32_t i) -> coro::task<> {
+      co_await pool.schedule();
+      const float *vec = vectors + static_cast<uint64_t>(i) * dim_;
+      encode_pq_slot(vec, ids[i]);
+      write_inserted_node(ids[i], vec, pruned[i]);
+    };
+
+    try {
+      for (uint32_t off = 0; off < count; off += batch_size) {
+        const uint32_t end = std::min<uint32_t>(count, off + batch_size);
+        run_batch_tasks(off, end, plan_one);
+        reserve_batch_insert_slots(labels, ids, off, end);
+        run_batch_tasks(off, end, write_one);
+        run_batch_reconnect_tasks(off, end, ids, pruned, pool);
+      }
+      page_io_->flush_dirty_pages();
+    } catch (...) {
+      pool.shutdown();
+      throw;
+    }
+    pool.shutdown();
+    return ids;
   }
 
   /// Lazy-delete: cache old neighbors for two-hop, tombstone + free the slot.
@@ -539,51 +590,39 @@ class DiskANNIndex {
     if (!updatable_) {
       throw std::runtime_error("DiskANNIndex::remove: index not loaded in updatable mode");
     }
-    std::lock_guard<std::mutex> lock(update_mutex_);
-    if (internal_id >= max_slot_id_) {
-      throw std::invalid_argument("DiskANNIndex::remove: internal_id out of range");
-    }
-    if (slot_alloc_.is_deleted(internal_id)) {
-      throw std::invalid_argument("DiskANNIndex::remove: node already deleted");
-    }
+    std::unique_lock<std::shared_mutex> lock(update_mutex_);
+    validate_removable_slot(internal_id);
     page_io_->clear_cache();
-
-    // 1. Read coords + old neighbors before tombstoning.
-    const DiskPageIO::NodeData nd = page_io_->read_node(internal_id);
-    update_ctx_.removed_node_nbrs_[internal_id] = nd.nbrs;
-
-    // 2. Tombstone + free slot.
-    slot_alloc_.free(internal_id);
-    --live_count_;
-    ++ops_since_last_insert_;
-
-    // 3. IP-DiskANN: search around deleted point for repair candidates.
-    const auto cand = run_update_search(nd.coords.data(), update_search_l_);
-    std::vector<uint32_t> candidates;
-    candidates.reserve(cand.size());
-    for (const auto &c : cand) {
-      candidates.push_back(c.first);
+    remove_unlocked(internal_id);
+    if (maybe_safety_net_reconnect()) {
+      page_io_->flush_dirty_pages();
     }
+  }
 
-    // 4. Nodes to reconnect = old neighbors ∪ search results (live only).
-    std::unordered_set<uint32_t> nodes_to_upd;
-    for (const uint32_t nbr : nd.nbrs) {
-      if (!slot_alloc_.is_deleted(nbr)) {
-        nodes_to_upd.insert(nbr);
-      }
+  /// Lazy-delete a batch of internal ids using the same semantics as remove().
+  /// The batch form amortizes update locking and cache setup over Yi-style
+  /// delete rounds.
+  void batch_remove(const uint32_t *internal_ids, uint32_t count) {
+    if (!updatable_) {
+      throw std::runtime_error("DiskANNIndex::batch_remove: index not loaded in updatable mode");
     }
-    for (const uint32_t c : candidates) {
-      if (!slot_alloc_.is_deleted(c)) {
-        nodes_to_upd.insert(c);
-      }
+    if (count == 0) {
+      return;
     }
-
-    // 5. IP-DiskANN reconnect: each affected node gets c replacement edges.
+    if (internal_ids == nullptr) {
+      throw std::invalid_argument("DiskANNIndex::batch_remove: null ids");
+    }
+    std::unique_lock<std::shared_mutex> lock(update_mutex_);
+    validate_remove_batch(internal_ids, count);
     page_io_->clear_cache();
-    for (const uint32_t nid : nodes_to_upd) {
-      update_node_ipdiskann(nid, candidates);
+    std::vector<std::vector<uint32_t>> old_neighbors =
+        page_io_->read_neighbors_batch_parallel(internal_ids, count, update_insert_threads_);
+    for (uint32_t i = 0; i < count; ++i) {
+      remove_unlocked_with_neighbors(internal_ids[i], std::move(old_neighbors[i]));
     }
-    maybe_safety_net_reconnect();
+    if (maybe_safety_net_reconnect()) {
+      page_io_->flush_dirty_pages();
+    }
   }
 
   /**
@@ -594,7 +633,7 @@ class DiskANNIndex {
     if (!updatable_) {
       throw std::runtime_error("DiskANNIndex::update_node: index not loaded in updatable mode");
     }
-    std::lock_guard<std::mutex> lock(update_mutex_);
+    std::unique_lock<std::shared_mutex> lock(update_mutex_);
     if (node_id >= max_slot_id_) {
       throw std::invalid_argument("DiskANNIndex::update_node: node_id out of range");
     }
@@ -603,6 +642,7 @@ class DiskANNIndex {
     }
     page_io_->clear_cache();
     update_node_impl(node_id);
+    page_io_->flush_dirty_pages();
   }
 
   /// Persist meta + ids + slot allocator state to disk.
@@ -610,18 +650,25 @@ class DiskANNIndex {
     if (!updatable_) {
       throw std::runtime_error("DiskANNIndex::flush: index not loaded in updatable mode");
     }
-    std::lock_guard<std::mutex> lock(update_mutex_);
+    std::unique_lock<std::shared_mutex> lock(update_mutex_);
+    page_io_->flush_dirty_pages();
     MetaHeader m;
     m.num_points = max_slot_id_;
     m.dim = dim_;
     m.max_degree = max_degree_;
     m.medoid = medoid_;
-    m.has_pq = 0;
-    m.pq_n_chunks = 0;
+    m.has_pq = has_pq_ ? 1 : 0;
+    m.pq_n_chunks = pq_n_chunks_;
     m.node_len = geom_.node_len;
     m.nodes_per_sector = geom_.nodes_per_sector;
     m.max_slot_id = max_slot_id_;
     m.live_count = live_count_;
+    if (has_pq_) {
+      if (pq_.num_points() != max_slot_id_) {
+        throw std::runtime_error("DiskANNIndex::flush: PQ code count does not match max_slot_id");
+      }
+      pq_.save(path(index_dir_, "pq_pivots.bin"), path(index_dir_, "pq_compressed.bin"));
+    }
     write_meta(path(index_dir_, "meta.bin"), m);
     write_ids(path(index_dir_, "ids.bin"), labels_.data(), labels_.size());
     slot_alloc_.save(path(index_dir_, "slots.bin"));
@@ -629,7 +676,7 @@ class DiskANNIndex {
 
  private:
   static constexpr uint32_t kNoSelf = std::numeric_limits<uint32_t>::max();
-  static constexpr uint32_t kIPDiskANNCopies = 3;
+  static constexpr size_t kUpdateNodeLockStripes = 4096;
 
   struct MetaHeader {
     uint64_t num_points = 0;
@@ -652,20 +699,26 @@ class DiskANNIndex {
 
   /// Wire up the update subsystem (page IO, slot allocator, context, config).
   void init_updatable(const std::string &index_dir, const DiskANNLoadParams &params) {
-    if (has_pq_) {
-      throw std::runtime_error(
-          "DiskANNIndex::load: updatable mode requires a No-PQ index (PQ updates unsupported)");
-    }
     index_dir_ = index_dir;
     update_alpha_ = params.update_alpha;
     update_search_l_ = std::max<uint32_t>(1, params.update_search_l);
     safety_net_ratio_ = params.safety_net_ratio;
     safety_net_ops_ = params.safety_net_ops;
+    if (params.update_reconnect_threads == 0) {
+      throw std::invalid_argument("DiskANNIndex::load: update_reconnect_threads must be > 0");
+    }
+    if (params.update_insert_threads == 0) {
+      throw std::invalid_argument("DiskANNIndex::load: update_insert_threads must be > 0");
+    }
+    update_insert_threads_ = params.update_insert_threads;
+    update_reconnect_threads_ = params.update_reconnect_threads;
     safety_net_fires_ = 0;
     ops_since_last_insert_ = 0;
     update_ctx_.clear();
 
-    page_io_ = std::make_unique<DiskPageIO>(path(index_dir, "diskann.index"), geom_);
+    page_io_ = std::make_unique<DiskPageIO>(path(index_dir, "diskann.index"),
+                                            geom_,
+                                            params.page_cache_capacity);
 
     const std::string slots_path = path(index_dir, "slots.bin");
     if (std::filesystem::exists(slots_path)) {
@@ -678,7 +731,8 @@ class DiskANNIndex {
     updatable_ = true;
   }
 
-  /// Tombstone-aware exact-L2 NN search returning up to @p l (id, dist) candidates.
+  /// Tombstone-aware update search returning up to @p l (id, dist) candidates.
+  /// PQ indexes use PQ beam distances; No-PQ indexes use exact-L2 disk greedy.
   std::vector<std::pair<uint32_t, float>> run_update_search(const float *query, uint32_t l) {
     ThreadData *td = acquire();
     std::vector<std::pair<uint32_t, float>> results;
@@ -687,17 +741,17 @@ class DiskANNIndex {
       ctx.reader = reader_.get();
       ctx.geom = &geom_;
       ctx.cache = &cache_;
-      ctx.pq = nullptr;
+      ctx.pq = has_pq_ ? &pq_ : nullptr;
       ctx.medoid = medoid_;
       ctx.num_points = max_slot_id_;
       ctx.tombstone = &slot_alloc_.tombstone();
       SearchParams sp;
       sp.search_list_size = l;
       sp.beam_width = beam_width_;
-      sp.use_pq = false;
+      sp.use_pq = has_pq_;
       sp.rerank = false;
-      sp.deterministic = true;  // reproducible graph construction
-      results = disk_greedy_search(ctx, query, l, sp, *td, nullptr);
+      sp.deterministic = false;
+      results = cached_beam_search(ctx, query, l, sp, *td, nullptr);
     } catch (...) {
       release(td);
       throw;
@@ -709,81 +763,285 @@ class DiskANNIndex {
   /// Cached L2 distance between two nodes via the page IO coords cache.
   float cached_l2(uint32_t a, uint32_t b) {
     const auto l2 = alaya::simd::get_l2_sqr_func();
-    const std::vector<float> &ca = page_io_->read_coords_cached(a);
-    const std::vector<float> &cb = page_io_->read_coords_cached(b);
+    const std::vector<float> ca = page_io_->read_coords_cached(a);
+    const std::vector<float> cb = page_io_->read_coords_cached(b);
     return l2(ca.data(), cb.data(), dim_);
   }
 
-  /// Shared reconnect backbone: score candidates, prune, write if changed,
-  /// consume inserted_edges for node_id.
-  void prune_and_write(uint32_t node_id,
-                       const std::vector<uint32_t> &old_nbrs,
-                       std::unordered_set<uint32_t> &cand) {
-    const auto ins_it = update_ctx_.inserted_edges_.find(node_id);
-    if (ins_it != update_ctx_.inserted_edges_.end()) {
-      for (const uint32_t v : ins_it->second) {
-        if (v != node_id && !slot_alloc_.is_deleted(v)) {
-          cand.insert(v);
-        }
-      }
+  template <typename DistFn>
+  std::vector<uint32_t> prune_insert_pool(std::vector<alaya::vamana::Neighbor> &pool,
+                                          DistFn dist_fn) {
+    std::vector<uint32_t> pruned;
+    std::vector<float> occlude_scratch;
+    const uint32_t maxc = std::max<uint32_t>(max_degree_, static_cast<uint32_t>(pool.size()));
+    alaya::vamana::prune_neighbors(kNoSelf,
+                                   pool,
+                                   update_alpha_,
+                                   max_degree_,
+                                   maxc,
+                                   pruned,
+                                   occlude_scratch,
+                                   dist_fn);
+    return pruned;
+  }
+
+  std::vector<uint32_t> select_insert_neighbors_exact(const float *query) {
+    const auto cand = run_update_search(query, update_search_l_);
+    std::vector<alaya::vamana::Neighbor> pool;
+    pool.reserve(cand.size());
+    for (const auto &c : cand) {
+      pool.emplace_back(c.first, c.second);
     }
+    auto dist_fn = [this](uint32_t a, uint32_t b) -> float {
+      return cached_l2(a, b);
+    };
+    return prune_insert_pool(pool, dist_fn);
+  }
 
-    if (!cand.empty()) {
-      const std::vector<float> &self_coords = page_io_->read_coords_cached(node_id);
-      const auto l2 = alaya::simd::get_l2_sqr_func();
-      std::vector<alaya::vamana::Neighbor> pool;
-      pool.reserve(cand.size());
-      for (const uint32_t c : cand) {
-        const std::vector<float> &cc = page_io_->read_coords_cached(c);
-        pool.emplace_back(c, l2(self_coords.data(), cc.data(), dim_));
-      }
-
-      std::vector<uint32_t> new_nbrs;
-      if (pool.size() <= max_degree_) {
-        std::sort(pool.begin(), pool.end());
-        for (const auto &nb : pool) {
-          new_nbrs.push_back(nb.id);
-        }
-      } else {
-        std::vector<float> occlude_scratch;
-        auto dist_fn = [this](uint32_t a, uint32_t b) -> float {
-          return cached_l2(a, b);
-        };
-        alaya::vamana::prune_neighbors(node_id,
-                                       pool,
-                                       update_alpha_,
-                                       max_degree_,
-                                       static_cast<uint32_t>(pool.size()),
-                                       new_nbrs,
-                                       occlude_scratch,
-                                       dist_fn);
-      }
-
-      if (!same_neighbor_set(old_nbrs, new_nbrs)) {
-        page_io_->write_node_neighbors(node_id,
-                                       static_cast<uint32_t>(new_nbrs.size()),
-                                       new_nbrs.data());
-      }
+  std::vector<uint32_t> select_insert_neighbors_pq(const float *query) {
+    const auto cand = run_update_search(query, update_search_l_);
+    std::vector<uint8_t> query_code(pq_n_chunks_);
+    pq_.encode_to_code(query, query_code.data());
+    std::vector<alaya::vamana::Neighbor> pool;
+    pool.reserve(cand.size());
+    for (const auto &c : cand) {
+      pool.emplace_back(c.first, pq_.pq_symmetric_distance(query_code.data(), c.first));
     }
+    auto dist_fn = [this](uint32_t a, uint32_t b) -> float {
+      return pq_.pq_symmetric_distance(a, b);
+    };
+    return prune_insert_pool(pool, dist_fn);
+  }
 
-    if (ins_it != update_ctx_.inserted_edges_.end()) {
-      update_ctx_.inserted_edges_.erase(ins_it);
+  std::vector<uint32_t> select_insert_neighbors(const float *query) {
+    if (has_pq_) {
+      return select_insert_neighbors_pq(query);
+    }
+    return select_insert_neighbors_exact(query);
+  }
+
+  uint32_t allocate_update_slot_unlocked(uint64_t label) {
+    const uint32_t slot = slot_alloc_.alloc();
+    update_ctx_.forget_slot(slot);
+    max_slot_id_ = std::max<uint64_t>(max_slot_id_, slot_alloc_.next_fresh_id());
+    set_label(slot, label);
+    ++live_count_;
+    ops_since_last_insert_ = 0;
+    return slot;
+  }
+
+  void reserve_batch_insert_slots(const uint64_t *labels,
+                                  std::vector<uint32_t> &ids,
+                                  uint32_t begin,
+                                  uint32_t end) {
+    std::lock_guard<std::mutex> slot_lock(slot_mutex_);
+    for (uint32_t i = begin; i < end; ++i) {
+      ids[i] = allocate_update_slot_unlocked(labels[i]);
+    }
+    resize_thread_data_slot_capacity();
+  }
+
+  void encode_pq_slot(const float *query, uint32_t slot) {
+    if (!has_pq_) {
+      return;
+    }
+    std::lock_guard<std::mutex> pq_lock(pq_mutex_);
+    pq_.encode_one(query, slot);
+  }
+
+  void validate_removable_slot(uint32_t internal_id) const {
+    if (internal_id >= max_slot_id_) {
+      throw std::invalid_argument("DiskANNIndex::remove: internal_id out of range");
+    }
+    if (slot_alloc_.is_deleted(internal_id)) {
+      throw std::invalid_argument("DiskANNIndex::remove: node already deleted");
     }
   }
 
-  /// Reconnect node_id's neighbor list: candidates = live old + two-hop through
-  /// deleted + inserted reverse edges, exact-L2 ranked, alpha-RNG pruned.
+  void validate_remove_batch(const uint32_t *internal_ids, uint32_t count) const {
+    std::unordered_set<uint32_t> seen;
+    seen.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+      validate_removable_slot(internal_ids[i]);
+      if (!seen.insert(internal_ids[i]).second) {
+        throw std::invalid_argument("DiskANNIndex::batch_remove: duplicate internal_id");
+      }
+    }
+  }
+
+  void remove_unlocked(uint32_t internal_id) {
+    const DiskPageIO::NodeData nd = page_io_->read_node(internal_id);
+    remove_unlocked_with_neighbors(internal_id, nd.nbrs);
+  }
+
+  void remove_unlocked_with_neighbors(uint32_t internal_id, std::vector<uint32_t> old_neighbors) {
+    update_ctx_.removed_node_nbrs_[internal_id] = std::move(old_neighbors);
+    slot_alloc_.free(internal_id);
+    --live_count_;
+    ++ops_since_last_insert_;
+  }
+
+  void write_inserted_node(uint32_t slot,
+                           const float *query,
+                           const std::vector<uint32_t> &neighbors) {
+    page_io_->write_node(slot, query, static_cast<uint32_t>(neighbors.size()), neighbors.data());
+  }
+
+  template <typename MakeTask>
+  void run_batch_tasks(uint32_t begin, uint32_t end, MakeTask make_task) {
+    auto run = [&]() -> coro::task<> {
+      std::vector<coro::task<>> tasks;
+      tasks.reserve(end - begin);
+      for (uint32_t i = begin; i < end; ++i) {
+        tasks.emplace_back(make_task(i));
+      }
+      co_await coro::when_all(std::move(tasks));
+    };
+    coro::sync_wait(run());
+  }
+
+  void run_batch_reconnect_tasks(uint32_t begin,
+                                 uint32_t end,
+                                 const std::vector<uint32_t> &ids,
+                                 const std::vector<std::vector<uint32_t>> &pruned,
+                                 coro::thread_pool &pool) {
+    size_t task_count = 0;
+    for (uint32_t i = begin; i < end; ++i) {
+      task_count += pruned[i].size();
+    }
+    if (task_count == 0) {
+      return;
+    }
+    auto reconnect_one = [this, &pool](uint32_t node_id, uint32_t slot) -> coro::task<> {
+      co_await pool.schedule();
+      update_node_impl_for_insert(node_id, slot);
+    };
+    auto run = [&]() -> coro::task<> {
+      std::vector<coro::task<>> tasks;
+      tasks.reserve(task_count);
+      for (uint32_t i = begin; i < end; ++i) {
+        for (const uint32_t node_id : pruned[i]) {
+          tasks.emplace_back(reconnect_one(node_id, ids[i]));
+        }
+      }
+      co_await coro::when_all(std::move(tasks));
+    };
+    coro::sync_wait(run());
+  }
+
+  void add_extra_edges(uint32_t node_id,
+                       const std::vector<uint32_t> &extra_edges,
+                       std::unordered_set<uint32_t> &cand) const {
+    for (const uint32_t v : extra_edges) {
+      if (v != node_id && !slot_alloc_.is_deleted(v)) {
+        cand.insert(v);
+      }
+    }
+  }
+
+  std::vector<alaya::vamana::Neighbor> score_candidates(uint32_t node_id,
+                                                        const std::unordered_set<uint32_t> &cand) {
+    if (has_pq_) {
+      return score_candidates_pq(node_id, cand);
+    }
+    const std::vector<float> self_coords = page_io_->read_coords_cached(node_id);
+    const auto l2 = alaya::simd::get_l2_sqr_func();
+    std::vector<alaya::vamana::Neighbor> pool;
+    pool.reserve(cand.size());
+    for (const uint32_t c : cand) {
+      const std::vector<float> cc = page_io_->read_coords_cached(c);
+      pool.emplace_back(c, l2(self_coords.data(), cc.data(), dim_));
+    }
+    return pool;
+  }
+
+  std::vector<alaya::vamana::Neighbor> score_candidates_pq(
+      uint32_t node_id,
+      const std::unordered_set<uint32_t> &cand) {
+    std::vector<alaya::vamana::Neighbor> pool;
+    pool.reserve(cand.size());
+    for (const uint32_t c : cand) {
+      pool.emplace_back(c, pq_.pq_symmetric_distance(node_id, c));
+    }
+    return pool;
+  }
+
+  template <typename DistFn>
+  std::vector<uint32_t> prune_candidate_pool_with_dist(uint32_t node_id,
+                                                       std::vector<alaya::vamana::Neighbor> &pool,
+                                                       DistFn dist_fn) {
+    std::vector<uint32_t> new_nbrs;
+    std::vector<float> occlude_scratch;
+    alaya::vamana::prune_neighbors(node_id,
+                                   pool,
+                                   update_alpha_,
+                                   max_degree_,
+                                   static_cast<uint32_t>(pool.size()),
+                                   new_nbrs,
+                                   occlude_scratch,
+                                   dist_fn);
+    return new_nbrs;
+  }
+
+  std::vector<uint32_t> prune_candidate_pool(uint32_t node_id,
+                                             std::vector<alaya::vamana::Neighbor> &pool) {
+    std::vector<uint32_t> new_nbrs;
+    if (pool.size() <= max_degree_) {
+      std::sort(pool.begin(), pool.end());
+      for (const auto &nb : pool) {
+        new_nbrs.push_back(nb.id);
+      }
+      return new_nbrs;
+    }
+    if (has_pq_) {
+      auto dist_fn = [this](uint32_t a, uint32_t b) -> float {
+        return pq_.pq_symmetric_distance(a, b);
+      };
+      return prune_candidate_pool_with_dist(node_id, pool, dist_fn);
+    }
+    auto dist_fn = [this](uint32_t a, uint32_t b) -> float {
+      return cached_l2(a, b);
+    };
+    return prune_candidate_pool_with_dist(node_id, pool, dist_fn);
+  }
+
+  /// Shared reconnect backbone: score candidates, prune, write if changed.
+  void prune_and_write(uint32_t node_id,
+                       const std::vector<uint32_t> &old_nbrs,
+                       std::unordered_set<uint32_t> &cand,
+                       const std::vector<uint32_t> &extra_edges) {
+    add_extra_edges(node_id, extra_edges, cand);
+    if (cand.empty()) {
+      return;
+    }
+    auto pool = score_candidates(node_id, cand);
+    const std::vector<uint32_t> new_nbrs = prune_candidate_pool(node_id, pool);
+    if (!same_neighbor_set(old_nbrs, new_nbrs)) {
+      page_io_->write_node_neighbors(node_id,
+                                     static_cast<uint32_t>(new_nbrs.size()),
+                                     new_nbrs.data());
+    }
+  }
+
   void update_node_impl(uint32_t node_id) {
+    const std::vector<uint32_t> extra_edges;
+    update_node_impl_locked(node_id, extra_edges);
+  }
+
+  /// Reconnect node_id's neighbor list: candidates = live old + two-hop through
+  /// deleted nodes + explicit extra edges, exact-L2 ranked, alpha-RNG pruned.
+  void update_node_impl(uint32_t node_id, const std::vector<uint32_t> &extra_edges) {
     const DiskPageIO::NodeData nd = page_io_->read_node(node_id);
 
     std::unordered_set<uint32_t> cand;
+    const auto &removed_node_nbrs = update_ctx_.removed_node_nbrs_;
     for (const uint32_t nbr : nd.nbrs) {
       if (nbr == node_id) {
         continue;
       }
       if (slot_alloc_.is_deleted(nbr)) {
-        const auto it = update_ctx_.removed_node_nbrs_.find(nbr);
-        if (it != update_ctx_.removed_node_nbrs_.end()) {
+        const auto it = removed_node_nbrs.find(nbr);
+        if (it != removed_node_nbrs.end()) {
           for (const uint32_t o : it->second) {
             if (o != node_id && !slot_alloc_.is_deleted(o)) {
               cand.insert(o);
@@ -794,48 +1052,72 @@ class DiskANNIndex {
         cand.insert(nbr);
       }
     }
-    prune_and_write(node_id, nd.nbrs, cand);
+    prune_and_write(node_id, nd.nbrs, cand, extra_edges);
   }
 
-  /// IP-DiskANN reconnect: keep live old neighbors + c closest candidates, prune.
-  void update_node_ipdiskann(uint32_t node_id, const std::vector<uint32_t> &candidates) {
-    const DiskPageIO::NodeData nd = page_io_->read_node(node_id);
+  void update_node_impl_locked(uint32_t node_id, const std::vector<uint32_t> &extra_edges) {
+    std::lock_guard<std::mutex> node_lock(update_node_mutex(node_id));
+    update_node_impl(node_id, extra_edges);
+  }
 
-    std::unordered_set<uint32_t> cand;
-    for (const uint32_t nbr : nd.nbrs) {
-      if (nbr != node_id && !slot_alloc_.is_deleted(nbr)) {
-        cand.insert(nbr);
+  void update_node_impl_for_insert(uint32_t node_id, uint32_t inserted_slot) {
+    const std::vector<uint32_t> extra_edges{inserted_slot};
+    update_node_impl_locked(node_id, extra_edges);
+  }
+
+  void reconnect_inserted_neighbors_serial(const std::vector<uint32_t> &neighbors, uint32_t slot) {
+    for (const uint32_t n : neighbors) {
+      update_node_impl_for_insert(n, slot);
+    }
+  }
+
+  void reconnect_inserted_neighbors_parallel(const std::vector<uint32_t> &neighbors,
+                                             uint32_t slot) {
+    const uint32_t workers =
+        std::min<uint32_t>(update_reconnect_threads_, static_cast<uint32_t>(neighbors.size()));
+    coro::thread_pool pool{{.thread_count = workers,
+                            .on_thread_start_functor = nullptr,
+                            .on_thread_stop_functor = nullptr}};
+    auto reconnect_one = [this, &pool, slot](uint32_t node_id) -> coro::task<> {
+      co_await pool.schedule();
+      update_node_impl_for_insert(node_id, slot);
+    };
+    auto run = [&]() -> coro::task<> {
+      std::vector<coro::task<>> tasks;
+      tasks.reserve(neighbors.size());
+      for (const uint32_t node_id : neighbors) {
+        tasks.emplace_back(reconnect_one(node_id));
       }
+      co_await coro::when_all(std::move(tasks));
+    };
+    try {
+      coro::sync_wait(run());
+    } catch (...) {
+      pool.shutdown();
+      throw;
     }
+    pool.shutdown();
+  }
 
-    const std::vector<float> &self_coords = page_io_->read_coords_cached(node_id);
-    const auto l2 = alaya::simd::get_l2_sqr_func();
-    std::vector<std::pair<float, uint32_t>> scored;
-    for (const uint32_t c : candidates) {
-      if (c != node_id && !slot_alloc_.is_deleted(c) && cand.find(c) == cand.end()) {
-        const std::vector<float> &cc = page_io_->read_coords_cached(c);
-        scored.emplace_back(l2(self_coords.data(), cc.data(), dim_), c);
-      }
+  void reconnect_inserted_neighbors(const std::vector<uint32_t> &neighbors, uint32_t slot) {
+    if (neighbors.empty()) {
+      return;
     }
-    std::partial_sort(scored.begin(),
-                      scored.begin() +
-                          static_cast<ptrdiff_t>(std::min<size_t>(kIPDiskANNCopies, scored.size())),
-                      scored.end());
-    for (size_t i = 0; i < std::min<size_t>(kIPDiskANNCopies, scored.size()); ++i) {
-      cand.insert(scored[i].second);
+    if (update_reconnect_threads_ == 1 || neighbors.size() == 1) {
+      reconnect_inserted_neighbors_serial(neighbors, slot);
+      return;
     }
-
-    prune_and_write(node_id, nd.nbrs, cand);
+    reconnect_inserted_neighbors_parallel(neighbors, slot);
   }
 
   /// Lightweight consolidation: just strip dangling edges to tombstoned nodes.
-  void maybe_safety_net_reconnect() {
+  bool maybe_safety_net_reconnect() {
     if (!update_ctx_.needs_safety_net_reconnect(safety_net_ratio_,
                                                 slot_alloc_.tombstone_count(),
                                                 max_slot_id_,
                                                 ops_since_last_insert_,
                                                 safety_net_ops_)) {
-      return;
+      return false;
     }
     std::unordered_set<uint32_t> affected;
     for (const auto &entry : update_ctx_.removed_node_nbrs_) {
@@ -860,6 +1142,7 @@ class DiskANNIndex {
     }
     ops_since_last_insert_ = 0;
     ++safety_net_fires_;
+    return true;
   }
 
   /// Grow labels_ on append; assign in place on slot reuse.
@@ -874,6 +1157,10 @@ class DiskANNIndex {
     for (auto &td : thread_data_storage_) {
       td->resize_slot_capacity(max_slot_id_);
     }
+  }
+
+  std::mutex &update_node_mutex(uint32_t node_id) {
+    return update_node_locks_[node_id % update_node_locks_.size()];
   }
 
   /// Order-independent equality of two neighbor id lists.
@@ -1053,13 +1340,18 @@ class DiskANNIndex {
   std::unique_ptr<DiskPageIO> page_io_;
   SlotAllocator slot_alloc_;
   DiskUpdateContext update_ctx_;
-  mutable std::mutex update_mutex_;  ///< serialises search + mutation (v1)
+  mutable std::shared_mutex update_mutex_;  ///< shared search, exclusive mutation
+  std::mutex slot_mutex_;
+  std::mutex pq_mutex_;
+  std::array<std::mutex, kUpdateNodeLockStripes> update_node_locks_;
   uint64_t ops_since_last_insert_ = 0;
   uint64_t safety_net_fires_ = 0;
   float update_alpha_ = 1.2f;
   uint32_t update_search_l_ = 100;
   double safety_net_ratio_ = 0.05;
   uint64_t safety_net_ops_ = 16;
+  uint32_t update_insert_threads_ = kDefaultDiskANNUpdateInsertThreads;
+  uint32_t update_reconnect_threads_ = kDefaultDiskANNUpdateReconnectThreads;
 };
 
 }  // namespace alaya::diskann

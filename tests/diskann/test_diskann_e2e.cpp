@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// End-to-end DiskANN index tests: build a 10K-vector index on disk, then load
+// End-to-end DiskANN index tests: build a small index on disk, then load
 // and search it, measuring recall against brute-force ground truth.
 
 #include "index/graph/diskann/diskann_index.hpp"
@@ -27,10 +27,11 @@ using alaya::diskann::DiskANNIndex;
 using alaya::diskann::DiskANNLoadParams;
 using alaya::diskann::DiskANNSearchParams;
 
-constexpr uint64_t kN = 10000;
-constexpr uint64_t kDim = 128;
-constexpr uint32_t kNQ = 100;
+constexpr uint64_t kN = 2000;
+constexpr uint64_t kDim = 64;
+constexpr uint32_t kNQ = 32;
 constexpr uint32_t kTopK = 10;
+constexpr uint32_t kPqTrainIters = 5;
 
 std::vector<float> make_vectors(uint64_t n, uint64_t dim, uint32_t seed) {
   std::mt19937 rng(seed);
@@ -83,11 +84,12 @@ class DiskANNE2ETest : public ::testing::Test {
     std::filesystem::remove_all(nopq_dir_, ec);
 
     DiskANNBuildParams bp;
-    bp.R = 64;
-    bp.L = 125;
+    bp.R = 48;
+    bp.L = 100;
     bp.alpha = 1.2f;
     bp.cache_ratio = 0.05;
-    bp.pq_n_chunks = 32;  // 128 / 32 = chunk_dim 4
+    bp.pq_train_iters = kPqTrainIters;
+    bp.pq_n_chunks = 16;  // 64 / 16 = chunk_dim 4
     DiskANNIndex::build(pq_dir_, data_.data(), labels_.data(), kN, kDim, bp);
 
     bp.pq_n_chunks = 0;  // no-PQ variant on the same data

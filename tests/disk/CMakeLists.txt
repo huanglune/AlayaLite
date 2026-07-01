@@ -48,22 +48,28 @@ if(ALAYA_ENABLE_LASER)
     list(APPEND ALAYA_LASER_SEGMENT_FIXTURE_ENV LD_PRELOAD=${ALAYA_ASAN_RUNTIME} ASAN_OPTIONS=detect_leaks=0)
   endif()
 
-  add_custom_command(
-    OUTPUT ${ALAYA_LASER_SEGMENT_FIXTURE_OUTPUTS}
-    BYPRODUCTS ${ALAYA_LASER_SEGMENT_FIXTURE_DIR}/${ALAYA_LASER_SEGMENT_FIXTURE_PREFIX}_pca_base.fbin
-               ${ALAYA_LASER_SEGMENT_FIXTURE_DIR}/${ALAYA_LASER_SEGMENT_FIXTURE_PREFIX}_vamana_graph.index
-               ${CMAKE_CURRENT_BINARY_DIR}/fixtures/python_stage
-    COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target _alayalitepy
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${ALAYA_LASER_SEGMENT_FIXTURE_DIR}
-    COMMAND
-      ${CMAKE_COMMAND} -E env ${ALAYA_LASER_SEGMENT_FIXTURE_ENV} ${Python3_EXECUTABLE}
-      ${CMAKE_SOURCE_DIR}/tests/disk/fixtures/build_laser_fixture.py --output-dir ${ALAYA_LASER_SEGMENT_FIXTURE_DIR}
-      --prefix ${ALAYA_LASER_SEGMENT_FIXTURE_PREFIX} --count 2048 --dim 128 --R 64 --seed 42 --optional-sidecars
-    DEPENDS ${CMAKE_SOURCE_DIR}/tests/disk/fixtures/build_laser_fixture.py
-    COMMENT "Generating deterministic LASER disk fixture"
-    VERBATIM
-  )
-  add_custom_target(laser_segment_fixture DEPENDS ${ALAYA_LASER_SEGMENT_FIXTURE_OUTPUTS})
+  set(ALAYA_LASER_SEGMENT_FIXTURE_AVAILABLE OFF)
+  if(BUILD_PYTHON)
+    add_custom_command(
+      OUTPUT ${ALAYA_LASER_SEGMENT_FIXTURE_OUTPUTS}
+      BYPRODUCTS ${ALAYA_LASER_SEGMENT_FIXTURE_DIR}/${ALAYA_LASER_SEGMENT_FIXTURE_PREFIX}_pca_base.fbin
+                 ${ALAYA_LASER_SEGMENT_FIXTURE_DIR}/${ALAYA_LASER_SEGMENT_FIXTURE_PREFIX}_vamana_graph.index
+                 ${CMAKE_CURRENT_BINARY_DIR}/fixtures/python_stage
+      COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target _alayalitepy
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${ALAYA_LASER_SEGMENT_FIXTURE_DIR}
+      COMMAND
+        ${CMAKE_COMMAND} -E env ${ALAYA_LASER_SEGMENT_FIXTURE_ENV} ${Python3_EXECUTABLE}
+        ${CMAKE_SOURCE_DIR}/tests/disk/fixtures/build_laser_fixture.py --output-dir ${ALAYA_LASER_SEGMENT_FIXTURE_DIR}
+        --prefix ${ALAYA_LASER_SEGMENT_FIXTURE_PREFIX} --count 2048 --dim 128 --R 64 --seed 42 --optional-sidecars
+      DEPENDS ${CMAKE_SOURCE_DIR}/tests/disk/fixtures/build_laser_fixture.py
+      COMMENT "Generating deterministic LASER disk fixture"
+      VERBATIM
+    )
+    add_custom_target(laser_segment_fixture DEPENDS ${ALAYA_LASER_SEGMENT_FIXTURE_OUTPUTS})
+    set(ALAYA_LASER_SEGMENT_FIXTURE_AVAILABLE ON)
+  else()
+    message(STATUS "Skipping LASER disk fixture generation because BUILD_PYTHON=OFF")
+  endif()
 
   set(ALAYA_LASER_SEGMENT_TEST_CANDIDATES
       test_laser_segment_importer.cpp
@@ -85,14 +91,16 @@ if(ALAYA_ENABLE_LASER)
     foreach(laser_segment_test_source IN LISTS ALAYA_LASER_SEGMENT_TEST_SOURCES)
       get_filename_component(_laser_segment_test_target ${laser_segment_test_source} NAME_WE)
       add_executable(${_laser_segment_test_target} ${laser_segment_test_source})
-      add_dependencies(${_laser_segment_test_target} laser_segment_fixture)
       target_link_libraries(${_laser_segment_test_target} PRIVATE ${PROJECT_NAME} alaya_laser ${GTEST_LIBS})
       target_compile_options(${_laser_segment_test_target} PRIVATE ${_ALAYA_LASER_CONSUMER_OPTIONS})
-      target_compile_definitions(
-        ${_laser_segment_test_target}
-        PRIVATE ALAYA_ENABLE_LASER=1 ALAYA_LASER_FIXTURE_DIR="${ALAYA_LASER_SEGMENT_FIXTURE_DIR}"
-                ALAYA_LASER_FIXTURE_PREFIX="${ALAYA_LASER_SEGMENT_FIXTURE_PREFIX}"
-      )
+      target_compile_definitions(${_laser_segment_test_target} PRIVATE ALAYA_ENABLE_LASER=1)
+      if(ALAYA_LASER_SEGMENT_FIXTURE_AVAILABLE)
+        add_dependencies(${_laser_segment_test_target} laser_segment_fixture)
+        target_compile_definitions(
+          ${_laser_segment_test_target} PRIVATE ALAYA_LASER_FIXTURE_DIR="${ALAYA_LASER_SEGMENT_FIXTURE_DIR}"
+                                                ALAYA_LASER_FIXTURE_PREFIX="${ALAYA_LASER_SEGMENT_FIXTURE_PREFIX}"
+        )
+      endif()
       add_coverage_to_target(${_laser_segment_test_target})
       add_test(NAME ${_laser_segment_test_target} COMMAND $<TARGET_FILE:${_laser_segment_test_target}>)
       if(_laser_segment_test_target STREQUAL "test_laser_adapter_overhead")
@@ -107,14 +115,16 @@ if(ALAYA_ENABLE_LASER)
 
   # The hybrid Flat/Vamana/Laser batch_search test is registered as a standard executable above; only its Laser-engine
   # branch needs the fixture, the alaya_laser link, and ALAYA_ENABLE_LASER=1.
-  add_dependencies(test_disk_collection_batch_search laser_segment_fixture)
   target_link_libraries(test_disk_collection_batch_search PRIVATE alaya_laser)
   target_compile_options(test_disk_collection_batch_search PRIVATE ${_ALAYA_LASER_CONSUMER_OPTIONS})
-  target_compile_definitions(
-    test_disk_collection_batch_search
-    PRIVATE ALAYA_ENABLE_LASER=1 ALAYA_LASER_FIXTURE_DIR="${ALAYA_LASER_SEGMENT_FIXTURE_DIR}"
-            ALAYA_LASER_FIXTURE_PREFIX="${ALAYA_LASER_SEGMENT_FIXTURE_PREFIX}"
-  )
+  target_compile_definitions(test_disk_collection_batch_search PRIVATE ALAYA_ENABLE_LASER=1)
+  if(ALAYA_LASER_SEGMENT_FIXTURE_AVAILABLE)
+    add_dependencies(test_disk_collection_batch_search laser_segment_fixture)
+    target_compile_definitions(
+      test_disk_collection_batch_search PRIVATE ALAYA_LASER_FIXTURE_DIR="${ALAYA_LASER_SEGMENT_FIXTURE_DIR}"
+                                                ALAYA_LASER_FIXTURE_PREFIX="${ALAYA_LASER_SEGMENT_FIXTURE_PREFIX}"
+    )
+  endif()
 else()
   set(ALAYA_LASER_NEGATIVE_TEST_CANDIDATES test_laser_segment_importer.cpp test_laser_segment_searcher.cpp
                                            test_segment_factory_laser.cpp test_disk_collection_laser.cpp

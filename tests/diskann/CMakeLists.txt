@@ -4,7 +4,13 @@
 # CMakeLists), so they link only the shared third-party libs. Beam search / index / e2e use the LASER AlignedFileReader
 # (libaio on Linux) and therefore need the alaya_laser interface, its consumer compile options, and ALAYA_ENABLE_LASER.
 
-set(_diskann_plain_tests test_diskann_layout test_diskann_pq test_diskann_node_cache test_diskann_tombstone_slot)
+set(_diskann_plain_tests
+    test_diskann_layout
+    test_diskann_pq
+    test_diskann_node_cache
+    test_diskann_tombstone_slot
+    test_diskann_update_trace
+)
 foreach(test_target IN LISTS _diskann_plain_tests)
   add_executable(${test_target} ${CMAKE_CURRENT_SOURCE_DIR}/${test_target}.cpp)
   target_link_libraries(${test_target} PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
@@ -41,5 +47,13 @@ if(ALAYA_ENABLE_LASER)
   target_link_libraries(bench_diskann_sift PRIVATE ${PROJECT_NAME} alaya_laser)
   target_compile_options(bench_diskann_sift PRIVATE ${_ALAYA_LASER_CONSUMER_OPTIONS})
   target_compile_definitions(bench_diskann_sift PRIVATE ALAYA_ENABLE_LASER=1)
+
+  add_executable(bench_diskann_sift_update ${CMAKE_CURRENT_SOURCE_DIR}/bench_diskann_sift_update.cpp)
+  target_link_libraries(bench_diskann_sift_update PRIVATE ${PROJECT_NAME} alaya_laser)
+  target_compile_options(bench_diskann_sift_update PRIVATE ${_ALAYA_LASER_CONSUMER_OPTIONS})
+  target_compile_definitions(bench_diskann_sift_update PRIVATE ALAYA_ENABLE_LASER=1)
+
+  add_executable(make_diskann_sift_update_trace ${CMAKE_CURRENT_SOURCE_DIR}/make_diskann_sift_update_trace.cpp)
+  target_link_libraries(make_diskann_sift_update_trace PRIVATE ${THIRD_PARTY_LIBS})
 
 endif()

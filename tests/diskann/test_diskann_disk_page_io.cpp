@@ -175,13 +175,56 @@ TEST_F(DiskPageIOTest, WriteNodeExtendsFileOnAppend) {
 TEST_F(DiskPageIOTest, CoordsCacheReturnsConsistentVectors) {
   build(100, 16, 16);
   DiskPageIO io(index_path(), geom_);
-  const std::vector<float> first = io.read_coords_cached(7);  // value copy
-  const auto &cached = io.read_coords_cached(7);              // cache hit
+  const std::vector<float> first = io.read_coords_cached(7);
+  const std::vector<float> cached = io.read_coords_cached(7);  // cache hit
   EXPECT_EQ(first, cached);
   ASSERT_EQ(cached.size(), dim_);
   for (uint64_t d = 0; d < dim_; ++d) {
     EXPECT_FLOAT_EQ(cached[d], v_[7 * dim_ + d]) << "d=" << d;
   }
+}
+
+TEST_F(DiskPageIOTest, DirtyPageIsWrittenOnlyAfterFlush) {
+  build(200, 32, 32);
+  DiskPageIO writer(index_path(), geom_, /*page_cache_capacity=*/2);
+  DiskPageIO reader(index_path(), geom_, /*page_cache_capacity=*/0);
+
+  const uint32_t id = 10;
+  const auto before = reader.read_node(id);
+  const std::vector<uint32_t> new_nbrs = {4, 5, 6, 7};
+
+  writer.write_node_neighbors(id, static_cast<uint32_t>(new_nbrs.size()), new_nbrs.data());
+
+  const auto visible_to_writer = writer.read_node(id);
+  EXPECT_EQ(visible_to_writer.nbrs, new_nbrs);
+
+  const auto still_on_disk = reader.read_node(id);
+  EXPECT_EQ(still_on_disk.nbrs, before.nbrs);
+
+  writer.flush_dirty_pages();
+  const auto after_flush = reader.read_node(id);
+  EXPECT_EQ(after_flush.nbrs, new_nbrs);
+}
+
+TEST_F(DiskPageIOTest, DirtyPageIsWrittenWhenEvicted) {
+  build(200, 32, 32);
+  DiskPageIO writer(index_path(), geom_, /*page_cache_capacity=*/1);
+  DiskPageIO reader(index_path(), geom_, /*page_cache_capacity=*/0);
+
+  const uint32_t dirty_id = 0;
+  const uint32_t other_page_id = static_cast<uint32_t>(geom_.nodes_per_sector);
+  ASSERT_NE(geom_.get_page_offset(dirty_id), geom_.get_page_offset(other_page_id));
+
+  const std::vector<uint32_t> new_nbrs = {8, 9, 10};
+  writer.write_node_neighbors(dirty_id, static_cast<uint32_t>(new_nbrs.size()), new_nbrs.data());
+
+  const auto before_eviction = reader.read_node(dirty_id);
+  EXPECT_NE(before_eviction.nbrs, new_nbrs);
+
+  (void)writer.read_node(other_page_id);
+
+  const auto after_eviction = reader.read_node(dirty_id);
+  EXPECT_EQ(after_eviction.nbrs, new_nbrs);
 }
 
 #else  // !__linux__

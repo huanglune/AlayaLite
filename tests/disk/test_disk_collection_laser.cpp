@@ -113,12 +113,10 @@ class DiskCollectionLaserTest : public ::testing::Test {
     });
   }
 
-  static void require_fixture_available() {
+  static bool fixture_available() {
     const auto dir = fixture_dir();
     const auto prefix = fixture_prefix();
-    if (!fixture_has_required_files(dir, prefix)) {
-      GTEST_SKIP() << "LASER fixture is missing or incomplete under " << dir;
-    }
+    return fixture_has_required_files(dir, prefix);
   }
 
   static auto identity_labels(uint64_t n = kLaserFixtureCount, uint64_t base = 0)
@@ -356,7 +354,9 @@ TEST_F(DiskCollectionLaserTest, flush_on_empty_laser_is_noop) {
 }
 
 TEST_F(DiskCollectionLaserTest, import_laser_segment_writes_segment) {
-  require_fixture_available();
+  if (!fixture_available()) {
+    GTEST_SKIP() << "LASER fixture is missing or incomplete under " << fixture_dir();
+  }
   const auto coll = tmp_root_ / "coll";
   const auto vectors = read_fixture_vectors(fixture_dir(), fixture_prefix());
   auto labels = identity_labels();
@@ -393,7 +393,9 @@ TEST_F(DiskCollectionLaserTest, import_laser_segment_writes_segment) {
 }
 
 TEST_F(DiskCollectionLaserTest, multi_laser_segment_search) {
-  require_fixture_available();
+  if (!fixture_available()) {
+    GTEST_SKIP() << "LASER fixture is missing or incomplete under " << fixture_dir();
+  }
   const auto coll = tmp_root_ / "coll";
   const auto second_fixture = prepare_second_fixture_dir(tmp_root_ / "fixture_seg_00000002");
   const auto vectors = read_fixture_vectors(fixture_dir(), fixture_prefix());
@@ -448,7 +450,9 @@ TEST_F(DiskCollectionLaserTest, multi_laser_segment_search) {
 }
 
 TEST_F(DiskCollectionLaserTest, duplicate_label_across_laser_segments_throws) {
-  require_fixture_available();
+  if (!fixture_available()) {
+    GTEST_SKIP() << "LASER fixture is missing or incomplete under " << fixture_dir();
+  }
   const auto coll = tmp_root_ / "coll";
   const auto second_fixture = prepare_second_fixture_dir(tmp_root_ / "fixture_seg_00000002");
   auto labels1 = identity_labels();
@@ -476,7 +480,9 @@ TEST_F(DiskCollectionLaserTest, duplicate_label_across_laser_segments_throws) {
 }
 
 TEST_F(DiskCollectionLaserTest, open_classifies_laser_orphans) {
-  require_fixture_available();
+  if (!fixture_available()) {
+    GTEST_SKIP() << "LASER fixture is missing or incomplete under " << fixture_dir();
+  }
   const auto coll = tmp_root_ / "coll";
   auto labels = identity_labels();
 
