@@ -40,6 +40,7 @@ constexpr uint32_t kMissingSlot = std::numeric_limits<uint32_t>::max();
 constexpr uint32_t kDefaultBenchmarkGraphR = 64;
 constexpr uint32_t kDefaultBenchmarkBuildL = 100;
 constexpr uint32_t kDefaultBenchmarkUpdateSearchL = 30;
+constexpr uint64_t kDefaultBenchmarkPageCachePages = 262144;
 constexpr uint32_t kBenchmarkTopK = 10;
 
 enum class MixedMode { Background, SharedQueue };
@@ -106,7 +107,7 @@ struct Options {
   uint32_t updates_per_round = 0;
   uint32_t mixed_query_batch = 10000;
   uint32_t mixed_sleep_ms = 5000;
-  uint64_t page_cache_capacity = 0;
+  uint64_t page_cache_capacity = kDefaultBenchmarkPageCachePages;
 };
 
 DatasetFiles resolve_dataset_files(const std::filesystem::path &data_dir) {
@@ -400,6 +401,7 @@ struct MixedSearchState {
   std::atomic<bool> window_paused{false};
   std::atomic<uint64_t> queries{0};
   std::atomic<uint64_t> latency_ns{0};
+  std::atomic<uint64_t> active_search_ns{0};
   std::vector<std::thread> workers;
   std::chrono::steady_clock::time_point started_at{};
   std::chrono::steady_clock::time_point stopped_at{};
@@ -599,6 +601,7 @@ void start_shared_queue_mixed_search(MixedSearchState &state,
         const uint32_t seq = state.next_query.fetch_add(1, std::memory_order_relaxed);
         run_mixed_search_query(state, idx, queries, seq % nq, sp);
       };
+      sleep_until_next_mixed_window(state, opt.mixed_sleep_ms);
       while (!state.stop.load(std::memory_order_acquire)) {
         auto run_window = [&]() -> coro::task<> {
           std::vector<coro::task<>> tasks;
@@ -611,7 +614,14 @@ void start_shared_queue_mixed_search(MixedSearchState &state,
           }
           co_await coro::when_all(std::move(tasks));
         };
+        const auto window_start = std::chrono::steady_clock::now();
         coro::sync_wait(run_window());
+        const auto window_end = std::chrono::steady_clock::now();
+        const auto active_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(window_end - window_start)
+                .count();
+        state.active_search_ns.fetch_add(static_cast<uint64_t>(active_ns),
+                                         std::memory_order_relaxed);
         sleep_until_next_mixed_window(state, opt.mixed_sleep_ms);
       }
     } catch (...) {
@@ -647,7 +657,11 @@ MixedSearchResult finish_mixed_search(MixedSearchState &state) {
   if (result.queries == 0) {
     return result;
   }
-  const double wall_s = std::chrono::duration<double>(state.stopped_at - state.started_at).count();
+  const uint64_t active_search_ns = state.active_search_ns.load(std::memory_order_relaxed);
+  const double wall_s =
+      active_search_ns == 0
+          ? std::chrono::duration<double>(state.stopped_at - state.started_at).count()
+          : static_cast<double>(active_search_ns) / 1'000'000'000.0;
   result.mean_us = static_cast<double>(state.latency_ns.load(std::memory_order_relaxed)) /
                    result.queries / 1000.0;
   result.qps = wall_s <= 0.0 ? 0.0 : static_cast<double>(result.queries) / wall_s;
@@ -919,9 +933,9 @@ int main(int argc, char **argv) {
                                                std::max<uint32_t>(1, opt.search_threads),
                                            .on_thread_start_functor = nullptr,
                                            .on_thread_stop_functor = nullptr});
-            start_shared_queue_mixed_search(mixed_state, idx, queries, opt, *mixed_pool);
+            start_shared_queue_mixed_search(mixed_state, idx, base, opt, *mixed_pool);
           } else {
-            start_mixed_search(mixed_state, idx, queries, opt);
+            start_mixed_search(mixed_state, idx, base, opt);
           }
           mixed_started = true;
         }
