@@ -384,14 +384,9 @@ inline int LinuxAlignedFileReader::submit_reqs(std::vector<AlignedRead> &read_re
                              " exceeds MAX_EVENTS=" + std::to_string(MAX_EVENTS));
   }
   size_t n_ops = read_reqs.size();
-  thread_local std::vector<struct iocb *> cbs;
-  thread_local std::vector<struct iocb> cb;
-  if (cbs.size() < n_ops) {
-    cbs.resize(n_ops);
-  }
-  if (cb.size() < n_ops) {
-    cb.resize(n_ops);
-  }
+  std::vector<struct iocb *> cbs(n_ops, nullptr);
+  std::vector<io_event> evts(n_ops);
+  std::vector<struct iocb> cb(n_ops);
   for (size_t j = 0; j < n_ops; j++) {
     io_prep_pread(cb.data() + j,
                   this->file_desc_,
@@ -418,10 +413,7 @@ inline int LinuxAlignedFileReader::submit_reqs(std::vector<AlignedRead> &read_re
 inline int LinuxAlignedFileReader::get_events(IOContext &ctx,
                                               int n_ops,
                                               std::vector<AlignedReadEvent> &out) {
-  thread_local std::vector<io_event> evts;
-  if (evts.size() < static_cast<size_t>(n_ops)) {
-    evts.resize(static_cast<size_t>(n_ops));
-  }
+  std::vector<io_event> evts(n_ops);
   auto ret = io_getevents(ctx,
                           static_cast<int64_t>(n_ops),
                           static_cast<int64_t>(n_ops),

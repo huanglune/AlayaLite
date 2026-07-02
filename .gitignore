@@ -16,7 +16,7 @@
 /build_tsan/
 /build-tidy
 /build_bench
-
+/build-release-nocov
 # Python artifacts
 __pycache__/
 *.py[cod]
