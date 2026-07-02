@@ -928,9 +928,13 @@ int main(int argc, char **argv) {
       try {
         if (opt.mixed) {
           if (opt.mixed_mode == MixedMode::SharedQueue) {
+            const uint32_t mixed_workers =
+                std::max({uint32_t{1},
+                          opt.search_threads,
+                          opt.update_insert_threads,
+                          opt.update_reconnect_threads});
             mixed_pool = std::make_unique<coro::thread_pool>(
-                coro::thread_pool::options{.thread_count =
-                                               std::max<uint32_t>(1, opt.search_threads),
+                coro::thread_pool::options{.thread_count = mixed_workers,
                                            .on_thread_start_functor = nullptr,
                                            .on_thread_stop_functor = nullptr});
             start_shared_queue_mixed_search(mixed_state, idx, base, opt, *mixed_pool);
