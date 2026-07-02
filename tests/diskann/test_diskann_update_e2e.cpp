@@ -20,6 +20,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "coro/thread_pool.hpp"
 #include "simd/distance_l2.hpp"
 
 #if defined(__linux__)
@@ -304,6 +305,44 @@ TEST_F(UpdateE2ETest, BatchInsertReturnsIdsAndMakesVectorsSearchable) {
     live_[labels[i]] = vec_at(nv, i);
     EXPECT_TRUE(top1_is(nv.data() + static_cast<uint64_t>(i) * 32, labels[i]))
         << "batch inserted vector " << i << " should be searchable";
+  }
+}
+
+TEST_F(UpdateE2ETest, ExternalPoolBatchUpdateKeepsVectorsSearchable) {
+  DiskANNLoadParams lp;
+  lp.num_threads = 2;
+  lp.page_cache_capacity = 16;
+  build_and_load(/*n=*/500, /*dim=*/32, /*r=*/32, lp);
+
+  std::vector<uint32_t> removed;
+  removed.assign(deletable_.begin(), deletable_.begin() + 4);
+  coro::thread_pool pool{
+      {.thread_count = 4, .on_thread_start_functor = nullptr, .on_thread_stop_functor = nullptr}};
+  idx_->batch_remove_with_pool(removed.data(), static_cast<uint32_t>(removed.size()), pool);
+  for (const uint32_t id : removed) {
+    live_.erase(id_label_[id]);
+  }
+
+  const auto nv = make_vectors(4, 32, /*seed=*/5151);
+  std::vector<uint64_t> labels(4);
+  for (uint32_t i = 0; i < labels.size(); ++i) {
+    labels[i] = 15000 + i;
+  }
+  const std::vector<uint32_t> ids =
+      idx_->batch_insert_with_pool(nv.data(),
+                                   labels.data(),
+                                   static_cast<uint32_t>(labels.size()),
+                                   4,
+                                   pool);
+  pool.shutdown();
+
+  ASSERT_EQ(ids.size(), labels.size());
+  EXPECT_EQ(idx_->live_count(), 500u);
+  for (uint32_t i = 0; i < ids.size(); ++i) {
+    id_label_[ids[i]] = labels[i];
+    live_[labels[i]] = vec_at(nv, i);
+    EXPECT_TRUE(top1_is(nv.data() + static_cast<uint64_t>(i) * 32, labels[i]))
+        << "external-pool batch inserted vector " << i << " should be searchable";
   }
 }
 

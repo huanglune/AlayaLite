@@ -16,6 +16,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -24,6 +25,9 @@
 #include <unordered_set>
 #include <vector>
 
+#include "coro/sync_wait.hpp"
+#include "coro/thread_pool.hpp"
+#include "coro/when_all.hpp"
 #include "index/graph/diskann/diskann_index.hpp"
 
 namespace {
@@ -37,6 +41,8 @@ constexpr uint32_t kDefaultBenchmarkGraphR = 64;
 constexpr uint32_t kDefaultBenchmarkBuildL = 100;
 constexpr uint32_t kDefaultBenchmarkUpdateSearchL = 30;
 constexpr uint32_t kBenchmarkTopK = 10;
+
+enum class MixedMode { Background, SharedQueue };
 
 struct FloatMatrix {
   std::vector<float> data;
@@ -83,6 +89,7 @@ struct Options {
   bool eval_only = false;
   bool single_updates = false;
   bool mixed = false;
+  MixedMode mixed_mode = MixedMode::Background;
   uint32_t max_rounds = 0;
   uint32_t nq = 1000;
   uint32_t build_r = kDefaultBenchmarkGraphR;
@@ -186,6 +193,26 @@ uint64_t parse_u64(const std::string &value, const char *name) {
   return static_cast<uint64_t>(std::stoull(value));
 }
 
+const char *mixed_mode_name(MixedMode mode) {
+  switch (mode) {
+    case MixedMode::Background:
+      return "background";
+    case MixedMode::SharedQueue:
+      return "shared_queue";
+  }
+  return "unknown";
+}
+
+MixedMode parse_mixed_mode(const std::string &value) {
+  if (value == "background") {
+    return MixedMode::Background;
+  }
+  if (value == "shared_queue") {
+    return MixedMode::SharedQueue;
+  }
+  throw std::invalid_argument("bad --mixed_mode: " + value);
+}
+
 TraceManifest read_manifest(const std::filesystem::path &path) {
   std::ifstream in(path);
   if (!in) {
@@ -249,6 +276,9 @@ Options parse_args(int argc, char **argv) {
       opt.single_updates = true;
     } else if (arg == "--mixed") {
       opt.mixed = true;
+    } else if (arg == "--mixed_mode" && i + 1 < argc) {
+      opt.mixed = true;
+      opt.mixed_mode = parse_mixed_mode(argv[++i]);
     } else if (arg == "--rounds" && i + 1 < argc) {
       opt.max_rounds = parse_u32(argv[++i], "--rounds");
     } else if (arg == "--nq" && i + 1 < argc) {
@@ -494,6 +524,22 @@ void wait_for_mixed_search_window(MixedSearchState &state) {
   }
 }
 
+void run_mixed_search_query(MixedSearchState &state,
+                            const DiskANNIndex &idx,
+                            const FloatMatrix &queries,
+                            uint32_t query_id,
+                            const DiskANNSearchParams &sp) {
+  std::array<uint64_t, kBenchmarkTopK> labels{};
+  std::array<float, kBenchmarkTopK> distances{};
+  const float *query = queries.data.data() + static_cast<size_t>(query_id) * queries.dim;
+  const auto t0 = std::chrono::steady_clock::now();
+  idx.search(query, kBenchmarkTopK, labels.data(), distances.data(), sp);
+  const auto t1 = std::chrono::steady_clock::now();
+  const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+  state.latency_ns.fetch_add(static_cast<uint64_t>(ns), std::memory_order_relaxed);
+  state.queries.fetch_add(1, std::memory_order_relaxed);
+}
+
 void start_mixed_search(MixedSearchState &state,
                         const DiskANNIndex &idx,
                         const FloatMatrix &queries,
@@ -509,8 +555,6 @@ void start_mixed_search(MixedSearchState &state,
   for (uint32_t worker_id = 0; worker_id < workers; ++worker_id) {
     state.workers.emplace_back([&, worker_id]() {
       (void)worker_id;
-      std::array<uint64_t, kBenchmarkTopK> labels{};
-      std::array<float, kBenchmarkTopK> distances{};
       state.ready.fetch_add(1, std::memory_order_release);
       try {
         while (!state.stop.load(std::memory_order_acquire)) {
@@ -520,13 +564,7 @@ void start_mixed_search(MixedSearchState &state,
           }
           const uint32_t seq = state.next_query.fetch_add(1, std::memory_order_relaxed);
           const uint32_t qi = seq % nq;
-          const float *query = queries.data.data() + static_cast<size_t>(qi) * queries.dim;
-          const auto t0 = std::chrono::steady_clock::now();
-          idx.search(query, kBenchmarkTopK, labels.data(), distances.data(), sp);
-          const auto t1 = std::chrono::steady_clock::now();
-          const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-          state.latency_ns.fetch_add(static_cast<uint64_t>(ns), std::memory_order_relaxed);
-          state.queries.fetch_add(1, std::memory_order_relaxed);
+          run_mixed_search_query(state, idx, queries, qi, sp);
           maybe_pause_mixed_search_window(state, opt);
         }
       } catch (...) {
@@ -535,6 +573,52 @@ void start_mixed_search(MixedSearchState &state,
     });
   }
   while (state.ready.load(std::memory_order_acquire) < workers) {
+    std::this_thread::yield();
+  }
+}
+
+void start_shared_queue_mixed_search(MixedSearchState &state,
+                                     const DiskANNIndex &idx,
+                                     const FloatMatrix &queries,
+                                     const Options &opt,
+                                     coro::thread_pool &pool) {
+  const uint32_t nq = opt.nq == 0 ? queries.n : std::min<uint32_t>(opt.nq, queries.n);
+  if (nq == 0) {
+    throw std::invalid_argument("--mixed requires at least one query");
+  }
+  const DiskANNSearchParams sp = make_search_params(opt);
+  state.started_at = std::chrono::steady_clock::now();
+  state.workers.emplace_back([&, nq, sp]() {
+    state.ready.fetch_add(1, std::memory_order_release);
+    try {
+      auto search_one = [&]() -> coro::task<> {
+        co_await pool.schedule();
+        if (state.stop.load(std::memory_order_acquire)) {
+          co_return;
+        }
+        const uint32_t seq = state.next_query.fetch_add(1, std::memory_order_relaxed);
+        run_mixed_search_query(state, idx, queries, seq % nq, sp);
+      };
+      while (!state.stop.load(std::memory_order_acquire)) {
+        auto run_window = [&]() -> coro::task<> {
+          std::vector<coro::task<>> tasks;
+          tasks.reserve(opt.mixed_query_batch);
+          for (uint32_t i = 0; i < opt.mixed_query_batch; ++i) {
+            if (state.stop.load(std::memory_order_acquire)) {
+              break;
+            }
+            tasks.emplace_back(search_one());
+          }
+          co_await coro::when_all(std::move(tasks));
+        };
+        coro::sync_wait(run_window());
+        sleep_until_next_mixed_window(state, opt.mixed_sleep_ms);
+      }
+    } catch (...) {
+      record_mixed_search_error(state);
+    }
+  });
+  while (state.ready.load(std::memory_order_acquire) < 1) {
     std::this_thread::yield();
   }
 }
@@ -570,6 +654,19 @@ MixedSearchResult finish_mixed_search(MixedSearchState &state) {
   return result;
 }
 
+template <typename MakeTask>
+void run_indexed_tasks(uint32_t count, MakeTask make_task) {
+  auto run = [&]() -> coro::task<> {
+    std::vector<coro::task<>> tasks;
+    tasks.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+      tasks.emplace_back(make_task(i));
+    }
+    co_await coro::when_all(std::move(tasks));
+  };
+  coro::sync_wait(run());
+}
+
 void apply_deletes(DiskANNIndex &idx,
                    const TraceRound &round,
                    const Options &opt,
@@ -596,6 +693,36 @@ void apply_deletes(DiskANNIndex &idx,
     slots.push_back(label_to_slot[label]);
   }
   idx.batch_remove(slots.data(), static_cast<uint32_t>(slots.size()));
+  for (const uint32_t label : round.deletes) {
+    live[label] = 0;
+    label_to_slot[label] = kMissingSlot;
+  }
+}
+
+void apply_deletes_shared(DiskANNIndex &idx,
+                          const TraceRound &round,
+                          const Options &opt,
+                          std::vector<uint8_t> &live,
+                          std::vector<uint32_t> &label_to_slot,
+                          coro::thread_pool &pool) {
+  std::vector<uint32_t> slots;
+  slots.reserve(round.deletes.size());
+  for (const uint32_t label : round.deletes) {
+    if (label >= live.size() || live[label] == 0 || label_to_slot[label] == kMissingSlot) {
+      throw std::runtime_error("trace delete id is not live: " + std::to_string(label));
+    }
+    slots.push_back(label_to_slot[label]);
+  }
+
+  if (opt.single_updates) {
+    auto remove_one = [&idx, &pool, &slots](uint32_t i) -> coro::task<> {
+      co_await pool.schedule();
+      idx.remove(slots[i]);
+    };
+    run_indexed_tasks(static_cast<uint32_t>(slots.size()), remove_one);
+  } else {
+    idx.batch_remove_with_pool(slots.data(), static_cast<uint32_t>(slots.size()), pool);
+  }
   for (const uint32_t label : round.deletes) {
     live[label] = 0;
     label_to_slot[label] = kMissingSlot;
@@ -635,6 +762,48 @@ void apply_inserts(DiskANNIndex &idx,
                                                        batch_labels.data(),
                                                        static_cast<uint32_t>(batch_labels.size()),
                                                        opt.insert_batch);
+  for (size_t i = 0; i < batch_labels.size(); ++i) {
+    const uint32_t label = static_cast<uint32_t>(batch_labels[i]);
+    live[label] = 1;
+    label_to_slot[label] = slots[i];
+  }
+}
+
+void apply_inserts_shared(DiskANNIndex &idx,
+                          const FloatMatrix &base,
+                          const TraceRound &round,
+                          const Options &opt,
+                          std::vector<uint8_t> &live,
+                          std::vector<uint32_t> &label_to_slot,
+                          coro::thread_pool &pool) {
+  std::vector<float> batch_vectors(static_cast<size_t>(round.inserts.size()) * base.dim);
+  std::vector<uint64_t> batch_labels(round.inserts.size());
+  for (size_t i = 0; i < round.inserts.size(); ++i) {
+    const uint32_t label = round.inserts[i];
+    if (label >= live.size() || live[label] != 0) {
+      throw std::runtime_error("trace insert id is already live: " + std::to_string(label));
+    }
+    const float *src = base.data.data() + static_cast<size_t>(label) * base.dim;
+    std::copy(src, src + base.dim, batch_vectors.data() + i * base.dim);
+    batch_labels[i] = label;
+  }
+
+  std::vector<uint32_t> slots(batch_labels.size());
+  if (opt.single_updates) {
+    auto insert_one =
+        [&idx, &pool, &batch_vectors, &batch_labels, &slots, &base](uint32_t i) -> coro::task<> {
+      co_await pool.schedule();
+      const float *src = batch_vectors.data() + static_cast<size_t>(i) * base.dim;
+      slots[i] = idx.insert(src, batch_labels[i]);
+    };
+    run_indexed_tasks(static_cast<uint32_t>(slots.size()), insert_one);
+  } else {
+    slots = idx.batch_insert_with_pool(batch_vectors.data(),
+                                       batch_labels.data(),
+                                       static_cast<uint32_t>(batch_labels.size()),
+                                       opt.insert_batch,
+                                       pool);
+  }
   for (size_t i = 0; i < batch_labels.size(); ++i) {
     const uint32_t label = static_cast<uint32_t>(batch_labels[i]);
     live[label] = 1;
@@ -740,15 +909,33 @@ int main(int argc, char **argv) {
       const TraceRound round = limit_round_updates(read_round(path, manifest.update_size), opt);
       MixedSearchState mixed_state;
       bool mixed_started = false;
+      std::unique_ptr<coro::thread_pool> mixed_pool;
       const auto t0 = std::chrono::steady_clock::now();
       try {
         if (opt.mixed) {
-          start_mixed_search(mixed_state, idx, queries, opt);
+          if (opt.mixed_mode == MixedMode::SharedQueue) {
+            mixed_pool = std::make_unique<coro::thread_pool>(
+                coro::thread_pool::options{.thread_count =
+                                               std::max<uint32_t>(1, opt.search_threads),
+                                           .on_thread_start_functor = nullptr,
+                                           .on_thread_stop_functor = nullptr});
+            start_shared_queue_mixed_search(mixed_state, idx, queries, opt, *mixed_pool);
+          } else {
+            start_mixed_search(mixed_state, idx, queries, opt);
+          }
           mixed_started = true;
         }
-        apply_deletes(idx, round, opt, live, label_to_slot);
+        if (opt.mixed && opt.mixed_mode == MixedMode::SharedQueue) {
+          apply_deletes_shared(idx, round, opt, live, label_to_slot, *mixed_pool);
+        } else {
+          apply_deletes(idx, round, opt, live, label_to_slot);
+        }
         const auto t_delete = std::chrono::steady_clock::now();
-        apply_inserts(idx, base, round, opt, live, label_to_slot);
+        if (opt.mixed && opt.mixed_mode == MixedMode::SharedQueue) {
+          apply_inserts_shared(idx, base, round, opt, live, label_to_slot, *mixed_pool);
+        } else {
+          apply_inserts(idx, base, round, opt, live, label_to_slot);
+        }
         const auto t_insert = std::chrono::steady_clock::now();
         if (opt.flush_rounds) {
           idx.flush();
@@ -757,6 +944,9 @@ int main(int argc, char **argv) {
         MixedSearchResult mixed_search;
         if (mixed_started) {
           mixed_search = finish_mixed_search(mixed_state);
+        }
+        if (mixed_pool) {
+          mixed_pool->shutdown();
         }
         const double update_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         const double delete_ms = std::chrono::duration<double, std::milli>(t_delete - t0).count();
@@ -767,6 +957,7 @@ int main(int argc, char **argv) {
         const RecallResult recall = evaluate_search(idx, queries, gt, live, opt);
         std::cout << "[round " << round_id << "] update_qps=" << update_qps
                   << " delete_ms=" << delete_ms << " insert_ms=" << insert_ms
+                  << " mixed_mode=" << mixed_mode_name(opt.mixed_mode)
                   << " mixed_search_qps=" << mixed_search.qps
                   << " mixed_search_mean_us=" << mixed_search.mean_us
                   << " mixed_search_queries=" << mixed_search.queries
@@ -782,6 +973,9 @@ int main(int argc, char **argv) {
         if (mixed_started) {
           request_mixed_search_stop(mixed_state);
           join_mixed_search(mixed_state);
+        }
+        if (mixed_pool) {
+          mixed_pool->shutdown();
         }
         throw;
       }

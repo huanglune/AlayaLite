@@ -561,55 +561,45 @@ class DiskANNIndex {
                                      const uint64_t *labels,
                                      uint32_t count,
                                      uint32_t batch_size = 32) {
-    if (!updatable_) {
-      throw std::runtime_error("DiskANNIndex::batch_insert: index not loaded in updatable mode");
-    }
+    validate_batch_insert_args(vectors, labels, count, batch_size, "batch_insert");
     if (count == 0) {
       return {};
-    }
-    if (vectors == nullptr || labels == nullptr) {
-      throw std::invalid_argument("DiskANNIndex::batch_insert: null vectors/labels");
-    }
-    if (batch_size == 0) {
-      throw std::invalid_argument("DiskANNIndex::batch_insert: batch_size must be > 0");
     }
 
     std::lock_guard<std::mutex> update_guard(update_serial_mutex_);
     page_io_->clear_cache();
 
-    std::vector<uint32_t> ids(count, 0);
-    std::vector<std::vector<uint32_t>> pruned(count);
     const uint32_t workers = std::min({batch_size, count, update_insert_threads_});
     coro::thread_pool pool{{.thread_count = workers,
                             .on_thread_start_functor = nullptr,
                             .on_thread_stop_functor = nullptr}};
-
-    auto plan_one = [this, &pool, vectors, &pruned](uint32_t i) -> coro::task<> {
-      co_await pool.schedule();
-      pruned[i] = select_insert_neighbors(vectors + static_cast<uint64_t>(i) * dim_);
-    };
-    auto write_one = [this, &pool, vectors, &ids, &pruned](uint32_t i) -> coro::task<> {
-      co_await pool.schedule();
-      const float *vec = vectors + static_cast<uint64_t>(i) * dim_;
-      encode_pq_slot(vec, ids[i]);
-      write_inserted_node(ids[i], vec, pruned[i]);
-    };
-
     try {
-      for (uint32_t off = 0; off < count; off += batch_size) {
-        const uint32_t end = std::min<uint32_t>(count, off + batch_size);
-        run_batch_tasks(off, end, plan_one);
-        reserve_batch_insert_slots(labels, ids, off, end);
-        run_batch_tasks(off, end, write_one);
-        run_batch_reconnect_tasks(off, end, ids, pruned, pool);
-      }
-      page_io_->flush_dirty_pages();
+      std::vector<uint32_t> ids =
+          batch_insert_locked_with_pool(vectors, labels, count, batch_size, pool);
+      pool.shutdown();
+      return ids;
     } catch (...) {
       pool.shutdown();
       throw;
     }
-    pool.shutdown();
-    return ids;
+  }
+
+  /// Insert a batch using a caller-owned coroutine pool. This keeps benchmarked
+  /// mixed workloads on one shared worker queue while preserving the blocking
+  /// public API.
+  std::vector<uint32_t> batch_insert_with_pool(const float *vectors,
+                                               const uint64_t *labels,
+                                               uint32_t count,
+                                               uint32_t batch_size,
+                                               coro::thread_pool &pool) {
+    validate_batch_insert_args(vectors, labels, count, batch_size, "batch_insert_with_pool");
+    if (count == 0) {
+      return {};
+    }
+
+    std::lock_guard<std::mutex> update_guard(update_serial_mutex_);
+    page_io_->clear_cache();
+    return batch_insert_locked_with_pool(vectors, labels, count, batch_size, pool);
   }
 
   /// Lazy-delete: cache old neighbors for two-hop, tombstone + free the slot.
@@ -625,6 +615,34 @@ class DiskANNIndex {
     }
     page_io_->clear_cache();
     remove_unlocked(internal_id);
+    if (maybe_safety_net_reconnect()) {
+      page_io_->flush_dirty_pages();
+    }
+  }
+
+  /// Lazy-delete a batch using a caller-owned coroutine pool. This mirrors
+  /// batch_remove() but avoids creating an update-private worker pool.
+  void batch_remove_with_pool(const uint32_t *internal_ids,
+                              uint32_t count,
+                              coro::thread_pool &pool) {
+    validate_batch_remove_args(internal_ids, count, "batch_remove_with_pool");
+    if (count == 0) {
+      return;
+    }
+    std::lock_guard<std::mutex> update_guard(update_serial_mutex_);
+    {
+      std::shared_lock<std::shared_mutex> state_lock(update_mutex_);
+      validate_remove_batch(internal_ids, count);
+    }
+    page_io_->clear_cache();
+    std::vector<DiskPageIO::NodeData> old_nodes =
+        page_io_->read_nodes_async(internal_ids, count, pool);
+    {
+      std::unique_lock<std::shared_mutex> state_lock(update_mutex_);
+      for (uint32_t i = 0; i < count; ++i) {
+        remove_unlocked_with_neighbors(internal_ids[i], std::move(old_nodes[i].nbrs));
+      }
+    }
     if (maybe_safety_net_reconnect()) {
       page_io_->flush_dirty_pages();
     }
@@ -914,6 +932,39 @@ class DiskANNIndex {
     pq_.encode_one(query, slot);
   }
 
+  void validate_batch_insert_args(const float *vectors,
+                                  const uint64_t *labels,
+                                  uint32_t count,
+                                  uint32_t batch_size,
+                                  const char *method) const {
+    if (!updatable_) {
+      throw std::runtime_error(std::string("DiskANNIndex::") + method +
+                               ": index not loaded in updatable mode");
+    }
+    if (count == 0) {
+      return;
+    }
+    if (vectors == nullptr || labels == nullptr) {
+      throw std::invalid_argument(std::string("DiskANNIndex::") + method + ": null vectors/labels");
+    }
+    if (batch_size == 0) {
+      throw std::invalid_argument(std::string("DiskANNIndex::") + method +
+                                  ": batch_size must be > 0");
+    }
+  }
+
+  void validate_batch_remove_args(const uint32_t *internal_ids,
+                                  uint32_t count,
+                                  const char *method) const {
+    if (!updatable_) {
+      throw std::runtime_error(std::string("DiskANNIndex::") + method +
+                               ": index not loaded in updatable mode");
+    }
+    if (count != 0 && internal_ids == nullptr) {
+      throw std::invalid_argument(std::string("DiskANNIndex::") + method + ": null ids");
+    }
+  }
+
   void validate_removable_slot(uint32_t internal_id) const {
     if (internal_id >= max_slot_id_) {
       throw std::invalid_argument("DiskANNIndex::remove: internal_id out of range");
@@ -951,6 +1002,35 @@ class DiskANNIndex {
                            const float *query,
                            const std::vector<uint32_t> &neighbors) {
     page_io_->write_node(slot, query, static_cast<uint32_t>(neighbors.size()), neighbors.data());
+  }
+
+  std::vector<uint32_t> batch_insert_locked_with_pool(const float *vectors,
+                                                      const uint64_t *labels,
+                                                      uint32_t count,
+                                                      uint32_t batch_size,
+                                                      coro::thread_pool &pool) {
+    std::vector<uint32_t> ids(count, 0);
+    std::vector<std::vector<uint32_t>> pruned(count);
+    auto plan_one = [this, &pool, vectors, &pruned](uint32_t i) -> coro::task<> {
+      co_await pool.schedule();
+      pruned[i] = select_insert_neighbors(vectors + static_cast<uint64_t>(i) * dim_);
+    };
+    auto write_one = [this, &pool, vectors, &ids, &pruned](uint32_t i) -> coro::task<> {
+      co_await pool.schedule();
+      const float *vec = vectors + static_cast<uint64_t>(i) * dim_;
+      encode_pq_slot(vec, ids[i]);
+      write_inserted_node(ids[i], vec, pruned[i]);
+    };
+
+    for (uint32_t off = 0; off < count; off += batch_size) {
+      const uint32_t end = std::min<uint32_t>(count, off + batch_size);
+      run_batch_tasks(off, end, plan_one);
+      reserve_batch_insert_slots(labels, ids, off, end);
+      run_batch_tasks(off, end, write_one);
+      run_batch_reconnect_tasks(off, end, ids, pruned, pool);
+    }
+    page_io_->flush_dirty_pages();
+    return ids;
   }
 
   template <typename MakeTask>
