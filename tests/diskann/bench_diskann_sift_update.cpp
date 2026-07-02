@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
@@ -42,6 +43,7 @@ constexpr uint32_t kDefaultBenchmarkBuildL = 100;
 constexpr uint32_t kDefaultBenchmarkUpdateSearchL = 30;
 constexpr uint64_t kDefaultBenchmarkPageCachePages = 262144;
 constexpr uint32_t kBenchmarkTopK = 10;
+constexpr double kDefaultBenchmarkCacheRatio = 1.0;
 
 enum class MixedMode { Background, SharedQueue };
 
@@ -107,6 +109,7 @@ struct Options {
   uint32_t updates_per_round = 0;
   uint32_t mixed_query_batch = 10000;
   uint32_t mixed_sleep_ms = 5000;
+  double cache_ratio = kDefaultBenchmarkCacheRatio;
   uint64_t page_cache_capacity = kDefaultBenchmarkPageCachePages;
 };
 
@@ -192,6 +195,14 @@ uint32_t parse_u32(const std::string &value, const char *name) {
 
 uint64_t parse_u64(const std::string &value, const char *name) {
   return static_cast<uint64_t>(std::stoull(value));
+}
+
+double parse_ratio(const std::string &value, const char *name) {
+  const double parsed = std::stod(value);
+  if (!std::isfinite(parsed) || parsed < 0.0 || parsed > 1.0) {
+    throw std::invalid_argument(std::string(name) + " must be in [0, 1]");
+  }
+  return parsed;
 }
 
 const char *mixed_mode_name(MixedMode mode) {
@@ -314,6 +325,8 @@ Options parse_args(int argc, char **argv) {
       opt.mixed_query_batch = std::max<uint32_t>(1, parse_u32(argv[++i], "--mixed_query_batch"));
     } else if (arg == "--mixed_sleep_ms" && i + 1 < argc) {
       opt.mixed_sleep_ms = parse_u32(argv[++i], "--mixed_sleep_ms");
+    } else if (arg == "--cache_ratio" && i + 1 < argc) {
+      opt.cache_ratio = parse_ratio(argv[++i], "--cache_ratio");
     } else if (arg == "--page_cache" && i + 1 < argc) {
       opt.page_cache_capacity = parse_u64(argv[++i], "--page_cache");
     } else {
@@ -371,7 +384,7 @@ void build_initial_index(const Options &opt,
   bp.L = opt.build_l;
   bp.alpha = 1.2f;
   bp.pq_n_chunks = 32;
-  bp.cache_ratio = 0.01;
+  bp.cache_ratio = opt.cache_ratio;
   bp.num_threads = 96;
   bp.seed = 1234;
   bp.verbose = true;
@@ -916,7 +929,7 @@ int main(int argc, char **argv) {
     csv << "round,deletes,inserts,update_ms,delete_ms,insert_ms,update_qps,"
            "mixed_search_qps,mixed_search_mean_us,mixed_search_queries,"
            "masked_recall_at_10,recall_hits,recall_total,search_mean_us,search_qps,"
-           "live_count,tombstones,free_slots\n";
+           "live_count,tombstones,free_slots,cache_ratio\n";
 
     for (uint32_t round_id = 0; round_id < rounds; ++round_id) {
       const auto path = trace_dir / (manifest.prefix + std::to_string(round_id));
@@ -986,7 +999,7 @@ int main(int argc, char **argv) {
             << mixed_search.qps << "," << mixed_search.mean_us << "," << mixed_search.queries << ","
             << recall.recall() << "," << recall.hits << "," << recall.total << "," << recall.mean_us
             << "," << recall.qps << "," << idx.live_count() << "," << idx.tombstone_count() << ","
-            << idx.free_slot_count() << "\n";
+            << idx.free_slot_count() << "," << opt.cache_ratio << "\n";
       } catch (...) {
         if (mixed_started) {
           request_mixed_search_stop(mixed_state);

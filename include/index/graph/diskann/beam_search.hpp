@@ -182,15 +182,17 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
     }
   };
 
+  NodeCache::Lookup seed_hit;
+
   // Synchronously read one node into scratch slot 0 (used only to seed the
   // medoid); returns a pointer to its record (cache or scratch).
   auto read_seed = [&](uint32_t id) -> const char * {
-    const char *rec = cache.lookup(id);
-    if (rec != nullptr) {
+    seed_hit = cache.lookup_record(id);
+    if (seed_hit) {
       if (stats != nullptr) {
         stats->n_cache_hits++;
       }
-      return rec;
+      return seed_hit.get();
     }
     std::vector<AlignedRead> r1;
     r1.emplace_back(geom.get_page_offset(id), page_size, id, td.sector_scratch);
@@ -228,6 +230,7 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
     std::vector<uint32_t> todo;
     std::vector<uint32_t> chunk_ids;
     std::vector<const char *> chunk_recs;
+    std::vector<NodeCache::Lookup> chunk_hits;
     while (frontier.has_unexpanded_node()) {
       const uint32_t x = frontier.closest_unexpanded().id;
       const NeighborScratchView nbrs = td.cached_neighbors(x);
@@ -242,16 +245,19 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
         reqs.clear();
         chunk_ids.clear();
         chunk_recs.clear();
+        chunk_hits.clear();
+        chunk_hits.reserve(end - off);
         uint64_t slot = 0;
         for (size_t i = off; i < end; ++i) {
           const uint32_t m = todo[i];
-          const char *crec = cache.lookup(m);
-          if (crec != nullptr) {
+          NodeCache::Lookup cached = cache.lookup_record(m);
+          if (cached) {
             if (stats != nullptr) {
               stats->n_cache_hits++;
             }
             chunk_ids.push_back(m);
-            chunk_recs.push_back(crec);
+            chunk_recs.push_back(cached.get());
+            chunk_hits.push_back(std::move(cached));
             continue;
           }
           char *buf = td.sector_scratch + (slot++) * page_size;
@@ -307,12 +313,12 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
       while (!free_slots.empty() && !pending.empty()) {
         const uint32_t m = pending.front();
         pending.pop_front();
-        const char *crec = cache.lookup(m);
-        if (crec != nullptr) {
+        NodeCache::Lookup cached = cache.lookup_record(m);
+        if (cached) {
           if (stats != nullptr) {
             stats->n_cache_hits++;
           }
-          absorb(m, crec);
+          absorb(m, cached.get());
           continue;
         }
         const uint64_t slot = free_slots.back();
@@ -442,17 +448,21 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
     // overlap of the default path and so runs ~10-15% slower.
     std::vector<uint32_t> batch;
     std::vector<const char *> batch_recs;
+    std::vector<NodeCache::Lookup> batch_hits;
     while (retset.has_unexpanded_node()) {
       batch.clear();
       batch_recs.clear();
+      batch_hits.clear();
+      batch_hits.reserve(beam);
       reqs.clear();
       uint64_t slot = 0;
       while (retset.has_unexpanded_node() && reqs.size() < beam) {
         const uint32_t id = retset.closest_unexpanded().id;
         batch.push_back(id);
-        const char *crec = cache.lookup(id);
-        if (crec != nullptr) {
-          batch_recs.push_back(crec);
+        NodeCache::Lookup cached = cache.lookup_record(id);
+        if (cached) {
+          batch_recs.push_back(cached.get());
+          batch_hits.push_back(std::move(cached));
           if (stats != nullptr) {
             stats->n_cache_hits++;
           }
@@ -500,12 +510,12 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
       reqs.clear();
       while (!free_slots.empty() && retset.has_unexpanded_node()) {
         const uint32_t id = retset.closest_unexpanded().id;
-        const char *crec = cache.lookup(id);
-        if (crec != nullptr) {
+        NodeCache::Lookup cached = cache.lookup_record(id);
+        if (cached) {
           if (stats != nullptr) {
             stats->n_cache_hits++;
           }
-          process_node(id, crec);
+          process_node(id, cached.get());
           continue;
         }
         const uint64_t slot = free_slots.back();

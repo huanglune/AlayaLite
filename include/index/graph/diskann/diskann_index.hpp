@@ -278,6 +278,7 @@ class DiskANNIndex {
 
     read_ids(path(index_dir, "ids.bin"), max_slot_id_);
     cache_.load(path(index_dir, "cache_ids.bin"), path(index_dir, "cache_nodes.bin"));
+    cache_.configure_geometry(dim_, max_degree_);
     if (has_pq_) {
       pq_.load(path(index_dir, "pq_pivots.bin"),
                path(index_dir, "pq_compressed.bin"),
@@ -730,6 +731,7 @@ class DiskANNIndex {
     }
     write_meta(path(index_dir_, "meta.bin"), m);
     write_ids(path(index_dir_, "ids.bin"), labels_.data(), labels_.size());
+    cache_.save(path(index_dir_, "cache_ids.bin"), path(index_dir_, "cache_nodes.bin"));
     slot_alloc_.save(path(index_dir_, "slots.bin"));
   }
 
@@ -1002,6 +1004,7 @@ class DiskANNIndex {
                            const float *query,
                            const std::vector<uint32_t> &neighbors) {
     page_io_->write_node(slot, query, static_cast<uint32_t>(neighbors.size()), neighbors.data());
+    cache_.upsert_node(slot, query, static_cast<uint32_t>(neighbors.size()), neighbors.data());
   }
 
   std::vector<uint32_t> batch_insert_locked_with_pool(const float *vectors,
@@ -1191,6 +1194,7 @@ class DiskANNIndex {
       page_io_->write_node_neighbors(node_id,
                                      static_cast<uint32_t>(new_nbrs.size()),
                                      new_nbrs.data());
+      cache_.update_neighbors(node_id, static_cast<uint32_t>(new_nbrs.size()), new_nbrs.data());
     }
   }
 
@@ -1314,6 +1318,7 @@ class DiskANNIndex {
       }
       if (live.size() != nd.nbrs.size()) {
         page_io_->write_node_neighbors(nid, static_cast<uint32_t>(live.size()), live.data());
+        cache_.update_neighbors(nid, static_cast<uint32_t>(live.size()), live.data());
       }
     }
     {
