@@ -428,8 +428,10 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
                               ctx.tombstone);
   };
 
-  std::vector<AlignedRead> reqs;
-  std::vector<AlignedReadEvent> evts;
+  auto &reqs = td.io_reqs;
+  auto &evts = td.io_events;
+  reqs.clear();
+  evts.clear();
 
   if (params.deterministic) {
     // Deterministic per-beam barrier: pop the closest unexpanded candidates, read
@@ -486,8 +488,8 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
     // so results are NOT bitwise-reproducible across runs/threads (set
     // deterministic for that). Thread-safety, correctness and recall are
     // unaffected — only the tie-ordering of equally-good candidates differs.
-    std::vector<uint64_t> free_slots;
-    free_slots.reserve(beam);
+    auto &free_slots = td.free_page_slots;
+    free_slots.clear();
     for (uint64_t s = 0; s < beam; ++s) {
       free_slots.push_back(s);
     }
@@ -545,7 +547,8 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
 
   // ---------------- Result extraction (PQ) ----------------
   std::vector<std::pair<uint32_t, float>> out;
-  std::vector<AlignedRead> rerank_req(1);
+  auto &rerank_req = td.rerank_reqs;
+  rerank_req.resize(1);
   auto is_live = [&](uint32_t id) {
     return ctx.tombstone == nullptr || !ctx.tombstone->is_deleted(id);
   };

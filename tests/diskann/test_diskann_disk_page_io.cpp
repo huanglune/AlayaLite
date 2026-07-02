@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 
+#include "coro/sync_wait.hpp"
+#include "coro/thread_pool.hpp"
 #include "index/graph/diskann/disk_layout.hpp"
 #include "index/graph/diskann/diskann_index.hpp"
 
@@ -92,6 +94,55 @@ TEST_F(DiskPageIOTest, ReadNodeMatchesBuild) {
     for (const auto nb : nd.nbrs) {
       EXPECT_LT(nb, n_);  // build neighbors are in range
     }
+  }
+}
+
+TEST_F(DiskPageIOTest, ReadNodesAsyncMatchesReadNode) {
+  build(256, 32, 32);
+  DiskPageIO io(index_path(), geom_);
+  const std::vector<uint32_t> ids = {0, 1, 17, 63, 127, 191, 255};
+
+  const std::vector<DiskPageIO::NodeData> batch = io.read_nodes_async(ids, /*threads=*/4);
+
+  ASSERT_EQ(batch.size(), ids.size());
+  for (size_t i = 0; i < ids.size(); ++i) {
+    const DiskPageIO::NodeData single = io.read_node(ids[i]);
+    EXPECT_EQ(batch[i].coords, single.coords) << "id=" << ids[i];
+    EXPECT_EQ(batch[i].nbrs, single.nbrs) << "id=" << ids[i];
+  }
+}
+
+TEST_F(DiskPageIOTest, ReadNodeAsyncTaskMatchesReadNode) {
+  build(256, 32, 32);
+  DiskPageIO io(index_path(), geom_);
+  coro::thread_pool pool{{.thread_count = 4,
+                          .on_thread_start_functor = nullptr,
+                          .on_thread_stop_functor = nullptr}};
+
+  const DiskPageIO::NodeData async_node = coro::sync_wait(io.read_node_async(127, pool));
+
+  pool.shutdown();
+  const DiskPageIO::NodeData single = io.read_node(127);
+  EXPECT_EQ(async_node.coords, single.coords);
+  EXPECT_EQ(async_node.nbrs, single.nbrs);
+}
+
+TEST_F(DiskPageIOTest, ReadNodesAsyncCanUseCallerThreadPool) {
+  build(256, 32, 32);
+  DiskPageIO io(index_path(), geom_);
+  coro::thread_pool pool{{.thread_count = 4,
+                          .on_thread_start_functor = nullptr,
+                          .on_thread_stop_functor = nullptr}};
+  const std::vector<uint32_t> ids = {2, 18, 64, 126, 190, 254};
+
+  const std::vector<DiskPageIO::NodeData> batch = io.read_nodes_async(ids, pool);
+
+  pool.shutdown();
+  ASSERT_EQ(batch.size(), ids.size());
+  for (size_t i = 0; i < ids.size(); ++i) {
+    const DiskPageIO::NodeData single = io.read_node(ids[i]);
+    EXPECT_EQ(batch[i].coords, single.coords) << "id=" << ids[i];
+    EXPECT_EQ(batch[i].nbrs, single.nbrs) << "id=" << ids[i];
   }
 }
 

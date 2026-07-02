@@ -81,6 +81,10 @@ struct ThreadData {
   uint32_t nbrs_slot_len = 0;
   std::vector<uint32_t> nbrs_free_offsets;
   std::vector<InFlightSlot> inflight;  ///< indexed by scratch page slot
+  std::vector<AlignedRead> io_reqs;
+  std::vector<AlignedReadEvent> io_events;
+  std::vector<uint64_t> free_page_slots;
+  std::vector<AlignedRead> rerank_reqs;
 
   // --- I/O scratch (allocated once, reused) ---
   char *sector_scratch = nullptr;  ///< n_page_slots * page_size bytes, sector-aligned.
@@ -132,6 +136,10 @@ struct ThreadData {
     nbrs_dirty.reserve(config.search_list_size);
     nbrs_free_offsets.reserve(config.search_list_size);
     inflight.assign(config.n_page_slots, {});
+    io_reqs.reserve(config.n_page_slots);
+    io_events.reserve(config.n_page_slots);
+    free_page_slots.reserve(config.n_page_slots);
+    rerank_reqs.resize(1);
     reset_neighbors();
   }
 

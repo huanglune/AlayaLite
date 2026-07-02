@@ -75,17 +75,23 @@ struct Options {
   bool rebuild = false;
   bool deterministic = false;
   bool flush_rounds = false;
+  bool build_only = false;
+  bool eval_only = false;
+  bool single_updates = false;
   uint32_t max_rounds = 0;
   uint32_t nq = 1000;
   uint32_t build_r = kDefaultBenchmarkGraphR;
   uint32_t build_l = kDefaultBenchmarkBuildL;
   uint32_t search_l = 100;
+  uint32_t rerank_count = 0;
   uint32_t update_l = kDefaultBenchmarkUpdateSearchL;
   uint32_t beam = 4;
   uint32_t search_threads = 1;
   uint32_t insert_batch = 32;
   uint32_t update_insert_threads = 32;
   uint32_t update_reconnect_threads = 4;
+  uint32_t warmup_searches = 0;
+  uint32_t updates_per_round = 0;
   uint64_t page_cache_capacity = 0;
 };
 
@@ -229,6 +235,12 @@ Options parse_args(int argc, char **argv) {
       opt.deterministic = true;
     } else if (arg == "--flush_rounds") {
       opt.flush_rounds = true;
+    } else if (arg == "--build_only") {
+      opt.build_only = true;
+    } else if (arg == "--eval_only") {
+      opt.eval_only = true;
+    } else if (arg == "--single_updates") {
+      opt.single_updates = true;
     } else if (arg == "--rounds" && i + 1 < argc) {
       opt.max_rounds = parse_u32(argv[++i], "--rounds");
     } else if (arg == "--nq" && i + 1 < argc) {
@@ -239,6 +251,8 @@ Options parse_args(int argc, char **argv) {
       opt.build_l = std::max<uint32_t>(1, parse_u32(argv[++i], "--build_L"));
     } else if (arg == "--L" && i + 1 < argc) {
       opt.search_l = parse_u32(argv[++i], "--L");
+    } else if (arg == "--rerank_count" && i + 1 < argc) {
+      opt.rerank_count = parse_u32(argv[++i], "--rerank_count");
     } else if (arg == "--update_L" && i + 1 < argc) {
       opt.update_l = std::max<uint32_t>(1, parse_u32(argv[++i], "--update_L"));
     } else if (arg == "--beam" && i + 1 < argc) {
@@ -253,9 +267,16 @@ Options parse_args(int argc, char **argv) {
     } else if (arg == "--update_reconnect_threads" && i + 1 < argc) {
       opt.update_reconnect_threads =
           std::max<uint32_t>(1, parse_u32(argv[++i], "--update_reconnect_threads"));
+    } else if (arg == "--warmup_searches" && i + 1 < argc) {
+      opt.warmup_searches = parse_u32(argv[++i], "--warmup_searches");
+    } else if (arg == "--updates_per_round" && i + 1 < argc) {
+      opt.updates_per_round = parse_u32(argv[++i], "--updates_per_round");
     } else if (arg == "--page_cache" && i + 1 < argc) {
       opt.page_cache_capacity = parse_u64(argv[++i], "--page_cache");
     } else {
+      if (arg.rfind("--", 0) == 0) {
+        throw std::invalid_argument("unknown option: " + arg);
+      }
       pos.push_back(arg);
     }
   }
@@ -272,6 +293,19 @@ Options parse_args(int argc, char **argv) {
     opt.out_csv = pos[3];
   }
   return opt;
+}
+
+TraceRound limit_round_updates(TraceRound round, const Options &opt) {
+  if (opt.updates_per_round == 0) {
+    return round;
+  }
+  const size_t count = static_cast<size_t>(opt.updates_per_round);
+  if (count > round.deletes.size() || count > round.inserts.size()) {
+    throw std::invalid_argument("--updates_per_round exceeds trace round size");
+  }
+  round.deletes.resize(count);
+  round.inserts.resize(count);
+  return round;
 }
 
 void build_initial_index(const Options &opt,
@@ -327,7 +361,7 @@ RecallResult evaluate_search(const DiskANNIndex &idx,
   sp.search_list_size = opt.search_l;
   sp.use_pq = true;
   sp.rerank = true;
-  sp.rerank_count = opt.search_l;
+  sp.rerank_count = opt.rerank_count == 0 ? opt.search_l : opt.rerank_count;
   sp.deterministic = opt.deterministic;
 
   std::vector<uint64_t> labels(static_cast<size_t>(nq) * kTopK);
@@ -388,8 +422,21 @@ RecallResult evaluate_search(const DiskANNIndex &idx,
 
 void apply_deletes(DiskANNIndex &idx,
                    const TraceRound &round,
+                   const Options &opt,
                    std::vector<uint8_t> &live,
                    std::vector<uint32_t> &label_to_slot) {
+  if (opt.single_updates) {
+    for (const uint32_t label : round.deletes) {
+      if (label >= live.size() || live[label] == 0 || label_to_slot[label] == kMissingSlot) {
+        throw std::runtime_error("trace delete id is not live: " + std::to_string(label));
+      }
+      idx.remove(label_to_slot[label]);
+      live[label] = 0;
+      label_to_slot[label] = kMissingSlot;
+    }
+    return;
+  }
+
   std::vector<uint32_t> slots;
   slots.reserve(round.deletes.size());
   for (const uint32_t label : round.deletes) {
@@ -411,6 +458,18 @@ void apply_inserts(DiskANNIndex &idx,
                    const Options &opt,
                    std::vector<uint8_t> &live,
                    std::vector<uint32_t> &label_to_slot) {
+  if (opt.single_updates) {
+    for (const uint32_t label : round.inserts) {
+      if (label >= live.size() || live[label] != 0) {
+        throw std::runtime_error("trace insert id is already live: " + std::to_string(label));
+      }
+      const float *src = base.data.data() + static_cast<size_t>(label) * base.dim;
+      label_to_slot[label] = idx.insert(src, label);
+      live[label] = 1;
+    }
+    return;
+  }
+
   std::vector<float> batch_vectors(static_cast<size_t>(round.inserts.size()) * base.dim);
   std::vector<uint64_t> batch_labels(round.inserts.size());
   for (size_t i = 0; i < round.inserts.size(); ++i) {
@@ -433,6 +492,33 @@ void apply_inserts(DiskANNIndex &idx,
   }
 }
 
+void apply_live_mask_only(const TraceRound &round, std::vector<uint8_t> &live) {
+  for (const uint32_t label : round.deletes) {
+    if (label >= live.size() || live[label] == 0) {
+      throw std::runtime_error("trace delete id is not live: " + std::to_string(label));
+    }
+    live[label] = 0;
+  }
+  for (const uint32_t label : round.inserts) {
+    if (label >= live.size() || live[label] != 0) {
+      throw std::runtime_error("trace insert id is already live: " + std::to_string(label));
+    }
+    live[label] = 1;
+  }
+}
+
+void run_warmup_searches(const DiskANNIndex &idx,
+                         const FloatMatrix &queries,
+                         const IntMatrix &gt,
+                         const std::vector<uint8_t> &live,
+                         const Options &opt) {
+  for (uint32_t i = 0; i < opt.warmup_searches; ++i) {
+    const RecallResult recall = evaluate_search(idx, queries, gt, live, opt);
+    std::cout << "[warmup " << i << "] masked_recall@10=" << recall.recall()
+              << " search_mean_us=" << recall.mean_us << " search_qps=" << recall.qps << "\n";
+  }
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -441,6 +527,9 @@ int main(int argc, char **argv) {
     const std::filesystem::path data_dir = opt.data_dir;
     const std::filesystem::path trace_dir = opt.trace_dir;
     const TraceManifest manifest = read_manifest(trace_dir / "manifest.txt");
+    if (opt.updates_per_round > manifest.update_size) {
+      throw std::invalid_argument("--updates_per_round exceeds trace update_size");
+    }
 
     const DatasetFiles dataset = resolve_dataset_files(data_dir);
     FloatMatrix base = read_fbin(dataset.base);
@@ -451,6 +540,10 @@ int main(int argc, char **argv) {
     }
 
     build_initial_index(opt, base, manifest);
+    if (opt.build_only) {
+      std::cout << "[update_bench] build_only complete: " << opt.index_dir << "\n";
+      return 0;
+    }
     DiskANNLoadParams lp;
     lp.num_threads = std::max<uint32_t>(opt.search_threads, 1);
     lp.beam_width = opt.beam;
@@ -471,6 +564,20 @@ int main(int argc, char **argv) {
 
     const uint32_t rounds =
         opt.max_rounds == 0 ? manifest.rounds : std::min<uint32_t>(opt.max_rounds, manifest.rounds);
+    if (opt.eval_only) {
+      for (uint32_t round_id = 0; round_id < rounds; ++round_id) {
+        const auto path = trace_dir / (manifest.prefix + std::to_string(round_id));
+        apply_live_mask_only(limit_round_updates(read_round(path, manifest.update_size), opt), live);
+      }
+      run_warmup_searches(idx, queries, gt, live, opt);
+      const RecallResult recall = evaluate_search(idx, queries, gt, live, opt);
+      std::cout << "[eval_only] rounds=" << rounds << " masked_recall@10=" << recall.recall()
+                << " search_mean_us=" << recall.mean_us << " search_qps=" << recall.qps << "\n";
+      return 0;
+    }
+
+    run_warmup_searches(idx, queries, gt, live, opt);
+
     std::ofstream csv(opt.out_csv);
     csv << "round,deletes,inserts,update_ms,delete_ms,insert_ms,update_qps,"
            "masked_recall_at_10,recall_hits,recall_total,search_mean_us,search_qps,"
@@ -478,9 +585,9 @@ int main(int argc, char **argv) {
 
     for (uint32_t round_id = 0; round_id < rounds; ++round_id) {
       const auto path = trace_dir / (manifest.prefix + std::to_string(round_id));
-      const TraceRound round = read_round(path, manifest.update_size);
+      const TraceRound round = limit_round_updates(read_round(path, manifest.update_size), opt);
       const auto t0 = std::chrono::steady_clock::now();
-      apply_deletes(idx, round, live, label_to_slot);
+      apply_deletes(idx, round, opt, live, label_to_slot);
       const auto t_delete = std::chrono::steady_clock::now();
       apply_inserts(idx, base, round, opt, live, label_to_slot);
       const auto t_insert = std::chrono::steady_clock::now();

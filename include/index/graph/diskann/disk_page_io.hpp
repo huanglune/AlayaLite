@@ -31,6 +31,10 @@
 #include <unordered_map>
 #include <vector>
 
+#include "coro/sync_wait.hpp"
+#include "coro/task.hpp"
+#include "coro/thread_pool.hpp"
+#include "coro/when_all.hpp"
 #if defined(__linux__)
   #include <fcntl.h>
   #include <sys/stat.h>
@@ -88,6 +92,78 @@ class DiskPageIO {
     const uint32_t n = view.n_nbrs();
     d.nbrs.assign(view.nbrs(), view.nbrs() + n);
     return d;
+  }
+
+  /// Awaitable single-node read. The blocking O_DIRECT pread is executed on @p pool.
+  coro::task<NodeData> read_node_async(uint32_t id, coro::thread_pool &pool) {
+    co_await pool.schedule();
+    co_return read_node_with_private_page(id);
+  }
+
+  /// Read multiple node records using coroutine tasks over private page buffers.
+  /// Shared cache state is protected briefly; O_DIRECT pread runs outside the mutex
+  /// and is guarded by a page epoch before cached state is reused.
+  std::vector<NodeData> read_nodes_async(const std::vector<uint32_t> &ids, uint32_t threads) {
+    return read_nodes_async(ids.data(), static_cast<uint32_t>(ids.size()), threads);
+  }
+
+  std::vector<NodeData> read_nodes_async(const std::vector<uint32_t> &ids,
+                                         coro::thread_pool &pool) {
+    return read_nodes_async(ids.data(), static_cast<uint32_t>(ids.size()), pool);
+  }
+
+  std::vector<NodeData> read_nodes_async(const uint32_t *ids, uint32_t count, uint32_t threads) {
+    if (count == 0) {
+      return {};
+    }
+    if (ids == nullptr) {
+      throw std::invalid_argument("DiskPageIO::read_nodes_async: null ids");
+    }
+    const uint32_t workers = std::min<uint32_t>({std::max<uint32_t>(1, threads), count});
+    if (workers == 1) {
+      std::vector<NodeData> out(count);
+      for (uint32_t i = 0; i < count; ++i) {
+        out[i] = read_node(ids[i]);
+      }
+      return out;
+    }
+
+    coro::thread_pool pool{{.thread_count = workers,
+                            .on_thread_start_functor = nullptr,
+                            .on_thread_stop_functor = nullptr}};
+    try {
+      std::vector<NodeData> out = read_nodes_async(ids, count, pool);
+      pool.shutdown();
+      return out;
+    } catch (...) {
+      pool.shutdown();
+      throw;
+    }
+  }
+
+  std::vector<NodeData> read_nodes_async(const uint32_t *ids,
+                                         uint32_t count,
+                                         coro::thread_pool &pool) {
+    if (count == 0) {
+      return {};
+    }
+    if (ids == nullptr) {
+      throw std::invalid_argument("DiskPageIO::read_nodes_async: null ids");
+    }
+    std::vector<NodeData> out(count);
+    auto read_one = [this, &pool, ids, &out](uint32_t i) -> coro::task<> {
+      out[i] = co_await read_node_async(ids[i], pool);
+    };
+    auto run = [&]() -> coro::task<> {
+      std::vector<coro::task<>> tasks;
+      tasks.reserve(count);
+      for (uint32_t i = 0; i < count; ++i) {
+        tasks.emplace_back(read_one(i));
+      }
+      co_await coro::when_all(std::move(tasks));
+    };
+    coro::sync_wait(run());
+    return out;
   }
 
   /// Read only neighbor lists for a delete batch. IDs sharing a disk page reuse
@@ -276,6 +352,68 @@ class DiskPageIO {
     return std::vector<uint32_t>(view.nbrs(), view.nbrs() + n);
   }
 
+  NodeData node_from_page(const char *page, uint32_t id) const {
+    const NodeRecordView view{page + geom_.offset_to_node(id), geom_.dim};
+    NodeData d;
+    d.coords.assign(view.coords(), view.coords() + geom_.dim);
+    const uint32_t n = view.n_nbrs();
+    d.nbrs.assign(view.nbrs(), view.nbrs() + n);
+    return d;
+  }
+
+  NodeData read_node_with_private_page(uint32_t id) {
+    char *buf =
+        static_cast<char *>(alaya::laser::memory::align_allocate<kSectorLen>(geom_.page_size));
+    try {
+      read_page_snapshot(id, buf);
+      NodeData node = node_from_page(buf, id);
+      alaya::laser::memory::align_free(buf);
+      return node;
+    } catch (...) {
+      alaya::laser::memory::align_free(buf);
+      throw;
+    }
+  }
+
+  void read_page_snapshot(uint32_t id, char *out) {
+    const uint64_t off = geom_.get_page_offset(id);
+    uint64_t observed_version = 0;
+    {
+      std::lock_guard<std::mutex> lock(io_mutex_);
+      if (page_cache_.read(off, out, geom_.page_size)) {
+        return;
+      }
+      observed_version = page_version(off);
+    }
+
+    read_page_from_disk(off, out);
+
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    if (page_cache_.read(off, out, geom_.page_size)) {
+      return;
+    }
+    if (page_version(off) != observed_version) {
+      read_page(id);
+      std::memcpy(out, page_buf_, geom_.page_size);
+      return;
+    }
+    page_cache_.write(off,
+                      out,
+                      geom_.page_size,
+                      false,
+                      [this](uint64_t page_off, const char *page) {
+                        write_page_to_disk(page_off, page);
+                      });
+  }
+
+  uint64_t page_version(uint64_t page_off) const {
+    const auto it = page_versions_.find(page_off);
+    if (it == page_versions_.end()) {
+      return 0;
+    }
+    return it->second;
+  }
+
 #if defined(__linux__)
   void read_neighbor_group_stride(const uint32_t *ids,
                                   const std::vector<uint32_t> &order,
@@ -323,6 +461,7 @@ class DiskPageIO {
   // ---- platform-gated syscalls (Linux O_DIRECT) ----
   void open_rw(const std::string &path);
   void read_page(uint32_t id);
+  void read_page_from_disk(uint64_t page_off, char *page) const;
   void write_page(uint32_t id);
   void write_page_to_disk(uint64_t page_off, const char *page);
   void extend_to(uint64_t new_size);
@@ -346,6 +485,7 @@ class DiskPageIO {
   char *flush_buf_ = nullptr;
   DiskPageCache page_cache_;
   std::unordered_map<uint32_t, std::vector<float>> vec_cache_;
+  std::unordered_map<uint64_t, uint64_t> page_versions_;
   mutable std::mutex io_mutex_;
 };
 
@@ -370,11 +510,7 @@ inline void DiskPageIO::read_page(uint32_t id) {
   if (page_cache_.read(off, page_buf_, geom_.page_size)) {
     return;
   }
-  const ssize_t r = ::pread(fd_, page_buf_, geom_.page_size, static_cast<off_t>(off));
-  if (r != static_cast<ssize_t>(geom_.page_size)) {
-    throw std::runtime_error("DiskPageIO::read_page: short/failed pread at " + std::to_string(off) +
-                             " (got " + std::to_string(r) + ")");
-  }
+  read_page_from_disk(off, page_buf_);
   page_cache_.write(off,
                     page_buf_,
                     geom_.page_size,
@@ -382,6 +518,14 @@ inline void DiskPageIO::read_page(uint32_t id) {
                     [this](uint64_t page_off, const char *page) {
                       write_page_to_disk(page_off, page);
                     });
+}
+
+inline void DiskPageIO::read_page_from_disk(uint64_t page_off, char *page) const {
+  const ssize_t r = ::pread(fd_, page, geom_.page_size, static_cast<off_t>(page_off));
+  if (r != static_cast<ssize_t>(geom_.page_size)) {
+    throw std::runtime_error("DiskPageIO::read_page: short/failed pread at " +
+                             std::to_string(page_off) + " (got " + std::to_string(r) + ")");
+  }
 }
 
 inline void DiskPageIO::write_page(uint32_t id) {
@@ -394,9 +538,11 @@ inline void DiskPageIO::write_page(uint32_t id) {
                       [this](uint64_t page_off, const char *page) {
                         write_page_to_disk(page_off, page);
                       });
+    ++page_versions_[off];
     return;
   }
   write_page_to_disk(off, page_buf_);
+  ++page_versions_[off];
 }
 
 inline void DiskPageIO::write_page_to_disk(uint64_t page_off, const char *page) {
@@ -433,6 +579,9 @@ inline void DiskPageIO::open_rw(const std::string &) {
   throw std::runtime_error("DiskPageIO: in-place DiskANN updates require Linux (O_DIRECT)");
 }
 inline void DiskPageIO::read_page(uint32_t) {
+  throw std::runtime_error("DiskPageIO: unsupported platform (needs Linux O_DIRECT)");
+}
+inline void DiskPageIO::read_page_from_disk(uint64_t, char *) const {
   throw std::runtime_error("DiskPageIO: unsupported platform (needs Linux O_DIRECT)");
 }
 inline void DiskPageIO::write_page(uint32_t) {

@@ -40,6 +40,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -900,33 +901,58 @@ class DiskANNIndex {
     coro::sync_wait(run());
   }
 
+  struct ReconnectWork {
+    uint32_t node_id = 0;
+    std::vector<uint32_t> extra_edges;
+  };
+
   void run_batch_reconnect_tasks(uint32_t begin,
                                  uint32_t end,
                                  const std::vector<uint32_t> &ids,
                                  const std::vector<std::vector<uint32_t>> &pruned,
                                  coro::thread_pool &pool) {
-    size_t task_count = 0;
-    for (uint32_t i = begin; i < end; ++i) {
-      task_count += pruned[i].size();
-    }
-    if (task_count == 0) {
+    std::vector<ReconnectWork> work = collect_batch_reconnect_work(begin, end, ids, pruned);
+    if (work.empty()) {
       return;
     }
-    auto reconnect_one = [this, &pool](uint32_t node_id, uint32_t slot) -> coro::task<> {
-      co_await pool.schedule();
-      update_node_impl_for_insert(node_id, slot);
+    auto reconnect_one = [this, &pool, &work](uint32_t i) -> coro::task<> {
+      const ReconnectWork &item = work[i];
+      const DiskPageIO::NodeData node = co_await page_io_->read_node_async(item.node_id, pool);
+      std::lock_guard<std::mutex> node_lock(update_node_mutex(item.node_id));
+      update_node_impl_from_snapshot(item.node_id, node, item.extra_edges);
     };
     auto run = [&]() -> coro::task<> {
       std::vector<coro::task<>> tasks;
-      tasks.reserve(task_count);
-      for (uint32_t i = begin; i < end; ++i) {
-        for (const uint32_t node_id : pruned[i]) {
-          tasks.emplace_back(reconnect_one(node_id, ids[i]));
-        }
+      tasks.reserve(work.size());
+      for (uint32_t i = 0; i < work.size(); ++i) {
+        tasks.emplace_back(reconnect_one(i));
       }
       co_await coro::when_all(std::move(tasks));
     };
     coro::sync_wait(run());
+  }
+
+  std::vector<ReconnectWork> collect_batch_reconnect_work(
+      uint32_t begin,
+      uint32_t end,
+      const std::vector<uint32_t> &ids,
+      const std::vector<std::vector<uint32_t>> &pruned) {
+    std::vector<ReconnectWork> work;
+    std::unordered_map<uint32_t, size_t> pos_by_node;
+    for (uint32_t i = begin; i < end; ++i) {
+      for (const uint32_t node_id : pruned[i]) {
+        auto [pos, inserted] = pos_by_node.emplace(node_id, work.size());
+        if (inserted) {
+          ReconnectWork item;
+          item.node_id = node_id;
+          item.extra_edges.push_back(ids[i]);
+          work.push_back(std::move(item));
+          continue;
+        }
+        work[pos->second].extra_edges.push_back(ids[i]);
+      }
+    }
+    return work;
   }
 
   void add_extra_edges(uint32_t node_id,
@@ -1032,7 +1058,12 @@ class DiskANNIndex {
   /// deleted nodes + explicit extra edges, exact-L2 ranked, alpha-RNG pruned.
   void update_node_impl(uint32_t node_id, const std::vector<uint32_t> &extra_edges) {
     const DiskPageIO::NodeData nd = page_io_->read_node(node_id);
+    update_node_impl_from_snapshot(node_id, nd, extra_edges);
+  }
 
+  void update_node_impl_from_snapshot(uint32_t node_id,
+                                      const DiskPageIO::NodeData &nd,
+                                      const std::vector<uint32_t> &extra_edges) {
     std::unordered_set<uint32_t> cand;
     const auto &removed_node_nbrs = update_ctx_.removed_node_nbrs_;
     for (const uint32_t nbr : nd.nbrs) {
