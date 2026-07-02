@@ -8,11 +8,14 @@
 #include <spdlog/spdlog.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <future>
 #include <map>
 #include <memory>
 #include <random>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -20,7 +23,7 @@
 #include "simd/distance_l2.hpp"
 
 #if defined(__linux__)
-#include <unistd.h>
+  #include <unistd.h>
 #endif
 
 namespace {
@@ -51,9 +54,8 @@ class UpdateE2ETest : public ::testing::Test {
 
   void SetUp() override {
     static std::atomic<uint64_t> counter{0};
-    dir_ = std::filesystem::temp_directory_path() /
-           ("diskann_upd_" + std::to_string(::getpid()) + "_" +
-            std::to_string(counter.fetch_add(1)));
+    dir_ = std::filesystem::temp_directory_path() / ("diskann_upd_" + std::to_string(::getpid()) +
+                                                     "_" + std::to_string(counter.fetch_add(1)));
     std::error_code ec;
     std::filesystem::remove_all(dir_, ec);
   }
@@ -408,6 +410,86 @@ TEST_F(UpdateE2ETest, MixedWorkloadKeepsRecallAbove90) {
     EXPECT_GE(r, 0.90) << "recall collapsed at round " << round;
   }
   EXPECT_EQ(idx_->live_count(), 500u);  // balanced insert/delete
+}
+
+TEST_F(UpdateE2ETest, SearchReturnsWhileBatchInsertIsInFlight) {
+  DiskANNLoadParams lp;
+  lp.num_threads = 2;
+  lp.update_insert_threads = 1;
+  lp.update_reconnect_threads = 1;
+  build_and_load(/*n=*/700, /*dim=*/32, /*r=*/32, lp);
+
+  const uint32_t n_insert = 96;
+  const auto nv = make_vectors(n_insert, 32, /*seed=*/9876);
+  std::vector<uint64_t> labels(n_insert);
+  for (uint32_t i = 0; i < labels.size(); ++i) {
+    labels[i] = 20000 + i;
+  }
+
+  std::atomic<bool> insert_started{false};
+  auto insert_future = std::async(std::launch::async, [&]() {
+    insert_started.store(true, std::memory_order_release);
+    return idx_->batch_insert(nv.data(), labels.data(), n_insert, /*batch_size=*/1);
+  });
+  while (!insert_started.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  ASSERT_EQ(insert_future.wait_for(std::chrono::milliseconds(0)), std::future_status::timeout)
+      << "batch_insert must still be running for the concurrency assertion";
+
+  auto search_future = std::async(std::launch::async, [&]() {
+    uint64_t out_l[10];
+    float out_d[10];
+    idx_->search(base_vecs_.data(), 10, out_l, out_d, {/*L=*/100, false, false, 0, true});
+  });
+
+  EXPECT_EQ(search_future.wait_for(std::chrono::milliseconds(50)), std::future_status::ready)
+      << "search should run while a batch insert is in flight";
+  EXPECT_EQ(insert_future.wait_for(std::chrono::milliseconds(0)), std::future_status::timeout)
+      << "batch_insert should not have completed before the overlapping search returns";
+
+  search_future.get();
+  const std::vector<uint32_t> ids = insert_future.get();
+  ASSERT_EQ(ids.size(), labels.size());
+}
+
+TEST_F(UpdateE2ETest, ReusedSlotStaysTombstonedUntilBatchInsertPublishesIt) {
+  DiskANNLoadParams lp;
+  lp.num_threads = 2;
+  lp.update_insert_threads = 1;
+  lp.update_reconnect_threads = 1;
+  build_and_load(/*n=*/700, /*dim=*/32, /*r=*/32, lp);
+
+  const uint32_t deleted_id = deletable_[0];
+  do_remove(deleted_id);
+  ASSERT_TRUE(idx_->is_deleted(deleted_id));
+
+  const uint32_t n_insert = 96;
+  const auto nv = make_vectors(n_insert, 32, /*seed=*/8765);
+  std::vector<uint64_t> labels(n_insert);
+  for (uint32_t i = 0; i < labels.size(); ++i) {
+    labels[i] = 30000 + i;
+  }
+
+  std::atomic<bool> insert_started{false};
+  auto insert_future = std::async(std::launch::async, [&]() {
+    insert_started.store(true, std::memory_order_release);
+    return idx_->batch_insert(nv.data(), labels.data(), n_insert, /*batch_size=*/1);
+  });
+  while (!insert_started.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  ASSERT_EQ(insert_future.wait_for(std::chrono::milliseconds(0)), std::future_status::timeout)
+      << "batch_insert must still be running while the reused slot is checked";
+  EXPECT_TRUE(idx_->is_deleted(deleted_id))
+      << "a reused slot must remain tombstoned until its new record is written and published";
+
+  const std::vector<uint32_t> ids = insert_future.get();
+  ASSERT_EQ(ids.size(), labels.size());
+  EXPECT_EQ(ids.front(), deleted_id);
+  EXPECT_FALSE(idx_->is_deleted(deleted_id));
 }
 
 // 7.4 -----------------------------------------------------------------------

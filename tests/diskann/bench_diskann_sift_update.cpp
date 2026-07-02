@@ -7,13 +7,16 @@
 // uint32 update_size, followed by update_size delete ids and update_size insert ids.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -33,6 +36,7 @@ constexpr uint32_t kMissingSlot = std::numeric_limits<uint32_t>::max();
 constexpr uint32_t kDefaultBenchmarkGraphR = 64;
 constexpr uint32_t kDefaultBenchmarkBuildL = 100;
 constexpr uint32_t kDefaultBenchmarkUpdateSearchL = 30;
+constexpr uint32_t kBenchmarkTopK = 10;
 
 struct FloatMatrix {
   std::vector<float> data;
@@ -78,6 +82,7 @@ struct Options {
   bool build_only = false;
   bool eval_only = false;
   bool single_updates = false;
+  bool mixed = false;
   uint32_t max_rounds = 0;
   uint32_t nq = 1000;
   uint32_t build_r = kDefaultBenchmarkGraphR;
@@ -92,6 +97,8 @@ struct Options {
   uint32_t update_reconnect_threads = 4;
   uint32_t warmup_searches = 0;
   uint32_t updates_per_round = 0;
+  uint32_t mixed_query_batch = 10000;
+  uint32_t mixed_sleep_ms = 5000;
   uint64_t page_cache_capacity = 0;
 };
 
@@ -111,8 +118,7 @@ DatasetFiles resolve_dataset_files(const std::filesystem::path &data_dir) {
       continue;
     }
     if (!std::filesystem::exists(files.queries) || !std::filesystem::exists(files.groundtruth)) {
-      throw std::runtime_error("incomplete " + files.name + " dataset under " +
-                               data_dir.string());
+      throw std::runtime_error("incomplete " + files.name + " dataset under " + data_dir.string());
     }
     return files;
   }
@@ -241,6 +247,8 @@ Options parse_args(int argc, char **argv) {
       opt.eval_only = true;
     } else if (arg == "--single_updates") {
       opt.single_updates = true;
+    } else if (arg == "--mixed") {
+      opt.mixed = true;
     } else if (arg == "--rounds" && i + 1 < argc) {
       opt.max_rounds = parse_u32(argv[++i], "--rounds");
     } else if (arg == "--nq" && i + 1 < argc) {
@@ -271,6 +279,10 @@ Options parse_args(int argc, char **argv) {
       opt.warmup_searches = parse_u32(argv[++i], "--warmup_searches");
     } else if (arg == "--updates_per_round" && i + 1 < argc) {
       opt.updates_per_round = parse_u32(argv[++i], "--updates_per_round");
+    } else if (arg == "--mixed_query_batch" && i + 1 < argc) {
+      opt.mixed_query_batch = std::max<uint32_t>(1, parse_u32(argv[++i], "--mixed_query_batch"));
+    } else if (arg == "--mixed_sleep_ms" && i + 1 < argc) {
+      opt.mixed_sleep_ms = parse_u32(argv[++i], "--mixed_sleep_ms");
     } else if (arg == "--page_cache" && i + 1 < argc) {
       opt.page_cache_capacity = parse_u64(argv[++i], "--page_cache");
     } else {
@@ -350,22 +362,47 @@ struct RecallResult {
   double recall() const { return total == 0 ? 0.0 : static_cast<double>(hits) / total; }
 };
 
-RecallResult evaluate_search(const DiskANNIndex &idx,
-                             const FloatMatrix &queries,
-                             const IntMatrix &gt,
-                             const std::vector<uint8_t> &live,
-                             const Options &opt) {
-  const uint32_t nq = opt.nq == 0 ? queries.n : std::min<uint32_t>(opt.nq, queries.n);
-  constexpr uint32_t kTopK = 10;
+struct MixedSearchState {
+  std::atomic<bool> stop{false};
+  std::atomic<uint32_t> ready{0};
+  std::atomic<uint32_t> next_query{0};
+  std::atomic<uint32_t> window_queries{0};
+  std::atomic<bool> window_paused{false};
+  std::atomic<uint64_t> queries{0};
+  std::atomic<uint64_t> latency_ns{0};
+  std::vector<std::thread> workers;
+  std::chrono::steady_clock::time_point started_at{};
+  std::chrono::steady_clock::time_point stopped_at{};
+  std::exception_ptr error = nullptr;
+  std::mutex error_mutex;
+};
+
+struct MixedSearchResult {
+  uint64_t queries = 0;
+  double mean_us = 0.0;
+  double qps = 0.0;
+};
+
+DiskANNSearchParams make_search_params(const Options &opt) {
   DiskANNSearchParams sp;
   sp.search_list_size = opt.search_l;
   sp.use_pq = true;
   sp.rerank = true;
   sp.rerank_count = opt.rerank_count == 0 ? opt.search_l : opt.rerank_count;
   sp.deterministic = opt.deterministic;
+  return sp;
+}
 
-  std::vector<uint64_t> labels(static_cast<size_t>(nq) * kTopK);
-  std::vector<float> distances(static_cast<size_t>(nq) * kTopK);
+RecallResult evaluate_search(const DiskANNIndex &idx,
+                             const FloatMatrix &queries,
+                             const IntMatrix &gt,
+                             const std::vector<uint8_t> &live,
+                             const Options &opt) {
+  const uint32_t nq = opt.nq == 0 ? queries.n : std::min<uint32_t>(opt.nq, queries.n);
+  const DiskANNSearchParams sp = make_search_params(opt);
+
+  std::vector<uint64_t> labels(static_cast<size_t>(nq) * kBenchmarkTopK);
+  std::vector<float> distances(static_cast<size_t>(nq) * kBenchmarkTopK);
   std::vector<double> lat_us(nq, 0.0);
   std::atomic<uint32_t> next{0};
   auto worker = [&]() {
@@ -377,9 +414,9 @@ RecallResult evaluate_search(const DiskANNIndex &idx,
       const float *query = queries.data.data() + static_cast<size_t>(qi) * queries.dim;
       auto t0 = std::chrono::steady_clock::now();
       idx.search(query,
-                 kTopK,
-                 labels.data() + static_cast<size_t>(qi) * kTopK,
-                 distances.data() + static_cast<size_t>(qi) * kTopK,
+                 kBenchmarkTopK,
+                 labels.data() + static_cast<size_t>(qi) * kBenchmarkTopK,
+                 distances.data() + static_cast<size_t>(qi) * kBenchmarkTopK,
                  sp);
       auto t1 = std::chrono::steady_clock::now();
       lat_us[qi] = std::chrono::duration<double, std::micro>(t1 - t0).count();
@@ -398,14 +435,14 @@ RecallResult evaluate_search(const DiskANNIndex &idx,
   RecallResult result;
   for (uint32_t qi = 0; qi < nq; ++qi) {
     std::unordered_set<uint64_t> got;
-    const uint64_t *row = labels.data() + static_cast<size_t>(qi) * kTopK;
-    for (uint32_t i = 0; i < kTopK; ++i) {
+    const uint64_t *row = labels.data() + static_cast<size_t>(qi) * kBenchmarkTopK;
+    for (uint32_t i = 0; i < kBenchmarkTopK; ++i) {
       if (row[i] != DiskANNIndex::kNoLabel) {
         got.insert(row[i]);
       }
     }
     const uint32_t *truth = gt.row(qi);
-    for (uint32_t i = 0; i < kTopK && i < gt.dim; ++i) {
+    for (uint32_t i = 0; i < kBenchmarkTopK && i < gt.dim; ++i) {
       if (truth[i] < live.size() && live[truth[i]] != 0) {
         ++result.total;
         if (got.count(truth[i]) != 0) {
@@ -417,6 +454,119 @@ RecallResult evaluate_search(const DiskANNIndex &idx,
   }
   result.mean_us /= nq;
   result.qps = static_cast<double>(nq) / std::chrono::duration<double>(wall1 - wall0).count();
+  return result;
+}
+
+void record_mixed_search_error(MixedSearchState &state) {
+  std::lock_guard<std::mutex> lock(state.error_mutex);
+  if (state.error == nullptr) {
+    state.error = std::current_exception();
+  }
+  state.stop.store(true, std::memory_order_release);
+}
+
+void sleep_until_next_mixed_window(MixedSearchState &state, uint32_t sleep_ms) {
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(sleep_ms);
+  while (!state.stop.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
+
+void maybe_pause_mixed_search_window(MixedSearchState &state, const Options &opt) {
+  const uint32_t finished = state.window_queries.fetch_add(1, std::memory_order_acq_rel) + 1;
+  if (finished < opt.mixed_query_batch) {
+    return;
+  }
+  bool expected = false;
+  if (!state.window_paused.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    return;
+  }
+  state.window_queries.store(0, std::memory_order_release);
+  sleep_until_next_mixed_window(state, opt.mixed_sleep_ms);
+  state.window_paused.store(false, std::memory_order_release);
+}
+
+void wait_for_mixed_search_window(MixedSearchState &state) {
+  while (!state.stop.load(std::memory_order_acquire) &&
+         state.window_paused.load(std::memory_order_acquire)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
+
+void start_mixed_search(MixedSearchState &state,
+                        const DiskANNIndex &idx,
+                        const FloatMatrix &queries,
+                        const Options &opt) {
+  const uint32_t nq = opt.nq == 0 ? queries.n : std::min<uint32_t>(opt.nq, queries.n);
+  if (nq == 0) {
+    throw std::invalid_argument("--mixed requires at least one query");
+  }
+  const DiskANNSearchParams sp = make_search_params(opt);
+  const uint32_t workers = std::max<uint32_t>(1, opt.search_threads);
+  state.started_at = std::chrono::steady_clock::now();
+  state.workers.reserve(workers);
+  for (uint32_t worker_id = 0; worker_id < workers; ++worker_id) {
+    state.workers.emplace_back([&, worker_id]() {
+      (void)worker_id;
+      std::array<uint64_t, kBenchmarkTopK> labels{};
+      std::array<float, kBenchmarkTopK> distances{};
+      state.ready.fetch_add(1, std::memory_order_release);
+      try {
+        while (!state.stop.load(std::memory_order_acquire)) {
+          wait_for_mixed_search_window(state);
+          if (state.stop.load(std::memory_order_acquire)) {
+            break;
+          }
+          const uint32_t seq = state.next_query.fetch_add(1, std::memory_order_relaxed);
+          const uint32_t qi = seq % nq;
+          const float *query = queries.data.data() + static_cast<size_t>(qi) * queries.dim;
+          const auto t0 = std::chrono::steady_clock::now();
+          idx.search(query, kBenchmarkTopK, labels.data(), distances.data(), sp);
+          const auto t1 = std::chrono::steady_clock::now();
+          const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+          state.latency_ns.fetch_add(static_cast<uint64_t>(ns), std::memory_order_relaxed);
+          state.queries.fetch_add(1, std::memory_order_relaxed);
+          maybe_pause_mixed_search_window(state, opt);
+        }
+      } catch (...) {
+        record_mixed_search_error(state);
+      }
+    });
+  }
+  while (state.ready.load(std::memory_order_acquire) < workers) {
+    std::this_thread::yield();
+  }
+}
+
+void request_mixed_search_stop(MixedSearchState &state) {
+  state.stop.store(true, std::memory_order_release);
+}
+
+void join_mixed_search(MixedSearchState &state) {
+  for (auto &worker : state.workers) {
+    if (worker.joinable()) {
+      worker.join();
+    }
+  }
+  state.stopped_at = std::chrono::steady_clock::now();
+}
+
+MixedSearchResult finish_mixed_search(MixedSearchState &state) {
+  request_mixed_search_stop(state);
+  join_mixed_search(state);
+  if (state.error != nullptr) {
+    std::rethrow_exception(state.error);
+  }
+  MixedSearchResult result;
+  result.queries = state.queries.load(std::memory_order_relaxed);
+  if (result.queries == 0) {
+    return result;
+  }
+  const double wall_s = std::chrono::duration<double>(state.stopped_at - state.started_at).count();
+  result.mean_us = static_cast<double>(state.latency_ns.load(std::memory_order_relaxed)) /
+                   result.queries / 1000.0;
+  result.qps = wall_s <= 0.0 ? 0.0 : static_cast<double>(result.queries) / wall_s;
   return result;
 }
 
@@ -567,7 +717,8 @@ int main(int argc, char **argv) {
     if (opt.eval_only) {
       for (uint32_t round_id = 0; round_id < rounds; ++round_id) {
         const auto path = trace_dir / (manifest.prefix + std::to_string(round_id));
-        apply_live_mask_only(limit_round_updates(read_round(path, manifest.update_size), opt), live);
+        apply_live_mask_only(limit_round_updates(read_round(path, manifest.update_size), opt),
+                             live);
       }
       run_warmup_searches(idx, queries, gt, live, opt);
       const RecallResult recall = evaluate_search(idx, queries, gt, live, opt);
@@ -580,37 +731,60 @@ int main(int argc, char **argv) {
 
     std::ofstream csv(opt.out_csv);
     csv << "round,deletes,inserts,update_ms,delete_ms,insert_ms,update_qps,"
+           "mixed_search_qps,mixed_search_mean_us,mixed_search_queries,"
            "masked_recall_at_10,recall_hits,recall_total,search_mean_us,search_qps,"
            "live_count,tombstones,free_slots\n";
 
     for (uint32_t round_id = 0; round_id < rounds; ++round_id) {
       const auto path = trace_dir / (manifest.prefix + std::to_string(round_id));
       const TraceRound round = limit_round_updates(read_round(path, manifest.update_size), opt);
+      MixedSearchState mixed_state;
+      bool mixed_started = false;
       const auto t0 = std::chrono::steady_clock::now();
-      apply_deletes(idx, round, opt, live, label_to_slot);
-      const auto t_delete = std::chrono::steady_clock::now();
-      apply_inserts(idx, base, round, opt, live, label_to_slot);
-      const auto t_insert = std::chrono::steady_clock::now();
-      if (opt.flush_rounds) {
-        idx.flush();
+      try {
+        if (opt.mixed) {
+          start_mixed_search(mixed_state, idx, queries, opt);
+          mixed_started = true;
+        }
+        apply_deletes(idx, round, opt, live, label_to_slot);
+        const auto t_delete = std::chrono::steady_clock::now();
+        apply_inserts(idx, base, round, opt, live, label_to_slot);
+        const auto t_insert = std::chrono::steady_clock::now();
+        if (opt.flush_rounds) {
+          idx.flush();
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        MixedSearchResult mixed_search;
+        if (mixed_started) {
+          mixed_search = finish_mixed_search(mixed_state);
+        }
+        const double update_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        const double delete_ms = std::chrono::duration<double, std::milli>(t_delete - t0).count();
+        const double insert_ms =
+            std::chrono::duration<double, std::milli>(t_insert - t_delete).count();
+        const double update_qps =
+            static_cast<double>(round.deletes.size() + round.inserts.size()) / (update_ms / 1000.0);
+        const RecallResult recall = evaluate_search(idx, queries, gt, live, opt);
+        std::cout << "[round " << round_id << "] update_qps=" << update_qps
+                  << " delete_ms=" << delete_ms << " insert_ms=" << insert_ms
+                  << " mixed_search_qps=" << mixed_search.qps
+                  << " mixed_search_mean_us=" << mixed_search.mean_us
+                  << " mixed_search_queries=" << mixed_search.queries
+                  << " masked_recall@10=" << recall.recall() << " live=" << idx.live_count()
+                  << " tombstones=" << idx.tombstone_count() << "\n";
+        csv << round_id << "," << round.deletes.size() << "," << round.inserts.size() << ","
+            << update_ms << "," << delete_ms << "," << insert_ms << "," << update_qps << ","
+            << mixed_search.qps << "," << mixed_search.mean_us << "," << mixed_search.queries << ","
+            << recall.recall() << "," << recall.hits << "," << recall.total << "," << recall.mean_us
+            << "," << recall.qps << "," << idx.live_count() << "," << idx.tombstone_count() << ","
+            << idx.free_slot_count() << "\n";
+      } catch (...) {
+        if (mixed_started) {
+          request_mixed_search_stop(mixed_state);
+          join_mixed_search(mixed_state);
+        }
+        throw;
       }
-      const auto t1 = std::chrono::steady_clock::now();
-      const double update_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-      const double delete_ms = std::chrono::duration<double, std::milli>(t_delete - t0).count();
-      const double insert_ms =
-          std::chrono::duration<double, std::milli>(t_insert - t_delete).count();
-      const double update_qps =
-          static_cast<double>(round.deletes.size() + round.inserts.size()) / (update_ms / 1000.0);
-      const RecallResult recall = evaluate_search(idx, queries, gt, live, opt);
-      std::cout << "[round " << round_id << "] update_qps=" << update_qps
-                << " delete_ms=" << delete_ms << " insert_ms=" << insert_ms
-                << " masked_recall@10=" << recall.recall() << " live=" << idx.live_count()
-                << " tombstones=" << idx.tombstone_count() << "\n";
-      csv << round_id << "," << round.deletes.size() << "," << round.inserts.size() << ","
-          << update_ms << "," << delete_ms << "," << insert_ms << "," << update_qps << ","
-          << recall.recall() << "," << recall.hits << "," << recall.total << ","
-          << recall.mean_us << "," << recall.qps << "," << idx.live_count() << ","
-          << idx.tombstone_count() << "," << idx.free_slot_count() << "\n";
     }
     idx.flush();
     std::cout << "[update_bench] wrote " << opt.out_csv << "\n";

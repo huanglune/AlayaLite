@@ -380,44 +380,53 @@ class DiskANNIndex {
       throw std::invalid_argument("DiskANNIndex::search: null output buffers");
     }
 
-    std::shared_lock<std::shared_mutex> search_lock;
-    if (updatable_) {
-      search_lock = std::shared_lock<std::shared_mutex>(update_mutex_);
+    const SearchSnapshot snapshot = make_search_snapshot();
+    const bool use_pq = params.use_pq && has_pq_;
+    std::shared_lock<std::shared_mutex> pq_lock;
+    if (use_pq) {
+      pq_lock = std::shared_lock<std::shared_mutex>(pq_mutex_);
     }
 
     ThreadData *td = acquire();
     uint32_t count = 0;
+    std::vector<std::pair<uint32_t, float>> results;
     try {
+      td->resize_slot_capacity(snapshot.max_slot_id);
       SearchContext ctx;
       ctx.reader = reader_.get();
       ctx.geom = &geom_;
       ctx.cache = &cache_;
-      ctx.pq = has_pq_ ? &pq_ : nullptr;
+      ctx.pq = use_pq ? &pq_ : nullptr;
       ctx.medoid = medoid_;
-      ctx.num_points = max_slot_id_;
-      if (updatable_) {
-        ctx.tombstone = &slot_alloc_.tombstone();
+      ctx.num_points = snapshot.max_slot_id;
+      if (snapshot.has_tombstone) {
+        ctx.tombstone = &snapshot.tombstone;
       }
 
       SearchParams sp;
       sp.search_list_size = params.search_list_size;
       sp.beam_width = beam_width_;
-      sp.use_pq = params.use_pq && has_pq_;
+      sp.use_pq = use_pq;
       sp.rerank = params.rerank;
       sp.rerank_count = params.rerank_count;
       sp.deterministic = params.deterministic;
 
-      const auto results = cached_beam_search(ctx, query, top_k, sp, *td, stats);
+      results = cached_beam_search(ctx, query, top_k, sp, *td, stats);
       count = static_cast<uint32_t>(results.size());
-      for (uint32_t i = 0; i < count; ++i) {
-        out_labels[i] = labels_[results[i].first];
-        out_distances[i] = results[i].second;
-      }
     } catch (...) {
       release(td);
       throw;
     }
     release(td);
+
+    {
+      std::shared_lock<std::shared_mutex> state_lock(update_mutex_);
+      for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t id = results[i].first;
+        out_labels[i] = id < labels_.size() ? labels_[id] : kNoLabel;
+        out_distances[i] = results[i].second;
+      }
+    }
 
     // Pad unused slots with sentinels so callers can detect short result rows.
     for (uint32_t i = count; i < top_k; ++i) {
@@ -486,17 +495,35 @@ class DiskANNIndex {
   }
 
   // --------------------------------------------------------------- accessors
-  [[nodiscard]] uint64_t size() const { return live_count_; }  // live (non-tombstoned) vectors
+  [[nodiscard]] uint64_t size() const { return live_count(); }  // live (non-tombstoned) vectors
   [[nodiscard]] uint64_t dim() const { return dim_; }
   [[nodiscard]] bool has_pq() const { return has_pq_; }
   [[nodiscard]] uint32_t medoid() const { return medoid_; }
   [[nodiscard]] bool updatable() const { return updatable_; }
-  [[nodiscard]] uint64_t live_count() const { return live_count_; }
-  [[nodiscard]] uint64_t max_slot_id() const { return max_slot_id_; }
-  [[nodiscard]] uint64_t tombstone_count() const { return slot_alloc_.tombstone_count(); }
-  [[nodiscard]] uint64_t free_slot_count() const { return slot_alloc_.free_count(); }
-  [[nodiscard]] uint64_t safety_net_fire_count() const { return safety_net_fires_; }
-  [[nodiscard]] bool is_deleted(uint32_t id) const { return slot_alloc_.is_deleted(id); }
+  [[nodiscard]] uint64_t live_count() const {
+    std::shared_lock<std::shared_mutex> lock(update_mutex_);
+    return live_count_;
+  }
+  [[nodiscard]] uint64_t max_slot_id() const {
+    std::shared_lock<std::shared_mutex> lock(update_mutex_);
+    return max_slot_id_;
+  }
+  [[nodiscard]] uint64_t tombstone_count() const {
+    std::shared_lock<std::shared_mutex> lock(update_mutex_);
+    return slot_alloc_.tombstone_count();
+  }
+  [[nodiscard]] uint64_t free_slot_count() const {
+    std::shared_lock<std::shared_mutex> lock(update_mutex_);
+    return slot_alloc_.free_count();
+  }
+  [[nodiscard]] uint64_t safety_net_fire_count() const {
+    std::shared_lock<std::shared_mutex> lock(update_mutex_);
+    return safety_net_fires_;
+  }
+  [[nodiscard]] bool is_deleted(uint32_t id) const {
+    std::shared_lock<std::shared_mutex> lock(update_mutex_);
+    return slot_alloc_.is_deleted(id);
+  }
 
   /// Sentinel label for padded (missing) result slots.
   static constexpr uint64_t kNoLabel = std::numeric_limits<uint64_t>::max();
@@ -511,15 +538,15 @@ class DiskANNIndex {
     if (query == nullptr) {
       throw std::invalid_argument("DiskANNIndex::insert: null query");
     }
-    std::unique_lock<std::shared_mutex> lock(update_mutex_);
+    std::lock_guard<std::mutex> update_guard(update_serial_mutex_);
     page_io_->clear_cache();
 
     const std::vector<uint32_t> pruned = select_insert_neighbors(query);
     uint32_t slot = 0;
     {
+      std::unique_lock<std::shared_mutex> state_lock(update_mutex_);
       std::lock_guard<std::mutex> slot_lock(slot_mutex_);
       slot = allocate_update_slot_unlocked(label);
-      resize_thread_data_slot_capacity();
     }
     encode_pq_slot(query, slot);
     write_inserted_node(slot, query, pruned);
@@ -547,7 +574,7 @@ class DiskANNIndex {
       throw std::invalid_argument("DiskANNIndex::batch_insert: batch_size must be > 0");
     }
 
-    std::unique_lock<std::shared_mutex> update_lock(update_mutex_);
+    std::lock_guard<std::mutex> update_guard(update_serial_mutex_);
     page_io_->clear_cache();
 
     std::vector<uint32_t> ids(count, 0);
@@ -591,8 +618,11 @@ class DiskANNIndex {
     if (!updatable_) {
       throw std::runtime_error("DiskANNIndex::remove: index not loaded in updatable mode");
     }
-    std::unique_lock<std::shared_mutex> lock(update_mutex_);
-    validate_removable_slot(internal_id);
+    std::lock_guard<std::mutex> update_guard(update_serial_mutex_);
+    {
+      std::shared_lock<std::shared_mutex> state_lock(update_mutex_);
+      validate_removable_slot(internal_id);
+    }
     page_io_->clear_cache();
     remove_unlocked(internal_id);
     if (maybe_safety_net_reconnect()) {
@@ -613,13 +643,19 @@ class DiskANNIndex {
     if (internal_ids == nullptr) {
       throw std::invalid_argument("DiskANNIndex::batch_remove: null ids");
     }
-    std::unique_lock<std::shared_mutex> lock(update_mutex_);
-    validate_remove_batch(internal_ids, count);
+    std::lock_guard<std::mutex> update_guard(update_serial_mutex_);
+    {
+      std::shared_lock<std::shared_mutex> state_lock(update_mutex_);
+      validate_remove_batch(internal_ids, count);
+    }
     page_io_->clear_cache();
     std::vector<std::vector<uint32_t>> old_neighbors =
         page_io_->read_neighbors_batch_parallel(internal_ids, count, update_insert_threads_);
-    for (uint32_t i = 0; i < count; ++i) {
-      remove_unlocked_with_neighbors(internal_ids[i], std::move(old_neighbors[i]));
+    {
+      std::unique_lock<std::shared_mutex> state_lock(update_mutex_);
+      for (uint32_t i = 0; i < count; ++i) {
+        remove_unlocked_with_neighbors(internal_ids[i], std::move(old_neighbors[i]));
+      }
     }
     if (maybe_safety_net_reconnect()) {
       page_io_->flush_dirty_pages();
@@ -634,12 +670,15 @@ class DiskANNIndex {
     if (!updatable_) {
       throw std::runtime_error("DiskANNIndex::update_node: index not loaded in updatable mode");
     }
-    std::unique_lock<std::shared_mutex> lock(update_mutex_);
-    if (node_id >= max_slot_id_) {
-      throw std::invalid_argument("DiskANNIndex::update_node: node_id out of range");
-    }
-    if (slot_alloc_.is_deleted(node_id)) {
-      throw std::invalid_argument("DiskANNIndex::update_node: node_id is deleted");
+    std::lock_guard<std::mutex> update_guard(update_serial_mutex_);
+    {
+      std::shared_lock<std::shared_mutex> state_lock(update_mutex_);
+      if (node_id >= max_slot_id_) {
+        throw std::invalid_argument("DiskANNIndex::update_node: node_id out of range");
+      }
+      if (slot_alloc_.is_deleted(node_id)) {
+        throw std::invalid_argument("DiskANNIndex::update_node: node_id is deleted");
+      }
     }
     page_io_->clear_cache();
     update_node_impl(node_id);
@@ -651,7 +690,8 @@ class DiskANNIndex {
     if (!updatable_) {
       throw std::runtime_error("DiskANNIndex::flush: index not loaded in updatable mode");
     }
-    std::unique_lock<std::shared_mutex> lock(update_mutex_);
+    std::lock_guard<std::mutex> update_guard(update_serial_mutex_);
+    std::shared_lock<std::shared_mutex> state_lock(update_mutex_);
     page_io_->flush_dirty_pages();
     MetaHeader m;
     m.num_points = max_slot_id_;
@@ -692,11 +732,29 @@ class DiskANNIndex {
     uint64_t live_count = 0;   // v2: num_points minus tombstones
   };
 
+  struct SearchSnapshot {
+    uint64_t max_slot_id = 0;
+    TombstoneBitmap tombstone;
+    bool has_tombstone = false;
+  };
+
   static std::string path(const std::string &dir, const char *name) {
     return (std::filesystem::path(dir) / name).string();
   }
 
-  // ---- in-place update internals (all called under update_mutex_) ----
+  SearchSnapshot make_search_snapshot() const {
+    SearchSnapshot snapshot;
+    std::shared_lock<std::shared_mutex> lock(update_mutex_);
+    snapshot.max_slot_id = max_slot_id_;
+    if (updatable_) {
+      snapshot.tombstone = slot_alloc_.tombstone();
+      snapshot.has_tombstone = true;
+    }
+    return snapshot;
+  }
+
+  // ---- in-place update internals (update APIs are serialized; metadata writes
+  //      take update_mutex_ only for the narrow mutation/snapshot windows) ----
 
   /// Wire up the update subsystem (page IO, slot allocator, context, config).
   void init_updatable(const std::string &index_dir, const DiskANNLoadParams &params) {
@@ -735,17 +793,23 @@ class DiskANNIndex {
   /// Tombstone-aware update search returning up to @p l (id, dist) candidates.
   /// PQ indexes use PQ beam distances; No-PQ indexes use exact-L2 disk greedy.
   std::vector<std::pair<uint32_t, float>> run_update_search(const float *query, uint32_t l) {
+    const SearchSnapshot snapshot = make_search_snapshot();
+    std::shared_lock<std::shared_mutex> pq_lock;
+    if (has_pq_) {
+      pq_lock = std::shared_lock<std::shared_mutex>(pq_mutex_);
+    }
     ThreadData *td = acquire();
     std::vector<std::pair<uint32_t, float>> results;
     try {
+      td->resize_slot_capacity(snapshot.max_slot_id);
       SearchContext ctx;
       ctx.reader = reader_.get();
       ctx.geom = &geom_;
       ctx.cache = &cache_;
       ctx.pq = has_pq_ ? &pq_ : nullptr;
       ctx.medoid = medoid_;
-      ctx.num_points = max_slot_id_;
-      ctx.tombstone = &slot_alloc_.tombstone();
+      ctx.num_points = snapshot.max_slot_id;
+      ctx.tombstone = &snapshot.tombstone;
       SearchParams sp;
       sp.search_list_size = l;
       sp.beam_width = beam_width_;
@@ -835,18 +899,18 @@ class DiskANNIndex {
                                   std::vector<uint32_t> &ids,
                                   uint32_t begin,
                                   uint32_t end) {
+    std::unique_lock<std::shared_mutex> state_lock(update_mutex_);
     std::lock_guard<std::mutex> slot_lock(slot_mutex_);
     for (uint32_t i = begin; i < end; ++i) {
       ids[i] = allocate_update_slot_unlocked(labels[i]);
     }
-    resize_thread_data_slot_capacity();
   }
 
   void encode_pq_slot(const float *query, uint32_t slot) {
     if (!has_pq_) {
       return;
     }
-    std::lock_guard<std::mutex> pq_lock(pq_mutex_);
+    std::unique_lock<std::shared_mutex> pq_lock(pq_mutex_);
     pq_.encode_one(query, slot);
   }
 
@@ -872,6 +936,7 @@ class DiskANNIndex {
 
   void remove_unlocked(uint32_t internal_id) {
     const DiskPageIO::NodeData nd = page_io_->read_node(internal_id);
+    std::unique_lock<std::shared_mutex> state_lock(update_mutex_);
     remove_unlocked_with_neighbors(internal_id, nd.nbrs);
   }
 
@@ -1171,8 +1236,11 @@ class DiskANNIndex {
         page_io_->write_node_neighbors(nid, static_cast<uint32_t>(live.size()), live.data());
       }
     }
-    ops_since_last_insert_ = 0;
-    ++safety_net_fires_;
+    {
+      std::unique_lock<std::shared_mutex> state_lock(update_mutex_);
+      ops_since_last_insert_ = 0;
+      ++safety_net_fires_;
+    }
     return true;
   }
 
@@ -1372,8 +1440,9 @@ class DiskANNIndex {
   SlotAllocator slot_alloc_;
   DiskUpdateContext update_ctx_;
   mutable std::shared_mutex update_mutex_;  ///< shared search, exclusive mutation
+  std::mutex update_serial_mutex_;
   std::mutex slot_mutex_;
-  std::mutex pq_mutex_;
+  mutable std::shared_mutex pq_mutex_;
   std::array<std::mutex, kUpdateNodeLockStripes> update_node_locks_;
   uint64_t ops_since_last_insert_ = 0;
   uint64_t safety_net_fires_ = 0;
