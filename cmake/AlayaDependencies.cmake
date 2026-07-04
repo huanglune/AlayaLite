@@ -4,13 +4,13 @@
 
 # AlayaDependencies.cmake - resolve every third-party package and aggregate them into THIRD_PARTY_LIBS.
 #
-# All packages come from the Conan toolchain included by ConanSetup.cmake, except OpenMP (system / Homebrew) and libaio
-# (system, handled in AlayaLaser.cmake). THIRD_PARTY_LIBS stays a plain list because test helper code and the AlayaLite
+# Packages resolve through the Conan dependency provider registered in AlayaConan.cmake: the first find_package below
+# triggers `conan install` transparently and the generated config packages land in ${CMAKE_BINARY_DIR}/conan. OpenMP
+# (system / Homebrew) and libaio (system, handled in AlayaLaser.cmake) are not in the Conan graph and fall through the
+# provider to CMake's builtin lookup. THIRD_PARTY_LIBS stays a plain list because test helper code and the AlayaLite
 # INTERFACE target both consume it.
 
 include_guard(GLOBAL)
-
-include(${CMAKE_CURRENT_LIST_DIR}/ConanSetup.cmake)
 
 if(APPLE)
   file(GLOB OPENMP_BREW_PATHS "/usr/local/opt/libomp" # Intel Mac

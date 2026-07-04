@@ -3,7 +3,7 @@
 
 .PHONY: help build build-debug build-release build-san build-coverage \
         test test-cpp test-cpp-debug test-san test-py test-py-integration test-py-cov \
-        lint format configure conan-install conan-install-debug \
+        lint format configure \
         install dev-install wheel clean clean-release clean-debug clean-all codegen \
         bump-version release-dry version
 
@@ -68,13 +68,9 @@ build-coverage: ## Configure + build the coverage preset
 configure: ## Configure only; override with BUILD_TYPE=Debug
 	@cmake -B build/$(BUILD_TYPE) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) -DBUILD_TESTING=ON $(CMAKE_FLAGS)
 
-# --no-project keeps uv from building alayalite itself first (an editable install runs the whole C++ build, which
-# needs these very dependencies — a bootstrap cycle on a fresh machine). The script only needs a bare interpreter.
-conan-install: ## Re-run conan install for Release (after conanfile changes)
-	@uv run --no-project python scripts/conan_build/conan_install.py --build-type Release
-
-conan-install-debug: ## Re-run conan install for Debug
-	@uv run --no-project python scripts/conan_build/conan_install.py --build-type Debug
+# C++ dependencies resolve automatically at configure time through the Conan dependency provider
+# (cmake/AlayaConan.cmake); every (re)configure re-runs `conan install`, so no separate install target is needed.
+# Requires the `conan` executable on PATH once: uv tool install conan
 
 # ============================================================================
 # Test

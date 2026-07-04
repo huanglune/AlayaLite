@@ -16,7 +16,8 @@ option(ALAYA_NATIVE_ARCH "Compile with -march=native for host-specific builds" O
 option(ALAYA_ALLOW_NATIVE_PACKAGE "Allow BUILD_PYTHON with host-specific -march=native" OFF)
 option(ALAYA_USE_CCACHE "Use ccache as compiler launcher when available" ON)
 option(ALAYA_USE_FAST_LINKER "Use mold or lld when available" ON)
-option(ALAYA_AUTO_CONAN "Run conan install automatically when the toolchain is missing" ON)
+# Consumed before project() by AlayaConan.cmake; declared here so it shows up in cmake -LH with the other switches.
+option(ALAYA_AUTO_CONAN "Resolve C++ dependencies via the bundled Conan dependency provider" ON)
 
 if(BUILD_PYTHON
    AND ALAYA_NATIVE_ARCH

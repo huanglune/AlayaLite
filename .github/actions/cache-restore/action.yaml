@@ -33,11 +33,10 @@ runs       :
     with:
       path: ~/.conan2
       key: >-
-        conan-v2-${{ runner.os }}-${{ inputs.target-arch }}-${{ inputs.build-type }}-${{ hashFiles('conanfile.py',
-        'scripts/conan_build/conan_install.py', 'scripts/conan_build/conan_profile*', 'cmake/ConanSetup.cmake',
-        'pyproject.toml') }}
+        conan-v3-${{ runner.os }}-${{ inputs.target-arch }}-${{ inputs.build-type }}-${{ hashFiles('conanfile.py',
+        'cmake/vendor/conan_provider.cmake', 'cmake/AlayaConan.cmake', 'pyproject.toml') }}
       restore-keys: |
-        conan-v2-${{ runner.os }}-${{ inputs.target-arch }}-${{ inputs.build-type }}-
+        conan-v3-${{ runner.os }}-${{ inputs.target-arch }}-${{ inputs.build-type }}-
 
   - name: Save Conan cache
     if: ${{ inputs.mode == 'save' }}
@@ -45,6 +44,5 @@ runs       :
     with:
       path: ~/.conan2
       key: >-
-        conan-v2-${{ runner.os }}-${{ inputs.target-arch }}-${{ inputs.build-type }}-${{ hashFiles('conanfile.py',
-        'scripts/conan_build/conan_install.py', 'scripts/conan_build/conan_profile*', 'cmake/ConanSetup.cmake',
-        'pyproject.toml') }}
+        conan-v3-${{ runner.os }}-${{ inputs.target-arch }}-${{ inputs.build-type }}-${{ hashFiles('conanfile.py',
+        'cmake/vendor/conan_provider.cmake', 'cmake/AlayaConan.cmake', 'pyproject.toml') }}

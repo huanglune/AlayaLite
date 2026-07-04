@@ -1,6 +1,6 @@
 [build-system]
-# scikit-build-core is the backend (no setuptools/wheel needed); conan feeds the C++ deps
-# (cmake/ConanSetup.cmake), jinja2 + pyyaml serve tools/codegen/gen.py inside isolated wheel builds.
+# scikit-build-core is the backend (no setuptools/wheel needed); conan supplies the C++ deps via the
+# dependency provider (cmake/AlayaConan.cmake), jinja2 + pyyaml serve tools/codegen/gen.py in isolated builds.
 requires = [
     "pybind11>=2.10.0",
     "conan>=2.0",
@@ -123,7 +123,9 @@ dev = [
 
 # ----------------- build whl begin ------------------
 [tool.scikit-build]
-cmake.version = ">=3.15,<=3.31"
+# 3.24 floor: the Conan dependency provider rides on CMAKE_PROJECT_TOP_LEVEL_INCLUDES. The `conan`
+# CLI itself comes from [build-system].requires, so it is always present inside PEP 517 builds.
+cmake.version = ">=3.24,<=3.31"
 cmake.build-type = "Release"
 wheel.packages = ["python/src/alayalite"]
 
@@ -135,7 +137,9 @@ ALAYA_NATIVE_ARCH="OFF"
 build = "cp3{9,10,11,12,13}-*"
 build-frontend = "build[uv]"
 skip = ["*-musllinux*", "*-manylinux_i686"]
-before-build = "python {project}/scripts/conan_build/conan_install.py --project-dir {project}"
+# C++ dependencies install during the CMake configure via the Conan dependency provider (the conan
+# CLI lives in the PEP 517 build env, see [build-system].requires); the mounted ~/.conan2 keeps the
+# package cache warm across the per-python-version builds and across CI runs.
 container-engine = "docker; create_args: -v ~/.conan2:/root/.conan2"
 test-requires = ["pytest", "pytest-asyncio", "pyyaml"]
 test-command = "python -c \"import platform, sys, alayalite; from alayalite import laser, vamana; is_linux_x86 = sys.platform.startswith('linux') and platform.machine() in {'x86_64', 'AMD64'}; is_windows_x86 = sys.platform == 'win32' and platform.machine() in {'x86_64', 'AMD64'}; laser_expected = is_linux_x86 or is_windows_x86; assert not (laser_expected and laser.RawIndex is None), 'LASER should be available on this lane'; simd = laser.selected_simd() if is_linux_x86 else 'not-tested'; print(alayalite.__version__); print(f'laser_simd={simd}', flush=True); assert (not is_linux_x86) or simd in {'avx512', 'avx2'}\""
@@ -156,10 +160,8 @@ repair-wheel-command = "delocate-listdeps {wheel} && delocate-wheel -w {dest_dir
 # is part of the VC Redist and delvewheel either bundles it from the VS install
 # or relies on the system VC Redist on the consumer machine.
 environment = { CMAKE_GENERATOR = "Visual Studio 17 2022", CMAKE_GENERATOR_PLATFORM = "x64" }
-# Windows-specific before-build overrides the global one: install delvewheel
-# (cibuildwheel does not bundle it the way it bundles auditwheel / delocate)
-# AND run the shared conan-install step that the global before-build provides.
-before-build = "pip install delvewheel && python {project}/scripts/conan_build/conan_install.py --project-dir {project}"
+# delvewheel is not bundled by cibuildwheel the way auditwheel / delocate are.
+before-build = "pip install delvewheel"
 repair-wheel-command = "delvewheel repair -w {dest_dir} {wheel}"
 # ----------------- build whl end ------------------
 

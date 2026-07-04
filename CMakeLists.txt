@@ -4,18 +4,26 @@
 
 # AlayaLite - header-only vector database core with a pybind11 extension module.
 #
-# This file only orchestrates; each concern lives in cmake/: AlayaOptions.cmake      every user-facing switch + option
-# validation AlayaPreflight.cmake    early, actionable environment checks (compiler floor, Python headers)
-# AlayaToolchain.cmake    C++ standard, ccache, fast linkers, sanitizer detection AlayaFlags.cmake        compile flags
-# as the linkable alaya_build_flags INTERFACE target AlayaDependencies.cmake Conan bootstrap + find_package for all
-# third-party libs (THIRD_PARTY_LIBS) AlayaLaser.cmake        LASER disk-index backend wiring (alaya_laser INTERFACE
-# target) AlayaTesting.cmake      alaya_cc_target / alaya_add_test helpers used by tests/*
+# cmake-format: off
+# This file only orchestrates; each concern lives in cmake/:
+#   AlayaConan.cmake        Conan dependency provider registration (must precede project())
+#   AlayaOptions.cmake      every user-facing switch + option validation
+#   AlayaPreflight.cmake    early, actionable environment checks (compiler floor, Python headers)
+#   AlayaToolchain.cmake    C++ standard, ccache, fast linkers, sanitizer detection
+#   AlayaFlags.cmake        compile flags as the linkable alaya_build_flags INTERFACE target
+#   AlayaDependencies.cmake find_package for all third-party libs (THIRD_PARTY_LIBS)
+#   AlayaLaser.cmake        LASER disk-index backend wiring (alaya_laser INTERFACE target)
+#   AlayaTesting.cmake      alaya_cc_target / alaya_add_test helpers used by tests/*
+# cmake-format: on
 #
 # Quick start (dev): cmake --preset release && cmake --build --preset release && ctest --preset release The same tree
 # also configures with a plain `cmake -B build/Release -DCMAKE_BUILD_TYPE=Release` (CI does), and is driven by
-# scikit-build-core for wheel builds (see pyproject.toml).
+# scikit-build-core for wheel builds (see pyproject.toml). The 3.24 floor comes from the Conan dependency provider
+# (CMAKE_PROJECT_TOP_LEVEL_INCLUDES).
 
-cmake_minimum_required(VERSION 3.23...3.31)
+cmake_minimum_required(VERSION 3.24...3.31)
+
+include(cmake/AlayaConan.cmake)
 
 project(AlayaLite LANGUAGES CXX)
 

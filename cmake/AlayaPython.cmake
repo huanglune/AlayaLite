@@ -4,10 +4,10 @@
 
 # AlayaPython.cmake - single source of truth for Python discovery.
 #
-# Everything in this project resolves Python through CMake's FindPython module (the `Python_*` variable family):
-# ConanSetup (interpreter for conan_install.py), the pybind11 module (interpreter + Development.Module), and the LASER
-# test fixture (interpreter). pybind11 is pointed at the same result via PYBIND11_FINDPYTHON=ON, so there is exactly one
-# interpreter per build tree and one hint variable to override it: -DPython_EXECUTABLE=<path>.
+# Everything in this project resolves Python through CMake's FindPython module (the `Python_*` variable family): the
+# pybind11 module (interpreter + Development.Module), codegen, and the LASER test fixture (interpreter). pybind11 is
+# pointed at the same result via PYBIND11_FINDPYTHON=ON, so there is exactly one interpreter per build tree and one hint
+# variable to override it: -DPython_EXECUTABLE=<path>.
 #
 # Resolution order: 1. An explicit -DPython_EXECUTABLE / -DPython_ROOT_DIR wins (this is also how scikit-build-core
 # drives wheel builds — it passes FindPython hints for the interpreter cibuildwheel selected). 2. -DPython3_EXECUTABLE
@@ -55,8 +55,10 @@ macro(alaya_python_hints)
 endmacro()
 
 # alaya_find_python(<components...>) - hints + find_package(Python REQUIRED). Safe to call repeatedly with growing
-# component lists; FindPython accumulates components in the cache.
+# component lists; FindPython accumulates components in the cache. BYPASS_PROVIDER keeps Python discovery away from the
+# Conan dependency provider: Python is never a Conan package, and the first intercepted find_package() must be a real
+# C++ dependency so the derived profile sees the fully configured toolchain (CMAKE_CXX_STANDARD -> cppstd).
 macro(alaya_find_python)
   alaya_python_hints()
-  find_package(Python REQUIRED COMPONENTS ${ARGN})
+  find_package(Python REQUIRED COMPONENTS ${ARGN} BYPASS_PROVIDER)
 endmacro()

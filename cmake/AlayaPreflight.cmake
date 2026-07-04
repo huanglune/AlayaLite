@@ -41,7 +41,7 @@ macro(alaya_preflight)
   endif()
 
   alaya_python_hints()
-  find_package(Python QUIET COMPONENTS ${_alaya_python_components})
+  find_package(Python QUIET COMPONENTS ${_alaya_python_components} BYPASS_PROVIDER)
   if(NOT Python_FOUND)
     if(BUILD_PYTHON
        AND Python_Interpreter_FOUND

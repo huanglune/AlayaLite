@@ -80,14 +80,16 @@ def test_conan_cache_action_uses_explicit_restore_and_save() -> None:
     assert "actions/cache/save@v4" not in uses_values
 
 
-def test_conan_cache_key_includes_install_script_and_target_arch() -> None:
+def test_conan_cache_key_includes_dependency_drivers_and_target_arch() -> None:
     action = _yaml(CONAN_CACHE_ACTION)
     restore_step = next(step for step in action["runs"]["steps"] if step.get("uses") == "actions/cache/restore@v5")
     key = restore_step["with"]["key"]
 
     assert "${{ inputs.target-arch }}" in key
-    assert "scripts/conan_build/conan_install.py" in key
-    assert key.startswith("conan-v2-")
+    # Dependency resolution goes through the vendored Conan provider; the cache key must track it.
+    assert "conanfile.py" in key
+    assert "cmake/vendor/conan_provider.cmake" in key
+    assert key.startswith("conan-v3-")
 
 
 def test_workflow_conan_cache_calls_are_arch_scoped_and_nonfatal_on_save_race() -> None:
@@ -174,7 +176,6 @@ def test_codecov_workflow_keeps_coverage_trigger_scope() -> None:
         "python/CMakeLists.txt",
         "cmake/**",
         "scripts/ci/codecov/**",
-        "scripts/conan_build/**",
         "codecov.yml",
     ]
 

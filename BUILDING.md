@@ -9,12 +9,17 @@ SPDX-License-Identifier: AGPL-3.0-only
 ## Prerequisites
 
 - A C++20 compiler: GCC ≥ 11, Clang ≥ 14, AppleClang (Xcode 15+), or MSVC 2022
-- CMake 3.23–3.31 and a build tool (Ninja recommended; Make works)
-- [uv](https://docs.astral.sh/uv/) — manages the Python side (venv, pytest, Conan bootstrap)
+- CMake 3.24–3.31 and a build tool (Ninja recommended; Make works)
+- [uv](https://docs.astral.sh/uv/) — manages the Python side (venv, pytest)
+- [Conan 2](https://conan.io) on PATH: `uv tool install conan` (once per machine)
 - Linux only: `libaio-dev` for the LASER disk index (`sudo apt-get install libaio-dev`)
 
-C++ dependencies (RocksDB, spdlog, Eigen, GTest, …) come from **Conan 2** automatically on the first CMake configure —
-there is nothing to install manually. Conan itself runs through `uvx`, so uv is the only bootstrap requirement.
+C++ dependencies (RocksDB, spdlog, Eigen, GTest, …) resolve through the official **Conan dependency provider**
+(`cmake/vendor/conan_provider.cmake`, wired up in `cmake/AlayaConan.cmake`): every CMake configure runs
+`conan install` with a profile derived from the actual toolchain state and drops the packages under
+`<build dir>/conan/`. There is no separate install step, and PEP 517 builds (`uv sync`, `uv build`, cibuildwheel)
+bring their own `conan` from `[build-system].requires`. Opt out with `-DALAYA_AUTO_CONAN=OFF` if you manage
+dependencies yourself.
 
 ## Quick start
 
@@ -58,10 +63,13 @@ interpreter without `python3-dev` is rejected at configure time with instruction
 
 ## Troubleshooting
 
+- **"The `conan` executable was not found on PATH"** — `uv tool install conan` (or `pipx install conan`), then
+  reconfigure.
 - **"Python interpreter … has no C API headers"** — run `uv sync`, or pass `-DPython_EXECUTABLE`, or install
   `python3-dev`, or configure with `-DBUILD_PYTHON=OFF`.
-- **Conan install failed** — the root cause is printed above CMake's error; re-run it directly to iterate:
-  `uv run --no-project python scripts/conan_build/conan_install.py --build-type Release`. Source-built packages need a
+- **Conan install failed during configure** — the conan output is echoed above CMake's error. Iterate directly with
+  `conan install . --build=missing -s build_type=Release -s compiler.cppstd=20`. Source-built packages need a
   compiler plus make/ninja on `PATH`.
-- **Rebuilding after `conanfile.py` changes** — `make conan-install` (Release) / `make conan-install-debug`.
+- **After `conanfile.py` changes** — nothing special: the provider re-runs `conan install` on the next configure
+  (`make build-release` reconfigures automatically).
 - **Wheel builds** — driven by scikit-build-core + cibuildwheel (see `pyproject.toml`); locally, `make wheel`.
