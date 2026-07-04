@@ -71,9 +71,16 @@ inline constexpr uint32_t kDefaultDiskANNUpdateInsertThreads = 32;
 
 /// Build-time configuration.
 struct DiskANNBuildParams {
-  uint32_t R = 64;            ///< graph degree bound
-  uint32_t L = 100;           ///< Vamana build beam width
-  float alpha = 1.2f;         ///< Vamana α-RNG pruning
+  uint32_t R = 64;     ///< graph degree bound (Vamana build)
+  uint32_t L = 100;    ///< Vamana build beam width
+  float alpha = 1.2f;  ///< Vamana α-RNG pruning
+  uint32_t record_capacity = 0;
+  ///< On-disk neighbor slots per node; 0 => R. Setting it above R leaves
+  ///< update headroom the way Yi does (records hold MAX_NEIGHBOURS=96 while
+  ///< the built graph uses ~64): reconnects keep candidate pools verbatim
+  ///< until a node exceeds the CAPACITY, instead of alpha-pruning on every
+  ///< touch of an already-full node. The update-time degree bound
+  ///< (max_degree) becomes this capacity.
   uint32_t pq_n_chunks = 0;   ///< 0 => no PQ
   double cache_ratio = 0.05;  ///< BFS cache fraction
   uint32_t num_threads = 0;   ///< 0 => all cores (Vamana build + PQ train/encode)
@@ -99,7 +106,16 @@ struct DiskANNLoadParams {
 
   // --- In-place update mode ---
   bool updatable = false;             ///< open O_RDWR + enable insert/remove/update_node/flush
-  uint32_t update_search_l = 100;     ///< L for the insert NN-search (candidate pool before prune)
+  uint32_t update_search_l = 0;       ///< L for the insert NN-search; 0 => max_degree + 32
+                                      ///< (Yi's build_k = degree + 32 rule)
+  bool update_rerank = true;          ///< re-rank insert search candidates by exact L2 (via the
+                                      ///< coords cache) before taking the top max_degree. Matches
+                                      ///< Yi's trace benchmark (_rerank_flag defaults true); Yi's
+                                      ///< sequential UpdateRunner sets it false.
+  bool update_insert_prune = false;   ///< alpha-RNG prune the insert pool instead of linking the
+                                      ///< top max_degree candidates. Yi never prunes at insert
+                                      ///< (its top_k == degree makes the prune branch dead code);
+                                      ///< reconnect re-prunes on overflow either way.
   float update_alpha = 1.2f;          ///< alpha-RNG pruning for insert/reconnect (Vamana default)
   double safety_net_ratio = 0.05;     ///< tombstone ratio that arms the safety-net reconnect
   uint64_t safety_net_ops = 16;       ///< deletes without an insert before the safety net may fire
@@ -206,10 +222,16 @@ class DiskANNIndex {
     auto t_vamana1 = clk::now();
     stamp("vamana", t_vamana0, t_vamana1);
 
-    const DiskLayoutGeometry geom = DiskLayoutGeometry::compute(dim, params.R);
+    // Records are sized for `capacity` neighbor slots (>= the built degree);
+    // the update-time degree bound follows the capacity.
+    const uint32_t capacity = params.record_capacity != 0 ? params.record_capacity : params.R;
+    if (capacity < params.R) {
+      throw std::invalid_argument("DiskANNIndex::build: record_capacity must be >= R");
+    }
+    const DiskLayoutGeometry geom = DiskLayoutGeometry::compute(dim, capacity);
 
     // 2. Sector-aligned disk layout.  3. External labels.
-    write_disk_layout(path(index_dir, "diskann.index"), vectors, graph, {n, dim, params.R, medoid});
+    write_disk_layout(path(index_dir, "diskann.index"), vectors, graph, {n, dim, capacity, medoid});
     write_ids(path(index_dir, "ids.bin"), labels, n);
     auto t_layout = clk::now();
     stamp("layout+ids", t_vamana1, t_layout);
@@ -233,7 +255,7 @@ class DiskANNIndex {
 
     // 5. BFS cache.
     NodeCache cache;
-    cache.generate(graph, vectors, medoid, n, dim, params.R, params.cache_ratio);
+    cache.generate(graph, vectors, medoid, n, dim, capacity, params.cache_ratio);
     cache.save(path(index_dir, "cache_ids.bin"), path(index_dir, "cache_nodes.bin"));
     stamp("cache", t_pq, clk::now());
 
@@ -241,7 +263,7 @@ class DiskANNIndex {
     MetaHeader meta;
     meta.num_points = n;
     meta.dim = dim;
-    meta.max_degree = params.R;
+    meta.max_degree = capacity;
     meta.medoid = medoid;
     meta.has_pq = has_pq ? 1 : 0;
     meta.pq_n_chunks = params.pq_n_chunks;
@@ -530,8 +552,10 @@ class DiskANNIndex {
   static constexpr uint64_t kNoLabel = std::numeric_limits<uint64_t>::max();
 
   // ------------------------------------------------------- in-place updates
-  /// Insert a vector: NN search -> alpha-RNG prune -> alloc slot -> write ->
-  /// reconnect pruned neighbors. Returns the allocated internal slot id.
+  /// Insert a vector: NN search -> select top-degree neighbors (Yi rule) ->
+  /// alloc slot -> write -> publish -> reconnect selected neighbors. Returns
+  /// the allocated internal slot id. Dirty pages are NOT flushed here (Yi
+  /// defers write-back out of the update path); call flush() to persist.
   uint32_t insert(const float *query, uint64_t label) {
     if (!updatable_) {
       throw std::runtime_error("DiskANNIndex::insert: index not loaded in updatable mode");
@@ -551,8 +575,8 @@ class DiskANNIndex {
     }
     encode_pq_slot(query, slot);
     write_inserted_node(slot, query, pruned);
+    publish_slots(&slot, &slot + 1);
     reconnect_inserted_neighbors(pruned, slot);
-    page_io_->flush_dirty_pages();
     return slot;
   }
 
@@ -704,6 +728,19 @@ class DiskANNIndex {
     page_io_->flush_dirty_pages();
   }
 
+  /// Write dirty pages and drop disk-backed overrides — a lightweight
+  /// durability point (the analog of Yi's round-boundary writeback_remaining).
+  /// flush() remains the full checkpoint (meta + PQ + cache + slots).
+  void flush_pages() {
+    if (!updatable_) {
+      throw std::runtime_error("DiskANNIndex::flush_pages: index not loaded in updatable mode");
+    }
+    std::lock_guard<std::mutex> update_guard(update_serial_mutex_);
+    std::shared_lock<std::shared_mutex> state_lock(update_mutex_);
+    page_io_->flush_dirty_pages();
+    cache_.drop_disk_backed_overrides();
+  }
+
   /// Persist meta + ids + slot allocator state to disk.
   void flush() {
     if (!updatable_) {
@@ -712,6 +749,9 @@ class DiskANNIndex {
     std::lock_guard<std::mutex> update_guard(update_serial_mutex_);
     std::shared_lock<std::shared_mutex> state_lock(update_mutex_);
     page_io_->flush_dirty_pages();
+    // Disk is current now; overrides for nodes outside the BFS hot cache can
+    // fall back to the (fresh) disk read path.
+    cache_.drop_disk_backed_overrides();
     MetaHeader m;
     m.num_points = max_slot_id_;
     m.dim = dim_;
@@ -738,6 +778,12 @@ class DiskANNIndex {
  private:
   static constexpr uint32_t kNoSelf = std::numeric_limits<uint32_t>::max();
   static constexpr size_t kUpdateNodeLockStripes = 4096;
+  /// Yi's co_update pulls at most 5 live two-hop candidates per deleted
+  /// neighbor; without the cap the pool inflates to the deleted node's whole
+  /// ex-neighborhood and reconnect cost explodes.
+  static constexpr uint32_t kTwoHopBypassPerDeleted = 5;
+  /// Yi heap-caps the reconnect pool at build_k = degree + 32 before pruning.
+  static constexpr uint32_t kReconnectPoolSlack = 32;
 
   struct MetaHeader {
     uint64_t num_points = 0;
@@ -754,7 +800,7 @@ class DiskANNIndex {
 
   struct SearchSnapshot {
     uint64_t max_slot_id = 0;
-    TombstoneBitmap tombstone;
+    TombstoneSnapshot tombstone;
     bool has_tombstone = false;
   };
 
@@ -767,7 +813,7 @@ class DiskANNIndex {
     std::shared_lock<std::shared_mutex> lock(update_mutex_);
     snapshot.max_slot_id = max_slot_id_;
     if (updatable_) {
-      snapshot.tombstone = slot_alloc_.tombstone();
+      slot_alloc_.tombstone().snapshot_into(snapshot.tombstone);
       snapshot.has_tombstone = true;
     }
     return snapshot;
@@ -780,7 +826,9 @@ class DiskANNIndex {
   void init_updatable(const std::string &index_dir, const DiskANNLoadParams &params) {
     index_dir_ = index_dir;
     update_alpha_ = params.update_alpha;
-    update_search_l_ = std::max<uint32_t>(1, params.update_search_l);
+    update_search_l_ = params.update_search_l != 0 ? params.update_search_l : max_degree_ + 32;
+    update_rerank_ = params.update_rerank;
+    update_insert_prune_ = params.update_insert_prune;
     safety_net_ratio_ = params.safety_net_ratio;
     safety_net_ops_ = params.safety_net_ops;
     if (params.update_reconnect_threads == 0) {
@@ -870,32 +918,88 @@ class DiskANNIndex {
     return pruned;
   }
 
-  std::vector<uint32_t> select_insert_neighbors_exact(const float *query) {
-    const auto cand = run_update_search(query, update_search_l_);
-    std::vector<alaya::vamana::Neighbor> pool;
-    pool.reserve(cand.size());
-    for (const auto &c : cand) {
-      pool.emplace_back(c.first, c.second);
+  /// Exact L2 between @p query and a stored node's coords. Served from the
+  /// NodeCache record when available (shared-lock memory read — the analog of
+  /// Yi's buffer-pool get_raw_dist); falls back to the update page cache.
+  float exact_query_distance(const float *query, uint32_t id) {
+    const auto l2 = alaya::simd::get_l2_sqr_func();
+    const NodeCache::Lookup rec = cache_.lookup_record(id);
+    if (rec) {
+      return l2(query, reinterpret_cast<const float *>(rec.get()), dim_);
     }
-    auto dist_fn = [this](uint32_t a, uint32_t b) -> float {
-      return cached_l2(a, b);
-    };
-    return prune_insert_pool(pool, dist_fn);
+    const std::vector<float> coords = page_io_->read_coords_cached(id);
+    return l2(query, coords.data(), dim_);
+  }
+
+  std::vector<uint32_t> select_insert_neighbors_exact(const float *query) {
+    auto cand = run_update_search(query, update_search_l_);
+    if (update_insert_prune_) {
+      std::vector<alaya::vamana::Neighbor> pool;
+      pool.reserve(cand.size());
+      for (const auto &c : cand) {
+        pool.emplace_back(c.first, c.second);
+      }
+      auto dist_fn = [this](uint32_t a, uint32_t b) -> float {
+        return cached_l2(a, b);
+      };
+      return prune_insert_pool(pool, dist_fn);
+    }
+    // Yi rule: link the top max_degree_ nearest, no alpha-prune. The No-PQ
+    // search already returns exact distances in ascending order, so the
+    // rerank option is a no-op here.
+    if (cand.size() > max_degree_) {
+      cand.resize(max_degree_);
+    }
+    std::vector<uint32_t> out;
+    out.reserve(cand.size());
+    for (const auto &c : cand) {
+      out.push_back(c.first);
+    }
+    return out;
   }
 
   std::vector<uint32_t> select_insert_neighbors_pq(const float *query) {
-    const auto cand = run_update_search(query, update_search_l_);
+    auto cand = run_update_search(query, update_search_l_);
     std::vector<uint8_t> query_code(pq_n_chunks_);
     pq_.encode_to_code(query, query_code.data());
+    if (update_insert_prune_) {
+      std::vector<alaya::vamana::Neighbor> pool;
+      pool.reserve(cand.size());
+      for (const auto &c : cand) {
+        pool.emplace_back(c.first, pq_.pq_symmetric_distance(query_code.data(), c.first));
+      }
+      auto dist_fn = [this](uint32_t a, uint32_t b) -> float {
+        return pq_.pq_symmetric_distance(a, b);
+      };
+      return prune_insert_pool(pool, dist_fn);
+    }
+    // Yi rule (co_insert:756-775): optionally re-rank the search pool by exact
+    // L2 (Yi's _rerank_flag inside the insert search), keep the top
+    // max_degree_, re-score the survivors with symmetric PQ and link in that
+    // order. The alpha-prune branch is dead code in Yi (top_k == degree).
+    if (update_rerank_) {
+      for (auto &c : cand) {
+        c.second = exact_query_distance(query, c.first);
+      }
+      std::sort(cand.begin(), cand.end(), [](const auto &a, const auto &b) {
+        return a.second < b.second || (a.second == b.second && a.first < b.first);
+      });
+    }
+    if (cand.size() > max_degree_) {
+      cand.resize(max_degree_);
+    }
     std::vector<alaya::vamana::Neighbor> pool;
     pool.reserve(cand.size());
     for (const auto &c : cand) {
       pool.emplace_back(c.first, pq_.pq_symmetric_distance(query_code.data(), c.first));
     }
-    auto dist_fn = [this](uint32_t a, uint32_t b) -> float {
-      return pq_.pq_symmetric_distance(a, b);
-    };
-    return prune_insert_pool(pool, dist_fn);
+    std::sort(pool.begin(), pool.end());
+    std::vector<uint32_t> out;
+    out.reserve(pool.size());
+    for (const auto &nb : pool) {
+      out.push_back(nb.id);
+    }
+    return out;
   }
 
   std::vector<uint32_t> select_insert_neighbors(const float *query) {
@@ -913,17 +1017,6 @@ class DiskANNIndex {
     ++live_count_;
     ops_since_last_insert_ = 0;
     return slot;
-  }
-
-  void reserve_batch_insert_slots(const uint64_t *labels,
-                                  std::vector<uint32_t> &ids,
-                                  uint32_t begin,
-                                  uint32_t end) {
-    std::unique_lock<std::shared_mutex> state_lock(update_mutex_);
-    std::lock_guard<std::mutex> slot_lock(slot_mutex_);
-    for (uint32_t i = begin; i < end; ++i) {
-      ids[i] = allocate_update_slot_unlocked(labels[i]);
-    }
   }
 
   void encode_pq_slot(const float *query, uint32_t slot) {
@@ -1007,114 +1100,105 @@ class DiskANNIndex {
     cache_.upsert_node(slot, query, static_cast<uint32_t>(neighbors.size()), neighbors.data());
   }
 
+  /// Staged reverse edges for a batch — Yi's `_inserted_edges` analog. Each
+  /// insert stages `selected neighbor -> new slot` edges, and whichever
+  /// reconnect task reaches a neighbor first drains ALL edges staged for it
+  /// (natural dedup across concurrent inserts, exactly like Yi's co_update).
+  struct StagedEdges {
+    static constexpr size_t kStripes = 64;
+    std::array<std::mutex, kStripes> mutexes;
+    std::array<std::unordered_map<uint32_t, std::vector<uint32_t>>, kStripes> maps;
+
+    void add(uint32_t node_id, uint32_t slot) {
+      const size_t s = node_id % kStripes;
+      std::lock_guard<std::mutex> lock(mutexes[s]);
+      maps[s][node_id].push_back(slot);
+    }
+
+    std::vector<uint32_t> drain(uint32_t node_id) {
+      const size_t s = node_id % kStripes;
+      std::lock_guard<std::mutex> lock(mutexes[s]);
+      const auto it = maps[s].find(node_id);
+      if (it == maps[s].end()) {
+        return {};
+      }
+      std::vector<uint32_t> out = std::move(it->second);
+      maps[s].erase(it);
+      return out;
+    }
+  };
+
+  /// Yi-style batch: end-to-end insert coroutines (search -> alloc -> write ->
+  /// publish -> stage edges -> reconnect), one when_all barrier per chunk of
+  /// batch_size. The earlier plan/reserve/write/reconnect phase pipeline put
+  /// four sync_wait barriers on every 32-insert chunk, which inverted thread
+  /// scaling (32 workers ran slower than 8); Yi has no intra-batch barriers.
   std::vector<uint32_t> batch_insert_locked_with_pool(const float *vectors,
                                                       const uint64_t *labels,
                                                       uint32_t count,
                                                       uint32_t batch_size,
                                                       coro::thread_pool &pool) {
     std::vector<uint32_t> ids(count, 0);
-    std::vector<std::vector<uint32_t>> pruned(count);
-    auto plan_one = [this, &pool, vectors, &pruned](uint32_t i) -> coro::task<> {
+    StagedEdges staged;
+
+    auto reconnect_one = [this, &pool, &staged](uint32_t node_id) -> coro::task<> {
       co_await pool.schedule();
-      pruned[i] = select_insert_neighbors(vectors + static_cast<uint64_t>(i) * dim_);
+      const std::vector<uint32_t> extra = staged.drain(node_id);
+      std::lock_guard<std::mutex> node_lock(update_node_mutex(node_id));
+      update_node_impl(node_id, extra);
     };
-    auto write_one = [this, &pool, vectors, &ids, &pruned](uint32_t i) -> coro::task<> {
+
+    auto insert_one =
+        [this, &pool, &staged, &reconnect_one, vectors, labels, &ids](uint32_t i) -> coro::task<> {
       co_await pool.schedule();
       const float *vec = vectors + static_cast<uint64_t>(i) * dim_;
+      const std::vector<uint32_t> selected = select_insert_neighbors(vec);
+      {
+        std::unique_lock<std::shared_mutex> state_lock(update_mutex_);
+        std::lock_guard<std::mutex> slot_lock(slot_mutex_);
+        ids[i] = allocate_update_slot_unlocked(labels[i]);
+      }
       encode_pq_slot(vec, ids[i]);
-      write_inserted_node(ids[i], vec, pruned[i]);
+      write_inserted_node(ids[i], vec, selected);
+      publish_slots(&ids[i], &ids[i] + 1);
+      for (const uint32_t n : selected) {
+        staged.add(n, ids[i]);
+      }
+      std::vector<coro::task<>> reconnects;
+      reconnects.reserve(selected.size());
+      for (const uint32_t n : selected) {
+        reconnects.emplace_back(reconnect_one(n));
+      }
+      co_await coro::when_all(std::move(reconnects));
     };
 
     for (uint32_t off = 0; off < count; off += batch_size) {
       const uint32_t end = std::min<uint32_t>(count, off + batch_size);
-      run_batch_tasks(off, end, plan_one);
-      reserve_batch_insert_slots(labels, ids, off, end);
-      run_batch_tasks(off, end, write_one);
-      run_batch_reconnect_tasks(off, end, ids, pruned, pool);
+      auto run = [&]() -> coro::task<> {
+        std::vector<coro::task<>> tasks;
+        tasks.reserve(end - off);
+        for (uint32_t i = off; i < end; ++i) {
+          tasks.emplace_back(insert_one(i));
+        }
+        co_await coro::when_all(std::move(tasks));
+      };
+      coro::sync_wait(run());
     }
-    page_io_->flush_dirty_pages();
     return ids;
   }
 
-  template <typename MakeTask>
-  void run_batch_tasks(uint32_t begin, uint32_t end, MakeTask make_task) {
-    auto run = [&]() -> coro::task<> {
-      std::vector<coro::task<>> tasks;
-      tasks.reserve(end - begin);
-      for (uint32_t i = begin; i < end; ++i) {
-        tasks.emplace_back(make_task(i));
-      }
-      co_await coro::when_all(std::move(tasks));
-    };
-    coro::sync_wait(run());
-  }
-
-  struct ReconnectWork {
-    uint32_t node_id = 0;
-    std::vector<uint32_t> extra_edges;
-  };
-
-  void run_batch_reconnect_tasks(uint32_t begin,
-                                 uint32_t end,
-                                 const std::vector<uint32_t> &ids,
-                                 const std::vector<std::vector<uint32_t>> &pruned,
-                                 coro::thread_pool &pool) {
-    std::vector<ReconnectWork> work = collect_batch_reconnect_work(begin, end, ids, pruned);
-    if (work.empty()) {
-      return;
-    }
-    auto reconnect_one = [this, &pool, &work](uint32_t i) -> coro::task<> {
-      const ReconnectWork &item = work[i];
-      const DiskPageIO::NodeData node = co_await page_io_->read_node_async(item.node_id, pool);
-      std::lock_guard<std::mutex> node_lock(update_node_mutex(item.node_id));
-      update_node_impl_from_snapshot(item.node_id, node, item.extra_edges);
-    };
-    auto run = [&]() -> coro::task<> {
-      std::vector<coro::task<>> tasks;
-      tasks.reserve(work.size());
-      for (uint32_t i = 0; i < work.size(); ++i) {
-        tasks.emplace_back(reconnect_one(i));
-      }
-      co_await coro::when_all(std::move(tasks));
-    };
-    coro::sync_wait(run());
-  }
-
-  std::vector<ReconnectWork> collect_batch_reconnect_work(
-      uint32_t begin,
-      uint32_t end,
-      const std::vector<uint32_t> &ids,
-      const std::vector<std::vector<uint32_t>> &pruned) {
-    std::vector<ReconnectWork> work;
-    std::unordered_map<uint32_t, size_t> pos_by_node;
-    for (uint32_t i = begin; i < end; ++i) {
-      for (const uint32_t node_id : pruned[i]) {
-        auto [pos, inserted] = pos_by_node.emplace(node_id, work.size());
-        if (inserted) {
-          ReconnectWork item;
-          item.node_id = node_id;
-          item.extra_edges.push_back(ids[i]);
-          work.push_back(std::move(item));
-          continue;
-        }
-        work[pos->second].extra_edges.push_back(ids[i]);
-      }
-    }
-    return work;
-  }
-
-  void add_extra_edges(uint32_t node_id,
-                       const std::vector<uint32_t> &extra_edges,
-                       std::unordered_set<uint32_t> &cand) const {
-    for (const uint32_t v : extra_edges) {
-      if (v != node_id && !slot_alloc_.is_deleted(v)) {
-        cand.insert(v);
-      }
+  /// Make written slots search-visible. Slots stay tombstoned ("dark") from
+  /// allocation until their node record and PQ code exist, so a concurrent
+  /// search can never surface a reused slot's stale bytes under a new label.
+  void publish_slots(const uint32_t *begin, const uint32_t *end) {
+    std::unique_lock<std::shared_mutex> state_lock(update_mutex_);
+    for (const uint32_t *it = begin; it != end; ++it) {
+      slot_alloc_.publish(*it);
     }
   }
 
   std::vector<alaya::vamana::Neighbor> score_candidates(uint32_t node_id,
-                                                        const std::unordered_set<uint32_t> &cand) {
+                                                        const std::vector<uint32_t> &cand) {
     if (has_pq_) {
       return score_candidates_pq(node_id, cand);
     }
@@ -1129,9 +1213,8 @@ class DiskANNIndex {
     return pool;
   }
 
-  std::vector<alaya::vamana::Neighbor> score_candidates_pq(
-      uint32_t node_id,
-      const std::unordered_set<uint32_t> &cand) {
+  std::vector<alaya::vamana::Neighbor> score_candidates_pq(uint32_t node_id,
+                                                           const std::vector<uint32_t> &cand) {
     std::vector<alaya::vamana::Neighbor> pool;
     pool.reserve(cand.size());
     for (const uint32_t c : cand) {
@@ -1179,23 +1262,52 @@ class DiskANNIndex {
     return prune_candidate_pool_with_dist(node_id, pool, dist_fn);
   }
 
-  /// Shared reconnect backbone: score candidates, prune, write if changed.
+  /// Shared reconnect backbone (Yi's co_update tail): pools at or under the
+  /// degree bound are kept verbatim with no distance work; larger pools are
+  /// scored, capped to degree+32 nearest (Yi's build_k heap), and alpha-pruned.
   void prune_and_write(uint32_t node_id,
                        const std::vector<uint32_t> &old_nbrs,
-                       std::unordered_set<uint32_t> &cand,
-                       const std::vector<uint32_t> &extra_edges) {
-    add_extra_edges(node_id, extra_edges, cand);
-    if (cand.empty()) {
-      return;
+                       const std::vector<uint32_t> &cand) {
+    std::vector<uint32_t> new_nbrs;
+    if (cand.size() <= max_degree_) {
+      new_nbrs = cand;
+    } else {
+      auto pool = score_candidates(node_id, cand);
+      const uint32_t cap = max_degree_ + kReconnectPoolSlack;
+      if (pool.size() > cap) {
+        std::nth_element(pool.begin(), pool.begin() + cap, pool.end());
+        pool.resize(cap);
+      }
+      new_nbrs = prune_candidate_pool(node_id, pool);
     }
-    auto pool = score_candidates(node_id, cand);
-    const std::vector<uint32_t> new_nbrs = prune_candidate_pool(node_id, pool);
     if (!same_neighbor_set(old_nbrs, new_nbrs)) {
       page_io_->write_node_neighbors(node_id,
                                      static_cast<uint32_t>(new_nbrs.size()),
                                      new_nbrs.data());
-      cache_.update_neighbors(node_id, static_cast<uint32_t>(new_nbrs.size()), new_nbrs.data());
+      mirror_neighbors_to_cache(node_id, new_nbrs);
     }
+  }
+
+  /// Publish a node's new neighbor list to the NodeCache override layer.
+  /// Search reads uncached nodes from DISK via the O_RDONLY reader, which
+  /// cannot see dirty pages in the update page cache — the override is the
+  /// only thing that keeps searches coherent between flushes, so it must be
+  /// installed unconditionally (NodeCache::update_neighbors silently no-ops
+  /// for nodes it has no record of).
+  void mirror_neighbors_to_cache(uint32_t node_id, const std::vector<uint32_t> &new_nbrs) {
+    const NodeCache::Lookup rec = cache_.lookup_record(node_id);
+    if (rec) {
+      cache_.upsert_node(node_id,
+                         reinterpret_cast<const float *>(rec.get()),
+                         static_cast<uint32_t>(new_nbrs.size()),
+                         new_nbrs.data());
+      return;
+    }
+    const std::vector<float> coords = page_io_->read_coords_cached(node_id);
+    cache_.upsert_node(node_id,
+                       coords.data(),
+                       static_cast<uint32_t>(new_nbrs.size()),
+                       new_nbrs.data());
   }
 
   void update_node_impl(uint32_t node_id) {
@@ -1213,26 +1325,47 @@ class DiskANNIndex {
   void update_node_impl_from_snapshot(uint32_t node_id,
                                       const DiskPageIO::NodeData &nd,
                                       const std::vector<uint32_t> &extra_edges) {
-    std::unordered_set<uint32_t> cand;
+    // Yi's co_update candidate order: staged/extra edges first, then live old
+    // neighbors, then at most kTwoHopBypassPerDeleted live two-hop candidates
+    // per deleted neighbor. Order-preserving with dedup (Yi skips the dedup
+    // but the fast path keeps the pool verbatim, so duplicates would waste
+    // degree slots).
+    std::vector<uint32_t> cand;
+    cand.reserve(extra_edges.size() + nd.nbrs.size());
+    std::unordered_set<uint32_t> seen;
+    const auto push = [&](uint32_t v) {
+      if (v != node_id && !slot_alloc_.is_deleted(v) && seen.insert(v).second) {
+        cand.push_back(v);
+      }
+    };
+    for (const uint32_t e : extra_edges) {
+      push(e);
+    }
     const auto &removed_node_nbrs = update_ctx_.removed_node_nbrs_;
     for (const uint32_t nbr : nd.nbrs) {
       if (nbr == node_id) {
         continue;
       }
-      if (slot_alloc_.is_deleted(nbr)) {
-        const auto it = removed_node_nbrs.find(nbr);
-        if (it != removed_node_nbrs.end()) {
-          for (const uint32_t o : it->second) {
-            if (o != node_id && !slot_alloc_.is_deleted(o)) {
-              cand.insert(o);
-            }
-          }
+      if (!slot_alloc_.is_deleted(nbr)) {
+        push(nbr);
+        continue;
+      }
+      const auto it = removed_node_nbrs.find(nbr);
+      if (it == removed_node_nbrs.end()) {
+        continue;
+      }
+      uint32_t pulled = 0;
+      for (const uint32_t o : it->second) {
+        if (o == node_id || slot_alloc_.is_deleted(o)) {
+          continue;
         }
-      } else {
-        cand.insert(nbr);
+        push(o);
+        if (++pulled == kTwoHopBypassPerDeleted) {
+          break;
+        }
       }
     }
-    prune_and_write(node_id, nd.nbrs, cand, extra_edges);
+    prune_and_write(node_id, nd.nbrs, cand);
   }
 
   void update_node_impl_locked(uint32_t node_id, const std::vector<uint32_t> &extra_edges) {
@@ -1318,7 +1451,7 @@ class DiskANNIndex {
       }
       if (live.size() != nd.nbrs.size()) {
         page_io_->write_node_neighbors(nid, static_cast<uint32_t>(live.size()), live.data());
-        cache_.update_neighbors(nid, static_cast<uint32_t>(live.size()), live.data());
+        mirror_neighbors_to_cache(nid, live);
       }
     }
     {
@@ -1533,6 +1666,8 @@ class DiskANNIndex {
   uint64_t safety_net_fires_ = 0;
   float update_alpha_ = 1.2f;
   uint32_t update_search_l_ = 100;
+  bool update_rerank_ = true;
+  bool update_insert_prune_ = false;
   double safety_net_ratio_ = 0.05;
   uint64_t safety_net_ops_ = 16;
   uint32_t update_insert_threads_ = kDefaultDiskANNUpdateInsertThreads;

@@ -86,7 +86,7 @@ struct SearchContext {
   uint64_t num_points = 0;
 
   // Tombstone-aware search (null for static indices).
-  const TombstoneBitmap *tombstone = nullptr;
+  const TombstoneSnapshot *tombstone = nullptr;
 };
 
 /// Optional instrumentation for tests / profiling.
@@ -113,7 +113,7 @@ inline void scan_and_insert_neighbors(alaya::vamana::NeighborPriorityQueue &rets
                                       const PQTable &pq,
                                       const float *pq_table,
                                       uint64_t num_points,
-                                      const TombstoneBitmap *tombstone = nullptr) {
+                                      const TombstoneSnapshot *tombstone = nullptr) {
   for (uint32_t k = 0; k < n_nbrs; ++k) {
     const uint32_t m = nbrs[k];
     if (m >= num_points) {
@@ -204,7 +204,7 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
   };
 
   // IP-DiskANN: tombstoned nodes are skipped (graph repaired at delete time).
-  const TombstoneBitmap *tomb = ctx.tombstone;
+  const TombstoneSnapshot *tomb = ctx.tombstone;
   auto consider = [&](uint32_t m, auto &&emit) {
     if (m >= ctx.num_points || !visited.test_and_set(m)) {
       return;

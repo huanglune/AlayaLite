@@ -8,8 +8,13 @@
  *
  * Slot lifecycle for in-place DiskANN updates (design D5):
  *   - `alloc()` reuses the most-recently-freed slot (LIFO) if the free list is
- *     non-empty, otherwise appends a fresh id (`next_fresh_id_++`). Either way
- *     the returned slot is marked live.
+ *     non-empty, otherwise appends a fresh id (`next_fresh_id_++`). The slot
+ *     stays tombstoned ("dark") until `publish()` — concurrent searches must
+ *     not see a slot whose node record / PQ code is not written yet (a reused
+ *     slot still has stale in-edges pointing at the old node's bytes).
+ *   - `publish(id)` clears the tombstone once the slot's data is fully written
+ *     (mirrors Yi, which adds a node to its live set only after the disk
+ *     append).
  *   - `free(id)` pushes the slot onto the free list and tombstones it.
  *
  * The allocator owns the `TombstoneBitmap` so that alloc/free keep liveness and
@@ -46,11 +51,11 @@ class SlotAllocator {
   void reset(uint32_t num_existing) {
     free_list_.clear();
     next_fresh_id_ = num_existing;
-    tombstone_ = TombstoneBitmap(num_existing);
+    tombstone_.reset(num_existing);
   }
 
   /// Allocate a slot: reuse the most recently freed id (LIFO), else append a
-  /// fresh id. The returned slot is marked live.
+  /// fresh id. The returned slot stays tombstoned until publish().
   uint32_t alloc() {
     uint32_t id;
     if (!free_list_.empty()) {
@@ -59,9 +64,12 @@ class SlotAllocator {
     } else {
       id = next_fresh_id_++;
     }
-    tombstone_.clear(id);
+    tombstone_.set(id);
     return id;
   }
+
+  /// Make an allocated slot visible to searches (its data is on disk/in cache).
+  void publish(uint32_t id) { tombstone_.clear(id); }
 
   /// Free @p id: push it onto the free list and tombstone it.
   void free(uint32_t id) {

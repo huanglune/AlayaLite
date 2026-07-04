@@ -15,14 +15,24 @@
  * Each operation read-modify-writes one sector-aligned page so co-resident nodes
  * survive updates. Appends extend the file with ftruncate. Linux O_DIRECT is
  * required for the private syscall path; non-Linux update calls throw loudly.
+ *
+ * Concurrency: state is sharded by page offset (mutex + LRU page cache + RMW
+ * scratch per shard), so parallel reconnect workers touching different pages
+ * proceed independently — the analog of Yi's per-buffer locks; a single global
+ * mutex here was measured to flatline update throughput regardless of worker
+ * count. Pages map to exactly one shard, which preserves per-page RMW atomicity.
+ * pread/pwrite are positional and thread-safe on one fd; ftruncate extension is
+ * serialized by a dedicated file mutex (lock order: shard -> file, always).
  */
 
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
@@ -58,24 +68,29 @@ class DiskPageIO {
   DiskPageIO(const std::string &index_path,
              const DiskLayoutGeometry &geom,
              size_t page_cache_capacity = 0)
-      : geom_(geom), page_cache_(page_cache_capacity) {
+      : geom_(geom) {
     try {
-      page_buf_ =
-          static_cast<char *>(alaya::laser::memory::align_allocate<kSectorLen>(geom_.page_size));
-      flush_buf_ =
-          static_cast<char *>(alaya::laser::memory::align_allocate<kSectorLen>(geom_.page_size));
+      // Tiny caches keep the single-cache eviction semantics (one shard per
+      // cached page); real workloads get the full shard fan-out.
+      num_shards_ =
+          page_cache_capacity == 0
+              ? kNumShards
+              : static_cast<uint32_t>(
+                    std::min<size_t>(std::max<size_t>(page_cache_capacity, 1), kNumShards));
+      const size_t shard_capacity =
+          page_cache_capacity == 0 ? 0 : std::max<size_t>(1, page_cache_capacity / num_shards_);
+      shards_.reserve(num_shards_);
+      for (uint32_t s = 0; s < num_shards_; ++s) {
+        shards_.push_back(std::make_unique<Shard>(shard_capacity, geom_.page_size));
+      }
       open_rw(index_path);  // sets fd_ + file_size_
     } catch (...) {
       close_fd();
-      free_buffers();
       throw;
     }
   }
 
-  ~DiskPageIO() {
-    close_fd();
-    free_buffers();
-  }
+  ~DiskPageIO() { close_fd(); }
 
   DiskPageIO(const DiskPageIO &) = delete;
   DiskPageIO &operator=(const DiskPageIO &) = delete;
@@ -84,14 +99,10 @@ class DiskPageIO {
 
   /// Read the full node record (coords + neighbors) of @p id.
   NodeData read_node(uint32_t id) {
-    std::lock_guard<std::mutex> lock(io_mutex_);
-    read_page(id);
-    const NodeRecordView view{page_buf_ + geom_.offset_to_node(id), geom_.dim};
-    NodeData d;
-    d.coords.assign(view.coords(), view.coords() + geom_.dim);
-    const uint32_t n = view.n_nbrs();
-    d.nbrs.assign(view.nbrs(), view.nbrs() + n);
-    return d;
+    Shard &shard = shard_for(geom_.get_page_offset(id));
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    read_page_locked(shard, id);
+    return node_from_page(shard.page_buf, id);
   }
 
   /// Awaitable single-node read. The blocking O_DIRECT pread is executed on @p pool.
@@ -169,30 +180,28 @@ class DiskPageIO {
   /// Read only neighbor lists for a delete batch. IDs sharing a disk page reuse
   /// the loaded page buffer, avoiding repeated O_DIRECT reads and coords copies.
   std::vector<std::vector<uint32_t>> read_neighbors_batch(const uint32_t *ids, uint32_t count) {
-    std::lock_guard<std::mutex> lock(io_mutex_);
     std::vector<std::vector<uint32_t>> out(count);
-    std::vector<uint32_t> order(count);
-    std::iota(order.begin(), order.end(), 0);
-    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-      return geom_.get_page_offset(ids[a]) < geom_.get_page_offset(ids[b]);
-    });
-    bool page_loaded = false;
-    uint64_t loaded_off = 0;
-    for (const uint32_t pos : order) {
-      const uint32_t id = ids[pos];
-      const uint64_t off = geom_.get_page_offset(id);
-      if (!page_loaded || off != loaded_off) {
-        read_page(id);
-        loaded_off = off;
-        page_loaded = true;
+    const std::vector<uint32_t> order = page_sorted_order(ids, count);
+    for (uint32_t begin = 0; begin < count;) {
+      const uint64_t page_off = geom_.get_page_offset(ids[order[begin]]);
+      uint32_t end = begin + 1;
+      while (end < count && geom_.get_page_offset(ids[order[end]]) == page_off) {
+        ++end;
       }
-      out[pos] = neighbors_from_loaded_page(id);
+      Shard &shard = shard_for(page_off);
+      std::lock_guard<std::mutex> lock(shard.mutex);
+      read_page_locked(shard, ids[order[begin]]);
+      for (uint32_t pos = begin; pos < end; ++pos) {
+        out[order[pos]] = neighbors_from_page(shard.page_buf, ids[order[pos]]);
+      }
+      begin = end;
     }
     return out;
   }
 
-  /// Parallel variant for Yi-style delete batches. It bypasses the shared page
-  /// buffer and page cache; callers must serialize it against writes.
+  /// Parallel variant for Yi-style delete batches. Pages are read via the shard
+  /// cache when present (dirty pages stay coherent) and raw pread otherwise;
+  /// callers must serialize it against writes.
   std::vector<std::vector<uint32_t>> read_neighbors_batch_parallel(const uint32_t *ids,
                                                                    uint32_t count,
                                                                    uint32_t threads) {
@@ -244,26 +253,31 @@ class DiskPageIO {
   /// Write a complete node record `[coords | n_nbrs | nbr_ids]`. Read-modify-write
   /// that preserves co-resident nodes; extends the file for a new-append slot.
   void write_node(uint32_t id, const float *coords, uint32_t n_nbrs, const uint32_t *nbr_ids) {
-    std::lock_guard<std::mutex> lock(io_mutex_);
     if (n_nbrs > geom_.max_degree) {
       throw std::invalid_argument("DiskPageIO::write_node: n_nbrs exceeds max_degree");
     }
-    load_page_for_write(id);
-    char *rec = page_buf_ + geom_.offset_to_node(id);
-    std::memset(rec, 0, geom_.node_len);  // clear stale bytes (esp. a reused slot's tail)
-    pack_node_record(rec, coords, nbr_ids, n_nbrs, geom_.dim);
-    write_page(id);
+    {
+      Shard &shard = shard_for(geom_.get_page_offset(id));
+      std::lock_guard<std::mutex> lock(shard.mutex);
+      load_page_for_write_locked(shard, id);
+      char *rec = shard.page_buf + geom_.offset_to_node(id);
+      std::memset(rec, 0, geom_.node_len);  // clear stale bytes (esp. a reused slot's tail)
+      pack_node_record(rec, coords, nbr_ids, n_nbrs, geom_.dim);
+      write_page_locked(shard, id);
+    }
+    std::lock_guard<std::mutex> vec_lock(vec_mutex_);
     vec_cache_[id].assign(coords, coords + geom_.dim);  // keep the coords cache coherent
   }
 
   /// Overwrite only the `n_nbrs` + `nbr_ids` fields, leaving coords untouched.
   void write_node_neighbors(uint32_t id, uint32_t n_nbrs, const uint32_t *nbr_ids) {
-    std::lock_guard<std::mutex> lock(io_mutex_);
     if (n_nbrs > geom_.max_degree) {
       throw std::invalid_argument("DiskPageIO::write_node_neighbors: n_nbrs exceeds max_degree");
     }
-    read_page(id);  // must read first to preserve coords + co-resident nodes
-    char *rec = page_buf_ + geom_.offset_to_node(id);
+    Shard &shard = shard_for(geom_.get_page_offset(id));
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    read_page_locked(shard, id);  // must read first to preserve coords + co-resident nodes
+    char *rec = shard.page_buf + geom_.offset_to_node(id);
     const uint64_t coords_bytes = geom_.dim * sizeof(float);
     // Zero the whole neighbor region first so no stale trailing ids survive.
     std::memset(rec + coords_bytes, 0, geom_.node_len - coords_bytes);
@@ -273,48 +287,103 @@ class DiskPageIO {
                   nbr_ids,
                   static_cast<size_t>(n_nbrs) * sizeof(uint32_t));
     }
-    write_page(id);
+    write_page_locked(shard, id);
   }
 
   /// Coords of @p id, served from the transient cache when present (design D8).
   std::vector<float> read_coords_cached(uint32_t id) {
-    std::lock_guard<std::mutex> lock(io_mutex_);
-    auto it = vec_cache_.find(id);
-    if (it != vec_cache_.end()) {
-      return it->second;
+    {
+      std::lock_guard<std::mutex> vec_lock(vec_mutex_);
+      auto it = vec_cache_.find(id);
+      if (it != vec_cache_.end()) {
+        return it->second;
+      }
     }
-    read_page(id);
-    const NodeRecordView view{page_buf_ + geom_.offset_to_node(id), geom_.dim};
-    auto res = vec_cache_.emplace(id, std::vector<float>(view.coords(), view.coords() + geom_.dim));
-    return res.first->second;
+    std::vector<float> coords;
+    {
+      Shard &shard = shard_for(geom_.get_page_offset(id));
+      std::lock_guard<std::mutex> lock(shard.mutex);
+      read_page_locked(shard, id);
+      const NodeRecordView view{shard.page_buf + geom_.offset_to_node(id), geom_.dim};
+      coords.assign(view.coords(), view.coords() + geom_.dim);
+    }
+    std::lock_guard<std::mutex> vec_lock(vec_mutex_);
+    return vec_cache_.emplace(id, std::move(coords)).first->second;
   }
 
   /// Drop the transient coords cache (call between independent update operations).
   void clear_cache() {
-    std::lock_guard<std::mutex> lock(io_mutex_);
+    std::lock_guard<std::mutex> vec_lock(vec_mutex_);
     vec_cache_.clear();
   }
 
   /// Write all dirty cached pages to disk; clean pages stay cached.
   void flush_dirty_pages() {
-    std::lock_guard<std::mutex> lock(io_mutex_);
-    flush_dirty_pages_unlocked();
+    for (auto &shard_ptr : shards_) {
+      Shard &shard = *shard_ptr;
+      std::lock_guard<std::mutex> lock(shard.mutex);
+      shard.cache.flush_dirty([this, &shard](uint64_t page_off, const char *page) {
+        write_page_to_disk(shard, page_off, page);
+      });
+    }
   }
 
-  [[nodiscard]] uint64_t file_size() const { return file_size_; }
+  [[nodiscard]] uint64_t file_size() const { return file_size_.load(std::memory_order_acquire); }
   [[nodiscard]] const DiskLayoutGeometry &geometry() const { return geom_; }
 
  private:
-  void flush_dirty_pages_unlocked() {
-    page_cache_.flush_dirty([this](uint64_t page_off, const char *page) {
-      write_page_to_disk(page_off, page);
-    });
+  /// Page-offset-sharded state: mutex + LRU cache + aligned RMW scratch. A page
+  /// maps to exactly one shard, so per-page RMW atomicity is preserved while
+  /// different pages proceed in parallel.
+  static constexpr uint32_t kNumShards = 64;
+
+  struct Shard {
+    Shard(size_t cache_capacity, uint64_t page_size) : cache(cache_capacity) {
+      page_buf = static_cast<char *>(alaya::laser::memory::align_allocate<kSectorLen>(page_size));
+      try {
+        flush_buf =
+            static_cast<char *>(alaya::laser::memory::align_allocate<kSectorLen>(page_size));
+      } catch (...) {
+        alaya::laser::memory::align_free(page_buf);
+        page_buf = nullptr;
+        throw;
+      }
+    }
+    ~Shard() {
+      if (page_buf != nullptr) {
+        alaya::laser::memory::align_free(page_buf);
+      }
+      if (flush_buf != nullptr) {
+        alaya::laser::memory::align_free(flush_buf);
+      }
+    }
+    Shard(const Shard &) = delete;
+    Shard &operator=(const Shard &) = delete;
+
+    std::mutex mutex;
+    DiskPageCache cache;
+    std::unordered_map<uint64_t, uint64_t> versions;
+    char *page_buf = nullptr;   ///< RMW scratch, guarded by mutex
+    char *flush_buf = nullptr;  ///< aligned bounce buffer for O_DIRECT cache flushes
+  };
+
+  Shard &shard_for(uint64_t page_off) {
+    return *shards_[(page_off / geom_.page_size) % num_shards_];
   }
 
-  std::vector<uint32_t> neighbors_from_loaded_page(uint32_t id) const {
-    const NodeRecordView view{page_buf_ + geom_.offset_to_node(id), geom_.dim};
+  std::vector<uint32_t> neighbors_from_page(const char *page, uint32_t id) const {
+    const NodeRecordView view{page + geom_.offset_to_node(id), geom_.dim};
     const uint32_t n = view.n_nbrs();
     return std::vector<uint32_t>(view.nbrs(), view.nbrs() + n);
+  }
+
+  NodeData node_from_page(const char *page, uint32_t id) const {
+    const NodeRecordView view{page + geom_.offset_to_node(id), geom_.dim};
+    NodeData d;
+    d.coords.assign(view.coords(), view.coords() + geom_.dim);
+    const uint32_t n = view.n_nbrs();
+    d.nbrs.assign(view.nbrs(), view.nbrs() + n);
+    return d;
   }
 
   struct NeighborPageGroup {
@@ -346,21 +415,6 @@ class DiskPageIO {
     return groups;
   }
 
-  std::vector<uint32_t> neighbors_from_page(const char *page, uint32_t id) const {
-    const NodeRecordView view{page + geom_.offset_to_node(id), geom_.dim};
-    const uint32_t n = view.n_nbrs();
-    return std::vector<uint32_t>(view.nbrs(), view.nbrs() + n);
-  }
-
-  NodeData node_from_page(const char *page, uint32_t id) const {
-    const NodeRecordView view{page + geom_.offset_to_node(id), geom_.dim};
-    NodeData d;
-    d.coords.assign(view.coords(), view.coords() + geom_.dim);
-    const uint32_t n = view.n_nbrs();
-    d.nbrs.assign(view.nbrs(), view.nbrs() + n);
-    return d;
-  }
-
   NodeData read_node_with_private_page(uint32_t id) {
     char *buf =
         static_cast<char *>(alaya::laser::memory::align_allocate<kSectorLen>(geom_.page_size));
@@ -377,38 +431,39 @@ class DiskPageIO {
 
   void read_page_snapshot(uint32_t id, char *out) {
     const uint64_t off = geom_.get_page_offset(id);
+    Shard &shard = shard_for(off);
     uint64_t observed_version = 0;
     {
-      std::lock_guard<std::mutex> lock(io_mutex_);
-      if (page_cache_.read(off, out, geom_.page_size)) {
+      std::lock_guard<std::mutex> lock(shard.mutex);
+      if (shard.cache.read(off, out, geom_.page_size)) {
         return;
       }
-      observed_version = page_version(off);
+      observed_version = page_version_locked(shard, off);
     }
 
     read_page_from_disk(off, out);
 
-    std::lock_guard<std::mutex> lock(io_mutex_);
-    if (page_cache_.read(off, out, geom_.page_size)) {
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    if (shard.cache.read(off, out, geom_.page_size)) {
       return;
     }
-    if (page_version(off) != observed_version) {
-      read_page(id);
-      std::memcpy(out, page_buf_, geom_.page_size);
+    if (page_version_locked(shard, off) != observed_version) {
+      read_page_locked(shard, id);
+      std::memcpy(out, shard.page_buf, geom_.page_size);
       return;
     }
-    page_cache_.write(off,
+    shard.cache.write(off,
                       out,
                       geom_.page_size,
                       false,
-                      [this](uint64_t page_off, const char *page) {
-                        write_page_to_disk(page_off, page);
+                      [this, &shard](uint64_t page_off, const char *page) {
+                        write_page_to_disk(shard, page_off, page);
                       });
   }
 
-  uint64_t page_version(uint64_t page_off) const {
-    const auto it = page_versions_.find(page_off);
-    if (it == page_versions_.end()) {
+  uint64_t page_version_locked(const Shard &shard, uint64_t page_off) const {
+    const auto it = shard.versions.find(page_off);
+    if (it == shard.versions.end()) {
       return 0;
     }
     return it->second;
@@ -420,7 +475,7 @@ class DiskPageIO {
                                   const std::vector<NeighborPageGroup> &groups,
                                   uint32_t worker,
                                   uint32_t workers,
-                                  std::vector<std::vector<uint32_t>> &out) const {
+                                  std::vector<std::vector<uint32_t>> &out) {
     char *buf =
         static_cast<char *>(alaya::laser::memory::align_allocate<kSectorLen>(geom_.page_size));
     try {
@@ -428,9 +483,20 @@ class DiskPageIO {
         const NeighborPageGroup group = groups[group_id];
         const uint32_t first_id = ids[order[group.begin]];
         const uint64_t page_off = geom_.get_page_offset(first_id);
-        const ssize_t r = ::pread(fd_, buf, geom_.page_size, static_cast<off_t>(page_off));
-        if (r != static_cast<ssize_t>(geom_.page_size)) {
-          throw std::runtime_error("DiskPageIO::read_neighbors_batch_parallel: short/failed pread");
+        // Serve from the shard cache when present — a dirty cached page is
+        // newer than the disk copy. Miss => the disk copy is current.
+        bool cached = false;
+        {
+          Shard &shard = shard_for(page_off);
+          std::lock_guard<std::mutex> lock(shard.mutex);
+          cached = shard.cache.read(page_off, buf, geom_.page_size);
+        }
+        if (!cached) {
+          const ssize_t r = ::pread(fd_, buf, geom_.page_size, static_cast<off_t>(page_off));
+          if (r != static_cast<ssize_t>(geom_.page_size)) {
+            throw std::runtime_error(
+                "DiskPageIO::read_neighbors_batch_parallel: short/failed pread");
+          }
         }
         for (uint32_t pos = group.begin; pos < group.end; ++pos) {
           const uint32_t out_pos = order[pos];
@@ -445,48 +511,45 @@ class DiskPageIO {
   }
 #endif
 
-  /// Ensure the page holding @p id exists, with page_buf_ holding its current
-  /// content (existing page: RMW) or zeros (freshly extended page).
-  void load_page_for_write(uint32_t id) {
+  /// Ensure the page holding @p id exists, with the shard's page_buf holding its
+  /// current content (existing page: RMW) or zeros (freshly extended page).
+  /// Caller holds the shard mutex; extension takes file_mutex_ (shard -> file
+  /// lock order, always).
+  void load_page_for_write_locked(Shard &shard, uint32_t id) {
     const uint64_t page_off = geom_.get_page_offset(id);
     const uint64_t page_end = page_off + geom_.page_size;
-    if (page_end <= file_size_) {
-      read_page(id);
-    } else {
-      extend_to(page_end);                         // ftruncate; OS zero-fills the new region
-      std::memset(page_buf_, 0, geom_.page_size);  // fresh in-memory page
+    if (page_end <= file_size_.load(std::memory_order_acquire)) {
+      read_page_locked(shard, id);
+      return;
     }
+    {
+      std::lock_guard<std::mutex> file_lock(file_mutex_);
+      if (page_end > file_size_.load(std::memory_order_acquire)) {
+        extend_to(page_end);  // ftruncate; OS zero-fills the new region
+        std::memset(shard.page_buf, 0, geom_.page_size);
+        return;
+      }
+    }
+    read_page_locked(shard, id);  // another thread extended past us meanwhile
   }
 
   // ---- platform-gated syscalls (Linux O_DIRECT) ----
   void open_rw(const std::string &path);
-  void read_page(uint32_t id);
+  void read_page_locked(Shard &shard, uint32_t id);
   void read_page_from_disk(uint64_t page_off, char *page) const;
-  void write_page(uint32_t id);
-  void write_page_to_disk(uint64_t page_off, const char *page);
+  void write_page_locked(Shard &shard, uint32_t id);
+  void write_page_to_disk(Shard &shard, uint64_t page_off, const char *page);
   void extend_to(uint64_t new_size);
   void close_fd();
 
-  void free_buffers() {
-    if (page_buf_ != nullptr) {
-      alaya::laser::memory::align_free(page_buf_);
-      page_buf_ = nullptr;
-    }
-    if (flush_buf_ != nullptr) {
-      alaya::laser::memory::align_free(flush_buf_);
-      flush_buf_ = nullptr;
-    }
-  }
-
   DiskLayoutGeometry geom_;
   int fd_ = -1;
-  uint64_t file_size_ = 0;
-  char *page_buf_ = nullptr;
-  char *flush_buf_ = nullptr;
-  DiskPageCache page_cache_;
+  std::atomic<uint64_t> file_size_{0};
+  uint32_t num_shards_ = kNumShards;
+  std::vector<std::unique_ptr<Shard>> shards_;
   std::unordered_map<uint32_t, std::vector<float>> vec_cache_;
-  std::unordered_map<uint64_t, uint64_t> page_versions_;
-  mutable std::mutex io_mutex_;
+  mutable std::mutex vec_mutex_;
+  std::mutex file_mutex_;  ///< serializes ftruncate extension (after shard lock)
 };
 
 #if defined(__linux__)
@@ -502,21 +565,21 @@ inline void DiskPageIO::open_rw(const std::string &path) {
     fd_ = -1;
     throw std::runtime_error("DiskPageIO::open_rw: fstat failed " + path);
   }
-  file_size_ = static_cast<uint64_t>(st.st_size);
+  file_size_.store(static_cast<uint64_t>(st.st_size), std::memory_order_release);
 }
 
-inline void DiskPageIO::read_page(uint32_t id) {
+inline void DiskPageIO::read_page_locked(Shard &shard, uint32_t id) {
   const uint64_t off = geom_.get_page_offset(id);
-  if (page_cache_.read(off, page_buf_, geom_.page_size)) {
+  if (shard.cache.read(off, shard.page_buf, geom_.page_size)) {
     return;
   }
-  read_page_from_disk(off, page_buf_);
-  page_cache_.write(off,
-                    page_buf_,
+  read_page_from_disk(off, shard.page_buf);
+  shard.cache.write(off,
+                    shard.page_buf,
                     geom_.page_size,
                     false,
-                    [this](uint64_t page_off, const char *page) {
-                      write_page_to_disk(page_off, page);
+                    [this, &shard](uint64_t page_off, const char *page) {
+                      write_page_to_disk(shard, page_off, page);
                     });
 }
 
@@ -528,28 +591,28 @@ inline void DiskPageIO::read_page_from_disk(uint64_t page_off, char *page) const
   }
 }
 
-inline void DiskPageIO::write_page(uint32_t id) {
+inline void DiskPageIO::write_page_locked(Shard &shard, uint32_t id) {
   const uint64_t off = geom_.get_page_offset(id);
-  if (page_cache_.enabled()) {
-    page_cache_.write(off,
-                      page_buf_,
+  if (shard.cache.enabled()) {
+    shard.cache.write(off,
+                      shard.page_buf,
                       geom_.page_size,
                       true,
-                      [this](uint64_t page_off, const char *page) {
-                        write_page_to_disk(page_off, page);
+                      [this, &shard](uint64_t page_off, const char *page) {
+                        write_page_to_disk(shard, page_off, page);
                       });
-    ++page_versions_[off];
+    ++shard.versions[off];
     return;
   }
-  write_page_to_disk(off, page_buf_);
-  ++page_versions_[off];
+  write_page_to_disk(shard, off, shard.page_buf);
+  ++shard.versions[off];
 }
 
-inline void DiskPageIO::write_page_to_disk(uint64_t page_off, const char *page) {
+inline void DiskPageIO::write_page_to_disk(Shard &shard, uint64_t page_off, const char *page) {
   const char *write_buf = page;
-  if (page != page_buf_) {
-    std::memcpy(flush_buf_, page, geom_.page_size);
-    write_buf = flush_buf_;
+  if (page != shard.page_buf) {
+    std::memcpy(shard.flush_buf, page, geom_.page_size);
+    write_buf = shard.flush_buf;
   }
   const ssize_t w = ::pwrite(fd_, write_buf, geom_.page_size, static_cast<off_t>(page_off));
   if (w != static_cast<ssize_t>(geom_.page_size)) {
@@ -563,7 +626,7 @@ inline void DiskPageIO::extend_to(uint64_t new_size) {
     throw std::runtime_error("DiskPageIO::extend_to: ftruncate failed to " +
                              std::to_string(new_size));
   }
-  file_size_ = new_size;
+  file_size_.store(new_size, std::memory_order_release);
 }
 
 inline void DiskPageIO::close_fd() {
@@ -578,16 +641,16 @@ inline void DiskPageIO::close_fd() {
 inline void DiskPageIO::open_rw(const std::string &) {
   throw std::runtime_error("DiskPageIO: in-place DiskANN updates require Linux (O_DIRECT)");
 }
-inline void DiskPageIO::read_page(uint32_t) {
+inline void DiskPageIO::read_page_locked(Shard &, uint32_t) {
   throw std::runtime_error("DiskPageIO: unsupported platform (needs Linux O_DIRECT)");
 }
 inline void DiskPageIO::read_page_from_disk(uint64_t, char *) const {
   throw std::runtime_error("DiskPageIO: unsupported platform (needs Linux O_DIRECT)");
 }
-inline void DiskPageIO::write_page(uint32_t) {
+inline void DiskPageIO::write_page_locked(Shard &, uint32_t) {
   throw std::runtime_error("DiskPageIO: unsupported platform (needs Linux O_DIRECT)");
 }
-inline void DiskPageIO::write_page_to_disk(uint64_t, const char *) {
+inline void DiskPageIO::write_page_to_disk(Shard &, uint64_t, const char *) {
   throw std::runtime_error("DiskPageIO: unsupported platform (needs Linux O_DIRECT)");
 }
 inline void DiskPageIO::extend_to(uint64_t) {

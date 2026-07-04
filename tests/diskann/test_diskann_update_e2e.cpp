@@ -239,6 +239,69 @@ TEST_F(UpdateE2ETest, InsertWithParallelReconnectKeepsVectorsSearchable) {
   }
 }
 
+TEST_F(UpdateE2ETest, RecordCapacityLeavesUpdateHeadroom) {
+  // Yi-style layout: records hold more neighbor slots than the built graph
+  // degree, so insert reconnects keep pools verbatim instead of pruning.
+  dim_ = 32;
+  base_vecs_ = make_vectors(300, 32, /*seed=*/7);
+  std::vector<uint64_t> labels(300);
+  for (uint64_t i = 0; i < labels.size(); ++i) {
+    labels[i] = 1000 + i;
+  }
+  DiskANNBuildParams bp;
+  bp.R = 16;
+  bp.record_capacity = 24;
+  bp.pq_n_chunks = 0;
+  DiskANNIndex::build(dir(), base_vecs_.data(), labels.data(), labels.size(), 32, bp);
+
+  DiskANNLoadParams lp;
+  lp.updatable = true;
+  idx_ = std::make_unique<DiskANNIndex>();
+  idx_->load(dir(), lp);
+  next_label_ = 1000 + 300;
+  medoid_ = idx_->medoid();
+  live_.clear();
+  id_label_.clear();
+  for (uint64_t i = 0; i < 300; ++i) {
+    live_[1000 + i] = vec_at(base_vecs_, i);
+    id_label_[static_cast<uint32_t>(i)] = 1000 + i;
+  }
+
+  const auto nv = make_vectors(8, 32, /*seed=*/77);
+  for (uint32_t i = 0; i < 8; ++i) {
+    const uint32_t id = do_insert(vec_at(nv, i));
+    ASSERT_TRUE(top1_is(nv.data() + static_cast<uint64_t>(i) * 32, id_label_[id]))
+        << "insert " << i << " should be findable on a capacity-padded layout";
+  }
+  idx_->flush();
+
+  // Reload and confirm the capacity survives the meta round-trip.
+  DiskANNIndex reloaded;
+  reloaded.load(dir(), lp);
+  const auto q = vec_at(nv, 0);
+  uint64_t out_l = 0;
+  float out_d = 0.0f;
+  DiskANNSearchParams sp;
+  sp.use_pq = false;
+  sp.rerank = false;
+  reloaded.search(q.data(), 1, &out_l, &out_d, sp);
+  EXPECT_EQ(out_l, 1300u);  // first insert's label (next_label_ started at 1300)
+}
+
+TEST_F(UpdateE2ETest, BuildRejectsCapacityBelowR) {
+  const auto vecs = make_vectors(100, 16, /*seed=*/23);
+  std::vector<uint64_t> labels(100);
+  for (uint32_t i = 0; i < labels.size(); ++i) {
+    labels[i] = i;
+  }
+  DiskANNBuildParams bp;
+  bp.R = 16;
+  bp.record_capacity = 8;
+  bp.pq_n_chunks = 0;
+  EXPECT_THROW(DiskANNIndex::build(dir(), vecs.data(), labels.data(), 100, 16, bp),
+               std::invalid_argument);
+}
+
 TEST_F(UpdateE2ETest, LoadRejectsZeroUpdateReconnectThreads) {
   const auto vecs = make_vectors(100, 16, /*seed=*/19);
   std::vector<uint64_t> labels(100);

@@ -40,7 +40,7 @@ using alaya::diskann::DiskANNSearchParams;
 constexpr uint32_t kMissingSlot = std::numeric_limits<uint32_t>::max();
 constexpr uint32_t kDefaultBenchmarkGraphR = 64;
 constexpr uint32_t kDefaultBenchmarkBuildL = 100;
-constexpr uint32_t kDefaultBenchmarkUpdateSearchL = 30;
+constexpr uint32_t kDefaultBenchmarkUpdateSearchL = 0;  // 0 => R + 32 (Yi's build_k rule)
 constexpr uint64_t kDefaultBenchmarkPageCachePages = 262144;
 constexpr uint32_t kBenchmarkTopK = 10;
 constexpr double kDefaultBenchmarkCacheRatio = 1.0;
@@ -87,16 +87,23 @@ struct Options {
   std::string out_csv = "/tmp/diskann_sift1m_alaya_update_pq.csv";
   bool rebuild = false;
   bool deterministic = false;
-  bool flush_rounds = false;
+  bool flush_rounds = true;  ///< flush after each round, outside the timed window (Yi's
+                             ///< write-back is likewise excluded from its update QPS)
   bool build_only = false;
   bool eval_only = false;
   bool single_updates = false;
   bool mixed = false;
+  bool update_rerank = true;        ///< Yi trace-bench parity (_rerank_flag=true)
+  bool update_insert_prune = false; ///< Yi never alpha-prunes at insert
+  bool mixed_round0_baseline = true;  ///< Yi UpdateRunner: round 0 runs no updates
   MixedMode mixed_mode = MixedMode::Background;
   uint32_t max_rounds = 0;
   uint32_t nq = 1000;
   uint32_t build_r = kDefaultBenchmarkGraphR;
   uint32_t build_l = kDefaultBenchmarkBuildL;
+  uint32_t record_capacity = 0;  ///< on-disk neighbor slots; 0 => R. Yi keeps
+                                 ///< MAX_NEIGHBOURS=96 slots over a ~64-degree
+                                 ///< graph, so reconnects rarely overflow.
   uint32_t search_l = 100;
   uint32_t rerank_count = 0;
   uint32_t update_l = kDefaultBenchmarkUpdateSearchL;
@@ -280,6 +287,14 @@ Options parse_args(int argc, char **argv) {
       opt.deterministic = true;
     } else if (arg == "--flush_rounds") {
       opt.flush_rounds = true;
+    } else if (arg == "--no_flush_rounds") {
+      opt.flush_rounds = false;
+    } else if (arg == "--no_update_rerank") {
+      opt.update_rerank = false;
+    } else if (arg == "--update_insert_prune") {
+      opt.update_insert_prune = true;
+    } else if (arg == "--no_mixed_round0") {
+      opt.mixed_round0_baseline = false;
     } else if (arg == "--build_only") {
       opt.build_only = true;
     } else if (arg == "--eval_only") {
@@ -297,6 +312,8 @@ Options parse_args(int argc, char **argv) {
       opt.nq = parse_u32(argv[++i], "--nq");
     } else if (arg == "--R" && i + 1 < argc) {
       opt.build_r = std::max<uint32_t>(1, parse_u32(argv[++i], "--R"));
+    } else if (arg == "--capacity" && i + 1 < argc) {
+      opt.record_capacity = parse_u32(argv[++i], "--capacity");  // 0 => R
     } else if (arg == "--build_L" && i + 1 < argc) {
       opt.build_l = std::max<uint32_t>(1, parse_u32(argv[++i], "--build_L"));
     } else if (arg == "--L" && i + 1 < argc) {
@@ -304,7 +321,7 @@ Options parse_args(int argc, char **argv) {
     } else if (arg == "--rerank_count" && i + 1 < argc) {
       opt.rerank_count = parse_u32(argv[++i], "--rerank_count");
     } else if (arg == "--update_L" && i + 1 < argc) {
-      opt.update_l = std::max<uint32_t>(1, parse_u32(argv[++i], "--update_L"));
+      opt.update_l = parse_u32(argv[++i], "--update_L");  // 0 => R + 32
     } else if (arg == "--beam" && i + 1 < argc) {
       opt.beam = parse_u32(argv[++i], "--beam");
     } else if (arg == "--threads" && i + 1 < argc) {
@@ -382,6 +399,7 @@ void build_initial_index(const Options &opt,
   DiskANNBuildParams bp;
   bp.R = opt.build_r;
   bp.L = opt.build_l;
+  bp.record_capacity = opt.record_capacity;
   bp.alpha = 1.2f;
   bp.pq_n_chunks = 32;
   bp.cache_ratio = opt.cache_ratio;
@@ -895,6 +913,8 @@ int main(int argc, char **argv) {
     lp.beam_width = opt.beam;
     lp.updatable = true;
     lp.update_search_l = opt.update_l;
+    lp.update_rerank = opt.update_rerank;
+    lp.update_insert_prune = opt.update_insert_prune;
     lp.update_insert_threads = opt.update_insert_threads;
     lp.update_reconnect_threads = opt.update_reconnect_threads;
     lp.page_cache_capacity = opt.page_cache_capacity;
@@ -929,17 +949,27 @@ int main(int argc, char **argv) {
     csv << "round,deletes,inserts,update_ms,delete_ms,insert_ms,update_qps,"
            "mixed_search_qps,mixed_search_mean_us,mixed_search_queries,"
            "masked_recall_at_10,recall_hits,recall_total,search_mean_us,search_qps,"
-           "live_count,tombstones,free_slots,cache_ratio\n";
+           "live_count,tombstones,free_slots,cache_ratio,flush_ms\n";
 
-    for (uint32_t round_id = 0; round_id < rounds; ++round_id) {
-      const auto path = trace_dir / (manifest.prefix + std::to_string(round_id));
-      const TraceRound round = limit_round_updates(read_round(path, manifest.update_size), opt);
+    // Yi's UpdateRunner runs NO updates in mixed round 0 (search-only baseline
+    // eval); replicate by prepending a baseline round and shifting trace files
+    // to rounds 1..N.
+    const bool round0_baseline = opt.mixed && opt.mixed_round0_baseline;
+    const uint32_t total_rounds = rounds + (round0_baseline ? 1U : 0U);
+    for (uint32_t round_id = 0; round_id < total_rounds; ++round_id) {
+      const bool baseline_round = round0_baseline && round_id == 0;
+      TraceRound round;
+      if (!baseline_round) {
+        const uint32_t trace_idx = round0_baseline ? round_id - 1 : round_id;
+        const auto path = trace_dir / (manifest.prefix + std::to_string(trace_idx));
+        round = limit_round_updates(read_round(path, manifest.update_size), opt);
+      }
       MixedSearchState mixed_state;
       bool mixed_started = false;
       std::unique_ptr<coro::thread_pool> mixed_pool;
       const auto t0 = std::chrono::steady_clock::now();
       try {
-        if (opt.mixed) {
+        if (opt.mixed && !baseline_round) {
           if (opt.mixed_mode == MixedMode::SharedQueue) {
             const uint32_t mixed_workers =
                 std::max({uint32_t{1},
@@ -956,21 +986,22 @@ int main(int argc, char **argv) {
           }
           mixed_started = true;
         }
-        if (opt.mixed && opt.mixed_mode == MixedMode::SharedQueue) {
-          apply_deletes_shared(idx, round, opt, live, label_to_slot, *mixed_pool);
-        } else {
-          apply_deletes(idx, round, opt, live, label_to_slot);
+        if (!baseline_round) {
+          if (opt.mixed && opt.mixed_mode == MixedMode::SharedQueue) {
+            apply_deletes_shared(idx, round, opt, live, label_to_slot, *mixed_pool);
+          } else {
+            apply_deletes(idx, round, opt, live, label_to_slot);
+          }
         }
         const auto t_delete = std::chrono::steady_clock::now();
-        if (opt.mixed && opt.mixed_mode == MixedMode::SharedQueue) {
-          apply_inserts_shared(idx, base, round, opt, live, label_to_slot, *mixed_pool);
-        } else {
-          apply_inserts(idx, base, round, opt, live, label_to_slot);
+        if (!baseline_round) {
+          if (opt.mixed && opt.mixed_mode == MixedMode::SharedQueue) {
+            apply_inserts_shared(idx, base, round, opt, live, label_to_slot, *mixed_pool);
+          } else {
+            apply_inserts(idx, base, round, opt, live, label_to_slot);
+          }
         }
         const auto t_insert = std::chrono::steady_clock::now();
-        if (opt.flush_rounds) {
-          idx.flush();
-        }
         const auto t1 = std::chrono::steady_clock::now();
         MixedSearchResult mixed_search;
         if (mixed_started) {
@@ -979,27 +1010,43 @@ int main(int argc, char **argv) {
         if (mixed_pool) {
           mixed_pool->shutdown();
         }
+        // Persist outside the timed window: Yi's dirty-page write-back is
+        // likewise excluded from its update QPS (background writeback_one /
+        // round-boundary writeback_remaining). flush_pages() is the light
+        // dirty-page write-back; the full checkpoint runs once after all
+        // rounds.
+        double flush_ms = 0.0;
+        if (opt.flush_rounds && !baseline_round) {
+          const auto f0 = std::chrono::steady_clock::now();
+          idx.flush_pages();
+          flush_ms =
+              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - f0)
+                  .count();
+        }
         const double update_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         const double delete_ms = std::chrono::duration<double, std::milli>(t_delete - t0).count();
         const double insert_ms =
             std::chrono::duration<double, std::milli>(t_insert - t_delete).count();
+        const size_t round_updates = round.deletes.size() + round.inserts.size();
         const double update_qps =
-            static_cast<double>(round.deletes.size() + round.inserts.size()) / (update_ms / 1000.0);
+            round_updates > 0 ? static_cast<double>(round_updates) / (update_ms / 1000.0) : 0.0;
         const RecallResult recall = evaluate_search(idx, queries, gt, live, opt);
         std::cout << "[round " << round_id << "] update_qps=" << update_qps
                   << " delete_ms=" << delete_ms << " insert_ms=" << insert_ms
+                  << " flush_ms=" << flush_ms
                   << " mixed_mode=" << mixed_mode_name(opt.mixed_mode)
                   << " mixed_search_qps=" << mixed_search.qps
                   << " mixed_search_mean_us=" << mixed_search.mean_us
                   << " mixed_search_queries=" << mixed_search.queries
                   << " masked_recall@10=" << recall.recall() << " live=" << idx.live_count()
-                  << " tombstones=" << idx.tombstone_count() << "\n";
+                  << " tombstones=" << idx.tombstone_count()
+                  << (baseline_round ? " (baseline)" : "") << "\n";
         csv << round_id << "," << round.deletes.size() << "," << round.inserts.size() << ","
             << update_ms << "," << delete_ms << "," << insert_ms << "," << update_qps << ","
             << mixed_search.qps << "," << mixed_search.mean_us << "," << mixed_search.queries << ","
             << recall.recall() << "," << recall.hits << "," << recall.total << "," << recall.mean_us
             << "," << recall.qps << "," << idx.live_count() << "," << idx.tombstone_count() << ","
-            << idx.free_slot_count() << "," << opt.cache_ratio << "\n";
+            << idx.free_slot_count() << "," << opt.cache_ratio << "," << flush_ms << "\n";
       } catch (...) {
         if (mixed_started) {
           request_mixed_search_stop(mixed_state);
