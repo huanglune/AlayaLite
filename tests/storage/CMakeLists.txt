@@ -1,18 +1,35 @@
-add_executable(storage_test ${CMAKE_CURRENT_SOURCE_DIR}/sequential_storage_test.cpp)
-add_executable(static_storage_test ${CMAKE_CURRENT_SOURCE_DIR}/static_storage_test.cpp)
-add_executable(rocksdb_storage_test ${CMAKE_CURRENT_SOURCE_DIR}/rocksdb_storage_test.cpp)
+# SPDX-FileCopyrightText: 2025 AlayaDB.AI
+#
+# SPDX-License-Identifier: AGPL-3.0-only
 
-target_link_libraries(storage_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
-target_link_libraries(static_storage_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
-target_link_libraries(rocksdb_storage_test PRIVATE ${THIRD_PARTY_LIBS} ${GTEST_LIBS})
+alaya_cc_target(
+  storage_test
+  GTEST
+  SRCS sequential_storage_test.cpp
+)
+alaya_cc_target(
+  static_storage_test
+  GTEST
+  SRCS static_storage_test.cpp
+)
+alaya_cc_target(
+  rocksdb_storage_test
+  GTEST
+  SRCS rocksdb_storage_test.cpp
+)
 
-add_coverage_to_target(storage_test)
-add_coverage_to_target(static_storage_test)
-add_coverage_to_target(rocksdb_storage_test)
-
-add_test(NAME storage_test_sequential_storage COMMAND $<TARGET_FILE:storage_test>)
-add_test(NAME storage_test_static_storage COMMAND $<TARGET_FILE:static_storage_test>)
-add_test(NAME storage_test_rocksdb_storage COMMAND $<TARGET_FILE:rocksdb_storage_test>)
-set_tests_properties(
-  storage_test_sequential_storage storage_test_static_storage storage_test_rocksdb_storage PROPERTIES LABELS "storage"
+alaya_add_test(
+  NAME storage_test_sequential_storage
+  TARGET storage_test
+  LABELS storage
+)
+alaya_add_test(
+  NAME storage_test_static_storage
+  TARGET static_storage_test
+  LABELS storage
+)
+alaya_add_test(
+  NAME storage_test_rocksdb_storage
+  TARGET rocksdb_storage_test
+  LABELS storage
 )

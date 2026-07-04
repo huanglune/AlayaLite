@@ -7,16 +7,18 @@
         install dev-install wheel clean clean-release clean-debug clean-all codegen \
         bump-version release-dry version
 
-# Configuration
-BUILD_RELEASE_DIR := build/Release
-BUILD_DEBUG_DIR   := build/Debug
-BUILD_SAN_DIR     := build/San
-BUILD_TYPE        ?= Release
-CMAKE_FLAGS       := -DBUILD_TESTING=ON
-PYTEST_FLAGS      := -v
-CTEST_FLAGS       := --output-on-failure -LE performance
-JOBS              := $(shell nproc 2>/dev/null || echo 4)
-PYTHON_VERSION    ?=
+# Configuration. Build flavors are defined once in CMakePresets.json; the *_DIR variables mirror the presets'
+# binaryDir values for the ctest/clean targets below. CMAKE_FLAGS appends extra -D options to a preset configure.
+BUILD_RELEASE_DIR  := build/Release
+BUILD_DEBUG_DIR    := build/Debug
+BUILD_SAN_DIR      := build/San
+BUILD_COVERAGE_DIR := build/Coverage
+BUILD_TYPE         ?= Release
+CMAKE_FLAGS        :=
+PYTEST_FLAGS       := -v
+CTEST_FLAGS        := --output-on-failure -LE performance
+JOBS               := $(shell nproc 2>/dev/null || echo 4)
+PYTHON_VERSION     ?=
 
 # Suppress "Entering/Leaving directory" messages from sub-makes
 MAKEFLAGS += --no-print-directory
@@ -47,31 +49,32 @@ help: ## Show this help message
 
 build: build-release ## Build project (release mode)
 
-build-release: ## Configure + build in Release mode
-	@cmake -B $(BUILD_RELEASE_DIR) -DCMAKE_BUILD_TYPE=Release $(CMAKE_FLAGS)
-	@cmake --build $(BUILD_RELEASE_DIR) -j$(JOBS)
+build-release: ## Configure + build the release preset
+	@cmake --preset release $(CMAKE_FLAGS)
+	@cmake --build --preset release -j$(JOBS)
 
-build-debug: ## Configure + build in Debug mode
-	@cmake -B $(BUILD_DEBUG_DIR) -DCMAKE_BUILD_TYPE=Debug $(CMAKE_FLAGS)
-	@cmake --build $(BUILD_DEBUG_DIR) -j$(JOBS)
+build-debug: ## Configure + build the debug preset
+	@cmake --preset debug $(CMAKE_FLAGS)
+	@cmake --build --preset debug -j$(JOBS)
 
-build-san: ## Configure + build with ASan + UBSan (-O1 overrides -Ofast)
-	@cmake -B $(BUILD_SAN_DIR) -DCMAKE_BUILD_TYPE=Debug $(CMAKE_FLAGS) \
-		-DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -O1"
-	@cmake --build $(BUILD_SAN_DIR) -j$(JOBS)
+build-san: ## Configure + build the asan preset (ASan + UBSan, -O1)
+	@cmake --preset asan $(CMAKE_FLAGS)
+	@cmake --build --preset asan -j$(JOBS)
 
-build-coverage: ## Configure + build with coverage instrumentation
-	@cmake -B $(BUILD_DEBUG_DIR) -DCMAKE_BUILD_TYPE=Debug $(CMAKE_FLAGS) -DENABLE_COVERAGE=ON
-	@cmake --build $(BUILD_DEBUG_DIR) -j$(JOBS)
+build-coverage: ## Configure + build the coverage preset
+	@cmake --preset coverage $(CMAKE_FLAGS)
+	@cmake --build --preset coverage -j$(JOBS)
 
 configure: ## Configure only; override with BUILD_TYPE=Debug
-	@cmake -B build/$(BUILD_TYPE) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) $(CMAKE_FLAGS)
+	@cmake -B build/$(BUILD_TYPE) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) -DBUILD_TESTING=ON $(CMAKE_FLAGS)
 
+# --no-project keeps uv from building alayalite itself first (an editable install runs the whole C++ build, which
+# needs these very dependencies — a bootstrap cycle on a fresh machine). The script only needs a bare interpreter.
 conan-install: ## Re-run conan install for Release (after conanfile changes)
-	@uv run python scripts/conan_build/conan_install.py --build-type Release
+	@uv run --no-project python scripts/conan_build/conan_install.py --build-type Release
 
 conan-install-debug: ## Re-run conan install for Debug
-	@uv run python scripts/conan_build/conan_install.py --build-type Debug
+	@uv run --no-project python scripts/conan_build/conan_install.py --build-type Debug
 
 # ============================================================================
 # Test
@@ -145,6 +148,7 @@ release-dry: ## Preview version bump without writing: make release-dry V=1.0.2
 
 clean: ## Remove all build directories and caches
 	@rm -rf build
+	@rm -f CMakeUserPresets.json
 	@rm -rf dist *.egg-info
 	@find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 	@find . -type d -name ".pytest_cache" -exec rm -rf {} + 2>/dev/null || true
@@ -153,8 +157,8 @@ clean: ## Remove all build directories and caches
 clean-release: ## Remove only Release build directory
 	@rm -rf $(BUILD_RELEASE_DIR)
 
-clean-debug: ## Remove only Debug/San build directories
-	@rm -rf $(BUILD_DEBUG_DIR) $(BUILD_SAN_DIR)
+clean-debug: ## Remove only Debug/San/Coverage build directories
+	@rm -rf $(BUILD_DEBUG_DIR) $(BUILD_SAN_DIR) $(BUILD_COVERAGE_DIR)
 
 clean-all: clean ## Remove build artifacts and virtualenv
 	@rm -rf .venv

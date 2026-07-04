@@ -78,6 +78,9 @@ class AlayaLiteConan(ConanFile):
 
     def generate(self):
         tc = CMakeToolchain(self)
+        # The project includes conan_toolchain.cmake itself (cmake/ConanSetup.cmake); a generated
+        # CMakeUserPresets.json would only go stale and break `cmake --preset` after `make clean`.
+        tc.user_presets_path = None
         tc.generate()
         cmake = CMakeDeps(self)
         cmake.generate()

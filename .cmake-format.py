@@ -11,6 +11,24 @@
 with section("parse"):
     # Specify structure for custom cmake functions
     additional_commands = {
+        "alaya_cc_target": {
+            "flags": ["GTEST", "LASER", "BARE"],
+            "kwargs": {"SRCS": "*", "LIBS": "*", "DEFS": "*", "OPTS": "*"},
+            "pargs": 1,
+        },
+        "alaya_add_test": {
+            "kwargs": {
+                "NAME": 1,
+                "TARGET": 1,
+                "FILTER": 1,
+                "TIMEOUT": 1,
+                "WORKING_DIRECTORY": 1,
+                "LABELS": "*",
+            },
+            "pargs": 0,
+        },
+        "alaya_apply_build_flags": {"pargs": 1},
+        "alaya_find_python": {"pargs": "*"},
         "cc_binary": {
             "flags": ["ADD_RUNTARGET"],
             "kwargs": {
@@ -286,12 +304,15 @@ with section("lint"):
     # regular expression pattern describing valid function names
     function_pattern = "[0-9a-z_]+"
 
-    # regular expression pattern describing valid macro names
-    macro_pattern = "[0-9A-Z_]+"
+    # regular expression pattern describing valid macro names. Lowercase alaya_* macros are allowed alongside the
+    # classic uppercase convention: cmake/AlayaPython.cmake must use macros (find_package results have to land in the
+    # caller's scope) and the project namespaces all its commands as lowercase alaya_*.
+    macro_pattern = "([0-9A-Z_]+|alaya_[a-z0-9_]+)"
 
     # regular expression pattern describing valid names for variables with global
-    # (cache) scope
-    global_var_pattern = "[A-Z][0-9A-Z_]+"
+    # (cache) scope. The Python_* alternative covers CMake FindPython interop variables (e.g. Python_EXECUTABLE),
+    # whose spelling is fixed by CMake.
+    global_var_pattern = "([A-Z][0-9A-Z_]+|Python_[0-9A-Za-z_]+)"
 
     # regular expression pattern describing valid names for variables with global
     # scope (but internal semantic)
@@ -306,8 +327,8 @@ with section("lint"):
     private_var_pattern = "_[0-9a-z_]+"
 
     # regular expression pattern describing valid names for public directory
-    # variables
-    public_var_pattern = "[A-Z][0-9A-Z_]+"
+    # variables (Python_* covers CMake FindPython interop, e.g. Python_FIND_VIRTUALENV)
+    public_var_pattern = "([A-Z][0-9A-Z_]+|Python_[0-9A-Za-z_]+)"
 
     # regular expression pattern describing valid names for function/macro
     # arguments and loop variables.
