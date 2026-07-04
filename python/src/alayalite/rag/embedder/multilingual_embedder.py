@@ -9,9 +9,6 @@ using multilingual models from the transformers library.
 
 from typing import List, Tuple
 
-import torch
-from transformers import AutoModel, AutoTokenizer
-
 from .base import BaseEmbedding
 
 
@@ -25,7 +22,17 @@ class MultilingualEmbedder(BaseEmbedding):
         Args:
             path (str): The model path or name for the multilingual transformer model.
         """
+        try:
+            import torch  # pylint: disable=import-outside-toplevel
+            from transformers import AutoModel, AutoTokenizer  # pylint: disable=import-outside-toplevel
+        except ImportError as exc:
+            raise ImportError(
+                "MultilingualEmbedder requires the optional RAG dependencies; "
+                "install with: pip install 'alayalite[rag]'"
+            ) from exc
+
         super().__init__(path)
+        self._torch = torch
         self.tokenizer = AutoTokenizer.from_pretrained(self.path)
         self.model = AutoModel.from_pretrained(self.path)
 
@@ -40,7 +47,7 @@ class MultilingualEmbedder(BaseEmbedding):
             Tuple[List[List[float]], int]: A tuple containing the list of embeddings and the embedding dimension.
         """
         batch_dict = self.tokenizer(texts, max_length=512, padding=True, truncation=True, return_tensors="pt")
-        with torch.no_grad():
+        with self._torch.no_grad():
             outputs = self.model(**batch_dict)
 
         attention_mask = batch_dict["attention_mask"]

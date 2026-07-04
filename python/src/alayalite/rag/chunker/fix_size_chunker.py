@@ -6,14 +6,7 @@
 This module provides the FixSizeChunker class for splitting text into fixed-size chunks.
 """
 
-import os
-import sys
-
-from langchain_text_splitters import CharacterTextSplitter
-from rag.chunker.base import BaseChunker
-
-parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-sys.path.append(parent_dir)
+from .base import BaseChunker
 
 
 class FixSizeChunker(BaseChunker):
@@ -37,6 +30,13 @@ class FixSizeChunker(BaseChunker):
         Returns:
             list: A list of text chunks.
         """
+        try:
+            from langchain_text_splitters import CharacterTextSplitter  # pylint: disable=import-outside-toplevel
+        except ImportError as exc:
+            raise ImportError(
+                "FixSizeChunker requires the optional RAG dependencies; install with: pip install 'alayalite[rag]'"
+            ) from exc
+
         text_splitter = CharacterTextSplitter(
             separator="\n",
             chunk_size=self.chunk_size,

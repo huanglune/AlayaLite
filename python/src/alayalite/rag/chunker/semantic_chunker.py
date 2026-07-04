@@ -7,17 +7,11 @@ This module provides the SemanticChunker class, which splits text based on
 semantic similarity using sentence embeddings.
 """
 
-import os
-import sys
 from typing import List
 
 import numpy as np
-from rag.chunker.base import BaseChunker
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
 
-parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-sys.path.append(parent_dir)
+from .base import BaseChunker
 
 
 class SemanticChunker(BaseChunker):
@@ -32,24 +26,31 @@ class SemanticChunker(BaseChunker):
 
     def __init__(self, model_name: str = "all-MiniLM-L6-v2", threshold: float = 0.8, window_size: int = 3):
         """Initializes the Semantic Chunker."""
+        try:
+            from sentence_transformers import SentenceTransformer  # pylint: disable=import-outside-toplevel
+        except ImportError as exc:
+            raise ImportError(
+                "SemanticChunker requires the optional RAG dependencies; install with: pip install 'alayalite[rag]'"
+            ) from exc
+
         # This class does not use the BaseChunker's __init__ as its logic is different.
         super().__init__(chunk_size=0, chunk_overlap=0)
         self.model = SentenceTransformer(model_name)
         self.threshold = threshold
         self.window_size = window_size
 
-    def chunking(self, text: str) -> List[str]:
+    def chunking(self, docs: str) -> List[str]:
         """
         Implements the semantic-aware chunking logic.
 
         Args:
-            text (str): The input text.
+            docs (str): The input text.
 
         Returns:
             List[str]: A list of chunked text blocks.
         """
         # Step 1: Basic sentence splitting
-        sentences = self._split_into_sentences(text)
+        sentences = self._split_into_sentences(docs)
 
         if not sentences:
             return []
@@ -100,8 +101,9 @@ class SemanticChunker(BaseChunker):
         prev_emb = np.mean(embeddings[prev_start : current_index + 1], axis=0)
         next_emb = np.mean(embeddings[next_start:next_end], axis=0)
 
-        # Calculate cosine similarity
-        similarity = cosine_similarity([prev_emb], [next_emb])[0][0]
+        # Calculate cosine similarity (epsilon guards the degenerate all-zero embedding)
+        denominator = np.linalg.norm(prev_emb) * np.linalg.norm(next_emb) + 1e-12
+        similarity = float(np.dot(prev_emb, next_emb) / denominator)
         return similarity < self.threshold
 
     def _encode_sentences(self, sentences: List[str]) -> np.ndarray:
