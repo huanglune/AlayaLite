@@ -5,16 +5,18 @@
 # AlayaConan.cmake - register the Conan dependency provider. Included from the top-level CMakeLists BEFORE project().
 #
 # Dependency resolution uses the official cmake-conan provider (cmake/vendor/conan_provider.cmake, pinned from
-# https://github.com/conan-io/cmake-conan @ b1593849dd84): the first find_package() triggers `conan install` with a
-# host profile derived from the actual CMake toolchain state (compiler, build type, arch, cppstd), and the generated
-# CMakeDeps config packages land under ${CMAKE_BINARY_DIR}/conan. Compared to the previous hand-rolled integration
-# this needs no toolchain-file include, no configure-time wrapper script, and no source-tree-anchored generator
-# directory — but it does require the `conan` executable (>= 2.0.5) on PATH. PEP 517 builds (uv sync / uv build /
-# cibuildwheel) get it automatically from [build-system].requires; interactive users install it once.
+# https://github.com/conan-io/cmake-conan @ b1593849dd84): the first find_package() triggers `conan install` with a host
+# profile derived from the actual CMake toolchain state (compiler, build type, arch, cppstd), and the generated
+# CMakeDeps config packages land under ${CMAKE_BINARY_DIR}/conan. Compared to the previous hand-rolled integration this
+# needs no toolchain-file include, no configure-time wrapper script, and no source-tree-anchored generator directory —
+# but it does require the `conan` executable (>= 2.0.5) on PATH. PEP 517 builds (uv sync / uv build / cibuildwheel) get
+# it automatically from [build-system].requires; interactive users install it once.
 #
 # Opt out with -DALAYA_AUTO_CONAN=OFF and provide dependencies yourself:
-#   conan install . --build=missing -s build_type=Release \
-#     && cmake -B build/manual -DALAYA_AUTO_CONAN=OFF -DCMAKE_PREFIX_PATH=<generators dir from the install output>
+# ~~~
+# conan install . --build=missing -s build_type=Release
+# cmake -B build/manual -DALAYA_AUTO_CONAN=OFF -DCMAKE_PREFIX_PATH=<generators dir from the install output>
+# ~~~
 
 include_guard(GLOBAL)
 
