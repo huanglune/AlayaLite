@@ -10,11 +10,13 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <future>
 #include <map>
 #include <memory>
 #include <random>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -84,6 +86,15 @@ class UpdateE2ETest : public ::testing::Test {
     DiskANNIndex::build(dir(), base_vecs_.data(), labels.data(), n, dim, bp);
 
     lp.updatable = true;
+    // ALAYA_DISKANN_UPDATE_IO=blocking|uring|auto lets CI exercise both update
+    // I/O backends with the same suite (default auto = uring when available).
+    if (const char *mode = std::getenv("ALAYA_DISKANN_UPDATE_IO")) {
+      if (std::string_view(mode) == "blocking") {
+        lp.update_io = alaya::diskann::DiskANNUpdateIO::kBlocking;
+      } else if (std::string_view(mode) == "uring") {
+        lp.update_io = alaya::diskann::DiskANNUpdateIO::kUring;
+      }
+    }
     idx_ = std::make_unique<DiskANNIndex>();
     idx_->load(dir(), lp);
 
@@ -582,11 +593,32 @@ TEST_F(UpdateE2ETest, ReusedSlotStaysTombstonedUntilBatchInsertPublishesIt) {
   while (!insert_started.load(std::memory_order_acquire)) {
     std::this_thread::yield();
   }
-  std::this_thread::sleep_for(std::chrono::milliseconds(5));
-  ASSERT_EQ(insert_future.wait_for(std::chrono::milliseconds(0)), std::future_status::timeout)
-      << "batch_insert must still be running while the reused slot is checked";
-  EXPECT_TRUE(idx_->is_deleted(deleted_id))
-      << "a reused slot must remain tombstoned until its new record is written and published";
+  // The tombstone is monotone for this slot while the batch runs: only the
+  // first sub-batch's publish clears it and nothing re-sets it. That makes
+  // two invariants probeable without assuming how fast the first insert
+  // publishes (a fixed sleep here loses once inserts get fast enough). The
+  // slot state is re-read AFTER each search so a publish landing mid-probe
+  // cannot fake a violation:
+  //   1. while tombstoned, the slot's new label must stay unsearchable —
+  //      a dark record is masked until written and published;
+  //   2. the tombstone never reappears once cleared.
+  bool was_live = false;
+  const DiskANNSearchParams probe_sp{/*L=*/64,
+                                     /*use_pq=*/false,
+                                     /*rerank=*/false,
+                                     /*rerank_count=*/0,
+                                     /*deterministic=*/true};
+  while (insert_future.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout) {
+    const bool found = topk_contains(nv.data(), 5, labels[0], probe_sp);
+    if (idx_->is_deleted(deleted_id)) {
+      EXPECT_FALSE(was_live) << "tombstone reappeared after the reused slot went live";
+      EXPECT_FALSE(found)
+          << "a reused slot must remain tombstoned until its new record is written and published";
+    } else {
+      was_live = true;
+    }
+    std::this_thread::yield();
+  }
 
   const std::vector<uint32_t> ids = insert_future.get();
   ASSERT_EQ(ids.size(), labels.size());

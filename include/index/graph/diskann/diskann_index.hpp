@@ -49,6 +49,7 @@
 #include "coro/thread_pool.hpp"
 #include "coro/when_all.hpp"
 #include "index/graph/diskann/beam_search.hpp"
+#include "index/graph/diskann/beam_search_async.hpp"
 #include "index/graph/diskann/disk_layout.hpp"
 #include "index/graph/diskann/disk_page_io.hpp"
 #include "index/graph/diskann/disk_update_context.hpp"
@@ -62,6 +63,8 @@
 #include "index/graph/vamana/robust_prune.hpp"
 #include "index/graph/vamana/vamana_builder.hpp"
 #include "simd/distance_l2.hpp"
+#include "storage/io/uring_reactor.hpp"
+#include "utils/coro_gate.hpp"
 
 namespace alaya::diskann {
 
@@ -90,6 +93,13 @@ struct DiskANNBuildParams {
 };
 
 /// Load-time configuration (sizes the thread-scratch pool).
+/// Update-path page-read backend.
+enum class DiskANNUpdateIO {
+  kAuto,      ///< io_uring reactor when the kernel supports it, else blocking preads
+  kUring,     ///< force the reactor; load() throws if io_uring is unavailable
+  kBlocking,  ///< pool-thread-blocking preads (the pre-reactor behavior)
+};
+
 struct DiskANNLoadParams {
   uint32_t num_threads = 4;    ///< max concurrent searches (ThreadData pool size)
   uint32_t beam_width = 4;     ///< PQ I/O beam width (PQ caps in-flight reads at this)
@@ -124,6 +134,15 @@ struct DiskANNLoadParams {
   ///< Coroutine worker count for batch_insert's outer insert concurrency.
   uint32_t update_reconnect_threads = kDefaultDiskANNUpdateReconnectThreads;
   ///< Coroutine worker count for reconnecting a single insert's pruned neighbors.
+  DiskANNUpdateIO update_io = DiskANNUpdateIO::kAuto;
+  ///< Page-read backend for the update path: with the io_uring reactor a page
+  ///< miss SUSPENDS the coroutine (the pool thread runs other inserts) instead
+  ///< of blocking in pread — Yi's tasklet behavior at plain pool sizes.
+  uint32_t update_search_concurrency = 0;
+  ///< Reactor mode only: concurrent suspended update searches (AsyncGate
+  ///< ThreadData count). Little's law sets insert throughput to this divided
+  ///< by search latency — worker threads bound CPU, this bounds in-flight
+  ///< searches (Yi: workers vs tasklets). 0 = 4x update_insert_threads.
 };
 
 /// Per-query search configuration.
@@ -349,6 +368,7 @@ class DiskANNIndex {
     scratch_config.max_degree = max_degree_;
     scratch_config.search_list_size = scratch_list_size;
     scratch_config.query_dim = dim_;
+    scratch_config_ = scratch_config;  // reused by init_updatable's gate ThreadData set
     thread_data_storage_.resize(pool);
     {
       std::vector<std::thread> regs;
@@ -660,12 +680,12 @@ class DiskANNIndex {
       validate_remove_batch(internal_ids, count);
     }
     page_io_->clear_cache();
-    std::vector<DiskPageIO::NodeData> old_nodes =
-        page_io_->read_nodes_async(internal_ids, count, pool);
+    std::vector<std::vector<uint32_t>> old_neighbors =
+        read_delete_neighbors(internal_ids, count, &pool);
     {
       std::unique_lock<std::shared_mutex> state_lock(update_mutex_);
       for (uint32_t i = 0; i < count; ++i) {
-        remove_unlocked_with_neighbors(internal_ids[i], std::move(old_nodes[i].nbrs));
+        remove_unlocked_with_neighbors(internal_ids[i], std::move(old_neighbors[i]));
       }
     }
     if (maybe_safety_net_reconnect()) {
@@ -693,7 +713,7 @@ class DiskANNIndex {
     }
     page_io_->clear_cache();
     std::vector<std::vector<uint32_t>> old_neighbors =
-        page_io_->read_neighbors_batch_parallel(internal_ids, count, update_insert_threads_);
+        read_delete_neighbors(internal_ids, count, nullptr);
     {
       std::unique_lock<std::shared_mutex> state_lock(update_mutex_);
       for (uint32_t i = 0; i < count; ++i) {
@@ -846,6 +866,47 @@ class DiskANNIndex {
     page_io_ = std::make_unique<DiskPageIO>(path(index_dir, "diskann.index"),
                                             geom_,
                                             params.page_cache_capacity);
+    update_reactor_.reset();
+    if (params.update_io != DiskANNUpdateIO::kBlocking) {
+      if (alaya::UringReactor::is_available()) {
+        update_reactor_ = std::make_unique<alaya::UringReactor>();
+        page_io_->set_reactor(update_reactor_.get());
+      } else if (params.update_io == DiskANNUpdateIO::kUring) {
+        throw std::runtime_error(
+            "DiskANNIndex::load: update_io=kUring but io_uring is unavailable");
+      }
+    }
+    page_io_->set_fallback_threads(params.update_insert_threads);
+
+#if defined(__linux__)
+    // Reactor-mode No-PQ update searches suspend on I/O waves while holding a
+    // ThreadData, so they draw from a dedicated suspending gate (AsyncGate)
+    // instead of the thread-blocking pool: with more queued insert coroutines
+    // than ThreadData objects, blocking acquisition would park every pool thread and
+    // leave no thread to run the resume that releases one (deadlock). The gate
+    // size is the in-flight-search bound — suspended searches burn memory, not
+    // CPU, so it deliberately exceeds the thread count (workers vs tasklets).
+    // These tds never issue libaio reads — no reader thread registration, so
+    // they cost no fs.aio-max-nr quota.
+    update_search_td_gate_.clear();
+    update_search_async_ = false;
+    if (update_reactor_ && reader_ && reader_->get_fd() >= 0) {
+      const uint32_t gate_tds = params.update_search_concurrency != 0
+                                    ? params.update_search_concurrency
+                                    : 4 * params.update_insert_threads;
+      const size_t base = thread_data_storage_.size();
+      thread_data_storage_.resize(base + gate_tds);
+      for (uint32_t t = 0; t < gate_tds; ++t) {
+        auto td = std::make_unique<ThreadData>();
+        td->alloc_scratch(scratch_config_);
+        td->ensure_wave_scratch(static_cast<uint64_t>(std::max<uint32_t>(1, max_degree_)) *
+                                geom_.page_size);
+        update_search_td_gate_.add(td.get());
+        thread_data_storage_[base + t] = std::move(td);
+      }
+      update_search_async_ = true;
+    }
+#endif
 
     const std::string slots_path = path(index_dir, "slots.bin");
     if (std::filesystem::exists(slots_path)) {
@@ -893,6 +954,111 @@ class DiskANNIndex {
     return results;
   }
 
+  /// run_update_search with the disk reads awaitable (No-PQ + reactor only):
+  /// the greedy search suspends on reactor waves instead of parking the pool
+  /// thread in io_getevents. Falls back to the sync search otherwise.
+  coro::task<std::vector<std::pair<uint32_t, float>>>
+  run_update_search_async(const float *query, uint32_t l, coro::thread_pool &pool) {
+#if defined(__linux__)
+    if (update_search_async_) {
+      const SearchSnapshot snapshot = make_search_snapshot();
+      auto mark = std::chrono::steady_clock::now();
+      // Suspending acquisition — see the gate comment in init_updatable().
+      ThreadData *td = co_await update_search_td_gate_.acquire(pool);
+      st_gate_us_.fetch_add(stage_us_since(mark), std::memory_order_relaxed);
+      std::vector<std::pair<uint32_t, float>> results;
+      try {
+        td->resize_slot_capacity(snapshot.max_slot_id);
+        SearchContext ctx;
+        ctx.reader = reader_.get();
+        ctx.geom = &geom_;
+        ctx.cache = &cache_;
+        ctx.pq = has_pq_ ? &pq_ : nullptr;
+        ctx.medoid = medoid_;
+        ctx.num_points = snapshot.max_slot_id;
+        ctx.tombstone = &snapshot.tombstone;
+        SearchParams sp;
+        sp.search_list_size = l;
+        sp.beam_width = beam_width_;
+        sp.use_pq = has_pq_;
+        sp.rerank = false;
+        // No pq_mutex_ here (a shared_mutex cannot be released on a different
+        // thread than locked it): safe because concurrent encode_pq_slot only
+        // writes codes of still-dark slots, all masked by snapshot.tombstone —
+        // see the note on pq_beam_search_async.
+        if (has_pq_) {
+          results = co_await pq_beam_search_async(ctx,
+                                                  query,
+                                                  l,
+                                                  sp,
+                                                  *td,
+                                                  nullptr,
+                                                  *update_reactor_,
+                                                  pool,
+                                                  reader_->get_fd(),
+                                                  page_io_.get());
+        } else {
+          results = co_await disk_greedy_search_async(ctx,
+                                                      query,
+                                                      l,
+                                                      sp,
+                                                      *td,
+                                                      nullptr,
+                                                      *update_reactor_,
+                                                      pool,
+                                                      reader_->get_fd(),
+                                                      page_io_.get());
+        }
+        st_greedy_us_.fetch_add(stage_us_since(mark), std::memory_order_relaxed);
+      } catch (...) {
+        update_search_td_gate_.release(td);
+        throw;
+      }
+      update_search_td_gate_.release(td);
+      co_return results;
+    }
+#endif
+    co_return run_update_search(query, l);
+  }
+
+ public:
+  /// Wall-microseconds by update stage, aggregated across coroutines since the
+  /// last take (wall, not CPU: a stage that yields through the pool queue books
+  /// its scheduling latency here — that is the point of measuring it).
+  struct UpdateStageStats {
+    uint64_t gate_us = 0;         ///< waiting for a search ThreadData
+    uint64_t greedy_us = 0;       ///< async greedy search proper
+    uint64_t search_us = 0;       ///< whole selection stage (incl. gate+greedy)
+    uint64_t alloc_us = 0;        ///< slot alloc + PQ encode
+    uint64_t prefetch_us = 0;     ///< slot page warm wave
+    uint64_t write_us = 0;        ///< write_inserted_node + publish + staging
+    uint64_t reconnect_us = 0;    ///< when_all over the insert's reconnects
+    uint64_t rc_prefetch_us = 0;  ///< reconnect input warm waves
+    uint64_t rc_lock_us = 0;      ///< node mutex acquisition wait
+    uint64_t rc_impl_us = 0;      ///< sync update_node_impl body
+    uint64_t inserts = 0;
+    uint64_t reconnects = 0;
+  };
+
+  /// Snapshot-and-reset the stage stats (benchmark instrumentation).
+  UpdateStageStats take_update_stage_stats() {
+    UpdateStageStats out;
+    out.gate_us = st_gate_us_.exchange(0, std::memory_order_acq_rel);
+    out.greedy_us = st_greedy_us_.exchange(0, std::memory_order_acq_rel);
+    out.search_us = st_search_us_.exchange(0, std::memory_order_acq_rel);
+    out.alloc_us = st_alloc_us_.exchange(0, std::memory_order_acq_rel);
+    out.prefetch_us = st_prefetch_us_.exchange(0, std::memory_order_acq_rel);
+    out.write_us = st_write_us_.exchange(0, std::memory_order_acq_rel);
+    out.reconnect_us = st_reconnect_us_.exchange(0, std::memory_order_acq_rel);
+    out.rc_prefetch_us = st_rc_prefetch_us_.exchange(0, std::memory_order_acq_rel);
+    out.rc_lock_us = st_rc_lock_us_.exchange(0, std::memory_order_acq_rel);
+    out.rc_impl_us = st_rc_impl_us_.exchange(0, std::memory_order_acq_rel);
+    out.inserts = st_inserts_.exchange(0, std::memory_order_acq_rel);
+    out.reconnects = st_reconnects_.exchange(0, std::memory_order_acq_rel);
+    return out;
+  }
+
+ private:
   /// Cached L2 distance between two nodes via the page IO coords cache.
   float cached_l2(uint32_t a, uint32_t b) {
     const auto l2 = alaya::simd::get_l2_sqr_func();
@@ -931,8 +1097,9 @@ class DiskANNIndex {
     return l2(query, coords.data(), dim_);
   }
 
-  std::vector<uint32_t> select_insert_neighbors_exact(const float *query) {
-    auto cand = run_update_search(query, update_search_l_);
+  std::vector<uint32_t> select_insert_neighbors_exact(
+      const float *query,
+      std::vector<std::pair<uint32_t, float>> cand) {
     if (update_insert_prune_) {
       std::vector<alaya::vamana::Neighbor> pool;
       pool.reserve(cand.size());
@@ -958,8 +1125,8 @@ class DiskANNIndex {
     return out;
   }
 
-  std::vector<uint32_t> select_insert_neighbors_pq(const float *query) {
-    auto cand = run_update_search(query, update_search_l_);
+  std::vector<uint32_t> select_insert_neighbors_pq(const float *query,
+                                                   std::vector<std::pair<uint32_t, float>> cand) {
     std::vector<uint8_t> query_code(pq_n_chunks_);
     pq_.encode_to_code(query, query_code.data());
     if (update_insert_prune_) {
@@ -1002,11 +1169,52 @@ class DiskANNIndex {
     return out;
   }
 
-  std::vector<uint32_t> select_insert_neighbors(const float *query) {
+  std::vector<uint32_t> select_insert_neighbors_from(const float *query,
+                                                     std::vector<std::pair<uint32_t, float>> cand) {
     if (has_pq_) {
-      return select_insert_neighbors_pq(query);
+      return select_insert_neighbors_pq(query, std::move(cand));
     }
-    return select_insert_neighbors_exact(query);
+    return select_insert_neighbors_exact(query, std::move(cand));
+  }
+
+  /// Which insert-selection variants do exact-coords distance work (and thus
+  /// profit from a coords prefetch wave)?
+  [[nodiscard]] bool insert_selection_needs_coords() const {
+    if (has_pq_) {
+      // The rerank loop calls exact_query_distance per candidate.
+      return !update_insert_prune_ && update_rerank_;
+    }
+    // No-PQ prune scores with cached_l2; the no-prune path reuses the exact
+    // search distances and reads nothing.
+    return update_insert_prune_;
+  }
+
+  /// select_insert_neighbors with the disk work made awaitable: the candidate
+  /// coords the selection will score are wave-prefetched through the reactor
+  /// (one suspension, all misses in flight together) before the sync selection
+  /// logic runs against warm caches.
+  coro::task<std::vector<uint32_t>> select_insert_neighbors_async(const float *query,
+                                                                  coro::thread_pool &pool) {
+    auto cand = co_await run_update_search_async(query, update_search_l_, pool);
+    if (page_io_->reactor_enabled() && insert_selection_needs_coords() && !cand.empty()) {
+      std::vector<uint32_t> want;
+      want.reserve(cand.size());
+      for (const auto &c : cand) {
+        // exact_query_distance (PQ rerank) is served by the NodeCache first;
+        // cached_l2 (No-PQ prune) always goes through the coords cache.
+        if (!has_pq_ || !cache_.lookup_record(c.first)) {
+          want.push_back(c.first);
+        }
+      }
+      if (!want.empty()) {
+        co_await page_io_->prefetch_coords(want.data(), want.size(), pool);
+      }
+    }
+    co_return select_insert_neighbors_from(query, std::move(cand));
+  }
+
+  std::vector<uint32_t> select_insert_neighbors(const float *query) {
+    return select_insert_neighbors_from(query, run_update_search(query, update_search_l_));
   }
 
   uint32_t allocate_update_slot_unlocked(uint64_t label) {
@@ -1086,6 +1294,27 @@ class DiskANNIndex {
     remove_unlocked_with_neighbors(internal_id, nd.nbrs);
   }
 
+  /// Neighbor lists of a delete batch. With the reactor this is one wave of
+  /// concurrent io_uring reads over the batch's unique pages (a single
+  /// suspension); without it, the blocking std::thread reader.
+  std::vector<std::vector<uint32_t>> read_delete_neighbors(const uint32_t *internal_ids,
+                                                           uint32_t count,
+                                                           coro::thread_pool *pool) {
+    if (page_io_->reactor_enabled() && count > 1) {
+      if (pool != nullptr) {
+        return coro::sync_wait(page_io_->read_neighbors_batch_async(internal_ids, count, *pool));
+      }
+      coro::thread_pool wave_pool{{.thread_count = 1,
+                                   .on_thread_start_functor = nullptr,
+                                   .on_thread_stop_functor = nullptr}};
+      auto out =
+          coro::sync_wait(page_io_->read_neighbors_batch_async(internal_ids, count, wave_pool));
+      wave_pool.shutdown();
+      return out;
+    }
+    return page_io_->read_neighbors_batch_parallel(internal_ids, count, update_insert_threads_);
+  }
+
   void remove_unlocked_with_neighbors(uint32_t internal_id, std::vector<uint32_t> old_neighbors) {
     update_ctx_.removed_node_nbrs_[internal_id] = std::move(old_neighbors);
     slot_alloc_.free(internal_id);
@@ -1143,33 +1372,64 @@ class DiskANNIndex {
 
     auto reconnect_one = [this, &pool, &staged](uint32_t node_id) -> coro::task<> {
       co_await pool.schedule();
+      auto mark = std::chrono::steady_clock::now();
       const std::vector<uint32_t> extra = staged.drain(node_id);
+      // The insert already warmed every selected node's page in ONE wave (see
+      // insert_one); per-reconnect work here is No-PQ only — deriving the
+      // candidate set (from the now-cached page) and waving candidate COORDS
+      // in before the prune. PQ scores in memory: nothing left to warm, and
+      // skipping the call avoids 1 page copy + a dead derivation per edge.
+      if (!has_pq_) {
+        co_await prefetch_reconnect_inputs(node_id, extra, pool);
+      }
+      st_rc_prefetch_us_.fetch_add(stage_us_since(mark), std::memory_order_relaxed);
       std::lock_guard<std::mutex> node_lock(update_node_mutex(node_id));
+      st_rc_lock_us_.fetch_add(stage_us_since(mark), std::memory_order_relaxed);
       update_node_impl(node_id, extra);
+      st_rc_impl_us_.fetch_add(stage_us_since(mark), std::memory_order_relaxed);
+      st_reconnects_.fetch_add(1, std::memory_order_relaxed);
     };
 
     auto insert_one =
         [this, &pool, &staged, &reconnect_one, vectors, labels, &ids](uint32_t i) -> coro::task<> {
       co_await pool.schedule();
+      auto mark = std::chrono::steady_clock::now();
       const float *vec = vectors + static_cast<uint64_t>(i) * dim_;
-      const std::vector<uint32_t> selected = select_insert_neighbors(vec);
+      const std::vector<uint32_t> selected = co_await select_insert_neighbors_async(vec, pool);
+      st_search_us_.fetch_add(stage_us_since(mark), std::memory_order_relaxed);
       {
         std::unique_lock<std::shared_mutex> state_lock(update_mutex_);
         std::lock_guard<std::mutex> slot_lock(slot_mutex_);
         ids[i] = allocate_update_slot_unlocked(labels[i]);
       }
       encode_pq_slot(vec, ids[i]);
+      st_alloc_us_.fetch_add(stage_us_since(mark), std::memory_order_relaxed);
+      if (page_io_->reactor_enabled()) {
+        // ONE wave warms every page this insert will RMW: the slot's own page
+        // (written below) plus all selected neighbors' pages (their reconnects
+        // read-modify-write them right after). One suspension instead of a
+        // wave per reconnect — the per-edge waves were the dominant queue load.
+        std::vector<uint32_t> warm;
+        warm.reserve(selected.size() + 1);
+        warm.push_back(ids[i]);
+        warm.insert(warm.end(), selected.begin(), selected.end());
+        co_await page_io_->prefetch_pages(warm.data(), warm.size(), pool);
+      }
+      st_prefetch_us_.fetch_add(stage_us_since(mark), std::memory_order_relaxed);
       write_inserted_node(ids[i], vec, selected);
       publish_slots(&ids[i], &ids[i] + 1);
       for (const uint32_t n : selected) {
         staged.add(n, ids[i]);
       }
+      st_write_us_.fetch_add(stage_us_since(mark), std::memory_order_relaxed);
       std::vector<coro::task<>> reconnects;
       reconnects.reserve(selected.size());
       for (const uint32_t n : selected) {
         reconnects.emplace_back(reconnect_one(n));
       }
       co_await coro::when_all(std::move(reconnects));
+      st_reconnect_us_.fetch_add(stage_us_since(mark), std::memory_order_relaxed);
+      st_inserts_.fetch_add(1, std::memory_order_relaxed);
     };
 
     for (uint32_t off = 0; off < count; off += batch_size) {
@@ -1373,6 +1633,69 @@ class DiskANNIndex {
     update_node_impl(node_id, extra_edges);
   }
 
+  /// Warm every page a reconnect of @p node_id will touch, with suspending
+  /// reactor reads, BEFORE the caller takes the per-node mutex: the node's own
+  /// page (read + rewritten in place) and — when the candidate pool will
+  /// overflow into distance work — the candidate coords. The sync reconnect
+  /// body re-derives everything under the lock; a page evicted in between just
+  /// falls back to the blocking pread it does today, so slight staleness here
+  /// costs latency, never correctness.
+  coro::task<> prefetch_reconnect_inputs(uint32_t node_id,
+                                         const std::vector<uint32_t> &extra_edges,
+                                         coro::thread_pool &pool) {
+    if (!page_io_->reactor_enabled()) {
+      co_return;
+    }
+    const DiskPageIO::NodeData nd = co_await page_io_->read_node_async(node_id, pool);
+    // Mirror update_node_impl_from_snapshot's candidate derivation.
+    std::vector<uint32_t> cand;
+    cand.reserve(extra_edges.size() + nd.nbrs.size() + 1);
+    std::unordered_set<uint32_t> seen;
+    const auto push = [&](uint32_t v) {
+      if (v != node_id && !slot_alloc_.is_deleted(v) && seen.insert(v).second) {
+        cand.push_back(v);
+      }
+    };
+    for (const uint32_t e : extra_edges) {
+      push(e);
+    }
+    const auto &removed_node_nbrs = update_ctx_.removed_node_nbrs_;
+    for (const uint32_t nbr : nd.nbrs) {
+      if (nbr == node_id) {
+        continue;
+      }
+      if (!slot_alloc_.is_deleted(nbr)) {
+        push(nbr);
+        continue;
+      }
+      const auto it = removed_node_nbrs.find(nbr);
+      if (it == removed_node_nbrs.end()) {
+        continue;
+      }
+      uint32_t pulled = 0;
+      for (const uint32_t o : it->second) {
+        if (o == node_id || slot_alloc_.is_deleted(o)) {
+          continue;
+        }
+        push(o);
+        if (++pulled == kTwoHopBypassPerDeleted) {
+          break;
+        }
+      }
+    }
+    if (cand.size() <= max_degree_) {
+      co_return;  // fast path keeps the pool verbatim — no distance reads at all
+    }
+    if (!has_pq_) {
+      // score_candidates reads self + candidate coords through the coords cache.
+      // (PQ mode scores in memory; its only coords read — mirror_neighbors_to_cache
+      // on a NodeCache miss — is served by the node page warmed above.)
+      cand.push_back(node_id);
+      co_await page_io_->prefetch_coords(cand.data(), cand.size(), pool);
+    }
+    co_return;
+  }
+
   void update_node_impl_for_insert(uint32_t node_id, uint32_t inserted_slot) {
     const std::vector<uint32_t> extra_edges{inserted_slot};
     update_node_impl_locked(node_id, extra_edges);
@@ -1393,9 +1716,19 @@ class DiskANNIndex {
                             .on_thread_stop_functor = nullptr}};
     auto reconnect_one = [this, &pool, slot](uint32_t node_id) -> coro::task<> {
       co_await pool.schedule();
-      update_node_impl_for_insert(node_id, slot);
+      const std::vector<uint32_t> extra_edges{slot};
+      // Node pages were warmed by the batch wave in run() below; No-PQ still
+      // derives + waves candidate coords per node (see batch reconnect_one).
+      if (!has_pq_) {
+        co_await prefetch_reconnect_inputs(node_id, extra_edges, pool);
+      }
+      std::lock_guard<std::mutex> node_lock(update_node_mutex(node_id));
+      update_node_impl(node_id, extra_edges);
     };
     auto run = [&]() -> coro::task<> {
+      if (page_io_->reactor_enabled() && !neighbors.empty()) {
+        co_await page_io_->prefetch_pages(neighbors.data(), neighbors.size(), pool);
+      }
       std::vector<coro::task<>> tasks;
       tasks.reserve(neighbors.size());
       for (const uint32_t node_id : neighbors) {
@@ -1508,6 +1841,10 @@ class DiskANNIndex {
       reader_->close();
       reader_->deregister_all_threads();
     }
+    // Gate holds raw pointers into thread_data_storage_: drop them before the
+    // storage goes away. Updates are quiesced here, so no waiter is parked.
+    update_search_td_gate_.clear();
+    update_search_async_ = false;
     for (auto &td : thread_data_storage_) {
       if (td) {
         td->free_scratch();
@@ -1518,6 +1855,7 @@ class DiskANNIndex {
     }
     reader_.reset();
     page_io_.reset();
+    update_reactor_.reset();  // after page_io_: it holds a raw pointer to the reactor
     update_ctx_.clear();
     updatable_ = false;
     loaded_ = false;
@@ -1648,12 +1986,17 @@ class DiskANNIndex {
   // thread-scratch pool
   std::vector<std::unique_ptr<ThreadData>> thread_data_storage_;
   mutable ::ConcurrentQueue<ThreadData *> thread_data_pool_{nullptr};
+  ThreadDataScratchConfig scratch_config_;              ///< saved at load for the gate tds
+  alaya::AsyncGate<ThreadData> update_search_td_gate_;  ///< reactor-mode update searches
+  bool update_search_async_ = false;                    ///< No-PQ + reactor + O_DIRECT fd available
 
   // in-place update state (active only when updatable_)
   bool updatable_ = false;
   uint64_t max_slot_id_ = 0;  ///< file capacity in slots (valid-id bound; only grows)
   uint64_t live_count_ = 0;   ///< live (non-tombstoned) vector count
   std::string index_dir_;     ///< saved at load for flush() output paths
+  std::unique_ptr<alaya::UringReactor> update_reactor_;  ///< declared before page_io_ so the
+                                                         ///< page IO (raw-pointer user) dies first
   std::unique_ptr<DiskPageIO> page_io_;
   SlotAllocator slot_alloc_;
   DiskUpdateContext update_ctx_;
@@ -1672,6 +2015,27 @@ class DiskANNIndex {
   uint64_t safety_net_ops_ = 16;
   uint32_t update_insert_threads_ = kDefaultDiskANNUpdateInsertThreads;
   uint32_t update_reconnect_threads_ = kDefaultDiskANNUpdateReconnectThreads;
+
+  // update-stage instrumentation (see UpdateStageStats)
+  std::atomic<uint64_t> st_gate_us_{0};
+  std::atomic<uint64_t> st_greedy_us_{0};
+  std::atomic<uint64_t> st_search_us_{0};
+  std::atomic<uint64_t> st_alloc_us_{0};
+  std::atomic<uint64_t> st_prefetch_us_{0};
+  std::atomic<uint64_t> st_write_us_{0};
+  std::atomic<uint64_t> st_reconnect_us_{0};
+  std::atomic<uint64_t> st_rc_prefetch_us_{0};
+  std::atomic<uint64_t> st_rc_lock_us_{0};
+  std::atomic<uint64_t> st_rc_impl_us_{0};
+  std::atomic<uint64_t> st_inserts_{0};
+  std::atomic<uint64_t> st_reconnects_{0};
+
+  static uint64_t stage_us_since(std::chrono::steady_clock::time_point &mark) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(now - mark).count();
+    mark = now;
+    return static_cast<uint64_t>(us);
+  }
 };
 
 }  // namespace alaya::diskann

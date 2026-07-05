@@ -92,6 +92,11 @@ struct ThreadData {
                                    ///< depth equals the slot count (PQ caps in-flight at
                                    ///< beam_width, so it ignores the surplus).
   uint64_t sector_scratch_bytes = 0;
+  char *wave_scratch = nullptr;  ///< Reactor wave buffer for the async update search
+                                 ///< (one page per neighbor of an expansion). Kept apart
+                                 ///< from sector_scratch so the sync pipelines' depth —
+                                 ///< which equals the sector slot count — is untouched.
+  uint64_t wave_scratch_bytes = 0;
   IOContext ctx_{};  ///< AIO context (owned via reader.register_thread())
 
   void resize_slot_capacity(uint64_t max_slot_id) {
@@ -141,6 +146,21 @@ struct ThreadData {
     free_page_slots.reserve(config.n_page_slots);
     rerank_reqs.resize(1);
     reset_neighbors();
+  }
+
+  /// Grow the wave buffer to at least @p bytes (sector-aligned; contents lost).
+  void ensure_wave_scratch(uint64_t bytes) {
+    if (wave_scratch_bytes >= bytes) {
+      return;
+    }
+    if (wave_scratch != nullptr) {
+      alaya::laser::memory::align_free(wave_scratch);
+      wave_scratch = nullptr;
+      wave_scratch_bytes = 0;
+    }
+    wave_scratch =
+        reinterpret_cast<char *>(alaya::laser::memory::align_allocate<kSectorLen>(bytes));
+    wave_scratch_bytes = bytes;
   }
 
   void set_exact_dist(uint32_t id, float distance) {
@@ -243,6 +263,11 @@ struct ThreadData {
       sector_scratch = nullptr;
     }
     sector_scratch_bytes = 0;
+    if (wave_scratch != nullptr) {
+      alaya::laser::memory::align_free(wave_scratch);
+      wave_scratch = nullptr;
+    }
+    wave_scratch_bytes = 0;
   }
 
  private:

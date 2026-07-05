@@ -118,6 +118,8 @@ struct Options {
   uint32_t mixed_sleep_ms = 5000;
   double cache_ratio = kDefaultBenchmarkCacheRatio;
   uint64_t page_cache_capacity = kDefaultBenchmarkPageCachePages;
+  alaya::diskann::DiskANNUpdateIO update_io = alaya::diskann::DiskANNUpdateIO::kAuto;
+  uint32_t update_search_concurrency = 0;  // 0 = library default (4x insert threads)
 };
 
 DatasetFiles resolve_dataset_files(const std::filesystem::path &data_dir) {
@@ -328,6 +330,19 @@ Options parse_args(int argc, char **argv) {
       opt.search_threads = std::max<uint32_t>(1, parse_u32(argv[++i], "--threads"));
     } else if (arg == "--insert_batch" && i + 1 < argc) {
       opt.insert_batch = std::max<uint32_t>(1, parse_u32(argv[++i], "--insert_batch"));
+    } else if (arg == "--update_io" && i + 1 < argc) {
+      const std::string mode = argv[++i];
+      if (mode == "auto") {
+        opt.update_io = alaya::diskann::DiskANNUpdateIO::kAuto;
+      } else if (mode == "uring") {
+        opt.update_io = alaya::diskann::DiskANNUpdateIO::kUring;
+      } else if (mode == "blocking") {
+        opt.update_io = alaya::diskann::DiskANNUpdateIO::kBlocking;
+      } else {
+        throw std::invalid_argument("--update_io expects auto|uring|blocking");
+      }
+    } else if (arg == "--update_search_concurrency" && i + 1 < argc) {
+      opt.update_search_concurrency = parse_u32(argv[++i], "--update_search_concurrency");
     } else if (arg == "--update_insert_threads" && i + 1 < argc) {
       opt.update_insert_threads =
           std::max<uint32_t>(1, parse_u32(argv[++i], "--update_insert_threads"));
@@ -918,6 +933,8 @@ int main(int argc, char **argv) {
     lp.update_insert_threads = opt.update_insert_threads;
     lp.update_reconnect_threads = opt.update_reconnect_threads;
     lp.page_cache_capacity = opt.page_cache_capacity;
+    lp.update_io = opt.update_io;
+    lp.update_search_concurrency = opt.update_search_concurrency;
     DiskANNIndex idx;
     idx.load(opt.index_dir, lp);
 
@@ -1027,6 +1044,21 @@ int main(int argc, char **argv) {
         const double delete_ms = std::chrono::duration<double, std::milli>(t_delete - t0).count();
         const double insert_ms =
             std::chrono::duration<double, std::milli>(t_insert - t_delete).count();
+        const auto stg = idx.take_update_stage_stats();
+        if (stg.inserts > 0) {
+          const auto per = [&](uint64_t us) {
+            return static_cast<double>(us) / 1000.0 / static_cast<double>(stg.inserts);
+          };
+          std::cout << "[stage per-insert ms] gate=" << per(stg.gate_us)
+                    << " greedy=" << per(stg.greedy_us) << " search=" << per(stg.search_us)
+                    << " alloc=" << per(stg.alloc_us) << " prefetch=" << per(stg.prefetch_us)
+                    << " write=" << per(stg.write_us) << " reconnect=" << per(stg.reconnect_us)
+                    << " | rc(prefetch=" << per(stg.rc_prefetch_us)
+                    << " lock=" << per(stg.rc_lock_us) << " impl=" << per(stg.rc_impl_us)
+                    << ") reconnects/insert="
+                    << static_cast<double>(stg.reconnects) / static_cast<double>(stg.inserts)
+                    << "\n";
+        }
         const size_t round_updates = round.deletes.size() + round.inserts.size();
         const double update_qps =
             round_updates > 0 ? static_cast<double>(round_updates) / (update_ms / 1000.0) : 0.0;

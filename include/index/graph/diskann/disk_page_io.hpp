@@ -39,6 +39,8 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "coro/sync_wait.hpp"
@@ -54,6 +56,7 @@
 #include "index/graph/diskann/disk_layout.hpp"
 #include "index/graph/diskann/disk_page_cache.hpp"
 #include "index/graph/laser/utils/memory.hpp"
+#include "storage/io/uring_reactor.hpp"
 
 namespace alaya::diskann {
 
@@ -105,10 +108,124 @@ class DiskPageIO {
     return node_from_page(shard.page_buf, id);
   }
 
-  /// Awaitable single-node read. The blocking O_DIRECT pread is executed on @p pool.
+  /// Attach a UringReactor: page misses in the awaitable paths become
+  /// suspending io_uring reads instead of pool-thread-blocking preads.
+  /// nullptr (default) keeps every path on blocking pread.
+  void set_reactor(UringReactor *reactor) {
+#if defined(__linux__)
+    reactor_ = reactor;
+#else
+    (void)reactor;
+#endif
+  }
+
+  [[nodiscard]] bool reactor_enabled() const {
+#if defined(__linux__)
+    return reactor_ != nullptr;
+#else
+    return false;
+#endif
+  }
+
+  /// Awaitable single-node read. With a reactor the miss suspends on io_uring;
+  /// otherwise the blocking O_DIRECT pread executes on @p pool.
   coro::task<NodeData> read_node_async(uint32_t id, coro::thread_pool &pool) {
+#if defined(__linux__)
+    if (reactor_ != nullptr) {
+      co_return co_await read_node_reactor(id, pool);
+    }
+#endif
     co_await pool.schedule();
     co_return read_node_with_private_page(id);
+  }
+
+  /// Wave-prefetch the coords of [ids, ids+count) into the transient coords
+  /// cache: pages missing from the shard caches are read CONCURRENTLY through
+  /// the reactor with a single suspension. Afterwards read_coords_cached() (and
+  /// the sync helpers built on it) are memory hits for these ids. Ids already
+  /// cached are skipped; without a reactor this is a no-op (callers fall back
+  /// to the lazy blocking reads they do today).
+  coro::task<> prefetch_coords(const uint32_t *ids, size_t count, coro::thread_pool &pool) {
+#if defined(__linux__)
+    if (reactor_ == nullptr || count == 0) {
+      co_return;
+    }
+    std::vector<uint32_t> missing;
+    missing.reserve(count);
+    {
+      std::unordered_set<uint32_t> seen;
+      seen.reserve(count);
+      std::lock_guard<std::mutex> vec_lock(vec_mutex_);
+      for (size_t i = 0; i < count; ++i) {
+        const uint32_t id = ids[i];
+        if (seen.insert(id).second && vec_cache_.find(id) == vec_cache_.end()) {
+          missing.push_back(id);
+        }
+      }
+    }
+    if (!missing.empty()) {
+      co_await wave_load_pages(missing,
+                               pool,
+                               /*skip_beyond_eof=*/false,
+                               [this](uint64_t /*off*/,
+                                      const char *page,
+                                      const std::vector<uint32_t> &page_ids) {
+                                 std::vector<std::pair<uint32_t, std::vector<float>>> decoded;
+                                 decoded.reserve(page_ids.size());
+                                 for (const uint32_t id : page_ids) {
+                                   const NodeRecordView view{page + geom_.offset_to_node(id),
+                                                             geom_.dim};
+                                   decoded.emplace_back(id,
+                                                        std::vector<float>(view.coords(),
+                                                                           view.coords() +
+                                                                               geom_.dim));
+                                 }
+                                 std::lock_guard<std::mutex> vec_lock(vec_mutex_);
+                                 for (auto &kv : decoded) {
+                                   vec_cache_.emplace(kv.first, std::move(kv.second));
+                                 }
+                               });
+    }
+#else
+    (void)ids;
+    (void)count;
+    (void)pool;
+#endif
+    co_return;
+  }
+
+  /// Wave-warm the shard page caches with the pages holding [ids, ids+count)
+  /// so an upcoming read-modify-write hits memory instead of a blocking pread
+  /// under the shard mutex. Pages beyond EOF (fresh append slots) are skipped —
+  /// the write path zero-fills those without reading. No-op without a reactor.
+  coro::task<> prefetch_pages(const uint32_t *ids, size_t count, coro::thread_pool &pool) {
+#if defined(__linux__)
+    if (reactor_ == nullptr || count == 0) {
+      co_return;
+    }
+    std::vector<uint32_t> unique_ids;
+    unique_ids.reserve(count);
+    {
+      std::unordered_set<uint64_t> seen_pages;
+      seen_pages.reserve(count);
+      for (size_t i = 0; i < count; ++i) {
+        if (seen_pages.insert(geom_.get_page_offset(ids[i])).second) {
+          unique_ids.push_back(ids[i]);
+        }
+      }
+    }
+    co_await wave_load_pages(unique_ids,
+                             pool,
+                             /*skip_beyond_eof=*/true,
+                             [](uint64_t /*off*/,
+                                const char * /*page*/,
+                                const std::vector<uint32_t> & /*page_ids*/) {});
+#else
+    (void)ids;
+    (void)count;
+    (void)pool;
+#endif
+    co_return;
   }
 
   /// Read multiple node records using coroutine tasks over private page buffers.
@@ -248,6 +365,47 @@ class DiskPageIO {
     (void)threads;
     return read_neighbors_batch(ids, count);
 #endif
+  }
+
+  /// Reactor variant of read_neighbors_batch_parallel: one wave of concurrent
+  /// io_uring reads over the unique pages (single suspension) instead of a
+  /// std::thread pool of blocking preads. Callers must serialize against writes,
+  /// exactly like the parallel variant.
+  coro::task<std::vector<std::vector<uint32_t>>>
+  read_neighbors_batch_async(const uint32_t *ids, uint32_t count, coro::thread_pool &pool) {
+#if defined(__linux__)
+    if (reactor_ != nullptr && count > 1) {
+      std::vector<std::vector<uint32_t>> out(count);
+      std::vector<uint32_t> unique_ids;
+      std::unordered_map<uint64_t, std::vector<uint32_t>> page_positions;
+      page_positions.reserve(count);
+      for (uint32_t i = 0; i < count; ++i) {
+        auto [it, fresh] = page_positions.try_emplace(geom_.get_page_offset(ids[i]));
+        if (fresh) {
+          unique_ids.push_back(ids[i]);
+        }
+        it->second.push_back(i);
+      }
+      co_await wave_load_pages(unique_ids,
+                               pool,
+                               /*skip_beyond_eof=*/false,
+                               [&](uint64_t page_off,
+                                   const char *page,
+                                   const std::vector<uint32_t> & /*page_ids*/) {
+                                 for (const uint32_t pos : page_positions.at(page_off)) {
+                                   out[pos] = neighbors_from_page(page, ids[pos]);
+                                 }
+                               });
+      co_return out;
+    }
+#endif
+    co_await pool.schedule();
+    co_return read_neighbors_batch_parallel(ids, count, update_fallback_threads_);
+  }
+
+  /// Thread count used by the blocking fallback of read_neighbors_batch_async.
+  void set_fallback_threads(uint32_t threads) {
+    update_fallback_threads_ = std::max<uint32_t>(1, threads);
   }
 
   /// Write a complete node record `[coords | n_nbrs | nbr_ids]`. Read-modify-write
@@ -415,6 +573,161 @@ class DiskPageIO {
     return groups;
   }
 
+#if defined(__linux__)
+  /// Load the pages of the (unique-id) list @p ids with one reactor wave.
+  /// Cached pages are consumed immediately without I/O; misses are read
+  /// CONCURRENTLY with a single suspension, version-reconciled, installed into
+  /// the shard caches, then consumed. @p consume runs OUTSIDE shard locks with
+  /// (page_offset, page_bytes, ids_of_this_page).
+  template <typename PageConsumer>
+  coro::task<> wave_load_pages(const std::vector<uint32_t> &ids,
+                               coro::thread_pool &pool,
+                               bool skip_beyond_eof,
+                               PageConsumer &&consume) {
+    struct PageWork {
+      uint64_t off = 0;
+      std::vector<uint32_t> ids;
+      uint64_t version = 0;
+      char *buf = nullptr;
+    };
+    std::vector<PageWork> pages;
+    {
+      std::unordered_map<uint64_t, size_t> index_of;
+      index_of.reserve(ids.size());
+      for (const uint32_t id : ids) {
+        const uint64_t off = geom_.get_page_offset(id);
+        if (skip_beyond_eof && off + geom_.page_size > file_size_.load(std::memory_order_acquire)) {
+          continue;  // fresh append page: the write path zero-fills it, nothing to read
+        }
+        auto [it, fresh] = index_of.try_emplace(off, pages.size());
+        if (fresh) {
+          pages.push_back(PageWork{off, {}, 0, nullptr});
+        }
+        pages[it->second].ids.push_back(id);
+      }
+    }
+    if (pages.empty()) {
+      co_return;
+    }
+
+    // One aligned block backs the whole wave (fd_ is O_DIRECT: buffer, offset
+    // and length must all be sector-aligned — page_size slices of an aligned
+    // base satisfy that).
+    char *wave_buf = static_cast<char *>(
+        alaya::laser::memory::align_allocate<kSectorLen>(pages.size() * geom_.page_size));
+    try {
+      // Phase 1: serve cache hits immediately; snapshot versions for misses.
+      std::vector<size_t> misses;
+      misses.reserve(pages.size());
+      for (size_t p = 0; p < pages.size(); ++p) {
+        PageWork &work = pages[p];
+        work.buf = wave_buf + p * geom_.page_size;
+        bool hit = false;
+        {
+          Shard &shard = shard_for(work.off);
+          std::lock_guard<std::mutex> lock(shard.mutex);
+          hit = shard.cache.read(work.off, work.buf, geom_.page_size);
+          if (!hit) {
+            work.version = page_version_locked(shard, work.off);
+          }
+        }
+        if (hit) {
+          consume(work.off, work.buf, work.ids);
+        } else {
+          misses.push_back(p);
+        }
+      }
+
+      if (!misses.empty()) {
+        // Phase 2: one suspension for every missing page of the wave.
+        std::vector<IORequest> reqs(misses.size());
+        for (size_t m = 0; m < misses.size(); ++m) {
+          PageWork &work = pages[misses[m]];
+          reqs[m] = IORequest{work.buf, geom_.page_size, work.off, nullptr};
+        }
+        const uint32_t failures = co_await reactor_->read_batch(pool,
+                                                                fd_,
+                                                                reqs.data(),
+                                                                static_cast<uint32_t>(reqs.size()));
+        if (failures != 0) {
+          throw std::runtime_error("DiskPageIO::wave_load_pages: " + std::to_string(failures) +
+                                   " short/failed io_uring reads");
+        }
+        // Phase 3: reconcile each read page with its shard cache, then consume.
+        for (const size_t p : misses) {
+          PageWork &work = pages[p];
+          reconcile_wave_page(work.off, work.buf, work.version);
+          consume(work.off, work.buf, work.ids);
+        }
+      }
+    } catch (...) {
+      alaya::laser::memory::align_free(wave_buf);
+      throw;
+    }
+    alaya::laser::memory::align_free(wave_buf);
+    co_return;
+  }
+
+  /// A reactor read of @p off landed in @p buf; fold it into the shard cache
+  /// under the shard lock. If a writer bumped the page version while the read
+  /// was in flight, @p buf is refreshed from the cache (or disk) instead of
+  /// installing stale bytes — read_page_snapshot's protocol, reused verbatim.
+  void reconcile_wave_page(uint64_t off, char *buf, uint64_t observed_version) {
+    Shard &shard = shard_for(off);
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    if (shard.cache.read(off, buf, geom_.page_size)) {
+      return;  // someone installed meanwhile (possibly a fresher write) — cache wins
+    }
+    if (page_version_locked(shard, off) != observed_version) {
+      read_page_locked_off(shard, off);  // rare: a write and an eviction raced our read
+      std::memcpy(buf, shard.page_buf, geom_.page_size);
+      return;
+    }
+    shard.cache.write(off,
+                      buf,
+                      geom_.page_size,
+                      false,
+                      [this, &shard](uint64_t page_off, const char *page) {
+                        write_page_to_disk(shard, page_off, page);
+                      });
+  }
+
+  /// Single-node read through the reactor: cache hit is immediate, a miss
+  /// suspends on io_uring and reconciles like a wave page.
+  coro::task<NodeData> read_node_reactor(uint32_t id, coro::thread_pool &pool) {
+    const uint64_t off = geom_.get_page_offset(id);
+    char *buf =
+        static_cast<char *>(alaya::laser::memory::align_allocate<kSectorLen>(geom_.page_size));
+    try {
+      bool hit = false;
+      uint64_t observed_version = 0;
+      {
+        Shard &shard = shard_for(off);
+        std::lock_guard<std::mutex> lock(shard.mutex);
+        hit = shard.cache.read(off, buf, geom_.page_size);
+        if (!hit) {
+          observed_version = page_version_locked(shard, off);
+        }
+      }
+      if (!hit) {
+        const int32_t got =
+            co_await reactor_->read(pool, fd_, buf, static_cast<uint32_t>(geom_.page_size), off);
+        if (got != static_cast<int32_t>(geom_.page_size)) {
+          throw std::runtime_error("DiskPageIO::read_node_reactor: short/failed read at " +
+                                   std::to_string(off) + " (got " + std::to_string(got) + ")");
+        }
+        reconcile_wave_page(off, buf, observed_version);
+      }
+      NodeData node = node_from_page(buf, id);
+      alaya::laser::memory::align_free(buf);
+      co_return node;
+    } catch (...) {
+      alaya::laser::memory::align_free(buf);
+      throw;
+    }
+  }
+#endif
+
   NodeData read_node_with_private_page(uint32_t id) {
     char *buf =
         static_cast<char *>(alaya::laser::memory::align_allocate<kSectorLen>(geom_.page_size));
@@ -429,6 +742,19 @@ class DiskPageIO {
     }
   }
 
+ public:
+  /// Non-blocking peek: copy the page containing @p off out of the update
+  /// shard cache if present. The reactor-mode UPDATE search consults this
+  /// before issuing a device read — recently written pages are exactly where
+  /// an update workload's searches land (Yi's unified buffer pool gives its
+  /// tasklets the same view). Eval/query search paths do not use this.
+  bool try_read_cached_page(uint64_t off, char *out) {
+    Shard &shard = shard_for(off);
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    return shard.cache.read(off, out, geom_.page_size);
+  }
+
+ private:
   void read_page_snapshot(uint32_t id, char *out) {
     const uint64_t off = geom_.get_page_offset(id);
     Shard &shard = shard_for(off);
@@ -536,6 +862,7 @@ class DiskPageIO {
   // ---- platform-gated syscalls (Linux O_DIRECT) ----
   void open_rw(const std::string &path);
   void read_page_locked(Shard &shard, uint32_t id);
+  void read_page_locked_off(Shard &shard, uint64_t page_off);
   void read_page_from_disk(uint64_t page_off, char *page) const;
   void write_page_locked(Shard &shard, uint32_t id);
   void write_page_to_disk(Shard &shard, uint64_t page_off, const char *page);
@@ -550,6 +877,10 @@ class DiskPageIO {
   std::unordered_map<uint32_t, std::vector<float>> vec_cache_;
   mutable std::mutex vec_mutex_;
   std::mutex file_mutex_;  ///< serializes ftruncate extension (after shard lock)
+#if defined(__linux__)
+  UringReactor *reactor_ = nullptr;  ///< not owned; nullptr = blocking pread paths
+#endif
+  uint32_t update_fallback_threads_ = 8;  ///< blocking fallback of read_neighbors_batch_async
 };
 
 #if defined(__linux__)
@@ -569,17 +900,20 @@ inline void DiskPageIO::open_rw(const std::string &path) {
 }
 
 inline void DiskPageIO::read_page_locked(Shard &shard, uint32_t id) {
-  const uint64_t off = geom_.get_page_offset(id);
-  if (shard.cache.read(off, shard.page_buf, geom_.page_size)) {
+  read_page_locked_off(shard, geom_.get_page_offset(id));
+}
+
+inline void DiskPageIO::read_page_locked_off(Shard &shard, uint64_t page_off) {
+  if (shard.cache.read(page_off, shard.page_buf, geom_.page_size)) {
     return;
   }
-  read_page_from_disk(off, shard.page_buf);
-  shard.cache.write(off,
+  read_page_from_disk(page_off, shard.page_buf);
+  shard.cache.write(page_off,
                     shard.page_buf,
                     geom_.page_size,
                     false,
-                    [this, &shard](uint64_t page_off, const char *page) {
-                      write_page_to_disk(shard, page_off, page);
+                    [this, &shard](uint64_t off, const char *page) {
+                      write_page_to_disk(shard, off, page);
                     });
 }
 
@@ -642,6 +976,9 @@ inline void DiskPageIO::open_rw(const std::string &) {
   throw std::runtime_error("DiskPageIO: in-place DiskANN updates require Linux (O_DIRECT)");
 }
 inline void DiskPageIO::read_page_locked(Shard &, uint32_t) {
+  throw std::runtime_error("DiskPageIO: unsupported platform (needs Linux O_DIRECT)");
+}
+inline void DiskPageIO::read_page_locked_off(Shard &, uint64_t) {
   throw std::runtime_error("DiskPageIO: unsupported platform (needs Linux O_DIRECT)");
 }
 inline void DiskPageIO::read_page_from_disk(uint64_t, char *) const {

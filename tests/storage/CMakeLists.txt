@@ -33,3 +33,14 @@ alaya_add_test(
   TARGET rocksdb_storage_test
   LABELS storage
 )
+
+alaya_cc_target(
+  uring_reactor_test
+  GTEST
+  SRCS uring_reactor_test.cpp
+)
+alaya_add_test(
+  NAME storage_test_uring_reactor
+  TARGET uring_reactor_test
+  LABELS storage
+)
