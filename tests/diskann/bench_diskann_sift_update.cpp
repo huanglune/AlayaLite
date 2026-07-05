@@ -120,6 +120,7 @@ struct Options {
   uint64_t page_cache_capacity = kDefaultBenchmarkPageCachePages;
   alaya::diskann::DiskANNUpdateIO update_io = alaya::diskann::DiskANNUpdateIO::kAuto;
   uint32_t update_search_concurrency = 0;  // 0 = library default (4x insert threads)
+  bool search_page_cache = true;           // searches peek+fill the shard page cache
 };
 
 DatasetFiles resolve_dataset_files(const std::filesystem::path &data_dir) {
@@ -361,6 +362,8 @@ Options parse_args(int argc, char **argv) {
       opt.cache_ratio = parse_ratio(argv[++i], "--cache_ratio");
     } else if (arg == "--page_cache" && i + 1 < argc) {
       opt.page_cache_capacity = parse_u64(argv[++i], "--page_cache");
+    } else if (arg == "--search_page_cache" && i + 1 < argc) {
+      opt.search_page_cache = parse_u64(argv[++i], "--search_page_cache") != 0;
     } else {
       if (arg.rfind("--", 0) == 0) {
         throw std::invalid_argument("unknown option: " + arg);
@@ -935,6 +938,7 @@ int main(int argc, char **argv) {
     lp.page_cache_capacity = opt.page_cache_capacity;
     lp.update_io = opt.update_io;
     lp.update_search_concurrency = opt.update_search_concurrency;
+    lp.search_page_cache = opt.search_page_cache;
     DiskANNIndex idx;
     idx.load(opt.index_dir, lp);
 
@@ -1070,7 +1074,8 @@ int main(int argc, char **argv) {
                   << " mixed_search_qps=" << mixed_search.qps
                   << " mixed_search_mean_us=" << mixed_search.mean_us
                   << " mixed_search_queries=" << mixed_search.queries
-                  << " masked_recall@10=" << recall.recall() << " live=" << idx.live_count()
+                  << " masked_recall@10=" << recall.recall() << " eval_qps=" << recall.qps
+                  << " eval_mean_us=" << recall.mean_us << " live=" << idx.live_count()
                   << " tombstones=" << idx.tombstone_count()
                   << (baseline_round ? " (baseline)" : "") << "\n";
         csv << round_id << "," << round.deletes.size() << "," << round.inserts.size() << ","

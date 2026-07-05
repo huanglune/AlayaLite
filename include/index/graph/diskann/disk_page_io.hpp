@@ -82,6 +82,7 @@ class DiskPageIO {
                     std::min<size_t>(std::max<size_t>(page_cache_capacity, 1), kNumShards));
       const size_t shard_capacity =
           page_cache_capacity == 0 ? 0 : std::max<size_t>(1, page_cache_capacity / num_shards_);
+      cache_enabled_ = shard_capacity > 0;
       shards_.reserve(num_shards_);
       for (uint32_t s = 0; s < num_shards_; ++s) {
         shards_.push_back(std::make_unique<Shard>(shard_capacity, geom_.page_size));
@@ -669,27 +670,10 @@ class DiskPageIO {
   }
 
   /// A reactor read of @p off landed in @p buf; fold it into the shard cache
-  /// under the shard lock. If a writer bumped the page version while the read
-  /// was in flight, @p buf is refreshed from the cache (or disk) instead of
-  /// installing stale bytes — read_page_snapshot's protocol, reused verbatim.
+  /// under the shard lock — read_page_snapshot's protocol, shared with the
+  /// public search-side fill.
   void reconcile_wave_page(uint64_t off, char *buf, uint64_t observed_version) {
-    Shard &shard = shard_for(off);
-    std::lock_guard<std::mutex> lock(shard.mutex);
-    if (shard.cache.read(off, buf, geom_.page_size)) {
-      return;  // someone installed meanwhile (possibly a fresher write) — cache wins
-    }
-    if (page_version_locked(shard, off) != observed_version) {
-      read_page_locked_off(shard, off);  // rare: a write and an eviction raced our read
-      std::memcpy(buf, shard.page_buf, geom_.page_size);
-      return;
-    }
-    shard.cache.write(off,
-                      buf,
-                      geom_.page_size,
-                      false,
-                      [this, &shard](uint64_t page_off, const char *page) {
-                        write_page_to_disk(shard, page_off, page);
-                      });
+    search_fill_page(off, buf, observed_version);
   }
 
   /// Single-node read through the reactor: cache hit is immediate, a miss
@@ -752,6 +736,50 @@ class DiskPageIO {
     Shard &shard = shard_for(off);
     std::lock_guard<std::mutex> lock(shard.mutex);
     return shard.cache.read(off, out, geom_.page_size);
+  }
+
+  /// True when the shard page caches were built with a nonzero capacity —
+  /// the search-side peek/fill pair below is pointless without them.
+  [[nodiscard]] bool page_cache_enabled() const { return cache_enabled_; }
+
+  /// Peek + version snapshot, the read half of the search fill protocol.
+  /// Hit: the page is copied into @p out and true is returned. Miss: false,
+  /// and @p version_out receives the page's current write version so the
+  /// caller can offer the device bytes back via search_fill_page().
+  bool search_peek_page(uint64_t off, char *out, uint64_t *version_out) {
+    Shard &shard = shard_for(off);
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    if (shard.cache.read(off, out, geom_.page_size)) {
+      return true;
+    }
+    *version_out = page_version_locked(shard, off);
+    return false;
+  }
+
+  /// Fold a device-read page into the shard cache — the unified-pool fill
+  /// that makes SEARCH misses populate the cache the way Yi's buffer pool
+  /// does for its tasklets. If a writer bumped the page version while the
+  /// read was in flight, @p buf is refreshed from the cache (or disk)
+  /// instead of installing stale bytes, so callers must fill BEFORE they
+  /// parse @p buf. Safe to call with a version from search_peek_page().
+  void search_fill_page(uint64_t off, char *buf, uint64_t observed_version) {
+    Shard &shard = shard_for(off);
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    if (shard.cache.read(off, buf, geom_.page_size)) {
+      return;  // someone installed meanwhile (possibly a fresher write) — cache wins
+    }
+    if (page_version_locked(shard, off) != observed_version) {
+      read_page_locked_off(shard, off);  // rare: a write and an eviction raced our read
+      std::memcpy(buf, shard.page_buf, geom_.page_size);
+      return;
+    }
+    shard.cache.write(off,
+                      buf,
+                      geom_.page_size,
+                      false,
+                      [this, &shard](uint64_t page_off, const char *page) {
+                        write_page_to_disk(shard, page_off, page);
+                      });
   }
 
  private:
@@ -873,6 +901,7 @@ class DiskPageIO {
   int fd_ = -1;
   std::atomic<uint64_t> file_size_{0};
   uint32_t num_shards_ = kNumShards;
+  bool cache_enabled_ = false;
   std::vector<std::unique_ptr<Shard>> shards_;
   std::unordered_map<uint32_t, std::vector<float>> vec_cache_;
   mutable std::mutex vec_mutex_;

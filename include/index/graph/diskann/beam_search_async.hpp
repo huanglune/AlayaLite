@@ -21,9 +21,12 @@
  * tie-ordering, not recall; with no cache hits the absorb sequence — and
  * therefore the result — is byte-identical to the sync deterministic variant.
  *
- * Reads go through the reader's O_DIRECT fd (AlignedFileReader::get_fd), not
- * DiskPageIO's buffered fd: search I/O must keep bypassing the OS page cache
- * or a disk-bound configuration silently turns into a RAM-cached one.
+ * Reads go through the reader's O_DIRECT fd (AlignedFileReader::get_fd);
+ * DiskPageIO's own fd is equally O_DIRECT but is left to the write path.
+ * When ctx.page_io is set, both searches peek the update shard cache before
+ * each device read and offer the pages they read back through the versioned
+ * fill protocol — the shard cache then behaves like Yi's unified buffer
+ * pool instead of a write-only view.
  *
  * The wave buffer is ThreadData::wave_scratch (one page per neighbor of an
  * expansion), separate from sector_scratch whose slot count doubles as the
@@ -73,11 +76,11 @@ inline auto disk_greedy_search_async(const SearchContext &ctx,
                                      SearchStats *stats,
                                      alaya::UringReactor &reactor,
                                      coro::thread_pool &pool,
-                                     int fd,
-                                     DiskPageIO *page_peek = nullptr)
+                                     int fd)
     -> coro::task<std::vector<std::pair<uint32_t, float>>> {
   const DiskLayoutGeometry &geom = *ctx.geom;
   const NodeCache &cache = *ctx.cache;
+  DiskPageIO *page_io = ctx.page_io;  ///< unified-pool peek + fill (may be null)
   const uint64_t dim = geom.dim;
   const uint64_t page_size = geom.page_size;
   const auto l2 = alaya::simd::get_l2_sqr_func();
@@ -134,22 +137,39 @@ inline auto disk_greedy_search_async(const SearchContext &ctx,
       }
     }  // Lookup released before any suspension.
     if (!seeded) {
-      std::vector<alaya::IORequest> seed_req;
-      seed_req.emplace_back(td.wave_scratch, page_size, geom.get_page_offset(ctx.medoid));
-      if (co_await reactor.read_batch(pool, fd, seed_req.data(), 1) != 0) {
-        beam_async_detail::throw_wave_failure(seed_req);
+      const uint64_t seed_off = geom.get_page_offset(ctx.medoid);
+      uint64_t seed_version = 0;
+      if (page_io != nullptr &&
+          page_io->search_peek_page(seed_off, td.wave_scratch, &seed_version)) {
+        if (stats != nullptr) {
+          stats->n_page_cache_hits++;
+        }
+        absorb(ctx.medoid, td.wave_scratch + geom.offset_to_node(ctx.medoid));
+        seeded = true;
       }
-      if (stats != nullptr) {
-        stats->n_ios++;
+      if (!seeded) {
+        std::vector<alaya::IORequest> seed_req;
+        seed_req.emplace_back(td.wave_scratch, page_size, seed_off);
+        if (co_await reactor.read_batch(pool, fd, seed_req.data(), 1) != 0) {
+          beam_async_detail::throw_wave_failure(seed_req);
+        }
+        if (page_io != nullptr) {
+          page_io->search_fill_page(seed_off, td.wave_scratch, seed_version);
+        }
+        if (stats != nullptr) {
+          stats->n_ios++;
+        }
+        absorb(ctx.medoid, td.wave_scratch + geom.offset_to_node(ctx.medoid));
       }
-      absorb(ctx.medoid, td.wave_scratch + geom.offset_to_node(ctx.medoid));
     }
   }
 
   std::vector<uint32_t> todo;
   std::vector<uint32_t> miss_ids;
+  std::vector<uint64_t> miss_versions;
   std::vector<alaya::IORequest> reqs;
   miss_ids.reserve(wave_slots);
+  miss_versions.reserve(wave_slots);
   reqs.reserve(wave_slots);
   while (frontier.has_unexpanded_node()) {
     const uint32_t x = frontier.closest_unexpanded().id;
@@ -162,6 +182,7 @@ inline auto disk_greedy_search_async(const SearchContext &ctx,
     }
     reqs.clear();
     miss_ids.clear();
+    miss_versions.clear();
     uint64_t slot = 0;
     for (const uint32_t m : todo) {
       NodeCache::Lookup cached = cache.lookup_record(m);
@@ -173,18 +194,21 @@ inline auto disk_greedy_search_async(const SearchContext &ctx,
         continue;
       }
       char *buf = td.wave_scratch + slot * page_size;
-      if (page_peek != nullptr && page_peek->try_read_cached_page(geom.get_page_offset(m), buf)) {
-        // Recently written page still in the update shard cache: serve it
-        // without a device read (slot buffer is consumed by absorb, reused).
+      const uint64_t page_off = geom.get_page_offset(m);
+      uint64_t version = 0;
+      if (page_io != nullptr && page_io->search_peek_page(page_off, buf, &version)) {
+        // Unified-pool hit: serve without a device read (slot buffer is
+        // consumed by absorb, reused).
         if (stats != nullptr) {
-          stats->n_cache_hits++;
+          stats->n_page_cache_hits++;
         }
         absorb(m, buf + geom.offset_to_node(m));
         continue;
       }
       ++slot;
       miss_ids.push_back(m);
-      reqs.emplace_back(buf, page_size, geom.get_page_offset(m));
+      miss_versions.push_back(version);
+      reqs.emplace_back(buf, page_size, page_off);
     }
     if (!reqs.empty()) {
       if (co_await reactor.read_batch(pool, fd, reqs.data(), static_cast<uint32_t>(reqs.size())) !=
@@ -195,8 +219,13 @@ inline auto disk_greedy_search_async(const SearchContext &ctx,
         stats->n_ios += reqs.size();
       }
       for (size_t j = 0; j < miss_ids.size(); ++j) {
-        absorb(miss_ids[j],
-               static_cast<const char *>(reqs[j].buffer_) + geom.offset_to_node(miss_ids[j]));
+        char *buf = static_cast<char *>(reqs[j].buffer_);
+        if (page_io != nullptr) {
+          // Offer the read page to the pool BEFORE parsing: a conflicting
+          // writer refreshes buf instead of the pool taking stale bytes.
+          page_io->search_fill_page(reqs[j].offset_, buf, miss_versions[j]);
+        }
+        absorb(miss_ids[j], buf + geom.offset_to_node(miss_ids[j]));
       }
     }
   }
@@ -235,14 +264,13 @@ inline auto pq_beam_search_async(const SearchContext &ctx,
                                  SearchStats *stats,
                                  alaya::UringReactor &reactor,
                                  coro::thread_pool &pool,
-                                 int fd,
-                                 DiskPageIO *page_peek = nullptr)
-    -> coro::task<std::vector<std::pair<uint32_t, float>>> {
+                                 int fd) -> coro::task<std::vector<std::pair<uint32_t, float>>> {
   if (params.rerank) {
     throw std::invalid_argument("pq_beam_search_async: rerank is not supported");
   }
   const DiskLayoutGeometry &geom = *ctx.geom;
   const NodeCache &cache = *ctx.cache;
+  DiskPageIO *page_io = ctx.page_io;  ///< unified-pool peek + fill (may be null)
   const PQTable &pq = *ctx.pq;
   const uint64_t dim = geom.dim;
   const uint64_t page_size = geom.page_size;
@@ -280,12 +308,15 @@ inline auto pq_beam_search_async(const SearchContext &ctx,
   };
 
   std::vector<uint32_t> miss_ids;
+  std::vector<uint64_t> miss_versions;
   std::vector<alaya::IORequest> reqs;
   miss_ids.reserve(beam);
+  miss_versions.reserve(beam);
   reqs.reserve(beam);
   while (retset.has_unexpanded_node()) {
     reqs.clear();
     miss_ids.clear();
+    miss_versions.clear();
     uint64_t slot = 0;
     while (retset.has_unexpanded_node() && reqs.size() < beam) {
       const uint32_t id = retset.closest_unexpanded().id;
@@ -298,18 +329,21 @@ inline auto pq_beam_search_async(const SearchContext &ctx,
         continue;  // Lookup released here — never held across the wave below
       }
       char *buf = td.wave_scratch + slot * page_size;
-      if (page_peek != nullptr && page_peek->try_read_cached_page(geom.get_page_offset(id), buf)) {
-        // Update shard cache hit (recently written page): no device read; the
-        // slot buffer is consumed by process_node and reused.
+      const uint64_t page_off = geom.get_page_offset(id);
+      uint64_t version = 0;
+      if (page_io != nullptr && page_io->search_peek_page(page_off, buf, &version)) {
+        // Unified-pool hit: no device read; the slot buffer is consumed by
+        // process_node and reused.
         if (stats != nullptr) {
-          stats->n_cache_hits++;
+          stats->n_page_cache_hits++;
         }
         process_node(id, buf + geom.offset_to_node(id));
         continue;
       }
       ++slot;
       miss_ids.push_back(id);
-      reqs.emplace_back(buf, page_size, geom.get_page_offset(id));
+      miss_versions.push_back(version);
+      reqs.emplace_back(buf, page_size, page_off);
     }
     if (!reqs.empty()) {
       if (co_await reactor.read_batch(pool, fd, reqs.data(), static_cast<uint32_t>(reqs.size())) !=
@@ -320,8 +354,13 @@ inline auto pq_beam_search_async(const SearchContext &ctx,
         stats->n_ios += reqs.size();
       }
       for (size_t j = 0; j < miss_ids.size(); ++j) {
-        process_node(miss_ids[j],
-                     static_cast<const char *>(reqs[j].buffer_) + geom.offset_to_node(miss_ids[j]));
+        char *buf = static_cast<char *>(reqs[j].buffer_);
+        if (page_io != nullptr) {
+          // Offer the read page to the pool BEFORE parsing: a conflicting
+          // writer refreshes buf instead of the pool taking stale bytes.
+          page_io->search_fill_page(reqs[j].offset_, buf, miss_versions[j]);
+        }
+        process_node(miss_ids[j], buf + geom.offset_to_node(miss_ids[j]));
       }
     }
   }

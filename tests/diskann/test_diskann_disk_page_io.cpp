@@ -35,6 +35,7 @@ using alaya::diskann::DiskANNBuildParams;
 using alaya::diskann::DiskANNIndex;
 using alaya::diskann::DiskLayoutGeometry;
 using alaya::diskann::DiskPageIO;
+using alaya::diskann::NodeRecordView;
 
 std::vector<float> make_vectors(uint64_t n, uint64_t dim, uint32_t seed = 123) {
   std::mt19937 rng(seed);
@@ -456,6 +457,94 @@ TEST_F(DiskPageIOReactorTest, ConcurrentWavesAndWritesStayCoherent) {
   EXPECT_EQ(mismatches.load(), 0U);
 }
 
+// ---- search peek/fill protocol (the unified-pool view for searches) ----
+
+namespace {
+// Raw page bytes straight from the file, bypassing every cache.
+std::vector<char> raw_page(const std::string &path, uint64_t off, uint64_t page_size) {
+  std::vector<char> bytes(page_size);
+  std::ifstream in(path, std::ios::binary);
+  in.seekg(static_cast<std::streamoff>(off));
+  in.read(bytes.data(), static_cast<std::streamsize>(page_size));
+  EXPECT_TRUE(in.good());
+  return bytes;
+}
+}  // namespace
+
+TEST_F(DiskPageIOTest, SearchFillInstallsPageForLaterPeeks) {
+  build(200, 32, 32);
+  DiskPageIO io(index_path(), geom_, /*page_cache_capacity=*/64);
+  const uint64_t off = geom_.get_page_offset(0);
+
+  std::vector<char> peek_buf(geom_.page_size);
+  uint64_t version = 1234;
+  ASSERT_FALSE(io.search_peek_page(off, peek_buf.data(), &version));
+  EXPECT_EQ(version, 0U);  // never written -> version 0
+
+  auto bytes = raw_page(index_path(), off, geom_.page_size);
+  io.search_fill_page(off, bytes.data(), version);
+
+  std::vector<char> again(geom_.page_size, 0);
+  uint64_t v2 = 0;
+  ASSERT_TRUE(io.search_peek_page(off, again.data(), &v2));
+  EXPECT_EQ(0, std::memcmp(again.data(), bytes.data(), geom_.page_size));
+}
+
+TEST_F(DiskPageIOTest, SearchFillRefusesStalePageAfterWriteAndEviction) {
+  build(200, 32, 32);
+  // capacity 1 -> a single one-page shard: the second write below evicts the
+  // first page, exposing the version-check branch of the fill protocol.
+  DiskPageIO io(index_path(), geom_, /*page_cache_capacity=*/1);
+  const uint32_t target = 0;
+  const uint64_t off = geom_.get_page_offset(target);
+
+  std::vector<char> stale(geom_.page_size);
+  uint64_t version = 0;
+  ASSERT_FALSE(io.search_peek_page(off, stale.data(), &version));
+  stale = raw_page(index_path(), off, geom_.page_size);  // pre-write content
+
+  // Concurrent-writer stand-in: rewrite the node (bumps the page version),
+  // then touch a different page so the written page is evicted (flushed).
+  std::vector<float> coords(dim_, 0.75f);
+  const std::vector<uint32_t> nbrs = {1, 2, 3};
+  io.write_node(target, coords.data(), static_cast<uint32_t>(nbrs.size()), nbrs.data());
+  uint32_t other = target;
+  while (geom_.get_page_offset(other) == off) {
+    ++other;
+  }
+  io.write_node(other, coords.data(), static_cast<uint32_t>(nbrs.size()), nbrs.data());
+
+  // The stale offer must be rejected AND the caller's buffer refreshed to the
+  // written content.
+  io.search_fill_page(off, stale.data(), version);
+  const NodeRecordView view{stale.data() + geom_.offset_to_node(target), dim_};
+  for (uint64_t d = 0; d < dim_; ++d) {
+    EXPECT_FLOAT_EQ(view.coords()[d], coords[d]) << "d=" << d;
+  }
+}
+
+TEST_F(DiskPageIOTest, SearchFillCacheWinsWhenPagePresent) {
+  build(200, 32, 32);
+  DiskPageIO io(index_path(), geom_, /*page_cache_capacity=*/64);
+  const uint32_t target = 0;
+  const uint64_t off = geom_.get_page_offset(target);
+
+  std::vector<char> stale(geom_.page_size);
+  uint64_t version = 0;
+  ASSERT_FALSE(io.search_peek_page(off, stale.data(), &version));
+  stale = raw_page(index_path(), off, geom_.page_size);
+
+  std::vector<float> coords(dim_, -0.5f);
+  const std::vector<uint32_t> nbrs = {7};
+  io.write_node(target, coords.data(), static_cast<uint32_t>(nbrs.size()), nbrs.data());
+
+  io.search_fill_page(off, stale.data(), version);  // cache holds the write -> cache wins
+  const NodeRecordView view{stale.data() + geom_.offset_to_node(target), dim_};
+  for (uint64_t d = 0; d < dim_; ++d) {
+    EXPECT_FLOAT_EQ(view.coords()[d], coords[d]) << "d=" << d;
+  }
+}
+
 #if defined(ALAYA_LASER_USE_LIBAIO)
 // The async update search must return exactly what the sync deterministic
 // scheduler returns when every read is a miss (empty NodeCache): both absorb
@@ -631,6 +720,77 @@ TEST_F(DiskPageIOTest, AsyncPqBeamSearchMatchesDeterministicSync) {
   reader.deregister_all_threads();
   reader.close();
 }
+// With ctx.page_io set, a search FILLS the shard cache with every page it
+// reads; repeating the identical deterministic query is then served entirely
+// from the pool — zero device reads — with an identical result. This is the
+// unified-buffer-pool behavior (Yi) the peek/fill pair exists for.
+TEST_F(DiskPageIOTest, SearchFillMakesRepeatSearchHitThePool) {
+  build(300, 16, 24);
+  DiskPageIO io(index_path(), geom_, /*page_cache_capacity=*/4096);
+
+  LinuxAlignedFileReader reader;
+  reader.open(index_path());
+  reader.register_thread();
+
+  uint32_t medoid = 0;
+  {
+    std::ifstream in(index_path(), std::ios::binary);
+    in.seekg(16);
+    in.read(reinterpret_cast<char *>(&medoid), sizeof(medoid));
+    ASSERT_TRUE(in.good());
+  }
+
+  const alaya::diskann::NodeCache cache;  // empty BFS cache: only the pool can hit
+  alaya::diskann::SearchContext ctx;
+  ctx.reader = &reader;
+  ctx.geom = &geom_;
+  ctx.cache = &cache;
+  ctx.pq = nullptr;
+  ctx.medoid = medoid;
+  ctx.num_points = n_;
+  ctx.page_io = &io;
+
+  alaya::diskann::SearchParams sp;
+  sp.search_list_size = 30;
+  sp.use_pq = false;
+  sp.rerank = false;
+  sp.deterministic = true;
+
+  alaya::diskann::ThreadDataScratchConfig cfg;
+  cfg.n_page_slots = 8;
+  cfg.page_size = geom_.page_size;
+  cfg.pq_table_entries = 0;
+  cfg.max_slot_id = n_;
+  cfg.max_degree = r_;
+  cfg.search_list_size = sp.search_list_size;
+  cfg.query_dim = dim_;
+  alaya::diskann::ThreadData td;
+  td.alloc_scratch(cfg);
+  td.ctx_ = reader.get_ctx();
+
+  const std::vector<float> query = make_vectors(1, dim_, /*seed=*/4242);
+  alaya::diskann::SearchStats cold;
+  const auto out_cold = alaya::diskann::disk_greedy_search(ctx, query.data(), 10, sp, td, &cold);
+  alaya::diskann::SearchStats warm;
+  const auto out_warm = alaya::diskann::disk_greedy_search(ctx, query.data(), 10, sp, td, &warm);
+
+  EXPECT_GT(cold.n_ios, 0U);
+  EXPECT_EQ(warm.n_ios, 0U) << "repeat search should be served from the pool";
+  // Identical deterministic traversal: every cold-run node (device read OR
+  // co-resident page hit — small indices pack ~24 nodes per page, so even the
+  // cold run hits pages its own earlier reads filled) is a pool hit when warm.
+  EXPECT_EQ(warm.n_page_cache_hits, cold.n_page_cache_hits + cold.n_ios);
+  ASSERT_EQ(out_warm.size(), out_cold.size());
+  for (size_t i = 0; i < out_cold.size(); ++i) {
+    EXPECT_EQ(out_warm[i].first, out_cold[i].first) << "rank " << i;
+    EXPECT_EQ(out_warm[i].second, out_cold[i].second) << "rank " << i;
+  }
+
+  td.free_scratch();
+  reader.deregister_all_threads();
+  reader.close();
+}
+
 #endif  // ALAYA_LASER_USE_LIBAIO
 
 #else  // !__linux__

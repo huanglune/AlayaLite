@@ -143,6 +143,12 @@ struct DiskANNLoadParams {
   ///< ThreadData count). Little's law sets insert throughput to this divided
   ///< by search latency — worker threads bound CPU, this bounds in-flight
   ///< searches (Yi: workers vs tasklets). 0 = 4x update_insert_threads.
+  bool search_page_cache = true;
+  ///< Updatable indices: let EVERY search (query-path and update-path) peek
+  ///< the shard page cache before each device read and fill it with the
+  ///< pages it reads — the cache then behaves like Yi's unified buffer pool
+  ///< (dynamic LRU shared by searches and updates) instead of a write-only
+  ///< view. Off = pre-async behavior: static BFS cache + raw device reads.
 };
 
 /// Per-query search configuration.
@@ -369,6 +375,7 @@ class DiskANNIndex {
     scratch_config.search_list_size = scratch_list_size;
     scratch_config.query_dim = dim_;
     scratch_config_ = scratch_config;  // reused by init_updatable's gate ThreadData set
+    search_page_cache_ = params.search_page_cache;
     thread_data_storage_.resize(pool);
     {
       std::vector<std::thread> regs;
@@ -445,6 +452,7 @@ class DiskANNIndex {
       if (snapshot.has_tombstone) {
         ctx.tombstone = &snapshot.tombstone;
       }
+      ctx.page_io = search_page_io();
 
       SearchParams sp;
       sp.search_list_size = params.search_list_size;
@@ -919,6 +927,16 @@ class DiskANNIndex {
     updatable_ = true;
   }
 
+  /// The unified-pool handle searches should use, or nullptr. Non-null only
+  /// for updatable indices with a nonzero page cache and the load param on —
+  /// then every search peeks the shard cache and fills it with read pages,
+  /// which is exactly the view Yi's unified buffer pool gives its tasklets.
+  DiskPageIO *search_page_io() const {
+    return (search_page_cache_ && page_io_ != nullptr && page_io_->page_cache_enabled())
+               ? page_io_.get()
+               : nullptr;
+  }
+
   /// Tombstone-aware update search returning up to @p l (id, dist) candidates.
   /// PQ indexes use PQ beam distances; No-PQ indexes use exact-L2 disk greedy.
   std::vector<std::pair<uint32_t, float>> run_update_search(const float *query, uint32_t l) {
@@ -939,6 +957,7 @@ class DiskANNIndex {
       ctx.medoid = medoid_;
       ctx.num_points = snapshot.max_slot_id;
       ctx.tombstone = &snapshot.tombstone;
+      ctx.page_io = search_page_io();
       SearchParams sp;
       sp.search_list_size = l;
       sp.beam_width = beam_width_;
@@ -977,6 +996,7 @@ class DiskANNIndex {
         ctx.medoid = medoid_;
         ctx.num_points = snapshot.max_slot_id;
         ctx.tombstone = &snapshot.tombstone;
+        ctx.page_io = search_page_io();
         SearchParams sp;
         sp.search_list_size = l;
         sp.beam_width = beam_width_;
@@ -995,8 +1015,7 @@ class DiskANNIndex {
                                                   nullptr,
                                                   *update_reactor_,
                                                   pool,
-                                                  reader_->get_fd(),
-                                                  page_io_.get());
+                                                  reader_->get_fd());
         } else {
           results = co_await disk_greedy_search_async(ctx,
                                                       query,
@@ -1006,8 +1025,7 @@ class DiskANNIndex {
                                                       nullptr,
                                                       *update_reactor_,
                                                       pool,
-                                                      reader_->get_fd(),
-                                                      page_io_.get());
+                                                      reader_->get_fd());
         }
         st_greedy_us_.fetch_add(stage_us_since(mark), std::memory_order_relaxed);
       } catch (...) {
@@ -1986,7 +2004,8 @@ class DiskANNIndex {
   // thread-scratch pool
   std::vector<std::unique_ptr<ThreadData>> thread_data_storage_;
   mutable ::ConcurrentQueue<ThreadData *> thread_data_pool_{nullptr};
-  ThreadDataScratchConfig scratch_config_;              ///< saved at load for the gate tds
+  ThreadDataScratchConfig scratch_config_;  ///< saved at load for the gate tds
+  bool search_page_cache_ = true;  ///< searches peek+fill the shard page cache (Yi pool view)
   alaya::AsyncGate<ThreadData> update_search_td_gate_;  ///< reactor-mode update searches
   bool update_search_async_ = false;                    ///< No-PQ + reactor + O_DIRECT fd available
 
