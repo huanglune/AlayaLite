@@ -51,6 +51,7 @@ COVERAGE_TARGETS=(
   storage_test
   static_storage_test
   rocksdb_storage_test
+  uring_reactor_test
   query_utils_test
   log_test
   evaluate_test
