@@ -119,13 +119,23 @@ TEST(SlotAllocatorTest, AllocAppendMode) {
   EXPECT_EQ(a.alloc(), 1001u);
 }
 
-TEST(SlotAllocatorTest, FreeThenReallocReturnsSameSlotAndTogglesTombstone) {
+TEST(SlotAllocatorTest, FreeThenReallocReturnsSameSlotAndStaysDarkUntilPublish) {
   SlotAllocator a(10);
   a.free(5);
   EXPECT_TRUE(a.is_deleted(5));
   EXPECT_EQ(a.free_count(), 1u);
-  EXPECT_EQ(a.alloc(), 5u);       // reuse the freed slot
-  EXPECT_FALSE(a.is_deleted(5));  // alloc marks it live again
+  EXPECT_EQ(a.alloc(), 5u);      // reuse the freed slot
+  EXPECT_TRUE(a.is_deleted(5));  // stays dark: its bytes are not written yet
+  a.publish(5);
+  EXPECT_FALSE(a.is_deleted(5));  // publish makes it search-visible
+}
+
+TEST(SlotAllocatorTest, FreshAllocIsDarkUntilPublish) {
+  SlotAllocator a(10);
+  EXPECT_EQ(a.alloc(), 10u);
+  EXPECT_TRUE(a.is_deleted(10));  // fresh slots are dark too (zero-page window)
+  a.publish(10);
+  EXPECT_FALSE(a.is_deleted(10));
 }
 
 TEST(SlotAllocatorTest, SaveLoadRoundTripWithBitmap) {

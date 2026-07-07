@@ -42,10 +42,11 @@ repos:
 - repo: https://github.com/pre-commit/pre-commit-hooks
   rev: v5.0.0
   hooks:
+  # cmake/vendor/ stays byte-identical to upstream (see cmake-format below).
   - id: trailing-whitespace
-    exclude: \.(yaml|yml)$
+    exclude: (\.(yaml|yml)$|^cmake/vendor/)
   - id: end-of-file-fixer
-    exclude: \.(yaml|yml)$
+    exclude: (\.(yaml|yml)$|^cmake/vendor/)
   - id: check-added-large-files
     args: [--maxkb=1000]
   - id: check-merge-conflict
@@ -90,8 +91,10 @@ repos:
 - repo: https://github.com/crate-ci/typos
   rev: v1.36.1
   hooks:
+  # --force-exclude: pre-commit passes filenames explicitly, which would otherwise
+  # override the .typo.toml excludes (cmake/vendor/).
   - id: typos
-    args: [-c, .typo.toml]
+    args: [-c, .typo.toml, --force-exclude]
 
 
 #===========================================================================
@@ -100,8 +103,11 @@ repos:
 - repo: https://github.com/cheshirekow/cmake-format-precommit
   rev: v0.6.13
   hooks:
+  # cmake/vendor/ holds pinned third-party files (conan_provider.cmake); keep them byte-identical to upstream.
   - id: cmake-format
+    exclude: ^cmake/vendor/
   - id: cmake-lint
+    exclude: ^cmake/vendor/
 
 #===========================================================================
 #                            CLANG FORMAT HOOK

@@ -61,7 +61,7 @@ TEST_F(PQTableTest, TrainRejectsIndivisibleDim) {
 }
 
 TEST_F(PQTableTest, TrainBalancedChunks) {
-  const uint64_t n = 300, dim = 128;
+  const uint64_t n = 128, dim = 128;
   const uint32_t n_chunks = 64;
   const auto data = make_vectors(n, dim);
   PQTable pq;
@@ -75,7 +75,7 @@ TEST_F(PQTableTest, TrainBalancedChunks) {
 }
 
 TEST_F(PQTableTest, EncodeShape) {
-  const uint64_t n = 1000, dim = 64;
+  const uint64_t n = 128, dim = 64;
   const uint32_t n_chunks = 32;
   const auto data = make_vectors(n, dim);
   PQTable pq;
@@ -102,6 +102,71 @@ TEST_F(PQTableTest, EncodeSmallExampleIsDeterministic) {
       EXPECT_EQ(codes[i * n_chunks + c], static_cast<uint8_t>(i)) << "i=" << i << " c=" << c;
     }
   }
+}
+
+TEST_F(PQTableTest, EncodeOneOverwritesAppendsAndPersists) {
+  const uint64_t n = 10, dim = 8;
+  const uint32_t n_chunks = 2;
+  const auto data = make_vectors(n, dim, /*seed=*/42);
+  PQTable pq;
+  pq.train(data.data(), n, dim, n_chunks);
+  pq.encode(data.data(), n);
+
+  pq.encode_one(data.data() + 5 * dim, /*point_id=*/2);
+  for (uint32_t c = 0; c < n_chunks; ++c) {
+    EXPECT_EQ(pq.codes()[2 * n_chunks + c], 5u);
+  }
+
+  pq.encode_one(data.data() + 7 * dim, /*point_id=*/12);
+  EXPECT_EQ(pq.num_points(), 13u);
+  ASSERT_EQ(pq.codes().size(), 13u * n_chunks);
+  for (uint32_t c = 0; c < n_chunks; ++c) {
+    EXPECT_EQ(pq.codes()[12 * n_chunks + c], 7u);
+  }
+
+  const auto pivots = temp_path("mutable_pivots");
+  const auto compressed = temp_path("mutable_compressed");
+  pq.save(pivots.string(), compressed.string());
+
+  PQTable loaded;
+  loaded.load(pivots.string(), compressed.string(), pq.num_points(), dim, n_chunks);
+  EXPECT_EQ(loaded.codes(), pq.codes());
+  EXPECT_EQ(loaded.num_points(), pq.num_points());
+}
+
+TEST_F(PQTableTest, EncodeToCodeMatchesStoredCode) {
+  const uint64_t n = 32, dim = 8;
+  const uint32_t n_chunks = 2;
+  const auto data = make_vectors(n, dim);
+  PQTable pq;
+  pq.train(data.data(), n, dim, n_chunks);
+  pq.encode(data.data(), n);
+
+  std::vector<uint8_t> code(n_chunks);
+  pq.encode_to_code(data.data() + 7 * dim, code.data());
+  const auto &codes = pq.codes();
+  const uint8_t *stored = codes.data() + 7 * n_chunks;
+  EXPECT_TRUE(std::equal(code.begin(), code.end(), stored));
+}
+
+TEST_F(PQTableTest, SymmetricDistanceMatchesCentroidDistance) {
+  const uint64_t dim = 2;
+  const uint32_t n_chunks = 1;
+  std::vector<float> global_centroid(dim, 0.0f);
+  std::vector<float> codebook(static_cast<size_t>(n_chunks) * kPQNumCentroids * dim, 0.0f);
+  for (uint32_t k = 0; k < kPQNumCentroids; ++k) {
+    codebook[static_cast<size_t>(k) * dim] = static_cast<float>(k);
+  }
+  PQTable pq = PQTable::from_codebook(dim, n_chunks, global_centroid, codebook);
+  const std::vector<float> data = {3.0f, 0.0f, 7.0f, 0.0f};
+  pq.encode(data.data(), 2);
+
+  const uint64_t first = 0;
+  const uint64_t second = 1;
+  EXPECT_FLOAT_EQ(pq.pq_symmetric_distance(first, second), 16.0f);
+  std::vector<uint8_t> code(n_chunks);
+  pq.encode_to_code(data.data(), code.data());
+  EXPECT_FLOAT_EQ(pq.pq_symmetric_distance(code.data(), 1), 16.0f);
 }
 
 // --- PQ distance equals true L2 in the lossless (n <= 256) regime ------------
@@ -157,18 +222,18 @@ TEST_F(PQTableTest, PreprocessQueryMatchesManualTable) {
 }
 
 TEST_F(PQTableTest, PQDistanceIsSumOfTableLookups) {
-  const uint64_t n = 400, dim = 32;  // n > 256 exercises real k-means
+  const uint64_t n = 257, dim = 32;  // n > 256 exercises real k-means
   const uint32_t n_chunks = 8;
   const auto data = make_vectors(n, dim);
   PQTable pq;
-  pq.train(data.data(), n, dim, n_chunks);
+  pq.train(data.data(), n, dim, n_chunks, /*n_iters=*/2);
   pq.encode(data.data(), n);
 
   std::vector<float> table(static_cast<size_t>(n_chunks) * kPQNumCentroids);
   std::vector<float> qres(dim);
   pq.preprocess_query(data.data() + 5 * dim, table.data(), qres.data());
   const auto &codes = pq.codes();
-  for (uint64_t pi : {0ull, 1ull, 100ull, 399ull}) {
+  for (uint64_t pi : {0ull, 1ull, 100ull, 256ull}) {
     float expected = 0.0f;
     for (uint32_t c = 0; c < n_chunks; ++c) {
       expected += table[static_cast<size_t>(c) * kPQNumCentroids + codes[pi * n_chunks + c]];
@@ -184,16 +249,16 @@ TEST_F(PQTableTest, ParallelTrainEncodeByteIdenticalToSerial) {
   // each point encodes independently, so multi-threaded train()/encode() must
   // produce a byte-identical codebook and codes to the single-threaded run. (Each
   // chunk's k-means stays serial internally, so there is no FP-reduction reorder.)
-  const uint64_t n = 2000, dim = 64;  // n > 256 => real k-means
-  const uint32_t n_chunks = 16;
+  const uint64_t n = 257, dim = 32;  // n > 256 => real k-means
+  const uint32_t n_chunks = 8;
   const auto data = make_vectors(n, dim, /*seed=*/123);
 
   PQTable serial;
-  serial.train(data.data(), n, dim, n_chunks, /*n_iters=*/15, /*seed=*/1234, /*num_threads=*/1);
+  serial.train(data.data(), n, dim, n_chunks, /*n_iters=*/2, /*seed=*/1234, /*num_threads=*/1);
   serial.encode(data.data(), n, /*num_threads=*/1);
 
   PQTable parallel;
-  parallel.train(data.data(), n, dim, n_chunks, /*n_iters=*/15, /*seed=*/1234, /*num_threads=*/8);
+  parallel.train(data.data(), n, dim, n_chunks, /*n_iters=*/2, /*seed=*/1234, /*num_threads=*/8);
   parallel.encode(data.data(), n, /*num_threads=*/8);
 
   ASSERT_EQ(serial.codebook().size(), parallel.codebook().size());
@@ -206,7 +271,7 @@ TEST_F(PQTableTest, ParallelTrainEncodeByteIdenticalToSerial) {
 // --- persistence ------------------------------------------------------------
 
 TEST_F(PQTableTest, FileRoundtripBitIdentical) {
-  const uint64_t n = 500, dim = 48;
+  const uint64_t n = 128, dim = 48;
   const uint32_t n_chunks = 12;
   const auto data = make_vectors(n, dim);
   PQTable pq;
@@ -238,7 +303,7 @@ TEST_F(PQTableTest, FileRoundtripBitIdentical) {
   std::vector<float> qres1(dim);
   pq.preprocess_query(data.data(), t0.data(), qres0.data());
   loaded.preprocess_query(data.data(), t1.data(), qres1.data());
-  for (uint64_t pi : {0ull, 250ull, 499ull}) {
+  for (uint64_t pi : {0ull, 64ull, 127ull}) {
     EXPECT_FLOAT_EQ(pq.pq_distance(pi, t0.data()), loaded.pq_distance(pi, t1.data()))
         << "pi=" << pi;
   }

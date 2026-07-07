@@ -13,7 +13,9 @@ import yaml
 ROOT = Path(__file__).resolve().parents[3]
 WORKFLOWS = ROOT / ".github" / "workflows"
 CONAN_CACHE_ACTION = ROOT / ".github" / "actions" / "cache-restore" / "action.yaml"
-CMAKE_LISTS = ROOT / "CMakeLists.txt"
+# Build switches and compile flags live in dedicated cmake/ modules (see CMakeLists.txt for the map).
+CMAKE_OPTIONS_MODULE = ROOT / "cmake" / "AlayaOptions.cmake"
+CMAKE_FLAGS_MODULE = ROOT / "cmake" / "AlayaFlags.cmake"
 PYPROJECT = ROOT / "pyproject.toml"
 PRINT_SUMMARY = ROOT / "cmake" / "PrintSummary.cmake"
 
@@ -78,14 +80,16 @@ def test_conan_cache_action_uses_explicit_restore_and_save() -> None:
     assert "actions/cache/save@v4" not in uses_values
 
 
-def test_conan_cache_key_includes_install_script_and_target_arch() -> None:
+def test_conan_cache_key_includes_dependency_drivers_and_target_arch() -> None:
     action = _yaml(CONAN_CACHE_ACTION)
     restore_step = next(step for step in action["runs"]["steps"] if step.get("uses") == "actions/cache/restore@v5")
     key = restore_step["with"]["key"]
 
     assert "${{ inputs.target-arch }}" in key
-    assert "scripts/conan_build/conan_install.py" in key
-    assert key.startswith("conan-v2-")
+    # Dependency resolution goes through the vendored Conan provider; the cache key must track it.
+    assert "conanfile.py" in key
+    assert "cmake/vendor/conan_provider.cmake" in key
+    assert key.startswith("conan-v3-")
 
 
 def test_workflow_conan_cache_calls_are_arch_scoped_and_nonfatal_on_save_race() -> None:
@@ -172,7 +176,6 @@ def test_codecov_workflow_keeps_coverage_trigger_scope() -> None:
         "python/CMakeLists.txt",
         "cmake/**",
         "scripts/ci/codecov/**",
-        "scripts/conan_build/**",
         "codecov.yml",
     ]
 
@@ -228,7 +231,7 @@ def test_codecov_python_restores_legacy_unit_test_cache() -> None:
 
 
 def test_cmake_defaults_to_portable_native_arch_and_guards_packages() -> None:
-    cmake_text = CMAKE_LISTS.read_text(encoding="utf-8")
+    cmake_text = CMAKE_OPTIONS_MODULE.read_text(encoding="utf-8")
 
     assert 'option(ALAYA_NATIVE_ARCH "Compile with -march=native for host-specific builds" OFF)' in cmake_text
     assert "option(ALAYA_ALLOW_NATIVE_PACKAGE" in cmake_text
@@ -248,7 +251,7 @@ def test_native_arch_option_name_is_used_consistently() -> None:
 
 
 def test_portable_cmake_uses_avx2_baseline_without_native_or_avx512() -> None:
-    cmake_text = CMAKE_LISTS.read_text(encoding="utf-8")
+    cmake_text = CMAKE_FLAGS_MODULE.read_text(encoding="utf-8")
 
     assert "list(APPEND ALAYA_SIMD_COMPILE_OPTIONS -mavx2 -mfma)" in cmake_text
     assert "list(APPEND ALAYA_SIMD_COMPILE_OPTIONS -mavx512" not in cmake_text

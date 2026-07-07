@@ -151,6 +151,11 @@ class AlignedFileReader {
   // Implementations must not throw when no completions are ready, but may throw
   // for genuine backend errors such as an invalid context.
   virtual int poll_events(IOContext &ctx, int max_events, std::vector<AlignedReadEvent> &out) = 0;
+
+  // Raw file descriptor of the opened file, or -1 when the backend has none
+  // (the update-path io_uring reactor reads the index through this fd so its
+  // waves keep the reader's O_DIRECT semantics).
+  virtual int get_fd() const { return -1; }
 };
 
 #if defined(ALAYA_LASER_USE_LIBAIO)
@@ -186,10 +191,34 @@ class LinuxAlignedFileReader : public AlignedFileReader {
   int submit_reqs(std::vector<AlignedRead> &read_reqs, IOContext &ctx) override;
   int get_events(IOContext &ctx, int n_ops, std::vector<AlignedReadEvent> &out) override;
   int poll_events(IOContext &ctx, int max_events, std::vector<AlignedReadEvent> &out) override;
+
+  int get_fd() const override { return file_desc_; }
 };
 
 using io_event_t = struct io_event;
 using iocb_t = struct iocb;
+
+/// io_getevents that keeps waiting until exactly @p want events arrive.
+/// A blocking io_getevents may legally return a PARTIAL batch when the calling
+/// thread is interrupted — by a POSIX signal, or by the kernel's TWA_SIGNAL
+/// task_work that an io_uring elsewhere in the process uses to run completions
+/// (e.g. the DiskANN update reactor). A partial delivery cannot be restarted
+/// transparently by the kernel, so the caller must drain the remainder itself.
+inline void io_getevents_exact(io_context_t ctx, io_event_t *evts, int64_t want, const char *who) {
+  int64_t got = 0;
+  while (got < want) {
+    const int64_t ret = io_getevents(ctx, want - got, want - got, evts + got, nullptr);
+    if (ret < 0) {
+      if (ret == -EINTR) {
+        continue;
+      }
+      throw std::runtime_error(std::string(who) + ": io_getevents() failed; returned " +
+                               std::to_string(ret) + " (" + ::strerror(static_cast<int>(-ret)) +
+                               ")");
+    }
+    got += ret;
+  }
+}
 
 inline void execute_io(io_context_t ctx,
                        int fd,
@@ -235,21 +264,9 @@ inline void execute_io(io_context_t ctx,
                                  ", errno=" + std::to_string(errno) + "=" +
                                  ::strerror(static_cast<int>(-ret)));
       } else {
-        // wait on io_getevents
-        ret = io_getevents(ctx,
-                           static_cast<int64_t>(n_ops),
-                           static_cast<int64_t>(n_ops),
-                           evts.data(),
-                           nullptr);
-        // if requests didn't complete
-        if (ret != static_cast<int64_t>(n_ops)) {
-          throw std::runtime_error("LinuxAlignedFileReader: io_getevents() failed; returned " +
-                                   std::to_string(ret) + ", expected=" + std::to_string(n_ops) +
-                                   ", errno=" + std::to_string(errno) + "=" +
-                                   ::strerror(static_cast<int>(-ret)));
-        } else {
-          break;
-        }
+        // wait for the whole batch (drains partial deliveries after interrupts)
+        io_getevents_exact(ctx, evts.data(), static_cast<int64_t>(n_ops), "LinuxAlignedFileReader");
+        break;
       }
     }
   }
@@ -414,23 +431,17 @@ inline int LinuxAlignedFileReader::get_events(IOContext &ctx,
                                               int n_ops,
                                               std::vector<AlignedReadEvent> &out) {
   std::vector<io_event> evts(n_ops);
-  auto ret = io_getevents(ctx,
-                          static_cast<int64_t>(n_ops),
-                          static_cast<int64_t>(n_ops),
-                          evts.data(),
-                          nullptr);
-  if (ret != static_cast<int64_t>(n_ops)) {
-    throw std::runtime_error(
-        "LinuxAlignedFileReader::get_events: io_getevents() failed; returned " +
-        std::to_string(ret));
-  }
+  io_getevents_exact(ctx,
+                     evts.data(),
+                     static_cast<int64_t>(n_ops),
+                     "LinuxAlignedFileReader::get_events");
   out.clear();
-  out.reserve(static_cast<size_t>(ret));
-  for (int64_t i = 0; i < ret; ++i) {
+  out.reserve(static_cast<size_t>(n_ops));
+  for (int64_t i = 0; i < n_ops; ++i) {
     out.push_back({static_cast<uint64_t>(reinterpret_cast<uintptr_t>(evts[i].data)),
                    static_cast<int64_t>(evts[i].res)});
   }
-  return static_cast<int>(ret);
+  return n_ops;
 }
 
 inline int LinuxAlignedFileReader::poll_events(IOContext &ctx,
@@ -442,7 +453,10 @@ inline int LinuxAlignedFileReader::poll_events(IOContext &ctx,
   }
 
   std::vector<io_event> evts(static_cast<size_t>(max_events));
-  auto ret = io_getevents(ctx, 0, static_cast<int64_t>(max_events), evts.data(), nullptr);
+  int64_t ret = 0;
+  do {  // non-blocking poll; -EINTR just means "try again"
+    ret = io_getevents(ctx, 0, static_cast<int64_t>(max_events), evts.data(), nullptr);
+  } while (ret == -EINTR);
   if (ret < 0) {
     throw std::runtime_error(
         "LinuxAlignedFileReader::poll_events: io_getevents() failed; returned " +

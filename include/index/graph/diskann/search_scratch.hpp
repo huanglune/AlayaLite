@@ -81,6 +81,12 @@ struct ThreadData {
   uint32_t nbrs_slot_len = 0;
   std::vector<uint32_t> nbrs_free_offsets;
   std::vector<InFlightSlot> inflight;  ///< indexed by scratch page slot
+  std::vector<AlignedRead> io_reqs;
+  std::vector<AlignedReadEvent> io_events;
+  std::vector<uint64_t> free_page_slots;
+  std::vector<AlignedRead> rerank_reqs;
+  std::vector<uint64_t> slot_versions;    ///< page slot -> shard page version at submit
+  std::vector<uint64_t> io_req_versions;  ///< parallel to io_reqs (barrier modes)
 
   // --- I/O scratch (allocated once, reused) ---
   char *sector_scratch = nullptr;  ///< n_page_slots * page_size bytes, sector-aligned.
@@ -88,6 +94,15 @@ struct ThreadData {
                                    ///< depth equals the slot count (PQ caps in-flight at
                                    ///< beam_width, so it ignores the surplus).
   uint64_t sector_scratch_bytes = 0;
+  char *wave_scratch = nullptr;  ///< Reactor wave buffer for the async update search
+                                 ///< (one page per neighbor of an expansion). Kept apart
+                                 ///< from sector_scratch so the sync pipelines' depth —
+                                 ///< which equals the sector slot count — is untouched.
+  uint64_t wave_scratch_bytes = 0;
+  char *peek_scratch = nullptr;  ///< One page for update-page-cache hits served inline
+                                 ///< by the pipelined searches (consumed immediately by
+                                 ///< process/absorb, so a single page suffices).
+  uint64_t peek_scratch_bytes = 0;
   IOContext ctx_{};  ///< AIO context (owned via reader.register_thread())
 
   void resize_slot_capacity(uint64_t max_slot_id) {
@@ -132,7 +147,43 @@ struct ThreadData {
     nbrs_dirty.reserve(config.search_list_size);
     nbrs_free_offsets.reserve(config.search_list_size);
     inflight.assign(config.n_page_slots, {});
+    io_reqs.reserve(config.n_page_slots);
+    io_events.reserve(config.n_page_slots);
+    free_page_slots.reserve(config.n_page_slots);
+    rerank_reqs.resize(1);
+    slot_versions.assign(config.n_page_slots, 0);
+    io_req_versions.reserve(config.n_page_slots);
     reset_neighbors();
+  }
+
+  /// Lazily allocate the single-page peek buffer (sector-aligned).
+  void ensure_peek_scratch(uint64_t bytes) {
+    if (peek_scratch_bytes >= bytes) {
+      return;
+    }
+    if (peek_scratch != nullptr) {
+      alaya::laser::memory::align_free(peek_scratch);
+      peek_scratch = nullptr;
+      peek_scratch_bytes = 0;
+    }
+    peek_scratch =
+        reinterpret_cast<char *>(alaya::laser::memory::align_allocate<kSectorLen>(bytes));
+    peek_scratch_bytes = bytes;
+  }
+
+  /// Grow the wave buffer to at least @p bytes (sector-aligned; contents lost).
+  void ensure_wave_scratch(uint64_t bytes) {
+    if (wave_scratch_bytes >= bytes) {
+      return;
+    }
+    if (wave_scratch != nullptr) {
+      alaya::laser::memory::align_free(wave_scratch);
+      wave_scratch = nullptr;
+      wave_scratch_bytes = 0;
+    }
+    wave_scratch =
+        reinterpret_cast<char *>(alaya::laser::memory::align_allocate<kSectorLen>(bytes));
+    wave_scratch_bytes = bytes;
   }
 
   void set_exact_dist(uint32_t id, float distance) {
@@ -235,6 +286,16 @@ struct ThreadData {
       sector_scratch = nullptr;
     }
     sector_scratch_bytes = 0;
+    if (wave_scratch != nullptr) {
+      alaya::laser::memory::align_free(wave_scratch);
+      wave_scratch = nullptr;
+    }
+    wave_scratch_bytes = 0;
+    if (peek_scratch != nullptr) {
+      alaya::laser::memory::align_free(peek_scratch);
+      peek_scratch = nullptr;
+    }
+    peek_scratch_bytes = 0;
   }
 
  private:

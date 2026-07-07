@@ -8,8 +8,6 @@ This module provides the M3eEmbedder class for creating embeddings using M3E mod
 
 from typing import List, Tuple
 
-from sentence_transformers import SentenceTransformer
-
 from .base import BaseEmbedding
 
 
@@ -23,6 +21,13 @@ class M3eEmbedder(BaseEmbedding):
         Args:
             path (str): The model path or name for the M3E sentence-transformer model.
         """
+        try:
+            from sentence_transformers import SentenceTransformer  # pylint: disable=import-outside-toplevel
+        except ImportError as exc:
+            raise ImportError(
+                "M3eEmbedder requires the optional RAG dependencies; install with: pip install 'alayalite[rag]'"
+            ) from exc
+
         super().__init__(path)
         self.model = SentenceTransformer(path)
 

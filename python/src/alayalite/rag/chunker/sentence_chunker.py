@@ -6,14 +6,9 @@
 This module provides the SentenceChunker class for splitting text into sentence-based chunks.
 """
 
-import os
 import re
-import sys
 
-from rag.chunker.base import BaseChunker
-
-parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-sys.path.append(parent_dir)
+from .base import BaseChunker
 
 
 class SentenceChunker(BaseChunker):

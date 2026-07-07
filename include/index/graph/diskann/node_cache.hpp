@@ -13,18 +13,24 @@
  * @c cache_nodes.bin. At load time the records are read into memory and indexed
  * for O(1) lookup, so a cache hit during beam search costs zero disk I/O.
  *
- * The cache is immutable after generate()/load(); concurrent search threads
- * only borrow read-only pointers into it.
+ * Build-time records stay immutable after generate()/load(). In-place updates
+ * publish per-node override records so concurrent search never observes a
+ * partially-written cached node.
  */
 
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
+#include <memory>
+#include <mutex>
 #include <queue>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -44,6 +50,14 @@ namespace alaya::diskann {
 class NodeCache {
  public:
   NodeCache() = default;
+
+  struct Lookup {
+    const char *record = nullptr;
+    std::shared_ptr<const std::vector<char>> owned;
+
+    [[nodiscard]] const char *get() const { return record; }
+    [[nodiscard]] explicit operator bool() const { return record != nullptr; }
+  };
 
   /**
    * @brief Select and pack the BFS cache from an in-memory graph + vectors.
@@ -75,6 +89,8 @@ class NodeCache {
     }
 
     const DiskLayoutGeometry geom = DiskLayoutGeometry::compute(dim, max_degree);
+    dim_ = dim;
+    max_degree_ = max_degree;
     node_len_ = geom.node_len;
 
     uint64_t target = 0;
@@ -88,6 +104,7 @@ class NodeCache {
     ids_.clear();
     map_.clear();
     node_data_.clear();
+    clear_overrides_unsafe();
     if (target == 0) {
       return;
     }
@@ -128,7 +145,20 @@ class NodeCache {
 
   /// Write cache_ids.bin and cache_nodes.bin.
   void save(const std::string &ids_path, const std::string &nodes_path) const {
-    const uint64_t count = ids_.size();
+    std::vector<uint32_t> ids = ids_;
+    std::vector<uint32_t> extra_ids;
+    for (const auto &shard : override_shards_) {
+      std::shared_lock<std::shared_mutex> lock(shard.mutex);
+      for (const auto &entry : shard.map) {
+        if (map_.find(entry.first) == map_.end()) {
+          extra_ids.push_back(entry.first);
+        }
+      }
+    }
+    std::sort(extra_ids.begin(), extra_ids.end());
+    ids.insert(ids.end(), extra_ids.begin(), extra_ids.end());
+
+    const uint64_t count = ids.size();
     {
       std::ofstream out(ids_path, std::ios::binary | std::ios::trunc);
       if (!out) {
@@ -136,7 +166,7 @@ class NodeCache {
       }
       out.write(reinterpret_cast<const char *>(&count), sizeof(count));
       if (count > 0) {
-        out.write(reinterpret_cast<const char *>(ids_.data()),
+        out.write(reinterpret_cast<const char *>(ids.data()),
                   static_cast<std::streamsize>(count * sizeof(uint32_t)));
       }
       if (!out) {
@@ -150,8 +180,14 @@ class NodeCache {
       }
       out.write(reinterpret_cast<const char *>(&count), sizeof(count));
       out.write(reinterpret_cast<const char *>(&node_len_), sizeof(node_len_));
-      if (!node_data_.empty()) {
-        out.write(node_data_.data(), static_cast<std::streamsize>(node_data_.size()));
+      for (const uint32_t id : ids) {
+        const auto override = find_override(id);  // hold ownership across the write
+        const char *record = override != nullptr ? override->data() : find_base_record(id);
+        if (record == nullptr) {
+          throw std::runtime_error("NodeCache::save: missing cached record for id " +
+                                   std::to_string(id));
+        }
+        out.write(record, static_cast<std::streamsize>(node_len_));
       }
       if (!out) {
         throw std::runtime_error("NodeCache::save: write failed for " + nodes_path);
@@ -211,6 +247,18 @@ class NodeCache {
     for (size_t i = 0; i < ids_.size(); ++i) {
       map_[ids_[i]] = i * node_len_;
     }
+    clear_overrides_unsafe();
+  }
+
+  void configure_geometry(uint64_t dim, uint32_t max_degree) {
+    // Load-time only (before any concurrent runtime access).
+    const DiskLayoutGeometry geom = DiskLayoutGeometry::compute(dim, max_degree);
+    if (node_len_ != 0 && node_len_ != geom.node_len) {
+      throw std::invalid_argument("NodeCache::configure_geometry: node_len mismatch");
+    }
+    dim_ = dim;
+    max_degree_ = max_degree;
+    node_len_ = geom.node_len;
   }
 
   // --- Runtime lookup ------------------------------------------------------
@@ -220,7 +268,117 @@ class NodeCache {
    * @return Pointer to the node's @c node_len -byte record, or nullptr on miss.
    *         The returned pointer is read-only and owned by this cache.
    */
+  [[nodiscard]] Lookup lookup_record(uint32_t node_id) const {
+    auto override = find_override(node_id);
+    if (override != nullptr) {
+      Lookup hit;
+      hit.owned = std::move(override);
+      hit.record = hit.owned->data();
+      return hit;
+    }
+    // Base records are immutable after generate()/load(): lock-free read.
+    return Lookup{find_base_record(node_id), {}};
+  }
+
   [[nodiscard]] const char *lookup(uint32_t node_id) const {
+    const Lookup hit = lookup_record(node_id);
+    return hit.get();
+  }
+
+  void upsert_node(uint32_t node_id,
+                   const float *coords,
+                   uint32_t n_nbrs,
+                   const uint32_t *nbr_ids) {
+    validate_record_input(coords, n_nbrs, nbr_ids, "NodeCache::upsert_node");
+    auto record = make_record(coords, n_nbrs, nbr_ids);
+    OverrideShard &shard = override_shard(node_id);
+    std::unique_lock<std::shared_mutex> lock(shard.mutex);
+    shard.map[node_id] = std::move(record);
+  }
+
+  void update_neighbors(uint32_t node_id, uint32_t n_nbrs, const uint32_t *nbr_ids) {
+    validate_neighbors_input(n_nbrs, nbr_ids, "NodeCache::update_neighbors");
+    std::vector<float> coords;
+    {
+      const auto override = find_override(node_id);
+      const char *record = override != nullptr ? override->data() : find_base_record(node_id);
+      if (record == nullptr) {
+        return;
+      }
+      coords.assign(reinterpret_cast<const float *>(record),
+                    reinterpret_cast<const float *>(record) + dim_);
+    }
+    upsert_node(node_id, coords.data(), n_nbrs, nbr_ids);
+  }
+
+  /// Drop override records for nodes that are NOT pinned in the BFS hot cache.
+  /// Only safe when the on-disk pages are current (i.e. right after a flush):
+  /// a dropped node falls back to the disk read path, while a hot-cached
+  /// node's base record predates its updates, so its override must stay.
+  /// Bounds override memory the way Yi's write-back bounds its dirty set.
+  void drop_disk_backed_overrides() {
+    for (auto &shard : override_shards_) {
+      std::unique_lock<std::shared_mutex> lock(shard.mutex);
+      for (auto it = shard.map.begin(); it != shard.map.end();) {
+        if (map_.find(it->first) == map_.end()) {
+          it = shard.map.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+  }
+
+  // --- Accessors -----------------------------------------------------------
+
+  [[nodiscard]] uint64_t size() const {
+    uint64_t count = ids_.size();
+    for (const auto &shard : override_shards_) {
+      std::shared_lock<std::shared_mutex> lock(shard.mutex);
+      for (const auto &entry : shard.map) {
+        if (map_.find(entry.first) == map_.end()) {
+          ++count;
+        }
+      }
+    }
+    return count;
+  }
+  [[nodiscard]] uint64_t node_len() const { return node_len_; }
+  [[nodiscard]] const std::vector<uint32_t> &ids() const { return ids_; }
+
+ private:
+  void validate_neighbors_input(uint32_t n_nbrs, const uint32_t *nbr_ids, const char *name) const {
+    if (dim_ == 0 || node_len_ == 0) {
+      throw std::runtime_error(std::string(name) + ": cache geometry is not configured");
+    }
+    if (n_nbrs > max_degree_) {
+      throw std::invalid_argument(std::string(name) + ": n_nbrs exceeds max_degree");
+    }
+    if (n_nbrs > 0 && nbr_ids == nullptr) {
+      throw std::invalid_argument(std::string(name) + ": null neighbor ids");
+    }
+  }
+
+  void validate_record_input(const float *coords,
+                             uint32_t n_nbrs,
+                             const uint32_t *nbr_ids,
+                             const char *name) const {
+    if (coords == nullptr) {
+      throw std::invalid_argument(std::string(name) + ": null coords");
+    }
+    validate_neighbors_input(n_nbrs, nbr_ids, name);
+  }
+
+  std::shared_ptr<const std::vector<char>> make_record(const float *coords,
+                                                       uint32_t n_nbrs,
+                                                       const uint32_t *nbr_ids) const {
+    auto record = std::make_shared<std::vector<char>>(node_len_, 0);
+    pack_node_record(record->data(), coords, nbr_ids, n_nbrs, dim_);
+    return record;
+  }
+
+  /// Base records are immutable after generate()/load(): lock-free.
+  [[nodiscard]] const char *find_base_record(uint32_t node_id) const {
     const auto it = map_.find(node_id);
     if (it == map_.end()) {
       return nullptr;
@@ -228,17 +386,45 @@ class NodeCache {
     return node_data_.data() + it->second;
   }
 
-  // --- Accessors -----------------------------------------------------------
+  /// Overrides are sharded by node id: reconnect-heavy update workloads take
+  /// a unique lock per published node, and one global mutex was measured to
+  /// invert thread scaling (more workers -> lower throughput). The base cache
+  /// (ids_/map_/node_data_) is immutable after generate()/load() and is read
+  /// lock-free.
+  static constexpr uint32_t kOverrideShards = 64;
 
-  [[nodiscard]] uint64_t size() const { return ids_.size(); }
-  [[nodiscard]] uint64_t node_len() const { return node_len_; }
-  [[nodiscard]] const std::vector<uint32_t> &ids() const { return ids_; }
+  struct OverrideShard {
+    mutable std::shared_mutex mutex;
+    std::unordered_map<uint32_t, std::shared_ptr<const std::vector<char>>> map;
+  };
 
- private:
+  OverrideShard &override_shard(uint32_t node_id) const {
+    return override_shards_[node_id % kOverrideShards];
+  }
+
+  [[nodiscard]] std::shared_ptr<const std::vector<char>> find_override(uint32_t node_id) const {
+    const OverrideShard &shard = override_shard(node_id);
+    std::shared_lock<std::shared_mutex> lock(shard.mutex);
+    const auto it = shard.map.find(node_id);
+    if (it == shard.map.end()) {
+      return nullptr;
+    }
+    return it->second;
+  }
+
+  void clear_overrides_unsafe() {
+    for (auto &shard : override_shards_) {
+      shard.map.clear();
+    }
+  }
+
+  uint64_t dim_ = 0;
+  uint32_t max_degree_ = 0;
   uint64_t node_len_ = 0;
   std::vector<uint32_t> ids_;                   // cached node ids, BFS order
   std::vector<char> node_data_;                 // size() * node_len_ bytes
   std::unordered_map<uint32_t, uint64_t> map_;  // node_id -> byte offset in node_data_
+  mutable std::array<OverrideShard, kOverrideShards> override_shards_;
 };
 
 }  // namespace alaya::diskann

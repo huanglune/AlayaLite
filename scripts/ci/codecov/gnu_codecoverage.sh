@@ -15,6 +15,13 @@ if [[ -n "${CMAKE_CXX_COMPILER_LAUNCHER:-}" ]]; then
   CMAKE_LAUNCHER_ARGS+=("-DCMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER}")
 fi
 
+# The configure step resolves C++ dependencies through the Conan dependency provider, which needs
+# the `conan` CLI on PATH. Self-provision on CI runners (uv is always present there).
+if ! command -v conan >/dev/null 2>&1; then
+  uv tool install conan
+  export PATH="$(uv tool dir)/conan/bin:$HOME/.local/bin:$PATH"
+fi
+
 COVERAGE_TARGETS=(
   coro_test
   search_test
@@ -44,6 +51,7 @@ COVERAGE_TARGETS=(
   storage_test
   static_storage_test
   rocksdb_storage_test
+  uring_reactor_test
   query_utils_test
   log_test
   evaluate_test

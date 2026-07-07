@@ -16,7 +16,6 @@ on  :
     - python/CMakeLists.txt
     - cmake/**
     - scripts/ci/codecov/**
-    - scripts/conan_build/**
     - codecov.yml
   push:
     branches: [main]
@@ -33,7 +32,6 @@ on  :
     - python/CMakeLists.txt
     - cmake/**
     - scripts/ci/codecov/**
-    - scripts/conan_build/**
     - codecov.yml
 
 jobs:
@@ -64,8 +62,7 @@ jobs:
       with:
         key: >-
           codecov-python-portable-v3-${{ runner.os }}-${{ runner.arch }}-Release-${{ hashFiles('CMakeLists.txt',
-          'python/CMakeLists.txt', 'conanfile.py', 'scripts/conan_build/conan_install.py',
-          'scripts/conan_build/conan_profile*', 'cmake/**/*.cmake') }}
+          'python/CMakeLists.txt', 'conanfile.py', 'cmake/**/*.cmake') }}
         restore-keys: |
           codecov-python-portable-v3-${{ runner.os }}-${{ runner.arch }}-Release-
           py-unit-portable-v2-${{ runner.os }}-${{ runner.arch }}-Release-
@@ -146,8 +143,7 @@ jobs:
       with:
         key: >-
           codecov-cpp-portable-v2-${{ runner.os }}-${{ runner.arch }}-Debug-${{ hashFiles('CMakeLists.txt',
-          'tests/CMakeLists.txt', 'conanfile.py', 'scripts/conan_build/conan_install.py',
-          'scripts/conan_build/conan_profile*', 'cmake/**/*.cmake', 'scripts/ci/codecov/gnu_codecoverage.sh') }}
+          'tests/CMakeLists.txt', 'conanfile.py', 'cmake/**/*.cmake', 'scripts/ci/codecov/gnu_codecoverage.sh') }}
         restore-keys: |
           codecov-cpp-portable-v2-${{ runner.os }}-${{ runner.arch }}-Debug-
 

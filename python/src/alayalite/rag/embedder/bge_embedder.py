@@ -8,8 +8,6 @@ This module provides the BgeEmbedder class for creating embeddings using BAAI's 
 
 from typing import List, Tuple
 
-from FlagEmbedding import BGEM3FlagModel
-
 from .base import BaseEmbedding
 
 
@@ -23,6 +21,13 @@ class BgeEmbedder(BaseEmbedding):
         Args:
             path (str): The model path or name for the BGE model.
         """
+        try:
+            from FlagEmbedding import BGEM3FlagModel  # pylint: disable=import-outside-toplevel
+        except ImportError as exc:
+            raise ImportError(
+                "BgeEmbedder requires the optional RAG dependencies; install with: pip install 'alayalite[rag]'"
+            ) from exc
+
         super().__init__(path)
         # For bge-m3, it is recommended to use BGEM3FlagModel.
         self.model = BGEM3FlagModel(model_name_or_path=self.path, use_fp16=False)

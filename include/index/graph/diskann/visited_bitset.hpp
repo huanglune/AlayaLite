@@ -5,7 +5,6 @@
 #pragma once
 
 #include <cstdint>
-#include <cstring>
 #include <stdexcept>
 #include <vector>
 
@@ -16,12 +15,14 @@ class VisitedBitset {
   void resize(uint64_t max_slot_id) {
     n_bits_ = max_slot_id;
     words_.assign(word_count_for(max_slot_id), 0);
+    dirty_words_.clear();
   }
 
   void clear() {
-    if (!words_.empty()) {
-      std::memset(words_.data(), 0, words_.size() * sizeof(uint64_t));
+    for (const uint32_t w : dirty_words_) {
+      words_[w] = 0;
     }
+    dirty_words_.clear();
   }
 
   [[nodiscard]] bool test(uint32_t id) const {
@@ -32,12 +33,19 @@ class VisitedBitset {
 
   void set(uint32_t id) {
     ensure_in_range(id);
-    words_[id >> kWordShift] |= bit_mask(id);
+    uint64_t &word = words_[id >> kWordShift];
+    if (word == 0) {
+      dirty_words_.push_back(id >> kWordShift);
+    }
+    word |= bit_mask(id);
   }
 
   [[nodiscard]] bool test_and_set(uint32_t id) {
     ensure_in_range(id);
     uint64_t &word = words_[id >> kWordShift];
+    if (word == 0) {
+      dirty_words_.push_back(id >> kWordShift);
+    }
     const uint64_t mask = bit_mask(id);
     const bool was_set = (word & mask) != 0;
     word |= mask;
@@ -65,6 +73,10 @@ class VisitedBitset {
 
   uint64_t n_bits_ = 0;
   std::vector<uint64_t> words_;
+  /// Indices of every nonzero word (recorded on the 0 -> nonzero transition,
+  /// so no duplicates). Lets clear() cost O(bits set) instead of a full-array
+  /// memset, which at large slot counts is megabytes per query.
+  std::vector<uint32_t> dirty_words_;
 };
 
 }  // namespace alaya::diskann

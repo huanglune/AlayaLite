@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "simd/distance_l2.hpp"
+#include "utils/prefetch.hpp"
 
 namespace alaya::diskann {
 
@@ -187,13 +188,9 @@ class PQTable {
         const uint64_t end = std::min<uint64_t>(start + kBlock, n);
         for (uint64_t i = start; i < end; ++i) {
           const float *v = data + i * dim_;
-          for (uint64_t d = 0; d < dim_; ++d) {
-            r[d] = v[d] - global_centroid_[d];
-          }
+          build_residual(v, r.data());
           uint8_t *code_row = codes_.data() + i * n_chunks_;
-          for (uint32_t c = 0; c < n_chunks_; ++c) {
-            code_row[c] = nearest_centroid(r.data() + static_cast<uint64_t>(c) * chunk_dim_, c);
-          }
+          encode_residual_to_row(r.data(), code_row);
         }
       }
     };
@@ -209,6 +206,40 @@ class PQTable {
         th.join();
       }
     }
+    build_symmetric_distance_table();
+  }
+
+  /// Encode one vector into @p point_id, overwriting existing slots or growing
+  /// the code table for append-style updates.
+  void encode_one(const float *vector, uint64_t point_id) {
+    if (codebook_.empty()) {
+      throw std::logic_error("PQTable::encode_one: not trained");
+    }
+    if (vector == nullptr) {
+      throw std::invalid_argument("PQTable::encode_one: vector is null");
+    }
+    ensure_l2();
+    const uint64_t new_points = point_id + 1;
+    if (new_points > num_points_) {
+      codes_.resize(static_cast<size_t>(new_points) * n_chunks_, 0);
+      num_points_ = new_points;
+    }
+    std::vector<float> residual(dim_);
+    build_residual(vector, residual.data());
+    encode_residual_to_row(residual.data(), codes_.data() + point_id * n_chunks_);
+  }
+
+  /// Encode one vector into a caller-owned code row without mutating the table.
+  void encode_to_code(const float *vector, uint8_t *code_out) const {
+    if (codebook_.empty()) {
+      throw std::logic_error("PQTable::encode_to_code: not trained");
+    }
+    if (vector == nullptr || code_out == nullptr) {
+      throw std::invalid_argument("PQTable::encode_to_code: null input/output");
+    }
+    std::vector<float> residual(dim_);
+    build_residual(vector, residual.data());
+    encode_residual_to_row(residual.data(), code_out);
   }
 
   // --- Search-time ---------------------------------------------------------
@@ -250,6 +281,81 @@ class PQTable {
     float sum = 0.0f;
     for (uint32_t c = 0; c < n_chunks_; ++c) {
       sum += dist_table[static_cast<size_t>(c) * kPQNumCentroids + code_row[c]];
+    }
+    return sum;
+  }
+
+  /**
+   * @brief Batch asymmetric PQ distances for @p n stored points
+   *        (gather-then-transposed-accumulate, Yi's eval kernel shape).
+   *
+   * Pass 1 gathers the code rows into a contiguous stack tile with software
+   * prefetch — the only random touches of the multi-GB code array, and they
+   * overlap instead of stalling a dependent chain the way per-point
+   * pq_distance() calls do. Pass 2 accumulates chunk-major, so one 1 KiB
+   * dist_table row stays L1-hot across all candidates and the inner loop
+   * vectorizes. Bit-identical to n pq_distance() calls: each point sums the
+   * same values in the same chunk-ascending order.
+   */
+  void pq_distance_batch(const uint32_t *point_ids,
+                         uint32_t n,
+                         const float *dist_table,
+                         float *out) const {
+    constexpr uint32_t kTilePoints = 96;  // >= max node degree; a few KiB of stack
+    constexpr uint32_t kTileChunks = 64;  // codes tile is kTilePoints * kTileChunks
+    if (n_chunks_ > kTileChunks) {        // exotic config: keep the scalar path
+      for (uint32_t i = 0; i < n; ++i) {
+        out[i] = pq_distance(point_ids[i], dist_table);
+      }
+      return;
+    }
+    const uint8_t *base = codes_.data();
+    uint8_t tile[kTilePoints * kTileChunks];
+    for (uint32_t off = 0; off < n; off += kTilePoints) {
+      const uint32_t m = std::min(kTilePoints, n - off);
+      for (uint32_t i = 0; i < m; ++i) {
+        if (i + 4 < m) {
+          alaya::prefetch_l3(base + static_cast<size_t>(point_ids[off + i + 4]) * n_chunks_);
+        }
+        std::memcpy(tile + static_cast<size_t>(i) * n_chunks_,
+                    base + static_cast<size_t>(point_ids[off + i]) * n_chunks_,
+                    n_chunks_);
+      }
+      float *o = out + off;
+      std::fill_n(o, m, 0.0F);
+      for (uint32_t c = 0; c < n_chunks_; ++c) {
+        const float *row = dist_table + static_cast<size_t>(c) * kPQNumCentroids;
+        for (uint32_t i = 0; i < m; ++i) {
+          o[i] += row[tile[static_cast<size_t>(i) * n_chunks_ + c]];
+        }
+      }
+    }
+  }
+
+  /// Symmetric PQ distance between two stored code rows.
+  [[nodiscard]] float pq_symmetric_distance(uint64_t lhs, uint64_t rhs) const {
+    if (lhs >= num_points_ || rhs >= num_points_) {
+      throw std::out_of_range("PQTable::pq_symmetric_distance: point id out of range");
+    }
+    return pq_symmetric_distance(codes_.data() + lhs * n_chunks_, rhs);
+  }
+
+  /// Symmetric PQ distance from a caller-owned code row to a stored point.
+  [[nodiscard]] float pq_symmetric_distance(const uint8_t *lhs_code, uint64_t rhs) const {
+    if (lhs_code == nullptr) {
+      throw std::invalid_argument("PQTable::pq_symmetric_distance: lhs_code is null");
+    }
+    if (rhs >= num_points_) {
+      throw std::out_of_range("PQTable::pq_symmetric_distance: point id out of range");
+    }
+    if (sym_dists_.empty()) {
+      throw std::logic_error("PQTable::pq_symmetric_distance: symmetric table not built");
+    }
+    const uint8_t *rhs_code = codes_.data() + rhs * n_chunks_;
+    float sum = 0.0f;
+    for (uint32_t c = 0; c < n_chunks_; ++c) {
+      const size_t off = static_cast<size_t>(c) * kPQNumCentroids * kPQNumCentroids;
+      sum += sym_dists_[off + static_cast<size_t>(lhs_code[c]) * kPQNumCentroids + rhs_code[c]];
     }
     return sum;
   }
@@ -357,6 +463,7 @@ class PQTable {
     if (!cin) {
       throw std::runtime_error("PQTable::load: short read on " + compressed_path);
     }
+    build_symmetric_distance_table();
   }
 
   /// Build a table directly from arrays (used by tests and external codebooks).
@@ -380,6 +487,7 @@ class PQTable {
     t.global_centroid_ = std::move(global_centroid);
     t.codebook_ = std::move(codebook);
     t.ensure_l2();
+    t.build_symmetric_distance_table();
     return t;
   }
 
@@ -404,6 +512,39 @@ class PQTable {
   [[nodiscard]] uint8_t nearest_centroid(const float *chunk_residual, uint32_t c) const {
     const float *cent = codebook_.data() + static_cast<size_t>(c) * kPQNumCentroids * chunk_dim_;
     return static_cast<uint8_t>(argmin_centroid(chunk_residual, cent));
+  }
+
+  void build_residual(const float *vector, float *residual) const {
+    for (uint64_t d = 0; d < dim_; ++d) {
+      residual[d] = vector[d] - global_centroid_[d];
+    }
+  }
+
+  void encode_residual_to_row(const float *residual, uint8_t *code_row) const {
+    for (uint32_t c = 0; c < n_chunks_; ++c) {
+      code_row[c] = nearest_centroid(residual + static_cast<uint64_t>(c) * chunk_dim_, c);
+    }
+  }
+
+  void build_symmetric_distance_table() {
+    if (codebook_.empty()) {
+      sym_dists_.clear();
+      return;
+    }
+    ensure_l2();
+    sym_dists_.assign(static_cast<size_t>(n_chunks_) * kPQNumCentroids * kPQNumCentroids, 0.0f);
+    for (uint32_t c = 0; c < n_chunks_; ++c) {
+      const float *centroids =
+          codebook_.data() + static_cast<size_t>(c) * kPQNumCentroids * chunk_dim_;
+      float *out = sym_dists_.data() + static_cast<size_t>(c) * kPQNumCentroids * kPQNumCentroids;
+      for (uint32_t lhs = 0; lhs < kPQNumCentroids; ++lhs) {
+        const float *lhs_centroid = centroids + static_cast<size_t>(lhs) * chunk_dim_;
+        for (uint32_t rhs = 0; rhs < kPQNumCentroids; ++rhs) {
+          out[static_cast<size_t>(lhs) * kPQNumCentroids + rhs] =
+              l2_(lhs_centroid, centroids + static_cast<size_t>(rhs) * chunk_dim_, chunk_dim_);
+        }
+      }
+    }
   }
 
   /**
@@ -536,6 +677,7 @@ class PQTable {
   std::vector<float> global_centroid_;  // dim
   std::vector<float> codebook_;         // n_chunks * 256 * chunk_dim
   std::vector<uint8_t> codes_;          // num_points * n_chunks
+  std::vector<float> sym_dists_;        // n_chunks * 256 * 256 centroid L2 table
   alaya::simd::L2SqrFunc l2_ = nullptr;
 };
 

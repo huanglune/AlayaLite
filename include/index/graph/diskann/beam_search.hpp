@@ -46,6 +46,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <stdexcept>
@@ -54,6 +55,7 @@
 #include <vector>
 
 #include "index/graph/diskann/disk_layout.hpp"
+#include "index/graph/diskann/disk_page_io.hpp"
 #include "index/graph/diskann/node_cache.hpp"
 #include "index/graph/diskann/pq_table.hpp"
 #include "index/graph/diskann/search_scratch.hpp"
@@ -86,15 +88,29 @@ struct SearchContext {
   uint64_t num_points = 0;
 
   // Tombstone-aware search (null for static indices).
-  const TombstoneBitmap *tombstone = nullptr;
+  const TombstoneSnapshot *tombstone = nullptr;
+
+  // Updatable indices: the shard page cache doubles as a unified buffer pool
+  // (Yi semantics) — searches peek it before device reads and offer their
+  // read pages back through the versioned fill protocol. nullptr keeps the
+  // static-index behavior: BFS cache + device reads only.
+  DiskPageIO *page_io = nullptr;
 };
 
 /// Optional instrumentation for tests / profiling.
 struct SearchStats {
   uint64_t n_ios = 0;                ///< page reads issued to disk
   uint64_t n_cache_hits = 0;         ///< nodes served from the BFS cache
+  uint64_t n_page_cache_hits = 0;    ///< nodes served from the update page cache
   uint64_t n_nodes_processed = 0;    ///< nodes whose exact distance was computed
   uint64_t n_rerank_reads = 0;       ///< extra synchronous reads for PQ rerank
+  uint64_t n_waits = 0;              ///< get_events calls in the async pipe
+  uint64_t inflight_sum = 0;         ///< inflight reads before each wait (depth = sum/waits)
+  uint64_t wait_us = 0;              ///< time blocked in get_events
+  uint64_t proc_us = 0;              ///< time in process_node (CPU)
+  uint64_t setup_us = 0;             ///< per-query snapshot + scratch setup
+  uint64_t peek_us = 0;              ///< time in search_peek_page
+  uint64_t fillpg_us = 0;            ///< time in search_fill_page
   std::vector<uint32_t> read_order;  ///< ids in the order first processed
 };
 
@@ -112,16 +128,42 @@ inline void scan_and_insert_neighbors(alaya::vamana::NeighborPriorityQueue &rets
                                       uint32_t n_nbrs,
                                       const PQTable &pq,
                                       const float *pq_table,
-                                      uint64_t num_points) {
+                                      uint64_t num_points,
+                                      const TombstoneSnapshot *tombstone = nullptr) {
+  // Filter first, then score all survivors with one batched PQ pass
+  // (pq_distance_batch): per-neighbor pq_distance() stalls on a dependent
+  // random 32 B code fetch per call — the eval hot spot at 100M scale. The
+  // filter order, the accumulation order per point, and the insertion order
+  // all match the former per-neighbor loop, so results are bit-identical.
+  constexpr uint32_t kScanTile = 128;  // >= max node degree in practice; loop-safe beyond
+  uint32_t ids[kScanTile];
+  float dists[kScanTile];
+  uint32_t cnt = 0;
+  const auto flush = [&]() {
+    pq.pq_distance_batch(ids, cnt, pq_table, dists);
+    for (uint32_t i = 0; i < cnt; ++i) {
+      retset.insert(alaya::vamana::Neighbor(ids[i], dists[i]));
+    }
+    cnt = 0;
+  };
   for (uint32_t k = 0; k < n_nbrs; ++k) {
     const uint32_t m = nbrs[k];
     if (m >= num_points) {
       continue;  // defensive: ignore corrupt neighbor ids
     }
+    if (tombstone != nullptr && tombstone->is_deleted(m)) {
+      continue;
+    }
     if (!visited.test_and_set(m)) {
       continue;
     }
-    retset.insert(alaya::vamana::Neighbor(m, pq.pq_distance(m, pq_table)));
+    ids[cnt] = m;
+    if (++cnt == kScanTile) {
+      flush();
+    }
+  }
+  if (cnt != 0) {
+    flush();
   }
 }
 
@@ -178,19 +220,37 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
     }
   };
 
+  NodeCache::Lookup seed_hit;
+
+  // Unified-pool view (updatable indices): peek the update page cache before
+  // any device read and fold read pages back in afterwards. Fill must run
+  // BEFORE the record is parsed — a conflicting writer refreshes the buffer.
+  DiskPageIO *page_io = ctx.page_io;
+
   // Synchronously read one node into scratch slot 0 (used only to seed the
   // medoid); returns a pointer to its record (cache or scratch).
   auto read_seed = [&](uint32_t id) -> const char * {
-    const char *rec = cache.lookup(id);
-    if (rec != nullptr) {
+    seed_hit = cache.lookup_record(id);
+    if (seed_hit) {
       if (stats != nullptr) {
         stats->n_cache_hits++;
       }
-      return rec;
+      return seed_hit.get();
+    }
+    const uint64_t off = geom.get_page_offset(id);
+    uint64_t version = 0;
+    if (page_io != nullptr && page_io->search_peek_page(off, td.sector_scratch, &version)) {
+      if (stats != nullptr) {
+        stats->n_page_cache_hits++;
+      }
+      return td.sector_scratch + geom.offset_to_node(id);
     }
     std::vector<AlignedRead> r1;
-    r1.emplace_back(geom.get_page_offset(id), page_size, id, td.sector_scratch);
+    r1.emplace_back(off, page_size, id, td.sector_scratch);
     reader.read(r1, td.ctx_);
+    if (page_io != nullptr) {
+      page_io->search_fill_page(off, td.sector_scratch, version);
+    }
     if (stats != nullptr) {
       stats->n_ios++;
     }
@@ -198,7 +258,7 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
   };
 
   // IP-DiskANN: tombstoned nodes are skipped (graph repaired at delete time).
-  const TombstoneBitmap *tomb = ctx.tombstone;
+  const TombstoneSnapshot *tomb = ctx.tombstone;
   auto consider = [&](uint32_t m, auto &&emit) {
     if (m >= ctx.num_points || !visited.test_and_set(m)) {
       return;
@@ -224,6 +284,7 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
     std::vector<uint32_t> todo;
     std::vector<uint32_t> chunk_ids;
     std::vector<const char *> chunk_recs;
+    std::vector<NodeCache::Lookup> chunk_hits;
     while (frontier.has_unexpanded_node()) {
       const uint32_t x = frontier.closest_unexpanded().id;
       const NeighborScratchView nbrs = td.cached_neighbors(x);
@@ -236,27 +297,49 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
       for (size_t off = 0; off < todo.size(); off += n_slots) {
         const size_t end = std::min<size_t>(off + n_slots, todo.size());
         reqs.clear();
+        td.io_req_versions.clear();
         chunk_ids.clear();
         chunk_recs.clear();
+        chunk_hits.clear();
+        chunk_hits.reserve(end - off);
         uint64_t slot = 0;
         for (size_t i = off; i < end; ++i) {
           const uint32_t m = todo[i];
-          const char *crec = cache.lookup(m);
-          if (crec != nullptr) {
+          NodeCache::Lookup cached = cache.lookup_record(m);
+          if (cached) {
             if (stats != nullptr) {
               stats->n_cache_hits++;
             }
             chunk_ids.push_back(m);
-            chunk_recs.push_back(crec);
+            chunk_recs.push_back(cached.get());
+            chunk_hits.push_back(std::move(cached));
             continue;
           }
           char *buf = td.sector_scratch + (slot++) * page_size;
+          const uint64_t page_off = geom.get_page_offset(m);
+          uint64_t version = 0;
+          if (page_io != nullptr && page_io->search_peek_page(page_off, buf, &version)) {
+            if (stats != nullptr) {
+              stats->n_page_cache_hits++;
+            }
+            chunk_ids.push_back(m);
+            chunk_recs.push_back(buf + geom.offset_to_node(m));
+            continue;  // slot consumed, no device read
+          }
           chunk_ids.push_back(m);
           chunk_recs.push_back(buf + geom.offset_to_node(m));
-          reqs.emplace_back(geom.get_page_offset(m), page_size, m, buf);
+          reqs.emplace_back(page_off, page_size, m, buf);
+          td.io_req_versions.push_back(version);
         }
         if (!reqs.empty()) {
           reader.read(reqs, td.ctx_);  // blocking; kernel runs the batch concurrently
+          if (page_io != nullptr) {
+            for (size_t r = 0; r < reqs.size(); ++r) {
+              page_io->search_fill_page(reqs[r].offset,
+                                        static_cast<char *>(reqs[r].buf),
+                                        td.io_req_versions[r]);
+            }
+          }
           if (stats != nullptr) {
             stats->n_ios += reqs.size();
           }
@@ -298,24 +381,37 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
 
     // Drain `pending` into free slots: cache hits absorbed inline (no slot), misses
     // submitted as O_DIRECT reads.
+    if (page_io != nullptr) {
+      td.ensure_peek_scratch(page_size);
+    }
     auto submit_pending = [&]() {
       reqs.clear();
       while (!free_slots.empty() && !pending.empty()) {
         const uint32_t m = pending.front();
         pending.pop_front();
-        const char *crec = cache.lookup(m);
-        if (crec != nullptr) {
+        NodeCache::Lookup cached = cache.lookup_record(m);
+        if (cached) {
           if (stats != nullptr) {
             stats->n_cache_hits++;
           }
-          absorb(m, crec);
+          absorb(m, cached.get());
+          continue;
+        }
+        const uint64_t page_off = geom.get_page_offset(m);
+        uint64_t version = 0;
+        if (page_io != nullptr && page_io->search_peek_page(page_off, td.peek_scratch, &version)) {
+          if (stats != nullptr) {
+            stats->n_page_cache_hits++;
+          }
+          absorb(m, td.peek_scratch + geom.offset_to_node(m));
           continue;
         }
         const uint64_t slot = free_slots.back();
         free_slots.pop_back();
         char *buf = td.sector_scratch + slot * page_size;
         td.set_inflight(slot, m, buf + geom.offset_to_node(m));
-        reqs.emplace_back(geom.get_page_offset(m), page_size, m, buf);
+        td.slot_versions[slot] = version;
+        reqs.emplace_back(page_off, page_size, m, buf);
       }
       if (!reqs.empty()) {
         reader.submit_reqs(reqs, td.ctx_);
@@ -341,6 +437,11 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
           InFlightSlot completed;
           if (!td.remove_inflight(static_cast<uint32_t>(e.id), completed)) {
             continue;  // defensive: completion for an id we are not tracking
+          }
+          if (page_io != nullptr) {
+            page_io->search_fill_page(geom.get_page_offset(static_cast<uint32_t>(e.id)),
+                                      td.sector_scratch + completed.page_slot * page_size,
+                                      td.slot_versions[completed.page_slot]);
           }
           absorb(static_cast<uint32_t>(e.id), completed.record);
           free_slots.push_back(completed.page_slot);
@@ -408,6 +509,7 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
   // on the sector we just read) and insert its unvisited neighbors into the
   // frontier with PQ approximate distances. Shared by both search paths.
   auto process_node = [&](uint32_t id, const char *rec) {
+    const auto tp0 = std::chrono::steady_clock::now();
     NodeRecordView view{rec, dim};
     td.set_exact_dist(id, l2(query, view.coords(), dim));
     if (stats != nullptr) {
@@ -420,11 +522,25 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
                               view.n_nbrs(),
                               pq,
                               pq_table,
-                              ctx.num_points);
+                              ctx.num_points,
+                              ctx.tombstone);
+    if (stats != nullptr) {
+      stats->proc_us += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                  std::chrono::steady_clock::now() - tp0)
+                                                  .count());
+    }
   };
 
-  std::vector<AlignedRead> reqs;
-  std::vector<AlignedReadEvent> evts;
+  auto &reqs = td.io_reqs;
+  auto &evts = td.io_events;
+  reqs.clear();
+  evts.clear();
+
+  // Unified-pool view (updatable indices) — see disk_greedy_search.
+  DiskPageIO *page_io = ctx.page_io;
+  // Page slots available in the sector scratch; page-cache hits borrow slots
+  // in the barrier mode below, so the batch is bounded by them.
+  const uint64_t n_slots = std::max<uint64_t>(1, td.sector_scratch_bytes / page_size);
 
   if (params.deterministic) {
     // Deterministic per-beam barrier: pop the closest unexpanded candidates, read
@@ -435,25 +551,40 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
     // overlap of the default path and so runs ~10-15% slower.
     std::vector<uint32_t> batch;
     std::vector<const char *> batch_recs;
+    std::vector<NodeCache::Lookup> batch_hits;
     while (retset.has_unexpanded_node()) {
       batch.clear();
       batch_recs.clear();
+      batch_hits.clear();
+      batch_hits.reserve(beam);
       reqs.clear();
+      td.io_req_versions.clear();
       uint64_t slot = 0;
-      while (retset.has_unexpanded_node() && reqs.size() < beam) {
+      while (retset.has_unexpanded_node() && reqs.size() < beam && slot < n_slots) {
         const uint32_t id = retset.closest_unexpanded().id;
         batch.push_back(id);
-        const char *crec = cache.lookup(id);
-        if (crec != nullptr) {
-          batch_recs.push_back(crec);
+        NodeCache::Lookup cached = cache.lookup_record(id);
+        if (cached) {
+          batch_recs.push_back(cached.get());
+          batch_hits.push_back(std::move(cached));
           if (stats != nullptr) {
             stats->n_cache_hits++;
           }
-        } else {
-          char *buf = td.sector_scratch + (slot++) * page_size;
-          batch_recs.push_back(buf + geom.offset_to_node(id));
-          reqs.emplace_back(geom.get_page_offset(id), page_size, id, buf);
+          continue;
         }
+        char *buf = td.sector_scratch + (slot++) * page_size;
+        const uint64_t page_off = geom.get_page_offset(id);
+        uint64_t version = 0;
+        if (page_io != nullptr && page_io->search_peek_page(page_off, buf, &version)) {
+          if (stats != nullptr) {
+            stats->n_page_cache_hits++;
+          }
+          batch_recs.push_back(buf + geom.offset_to_node(id));
+          continue;  // slot consumed, no device read
+        }
+        batch_recs.push_back(buf + geom.offset_to_node(id));
+        reqs.emplace_back(page_off, page_size, id, buf);
+        td.io_req_versions.push_back(version);
       }
 
       if (!reqs.empty()) {
@@ -466,6 +597,13 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
           if (e.result != static_cast<int64_t>(page_size)) {
             throw std::runtime_error("cached_beam_search: short/failed read, result=" +
                                      std::to_string(e.result));
+          }
+        }
+        if (page_io != nullptr) {
+          for (size_t r = 0; r < reqs.size(); ++r) {
+            page_io->search_fill_page(reqs[r].offset,
+                                      static_cast<char *>(reqs[r].buf),
+                                      td.io_req_versions[r]);
           }
         }
       }
@@ -481,31 +619,55 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
     // so results are NOT bitwise-reproducible across runs/threads (set
     // deterministic for that). Thread-safety, correctness and recall are
     // unaffected — only the tie-ordering of equally-good candidates differs.
-    std::vector<uint64_t> free_slots;
-    free_slots.reserve(beam);
+    auto &free_slots = td.free_page_slots;
+    free_slots.clear();
     for (uint64_t s = 0; s < beam; ++s) {
       free_slots.push_back(s);
     }
     // Pop closest-unexpanded candidates, serving cache hits inline and submitting
     // cache misses into free scratch slots. Stops when the slots are full or the
     // frontier has no unexpanded node left.
+    if (page_io != nullptr) {
+      td.ensure_peek_scratch(page_size);
+    }
     auto fill_pipe = [&]() {
       reqs.clear();
       while (!free_slots.empty() && retset.has_unexpanded_node()) {
         const uint32_t id = retset.closest_unexpanded().id;
-        const char *crec = cache.lookup(id);
-        if (crec != nullptr) {
+        NodeCache::Lookup cached = cache.lookup_record(id);
+        if (cached) {
           if (stats != nullptr) {
             stats->n_cache_hits++;
           }
-          process_node(id, crec);
+          process_node(id, cached.get());
+          continue;
+        }
+        const uint64_t page_off = geom.get_page_offset(id);
+        uint64_t version = 0;
+        bool peeked = false;
+        if (page_io != nullptr) {
+          const auto tk0 = std::chrono::steady_clock::now();
+          peeked = page_io->search_peek_page(page_off, td.peek_scratch, &version);
+          if (stats != nullptr) {
+            stats->peek_us +=
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now() - tk0)
+                                          .count());
+          }
+        }
+        if (peeked) {
+          if (stats != nullptr) {
+            stats->n_page_cache_hits++;
+          }
+          process_node(id, td.peek_scratch + geom.offset_to_node(id));
           continue;
         }
         const uint64_t slot = free_slots.back();
         free_slots.pop_back();
         char *buf = td.sector_scratch + slot * page_size;
         td.set_inflight(slot, id, buf + geom.offset_to_node(id));
-        reqs.emplace_back(geom.get_page_offset(id), page_size, id, buf);
+        td.slot_versions[slot] = version;
+        reqs.emplace_back(page_off, page_size, id, buf);
       }
       if (!reqs.empty()) {
         reader.submit_reqs(reqs, td.ctx_);
@@ -521,7 +683,18 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
       // other in-flight reads keep the disk busy while we process this one — that
       // is the I/O/compute overlap. NOTE: poll_events/get_events both clear their
       // out-vector, so they must not share one; we use get_events alone here.
+      const auto tw0 = std::chrono::steady_clock::now();
+      if (stats != nullptr) {
+        stats->n_waits++;
+        stats->inflight_sum += beam - free_slots.size();
+      }
       reader.get_events(td.ctx_, 1, evts);
+      if (stats != nullptr) {
+        stats->wait_us +=
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - tw0)
+                                      .count());
+      }
       for (const auto &e : evts) {
         if (e.result != static_cast<int64_t>(page_size)) {
           throw std::runtime_error("cached_beam_search: short/failed read, result=" +
@@ -530,6 +703,18 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
         InFlightSlot completed;
         if (!td.remove_inflight(static_cast<uint32_t>(e.id), completed)) {
           continue;  // defensive: completion for an id we are not tracking
+        }
+        if (page_io != nullptr) {
+          const auto tf0 = std::chrono::steady_clock::now();
+          page_io->search_fill_page(geom.get_page_offset(static_cast<uint32_t>(e.id)),
+                                    td.sector_scratch + completed.page_slot * page_size,
+                                    td.slot_versions[completed.page_slot]);
+          if (stats != nullptr) {
+            stats->fillpg_us +=
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now() - tf0)
+                                          .count());
+          }
         }
         process_node(static_cast<uint32_t>(e.id), completed.record);
         free_slots.push_back(completed.page_slot);
@@ -540,7 +725,11 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
 
   // ---------------- Result extraction (PQ) ----------------
   std::vector<std::pair<uint32_t, float>> out;
-  std::vector<AlignedRead> rerank_req(1);
+  auto &rerank_req = td.rerank_reqs;
+  rerank_req.resize(1);
+  auto is_live = [&](uint32_t id) {
+    return ctx.tombstone == nullptr || !ctx.tombstone->is_deleted(id);
+  };
 
   auto read_exact_sync = [&](uint32_t id) -> float {
     const float known = td.exact_dist(id);
@@ -548,14 +737,24 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
       return known;
     }
     char *buf = td.sector_scratch;
-    rerank_req[0] = {geom.get_page_offset(id), page_size, id, buf};
-    reader.read(rerank_req, td.ctx_);
+    const uint64_t page_off = geom.get_page_offset(id);
+    uint64_t version = 0;
+    const bool peeked = page_io != nullptr && page_io->search_peek_page(page_off, buf, &version);
+    if (!peeked) {
+      rerank_req[0] = {page_off, page_size, id, buf};
+      reader.read(rerank_req, td.ctx_);
+      if (page_io != nullptr) {
+        page_io->search_fill_page(page_off, buf, version);
+      }
+      if (stats != nullptr) {
+        stats->n_rerank_reads++;
+      }
+    } else if (stats != nullptr) {
+      stats->n_page_cache_hits++;
+    }
     NodeRecordView view{buf + geom.offset_to_node(id), dim};
     const float ex = l2(query, view.coords(), dim);
     td.set_exact_dist(id, ex);
-    if (stats != nullptr) {
-      stats->n_rerank_reads++;
-    }
     return ex;
   };
 
@@ -563,18 +762,22 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
     // Re-score the top PQ candidates with exact L2.
     const size_t want =
         params.rerank_count > 0 ? params.rerank_count : static_cast<size_t>(top_k) * 3;
-    const size_t n_cand = std::min<size_t>(retset.size(), want);
-    out.reserve(n_cand);
-    for (size_t i = 0; i < n_cand; ++i) {
+    out.reserve(std::min<size_t>(retset.size(), want));
+    for (size_t i = 0; i < retset.size() && out.size() < want; ++i) {
       const uint32_t id = retset[i].id;
+      if (!is_live(id)) {
+        continue;
+      }
       out.emplace_back(id, read_exact_sync(id));
     }
   } else {
     // Top candidates ranked by PQ distance (exact where known during traversal).
-    const size_t n_cand = std::min<size_t>(retset.size(), static_cast<size_t>(top_k));
-    out.reserve(n_cand);
-    for (size_t i = 0; i < n_cand; ++i) {
+    out.reserve(std::min<size_t>(retset.size(), static_cast<size_t>(top_k)));
+    for (size_t i = 0; i < retset.size() && out.size() < top_k; ++i) {
       const uint32_t id = retset[i].id;
+      if (!is_live(id)) {
+        continue;
+      }
       const float exact = td.exact_dist(id);
       out.emplace_back(id, !ThreadData::is_missing_exact(exact) ? exact : retset[i].distance);
     }

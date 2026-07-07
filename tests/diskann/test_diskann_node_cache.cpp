@@ -160,6 +160,28 @@ TEST_F(NodeCacheTest, CacheMissReturnsNullptr) {
   EXPECT_EQ(cache.lookup(uncached), nullptr);
 }
 
+TEST_F(NodeCacheTest, UpdateNeighborsOverridesCachedRecord) {
+  const uint64_t n = 100, dim = 8;
+  const uint32_t r = 8, medoid = 0;
+  const auto vecs = make_vectors(n, dim);
+  const auto graph = make_connected_graph(n, r);
+  NodeCache cache;
+  cache.generate(graph, vecs.data(), medoid, n, dim, r, /*cache_ratio=*/1.0);
+
+  const uint32_t id = 12;
+  const std::vector<uint32_t> replacement{2, 4, 6, 8};
+  cache.update_neighbors(id, static_cast<uint32_t>(replacement.size()), replacement.data());
+
+  const char *rec = cache.lookup(id);
+  ASSERT_NE(rec, nullptr);
+  NodeRecordView view{rec, dim};
+  EXPECT_EQ(view.n_nbrs(), replacement.size());
+  for (uint32_t i = 0; i < replacement.size(); ++i) {
+    EXPECT_EQ(view.nbrs()[i], replacement[i]) << "i=" << i;
+  }
+  EXPECT_FLOAT_EQ(view.coords()[0], vecs[id * dim]);
+}
+
 TEST_F(NodeCacheTest, FileRoundtrip) {
   const uint64_t n = 800, dim = 16;
   const uint32_t r = 10, medoid = 55;

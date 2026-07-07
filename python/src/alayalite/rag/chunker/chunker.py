@@ -6,16 +6,9 @@
 This module provides factory functions to create and use various text chunkers.
 """
 
-import os
-import sys
-
-from rag.chunker.FixSizeChunker import FixSizeChunker
-from rag.chunker.SemanticChunker import SemanticChunker
-from rag.chunker.SentenceChunker import SentenceChunker
-
-# Add the parent directory to the system path to allow for package-level imports
-parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-sys.path.append(parent_dir)
+from .fix_size_chunker import FixSizeChunker
+from .semantic_chunker import SemanticChunker
+from .sentence_chunker import SentenceChunker
 
 
 def get_chunker(chunk_model="fix_size", chunksize=3, overlap=0, semantic_model="all-MiniLM-L6-v2"):
@@ -38,7 +31,6 @@ def chunker(docs, chunk_model="fix_size", chunksize=3, overlap=0, semantic_model
     Creates a chunker and applies it to the given documents.
     """
     chunker_instance = get_chunker(chunk_model, chunksize, overlap, semantic_model)
-    print(docs)
     return chunker_instance.chunking(docs)
 
 

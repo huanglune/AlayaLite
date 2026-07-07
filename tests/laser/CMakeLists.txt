@@ -1,114 +1,110 @@
-# Gate L1 — mechanical port compile smoke test. Verifies the Laser headers under include/index/graph/laser/ compile
-# under AlayaLite's toolchain. See openspec/changes/port-laser-disk-index tasks.md item 2.13.
+# SPDX-FileCopyrightText: 2025 AlayaDB.AI
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# LASER module tests. These targets manage their exact link set (BARE): the backend file-reader tests deliberately do
+# NOT link alaya_laser so they can pin a backend definition themselves regardless of the platform default, and the
+# compile smoke tests link only the LASER surface. All of them build with the standard test-only flags plus the LASER
+# consumer options (see _ALAYA_LASER_CONSUMER_OPTIONS).
 
 if(NOT ALAYA_ENABLE_LASER)
   return()
 endif()
 
-add_executable(test_laser_compile ${CMAKE_CURRENT_SOURCE_DIR}/test_laser_compile.cpp)
-target_link_libraries(test_laser_compile PRIVATE alaya_laser)
-target_compile_features(test_laser_compile PRIVATE cxx_std_20)
-# Explicit SIMD flags for Laser (see CMakeLists.txt _ALAYA_LASER_CONSUMER_OPTIONS) plus the standard test-only flags.
-target_compile_options(
-  test_laser_compile
-  PRIVATE -O3
-          -DNDEBUG
-          -Wall
-          -Wextra
-          ${_ALAYA_LASER_CONSUMER_OPTIONS}
+set(_laser_test_opts
+    -O3
+    -DNDEBUG
+    -Wall
+    -Wextra
+    ${_ALAYA_LASER_CONSUMER_OPTIONS}
 )
 
-add_test(NAME laser_test_compile COMMAND $<TARGET_FILE:test_laser_compile>)
+set(_laser_reader_libs Eigen3::Eigen concurrentqueue::concurrentqueue spdlog::spdlog_header_only)
+if(TARGET OpenMP::OpenMP_CXX)
+  list(APPEND _laser_reader_libs OpenMP::OpenMP_CXX)
+endif()
+
+# Gate L1 — mechanical port compile smoke test. Verifies the Laser headers under include/index/graph/laser/ compile
+# under AlayaLite's toolchain. See openspec/changes/port-laser-disk-index tasks.md item 2.13.
+alaya_cc_target(
+  test_laser_compile
+  BARE
+  SRCS test_laser_compile.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(NAME laser_test_compile TARGET test_laser_compile)
 
 # Round-trip test for FHTRotator::dump_signs: seeded determinism, seed sensitivity, and on-disk layout. See the test
 # source for details.
-add_executable(test_rotator_dump ${CMAKE_CURRENT_SOURCE_DIR}/test_rotator_dump.cpp)
-target_link_libraries(test_rotator_dump PRIVATE alaya_laser)
-target_compile_features(test_rotator_dump PRIVATE cxx_std_20)
-target_compile_options(
+alaya_cc_target(
   test_rotator_dump
-  PRIVATE -O3
-          -DNDEBUG
-          -Wall
-          -Wextra
-          ${_ALAYA_LASER_CONSUMER_OPTIONS}
+  BARE
+  SRCS test_rotator_dump.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
 )
+alaya_add_test(NAME laser_test_rotator_dump TARGET test_rotator_dump)
 
-add_test(NAME laser_test_rotator_dump COMMAND $<TARGET_FILE:test_rotator_dump>)
-
-add_executable(test_laser_page_layout_round_trip ${CMAKE_CURRENT_SOURCE_DIR}/qg/test_page_layout_round_trip.cpp)
-target_link_libraries(test_laser_page_layout_round_trip PRIVATE alaya_laser ${GTEST_LIBS})
-target_compile_features(test_laser_page_layout_round_trip PRIVATE cxx_std_20)
-target_compile_definitions(test_laser_page_layout_round_trip PRIVATE ALAYA_LASER_TESTING)
-target_compile_options(
+alaya_cc_target(
   test_laser_page_layout_round_trip
-  PRIVATE -O3
-          -DNDEBUG
-          -Wall
-          -Wextra
-          ${_ALAYA_LASER_CONSUMER_OPTIONS}
+  BARE GTEST
+  SRCS qg/test_page_layout_round_trip.cpp
+  LIBS alaya_laser
+  DEFS ALAYA_LASER_TESTING
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_page_layout_round_trip
+  TARGET test_laser_page_layout_round_trip
+  LABELS laser
 )
 
-add_test(NAME laser_test_page_layout_round_trip COMMAND $<TARGET_FILE:test_laser_page_layout_round_trip>)
-set_tests_properties(laser_test_page_layout_round_trip PROPERTIES LABELS laser)
-
-add_executable(test_threadpool_file_reader ${CMAKE_CURRENT_SOURCE_DIR}/utils/test_threadpool_file_reader.cpp)
-target_include_directories(test_threadpool_file_reader PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(
-  test_threadpool_file_reader PRIVATE ${GTEST_LIBS} Eigen3::Eigen concurrentqueue::concurrentqueue
-                                      spdlog::spdlog_header_only
-)
-if(TARGET OpenMP::OpenMP_CXX)
-  target_link_libraries(test_threadpool_file_reader PRIVATE OpenMP::OpenMP_CXX)
-endif()
-target_compile_features(test_threadpool_file_reader PRIVATE cxx_std_20)
-target_compile_definitions(test_threadpool_file_reader PRIVATE ALAYA_LASER_USE_THREADPOOL=1)
-target_compile_options(
+# Backend file-reader tests: pin the backend definition per target instead of linking alaya_laser, so each backend is
+# exercised on every platform that can compile it.
+alaya_cc_target(
   test_threadpool_file_reader
-  PRIVATE -O3
-          -DNDEBUG
-          -Wall
-          -Wextra
-          ${_ALAYA_LASER_CONSUMER_OPTIONS}
+  BARE GTEST
+  SRCS utils/test_threadpool_file_reader.cpp
+  LIBS ${_laser_reader_libs}
+  DEFS ALAYA_LASER_USE_THREADPOOL=1
+  OPTS ${_laser_test_opts}
 )
-
-add_test(NAME laser_test_threadpool_file_reader COMMAND $<TARGET_FILE:test_threadpool_file_reader>)
-set_tests_properties(laser_test_threadpool_file_reader PROPERTIES LABELS "laser;threadpool")
+alaya_add_test(
+  NAME laser_test_threadpool_file_reader
+  TARGET test_threadpool_file_reader
+  LABELS laser threadpool
+)
 
 # IOCP backend test (Windows-only payload; on Linux/macOS the file compiles to a single SUCCEED placeholder so the CTest
-# matrix stays uniform).
-add_executable(test_iocp_file_reader ${CMAKE_CURRENT_SOURCE_DIR}/utils/test_iocp_file_reader.cpp)
-target_include_directories(test_iocp_file_reader PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(
-  test_iocp_file_reader PRIVATE ${GTEST_LIBS} Eigen3::Eigen concurrentqueue::concurrentqueue spdlog::spdlog_header_only
+# matrix stays uniform). MSVC has different flag syntax, so the GCC/Clang-only options are attached conditionally.
+alaya_cc_target(
+  test_iocp_file_reader
+  BARE GTEST
+  SRCS utils/test_iocp_file_reader.cpp
+  LIBS ${_laser_reader_libs}
 )
-if(TARGET OpenMP::OpenMP_CXX)
-  target_link_libraries(test_iocp_file_reader PRIVATE OpenMP::OpenMP_CXX)
-endif()
-target_compile_features(test_iocp_file_reader PRIVATE cxx_std_20)
 if(WIN32)
   target_compile_definitions(test_iocp_file_reader PRIVATE ALAYA_LASER_USE_IOCP=1)
 endif()
-# MSVC and GCC/Clang have different flag syntax; the simd consumer options above are GCC/Clang-only, so only attach them
-# on non-MSVC builds.
 if(NOT MSVC)
-  target_compile_options(
-    test_iocp_file_reader
-    PRIVATE -O3
-            -DNDEBUG
-            -Wall
-            -Wextra
-            ${_ALAYA_LASER_CONSUMER_OPTIONS}
-  )
+  target_compile_options(test_iocp_file_reader PRIVATE ${_laser_test_opts})
 endif()
+alaya_add_test(
+  NAME laser_test_iocp_file_reader
+  TARGET test_iocp_file_reader
+  LABELS laser iocp
+)
 
-add_test(NAME laser_test_iocp_file_reader COMMAND $<TARGET_FILE:test_iocp_file_reader>)
-set_tests_properties(laser_test_iocp_file_reader PROPERTIES LABELS "laser;iocp")
-
-add_executable(laser_simd_dispatch_test ${CMAKE_CURRENT_SOURCE_DIR}/simd_dispatch_test.cpp)
-target_link_libraries(laser_simd_dispatch_test PRIVATE alaya_laser ${GTEST_LIBS})
-target_compile_features(laser_simd_dispatch_test PRIVATE cxx_std_20)
-target_compile_options(laser_simd_dispatch_test PRIVATE -Wall -Wextra ${_ALAYA_LASER_CONSUMER_OPTIONS})
-
-add_test(NAME laser_test_simd_dispatch COMMAND $<TARGET_FILE:laser_simd_dispatch_test>)
-set_tests_properties(laser_test_simd_dispatch PROPERTIES LABELS "laser;simd")
+alaya_cc_target(
+  laser_simd_dispatch_test
+  BARE GTEST
+  SRCS simd_dispatch_test.cpp
+  LIBS alaya_laser
+  OPTS -Wall -Wextra ${_ALAYA_LASER_CONSUMER_OPTIONS}
+)
+alaya_add_test(
+  NAME laser_test_simd_dispatch
+  TARGET laser_simd_dispatch_test
+  LABELS laser simd
+)

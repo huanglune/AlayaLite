@@ -17,6 +17,12 @@ SPDX-License-Identifier = "AGPL-3.0-only"
 #     position after the catch-all ensures they are matched last and win. ---
 
 [[annotations]]
+path = "cmake/vendor/conan_provider.cmake"
+precedence = "override"
+SPDX-FileCopyrightText = "2024 JFrog"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
 path = "include/index/graph/laser/utils/concurrent_queue.hpp"
 precedence = "override"
 SPDX-FileCopyrightText = "Microsoft Corporation"

@@ -8,8 +8,6 @@ This module provides the JinaEmbedder class for creating embeddings using Jina A
 
 from typing import List, Tuple
 
-from sentence_transformers import SentenceTransformer
-
 from .base import BaseEmbedding
 
 
@@ -23,6 +21,13 @@ class JinaEmbedder(BaseEmbedding):
         Args:
             path (str): The model path or name for the Jina sentence-transformer model.
         """
+        try:
+            from sentence_transformers import SentenceTransformer  # pylint: disable=import-outside-toplevel
+        except ImportError as exc:
+            raise ImportError(
+                "JinaEmbedder requires the optional RAG dependencies; install with: pip install 'alayalite[rag]'"
+            ) from exc
+
         super().__init__(path)
         self.model = SentenceTransformer(path, trust_remote_code=True)
 

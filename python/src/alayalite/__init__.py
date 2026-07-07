@@ -17,7 +17,11 @@ from .collection import Collection  # noqa: E402
 from .index import Index  # noqa: E402
 from .utils import calc_gt, calc_recall, load_fvecs, load_ivecs  # noqa: E402
 
-# Ignore warnings related to "subnormal numbers"
+# The extension module is compiled with -Ofast (fast-math), so loading it enables flush-to-zero /
+# denormals-are-zero on the calling thread. numpy notices the changed FPU state and emits "smallest
+# subnormal ... is zero" UserWarnings from any later finfo() call anywhere in the process. The FTZ
+# side effect is expected and harmless for this workload; suppress exactly these two messages so
+# they don't spam applications embedding the SDK.
 warnings.filterwarnings(
     "ignore",
     message="The value of the smallest subnormal for <class 'numpy.float32'> type is zero.",

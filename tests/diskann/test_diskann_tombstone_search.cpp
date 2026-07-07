@@ -98,6 +98,10 @@ class TombstoneSearchTest : public ::testing::Test {
                                                  const TombstoneBitmap *tomb,
                                                  bool deterministic,
                                                  uint32_t l = 50) {
+    alaya::diskann::TombstoneSnapshot snap;
+    if (tomb != nullptr) {
+      tomb->snapshot_into(snap);
+    }
     SearchContext ctx;
     ctx.reader = reader_.get();
     ctx.geom = &geom_;
@@ -105,7 +109,7 @@ class TombstoneSearchTest : public ::testing::Test {
     ctx.pq = nullptr;
     ctx.medoid = scn_.medoid;
     ctx.num_points = n_;
-    ctx.tombstone = tomb;
+    ctx.tombstone = tomb != nullptr ? &snap : nullptr;
     SearchParams p;
     p.search_list_size = l;
     p.beam_width = 4;

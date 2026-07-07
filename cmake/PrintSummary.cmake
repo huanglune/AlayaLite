@@ -1,3 +1,11 @@
+# SPDX-FileCopyrightText: 2025 AlayaDB.AI
+#
+# SPDX-License-Identifier: AGPL-3.0-only
+
+# PrintSummary.cmake - the configuration banner printed at the end of every configure.
+
+include_guard(GLOBAL)
+
 function(print_dependency_summary)
   message(STATUS "| Dependencies:")
   if(TARGET OpenMP::OpenMP_CXX)
@@ -19,7 +27,9 @@ function(print_dependency_summary)
   endif()
   if(pybind11_FOUND)
     message(STATUS "|   - pybind11        : ${pybind11_VERSION}")
-    message(STATUS "|   - Python          : ${Python_VERSION}")
+  endif()
+  if(Python_FOUND)
+    message(STATUS "|   - Python          : ${Python_VERSION} (${Python_EXECUTABLE})")
   endif()
 endfunction()
 
@@ -30,6 +40,7 @@ function(print_project_options_summary)
   message(STATUS "|   - BUILD_TESTING   : ${BUILD_TESTING}")
   message(STATUS "|   - ENABLE_COVERAGE : ${ENABLE_COVERAGE}")
   message(STATUS "|   - NATIVE_ARCH     : ${ALAYA_NATIVE_ARCH}")
+  message(STATUS "|   - ENABLE_LASER    : ${ALAYA_ENABLE_LASER}")
 endfunction()
 
 # Print build configuration summary Usage: print_build_summary()
@@ -49,8 +60,10 @@ function(print_build_summary)
   message(STATUS "|   - CMake Version   : ${CMAKE_VERSION}")
   message(STATUS "|")
   message(STATUS "| Compiler Flags:")
-  get_directory_property(_compile_opts COMPILE_OPTIONS)
-  message(STATUS "|   - Compile Options : ${_compile_opts}")
+  if(TARGET alaya_build_flags)
+    get_target_property(_compile_opts alaya_build_flags INTERFACE_COMPILE_OPTIONS)
+    message(STATUS "|   - Compile Options : ${_compile_opts}")
+  endif()
   if(CMAKE_BUILD_TYPE STREQUAL "Release")
     message(STATUS "|   - Release Flags   : ${CMAKE_CXX_FLAGS_RELEASE}")
   elseif(CMAKE_BUILD_TYPE STREQUAL "Debug")

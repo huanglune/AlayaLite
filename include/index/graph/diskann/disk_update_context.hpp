@@ -6,9 +6,8 @@
  * @file disk_update_context.hpp
  * @brief Transient bookkeeping for in-place DiskANN updates.
  *
- * Tracks reverse edges for reconnect and cached old neighbors for two-hop
- * bypass through tombstoned nodes. Reused slots must call forget_slot() to
- * evict stale two-hop data.
+ * Tracks cached old neighbors for two-hop bypass through tombstoned nodes.
+ * Reused slots must call forget_slot() to evict stale two-hop data.
  */
 
 #pragma once
@@ -20,16 +19,11 @@
 namespace alaya::diskann {
 
 struct DiskUpdateContext {
-  /// Reverse edges queued for a node's next reconnect (node id -> new neighbor ids).
-  std::unordered_map<uint32_t, std::vector<uint32_t>> inserted_edges_;
   /// Old neighbor list of each deleted node, for two-hop bypass.
   std::unordered_map<uint32_t, std::vector<uint32_t>> removed_node_nbrs_;
 
   /// Drop all transient state (e.g. after flush, or on teardown).
-  void clear() {
-    inserted_edges_.clear();
-    removed_node_nbrs_.clear();
-  }
+  void clear() { removed_node_nbrs_.clear(); }
 
   /// Forget a slot that has just been reused by an insert: its cached two-hop
   /// data no longer describes the node now living in the slot.
