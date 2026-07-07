@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-07-07
+
+### Added
+- `search_pipelined()` query-level coroutine pipelining: pool threads drive
+  concurrent query coroutines over a shared io_uring reactor, each suspending
+  on beam-wave reads. Throughput follows Little's law instead of threads/latency.
+  Requires `update_io=uring`. (#103)
+- `pq_distance_batch()` batched PQ distance kernel with gather-then-transposed
+  accumulate and software prefetch; eliminates per-neighbor dependent random
+  code fetch at 100M+ scale. (#103)
+- Coroutine async update I/O via cooperatively-polled io_uring reactor,
+  replacing blocking threads during page reads/writes. (#103)
+- Unified page pool: searches peek and fill the shard page cache so hot pages
+  written by updates are visible without cold reads. (#103)
+- `--eval_pipeline` flag and per-query IO/timing breakdown in the update
+  benchmark. (#103)
+
+### Changed
+- `VisitedBitset::clear()` uses dirty-word tracking (O(words set)) instead of
+  full-array memset, removing the per-query DRAM bandwidth wall at large slot
+  counts. (#103)
+- `DiskPageCache::write()` recycles the LRU victim's map node and buffer
+  in-place at steady-state capacity instead of erase+alloc. (#103)
+- `make_search_snapshot()` skips tombstone bitmap copy when count is zero. (#103)
+- `make format` now routes through pre-commit pinned formatters, preventing
+  version-drift formatting mismatches. (#103)
+
+### Fixed
+- Portable `alaya::prefetch_l3()` replaces bare `__builtin_prefetch` in
+  `pq_distance_batch` for MSVC compatibility. (#103)
+- `io_engine.hpp` adds `<io.h>` and `ssize_t` typedef for Windows builds. (#103)
+- `uring_reactor_test` gated behind `CMAKE_SYSTEM_NAME STREQUAL "Linux"`. (#103)
+
 ## [1.0.2] - 2026-06-30
 
 ### Changed
@@ -307,7 +340,8 @@ First stable release of AlayaLite. Highlights since the 0.1.x alpha line:
 - RAG components (embedders, chunkers)
 - Basic CI/CD pipeline
 
-[Unreleased]: https://github.com/AlayaDB-AI/AlayaLite/compare/v1.0.2...HEAD
+[Unreleased]: https://github.com/AlayaDB-AI/AlayaLite/compare/v1.0.3...HEAD
+[1.0.3]: https://github.com/AlayaDB-AI/AlayaLite/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/AlayaDB-AI/AlayaLite/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/AlayaDB-AI/AlayaLite/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/AlayaDB-AI/AlayaLite/compare/v0.1.1a1...v1.0.0
