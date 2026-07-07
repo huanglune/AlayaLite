@@ -103,9 +103,9 @@ test-py-cov: ## Run Python tests with HTML coverage report
 lint: ## Run all pre-commit checks
 	@uvx pre-commit run -a
 
-format: ## Auto-format C++ sources with clang-format
-	@find include tests tools python/src -name '*.h' -o -name '*.cpp' -o -name '*.cc' \
-		| xargs clang-format -i --style=file
+format: ## Auto-format C++/Python sources (uses pre-commit pinned versions)
+	@uvx pre-commit run clang-format -a
+	@uvx pre-commit run ruff-format -a
 
 codegen: ## Regenerate Python-binding dispatch header from tools/codegen/dispatch.yaml
 	@uv run python tools/codegen/gen.py
