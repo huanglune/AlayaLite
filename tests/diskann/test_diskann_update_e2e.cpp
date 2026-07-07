@@ -472,6 +472,102 @@ TEST_F(UpdateE2ETest, PQSearchSkipsDeletedLabels) {
   }
 }
 
+TEST_F(UpdateE2ETest, PipelinedSearchMatchesBatchSearch) {
+  build_and_load(/*n=*/600, /*dim=*/32, /*r=*/32, {}, /*pq_n_chunks=*/8);
+  ASSERT_TRUE(idx_->has_pq());
+
+  // Post-update state: labels beyond the base range plus live tombstones.
+  const auto extra = make_vectors(20, 32, /*seed=*/4242);
+  for (uint32_t i = 0; i < 20; ++i) {
+    do_insert(vec_at(extra, i));
+  }
+  for (uint32_t i = 0; i < 10; ++i) {
+    do_remove(deletable_[i]);
+  }
+
+  constexpr uint32_t kNq = 60;
+  constexpr uint32_t kK = 5;
+  const auto queries = make_vectors(kNq, 32, /*seed=*/7);
+  // The pipelined path reproduces the sync rerank semantics without rerank
+  // reads: it takes the full exact-scored search list and cuts top_k by exact
+  // distance (traversal expands every retset entry, so rerank re-reads 0
+  // nodes). Reference = sync search WITH rerank over the same L-sized pool;
+  // the pipelined call itself rejects rerank=true.
+  const DiskANNSearchParams ref_sp{/*L=*/48,
+                                   /*use_pq=*/true,
+                                   /*rerank=*/true,
+                                   /*rerank_count=*/48,
+                                   /*deterministic=*/false};
+  const DiskANNSearchParams sp{/*L=*/48,
+                               /*use_pq=*/true,
+                               /*rerank=*/false,
+                               /*rerank_count=*/0,
+                               /*deterministic=*/false};
+
+  std::vector<uint64_t> ref_l(kNq * kK);
+  std::vector<float> ref_d(kNq * kK);
+  idx_->batch_search(
+      queries.data(), kNq, kK, ref_l.data(), ref_d.data(), /*num_threads=*/2, ref_sp);
+
+  std::vector<uint64_t> pipe_l(kNq * kK, 0);
+  std::vector<float> pipe_d(kNq * kK, 0.0F);
+  const char *mode = std::getenv("ALAYA_DISKANN_UPDATE_IO");
+  if (mode != nullptr && std::string_view(mode) == "blocking") {
+    // No reactor in blocking mode: the pipelined path must refuse loudly.
+    EXPECT_THROW(idx_->search_pipelined(
+                     queries.data(), kNq, kK, pipe_l.data(), pipe_d.data(), 2, 8, sp),
+                 std::runtime_error);
+    return;
+  }
+  idx_->search_pipelined(queries.data(),
+                         kNq,
+                         kK,
+                         pipe_l.data(),
+                         pipe_d.data(),
+                         /*num_threads=*/2,
+                         /*pipeline=*/8,
+                         sp);
+
+  uint64_t ref_hits = 0;
+  uint64_t pipe_hits = 0;
+  uint64_t total = 0;
+  for (uint32_t qi = 0; qi < kNq; ++qi) {
+    const float *q = queries.data() + static_cast<uint64_t>(qi) * 32;
+    const auto truth = ground_truth(q, kK);
+    std::unordered_set<uint64_t> ref_set;
+    std::unordered_set<uint64_t> pipe_set;
+    for (uint32_t i = 0; i < kK; ++i) {
+      const uint64_t rl = ref_l[qi * kK + i];
+      const uint64_t pl = pipe_l[qi * kK + i];
+      if (rl != DiskANNIndex::kNoLabel) {
+        ref_set.insert(rl);
+      }
+      if (pl != DiskANNIndex::kNoLabel) {
+        pipe_set.insert(pl);
+        // Every pipelined hit must be a live label and carry its exact L2
+        // distance (validates label mapping + the distance channel).
+        const auto it = live_.find(pl);
+        ASSERT_NE(it, live_.end()) << "pipelined search returned a dead/unknown label";
+        const float exact = alaya::simd::l2_sqr<float, float>(q, it->second.data(), 32);
+        EXPECT_NEAR(pipe_d[qi * kK + i], exact, 1e-3F * std::max(1.0F, exact));
+      }
+    }
+    EXPECT_FALSE(pipe_set.empty()) << "query " << qi << " returned no results";
+    for (const uint64_t t : truth) {
+      ++total;
+      ref_hits += ref_set.count(t);
+      pipe_hits += pipe_set.count(t);
+    }
+  }
+  const double ref_recall = static_cast<double>(ref_hits) / static_cast<double>(total);
+  const double pipe_recall = static_cast<double>(pipe_hits) / static_cast<double>(total);
+  // Same recall-equivalence class as the sync schedulers: parity within noise.
+  // No high absolute bar — rerank-free PQ over random uniform vectors tops out
+  // around ~0.75 recall for BOTH paths; parity is the invariant under test.
+  EXPECT_NEAR(pipe_recall, ref_recall, 0.03) << "pipe=" << pipe_recall << " ref=" << ref_recall;
+  EXPECT_GE(pipe_recall, 0.60);
+}
+
 // 7.2 -----------------------------------------------------------------------
 TEST_F(UpdateE2ETest, DeleteHidesVectorsAndPreservesRecall) {
   build_and_load(500, 32, 32, {});

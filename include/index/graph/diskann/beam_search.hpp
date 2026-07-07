@@ -46,6 +46,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <stdexcept>
@@ -103,6 +104,13 @@ struct SearchStats {
   uint64_t n_page_cache_hits = 0;    ///< nodes served from the update page cache
   uint64_t n_nodes_processed = 0;    ///< nodes whose exact distance was computed
   uint64_t n_rerank_reads = 0;       ///< extra synchronous reads for PQ rerank
+  uint64_t n_waits = 0;              ///< get_events calls in the async pipe
+  uint64_t inflight_sum = 0;         ///< inflight reads before each wait (depth = sum/waits)
+  uint64_t wait_us = 0;              ///< time blocked in get_events
+  uint64_t proc_us = 0;              ///< time in process_node (CPU)
+  uint64_t setup_us = 0;             ///< per-query snapshot + scratch setup
+  uint64_t peek_us = 0;              ///< time in search_peek_page
+  uint64_t fillpg_us = 0;            ///< time in search_fill_page
   std::vector<uint32_t> read_order;  ///< ids in the order first processed
 };
 
@@ -122,6 +130,22 @@ inline void scan_and_insert_neighbors(alaya::vamana::NeighborPriorityQueue &rets
                                       const float *pq_table,
                                       uint64_t num_points,
                                       const TombstoneSnapshot *tombstone = nullptr) {
+  // Filter first, then score all survivors with one batched PQ pass
+  // (pq_distance_batch): per-neighbor pq_distance() stalls on a dependent
+  // random 32 B code fetch per call — the eval hot spot at 100M scale. The
+  // filter order, the accumulation order per point, and the insertion order
+  // all match the former per-neighbor loop, so results are bit-identical.
+  constexpr uint32_t kScanTile = 128;  // >= max node degree in practice; loop-safe beyond
+  uint32_t ids[kScanTile];
+  float dists[kScanTile];
+  uint32_t cnt = 0;
+  const auto flush = [&]() {
+    pq.pq_distance_batch(ids, cnt, pq_table, dists);
+    for (uint32_t i = 0; i < cnt; ++i) {
+      retset.insert(alaya::vamana::Neighbor(ids[i], dists[i]));
+    }
+    cnt = 0;
+  };
   for (uint32_t k = 0; k < n_nbrs; ++k) {
     const uint32_t m = nbrs[k];
     if (m >= num_points) {
@@ -133,7 +157,13 @@ inline void scan_and_insert_neighbors(alaya::vamana::NeighborPriorityQueue &rets
     if (!visited.test_and_set(m)) {
       continue;
     }
-    retset.insert(alaya::vamana::Neighbor(m, pq.pq_distance(m, pq_table)));
+    ids[cnt] = m;
+    if (++cnt == kScanTile) {
+      flush();
+    }
+  }
+  if (cnt != 0) {
+    flush();
   }
 }
 
@@ -479,6 +509,7 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
   // on the sector we just read) and insert its unvisited neighbors into the
   // frontier with PQ approximate distances. Shared by both search paths.
   auto process_node = [&](uint32_t id, const char *rec) {
+    const auto tp0 = std::chrono::steady_clock::now();
     NodeRecordView view{rec, dim};
     td.set_exact_dist(id, l2(query, view.coords(), dim));
     if (stats != nullptr) {
@@ -493,6 +524,11 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
                               pq_table,
                               ctx.num_points,
                               ctx.tombstone);
+    if (stats != nullptr) {
+      stats->proc_us += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                  std::chrono::steady_clock::now() - tp0)
+                                                  .count());
+    }
   };
 
   auto &reqs = td.io_reqs;
@@ -608,7 +644,18 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
         }
         const uint64_t page_off = geom.get_page_offset(id);
         uint64_t version = 0;
-        if (page_io != nullptr && page_io->search_peek_page(page_off, td.peek_scratch, &version)) {
+        bool peeked = false;
+        if (page_io != nullptr) {
+          const auto tk0 = std::chrono::steady_clock::now();
+          peeked = page_io->search_peek_page(page_off, td.peek_scratch, &version);
+          if (stats != nullptr) {
+            stats->peek_us +=
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now() - tk0)
+                                          .count());
+          }
+        }
+        if (peeked) {
           if (stats != nullptr) {
             stats->n_page_cache_hits++;
           }
@@ -636,7 +683,18 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
       // other in-flight reads keep the disk busy while we process this one — that
       // is the I/O/compute overlap. NOTE: poll_events/get_events both clear their
       // out-vector, so they must not share one; we use get_events alone here.
+      const auto tw0 = std::chrono::steady_clock::now();
+      if (stats != nullptr) {
+        stats->n_waits++;
+        stats->inflight_sum += beam - free_slots.size();
+      }
       reader.get_events(td.ctx_, 1, evts);
+      if (stats != nullptr) {
+        stats->wait_us +=
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - tw0)
+                                      .count());
+      }
       for (const auto &e : evts) {
         if (e.result != static_cast<int64_t>(page_size)) {
           throw std::runtime_error("cached_beam_search: short/failed read, result=" +
@@ -647,9 +705,16 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
           continue;  // defensive: completion for an id we are not tracking
         }
         if (page_io != nullptr) {
+          const auto tf0 = std::chrono::steady_clock::now();
           page_io->search_fill_page(geom.get_page_offset(static_cast<uint32_t>(e.id)),
                                     td.sector_scratch + completed.page_slot * page_size,
                                     td.slot_versions[completed.page_slot]);
+          if (stats != nullptr) {
+            stats->fillpg_us +=
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now() - tf0)
+                                          .count());
+          }
         }
         process_node(static_cast<uint32_t>(e.id), completed.record);
         free_slots.push_back(completed.page_slot);

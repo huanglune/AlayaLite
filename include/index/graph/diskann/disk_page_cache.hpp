@@ -45,7 +45,35 @@ class DiskPageCache {
       touch(it);
       return;
     }
-    evict_until_room(std::forward<FlushPage>(flush));
+    if (pages_.size() >= capacity_) {
+      // At capacity (the steady state once the pool is warm): recycle the LRU
+      // victim's map node, byte buffer and LRU node instead of erase+alloc —
+      // a full pool would otherwise pay one 4KB heap alloc + free per fill,
+      // which under concurrent shard traffic dominates the search fill path.
+      evict_excess(std::forward<FlushPage>(flush));  // only if capacity shrank below size
+      const uint64_t victim_off = lru_.back();
+      auto vit = pages_.find(victim_off);
+      if (vit == pages_.end()) {  // defensive: lru_/pages_ out of sync
+        lru_.pop_back();
+        lru_.push_front(page_off);
+        pages_.emplace(page_off,
+                       Entry{std::vector<char>(page, page + page_size), dirty, lru_.begin()});
+        return;
+      }
+      if (vit->second.dirty) {
+        flush(victim_off, vit->second.bytes.data());
+      }
+      auto node = pages_.extract(vit);
+      node.key() = page_off;
+      Entry &entry = node.mapped();
+      entry.bytes.assign(page, page + page_size);  // same 4KB buffer, no realloc
+      entry.dirty = dirty;
+      lru_.back() = page_off;
+      lru_.splice(lru_.begin(), lru_, std::prev(lru_.end()));
+      entry.lru_it = lru_.begin();
+      pages_.insert(std::move(node));
+      return;
+    }
     lru_.push_front(page_off);
     pages_.emplace(page_off, Entry{std::vector<char>(page, page + page_size), dirty, lru_.begin()});
   }
@@ -77,9 +105,11 @@ class DiskPageCache {
     it->second.lru_it = lru_.begin();
   }
 
+  /// Drop entries until size() == capacity_ (no-op in the normal at-capacity
+  /// case, which recycles the victim in write() instead of erasing it).
   template <typename FlushPage>
-  void evict_until_room(FlushPage &&flush) {
-    while (pages_.size() >= capacity_) {
+  void evict_excess(FlushPage &&flush) {
+    while (pages_.size() > capacity_) {
       const uint64_t page_off = lru_.back();
       auto it = pages_.find(page_off);
       if (it != pages_.end() && it->second.dirty) {

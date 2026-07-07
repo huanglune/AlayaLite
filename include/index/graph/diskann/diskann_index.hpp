@@ -430,6 +430,7 @@ class DiskANNIndex {
       throw std::invalid_argument("DiskANNIndex::search: null output buffers");
     }
 
+    const auto ts0 = std::chrono::steady_clock::now();
     const SearchSnapshot snapshot = make_search_snapshot();
     const bool use_pq = params.use_pq && has_pq_;
     std::shared_lock<std::shared_mutex> pq_lock;
@@ -442,6 +443,12 @@ class DiskANNIndex {
     std::vector<std::pair<uint32_t, float>> results;
     try {
       td->resize_slot_capacity(snapshot.max_slot_id);
+      if (stats != nullptr) {
+        stats->setup_us +=
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - ts0)
+                                      .count());
+      }
       SearchContext ctx;
       ctx.reader = reader_.get();
       ctx.geom = &geom_;
@@ -544,6 +551,218 @@ class DiskANNIndex {
       th.join();
     }
   }
+
+#if defined(__linux__)
+  // --------------------------------------------------- pipelined batch search
+  /**
+   * @brief Pre-allocates and first-touches the per-slot scratch for up to
+   *        @p pipeline in-flight slots, using @p num_threads workers for the
+   *        touch. search_pipelined self-heals without it, but pays the
+   *        allocation inside its own wall clock — at depth 1024 on a 10M-slot
+   *        index that is ~130 GB of first-touch, which would dominate a timed
+   *        benchmark call. Idempotent.
+   */
+  void prewarm_pipeline(uint32_t num_threads, uint32_t pipeline) const {
+    const uint32_t inflight = std::max<uint32_t>(1, pipeline);
+    const uint32_t workers = std::max<uint32_t>(1, num_threads);
+    std::lock_guard<std::mutex> pipeline_guard(pipeline_tds_mutex_);
+    coro::thread_pool pool{{.thread_count = workers,
+                            .on_thread_start_functor = nullptr,
+                            .on_thread_stop_functor = nullptr}};
+    ensure_pipeline_tds_locked(inflight, pool);
+  }
+
+  /**
+   * @brief Query-level pipelined batch search: @p num_threads pool threads
+   *        drive up to @p pipeline concurrent query coroutines; a query
+   *        suspends on its beam-wave reads (io_uring reactor) instead of
+   *        parking its thread, which then resumes another in-flight query.
+   *        This is Yi's worker/tasklet split for the read-only search path:
+   *        threads bound CPU, @p pipeline bounds in-flight queries, and
+   *        throughput follows Little's law instead of 8/latency.
+   *
+   * Per-query semantics match search() with rerank off (the async beams sit in
+   * the sync schedulers' recall-equivalence class). Rerank is rejected, as in
+   * pq_beam_search_async — in the trace-bench protocol it is a no-op anyway
+   * (every retset entry is expanded during traversal, so rerank re-reads 0
+   * nodes). Requires an updatable load with update_io=uring for the shared
+   * reactor. Each in-flight slot owns a private ThreadData (visited bits +
+   * scratch), so @p pipeline trades memory for I/O overlap; the search()/
+   * update ThreadData pools are not touched.
+   *
+   * @p per_query_stats / @p per_query_us: optional arrays of @p n_queries.
+   */
+  void search_pipelined(const float *queries,
+                        uint32_t n_queries,
+                        uint32_t top_k,
+                        uint64_t *out_labels,
+                        float *out_distances,
+                        uint32_t num_threads,
+                        uint32_t pipeline,
+                        const DiskANNSearchParams &params = {},
+                        SearchStats *per_query_stats = nullptr,
+                        double *per_query_us = nullptr) const {
+    if (!loaded_) {
+      throw std::runtime_error("DiskANNIndex::search_pipelined: index not loaded");
+    }
+    if (queries == nullptr) {
+      throw std::invalid_argument("DiskANNIndex::search_pipelined: null queries");
+    }
+    if (top_k == 0) {
+      throw std::invalid_argument("DiskANNIndex::search_pipelined: top_k must be > 0");
+    }
+    if (out_labels == nullptr || out_distances == nullptr) {
+      throw std::invalid_argument("DiskANNIndex::search_pipelined: null output buffers");
+    }
+    if (params.rerank) {
+      throw std::invalid_argument("DiskANNIndex::search_pipelined: rerank is not supported");
+    }
+    if (!update_reactor_ || !reader_ || reader_->get_fd() < 0) {
+      throw std::runtime_error(
+          "DiskANNIndex::search_pipelined: requires an updatable load with "
+          "update_io=uring (shared reactor)");
+    }
+    if (n_queries == 0) {
+      return;
+    }
+
+    const bool use_pq = params.use_pq && has_pq_;
+    const uint32_t inflight = std::max<uint32_t>(1, std::min(pipeline, n_queries));
+    const uint32_t workers = std::max<uint32_t>(1, num_threads);
+    const int fd = reader_->get_fd();
+    // Rerank-pool semantics without rerank reads: ask the traversal for the
+    // full search list (every entry carries its exact distance by the time it
+    // is expanded), then cut the exact-sorted list to top_k below. Requesting
+    // only top_k would pre-cut by PQ order — measurably worse recall.
+    const uint32_t ask = std::max<uint32_t>(top_k, params.search_list_size);
+
+    // One private ThreadData per in-flight coroutine, cached across calls: a
+    // slot holds its td for the whole run, so no gate is needed, and reuse
+    // matters because per-slot scratch is ~12 B/slot/td (visited bits +
+    // exact-dist + neighbor offsets — ~1 GiB per td at 90M slots). Concurrent
+    // search_pipelined calls serialize on the cache mutex by design. These
+    // tds never issue libaio reads (pure reactor path), so they cost no
+    // fs.aio-max-nr quota.
+    std::lock_guard<std::mutex> pipeline_guard(pipeline_tds_mutex_);
+
+    std::atomic<uint32_t> next{0};
+    std::mutex error_mutex;
+    std::exception_ptr first_error;
+
+    coro::thread_pool pool{{.thread_count = workers,
+                            .on_thread_start_functor = nullptr,
+                            .on_thread_stop_functor = nullptr}};
+    ensure_pipeline_tds_locked(inflight, pool);
+
+    auto drive = [&](ThreadData *td) -> coro::task<void> {
+      co_await pool.schedule();
+      for (;;) {
+        const uint32_t qi = next.fetch_add(1, std::memory_order_relaxed);
+        if (qi >= n_queries) {
+          break;
+        }
+        try {
+          const auto t0 = std::chrono::steady_clock::now();
+          const SearchSnapshot snapshot = make_search_snapshot();
+          td->resize_slot_capacity(snapshot.max_slot_id);
+          SearchContext ctx;
+          ctx.reader = reader_.get();
+          ctx.geom = &geom_;
+          ctx.cache = &cache_;
+          ctx.pq = use_pq ? &pq_ : nullptr;
+          ctx.medoid = medoid_;
+          ctx.num_points = snapshot.max_slot_id;
+          if (snapshot.has_tombstone) {
+            ctx.tombstone = &snapshot.tombstone;
+          }
+          ctx.page_io = search_page_io();
+
+          SearchParams sp;
+          sp.search_list_size = params.search_list_size;
+          sp.beam_width = beam_width_;
+          sp.use_pq = use_pq;
+          sp.rerank = false;
+          sp.deterministic = params.deterministic;
+
+          SearchStats *stats = per_query_stats != nullptr ? &per_query_stats[qi] : nullptr;
+          const float *query = queries + static_cast<uint64_t>(qi) * dim_;
+          // No pq_mutex_ across the coroutine (a shared_mutex may not be
+          // released on another thread) — safe by the dark-slot protocol, see
+          // run_update_search_async.
+          std::vector<std::pair<uint32_t, float>> results;
+          if (use_pq) {
+            results = co_await pq_beam_search_async(ctx,
+                                                    query,
+                                                    ask,
+                                                    sp,
+                                                    *td,
+                                                    stats,
+                                                    *update_reactor_,
+                                                    pool,
+                                                    fd);
+          } else {
+            results = co_await disk_greedy_search_async(ctx,
+                                                        query,
+                                                        ask,
+                                                        sp,
+                                                        *td,
+                                                        stats,
+                                                        *update_reactor_,
+                                                        pool,
+                                                        fd);
+          }
+
+          uint64_t *labels_row = out_labels + static_cast<uint64_t>(qi) * top_k;
+          float *dist_row = out_distances + static_cast<uint64_t>(qi) * top_k;
+          const uint32_t count = std::min<uint32_t>(static_cast<uint32_t>(results.size()), top_k);
+          {
+            std::shared_lock<std::shared_mutex> state_lock(update_mutex_);
+            for (uint32_t i = 0; i < count; ++i) {
+              const uint32_t id = results[i].first;
+              labels_row[i] = id < labels_.size() ? labels_[id] : kNoLabel;
+              dist_row[i] = results[i].second;
+            }
+          }
+          for (uint32_t i = count; i < top_k; ++i) {
+            labels_row[i] = kNoLabel;
+            dist_row[i] = std::numeric_limits<float>::max();
+          }
+          if (per_query_us != nullptr) {
+            per_query_us[qi] =
+                std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0)
+                    .count();
+          }
+        } catch (...) {
+          {
+            std::lock_guard<std::mutex> guard(error_mutex);
+            if (!first_error) {
+              first_error = std::current_exception();
+            }
+          }
+          next.store(n_queries, std::memory_order_relaxed);  // drain remaining work
+          break;
+        }
+      }
+      co_return;
+    };
+
+    std::vector<coro::task<void>> tasks;
+    tasks.reserve(inflight);
+    for (uint32_t t = 0; t < inflight; ++t) {
+      tasks.emplace_back(drive(pipeline_tds_[t].get()));
+    }
+    try {
+      coro::sync_wait(coro::when_all(std::move(tasks)));
+    } catch (...) {
+      pool.shutdown();
+      throw;
+    }
+    pool.shutdown();
+    if (first_error) {
+      std::rethrow_exception(first_error);
+    }
+  }
+#endif  // __linux__
 
   // --------------------------------------------------------------- accessors
   [[nodiscard]] uint64_t size() const { return live_count(); }  // live (non-tombstoned) vectors
@@ -840,7 +1059,12 @@ class DiskANNIndex {
     SearchSnapshot snapshot;
     std::shared_lock<std::shared_mutex> lock(update_mutex_);
     snapshot.max_slot_id = max_slot_id_;
-    if (updatable_) {
+    // All tombstone mutators run under the exclusive side of update_mutex_
+    // (verified in the A3 audit), so count() is stable under our shared lock:
+    // zero set bits means the snapshot would be all-live — skip the copy. The
+    // bitmap's capacity never shrinks, so after the first update round every
+    // query would otherwise pay a full-capacity copy even with no tombstones.
+    if (updatable_ && slot_alloc_.tombstone().count() > 0) {
       slot_alloc_.tombstone().snapshot_into(snapshot.tombstone);
       snapshot.has_tombstone = true;
     }
@@ -2008,6 +2232,38 @@ class DiskANNIndex {
   bool search_page_cache_ = true;  ///< searches peek+fill the shard page cache (Yi pool view)
   alaya::AsyncGate<ThreadData> update_search_td_gate_;  ///< reactor-mode update searches
   bool update_search_async_ = false;                    ///< No-PQ + reactor + O_DIRECT fd available
+#if defined(__linux__)
+  // search_pipelined slot contexts, cached across calls (per-slot scratch is
+  // ~12 B/slot/td — rebuilding per call would dwarf the queries themselves).
+  mutable std::vector<std::unique_ptr<ThreadData>> pipeline_tds_;
+  mutable std::mutex pipeline_tds_mutex_;  ///< serializes concurrent pipelined calls
+
+  /// Grows the pipeline td cache to @p inflight slots and first-touches every
+  /// td's per-slot scratch in parallel on @p pool (the first touch of
+  /// ~1 GiB/td at 90M slots costs ~0.5 s single-threaded and must not
+  /// serialize into the first in-flight queries). Caller must hold
+  /// pipeline_tds_mutex_.
+  void ensure_pipeline_tds_locked(uint32_t inflight, coro::thread_pool &pool) const {
+    while (pipeline_tds_.size() < inflight) {
+      auto td = std::make_unique<ThreadData>();
+      td->alloc_scratch(scratch_config_);
+      td->ensure_wave_scratch(static_cast<uint64_t>(std::max<uint32_t>(1, beam_width_)) *
+                              geom_.page_size);
+      pipeline_tds_.push_back(std::move(td));
+    }
+    const uint64_t max_slot = max_slot_id();
+    std::vector<coro::task<void>> warm;
+    warm.reserve(inflight);
+    auto presize = [&](ThreadData *td) -> coro::task<void> {
+      co_await pool.schedule();
+      td->resize_slot_capacity(max_slot);
+    };
+    for (uint32_t t = 0; t < inflight; ++t) {
+      warm.emplace_back(presize(pipeline_tds_[t].get()));
+    }
+    coro::sync_wait(coro::when_all(std::move(warm)));
+  }
+#endif
 
   // in-place update state (active only when updatable_)
   bool updatable_ = false;

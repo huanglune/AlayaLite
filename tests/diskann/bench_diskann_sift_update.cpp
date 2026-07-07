@@ -109,6 +109,9 @@ struct Options {
   uint32_t update_l = kDefaultBenchmarkUpdateSearchL;
   uint32_t beam = 4;
   uint32_t search_threads = 1;
+  uint32_t eval_pipeline = 0;  ///< >1: eval via search_pipelined with this many
+                               ///< in-flight query coroutines (Yi tasklet-style);
+                               ///< 0/1 = classic one-query-per-thread eval
   uint32_t insert_batch = 32;
   uint32_t update_insert_threads = 32;
   uint32_t update_reconnect_threads = 4;
@@ -329,6 +332,8 @@ Options parse_args(int argc, char **argv) {
       opt.beam = parse_u32(argv[++i], "--beam");
     } else if (arg == "--threads" && i + 1 < argc) {
       opt.search_threads = std::max<uint32_t>(1, parse_u32(argv[++i], "--threads"));
+    } else if (arg == "--eval_pipeline" && i + 1 < argc) {
+      opt.eval_pipeline = parse_u32(argv[++i], "--eval_pipeline");
     } else if (arg == "--insert_batch" && i + 1 < argc) {
       opt.insert_batch = std::max<uint32_t>(1, parse_u32(argv[++i], "--insert_batch"));
     } else if (arg == "--update_io" && i + 1 < argc) {
@@ -486,32 +491,130 @@ RecallResult evaluate_search(const DiskANNIndex &idx,
   std::vector<float> distances(static_cast<size_t>(nq) * kBenchmarkTopK);
   std::vector<double> lat_us(nq, 0.0);
   std::atomic<uint32_t> next{0};
+  std::atomic<uint64_t> tot_ios{0};
+  std::atomic<uint64_t> tot_page_hits{0};
+  std::atomic<uint64_t> tot_bfs_hits{0};
+  std::atomic<uint64_t> tot_nodes{0};
+  std::atomic<uint64_t> tot_waits{0};
+  std::atomic<uint64_t> tot_inflight{0};
+  std::atomic<uint64_t> tot_wait_us{0};
+  std::atomic<uint64_t> tot_proc_us{0};
+  std::atomic<uint64_t> tot_setup_us{0};
+  std::atomic<uint64_t> tot_peek_us{0};
+  std::atomic<uint64_t> tot_fillpg_us{0};
+  std::atomic<uint64_t> tot_rerank_reads{0};
   auto worker = [&]() {
+    uint64_t ios = 0;
+    uint64_t page_hits = 0;
+    uint64_t bfs_hits = 0;
+    uint64_t nodes = 0;
     for (;;) {
       const uint32_t qi = next.fetch_add(1, std::memory_order_relaxed);
       if (qi >= nq) {
         break;
       }
       const float *query = queries.data.data() + static_cast<size_t>(qi) * queries.dim;
+      alaya::diskann::SearchStats stats;
       auto t0 = std::chrono::steady_clock::now();
       idx.search(query,
                  kBenchmarkTopK,
                  labels.data() + static_cast<size_t>(qi) * kBenchmarkTopK,
                  distances.data() + static_cast<size_t>(qi) * kBenchmarkTopK,
-                 sp);
+                 sp,
+                 &stats);
       auto t1 = std::chrono::steady_clock::now();
       lat_us[qi] = std::chrono::duration<double, std::micro>(t1 - t0).count();
+      ios += stats.n_ios;
+      page_hits += stats.n_page_cache_hits;
+      bfs_hits += stats.n_cache_hits;
+      nodes += stats.n_nodes_processed;
+      tot_waits.fetch_add(stats.n_waits, std::memory_order_relaxed);
+      tot_inflight.fetch_add(stats.inflight_sum, std::memory_order_relaxed);
+      tot_wait_us.fetch_add(stats.wait_us, std::memory_order_relaxed);
+      tot_proc_us.fetch_add(stats.proc_us, std::memory_order_relaxed);
+      tot_setup_us.fetch_add(stats.setup_us, std::memory_order_relaxed);
+      tot_peek_us.fetch_add(stats.peek_us, std::memory_order_relaxed);
+      tot_fillpg_us.fetch_add(stats.fillpg_us, std::memory_order_relaxed);
+      tot_rerank_reads.fetch_add(stats.n_rerank_reads, std::memory_order_relaxed);
     }
+    tot_ios.fetch_add(ios, std::memory_order_relaxed);
+    tot_page_hits.fetch_add(page_hits, std::memory_order_relaxed);
+    tot_bfs_hits.fetch_add(bfs_hits, std::memory_order_relaxed);
+    tot_nodes.fetch_add(nodes, std::memory_order_relaxed);
   };
-  const auto wall0 = std::chrono::steady_clock::now();
-  std::vector<std::thread> threads;
-  for (uint32_t i = 0; i < opt.search_threads; ++i) {
-    threads.emplace_back(worker);
+#if defined(__linux__)
+  if (opt.eval_pipeline > 1) {
+    // Scratch first-touch (~12 B/slot per in-flight slot) must not land in the
+    // timed window: at depth 1024 on 10M slots it rivals the queries themselves.
+    idx.prewarm_pipeline(opt.search_threads, opt.eval_pipeline);
   }
-  for (auto &thread : threads) {
-    thread.join();
+#endif
+  const auto wall0 = std::chrono::steady_clock::now();
+#if defined(__linux__)
+  if (opt.eval_pipeline > 1) {
+    // Yi-style query pipelining: threads keep eval_pipeline queries in flight
+    // as coroutines. rerank is forced off — a no-op in this protocol (every
+    // retset entry is expanded during traversal; rerank_reads=0 on all legs).
+    std::vector<alaya::diskann::SearchStats> qstats(nq);
+    DiskANNSearchParams psp = sp;
+    psp.rerank = false;
+    idx.search_pipelined(queries.data.data(),
+                         nq,
+                         kBenchmarkTopK,
+                         labels.data(),
+                         distances.data(),
+                         opt.search_threads,
+                         opt.eval_pipeline,
+                         psp,
+                         qstats.data(),
+                         lat_us.data());
+    for (uint32_t qi = 0; qi < nq; ++qi) {
+      const auto &st = qstats[qi];
+      tot_ios.fetch_add(st.n_ios, std::memory_order_relaxed);
+      tot_page_hits.fetch_add(st.n_page_cache_hits, std::memory_order_relaxed);
+      tot_bfs_hits.fetch_add(st.n_cache_hits, std::memory_order_relaxed);
+      tot_nodes.fetch_add(st.n_nodes_processed, std::memory_order_relaxed);
+      tot_waits.fetch_add(st.n_waits, std::memory_order_relaxed);
+      tot_inflight.fetch_add(st.inflight_sum, std::memory_order_relaxed);
+      tot_wait_us.fetch_add(st.wait_us, std::memory_order_relaxed);
+      tot_proc_us.fetch_add(st.proc_us, std::memory_order_relaxed);
+      tot_setup_us.fetch_add(st.setup_us, std::memory_order_relaxed);
+      tot_peek_us.fetch_add(st.peek_us, std::memory_order_relaxed);
+      tot_fillpg_us.fetch_add(st.fillpg_us, std::memory_order_relaxed);
+      tot_rerank_reads.fetch_add(st.n_rerank_reads, std::memory_order_relaxed);
+    }
+  } else {
+#else
+  {
+#endif
+    std::vector<std::thread> threads;
+    for (uint32_t i = 0; i < opt.search_threads; ++i) {
+      threads.emplace_back(worker);
+    }
+    for (auto &thread : threads) {
+      thread.join();
+    }
   }
   const auto wall1 = std::chrono::steady_clock::now();
+
+  std::cout << "[eval io] per-query ios=" << static_cast<double>(tot_ios.load()) / nq
+            << " page_hits=" << static_cast<double>(tot_page_hits.load()) / nq
+            << " bfs_hits=" << static_cast<double>(tot_bfs_hits.load()) / nq
+            << " nodes=" << static_cast<double>(tot_nodes.load()) / nq << " hit_ratio="
+            << (static_cast<double>(tot_page_hits.load() + tot_bfs_hits.load()) /
+                std::max<double>(1.0,
+                                 static_cast<double>(tot_ios.load() + tot_page_hits.load() +
+                                                     tot_bfs_hits.load())))
+            << " depth=" << (static_cast<double>(tot_inflight.load()) /
+                             std::max<double>(1.0, static_cast<double>(tot_waits.load())))
+            << " waits=" << static_cast<double>(tot_waits.load()) / nq
+            << " wait_us=" << static_cast<double>(tot_wait_us.load()) / nq
+            << " proc_us=" << static_cast<double>(tot_proc_us.load()) / nq
+            << " setup_us=" << static_cast<double>(tot_setup_us.load()) / nq
+            << " peek_us=" << static_cast<double>(tot_peek_us.load()) / nq
+            << " fillpg_us=" << static_cast<double>(tot_fillpg_us.load()) / nq
+            << " rerank_reads=" << static_cast<double>(tot_rerank_reads.load()) / nq
+            << " pipeline=" << std::max<uint32_t>(1, opt.eval_pipeline) << "\n";
 
   RecallResult result;
   for (uint32_t qi = 0; qi < nq; ++qi) {

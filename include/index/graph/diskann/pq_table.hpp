@@ -284,6 +284,53 @@ class PQTable {
     return sum;
   }
 
+  /**
+   * @brief Batch asymmetric PQ distances for @p n stored points
+   *        (gather-then-transposed-accumulate, Yi's eval kernel shape).
+   *
+   * Pass 1 gathers the code rows into a contiguous stack tile with software
+   * prefetch — the only random touches of the multi-GB code array, and they
+   * overlap instead of stalling a dependent chain the way per-point
+   * pq_distance() calls do. Pass 2 accumulates chunk-major, so one 1 KiB
+   * dist_table row stays L1-hot across all candidates and the inner loop
+   * vectorizes. Bit-identical to n pq_distance() calls: each point sums the
+   * same values in the same chunk-ascending order.
+   */
+  void pq_distance_batch(const uint32_t *point_ids,
+                         uint32_t n,
+                         const float *dist_table,
+                         float *out) const {
+    constexpr uint32_t kTilePoints = 96;  // >= max node degree; a few KiB of stack
+    constexpr uint32_t kTileChunks = 64;  // codes tile is kTilePoints * kTileChunks
+    if (n_chunks_ > kTileChunks) {        // exotic config: keep the scalar path
+      for (uint32_t i = 0; i < n; ++i) {
+        out[i] = pq_distance(point_ids[i], dist_table);
+      }
+      return;
+    }
+    const uint8_t *base = codes_.data();
+    uint8_t tile[kTilePoints * kTileChunks];
+    for (uint32_t off = 0; off < n; off += kTilePoints) {
+      const uint32_t m = std::min(kTilePoints, n - off);
+      for (uint32_t i = 0; i < m; ++i) {
+        if (i + 4 < m) {
+          __builtin_prefetch(base + static_cast<size_t>(point_ids[off + i + 4]) * n_chunks_, 0, 1);
+        }
+        std::memcpy(tile + static_cast<size_t>(i) * n_chunks_,
+                    base + static_cast<size_t>(point_ids[off + i]) * n_chunks_,
+                    n_chunks_);
+      }
+      float *o = out + off;
+      std::fill_n(o, m, 0.0F);
+      for (uint32_t c = 0; c < n_chunks_; ++c) {
+        const float *row = dist_table + static_cast<size_t>(c) * kPQNumCentroids;
+        for (uint32_t i = 0; i < m; ++i) {
+          o[i] += row[tile[static_cast<size_t>(i) * n_chunks_ + c]];
+        }
+      }
+    }
+  }
+
   /// Symmetric PQ distance between two stored code rows.
   [[nodiscard]] float pq_symmetric_distance(uint64_t lhs, uint64_t rhs) const {
     if (lhs >= num_points_ || rhs >= num_points_) {
