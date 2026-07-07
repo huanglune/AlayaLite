@@ -16,7 +16,9 @@
 #ifdef ALAYA_OS_LINUX
   #include <unistd.h>
 #elif defined(ALAYA_OS_WINDOWS)
+  #include <io.h>
   #include <windows.h>
+using ssize_t = ptrdiff_t;
 #else
   #include <unistd.h>
 #endif

@@ -93,8 +93,8 @@ struct Options {
   bool eval_only = false;
   bool single_updates = false;
   bool mixed = false;
-  bool update_rerank = true;        ///< Yi trace-bench parity (_rerank_flag=true)
-  bool update_insert_prune = false; ///< Yi never alpha-prunes at insert
+  bool update_rerank = true;          ///< Yi trace-bench parity (_rerank_flag=true)
+  bool update_insert_prune = false;   ///< Yi never alpha-prunes at insert
   bool mixed_round0_baseline = true;  ///< Yi UpdateRunner: round 0 runs no updates
   MixedMode mixed_mode = MixedMode::Background;
   uint32_t max_rounds = 0;
@@ -605,8 +605,9 @@ RecallResult evaluate_search(const DiskANNIndex &idx,
                 std::max<double>(1.0,
                                  static_cast<double>(tot_ios.load() + tot_page_hits.load() +
                                                      tot_bfs_hits.load())))
-            << " depth=" << (static_cast<double>(tot_inflight.load()) /
-                             std::max<double>(1.0, static_cast<double>(tot_waits.load())))
+            << " depth="
+            << (static_cast<double>(tot_inflight.load()) /
+                std::max<double>(1.0, static_cast<double>(tot_waits.load())))
             << " waits=" << static_cast<double>(tot_waits.load()) / nq
             << " wait_us=" << static_cast<double>(tot_wait_us.load()) / nq
             << " proc_us=" << static_cast<double>(tot_proc_us.load()) / nq
@@ -617,6 +618,13 @@ RecallResult evaluate_search(const DiskANNIndex &idx,
             << " pipeline=" << std::max<uint32_t>(1, opt.eval_pipeline) << "\n";
 
   RecallResult result;
+  // Recall by GT-id bucket: sequential traces assign ids in insertion order, so
+  // the id encodes node age (original build vs round-r insert). The per-bucket
+  // split separates "old survivors got eroded" from "new inserts are wired
+  // weakly" — indistinguishable in the aggregate number.
+  constexpr uint32_t kIdBucketWidth = 500000;
+  std::vector<uint64_t> bucket_hits(20, 0);
+  std::vector<uint64_t> bucket_total(20, 0);
   for (uint32_t qi = 0; qi < nq; ++qi) {
     std::unordered_set<uint64_t> got;
     const uint64_t *row = labels.data() + static_cast<size_t>(qi) * kBenchmarkTopK;
@@ -629,13 +637,21 @@ RecallResult evaluate_search(const DiskANNIndex &idx,
     for (uint32_t i = 0; i < kBenchmarkTopK && i < gt.dim; ++i) {
       if (truth[i] < live.size() && live[truth[i]] != 0) {
         ++result.total;
+        const size_t bucket = std::min<size_t>(truth[i] / kIdBucketWidth, bucket_hits.size() - 1);
+        ++bucket_total[bucket];
         if (got.count(truth[i]) != 0) {
           ++result.hits;
+          ++bucket_hits[bucket];
         }
       }
     }
     result.mean_us += lat_us[qi];
   }
+  std::cout << "[recall_buckets] w=" << kIdBucketWidth;
+  for (size_t bucket = 0; bucket < bucket_hits.size(); ++bucket) {
+    std::cout << " " << bucket_hits[bucket] << "/" << bucket_total[bucket];
+  }
+  std::cout << "\n";
   result.mean_us /= nq;
   result.qps = static_cast<double>(nq) / std::chrono::duration<double>(wall1 - wall0).count();
   return result;
@@ -770,8 +786,7 @@ void start_shared_queue_mixed_search(MixedSearchState &state,
         coro::sync_wait(run_window());
         const auto window_end = std::chrono::steady_clock::now();
         const auto active_ns =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(window_end - window_start)
-                .count();
+            std::chrono::duration_cast<std::chrono::nanoseconds>(window_end - window_start).count();
         state.active_search_ns.fetch_add(static_cast<uint64_t>(active_ns),
                                          std::memory_order_relaxed);
         sleep_until_next_mixed_window(state, opt.mixed_sleep_ms);
@@ -1095,11 +1110,10 @@ int main(int argc, char **argv) {
       try {
         if (opt.mixed && !baseline_round) {
           if (opt.mixed_mode == MixedMode::SharedQueue) {
-            const uint32_t mixed_workers =
-                std::max({uint32_t{1},
-                          opt.search_threads,
-                          opt.update_insert_threads,
-                          opt.update_reconnect_threads});
+            const uint32_t mixed_workers = std::max({uint32_t{1},
+                                                     opt.search_threads,
+                                                     opt.update_insert_threads,
+                                                     opt.update_reconnect_threads});
             mixed_pool = std::make_unique<coro::thread_pool>(
                 coro::thread_pool::options{.thread_count = mixed_workers,
                                            .on_thread_start_functor = nullptr,
@@ -1172,8 +1186,7 @@ int main(int argc, char **argv) {
         const RecallResult recall = evaluate_search(idx, queries, gt, live, opt);
         std::cout << "[round " << round_id << "] update_qps=" << update_qps
                   << " delete_ms=" << delete_ms << " insert_ms=" << insert_ms
-                  << " flush_ms=" << flush_ms
-                  << " mixed_mode=" << mixed_mode_name(opt.mixed_mode)
+                  << " flush_ms=" << flush_ms << " mixed_mode=" << mixed_mode_name(opt.mixed_mode)
                   << " mixed_search_qps=" << mixed_search.qps
                   << " mixed_search_mean_us=" << mixed_search.mean_us
                   << " mixed_search_queries=" << mixed_search.queries

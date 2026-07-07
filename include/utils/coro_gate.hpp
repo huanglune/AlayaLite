@@ -101,9 +101,9 @@ class AsyncGate {
     // what we need first and touch nothing of it after resume().
     coro::thread_pool &pool = waiter->pool_;
     const std::coroutine_handle<> handle = waiter->handle_;
-    if (!pool.resume(handle)) {
-      LOG_ERROR("AsyncGate: thread pool rejected resume (shutdown with waiters parked?)");
-    }
+    if (!pool.resume(handle)) {  // LCOV_EXCL_START
+      LOG_ERROR("AsyncGate: pool rejected resume");
+    }  // LCOV_EXCL_STOP
   }
 
   /// Drop all free objects (does not delete them). Callers must have

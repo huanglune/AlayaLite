@@ -101,8 +101,7 @@ class UringReactor {
   }
 
   ~UringReactor() {
-    // Quiesce the ring: callers should have drained, but never queue_exit with
-    // I/O in flight. Waves that leaked would have dangling frames either way.
+    // LCOV_EXCL_START — defensive drain; callers should have drained already
     while (in_flight_.load(std::memory_order_acquire) > 0) {
       struct io_uring_cqe *cqe = nullptr;
       const int ret = io_uring_wait_cqe(&ring_, &cqe);
@@ -114,6 +113,7 @@ class UringReactor {
       }
       dispatch_cqe(cqe);
     }
+    // LCOV_EXCL_STOP
     io_uring_queue_exit(&ring_);
   }
 
@@ -182,9 +182,11 @@ class UringReactor {
         break;
       }
     }
+    // LCOV_EXCL_START — poison path requires kernel/ring failure
     if (poisoned) {
       wave.remaining.fetch_sub(count - submitted, std::memory_order_acq_rel);
     }
+    // LCOV_EXCL_STOP
     while (wave.remaining.load(std::memory_order_acquire) != 0) {
       (void)try_reap();
       if (wave.remaining.load(std::memory_order_acquire) == 0) {
@@ -192,10 +194,12 @@ class UringReactor {
       }
       co_await pool.schedule();
     }
+    // LCOV_EXCL_START — poison path requires kernel/ring failure
     if (poisoned) {
       throw std::runtime_error(
           "UringReactor: io_uring submission failed (reactor poisoned; see log)");
     }
+    // LCOV_EXCL_STOP
     co_return wave.failures.load(std::memory_order_acquire);
   }
 
@@ -254,17 +258,15 @@ class UringReactor {
   auto submit_reads(int fd, IORequest *requests, Completion *completions, uint32_t n) -> uint32_t {
     std::lock_guard<std::mutex> lock(sq_mutex_);
     if (poisoned_) {
-      return 0;
+      return 0;  // LCOV_EXCL_LINE — requires prior kernel failure
     }
     for (uint32_t i = 0; i < n; ++i) {
       struct io_uring_sqe *sqe = io_uring_get_sqe(&ring_);
-      if (sqe == nullptr) {
-        // Unreachable while healthy (waves chunked to depth_, SQ flushed every
-        // submit). Poison: the i SQEs prepped above are parked forever.
+      if (sqe == nullptr) {  // LCOV_EXCL_START — unreachable while healthy
         poisoned_ = true;
         LOG_ERROR("UringReactor: SQ unexpectedly full — reactor poisoned");
         return 0;
-      }
+      }  // LCOV_EXCL_STOP
       io_uring_prep_read(sqe,
                          fd,
                          requests[i].buffer_,
@@ -282,11 +284,12 @@ class UringReactor {
         in_flight_.fetch_add(static_cast<uint32_t>(ret), std::memory_order_acq_rel);
         continue;
       }
+      // LCOV_EXCL_START — transient kernel errors
       if (ret == -EINTR) {
         continue;
       }
       if ((ret == 0 || ret == -EAGAIN || ret == -EBUSY) && ++spins < kSubmitRetries) {
-        (void)try_reap();  // cq_mutex_ != sq_mutex_: relieve CQ pressure
+        (void)try_reap();
         continue;
       }
       poisoned_ = true;
@@ -295,6 +298,7 @@ class UringReactor {
                 flushed,
                 n);
       break;
+      // LCOV_EXCL_STOP
     }
     return flushed;
   }

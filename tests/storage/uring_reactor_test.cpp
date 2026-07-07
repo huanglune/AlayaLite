@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -70,9 +71,8 @@ class UringReactorTest : public ::testing::Test {
 
 TEST_F(UringReactorTest, SingleReadReturnsData) {
   UringReactor reactor;
-  coro::thread_pool pool{{.thread_count = 2,
-                          .on_thread_start_functor = nullptr,
-                          .on_thread_stop_functor = nullptr}};
+  coro::thread_pool pool{
+      {.thread_count = 2, .on_thread_start_functor = nullptr, .on_thread_stop_functor = nullptr}};
   std::vector<char> buf(4096, 0);
   auto task = [&]() -> coro::task<int32_t> {
     co_await pool.schedule();
@@ -85,9 +85,8 @@ TEST_F(UringReactorTest, SingleReadReturnsData) {
 
 TEST_F(UringReactorTest, BatchWaveCompletesAllReads) {
   UringReactor reactor;
-  coro::thread_pool pool{{.thread_count = 2,
-                          .on_thread_start_functor = nullptr,
-                          .on_thread_stop_functor = nullptr}};
+  coro::thread_pool pool{
+      {.thread_count = 2, .on_thread_start_functor = nullptr, .on_thread_stop_functor = nullptr}};
   constexpr uint32_t kReads = 64;
   constexpr size_t kLen = 4096;
   std::vector<char> buf(kReads * kLen, 0);
@@ -112,9 +111,8 @@ TEST_F(UringReactorTest, BatchWaveCompletesAllReads) {
 
 TEST_F(UringReactorTest, EmptyBatchDoesNotSuspend) {
   UringReactor reactor;
-  coro::thread_pool pool{{.thread_count = 1,
-                          .on_thread_start_functor = nullptr,
-                          .on_thread_stop_functor = nullptr}};
+  coro::thread_pool pool{
+      {.thread_count = 1, .on_thread_start_functor = nullptr, .on_thread_stop_functor = nullptr}};
   auto task = [&]() -> coro::task<uint32_t> {
     co_await pool.schedule();
     co_return co_await reactor.read_batch(pool, fd_, nullptr, 0);
@@ -124,9 +122,8 @@ TEST_F(UringReactorTest, EmptyBatchDoesNotSuspend) {
 
 TEST_F(UringReactorTest, ShortReadPastEofCountsAsFailure) {
   UringReactor reactor;
-  coro::thread_pool pool{{.thread_count = 1,
-                          .on_thread_start_functor = nullptr,
-                          .on_thread_stop_functor = nullptr}};
+  coro::thread_pool pool{
+      {.thread_count = 1, .on_thread_start_functor = nullptr, .on_thread_stop_functor = nullptr}};
   std::vector<char> buf(4096, 0);
   std::vector<IORequest> reqs(1);
   reqs[0] = IORequest{buf.data(), 4096, kFileSize - 1024, nullptr};  // only 1024 bytes left
@@ -140,9 +137,8 @@ TEST_F(UringReactorTest, ShortReadPastEofCountsAsFailure) {
 
 TEST_F(UringReactorTest, ConcurrentWavesFromManyTasks) {
   UringReactor reactor;
-  coro::thread_pool pool{{.thread_count = 8,
-                          .on_thread_start_functor = nullptr,
-                          .on_thread_stop_functor = nullptr}};
+  coro::thread_pool pool{
+      {.thread_count = 8, .on_thread_start_functor = nullptr, .on_thread_stop_functor = nullptr}};
   constexpr uint32_t kTasks = 32;
   constexpr uint32_t kReadsPerTask = 16;
   constexpr size_t kLen = 4096;
@@ -153,8 +149,7 @@ TEST_F(UringReactorTest, ConcurrentWavesFromManyTasks) {
     std::vector<char> buf(kReadsPerTask * kLen);
     std::vector<IORequest> reqs(kReadsPerTask);
     for (uint32_t i = 0; i < kReadsPerTask; ++i) {
-      const uint64_t off =
-          (static_cast<uint64_t>(task_id * 7919 + i * 4096)) % (kFileSize - kLen);
+      const uint64_t off = (static_cast<uint64_t>(task_id * 7919 + i * 4096)) % (kFileSize - kLen);
       reqs[i] = IORequest{buf.data() + i * kLen, kLen, off, nullptr};
     }
     total_failures += co_await reactor.read_batch(pool, fd_, reqs.data(), kReadsPerTask);
@@ -190,9 +185,8 @@ TEST_F(UringReactorTest, AsyncGateSuspendsInsteadOfBlockingUnderOversubscription
   constexpr uint32_t kLen = 4096;
 
   UringReactor reactor;
-  coro::thread_pool pool{{.thread_count = 2,
-                          .on_thread_start_functor = nullptr,
-                          .on_thread_stop_functor = nullptr}};
+  coro::thread_pool pool{
+      {.thread_count = 2, .on_thread_start_functor = nullptr, .on_thread_stop_functor = nullptr}};
   alaya::AsyncGate<Pooled> gate;
   std::vector<Pooled> items(kItems);
   for (auto &item : items) {
@@ -248,9 +242,8 @@ TEST_F(UringReactorTest, SequentialWaveReuseUnderConcurrency) {
   constexpr uint32_t kLen = 4096;
 
   UringReactor reactor;
-  coro::thread_pool pool{{.thread_count = 4,
-                          .on_thread_start_functor = nullptr,
-                          .on_thread_stop_functor = nullptr}};
+  coro::thread_pool pool{
+      {.thread_count = 4, .on_thread_start_functor = nullptr, .on_thread_stop_functor = nullptr}};
   std::atomic<uint32_t> corruption{0};
   std::atomic<uint32_t> io_failures{0};
 

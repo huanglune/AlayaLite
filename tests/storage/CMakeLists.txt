@@ -34,13 +34,15 @@ alaya_add_test(
   LABELS storage
 )
 
-alaya_cc_target(
-  uring_reactor_test
-  GTEST
-  SRCS uring_reactor_test.cpp
-)
-alaya_add_test(
-  NAME storage_test_uring_reactor
-  TARGET uring_reactor_test
-  LABELS storage
-)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  alaya_cc_target(
+    uring_reactor_test
+    GTEST
+    SRCS uring_reactor_test.cpp
+  )
+  alaya_add_test(
+    NAME storage_test_uring_reactor
+    TARGET uring_reactor_test
+    LABELS storage
+  )
+endif()

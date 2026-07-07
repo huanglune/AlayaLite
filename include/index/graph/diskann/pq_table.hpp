@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "simd/distance_l2.hpp"
+#include "utils/prefetch.hpp"
 
 namespace alaya::diskann {
 
@@ -314,7 +315,7 @@ class PQTable {
       const uint32_t m = std::min(kTilePoints, n - off);
       for (uint32_t i = 0; i < m; ++i) {
         if (i + 4 < m) {
-          __builtin_prefetch(base + static_cast<size_t>(point_ids[off + i + 4]) * n_chunks_, 0, 1);
+          alaya::prefetch_l3(base + static_cast<size_t>(point_ids[off + i + 4]) * n_chunks_);
         }
         std::memcpy(tile + static_cast<size_t>(i) * n_chunks_,
                     base + static_cast<size_t>(point_ids[off + i]) * n_chunks_,
