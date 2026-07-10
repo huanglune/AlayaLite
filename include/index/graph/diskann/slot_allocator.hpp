@@ -16,6 +16,10 @@
  *     (mirrors Yi, which adds a node to its live set only after the disk
  *     append).
  *   - `free(id)` pushes the slot onto the free list and tombstones it.
+ *   - delete-time graph repair can split that last step: `mark_removed(id)`
+ *     makes searches treat the slot as dead while it remains unavailable for
+ *     reuse, then `release(id)` makes it allocatable after all in-neighbors
+ *     have been patched.
  *
  * The allocator owns the `TombstoneBitmap` so that alloc/free keep liveness and
  * reuse in lockstep, and so a single `save()`/`load()` round-trips the complete
@@ -76,6 +80,13 @@ class SlotAllocator {
     free_list_.push_back(id);
     tombstone_.set(id);
   }
+
+  /// Tombstone @p id without putting it on the free list. Delete-time repair
+  /// must patch in-neighbors during this window, before the slot can be reused.
+  void mark_removed(uint32_t id) { tombstone_.set(id); }
+
+  /// Make a mark_removed() slot reusable after its in-neighbor repair window.
+  void release(uint32_t id) { free_list_.push_back(id); }
 
   [[nodiscard]] bool is_deleted(uint32_t id) const { return tombstone_.is_deleted(id); }
   [[nodiscard]] uint32_t next_fresh_id() const { return next_fresh_id_; }
