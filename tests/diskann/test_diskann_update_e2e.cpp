@@ -978,6 +978,40 @@ TEST_F(UpdateE2ETest, RepairWithSearchDiscovery) {
   exercise_repair_remove_contract(/*repair_search_l=*/32, /*check_recall_floor=*/true);
 }
 
+// Repair supersedes the lazy path's safety net. Under DEFAULT arming (5%
+// tombstones, 16 deletes) a 10% batch delete satisfies both thresholds, so
+// this pins the skip: without it every armed batch pays a redundant scan of
+// the whole delete history that can never find an edge to fix.
+TEST_F(UpdateE2ETest, RepairSkipsSafetyNetUnderDefaultArming) {
+#if defined(ALAYA_UPDATE_E2E_TSAN)
+  constexpr uint32_t kN = 600;
+  constexpr uint32_t kDelete = 60;
+#else
+  constexpr uint32_t kN = 1500;
+  constexpr uint32_t kDelete = 150;
+#endif
+  constexpr uint32_t kDim = 32;
+
+  DiskANNLoadParams lp;
+  lp.update_repair = true;  // safety_net_ratio/ops stay at their defaults
+  build_and_load(kN, kDim, 32, lp);
+
+  std::mt19937 rng(4242);
+  const std::vector<uint32_t> deleted = take_random_deletable(kDelete, rng);
+  const auto deleted_labels = mirror_batch_remove(deleted);
+  EXPECT_EQ(idx_->safety_net_fire_count(), 0u);
+  EXPECT_EQ(idx_->free_slot_count(), static_cast<uint64_t>(kDelete));
+
+  const std::vector<uint32_t> deleted_again = take_random_deletable(kDelete, rng);
+  const auto deleted_labels_again = mirror_batch_remove(deleted_again);
+  EXPECT_EQ(idx_->safety_net_fire_count(), 0u);
+
+  std::unordered_set<uint64_t> forbidden(deleted_labels.begin(), deleted_labels.end());
+  forbidden.insert(deleted_labels_again.begin(), deleted_labels_again.end());
+  const auto deleted_queries = base_queries_for_ids(deleted, 32);
+  expect_searches_omit_labels(deleted_queries, /*k=*/10, /*l=*/100, forbidden);
+}
+
 TEST_F(UpdateE2ETest, InDegreeCounterInvariant) {
 #if defined(ALAYA_UPDATE_E2E_TSAN)
   constexpr uint32_t kN = 400;
