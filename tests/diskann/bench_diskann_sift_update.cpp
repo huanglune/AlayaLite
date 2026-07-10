@@ -270,6 +270,9 @@ void print_usage(const char *argv0) {
             << "  --track_indegree           track live-slot in-degree percentiles\n"
             << "  --garden_budget N          refresh up to N low-in-degree live nodes per round\n"
             << "  --garden_l N               garden search list (0 => use --update_L)\n"
+            << "  --garden_pass N            eval_only: garden_refresh(N) per pass, then re-eval\n"
+            << "  --garden_pass_iters N      garden passes in --garden_pass mode (default 3)\n"
+            << "  --oracle_ids FILE          batch-rebuild on FILE's ids.bin label set, eval once\n"
             << "  --build_only               build the initial index and exit\n"
             << "  --eval_only                replay live mask and run eval only\n"
             << "  --single_updates           issue single remove/insert calls\n"
@@ -479,6 +482,14 @@ std::vector<uint64_t> read_ids_file(const std::string &path) {
   in.read(reinterpret_cast<char *>(&count), sizeof(count));
   if (!in) {
     throw std::runtime_error("oracle ids file truncated header: " + path);
+  }
+  // Validate the header count against the actual file size BEFORE allocating:
+  // a corrupt count would otherwise request a giant vector up front.
+  const uint64_t payload_bytes =
+      static_cast<uint64_t>(std::filesystem::file_size(path)) - sizeof(uint64_t);
+  if (count > payload_bytes / sizeof(uint64_t)) {
+    throw std::runtime_error("oracle ids file count " + std::to_string(count) +
+                             " exceeds file size: " + path);
   }
   std::vector<uint64_t> labels(count);
   in.read(reinterpret_cast<char *>(labels.data()),

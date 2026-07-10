@@ -1097,7 +1097,13 @@ class DiskANNIndex {
   // untracked by the guarded in-degree helpers; brand-new slots are not garden
   // targets.
   static constexpr uint64_t kInDegreeHeadroomSlots = 1ULL << 20;
-  static constexpr uint32_t kInDegreeRecountChunk = 65536;
+  /// Load-time recount ids per wave. Each wave backs its unique pages with ONE
+  /// contiguous aligned buffer and keeps them all in flight (the reactor
+  /// submits in ring-depth chunks regardless), so the bound is wave-buffer
+  /// memory, not SQ depth: 8192 ids cap the worst case (one node per page,
+  /// high-dim) at 32 MiB while staying far above the ring depth, which is what
+  /// saturates the one-time scan.
+  static constexpr uint32_t kInDegreeRecountChunk = 8192;
   /// when_all fan-out per repair/garden wave. Chunking at the worker count
   /// re-created the intra-batch barrier convoy batch_insert removed (each
   /// chunk waits on its slowest member and the AsyncGate never fills); one

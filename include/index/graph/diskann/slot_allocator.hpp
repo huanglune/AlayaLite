@@ -86,7 +86,13 @@ class SlotAllocator {
   void mark_removed(uint32_t id) { tombstone_.set(id); }
 
   /// Make a mark_removed() slot reusable after its in-neighbor repair window.
-  void release(uint32_t id) { free_list_.push_back(id); }
+  /// Re-asserts the tombstone (a no-op in the intended mark_removed() ->
+  /// release() sequence) so misuse on a live slot can never leave it
+  /// simultaneously searchable and allocatable.
+  void release(uint32_t id) {
+    tombstone_.set(id);
+    free_list_.push_back(id);
+  }
 
   [[nodiscard]] bool is_deleted(uint32_t id) const { return tombstone_.is_deleted(id); }
   [[nodiscard]] uint32_t next_fresh_id() const { return next_fresh_id_; }
