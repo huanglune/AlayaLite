@@ -14,3 +14,11 @@ _FULL_PARAMS = [
     ({{ to_numpy_dtype(c.data) }}, {{ to_numpy_dtype(c.id) }}, "{{ to_python_quantization(c.quant) }}", "{{ to_python_index_type(c.index) }}", False),
 {% endfor %}
 ]
+
+# Positional peer of _FULL_PARAMS.  Keeping identity metadata separate avoids
+# changing the long-standing five-field construction matrix tuple.
+_IMPLEMENTATION_IDENTITIES = [
+{% for c in combinations %}
+    ("{{ c.implementation_key }}", "{{ c.engine_factory_key }}", "{{ artifact_identity(c) }}"),
+{% endfor %}
+]

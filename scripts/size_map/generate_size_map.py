@@ -5,27 +5,24 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
-import re
 import subprocess
+from pathlib import Path
 
+import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 def _rows() -> list[tuple[str, str, str, str]]:
-    text = (ROOT / "tools/codegen/dispatch.yaml").read_text(encoding="utf-8")
-    return re.findall(
-        r"^- \{data: ([^,]+), id: ([^,]+), quant: ([^,]+), index: ([^}]+)\}$",
-        text,
-        re.MULTILINE,
-    )
+    config = yaml.safe_load((ROOT / "tools/codegen/dispatch.yaml").read_text(encoding="utf-8"))
+    return [(row["data"], row["id"], row["quant"], row["index"]) for row in config["combinations"]]
 
 
 def _text_bytes(obj: Path) -> int:
     output = subprocess.check_output(["size", "-A", str(obj)], text=True)
-    return sum(int(parts[1]) for line in output.splitlines()
-               if (parts := line.split()) and parts[0].startswith(".text"))
+    return sum(
+        int(parts[1]) for line in output.splitlines() if (parts := line.split()) and parts[0].startswith(".text")
+    )
 
 
 def _symbols(obj: Path) -> list[tuple[int, str]]:
@@ -61,13 +58,18 @@ def main() -> int:
     for row in _rows():
         builder, space, _ = _tokens(row)
         matched = [(size, name) for size, name in symbols if builder in name and space in name]
-        combinations.append({
-            "data": row[0], "id": row[1], "quant": row[2], "index": row[3],
-            # An attribution map, not a sum of disjoint sections: template symbols may be
-            # shared by scalar-on/off and nested Fusion builders.
-            "attributed_text_symbol_bytes": sum(size for size, _ in matched),
-            "matched_text_symbols": len(matched),
-        })
+        combinations.append(
+            {
+                "data": row[0],
+                "id": row[1],
+                "quant": row[2],
+                "index": row[3],
+                # An attribution map, not a sum of disjoint sections: template symbols may be
+                # shared by scalar-on/off and nested Fusion builders.
+                "attributed_text_symbol_bytes": sum(size for size, _ in matched),
+                "matched_text_symbols": len(matched),
+            }
+        )
     payload = {
         "schema_version": 1,
         "measurement": "GNU nm symbol attribution; entries may overlap",
@@ -75,8 +77,7 @@ def main() -> int:
         "dispatch_combinations": combinations,
         "index_factory_object": {"bytes": obj.stat().st_size, "text_bytes": _text_bytes(obj)},
         "extension_module": {"bytes": module.stat().st_size},
-        "wheel": None if args.wheel is None else {"bytes": args.wheel.stat().st_size,
-                                                   "name": args.wheel.name},
+        "wheel": None if args.wheel is None else {"bytes": args.wheel.stat().st_size, "name": args.wheel.name},
     }
     args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(args.output)

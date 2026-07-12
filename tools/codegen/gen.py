@@ -31,6 +31,17 @@ NUMPY_DTYPE_MAP = {
 
 VALID_DATA_TYPES = frozenset(NUMPY_DTYPE_MAP.keys())
 VALID_ID_TYPES = frozenset({"uint32_t", "uint64_t"})
+VALID_ENGINE_FEATURES = frozenset(
+    {
+        "none",
+        "knng_segment",
+        "nsg_segment",
+        "fusion_segment",
+        "qg_segment",
+        "vamana_memory_segment",
+    }
+)
+VALID_ROLLBACK_MODES = frozenset({"feature_flag", "source_revert"})
 
 QUANTIZATION_MAP = {
     "NONE": "none",
@@ -59,8 +70,80 @@ def _validate(config: dict[str, Any]) -> None:
     if not isinstance(combinations, list) or not combinations:
         raise ValueError("'combinations' must be a non-empty list")
 
+    implementation_registry = config.get("implementation_registry")
+    if not isinstance(implementation_registry, dict) or not implementation_registry:
+        raise ValueError("'implementation_registry' must be a non-empty mapping")
+    engine_factories = config.get("engine_factories")
+    if not isinstance(engine_factories, dict) or not engine_factories:
+        raise ValueError("'engine_factories' must be a non-empty mapping")
+
+    for implementation_key, registration in implementation_registry.items():
+        if not isinstance(implementation_key, str) or not implementation_key:
+            raise ValueError(f"Invalid implementation key: {implementation_key!r}")
+        if not isinstance(registration, dict):
+            raise ValueError(f"Implementation registration must be a mapping: {implementation_key}")
+        required = {"engine_factory_key", "artifact_identity"}
+        missing = required - set(registration)
+        if missing:
+            raise ValueError(f"Implementation '{implementation_key}' missing keys {sorted(missing)}")
+        if not isinstance(registration["engine_factory_key"], str) or not registration["engine_factory_key"]:
+            raise ValueError(f"Implementation '{implementation_key}' has an invalid engine key")
+        if not isinstance(registration["artifact_identity"], str) or not registration["artifact_identity"]:
+            raise ValueError(f"Implementation '{implementation_key}' has an invalid artifact identity")
+
+    for engine_factory_key, registration in engine_factories.items():
+        if not isinstance(engine_factory_key, str) or not engine_factory_key:
+            raise ValueError(f"Invalid engine factory key: {engine_factory_key!r}")
+        if not isinstance(registration, dict):
+            raise ValueError(f"Engine factory registration must be a mapping: {engine_factory_key}")
+        required = {
+            "feature_flag",
+            "legacy_implementation_key",
+            "legacy_engine_factory_key",
+            "rollback",
+        }
+        missing = required - set(registration)
+        if missing:
+            raise ValueError(f"Engine factory '{engine_factory_key}' missing keys {sorted(missing)}")
+
+        feature_flag = str(registration["feature_flag"])
+        rollback = str(registration["rollback"])
+        legacy_implementation_key = str(registration["legacy_implementation_key"])
+        legacy_engine_factory_key = str(registration["legacy_engine_factory_key"])
+        if feature_flag not in VALID_ENGINE_FEATURES:
+            raise ValueError(f"Engine factory '{engine_factory_key}' has unknown feature flag '{feature_flag}'")
+        if rollback not in VALID_ROLLBACK_MODES:
+            raise ValueError(f"Engine factory '{engine_factory_key}' has unknown rollback mode '{rollback}'")
+        if rollback == "source_revert" and feature_flag != "none":
+            raise ValueError(f"Source-revert engine '{engine_factory_key}' cannot have a runtime feature flag")
+        if rollback == "feature_flag" and feature_flag == "none":
+            raise ValueError(f"Runtime-rollback engine '{engine_factory_key}' must have an independent feature flag")
+        if legacy_implementation_key not in implementation_registry:
+            raise ValueError(
+                f"Engine factory '{engine_factory_key}' names unknown legacy implementation "
+                f"'{legacy_implementation_key}'"
+            )
+        if legacy_engine_factory_key not in engine_factories:
+            raise ValueError(
+                f"Engine factory '{engine_factory_key}' names unknown legacy engine '{legacy_engine_factory_key}'"
+            )
+        registered_legacy_engine = str(implementation_registry[legacy_implementation_key]["engine_factory_key"])
+        if registered_legacy_engine != legacy_engine_factory_key:
+            raise ValueError(
+                f"Engine factory '{engine_factory_key}' legacy pair disagrees: "
+                f"implementation '{legacy_implementation_key}' belongs to "
+                f"'{registered_legacy_engine}', not '{legacy_engine_factory_key}'"
+            )
+
     seen: set[tuple[str, str, str, str]] = set()
-    required_keys = {"data", "id", "quant", "index"}
+    required_keys = {
+        "data",
+        "id",
+        "quant",
+        "index",
+        "implementation_key",
+        "engine_factory_key",
+    }
     valid_quants = set(config.get("search_spaces", {}).keys())
     valid_indexes = set(config.get("builders", {}).keys())
 
@@ -75,6 +158,8 @@ def _validate(config: dict[str, Any]) -> None:
         id_type = str(combo["id"])
         quant = str(combo["quant"])
         index = str(combo["index"])
+        implementation_key = str(combo["implementation_key"])
+        engine_factory_key = str(combo["engine_factory_key"])
 
         key = (data, id_type, quant, index)
         if key in seen:
@@ -91,6 +176,16 @@ def _validate(config: dict[str, Any]) -> None:
             raise ValueError(f"Missing build_space template for quantization type '{quant}'")
         if index not in valid_indexes:
             raise ValueError(f"Unknown index type '{index}' in {combo}")
+        if implementation_key not in implementation_registry:
+            raise ValueError(f"Unknown implementation key '{implementation_key}' in {combo}")
+        if engine_factory_key not in engine_factories:
+            raise ValueError(f"Unknown engine factory key '{engine_factory_key}' in {combo}")
+        registered_engine = str(implementation_registry[implementation_key]["engine_factory_key"])
+        if registered_engine != engine_factory_key:
+            raise ValueError(
+                f"Dispatch row implementation/engine mismatch: '{implementation_key}' belongs to "
+                f"'{registered_engine}', not '{engine_factory_key}' in {combo}"
+            )
 
         if quant == "RABITQ":
             if data != "float":
@@ -147,6 +242,14 @@ def _to_python_index_type(index: str) -> str:
         raise ValueError(f"Unsupported index mapping for generated tests: {index}") from exc
 
 
+def _implementation_registration(config: dict[str, Any], combo: dict[str, str]) -> dict[str, str]:
+    return config["implementation_registry"][combo["implementation_key"]]
+
+
+def _engine_registration(config: dict[str, Any], combo: dict[str, str]) -> dict[str, str]:
+    return config["engine_factories"][combo["engine_factory_key"]]
+
+
 def _render(config: dict[str, Any]) -> tuple[str, str]:
     env = Environment(
         loader=FileSystemLoader(str(TEMPLATE_DIR)),
@@ -161,6 +264,17 @@ def _render(config: dict[str, Any]) -> tuple[str, str]:
     env.globals["to_numpy_dtype"] = _to_numpy_dtype
     env.globals["to_python_quantization"] = _to_python_quantization
     env.globals["to_python_index_type"] = _to_python_index_type
+    env.globals["artifact_identity"] = lambda combo: _implementation_registration(config, combo)["artifact_identity"]
+    env.globals["engine_feature"] = lambda combo: _engine_registration(config, combo)["feature_flag"]
+    env.globals["legacy_implementation_key"] = lambda combo: _engine_registration(config, combo)[
+        "legacy_implementation_key"
+    ]
+    env.globals["legacy_engine_factory_key"] = lambda combo: _engine_registration(config, combo)[
+        "legacy_engine_factory_key"
+    ]
+    env.globals["source_revert_only"] = lambda combo: (
+        _engine_registration(config, combo)["rollback"] == "source_revert"
+    )
 
     dispatch_template = env.get_template("dispatch_factory.hpp.j2")
     dispatch_rendered = dispatch_template.render(combinations=config["combinations"]).rstrip() + "\n"

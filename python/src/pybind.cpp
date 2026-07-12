@@ -186,6 +186,9 @@ PYBIND11_MODULE(_alayalitepy, m) {
            py::arg("params"))
       .def("to_string", &alaya::BasePyIndex::to_string)
       .def("has_scalar_data", &alaya::BasePyIndex::has_scalar_data)
+      .def("get_declared_index_type", &alaya::BasePyIndex::get_declared_index_type)
+      .def("get_implementation_key", &alaya::BasePyIndex::get_implementation_key)
+      .def("get_engine_factory_key", &alaya::BasePyIndex::get_engine_factory_key)
       .def("fit",
            &alaya::BasePyIndex::fit,
            py::arg("vectors"),

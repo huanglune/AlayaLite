@@ -12,6 +12,7 @@
 #include <string>
 #include <variant>
 
+#include "memory_engine_registry.hpp"
 #include "utils/metadata_filter.hpp"
 
 namespace py = pybind11;
@@ -20,10 +21,22 @@ namespace alaya {
 
 class BasePyIndex {
  public:
+  BasePyIndex() = delete;
+  explicit BasePyIndex(internal::memory::DispatchIdentity dispatch_identity)
+      : dispatch_identity_(dispatch_identity) {}
   virtual ~BasePyIndex() = default;
 
   virtual auto to_string() const -> std::string = 0;
   virtual auto has_scalar_data() const -> bool = 0;
+  auto get_declared_index_type() const -> std::string {
+    return std::string(dispatch_identity_.declared_index_type);
+  }
+  auto get_implementation_key() const -> std::string {
+    return std::string(dispatch_identity_.implementation_key);
+  }
+  auto get_engine_factory_key() const -> std::string {
+    return std::string(dispatch_identity_.engine_factory_key);
+  }
 
   virtual auto fit(py::array vectors,
                    uint32_t ef_construction,
@@ -95,6 +108,9 @@ class BasePyIndex {
 
  protected:
   uint32_t data_dim_{0};
+
+ private:
+  internal::memory::DispatchIdentity dispatch_identity_;
 };
 
 }  // namespace alaya

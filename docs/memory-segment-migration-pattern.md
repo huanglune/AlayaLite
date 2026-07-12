@@ -58,6 +58,30 @@ need graph access until their own abstraction steps; their access is isolated
 in `detail/hnsw_segment_bridge.hpp`. Neither detail type is a registry entry or
 a supported user API.
 
+## Per-row registry handoff
+
+Gate 5 migrations switch one explicit dispatch row at a time. For each row:
+
+1. Keep the row's old factory registered as its legacy fallback and implement
+   the new Segment factory behind that engine's independent feature bit.
+2. Change `implementation_key` and `engine_factory_key` in
+   `tools/codegen/dispatch.yaml` to the implementation that really runs. Do not
+   copy the requested `index_type` when the artifact proves a different engine.
+3. Run `python tools/codegen/gen.py` and review both generated files. The C++
+   registration and Python identity expectation must change together.
+4. Run `python/tests/client/test_index_algorithm_identity.py`. The migrated row
+   must report the generated runtime keys, persist the matching algorithm
+   fingerprint for scalar off and on, and turn from its documented xfail into a
+   pass. Unrelated rows must not change status.
+5. Disable only that engine's feature bit and run the new/legacy differential
+   tests; the row must use its recorded legacy factory while other engines stay
+   on their selected implementations.
+
+HNSW is the deliberate exception to step 5. Its public legacy builder was
+removed before Gate 5, so `hnsw_segment` has no runtime fallback bit and rolls
+back as the Gate 0 source/git revert unit. Feature-bit rollback applies only to
+rows migrated from Gate 5 onward.
+
 ## Mutation gate outcome
 
 The executable characterization in `tests/index/hnsw_test.cpp` checks the

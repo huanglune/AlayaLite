@@ -46,6 +46,7 @@
 #include "index/graph/qg/qg_builder.hpp"
 #include "index_factory.hpp"
 #include "materialized_view.hpp"
+#include "memory_engine_registry.hpp"
 #include "params.hpp"
 #include "parse.hpp"
 #include "recovery/recovery_manager.hpp"
@@ -88,7 +89,10 @@ class PyIndex : public BasePyIndex {
   using HnswSegmentType = HnswSegment<SearchSpaceType, BuildSpaceType>;
 
   PyIndex() = delete;
-  explicit PyIndex(IndexParams params) : params_(std::move(params)) { initialize_recovery(); }
+  explicit PyIndex(IndexParams params, internal::memory::DispatchIdentity dispatch_identity)
+      : BasePyIndex(dispatch_identity), params_(std::move(params)) {
+    initialize_recovery();
+  }
 
   auto to_string() const -> std::string override { return "PyIndex"; }
   auto get_materialized_view_partition_count() const -> uint32_t override {

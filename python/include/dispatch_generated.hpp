@@ -9,6 +9,8 @@
 // It must be included from exactly ONE translation unit (python/src/index_factory.cpp)
 // to avoid duplicate-symbol errors and to amortize the 33-template-specialization
 // compile cost over a single .o file.
+// Current and legacy branches intentionally share PyIndex until a Gate 5 row
+// migrates; that migration replaces only its current factory branch.
 
 #pragma once
 
@@ -17,533 +19,1067 @@
 namespace alaya {
 
 auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIndex> {
+  return create(params, internal::memory::MemoryEngineFeatureFlags{});
+}
+
+auto IndexFactory::create(const IndexParams &params,
+                          const internal::memory::MemoryEngineFeatureFlags &features)
+    -> std::unique_ptr<BasePyIndex> {
   // float / uint32_t / NONE / HNSW
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint32_t>())
       && params.quantization_type_ == QuantizationType::NONE
       && params.index_type_ == IndexType::HNSW) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"hnsw", "hnsw_segment", "hnsw"},
+        {"hnsw", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,ScalarData>;
       using SearchSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,ScalarData>;
       using GraphBuilderType = HnswSegment<BuildSpaceType>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = HnswSegment<BuildSpaceType>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // float / uint32_t / NONE / NSG
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint32_t>())
       && params.quantization_type_ == QuantizationType::NONE
       && params.index_type_ == IndexType::NSG) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"nsg", "hnsw_segment", "hnsw"},
+        {"nsg", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,ScalarData>;
       using SearchSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,ScalarData>;
       using GraphBuilderType = NSGBuilder<BuildSpaceType>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = NSGBuilder<BuildSpaceType>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // float / uint32_t / NONE / FUSION
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint32_t>())
       && params.quantization_type_ == QuantizationType::NONE
       && params.index_type_ == IndexType::FUSION) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"fusion", "hnsw_segment", "hnsw"},
+        {"fusion", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,ScalarData>;
       using SearchSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,ScalarData>;
       using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // float / uint32_t / SQ8 / HNSW
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint32_t>())
       && params.quantization_type_ == QuantizationType::SQ8
       && params.index_type_ == IndexType::HNSW) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"hnsw", "hnsw_segment", "hnsw"},
+        {"hnsw", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
       using SearchSpaceType = SQ8Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
       using GraphBuilderType = HnswSegment<BuildSpaceType>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = SQ8Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = HnswSegment<BuildSpaceType>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // float / uint32_t / SQ8 / NSG
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint32_t>())
       && params.quantization_type_ == QuantizationType::SQ8
       && params.index_type_ == IndexType::NSG) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"nsg", "hnsw_segment", "hnsw"},
+        {"nsg", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
       using SearchSpaceType = SQ8Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
       using GraphBuilderType = NSGBuilder<BuildSpaceType>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = SQ8Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = NSGBuilder<BuildSpaceType>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // float / uint32_t / SQ8 / FUSION
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint32_t>())
       && params.quantization_type_ == QuantizationType::SQ8
       && params.index_type_ == IndexType::FUSION) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"fusion", "hnsw_segment", "hnsw"},
+        {"fusion", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
       using SearchSpaceType = SQ8Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
       using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = SQ8Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // float / uint32_t / SQ4 / HNSW
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint32_t>())
       && params.quantization_type_ == QuantizationType::SQ4
       && params.index_type_ == IndexType::HNSW) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"hnsw", "hnsw_segment", "hnsw"},
+        {"hnsw", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
       using SearchSpaceType = SQ4Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
       using GraphBuilderType = HnswSegment<BuildSpaceType>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = SQ4Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = HnswSegment<BuildSpaceType>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // float / uint32_t / SQ4 / NSG
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint32_t>())
       && params.quantization_type_ == QuantizationType::SQ4
       && params.index_type_ == IndexType::NSG) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"nsg", "hnsw_segment", "hnsw"},
+        {"nsg", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
       using SearchSpaceType = SQ4Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
       using GraphBuilderType = NSGBuilder<BuildSpaceType>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = SQ4Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = NSGBuilder<BuildSpaceType>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // float / uint32_t / SQ4 / FUSION
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint32_t>())
       && params.quantization_type_ == QuantizationType::SQ4
       && params.index_type_ == IndexType::FUSION) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"fusion", "hnsw_segment", "hnsw"},
+        {"fusion", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
       using SearchSpaceType = SQ4Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
       using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = SQ4Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // float / uint32_t / RABITQ / HNSW
+  // implementation=legacy_qg_model engine=qg
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint32_t>())
       && params.quantization_type_ == QuantizationType::RABITQ
       && params.index_type_ == IndexType::HNSW) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"hnsw", "legacy_qg_model", "qg"},
+        {"hnsw", "legacy_qg_model", "qg"},
+        internal::memory::EngineFeature::qg_segment,
+        false};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RaBitQSpace<float,float,uint32_t,ScalarData>;
       using SearchSpaceType = RaBitQSpace<float,float,uint32_t,ScalarData>;
       using GraphBuilderType = HnswSegment<BuildSpaceType>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RaBitQSpace<float,float,uint32_t,EmptyScalarData>;
     using SearchSpaceType = RaBitQSpace<float,float,uint32_t,EmptyScalarData>;
     using GraphBuilderType = HnswSegment<BuildSpaceType>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // float / uint32_t / RABITQ / NSG
+  // implementation=legacy_qg_model engine=qg
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint32_t>())
       && params.quantization_type_ == QuantizationType::RABITQ
       && params.index_type_ == IndexType::NSG) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"nsg", "legacy_qg_model", "qg"},
+        {"nsg", "legacy_qg_model", "qg"},
+        internal::memory::EngineFeature::qg_segment,
+        false};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RaBitQSpace<float,float,uint32_t,ScalarData>;
       using SearchSpaceType = RaBitQSpace<float,float,uint32_t,ScalarData>;
       using GraphBuilderType = NSGBuilder<BuildSpaceType>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RaBitQSpace<float,float,uint32_t,EmptyScalarData>;
     using SearchSpaceType = RaBitQSpace<float,float,uint32_t,EmptyScalarData>;
     using GraphBuilderType = NSGBuilder<BuildSpaceType>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // float / uint32_t / RABITQ / FUSION
+  // implementation=legacy_qg_model engine=qg
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint32_t>())
       && params.quantization_type_ == QuantizationType::RABITQ
       && params.index_type_ == IndexType::FUSION) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"fusion", "legacy_qg_model", "qg"},
+        {"fusion", "legacy_qg_model", "qg"},
+        internal::memory::EngineFeature::qg_segment,
+        false};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RaBitQSpace<float,float,uint32_t,ScalarData>;
       using SearchSpaceType = RaBitQSpace<float,float,uint32_t,ScalarData>;
       using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RaBitQSpace<float,float,uint32_t,EmptyScalarData>;
     using SearchSpaceType = RaBitQSpace<float,float,uint32_t,EmptyScalarData>;
     using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // float / uint64_t / NONE / HNSW
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint64_t>())
       && params.quantization_type_ == QuantizationType::NONE
       && params.index_type_ == IndexType::HNSW) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"hnsw", "hnsw_segment", "hnsw"},
+        {"hnsw", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,ScalarData>;
       using SearchSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,ScalarData>;
       using GraphBuilderType = HnswSegment<BuildSpaceType>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = HnswSegment<BuildSpaceType>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // float / uint64_t / NONE / NSG
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint64_t>())
       && params.quantization_type_ == QuantizationType::NONE
       && params.index_type_ == IndexType::NSG) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"nsg", "hnsw_segment", "hnsw"},
+        {"nsg", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,ScalarData>;
       using SearchSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,ScalarData>;
       using GraphBuilderType = NSGBuilder<BuildSpaceType>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = NSGBuilder<BuildSpaceType>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // float / uint64_t / NONE / FUSION
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint64_t>())
       && params.quantization_type_ == QuantizationType::NONE
       && params.index_type_ == IndexType::FUSION) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"fusion", "hnsw_segment", "hnsw"},
+        {"fusion", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,ScalarData>;
       using SearchSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,ScalarData>;
       using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // float / uint64_t / SQ8 / HNSW
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint64_t>())
       && params.quantization_type_ == QuantizationType::SQ8
       && params.index_type_ == IndexType::HNSW) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"hnsw", "hnsw_segment", "hnsw"},
+        {"hnsw", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
       using SearchSpaceType = SQ8Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
       using GraphBuilderType = HnswSegment<BuildSpaceType>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = SQ8Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = HnswSegment<BuildSpaceType>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // float / uint64_t / SQ8 / NSG
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint64_t>())
       && params.quantization_type_ == QuantizationType::SQ8
       && params.index_type_ == IndexType::NSG) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"nsg", "hnsw_segment", "hnsw"},
+        {"nsg", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
       using SearchSpaceType = SQ8Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
       using GraphBuilderType = NSGBuilder<BuildSpaceType>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = SQ8Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = NSGBuilder<BuildSpaceType>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // float / uint64_t / SQ8 / FUSION
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint64_t>())
       && params.quantization_type_ == QuantizationType::SQ8
       && params.index_type_ == IndexType::FUSION) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"fusion", "hnsw_segment", "hnsw"},
+        {"fusion", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
       using SearchSpaceType = SQ8Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
       using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = SQ8Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // float / uint64_t / SQ4 / HNSW
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint64_t>())
       && params.quantization_type_ == QuantizationType::SQ4
       && params.index_type_ == IndexType::HNSW) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"hnsw", "hnsw_segment", "hnsw"},
+        {"hnsw", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
       using SearchSpaceType = SQ4Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
       using GraphBuilderType = HnswSegment<BuildSpaceType>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = SQ4Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = HnswSegment<BuildSpaceType>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // float / uint64_t / SQ4 / NSG
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint64_t>())
       && params.quantization_type_ == QuantizationType::SQ4
       && params.index_type_ == IndexType::NSG) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"nsg", "hnsw_segment", "hnsw"},
+        {"nsg", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
       using SearchSpaceType = SQ4Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
       using GraphBuilderType = NSGBuilder<BuildSpaceType>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = SQ4Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = NSGBuilder<BuildSpaceType>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // float / uint64_t / SQ4 / FUSION
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint64_t>())
       && params.quantization_type_ == QuantizationType::SQ4
       && params.index_type_ == IndexType::FUSION) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"fusion", "hnsw_segment", "hnsw"},
+        {"fusion", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
       using SearchSpaceType = SQ4Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
       using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = SQ4Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // int8_t / uint32_t / NONE / HNSW
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<int8_t>())
       && params.id_type_.is(py::dtype::of<uint32_t>())
       && params.quantization_type_ == QuantizationType::NONE
       && params.index_type_ == IndexType::HNSW) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"hnsw", "hnsw_segment", "hnsw"},
+        {"hnsw", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,ScalarData>;
       using SearchSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,ScalarData>;
       using GraphBuilderType = HnswSegment<BuildSpaceType>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = HnswSegment<BuildSpaceType>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // int8_t / uint32_t / NONE / NSG
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<int8_t>())
       && params.id_type_.is(py::dtype::of<uint32_t>())
       && params.quantization_type_ == QuantizationType::NONE
       && params.index_type_ == IndexType::NSG) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"nsg", "hnsw_segment", "hnsw"},
+        {"nsg", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,ScalarData>;
       using SearchSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,ScalarData>;
       using GraphBuilderType = NSGBuilder<BuildSpaceType>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = NSGBuilder<BuildSpaceType>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // int8_t / uint32_t / NONE / FUSION
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<int8_t>())
       && params.id_type_.is(py::dtype::of<uint32_t>())
       && params.quantization_type_ == QuantizationType::NONE
       && params.index_type_ == IndexType::FUSION) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"fusion", "hnsw_segment", "hnsw"},
+        {"fusion", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,ScalarData>;
       using SearchSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,ScalarData>;
       using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // int8_t / uint64_t / NONE / HNSW
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<int8_t>())
       && params.id_type_.is(py::dtype::of<uint64_t>())
       && params.quantization_type_ == QuantizationType::NONE
       && params.index_type_ == IndexType::HNSW) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"hnsw", "hnsw_segment", "hnsw"},
+        {"hnsw", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,ScalarData>;
       using SearchSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,ScalarData>;
       using GraphBuilderType = HnswSegment<BuildSpaceType>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = HnswSegment<BuildSpaceType>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // int8_t / uint64_t / NONE / NSG
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<int8_t>())
       && params.id_type_.is(py::dtype::of<uint64_t>())
       && params.quantization_type_ == QuantizationType::NONE
       && params.index_type_ == IndexType::NSG) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"nsg", "hnsw_segment", "hnsw"},
+        {"nsg", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,ScalarData>;
       using SearchSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,ScalarData>;
       using GraphBuilderType = NSGBuilder<BuildSpaceType>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = NSGBuilder<BuildSpaceType>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // int8_t / uint64_t / NONE / FUSION
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<int8_t>())
       && params.id_type_.is(py::dtype::of<uint64_t>())
       && params.quantization_type_ == QuantizationType::NONE
       && params.index_type_ == IndexType::FUSION) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"fusion", "hnsw_segment", "hnsw"},
+        {"fusion", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,ScalarData>;
       using SearchSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,ScalarData>;
       using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // uint8_t / uint32_t / NONE / HNSW
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<uint8_t>())
       && params.id_type_.is(py::dtype::of<uint32_t>())
       && params.quantization_type_ == QuantizationType::NONE
       && params.index_type_ == IndexType::HNSW) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"hnsw", "hnsw_segment", "hnsw"},
+        {"hnsw", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
       using SearchSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
       using GraphBuilderType = HnswSegment<BuildSpaceType>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = HnswSegment<BuildSpaceType>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // uint8_t / uint32_t / NONE / NSG
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<uint8_t>())
       && params.id_type_.is(py::dtype::of<uint32_t>())
       && params.quantization_type_ == QuantizationType::NONE
       && params.index_type_ == IndexType::NSG) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"nsg", "hnsw_segment", "hnsw"},
+        {"nsg", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
       using SearchSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
       using GraphBuilderType = NSGBuilder<BuildSpaceType>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = NSGBuilder<BuildSpaceType>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // uint8_t / uint32_t / NONE / FUSION
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<uint8_t>())
       && params.id_type_.is(py::dtype::of<uint32_t>())
       && params.quantization_type_ == QuantizationType::NONE
       && params.index_type_ == IndexType::FUSION) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"fusion", "hnsw_segment", "hnsw"},
+        {"fusion", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
       using SearchSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
       using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
     using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // uint8_t / uint64_t / NONE / HNSW
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<uint8_t>())
       && params.id_type_.is(py::dtype::of<uint64_t>())
       && params.quantization_type_ == QuantizationType::NONE
       && params.index_type_ == IndexType::HNSW) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"hnsw", "hnsw_segment", "hnsw"},
+        {"hnsw", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
       using SearchSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
       using GraphBuilderType = HnswSegment<BuildSpaceType>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = HnswSegment<BuildSpaceType>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // uint8_t / uint64_t / NONE / NSG
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<uint8_t>())
       && params.id_type_.is(py::dtype::of<uint64_t>())
       && params.quantization_type_ == QuantizationType::NONE
       && params.index_type_ == IndexType::NSG) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"nsg", "hnsw_segment", "hnsw"},
+        {"nsg", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
       using SearchSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
       using GraphBuilderType = NSGBuilder<BuildSpaceType>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = NSGBuilder<BuildSpaceType>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   // uint8_t / uint64_t / NONE / FUSION
+  // implementation=hnsw_segment engine=hnsw
   if (params.data_type_.is(py::dtype::of<uint8_t>())
       && params.id_type_.is(py::dtype::of<uint64_t>())
       && params.quantization_type_ == QuantizationType::NONE
       && params.index_type_ == IndexType::FUSION) {
+    constexpr internal::memory::FactoryRegistration registration{
+        {"fusion", "hnsw_segment", "hnsw"},
+        {"fusion", "hnsw_segment", "hnsw"},
+        internal::memory::EngineFeature::none,
+        true};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
       using SearchSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
       using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+      if (registration.use_legacy(features)) {
+        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                           registration.legacy);
+      }
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.current);
     }
     using BuildSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
     using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
+    if (registration.use_legacy(features)) {
+      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                         registration.legacy);
+    }
+    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
+                                                                       registration.current);
   }
   throw std::runtime_error(
       std::string("Unsupported dispatch combination: data_type=")

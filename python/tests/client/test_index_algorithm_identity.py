@@ -26,13 +26,18 @@ import pytest
 from alayalite import Index
 from alayalite.schema import IndexParams
 
-from ._dispatch_matrix_params import _FULL_PARAMS
+from ._dispatch_matrix_params import _FULL_PARAMS, _IMPLEMENTATION_IDENTITIES
 
 DIM = 16
 RABITQ_DIM = 64
 N_VECTORS = 256
 CAPACITY = 512
 MAX_NBRS = 16
+
+ARTIFACT_IDENTITY_BY_IMPLEMENTATION_KEY = {
+    "hnsw_segment": "hnsw",
+    "legacy_qg_model": "qg",
+}
 
 
 def _case_id(case) -> str:
@@ -73,17 +78,9 @@ def _graph_identity(graph_path: Path, id_type, configured_max_nbrs: int) -> str:
 
     # SequentialStorage::save writes five size_t values, its aligned capacity,
     # and an unaligned validity bitmap.  Any remaining bytes are OverlayGraph.
-    fields = [
-        _read_native_word(raw, storage_offset + (i * word_width), word_width)
-        for i in range(5)
-    ]
+    fields = [_read_native_word(raw, storage_offset + (i * word_width), word_width) for i in range(5)]
     _, aligned_item_size, capacity, _, _ = fields
-    flat_graph_size = (
-        storage_offset
-        + (5 * word_width)
-        + (aligned_item_size * capacity)
-        + ((capacity + 7) // 8)
-    )
+    flat_graph_size = storage_offset + (5 * word_width) + (aligned_item_size * capacity) + ((capacity + 7) // 8)
     overlay_size = len(raw) - flat_graph_size
     assert overlay_size >= 0, "legacy Graph artifact is shorter than its declared storage layout"
 
@@ -111,7 +108,7 @@ def _persisted_identity(save_dir: Path, id_type, quant: str) -> str:
     return "unknown"
 
 
-def _build_and_observe(case, has_scalar_data: bool, case_dir: Path) -> str:
+def _build_and_observe(case, has_scalar_data: bool, case_dir: Path) -> tuple[str, tuple[str, str, str]]:
     data_type, id_type, quant, requested_index_type, _ = case
     rocksdb_path = str(case_dir / "active" / "rocksdb") if has_scalar_data else ""
     params = IndexParams(
@@ -137,31 +134,54 @@ def _build_and_observe(case, has_scalar_data: bool, case_dir: Path) -> str:
                 "metadata_list": [{"row": i} for i in range(N_VECTORS)],
             }
         index.fit(vectors, ef_construction=64, num_threads=1, **fit_kwargs)
+        cpp_index = index.get_cpp_index()
+        runtime_identity = (
+            cpp_index.get_declared_index_type(),
+            cpp_index.get_implementation_key(),
+            cpp_index.get_engine_factory_key(),
+        )
         save_dir = case_dir / "saved"
         index.save(save_dir)
-        return _persisted_identity(save_dir, id_type, quant)
+        return _persisted_identity(save_dir, id_type, quant), runtime_identity
     finally:
         index.close()
 
 
-@pytest.mark.parametrize("case", _FULL_PARAMS, ids=_case_id)
-def test_full_dispatch_matrix_persisted_algorithm_identity(case, tmp_path):
-    """Pin the observed identity and xfail every known configuration mismatch."""
+@pytest.mark.parametrize(
+    "case,declared_identity",
+    list(zip(_FULL_PARAMS, _IMPLEMENTATION_IDENTITIES, strict=True)),
+    ids=[_case_id(case) for case in _FULL_PARAMS],
+)
+def test_full_dispatch_matrix_persisted_algorithm_identity(case, declared_identity, tmp_path):
+    """Pin generated/runtime keys and the artifact algorithm in both directions."""
     _, _, quant, requested_index_type, _ = case
-    observed = [
+    observations = [
         _build_and_observe(case, has_scalar_data, tmp_path / f"sd{int(has_scalar_data)}")
         for has_scalar_data in (False, True)
     ]
+    observed_artifacts = [artifact for artifact, _ in observations]
+    runtime_identities = [identity for _, identity in observations]
+
+    implementation_key, engine_factory_key, declared_artifact_identity = declared_identity
+    expected_runtime_identity = (
+        requested_index_type,
+        implementation_key,
+        engine_factory_key,
+    )
+    assert runtime_identities == [expected_runtime_identity, expected_runtime_identity]
+    assert ARTIFACT_IDENTITY_BY_IMPLEMENTATION_KEY[implementation_key] == declared_artifact_identity
+    assert engine_factory_key == declared_artifact_identity
+    assert observed_artifacts == [declared_artifact_identity, declared_artifact_identity]
 
     # Task W / MUST-11 runtime evidence (2026-07-12): fit ignores the
     # generated GraphBuilderType. Non-RaBitQ rows build HNSW; RaBitQ rows build
     # QG irrespective of the configured index_type. The fix belongs to Gate 5.
     legacy_actual = "qg" if quant == "rabitq" else "hnsw"
-    assert observed == [legacy_actual, legacy_actual]
+    assert declared_artifact_identity == legacy_actual
     if legacy_actual != requested_index_type:
         pytest.xfail(
             "Task W / MUST-11: legacy fit silently builds "
             f"{legacy_actual} for requested {requested_index_type}; fix deferred to Gate 5"
         )
 
-    assert observed == [requested_index_type, requested_index_type]
+    assert observed_artifacts == [requested_index_type, requested_index_type]
