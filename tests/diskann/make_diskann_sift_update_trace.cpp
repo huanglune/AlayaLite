@@ -57,6 +57,9 @@ alaya::diskann::bench::UpdateTraceMode parse_mode(const std::string &value) {
   if (value == "yi_sequential") {
     return alaya::diskann::bench::UpdateTraceMode::YiSequential;
   }
+  if (value == "insert_only") {
+    return alaya::diskann::bench::UpdateTraceMode::InsertOnly;
+  }
   throw std::invalid_argument("invalid --mode: " + value);
 }
 
@@ -68,7 +71,7 @@ void print_usage(const char *argv0) {
             << "  --rounds N         update rounds (default: 10)\n"
             << "  --update_size N    deletes and inserts per round (default: 10000)\n"
             << "  --seed N           deterministic RNG seed (default: 1234)\n"
-            << "  --mode MODE        random or yi_sequential (default: random)\n"
+            << "  --mode MODE        random, yi_sequential, or insert_only (default: random)\n"
             << "  --prefix STR       round filename prefix (default: round_)\n";
 }
 

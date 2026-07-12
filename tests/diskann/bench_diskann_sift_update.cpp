@@ -19,6 +19,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -62,6 +63,7 @@ struct IntMatrix {
 
 struct TraceManifest {
   std::string prefix = "round_";
+  std::string mode = "random";
   uint32_t initial_count = 0;
   uint32_t total_count = 0;
   uint32_t rounds = 0;
@@ -85,6 +87,8 @@ struct Options {
   std::string trace_dir = "/tmp/diskann_sift1m_update_trace_20260701";
   std::string index_dir = "/tmp/diskann_sift1m_alaya_update_pq";
   std::string out_csv = "/tmp/diskann_sift1m_alaya_update_pq.csv";
+  std::string query_groups;
+  bool pre_insert_eval = false;
   bool rebuild = false;
   bool deterministic = false;
   bool flush_rounds = true;  ///< flush after each round, outside the timed window (Yi's
@@ -252,6 +256,9 @@ TraceManifest read_manifest(const std::filesystem::path &path) {
   }
   TraceManifest m;
   m.prefix = kv.at("file_prefix");
+  if (const auto it = kv.find("mode"); it != kv.end()) {
+    m.mode = it->second;
+  }
   m.initial_count = parse_u32(kv.at("initial_count"), "initial_count");
   m.total_count = parse_u32(kv.at("total_count"), "total_count");
   m.rounds = parse_u32(kv.at("rounds"), "rounds");
@@ -259,19 +266,29 @@ TraceManifest read_manifest(const std::filesystem::path &path) {
   return m;
 }
 
-TraceRound read_round(const std::filesystem::path &path, uint32_t expected_size) {
+TraceRound read_round(const std::filesystem::path &path,
+                      uint32_t expected_size,
+                      const std::string &mode) {
   std::ifstream in(path, std::ios::binary);
   if (!in) {
     throw std::runtime_error("cannot open trace round: " + path.string());
   }
   uint32_t n = 0;
   in.read(reinterpret_cast<char *>(&n), sizeof(n));
-  if (!in || n != expected_size) {
+  if (!in || (mode != "insert_only" && n != expected_size) ||
+      (mode == "insert_only" && n != 0)) {
     throw std::runtime_error("bad trace round header: " + path.string());
   }
   TraceRound round;
   round.deletes.resize(n);
-  round.inserts.resize(n);
+  uint32_t insert_count = n;
+  if (mode == "insert_only") {
+    in.read(reinterpret_cast<char *>(&insert_count), sizeof(insert_count));
+    if (!in || insert_count != expected_size) {
+      throw std::runtime_error("bad insert-only trace header: " + path.string());
+    }
+  }
+  round.inserts.resize(insert_count);
   in.read(reinterpret_cast<char *>(round.deletes.data()),
           static_cast<std::streamsize>(round.deletes.size() * sizeof(uint32_t)));
   in.read(reinterpret_cast<char *>(round.inserts.data()),
@@ -305,6 +322,10 @@ Options parse_args(int argc, char **argv) {
       opt.build_only = true;
     } else if (arg == "--eval_only") {
       opt.eval_only = true;
+    } else if (arg == "--pre_insert_eval") {
+      opt.pre_insert_eval = true;
+    } else if (arg == "--query_groups" && i + 1 < argc) {
+      opt.query_groups = argv[++i];
     } else if (arg == "--single_updates") {
       opt.single_updates = true;
     } else if (arg == "--mixed") {
@@ -444,8 +465,44 @@ struct RecallResult {
   uint64_t total = 0;
   double mean_us = 0.0;
   double qps = 0.0;
+  std::array<uint64_t, 3> group_hits{};
+  std::array<uint64_t, 3> group_total{};
   double recall() const { return total == 0 ? 0.0 : static_cast<double>(hits) / total; }
+  double group_recall(size_t group) const {
+    return group_total[group] == 0
+               ? -1.0
+               : static_cast<double>(group_hits[group]) / group_total[group];
+  }
 };
+
+std::vector<int8_t> read_query_groups(const std::string &path, uint32_t expected_n) {
+  if (path.empty()) {
+    return {};
+  }
+  std::ifstream in(path);
+  if (!in) {
+    throw std::runtime_error("cannot open query groups: " + path);
+  }
+  std::vector<int8_t> groups;
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.empty() || line[0] == '#') {
+      continue;
+    }
+    std::istringstream row(line);
+    int group = -1;
+    double frac = 0.0;
+    if (!(row >> group >> frac) || group < 0 || group > 2) {
+      throw std::runtime_error("bad query group row: " + line);
+    }
+    groups.push_back(static_cast<int8_t>(group));
+  }
+  if (groups.size() != expected_n) {
+    throw std::runtime_error("query group count mismatch: got " + std::to_string(groups.size()) +
+                             ", expected " + std::to_string(expected_n));
+  }
+  return groups;
+}
 
 struct MixedSearchState {
   std::atomic<bool> stop{false};
@@ -483,7 +540,8 @@ RecallResult evaluate_search(const DiskANNIndex &idx,
                              const FloatMatrix &queries,
                              const IntMatrix &gt,
                              const std::vector<uint8_t> &live,
-                             const Options &opt) {
+                             const Options &opt,
+                             const std::vector<int8_t> &query_groups) {
   const uint32_t nq = opt.nq == 0 ? queries.n : std::min<uint32_t>(opt.nq, queries.n);
   const DiskANNSearchParams sp = make_search_params(opt);
 
@@ -642,6 +700,13 @@ RecallResult evaluate_search(const DiskANNIndex &idx,
         if (got.count(truth[i]) != 0) {
           ++result.hits;
           ++bucket_hits[bucket];
+        }
+        if (!query_groups.empty()) {
+          const size_t group = static_cast<size_t>(query_groups[qi]);
+          ++result.group_total[group];
+          if (got.count(truth[i]) != 0) {
+            ++result.group_hits[group];
+          }
         }
       }
     }
@@ -1011,9 +1076,10 @@ void run_warmup_searches(const DiskANNIndex &idx,
                          const FloatMatrix &queries,
                          const IntMatrix &gt,
                          const std::vector<uint8_t> &live,
-                         const Options &opt) {
+                         const Options &opt,
+                         const std::vector<int8_t> &query_groups) {
   for (uint32_t i = 0; i < opt.warmup_searches; ++i) {
-    const RecallResult recall = evaluate_search(idx, queries, gt, live, opt);
+    const RecallResult recall = evaluate_search(idx, queries, gt, live, opt, query_groups);
     std::cout << "[warmup " << i << "] masked_recall@10=" << recall.recall()
               << " search_mean_us=" << recall.mean_us << " search_qps=" << recall.qps << "\n";
   }
@@ -1038,6 +1104,7 @@ int main(int argc, char **argv) {
     if (base.n != manifest.total_count || queries.dim != base.dim || gt.n != queries.n) {
       throw std::runtime_error(dataset.name + " data and trace manifest are inconsistent");
     }
+    const std::vector<int8_t> query_groups = read_query_groups(opt.query_groups, queries.n);
 
     build_initial_index(opt, base, manifest);
     if (opt.build_only) {
@@ -1072,23 +1139,41 @@ int main(int argc, char **argv) {
     if (opt.eval_only) {
       for (uint32_t round_id = 0; round_id < rounds; ++round_id) {
         const auto path = trace_dir / (manifest.prefix + std::to_string(round_id));
-        apply_live_mask_only(limit_round_updates(read_round(path, manifest.update_size), opt),
+        apply_live_mask_only(
+            limit_round_updates(read_round(path, manifest.update_size, manifest.mode), opt),
                              live);
       }
-      run_warmup_searches(idx, queries, gt, live, opt);
-      const RecallResult recall = evaluate_search(idx, queries, gt, live, opt);
+      run_warmup_searches(idx, queries, gt, live, opt, query_groups);
+      const RecallResult recall = evaluate_search(idx, queries, gt, live, opt, query_groups);
       std::cout << "[eval_only] rounds=" << rounds << " masked_recall@10=" << recall.recall()
+                << " recall_g0=" << recall.group_recall(0)
+                << " recall_g1=" << recall.group_recall(1)
+                << " recall_g2=" << recall.group_recall(2)
                 << " search_mean_us=" << recall.mean_us << " search_qps=" << recall.qps << "\n";
       return 0;
     }
 
-    run_warmup_searches(idx, queries, gt, live, opt);
+    run_warmup_searches(idx, queries, gt, live, opt, query_groups);
 
     std::ofstream csv(opt.out_csv);
     csv << "round,deletes,inserts,update_ms,delete_ms,insert_ms,update_qps,"
            "mixed_search_qps,mixed_search_mean_us,mixed_search_queries,"
            "masked_recall_at_10,recall_hits,recall_total,search_mean_us,search_qps,"
-           "live_count,tombstones,free_slots,cache_ratio,flush_ms\n";
+           "recall_g0,recall_g1,recall_g2,live_count,tombstones,free_slots,cache_ratio,flush_ms\n";
+
+    if (opt.pre_insert_eval) {
+      const RecallResult recall = evaluate_search(idx, queries, gt, live, opt, query_groups);
+      std::cout << "[pre-insert] masked_recall@10=" << recall.recall()
+                << " recall_g0=" << recall.group_recall(0)
+                << " recall_g1=" << recall.group_recall(1)
+                << " recall_g2=" << recall.group_recall(2) << " live=" << idx.live_count()
+                << "\n";
+      csv << "-1,0,0,0,0,0,0,0,0,0," << recall.recall() << "," << recall.hits << ","
+          << recall.total << "," << recall.mean_us << "," << recall.qps << ","
+          << recall.group_recall(0) << "," << recall.group_recall(1) << ","
+          << recall.group_recall(2) << "," << idx.live_count() << "," << idx.tombstone_count()
+          << "," << idx.free_slot_count() << "," << opt.cache_ratio << ",0\n";
+    }
 
     // Yi's UpdateRunner runs NO updates in mixed round 0 (search-only baseline
     // eval); replicate by prepending a baseline round and shifting trace files
@@ -1101,7 +1186,7 @@ int main(int argc, char **argv) {
       if (!baseline_round) {
         const uint32_t trace_idx = round0_baseline ? round_id - 1 : round_id;
         const auto path = trace_dir / (manifest.prefix + std::to_string(trace_idx));
-        round = limit_round_updates(read_round(path, manifest.update_size), opt);
+        round = limit_round_updates(read_round(path, manifest.update_size, manifest.mode), opt);
       }
       MixedSearchState mixed_state;
       bool mixed_started = false;
@@ -1183,7 +1268,7 @@ int main(int argc, char **argv) {
         const size_t round_updates = round.deletes.size() + round.inserts.size();
         const double update_qps =
             round_updates > 0 ? static_cast<double>(round_updates) / (update_ms / 1000.0) : 0.0;
-        const RecallResult recall = evaluate_search(idx, queries, gt, live, opt);
+        const RecallResult recall = evaluate_search(idx, queries, gt, live, opt, query_groups);
         std::cout << "[round " << round_id << "] update_qps=" << update_qps
                   << " delete_ms=" << delete_ms << " insert_ms=" << insert_ms
                   << " flush_ms=" << flush_ms << " mixed_mode=" << mixed_mode_name(opt.mixed_mode)
@@ -1191,6 +1276,9 @@ int main(int argc, char **argv) {
                   << " mixed_search_mean_us=" << mixed_search.mean_us
                   << " mixed_search_queries=" << mixed_search.queries
                   << " masked_recall@10=" << recall.recall() << " eval_qps=" << recall.qps
+                  << " recall_g0=" << recall.group_recall(0)
+                  << " recall_g1=" << recall.group_recall(1)
+                  << " recall_g2=" << recall.group_recall(2)
                   << " eval_mean_us=" << recall.mean_us << " live=" << idx.live_count()
                   << " tombstones=" << idx.tombstone_count()
                   << (baseline_round ? " (baseline)" : "") << "\n";
@@ -1198,7 +1286,9 @@ int main(int argc, char **argv) {
             << update_ms << "," << delete_ms << "," << insert_ms << "," << update_qps << ","
             << mixed_search.qps << "," << mixed_search.mean_us << "," << mixed_search.queries << ","
             << recall.recall() << "," << recall.hits << "," << recall.total << "," << recall.mean_us
-            << "," << recall.qps << "," << idx.live_count() << "," << idx.tombstone_count() << ","
+            << "," << recall.qps << "," << recall.group_recall(0) << ","
+            << recall.group_recall(1) << "," << recall.group_recall(2) << ","
+            << idx.live_count() << "," << idx.tombstone_count() << ","
             << idx.free_slot_count() << "," << opt.cache_ratio << "," << flush_ms << "\n";
       } catch (...) {
         if (mixed_started) {

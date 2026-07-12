@@ -117,4 +117,39 @@ TEST(DiskANNUpdateTraceTest, RejectsInsufficientReserveIds) {
   EXPECT_THROW(alaya::diskann::bench::generate_update_trace(cfg), std::invalid_argument);
 }
 
+TEST(DiskANNUpdateTraceTest, InsertOnlyTraceUsesSequentialTailAndEmptyDeletes) {
+  const std::filesystem::path dir =
+      std::filesystem::temp_directory_path() / "diskann_update_trace_insert_only_test";
+  std::filesystem::remove_all(dir);
+  alaya::diskann::bench::UpdateTraceConfig cfg{
+      .output_dir = dir,
+      .initial_count = 10,
+      .total_count = 16,
+      .rounds = 2,
+      .update_size = 3,
+      .seed = 7,
+      .mode = alaya::diskann::bench::UpdateTraceMode::InsertOnly,
+  };
+  alaya::diskann::bench::generate_update_trace(cfg);
+
+  for (uint32_t round = 0; round < 2; ++round) {
+    std::ifstream in(dir / ("round_" + std::to_string(round)), std::ios::binary);
+    uint32_t delete_count = 99;
+    uint32_t insert_count = 0;
+    in.read(reinterpret_cast<char *>(&delete_count), sizeof(delete_count));
+    in.read(reinterpret_cast<char *>(&insert_count), sizeof(insert_count));
+    EXPECT_EQ(delete_count, 0);
+    EXPECT_EQ(insert_count, 3);
+    for (uint32_t i = 0; i < insert_count; ++i) {
+      uint32_t id = 0;
+      in.read(reinterpret_cast<char *>(&id), sizeof(id));
+      EXPECT_EQ(id, 10 + round * 3 + i);
+    }
+  }
+  std::ifstream manifest(dir / "manifest.txt");
+  const std::string text((std::istreambuf_iterator<char>(manifest)), {});
+  EXPECT_NE(text.find("mode=insert_only"), std::string::npos);
+  std::filesystem::remove_all(dir);
+}
+
 }  // namespace
