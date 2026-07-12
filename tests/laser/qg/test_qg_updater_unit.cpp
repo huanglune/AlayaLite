@@ -11,16 +11,21 @@
 //   4. Ghost-slot detection distinguishes zero-padded tail slots.
 //   5. Inserted vectors are searchable after reload; tombstoned ids are
 //      filtered from results while still being traversable.
+//   6. V2 trailers/A-B superblocks migrate, round-trip, and recover correctly.
+//   7. Consolidated PIDs are reused dark-until-publish and bound file growth.
 
 #include <gtest/gtest.h>
 
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <numeric>
 #include <random>
 #include <string>
 #include <vector>
@@ -35,7 +40,10 @@ namespace alaya::laser {
 namespace {
 
 constexpr size_t kDim = 64;
-constexpr size_t kDeg = 32;
+// R32/d64 produces a byte-perfect 4*1024B page with no trailer slack and is
+// intentionally rejected by format v2.  R64 keeps the same test dimension
+// while leaving 512B of slack for two row trailers.
+constexpr size_t kDeg = 64;
 constexpr size_t kN = 2000;
 
 std::vector<float> make_data(size_t n, size_t dim, uint32_t seed) {
@@ -60,6 +68,7 @@ void write_fbin(const std::string &path, const float *data, int32_t n, int32_t d
 struct TinyIndex {
   std::filesystem::path dir;
   std::string prefix;
+  std::string v1_prefix;
   std::vector<float> data;
 
   static TinyIndex build(uint32_t seed) {
@@ -85,6 +94,18 @@ struct TinyIndex {
     QuantizedGraph qg(kN, kDeg, kDim, kDim, /*rotator_seed=*/7);
     QGBuilder builder(qg, /*ef_build=*/64, /*num_threads=*/4);
     builder.build(vamana_path.c_str(), t.prefix.c_str());
+
+    // Preserve an immutable v1 artifact even though most updater tests migrate
+    // their working copy on construction.
+    const std::string suffix =
+        "_R" + std::to_string(kDeg) + "_MD" + std::to_string(kDim) + ".index";
+    t.v1_prefix = (t.dir / "v1_snapshot").string();
+    for (const std::string &ext :
+         {suffix, suffix + "_rotator", suffix + "_cache_ids", suffix + "_cache_nodes"}) {
+      std::filesystem::copy_file(t.prefix + ext,
+                                 t.v1_prefix + ext,
+                                 std::filesystem::copy_options::overwrite_existing);
+    }
     return t;
   }
 
@@ -110,6 +131,67 @@ std::vector<char> read_node_row(const QuantizedGraph &qg_meta,
   ::close(fd);
   return {page.begin() + static_cast<int64_t>((id % npp) * node_len),
           page.begin() + static_cast<int64_t>((id % npp + 1) * node_len)};
+}
+
+std::string index_suffix() {
+  return "_R" + std::to_string(kDeg) + "_MD" + std::to_string(kDim) + ".index";
+}
+
+void copy_index_artifact(const std::string &from, const std::string &to) {
+  const std::string suffix = index_suffix();
+  for (const std::string &ext :
+       {suffix, suffix + "_rotator", suffix + "_cache_ids", suffix + "_cache_nodes"}) {
+    std::filesystem::copy_file(
+        from + ext, to + ext, std::filesystem::copy_options::overwrite_existing);
+  }
+}
+
+bool v1_ghost_slot(const char *row,
+                   size_t slot,
+                   size_t degree,
+                   size_t padded_dim,
+                   size_t code_off,
+                   size_t factor_off,
+                   size_t neighbor_off) {
+  const auto *ids = reinterpret_cast<const PID *>(row + neighbor_off);
+  if (ids[slot] != 0) return false;
+  const auto *fac = reinterpret_cast<const float *>(row + factor_off);
+  if (fac[slot] != 0 || fac[degree + slot] != 0 || fac[2 * degree + slot] != 0) return false;
+  const uint8_t *block = reinterpret_cast<const uint8_t *>(row + code_off) +
+                         (slot / kBatchSize) * padded_dim * 4;
+  std::vector<uint64_t> bins(kBatchSize * padded_dim / 64);
+  unpack_codes_block(padded_dim, block, bins.data());
+  const uint64_t *words = bins.data() + (slot % kBatchSize) * (padded_dim / 64);
+  for (size_t w = 0; w < padded_dim / 64; ++w) {
+    if (words[w] != 0) return false;
+  }
+  return true;
+}
+
+TEST(QGUpdaterUnit, TrailerRoundTripThreeRowsPerPage) {
+  constexpr size_t page_size = 4096;
+  constexpr size_t npp = 3;
+  constexpr size_t row_size = 1200;
+  static_assert(npp * row_size + npp * sizeof(QGRowTrailer) <= page_size);
+  std::vector<char> page(page_size, static_cast<char>(0x5a));
+  const std::vector<char> row_bytes(page.begin(), page.begin() + npp * row_size);
+
+  for (size_t slot = 0; slot < npp; ++slot) {
+    qg_write_page_trailer(page.data(),
+                          page_size,
+                          npp,
+                          slot,
+                          {static_cast<uint16_t>(7 + slot),
+                           static_cast<uint16_t>(slot == 1 ? kQGRowTombstone : 0)});
+  }
+  for (size_t slot = 0; slot < npp; ++slot) {
+    const QGRowTrailer got = qg_read_page_trailer(page.data(), page_size, npp, slot);
+    EXPECT_EQ(got.valid_degree, 7 + slot);
+    EXPECT_EQ(got.flags, slot == 1 ? kQGRowTombstone : 0);
+    EXPECT_EQ(qg_page_trailer_offset(page_size, npp, slot), page_size - 12 + slot * 4);
+  }
+  EXPECT_TRUE(std::equal(row_bytes.begin(), row_bytes.end(), page.begin()))
+      << "trailer writes must not touch any row body";
 }
 
 TEST(QGUpdaterUnit, UnpackRoundTrip) {
@@ -183,6 +265,64 @@ class QGUpdaterIndexTest : public ::testing::Test {
 };
 TinyIndex *QGUpdaterIndexTest::tiny_ = nullptr;
 
+TEST_F(QGUpdaterIndexTest, MigratesV1DegreesAndPreservesSearchExactly) {
+  const std::string prefix = (tiny_->dir / "migrate").string();
+  copy_index_artifact(tiny_->v1_prefix, prefix);
+  const std::string path = prefix + index_suffix();
+  const size_t node_len = (32 * kDim + 128 * kDeg + kDeg * kDim) / 8;
+  const size_t npp = std::max<size_t>(1, kSectorLen / node_len);
+  const size_t page_size = (npp * node_len + kSectorLen - 1) / kSectorLen * kSectorLen;
+  const size_t code_off = kDim * sizeof(float);
+  const size_t factor_off =
+      (kDim + (kDim / 64) * 2 * kDeg) * sizeof(float);
+  const size_t neighbor_off = factor_off + 3 * kDeg * sizeof(float);
+
+  std::array<char, kSectorLen> header{};
+  {
+    std::ifstream in(path, std::ios::binary);
+    ASSERT_TRUE(in.is_open());
+    in.read(header.data(), header.size());
+  }
+  QGSuperblockV2 absent;
+  EXPECT_EQ(select_qg_superblock(header.data(), absent), -1);
+  EXPECT_FALSE(qg_header_has_v2_magic(header.data()));
+
+  std::vector<uint16_t> expected_degree(kN);
+  QuantizedGraph qg(kN, kDeg, kDim, kDim);
+  qg.load_disk_index(prefix.c_str(), 0.0F);
+  // Beam 1 makes completion order deterministic, so this is a byte-for-byte
+  // result comparison rather than an asynchronous beam scheduling check.
+  qg.set_params(100, 1, 1);
+  for (PID id = 0; id < kN; ++id) {
+    const auto row = read_node_row(qg, path, id, node_len, page_size, npp);
+    for (size_t slot = 0; slot < kDeg; ++slot) {
+      expected_degree[id] += static_cast<uint16_t>(!v1_ghost_slot(row.data(),
+                                                                  slot,
+                                                                  kDeg,
+                                                                  kDim,
+                                                                  code_off,
+                                                                  factor_off,
+                                                                  neighbor_off));
+    }
+  }
+  std::vector<uint32_t> before(32 * 10);
+  for (size_t i = 0; i < 32; ++i) {
+    qg.search(tiny_->data.data() + i * kDim, 10, before.data() + i * 10);
+  }
+
+  QGUpdater upd(qg, UpdateParams{});
+  EXPECT_EQ(upd.generation(), 1U);
+  EXPECT_EQ(upd.active_superblock_slot(), 0);
+  for (PID id = 0; id < kN; ++id) {
+    EXPECT_EQ(upd.trailer(id).valid_degree, expected_degree[id]) << "id=" << id;
+  }
+  std::vector<uint32_t> after(before.size());
+  for (size_t i = 0; i < 32; ++i) {
+    qg.search(tiny_->data.data() + i * kDim, 10, after.data() + i * 10);
+  }
+  EXPECT_EQ(after, before);
+}
+
 TEST_F(QGUpdaterIndexTest, AssembleRowMatchesBuilder) {
   QuantizedGraph qg(kN, kDeg, kDim, kDim);
   qg.load_disk_index(tiny_->prefix.c_str(), 0.0F);
@@ -203,9 +343,9 @@ TEST_F(QGUpdaterIndexTest, AssembleRowMatchesBuilder) {
     std::vector<const float *> nb_vecs;
     bool usable = true;
     for (size_t j = 0; j < kDeg; ++j) {
-      if (upd.is_ghost_slot(row.data(), j)) {
+      if (upd.is_v1_ghost_slot(row.data(), j)) {
         for (size_t k = j; k < kDeg; ++k) {
-          if (!upd.is_ghost_slot(row.data(), k)) {
+          if (!upd.is_v1_ghost_slot(row.data(), k)) {
             usable = false;  // hole in the middle — builder wrote contiguous, skip
           }
         }
@@ -284,7 +424,7 @@ TEST_F(QGUpdaterIndexTest, InsertPatchTombstoneEndToEnd) {
       const auto *ids = reinterpret_cast<const PID *>(row.data() + upd.neighbor_off_bytes());
       bool has_new = false;
       for (size_t j = 0; j < kDeg; ++j) {
-        if (!upd.is_ghost_slot(row.data(), j) && ids[j] >= kN) {
+        if (!upd.is_v1_ghost_slot(row.data(), j) && ids[j] >= kN) {
           has_new = true;
         }
       }
@@ -295,9 +435,9 @@ TEST_F(QGUpdaterIndexTest, InsertPatchTombstoneEndToEnd) {
       std::vector<const float *> nb_vecs;
       bool usable = true;
       for (size_t j = 0; j < kDeg; ++j) {
-        if (upd.is_ghost_slot(row.data(), j)) {
+        if (upd.is_v1_ghost_slot(row.data(), j)) {
           for (size_t k = j; k < kDeg; ++k) {
-            usable = usable && upd.is_ghost_slot(row.data(), k);
+            usable = usable && upd.is_v1_ghost_slot(row.data(), k);
           }
           break;
         }
@@ -462,7 +602,7 @@ TEST_F(QGUpdaterIndexTest, ParallelBatchInsertAndConsolidate) {
       auto row = read_node_row(qg, index_path, u, node_len, page_size, npp);
       const auto *ids = reinterpret_cast<const PID *>(row.data() + upd.neighbor_off_bytes());
       for (size_t j = 0; j < kDeg; ++j) {
-        if (!upd.is_ghost_slot(row.data(), j) && ids[j] >= 100 && ids[j] < 300) {
+        if (!upd.is_v1_ghost_slot(row.data(), j) && ids[j] >= 100 && ids[j] < 300) {
           ++dead_refs;
         }
       }
@@ -542,14 +682,17 @@ TEST_F(QGUpdaterIndexTest, ExactEvictRemovesExactFarthestNeighbor) {
   const size_t npp = std::max<size_t>(1, 4096 / node_len);
   const size_t page_size = (npp * node_len + kSectorLen - 1) / kSectorLen * kSectorLen;
   std::vector<std::vector<char>> before(kN);
+  std::vector<uint16_t> before_degree(kN);
   for (PID id = 0; id < kN; ++id) {
     before[id] = read_node_row(qg, prefix + suffix, id, node_len, page_size, npp);
+    before_degree[id] = upd.trailer(id).valid_degree;
   }
   const auto inserted = make_data(1, kDim, 7781);
   upd.insert(inserted.data());
 
   size_t checked = 0;
   for (PID u = 0; u < kN; ++u) {
+    if (before_degree[u] != kDeg) continue;  // headroom fill is not an eviction
     const auto after = read_node_row(qg, prefix + suffix, u, node_len, page_size, npp);
     const auto *old_ids = reinterpret_cast<const PID *>(before[u].data() + upd.neighbor_off_bytes());
     const auto *new_ids = reinterpret_cast<const PID *>(after.data() + upd.neighbor_off_bytes());
@@ -613,6 +756,179 @@ TEST(QGUpdaterUnit, GroupedRecallArithmetic) {
   EXPECT_DOUBLE_EQ(grouped_recall({0}, {0}, {0})[1], -1.0);
 }
 
+TEST_F(QGUpdaterIndexTest, SuperblockSelectsGoodCopyAndAlternatesGeneration) {
+  const std::string prefix = (tiny_->dir / "superblock").string();
+  copy_index_artifact(tiny_->v1_prefix, prefix);
+  const std::string path = prefix + index_suffix();
+
+  {
+    QuantizedGraph qg(kN, kDeg, kDim, kDim);
+    qg.load_disk_index(prefix.c_str(), 0.0F);
+    QGUpdater upd(qg, UpdateParams{});  // migration writes A generation 1
+    upd.checkpoint();                    // B generation 2
+    EXPECT_EQ(upd.active_superblock_slot(), 1);
+    EXPECT_EQ(upd.generation(), 2U);
+  }
+
+  // Deliberately destroy A while leaving the newer B copy intact.
+  const int fd = ::open(path.c_str(), O_WRONLY);
+  ASSERT_GE(fd, 0);
+  std::array<char, kQGSuperblockSize> garbage{};
+  std::fill(garbage.begin(), garbage.end(), static_cast<char>(0xa5));
+  ASSERT_EQ(::pwrite(fd, garbage.data(), garbage.size(), 0),
+            static_cast<ssize_t>(garbage.size()));
+  ASSERT_EQ(::fsync(fd), 0);
+  ::close(fd);
+
+  {
+    QuantizedGraph qg(kN, kDeg, kDim, kDim);
+    EXPECT_NO_THROW(qg.load_disk_index(prefix.c_str(), 0.0F));
+    QGUpdater upd(qg, UpdateParams{});
+    EXPECT_EQ(upd.active_superblock_slot(), 1);
+    EXPECT_EQ(upd.generation(), 2U);
+    upd.checkpoint();  // repairs A as generation 3
+    EXPECT_EQ(upd.active_superblock_slot(), 0);
+    EXPECT_EQ(upd.generation(), 3U);
+  }
+  {
+    QuantizedGraph qg(kN, kDeg, kDim, kDim);
+    qg.load_disk_index(prefix.c_str(), 0.0F);
+    QGUpdater upd(qg, UpdateParams{});
+    EXPECT_EQ(upd.active_superblock_slot(), 0);
+    EXPECT_EQ(upd.generation(), 3U);
+  }
+}
+
+TEST_F(QGUpdaterIndexTest, ReusedPidStaysDarkUntilPublishAndRowIsFullyRewritten) {
+  const std::string prefix = (tiny_->dir / "reuse_dark").string();
+  copy_index_artifact(tiny_->v1_prefix, prefix);
+  const std::string path = prefix + index_suffix();
+  const size_t node_len = (32 * kDim + 128 * kDeg + kDeg * kDim) / 8;
+  const size_t npp = std::max<size_t>(1, kSectorLen / node_len);
+  const size_t page_size = (npp * node_len + kSectorLen - 1) / kSectorLen * kSectorLen;
+
+  QuantizedGraph qg(kN, kDeg, kDim, kDim);
+  qg.load_disk_index(prefix.c_str(), 0.0F);
+  const PID victim = qg.entry_point();
+  qg.set_params(256, 1, 16);
+  UpdateParams params;
+  params.ef_insert = 256;
+  params.prune_pool_cap = 512;
+  params.write_cache = false;
+  params.max_points = kN + 16;
+  QGUpdater upd(qg, params);
+  const auto old_row = read_node_row(qg, path, victim, node_len, page_size, npp);
+
+  upd.tombstone(victim);
+  EXPECT_NE(qg.entry_point(), victim) << "routing root must move before its PID is reusable";
+  upd.consolidate(4);
+  ASSERT_EQ(upd.free_list_head(), victim);
+  ASSERT_EQ(upd.free_count(), 1U);
+  EXPECT_EQ(upd.trailer(victim).flags & (kQGRowTombstone | kQGRowFree),
+            kQGRowTombstone | kQGRowFree);
+
+  auto y = make_data(1, kDim, 0x5eed);
+  const PID reused = upd.allocate_and_insert(y.data());
+  ASSERT_EQ(reused, victim);
+  ASSERT_EQ(upd.free_count(), 0U);
+  const QGRowTrailer dark_trailer = upd.trailer(reused);
+  EXPECT_EQ(dark_trailer.flags & (kQGRowTombstone | kQGRowFree),
+            kQGRowTombstone | kQGRowFree);
+
+  const auto rewritten = read_node_row(qg, path, reused, node_len, page_size, npp);
+  const auto *ids = reinterpret_cast<const PID *>(rewritten.data() + upd.neighbor_off_bytes());
+  std::vector<PID> nb_ids(ids, ids + dark_trailer.valid_degree);
+  std::vector<const float *> nb_vecs;
+  for (PID id : nb_ids) {
+    ASSERT_LT(id, kN);
+    nb_vecs.push_back(tiny_->data.data() + static_cast<size_t>(id) * kDim);
+  }
+  std::vector<char> expected(node_len);
+  upd.assemble_row(expected.data(), y.data(), nb_vecs, nb_ids);
+  EXPECT_EQ(rewritten, expected) << "reused row must contain no free-link/old-row residue";
+  EXPECT_NE(rewritten, old_row);
+
+  std::vector<uint32_t> result(10);
+  qg.search(y.data(), result.size(), result.data());
+  EXPECT_EQ(std::count(result.begin(), result.end(), reused), 0)
+      << "a reused id below committed watermark must remain result-filtered";
+
+  upd.publish(upd.num_points());  // watermark is unchanged for a reused PID
+  EXPECT_EQ(upd.trailer(reused).flags & (kQGRowTombstone | kQGRowFree), 0);
+  qg.search(y.data(), result.size(), result.data());
+  EXPECT_EQ(result[0], reused);
+  EXPECT_EQ(upd.stats().freed_slots, 1U);
+  EXPECT_EQ(upd.stats().reused_slots, 1U);
+  upd.checkpoint();
+  std::array<char, kSectorLen> header{};
+  {
+    std::ifstream in(path, std::ios::binary);
+    in.read(header.data(), header.size());
+  }
+  QGSuperblockV2 persisted;
+  ASSERT_GE(select_qg_superblock(header.data(), persisted), 0);
+  EXPECT_EQ(persisted.entry_point, qg.entry_point());
+  EXPECT_NE(persisted.entry_point, victim);
+}
+
+TEST_F(QGUpdaterIndexTest, ReusePlatformsFileWhileAppendControlGrows) {
+  const std::string reuse_prefix = (tiny_->dir / "platform_reuse").string();
+  const std::string append_prefix = (tiny_->dir / "platform_append").string();
+  copy_index_artifact(tiny_->v1_prefix, reuse_prefix);
+  copy_index_artifact(tiny_->v1_prefix, append_prefix);
+  const auto replacement = make_data(5 * kN, kDim, 0x123456);
+
+  auto run = [&](const std::string &prefix, bool reuse) {
+    QuantizedGraph qg(kN, kDeg, kDim, kDim);
+    qg.load_disk_index(prefix.c_str(), 0.0F);
+    UpdateParams params;
+    params.backlink_mode = UpdateParams::Backlink::kNone;
+    params.ef_insert = 8;
+    params.prune_pool_cap = 8;
+    params.max_points = 6 * kN + 1024;
+    QGUpdater upd(qg, params);
+    std::vector<PID> live(kN);
+    std::iota(live.begin(), live.end(), PID{0});
+    std::vector<size_t> pages;
+    for (size_t round = 0; round < 5; ++round) {
+      for (PID id : live) upd.tombstone(id);
+      upd.consolidate(4, 0, reuse);
+      live.clear();
+      live.reserve(kN);
+      for (size_t i = 0; i < kN; ++i) {
+        const float *vec = replacement.data() + (round * kN + i) * kDim;
+        PID id;
+        if (reuse) {
+          id = upd.allocate_and_insert(vec);
+        } else {
+          id = static_cast<PID>(kN + round * kN + i);
+          upd.insert_with_id(vec, id);
+        }
+        live.push_back(id);
+      }
+      upd.flush(1);
+      upd.publish(upd.allocated_points());
+      upd.checkpoint();
+      pages.push_back(upd.file_pages());
+      EXPECT_EQ(upd.live_count(), kN);
+      EXPECT_EQ(std::filesystem::file_size(prefix + index_suffix()),
+                kSectorLen + upd.file_pages() * 4096);
+    }
+    return std::make_pair(pages, upd.stats());
+  };
+
+  const auto [reuse_pages, reuse_stats] = run(reuse_prefix, true);
+  const auto [append_pages, append_stats] = run(append_prefix, false);
+  ASSERT_EQ(reuse_pages.size(), 5U);
+  ASSERT_EQ(append_pages.size(), 5U);
+  for (size_t pages : reuse_pages) EXPECT_EQ(pages, reuse_pages.front());
+  for (size_t i = 1; i < append_pages.size(); ++i) {
+    EXPECT_GT(append_pages[i], append_pages[i - 1]);
+  }
+  EXPECT_EQ(reuse_stats.reused_slots, 5 * kN);
+  EXPECT_EQ(append_stats.reused_slots, 0U);
+}
+
 TEST_F(QGUpdaterIndexTest, GhostSlotDetection) {
   QuantizedGraph qg(kN, kDeg, kDim, kDim);
   qg.load_disk_index(tiny_->prefix.c_str(), 0.0F);
@@ -630,10 +946,10 @@ TEST_F(QGUpdaterIndexTest, GhostSlotDetection) {
   }
   upd.assemble_row(row.data(), tiny_->data.data(), vecs, ids);
   for (size_t j = 0; j < d_use; ++j) {
-    EXPECT_FALSE(upd.is_ghost_slot(row.data(), j)) << "slot " << j;
+    EXPECT_FALSE(upd.is_v1_ghost_slot(row.data(), j)) << "slot " << j;
   }
   for (size_t j = d_use; j < kDeg; ++j) {
-    EXPECT_TRUE(upd.is_ghost_slot(row.data(), j)) << "slot " << j;
+    EXPECT_TRUE(upd.is_v1_ghost_slot(row.data(), j)) << "slot " << j;
   }
 }
 

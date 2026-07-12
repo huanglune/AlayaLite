@@ -7,6 +7,7 @@
 #include <omp.h>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cfloat>
 #include <chrono>
@@ -80,6 +81,82 @@ struct ClusterStats {
 };
 
 constexpr size_t kSectorLen = 4096;
+
+// LASER QG format-v2 metadata.  The two copies occupy [0, 512) and
+// [512, 1024) of the existing 4 KiB metadata sector.  The compatibility
+// fields let the ordinary read-only QG loader validate/open a
+// v2 file without changing any graph-search layout or addressing code.
+constexpr uint64_t kQGSuperblockMagic = 0x324751524553414cULL;  // "LASERQG2"
+constexpr uint32_t kQGFormatVersion = 2;
+constexpr size_t kQGSuperblockSize = 512;
+constexpr size_t kQGSuperblockCopies = 2;
+
+struct QGSuperblockV2 {
+  uint64_t magic = 0;
+  uint32_t format_version = 0;
+  uint32_t checksum = 0;
+  uint64_t generation = 0;
+  uint64_t num_points = 0;
+  uint64_t live_count = 0;
+  PID free_list_head = kPidMax;
+  uint32_t reserved0 = 0;
+  uint64_t free_count = 0;
+
+  // v1 loader metadata mirrored into the reserved portion of the 512-byte
+  // superblock. The required v2 fields above remain authoritative.
+  uint64_t entry_point = 0;
+  uint64_t dimension = 0;
+  uint64_t node_len = 0;
+  uint64_t node_per_page = 0;
+  uint64_t page_size = 0;
+  uint64_t file_size = 0;
+  std::array<uint8_t, 408> reserved{};
+};
+static_assert(sizeof(QGSuperblockV2) == kQGSuperblockSize);
+
+inline uint32_t qg_crc32(const void *data, size_t len) {
+  uint32_t crc = 0xffffffffU;
+  const auto *bytes = static_cast<const uint8_t *>(data);
+  for (size_t i = 0; i < len; ++i) {
+    crc ^= bytes[i];
+    for (int bit = 0; bit < 8; ++bit) {
+      crc = (crc >> 1U) ^ (0xedb88320U & (0U - (crc & 1U)));
+    }
+  }
+  return ~crc;
+}
+
+inline uint32_t qg_superblock_checksum(const QGSuperblockV2 &sb) {
+  QGSuperblockV2 copy = sb;
+  copy.checksum = 0;
+  return qg_crc32(&copy, sizeof(copy));
+}
+
+inline bool qg_superblock_valid(const QGSuperblockV2 &sb) {
+  return sb.magic == kQGSuperblockMagic && sb.format_version == kQGFormatVersion &&
+         sb.checksum == qg_superblock_checksum(sb);
+}
+
+// Returns 0 (A), 1 (B), or -1 when neither copy is valid.
+inline int select_qg_superblock(const char *header, QGSuperblockV2 &selected) {
+  QGSuperblockV2 copies[kQGSuperblockCopies];
+  std::memcpy(&copies[0], header, sizeof(QGSuperblockV2));
+  std::memcpy(&copies[1], header + kQGSuperblockSize, sizeof(QGSuperblockV2));
+  const bool valid_a = qg_superblock_valid(copies[0]);
+  const bool valid_b = qg_superblock_valid(copies[1]);
+  if (!valid_a && !valid_b) return -1;
+  const int slot = valid_b && (!valid_a || copies[1].generation > copies[0].generation) ? 1 : 0;
+  selected = copies[slot];
+  return slot;
+}
+
+inline bool qg_header_has_v2_magic(const char *header) {
+  uint64_t magic_a = 0;
+  uint64_t magic_b = 0;
+  std::memcpy(&magic_a, header, sizeof(magic_a));
+  std::memcpy(&magic_b, header + kQGSuperblockSize, sizeof(magic_b));
+  return magic_a == kQGSuperblockMagic || magic_b == kQGSuperblockMagic;
+}
 
 class QuantizedGraph {
   friend class QGBuilder;
@@ -867,16 +944,38 @@ inline void QuantizedGraph::load_disk_index(const char *filename, float search_D
   std::ifstream input(index_file_name_, std::ios::binary);
   assert(input.is_open());
 
-  std::vector<uint64_t> metas(kSectorLen / sizeof(uint64_t), 0);
-  input.read(reinterpret_cast<char *>(metas.data()), kSectorLen);
+  std::array<char, kSectorLen> header{};
+  input.read(header.data(), header.size());
+  if (!input) {
+    throw std::runtime_error("QuantizedGraph::load_disk_index: short metadata sector");
+  }
 
-  assert(metas[0] == num_points_);
-  assert(metas[1] == dimension_);
-  assert(metas[3] == node_len_);
-  assert(metas[4] == node_per_page_);
-  assert(metas[8] == std::filesystem::file_size(index_file_name_));
-
-  entry_point_ = metas[2];
+  QGSuperblockV2 sb;
+  const int sb_slot = select_qg_superblock(header.data(), sb);
+  if (sb_slot >= 0) {
+    if (sb.dimension != dimension_ || sb.node_len != node_len_ ||
+        sb.node_per_page != node_per_page_ || sb.page_size != page_size_) {
+      throw std::runtime_error("QuantizedGraph::load_disk_index: v2 geometry mismatch");
+    }
+    if (sb.file_size != std::filesystem::file_size(index_file_name_)) {
+      throw std::runtime_error("QuantizedGraph::load_disk_index: v2 file-size mismatch");
+    }
+    num_points_ = static_cast<size_t>(sb.num_points);
+    entry_point_ = static_cast<PID>(sb.entry_point);
+  } else {
+    if (qg_header_has_v2_magic(header.data())) {
+      throw std::runtime_error(
+          "QuantizedGraph::load_disk_index: both v2 superblocks have invalid checksums");
+    }
+    std::array<uint64_t, kSectorLen / sizeof(uint64_t)> metas{};
+    std::memcpy(metas.data(), header.data(), header.size());
+    assert(metas[0] == num_points_);
+    assert(metas[1] == dimension_);
+    assert(metas[3] == node_len_);
+    assert(metas[4] == node_per_page_);
+    assert(metas[8] == std::filesystem::file_size(index_file_name_));
+    entry_point_ = static_cast<PID>(metas[2]);
+  }
 
   std::string rotator_path = std::string(index_file_name_) + "_rotator";
   std::ifstream rotator_input(rotator_path, std::ios::binary);

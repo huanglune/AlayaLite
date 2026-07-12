@@ -181,6 +181,8 @@ struct Args {
   size_t ef_insert = 100, prune_cap = 300, alpha_check_max = 16;
   size_t batch = 4096, insert_threads = 32;
   uint32_t consolidate = 0, r_target = 0;
+  uint32_t reuse = 0;             // churn: 1 = allocate from consolidated free-list first
+  uint32_t checkpoint_every = 1;  // churn: superblock cadence in rounds
   uint32_t garden = 0;
   double garden_frac = 0.05;
   size_t ef_maintenance = 200, pump_budget = 4;
@@ -267,6 +269,10 @@ Args parse(int argc, char **argv) {
       a.consolidate = std::stoul(v);
     else if (k == "--r_target")
       a.r_target = std::stoul(v);
+    else if (k == "--reuse")
+      a.reuse = std::stoul(v);
+    else if (k == "--checkpoint_every")
+      a.checkpoint_every = std::stoul(v);
     else if (k == "--garden")
       a.garden = std::stoul(v);
     else if (k == "--garden_frac")
@@ -303,6 +309,12 @@ Args parse(int argc, char **argv) {
     } else {
       throw std::runtime_error("unknown arg " + k);
     }
+  }
+  if (a.checkpoint_every == 0) {
+    throw std::runtime_error("--checkpoint_every must be >= 1");
+  }
+  if (a.reuse > 1) {
+    throw std::runtime_error("--reuse must be 0 or 1");
   }
   return a;
 }
@@ -473,6 +485,9 @@ int do_churn(const Args &a) {
   if (a.n + a.runs * a.count > base.n) {
     throw std::runtime_error("churn: not enough vectors for rounds");
   }
+  if (a.reuse != 0 && a.pipeline != 0) {
+    throw std::runtime_error("churn: --reuse 1 requires --pipeline 0 (publish each reuse batch)");
+  }
 
   alaya::laser::QuantizedGraph qg(a.n, a.R, main_dim, dim);
   qg.load_disk_index(a.prefix.c_str(), 0.0F);
@@ -508,9 +523,13 @@ int do_churn(const Args &a) {
   const std::vector<int> query_groups = read_query_groups(a.query_groups, query.n);
   const uint32_t ef_eval = a.efs.empty() ? 100 : a.efs[0];
   const int ins_threads = static_cast<int>(std::max<size_t>(1, a.insert_threads));
+  std::vector<alaya::laser::PID> source_to_pid(base.n, alaya::laser::kPidMax);
+  for (size_t source = 0; source < a.n; ++source) {
+    source_to_pid[source] = static_cast<alaya::laser::PID>(source);
+  }
+  alaya::laser::UpdateStats last_round_stats;
 
   auto eval_round = [&](uint64_t round) {
-    upd.finalize();  // commit num_points so set_params sizes workspaces right
     qg.set_result_filter(&upd.deleted());
     qg.set_params(ef_eval, a.threads, static_cast<int>(a.beam));
     auto t0 = std::chrono::steady_clock::now();
@@ -525,9 +544,12 @@ int do_churn(const Args &a) {
       const uint32_t *truth_row = gt.row(qi);
       std::unordered_set<uint32_t> truth;
       for (uint32_t j = 0; j < gt.dim && truth.size() < a.topk; ++j) {
-        const uint32_t t = truth_row[j];
-        if (t < upd.num_points() && upd.deleted().find(t) == upd.deleted().end()) {
-          truth.insert(t);
+        const uint32_t source = truth_row[j];
+        if (source < source_to_pid.size()) {
+          const alaya::laser::PID pid = source_to_pid[source];
+          if (pid != alaya::laser::kPidMax && upd.deleted().find(pid) == upd.deleted().end()) {
+            truth.insert(pid);
+          }
         }
       }
       total += truth.size();
@@ -557,11 +579,17 @@ int do_churn(const Args &a) {
     };
     std::cout << "round," << round << ",recall,"
               << (total == 0 ? 0.0 : static_cast<double>(hits) / static_cast<double>(total))
-              << ",qps," << qps << ",live," << upd.num_points() - upd.deleted().size()
+              << ",qps," << qps << ",live," << upd.live_count()
               << ",free_fills," << s.free_slot_fills << ",evictions," << s.evictions
               << ",est_skips," << s.est_skips << ",forced," << s.forced_links
               << ",indeg_p1," << pct(0.01) << ",indeg_p5," << pct(0.05)
-              << ",indeg_p50," << pct(0.50);
+              << ",indeg_p50," << pct(0.50) << ",file_pages," << upd.file_pages()
+              << ",freed," << s.freed_slots - last_round_stats.freed_slots
+              << ",reused," << s.reused_slots - last_round_stats.reused_slots
+              << ",live_frac,"
+              << (upd.allocated_points() == 0
+                      ? 0.0
+                      : static_cast<double>(upd.live_count()) / upd.allocated_points());
     if (!query_groups.empty()) {
       for (size_t g = 0; g < 3; ++g) {
         const double value = group_total[g] == 0
@@ -572,19 +600,27 @@ int do_churn(const Args &a) {
     }
     print_telemetry(s);
     std::cout << "\n" << std::flush;
+    last_round_stats = s;
   };
 
   std::cout << "[churn] base_n=" << a.n << " rounds=" << a.runs << " count=" << a.count
             << " arm=" << a.arm << " ef_eval=" << ef_eval << " insert_threads=" << ins_threads
-            << " consolidate=" << a.consolidate << " r_target=" << a.r_target << "\n";
+            << " consolidate=" << a.consolidate << " r_target=" << a.r_target
+            << " reuse=" << a.reuse << " checkpoint_every=" << a.checkpoint_every << "\n";
   eval_round(0);
   for (uint64_t r = 0; r < a.runs; ++r) {
     for (uint64_t i = 0; i < a.count; ++i) {
-      upd.tombstone(static_cast<alaya::laser::PID>(r * a.count + i));
+      const uint64_t source = r * a.count + i;
+      const alaya::laser::PID pid = source_to_pid[source];
+      if (pid == alaya::laser::kPidMax) {
+        throw std::runtime_error("churn: source-to-PID map lost a live source");
+      }
+      upd.tombstone(pid);
+      source_to_pid[source] = alaya::laser::kPidMax;
     }
     auto tc0 = std::chrono::steady_clock::now();
-    if (a.consolidate != 0) {
-      upd.consolidate(a.insert_threads, a.r_target);
+    if (a.consolidate != 0 || a.reuse != 0) {
+      upd.consolidate(a.insert_threads, a.r_target, a.reuse != 0);
     }
     auto tc1 = std::chrono::steady_clock::now();
     const auto garden_before = upd.stats();
@@ -622,8 +658,20 @@ int do_churn(const Args &a) {
 #pragma omp parallel for num_threads(ins_threads) schedule(dynamic)
       for (int64_t oi = 0; oi < batch_size; ++oi) {
         const uint64_t i = insert_order[start + static_cast<size_t>(oi)];
-        upd.insert_with_id(base.row(ins_base + static_cast<uint64_t>(i)),
-                           static_cast<alaya::laser::PID>(ins_base + static_cast<uint64_t>(i)));
+        const uint64_t source = ins_base + i;
+        alaya::laser::PID pid;
+        if (a.reuse != 0) {
+          pid = upd.allocate_and_insert(base.row(source));
+        } else {
+          pid = static_cast<alaya::laser::PID>(source);
+          upd.insert_with_id(base.row(source), pid);
+        }
+        source_to_pid[source] = pid;
+      }
+      if (a.reuse != 0) {
+        upd.flush(fl_threads);
+        upd.publish(upd.allocated_points());
+        continue;
       }
       if (pending.valid()) {
         pending.get();
@@ -641,7 +689,7 @@ int do_churn(const Args &a) {
       pending.get();
       if (a.shuffle_seed == 0) upd.publish(pending_publish);
     }
-    if (a.shuffle_seed != 0) upd.publish(ins_base + a.count);
+    if (a.reuse == 0 && a.shuffle_seed != 0) upd.publish(ins_base + a.count);
     auto t1 = std::chrono::steady_clock::now();
     std::cout << "[churn] round " << r + 1
               << " insert_qps=" << a.count / std::chrono::duration<double>(t1 - t0).count()
@@ -649,8 +697,14 @@ int do_churn(const Args &a) {
               << " garden_s=" << std::chrono::duration<double>(tg1 - tg0).count()
               << " gardened_rows="
               << garden_after.gardened_rows - garden_before.gardened_rows << "\n";
+    if ((r + 1) % a.checkpoint_every == 0) {
+      upd.checkpoint();
+    } else {
+      upd.writeback(a.insert_threads);
+    }
     eval_round(r + 1);
   }
+  if (a.runs % a.checkpoint_every != 0) upd.checkpoint();
   return 0;
 }
 

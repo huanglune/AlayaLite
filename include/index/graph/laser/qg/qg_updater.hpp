@@ -13,7 +13,8 @@
  * codebook to retrain. The FastScan 32-slot interleave is a lossless
  * permutation, so a single logical slot can be replaced by unpacking one
  * 32-slot block, swapping the code, and repacking. File addressing is pure id
- * arithmetic, so new nodes append as new pages at EOF.
+ * arithmetic; inserts either reuse a consolidated free PID in place or append
+ * at EOF.
  *
  * Insert = FreshDiskANN-style: beam search (capturing expanded rows) ->
  * alpha-RobustPrune over captured exact distances -> assemble + append the new
@@ -30,11 +31,10 @@
  *                 rewrite the whole row (quality reference, R extra reads)
  *
  * Concurrency model (multi-writer inserts, batch three-phase publish):
- *   - The caller runs a parallel batch of insert_with_id() over a dense id
- *     range and calls publish(base + batch) once after the batch barrier.
- *     Searches use the pre-batch `committed_` snapshot, so a published id is
- *     always fully written and has its backlinks in place (mini-batch
- *     semantics: batch members cannot link to each other).
+ *   - The caller runs a parallel append batch with insert_with_id(), or lets
+ *     allocate_and_insert() pop reclaimed PIDs. publish() advances the append
+ *     watermark and simultaneously removes reused PIDs from the tombstone
+ *     result filter after their rows/backlinks are complete.
  *   - Every row write (append, backlink patch, consolidation rewrite) runs
  *     under a striped page-lock table, and bumps a per-page seqlock version
  *     (odd = write in progress). Lock-free search reads validate the version
@@ -42,18 +42,18 @@
  *   - tombstone() / consolidate() must not run concurrently with inserts
  *     (phase separation is the caller's responsibility).
  *
- * Deletes are in-memory tombstones filtered from results at search time
- * (routing still traverses deleted nodes); see QuantizedGraph::set_result_filter.
- * consolidate() purges dead out-edges from live rows: each dead slot is
+ * Deletes have persistent trailer flags plus a RAM result filter (routing can
+ * still traverse tombstoned rows until they become free). consolidate() purges dead out-edges:
+ * each dead slot is
  * spliced to the nearest live neighbor of the dead node (ranked with zero
  * extra I/O by FastScan-scanning the dead node's own row with the live row's
  * vector as query), or zeroed back into a free ghost slot (regenerating
  * update headroom) when no candidate exists.
  *
- * NOT production ready: no WAL / torn-page protection, no persistent
- * tombstones, meta sector rewritten only in finalize(). Ghost slots are
- * detected heuristically (id==0 && code==0 && factors==0) because the v1 row
- * format stores no valid-degree.
+ * Format v2 stores authoritative per-row valid_degree/flags trailers and A/B
+ * CRC-protected superblocks. It is not production ready: there is no WAL or
+ * torn-page recovery yet; the legacy ghost heuristic exists only in the one-
+ * time v1 migration scan.
  */
 
 #pragma once
@@ -73,6 +73,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -153,6 +155,46 @@ struct EdgePayload {
   float factor_vq = 0;
   bool degenerate = false;
 };
+
+/** Per-row format-v2 metadata stored in the page trailer. */
+struct QGRowTrailer {
+  uint16_t valid_degree = 0;
+  uint16_t flags = 0;
+};
+static_assert(sizeof(QGRowTrailer) == 4);
+
+constexpr uint16_t kQGRowTombstone = 1U << 0U;
+constexpr uint16_t kQGRowFree = 1U << 1U;
+
+inline size_t qg_page_trailer_offset(size_t page_size, size_t nodes_per_page, size_t row_slot) {
+  if (nodes_per_page == 0 || row_slot >= nodes_per_page ||
+      nodes_per_page * sizeof(QGRowTrailer) > page_size) {
+    throw std::out_of_range("qg_page_trailer_offset: invalid page geometry/slot");
+  }
+  return page_size - nodes_per_page * sizeof(QGRowTrailer) +
+         row_slot * sizeof(QGRowTrailer);
+}
+
+inline QGRowTrailer qg_read_page_trailer(const char *page,
+                                         size_t page_size,
+                                         size_t nodes_per_page,
+                                         size_t row_slot) {
+  QGRowTrailer trailer;
+  std::memcpy(&trailer,
+              page + qg_page_trailer_offset(page_size, nodes_per_page, row_slot),
+              sizeof(trailer));
+  return trailer;
+}
+
+inline void qg_write_page_trailer(char *page,
+                                  size_t page_size,
+                                  size_t nodes_per_page,
+                                  size_t row_slot,
+                                  QGRowTrailer trailer) {
+  std::memcpy(page + qg_page_trailer_offset(page_size, nodes_per_page, row_slot),
+              &trailer,
+              sizeof(trailer));
+}
 
 /**
  * @brief Compute the RaBitQ payload of a single edge u->v.
@@ -240,6 +282,8 @@ struct UpdateStats {
   uint64_t consolidated_rows = 0;
   uint64_t spliced_slots = 0;
   uint64_t ghosted_slots = 0;
+  uint64_t freed_slots = 0;
+  uint64_t reused_slots = 0;
   uint64_t gardened_rows = 0;
   uint64_t garden_pump_links = 0;
   uint64_t garden_us = 0;
@@ -311,6 +355,9 @@ class QGUpdater {
       : qg_(qg),
         params_(params),
         committed_(qg.num_points_),
+        allocated_points_(qg.num_points_),
+        next_append_id_(static_cast<PID>(qg.num_points_)),
+        live_count_(qg.num_points_),
         dim_(qg.dimension_),
         res_dim_(qg.residual_dimension_),
         full_dim_(qg.dimension_ + qg.residual_dimension_),
@@ -331,6 +378,13 @@ class QGUpdater {
     if (qg_.index_file_name_.empty()) {
       throw std::logic_error("QGUpdater: call load_disk_index() first");
     }
+    if (qg_.num_points_ > kPidMax || deg_ > std::numeric_limits<uint16_t>::max()) {
+      throw std::invalid_argument("QGUpdater: PID/valid-degree field overflow");
+    }
+    if (npp_ * node_len_ + npp_ * sizeof(QGRowTrailer) > page_size_) {
+      throw std::invalid_argument(
+          "QGUpdater: page has insufficient slack for format-v2 row trailers");
+    }
     // Reads stay buffered: the OS page cache serves the ~ef_insert row reads
     // per insert from RAM. Writes get their own O_DIRECT fd — buffered pwrite
     // serializes on the ext4 exclusive inode lock (~287k pwrites/s measured),
@@ -348,12 +402,25 @@ class QGUpdater {
       wfd_ = ::open(qg_.index_file_name_.c_str(), O_RDWR | O_DIRECT);
       direct_io_ = wfd_ >= 0;  // unsupported (e.g. tmpfs) -> buffered writes on fd_
     }
+    try {
+      load_or_migrate_format();
+    } catch (...) {
+      if (wfd_ >= 0) ::close(wfd_);
+      ::close(fd_);
+      wfd_ = -1;
+      fd_ = -1;
+      throw;
+    }
+    qg_.set_result_filter(&deleted_);
   }
 
   QGUpdater(const QGUpdater &) = delete;
   auto operator=(const QGUpdater &) -> QGUpdater & = delete;
 
   ~QGUpdater() {
+    if (qg_.result_filter_ == &deleted_) {
+      qg_.set_result_filter(nullptr);
+    }
     if (fd_ >= 0) {
       ::close(fd_);
     }
@@ -363,6 +430,28 @@ class QGUpdater {
   }
 
   [[nodiscard]] size_t num_points() const { return committed_.load(std::memory_order_acquire); }
+
+  [[nodiscard]] size_t allocated_points() const {
+    return allocated_points_.load(std::memory_order_acquire);
+  }
+
+  [[nodiscard]] uint64_t live_count() const { return live_count_.load(std::memory_order_acquire); }
+
+  [[nodiscard]] uint64_t free_count() const { return free_count_.load(std::memory_order_acquire); }
+
+  [[nodiscard]] PID free_list_head() const {
+    return free_list_head_.load(std::memory_order_acquire);
+  }
+
+  [[nodiscard]] uint64_t generation() const { return superblock_.generation; }
+
+  [[nodiscard]] int active_superblock_slot() const { return active_superblock_slot_; }
+
+  /** Page count represented by the currently selected/checkpointed superblock. */
+  [[nodiscard]] size_t file_pages() const {
+    const size_t n = static_cast<size_t>(superblock_.num_points);
+    return (n + npp_ - 1) / npp_;
+  }
 
   /** @brief True when writes go through the O_DIRECT fd (false = buffered fallback). */
   [[nodiscard]] bool direct_io() const { return direct_io_; }
@@ -396,6 +485,8 @@ class QGUpdater {
     s.consolidated_rows = stats_.consolidated_rows.load();
     s.spliced_slots = stats_.spliced_slots.load();
     s.ghosted_slots = stats_.ghosted_slots.load();
+    s.freed_slots = stats_.freed_slots.load();
+    s.reused_slots = stats_.reused_slots.load();
     s.gardened_rows = stats_.gardened_rows.load();
     s.garden_pump_links = stats_.garden_pump_links.load();
     s.garden_us = stats_.garden_us.load();
@@ -422,8 +513,9 @@ class QGUpdater {
       read_node_page(static_cast<PID>(ui), page.data());
       const char *row = page.data() + node_offset_in_page(static_cast<PID>(ui));
       const auto *ids = reinterpret_cast<const PID *>(row + neighbor_off_bytes());
-      for (size_t j = 0; j < deg_; ++j) {
-        if (!is_ghost_slot(row, j) && ids[j] < indegree_.size()) {
+      const size_t degree = row_trailer(page.data(), static_cast<PID>(ui)).valid_degree;
+      for (size_t j = 0; j < degree; ++j) {
+        if (ids[j] < indegree_.size()) {
           indegree_[ids[j]].fetch_add(1, std::memory_order_relaxed);
         }
       }
@@ -435,18 +527,47 @@ class QGUpdater {
    * NOT safe concurrently with inserts/consolidate (phase separation).
    */
   void tombstone(PID id) {
-    if (!deleted_.insert(id).second || !params_.maintain_indegree || id >= num_points()) return;
-    AlignedBuf page(page_size_);
-    read_node_page(id, page.data());
-    add_row_indegree(page.data() + node_offset_in_page(id), -1);
+    if (id >= allocated_points()) {
+      throw std::out_of_range("QGUpdater::tombstone id outside allocated range");
+    }
+    if (!deleted_.insert(id).second) return;
+    repair_routing_roots(id);
+    const std::lock_guard<std::mutex> guard(page_lock(id));
+    modify_node_page(id, [&](char *page) {
+      QGRowTrailer trailer = row_trailer(page, id);
+      add_row_indegree(page + node_offset_in_page(id), trailer.valid_degree, -1);
+      trailer.flags |= kQGRowTombstone;
+      set_row_trailer(page, id, trailer);
+      return true;
+    });
+    live_count_.fetch_sub(1, std::memory_order_acq_rel);
   }
 
-  /** @brief Serial insert; assigns the next dense id and publishes it. */
+  /** @brief Serial allocate/reuse, insert, and publish. */
   PID insert(const float *vec) {
-    const PID id = static_cast<PID>(committed_.load(std::memory_order_acquire));
-    insert_with_id(vec, id);
+    const PID id = allocate_and_insert(vec);
     flush(1);
-    publish(static_cast<size_t>(id) + 1);
+    publish(allocated_points());
+    return id;
+  }
+
+  /** Allocate a reclaimed PID when available, otherwise append a new PID. */
+  PID allocate_and_insert(const float *vec) {
+    PID id = pop_free_slot();
+    const bool reused = id != kPidMax;
+    if (!reused) {
+      id = next_append_id_.fetch_add(1, std::memory_order_acq_rel);
+      if (id == kPidMax) {
+        throw std::overflow_error("QGUpdater: PID space exhausted");
+      }
+      note_allocated(static_cast<size_t>(id) + 1);
+    }
+    insert_with_id_impl(vec, id, reused);
+    if (reused) {
+      const std::lock_guard<std::mutex> guard(pending_reused_mutex_);
+      pending_reused_.push_back(id);
+      stats_.reused_slots++;
+    }
     return id;
   }
 
@@ -455,8 +576,34 @@ class QGUpdater {
    * and backlinks for ids below `new_committed` must already be written.
    */
   void publish(size_t new_committed) {
-    assert(new_committed >= committed_.load(std::memory_order_relaxed));
+    const size_t old_committed = committed_.load(std::memory_order_acquire);
+    if (new_committed < old_committed || new_committed > allocated_points()) {
+      throw std::invalid_argument("QGUpdater::publish invalid committed watermark");
+    }
+
+    std::vector<PID> reused;
+    {
+      const std::lock_guard<std::mutex> guard(pending_reused_mutex_);
+      reused.swap(pending_reused_);
+    }
+    // A reused id is below the existing watermark.  Its trailer is made live
+    // first, then the result-filter tombstone is erased; that erase is the
+    // reused-row visibility point.  The ordinary committed watermark only
+    // gates newly appended ids.
+    for (PID id : reused) {
+      const std::lock_guard<std::mutex> guard(page_lock(id));
+      modify_node_page(id, [&](char *page) {
+        QGRowTrailer trailer = row_trailer(page, id);
+        trailer.flags &= static_cast<uint16_t>(~(kQGRowTombstone | kQGRowFree));
+        set_row_trailer(page, id, trailer);
+        return true;
+      });
+      deleted_.erase(id);
+    }
+    live_count_.fetch_add(reused.size() + (new_committed - old_committed),
+                          std::memory_order_acq_rel);
     committed_.store(new_committed, std::memory_order_release);
+    qg_.num_points_ = new_committed;
   }
 
   /**
@@ -480,6 +627,12 @@ class QGUpdater {
         std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count());
   }
 
+  /** Force dirty update-cache pages to the index file without advancing metadata. */
+  void writeback(size_t num_threads) {
+    drain_staged_edges(num_threads);
+    flush_dirty(num_threads);
+  }
+
   /**
    * @brief Multi-writer insert with a caller-assigned dense id (batch phase).
    *
@@ -488,10 +641,19 @@ class QGUpdater {
    * publish(base + batch_size) once after the batch barrier. Searches inside
    * the batch see the pre-batch snapshot only (mini-batch semantics: batch
    * members cannot link to each other); every new row and all its backlinks
-   * are on disk before the watermark moves, so a published id is always
-   * reachable and fully written.
+   * are fully materialized in the update cache/file before the watermark
+   * moves.
    */
   void insert_with_id(const float *vec, PID id) {
+    note_allocated(static_cast<size_t>(id) + 1);
+    insert_with_id_impl(vec, id, false);
+  }
+
+ private:
+  void insert_with_id_impl(const float *vec, PID id, bool reused) {
+    if (page_index(id) >= page_versions_.size()) {
+      throw std::runtime_error("QGUpdater: id exceeds max_points capacity");
+    }
     // --- PCA transform (same path queries take) ---
     const float *tvec = vec;
     std::vector<float> pca_buf;
@@ -520,7 +682,7 @@ class QGUpdater {
     }
     std::vector<char> row(node_len_);
     assemble_row(row.data(), tvec, nb_vecs, nb_ids);
-    append_node(id, row.data());
+    append_node(id, row.data(), nb_ids.size(), reused);
 
     // --- reverse edges ---
     if (params_.backlink_mode != UpdateParams::Backlink::kNone && !sel.empty()) {
@@ -561,6 +723,8 @@ class QGUpdater {
     stats_.inserts++;
   }
 
+ public:
+
   /**
    * @brief Purge dead out-edges from all live rows (FreshDiskANN-style
    * consolidation instantiated on the LASER layout).
@@ -568,11 +732,12 @@ class QGUpdater {
    * For each live row u with tombstoned neighbors: rank the dead neighbor d's
    * own adjacency for u with a single FastScan pass over d's row (codes are
    * centered at d, but the estimator targets ||u - n_i|| directly, no extra
-   * I/O), splice the nearest live candidate into the slot, or zero the slot
-   * back into free headroom when no candidate exists. One page write per
-   * dirty row. Must not run concurrently with inserts.
+   * I/O), splice the nearest live candidate into the slot, or remove the slot
+   * from the packed valid prefix when no candidate exists. When
+   * `reclaim_slots` is true, the purged tombstoned rows then enter the LIFO
+   * free-list. Must not run concurrently with inserts.
    */
-  void consolidate(size_t num_threads, size_t r_target = 0) {
+  void consolidate(size_t num_threads, size_t r_target = 0, bool reclaim_slots = true) {
     const size_t n = committed_.load(std::memory_order_acquire);
     const size_t target = r_target == 0 ? deg_ : std::min(r_target, deg_);
     const int nt = static_cast<int>(std::max<size_t>(1, num_threads));
@@ -586,6 +751,18 @@ class QGUpdater {
     }
     drain_staged_edges(num_threads);
     flush_dirty(num_threads);
+    if (reclaim_slots) {
+      // Only after every live row has purged dead out-edges and that purge has
+      // reached the file may a tombstoned row become a reusable free slot.
+      std::vector<PID> eligible;
+      eligible.reserve(deleted_.size());
+      for (PID id : deleted_) {
+        if (id < n) eligible.push_back(id);
+      }
+      std::sort(eligible.begin(), eligible.end());
+      for (PID id : eligible) push_free_slot(id);
+      flush_dirty(num_threads);
+    }
   }
 
   /** Refresh a deterministic budget of live rows; phase-separated from updates. */
@@ -625,33 +802,42 @@ class QGUpdater {
             .count());
   }
 
-  /**
-   * @brief Rewrite the meta sector (num_points, file size) and fsync, so a
-   * fresh QuantizedGraph(num_points(), ...).load_disk_index() accepts the file.
-   */
-  void finalize() {
+  /** Persist dirty pages and atomically advance the alternate A/B superblock. */
+  void checkpoint() {
+    const std::lock_guard<std::mutex> checkpoint_guard(checkpoint_mutex_);
     drain_staged_edges(1);
     flush_dirty(1);
-    const size_t n = committed_.load(std::memory_order_acquire);
-    std::vector<uint64_t> metas(kSectorLen / sizeof(uint64_t), 0);
-    read_at(0, reinterpret_cast<char *>(metas.data()), kSectorLen);
-    metas[0] = n;
+    const size_t n = allocated_points_.load(std::memory_order_acquire);
     const size_t page_num = (n + npp_ - 1) / npp_;
-    metas[8] = kSectorLen + page_num * page_size_;
-    write_at(0, reinterpret_cast<const char *>(metas.data()), kSectorLen);
-    // Pages are written on append, but a trailing partially-filled page may
-    // leave the file shorter than meta[8]; extend explicitly.
-    if (::ftruncate(fd_, static_cast<off_t>(metas[8])) != 0) {
+    const uint64_t file_size = kSectorLen + page_num * page_size_;
+    if (::ftruncate(fd_, static_cast<off_t>(file_size)) != 0) {
       throw std::runtime_error("QGUpdater: ftruncate failed");
     }
-    if (::fsync(fd_) != 0) {
-      throw std::runtime_error("QGUpdater: fsync failed");
-    }
-    qg_.num_points_ = n;
+    QGSuperblockV2 next = superblock_;
+    next.magic = kQGSuperblockMagic;
+    next.format_version = kQGFormatVersion;
+    next.generation = superblock_.generation + 1;
+    next.num_points = n;
+    next.live_count = live_count_.load(std::memory_order_acquire);
+    next.free_list_head = free_list_head_.load(std::memory_order_acquire);
+    next.free_count = free_count_.load(std::memory_order_acquire);
+    next.entry_point = qg_.entry_point_;
+    next.file_size = file_size;
+    next.checksum = qg_superblock_checksum(next);
+    const int next_slot = active_superblock_slot_ == 0 ? 1 : 0;
+    write_superblock(next_slot, next);
+    superblock_ = next;
+    active_superblock_slot_ = next_slot;
+    qg_.num_points_ = committed_.load(std::memory_order_acquire);
   }
 
-  /** @brief Ghost-slot heuristic: zero id, zero factors, zero code bits. */
-  bool is_ghost_slot(const char *row, size_t slot) const {
+  void finalize() { checkpoint(); }
+
+  /**
+   * Migration-only v1 ghost-slot heuristic.  Format-v2 update paths never use
+   * this predicate; they read valid_degree from the authoritative trailer.
+   */
+  bool is_v1_ghost_slot(const char *row, size_t slot) const {
     const auto *ids = reinterpret_cast<const PID *>(row + neighbor_off_bytes());
     if (ids[slot] != 0) {
       return false;
@@ -678,6 +864,17 @@ class QGUpdater {
   [[nodiscard]] size_t code_off_bytes() const { return qg_.code_offset_ * sizeof(float); }
   [[nodiscard]] size_t factor_off_bytes() const { return qg_.factor_offset_ * sizeof(float); }
   [[nodiscard]] size_t neighbor_off_bytes() const { return qg_.neighbor_offset_ * sizeof(float); }
+
+  [[nodiscard]] QGRowTrailer trailer(PID id) {
+    if (id >= allocated_points()) throw std::out_of_range("QGUpdater::trailer id");
+    AlignedBuf page(page_size_);
+    read_node_page(id, page.data());
+    return row_trailer(page.data(), id);
+  }
+
+  [[nodiscard]] size_t trailer_offset_in_page(PID id) const {
+    return qg_page_trailer_offset(page_size_, npp_, id % npp_);
+  }
 
   /** @brief Assemble a full node row exactly like the static builder. */
   void assemble_row(char *row,
@@ -757,6 +954,8 @@ class QGUpdater {
     std::atomic<uint64_t> consolidated_rows{0};
     std::atomic<uint64_t> spliced_slots{0};
     std::atomic<uint64_t> ghosted_slots{0};
+    std::atomic<uint64_t> freed_slots{0};
+    std::atomic<uint64_t> reused_slots{0};
     std::atomic<uint64_t> gardened_rows{0};
     std::atomic<uint64_t> garden_pump_links{0};
     std::atomic<uint64_t> garden_us{0};
@@ -789,11 +988,354 @@ class QGUpdater {
     char *p_ = nullptr;
   };
 
+  [[nodiscard]] QGRowTrailer row_trailer(const char *page, PID id) const {
+    return qg_read_page_trailer(page, page_size_, npp_, id % npp_);
+  }
+
+  void set_row_trailer(char *page, PID id, QGRowTrailer trailer) const {
+    if (trailer.valid_degree > deg_) {
+      throw std::runtime_error("QGUpdater: corrupt valid_degree");
+    }
+    qg_write_page_trailer(page, page_size_, npp_, id % npp_, trailer);
+  }
+
+  void note_allocated(size_t end) {
+    if (end > static_cast<size_t>(kPidMax)) {
+      throw std::overflow_error("QGUpdater: PID space exhausted");
+    }
+    size_t current = allocated_points_.load(std::memory_order_acquire);
+    while (current < end &&
+           !allocated_points_.compare_exchange_weak(
+               current, end, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    }
+    PID next = next_append_id_.load(std::memory_order_acquire);
+    const PID desired = static_cast<PID>(end);
+    while (next < desired &&
+           !next_append_id_.compare_exchange_weak(
+               next, desired, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    }
+  }
+
+  void write_superblock(int slot, const QGSuperblockV2 &sb) {
+    if (slot < 0 || slot >= static_cast<int>(kQGSuperblockCopies) ||
+        !qg_superblock_valid(sb)) {
+      throw std::invalid_argument("QGUpdater::write_superblock invalid slot/block");
+    }
+    const off_t off = static_cast<off_t>(slot * kQGSuperblockSize);
+    ssize_t written;
+    do {
+      written = ::pwrite(fd_, &sb, sizeof(sb), off);
+    } while (written < 0 && errno == EINTR);
+    if (written != static_cast<ssize_t>(sizeof(sb))) {
+      throw std::runtime_error("QGUpdater: superblock pwrite failed/short errno=" +
+                               std::to_string(errno));
+    }
+    if (::fsync(fd_) != 0) {
+      throw std::runtime_error("QGUpdater: superblock fsync failed");
+    }
+  }
+
+  size_t compact_v1_row(char *row) {
+    if (deg_ % kBatchSize != 0) {
+      throw std::runtime_error("QGUpdater: degree must be a multiple of FastScan batch size");
+    }
+    std::vector<size_t> live_slots;
+    live_slots.reserve(deg_);
+    for (size_t slot = 0; slot < deg_; ++slot) {
+      if (!is_v1_ghost_slot(row, slot)) live_slots.push_back(slot);
+    }
+
+    const size_t words = pd_ / 64;
+    std::vector<uint64_t> old_bins(deg_ * words);
+    std::vector<uint64_t> block_bins(kBatchSize * words);
+    const auto *code = reinterpret_cast<const uint8_t *>(row + code_off_bytes());
+    for (size_t block = 0; block < deg_ / kBatchSize; ++block) {
+      unpack_codes_block(pd_, code + block * pd_ * 4, block_bins.data());
+      std::copy(block_bins.begin(),
+                block_bins.end(),
+                old_bins.begin() + block * kBatchSize * words);
+    }
+    std::vector<uint64_t> compact_bins(deg_ * words, 0);
+    const auto *old_fac = reinterpret_cast<const float *>(row + factor_off_bytes());
+    const auto *old_ids = reinterpret_cast<const PID *>(row + neighbor_off_bytes());
+    std::vector<float> compact_fac(3 * deg_, 0.0F);
+    std::vector<PID> compact_ids(deg_, 0);
+    for (size_t dst = 0; dst < live_slots.size(); ++dst) {
+      const size_t src = live_slots[dst];
+      std::copy(old_bins.begin() + src * words,
+                old_bins.begin() + (src + 1) * words,
+                compact_bins.begin() + dst * words);
+      compact_fac[dst] = old_fac[src];
+      compact_fac[deg_ + dst] = old_fac[deg_ + src];
+      compact_fac[2 * deg_ + dst] = old_fac[2 * deg_ + src];
+      compact_ids[dst] = old_ids[src];
+    }
+    auto *new_code = reinterpret_cast<uint8_t *>(row + code_off_bytes());
+    for (size_t block = 0; block < deg_ / kBatchSize; ++block) {
+      pack_codes(pd_,
+                 compact_bins.data() + block * kBatchSize * words,
+                 kBatchSize,
+                 new_code + block * pd_ * 4);
+    }
+    std::memcpy(row + factor_off_bytes(), compact_fac.data(), compact_fac.size() * sizeof(float));
+    std::memcpy(row + neighbor_off_bytes(), compact_ids.data(), compact_ids.size() * sizeof(PID));
+    return live_slots.size();
+  }
+
+  void migrate_v1(const char *header) {
+    std::array<uint64_t, kSectorLen / sizeof(uint64_t)> metas{};
+    std::memcpy(metas.data(), header, kSectorLen);
+    const size_t n = qg_.num_points_;
+    const size_t pages = (n + npp_ - 1) / npp_;
+    std::clog << "[QGUpdater] LASER v1->v2 migration: " << n << " rows, " << pages
+              << " pages\n";
+    AlignedBuf page(page_size_);
+    const size_t progress_step = std::max<size_t>(1, pages / 10);
+    for (size_t pi = 0; pi < pages; ++pi) {
+      read_at(kSectorLen + pi * page_size_, page.data(), page_size_);
+      for (size_t slot = 0; slot < npp_; ++slot) {
+        const size_t id = pi * npp_ + slot;
+        QGRowTrailer trailer{};
+        if (id < n) {
+          char *row = page.data() + slot * node_len_;
+          trailer.valid_degree = static_cast<uint16_t>(compact_v1_row(row));
+        }
+        qg_write_page_trailer(page.data(), page_size_, npp_, slot, trailer);
+      }
+      write_at(kSectorLen + pi * page_size_, page.data(), page_size_);
+      if ((pi + 1) % progress_step == 0 || pi + 1 == pages) {
+        std::clog << "[QGUpdater] migration " << (pi + 1) << "/" << pages << " pages\n";
+      }
+    }
+
+    QGSuperblockV2 sb;
+    sb.magic = kQGSuperblockMagic;
+    sb.format_version = kQGFormatVersion;
+    sb.generation = 1;
+    sb.num_points = n;
+    sb.live_count = n;
+    sb.free_list_head = kPidMax;
+    sb.free_count = 0;
+    sb.entry_point = metas[2];
+    sb.dimension = dim_;
+    sb.node_len = node_len_;
+    sb.node_per_page = npp_;
+    sb.page_size = page_size_;
+    sb.file_size = kSectorLen + pages * page_size_;
+    sb.checksum = qg_superblock_checksum(sb);
+    write_superblock(0, sb);
+
+    superblock_ = sb;
+    active_superblock_slot_ = 0;
+    committed_.store(n, std::memory_order_release);
+    allocated_points_.store(n, std::memory_order_release);
+    next_append_id_.store(static_cast<PID>(n), std::memory_order_release);
+    live_count_.store(n, std::memory_order_release);
+    free_list_head_.store(kPidMax, std::memory_order_release);
+    free_count_.store(0, std::memory_order_release);
+    std::clog << "[QGUpdater] migration complete: generation=1\n";
+  }
+
+  void rebuild_free_chain(const std::vector<PID> &free_ids) {
+    PID head = kPidMax;
+    for (PID id : free_ids) {
+      const std::lock_guard<std::mutex> guard(page_lock(id));
+      const PID next = head;
+      modify_node_page(id, [&](char *page) {
+        char *row = page + node_offset_in_page(id);
+        const uint64_t next64 = next;
+        std::memcpy(row, &next64, sizeof(next64));
+        QGRowTrailer trailer = row_trailer(page, id);
+        trailer.valid_degree = 0;
+        trailer.flags |= kQGRowTombstone | kQGRowFree;
+        set_row_trailer(page, id, trailer);
+        return true;
+      });
+      head = id;
+    }
+    free_list_head_.store(head, std::memory_order_release);
+    free_count_.store(free_ids.size(), std::memory_order_release);
+  }
+
+  void load_v2_state(const QGSuperblockV2 &sb) {
+    const size_t n = static_cast<size_t>(sb.num_points);
+    if (n > kPidMax || sb.node_len != node_len_ || sb.node_per_page != npp_ ||
+        sb.page_size != page_size_ || sb.dimension != dim_) {
+      throw std::runtime_error("QGUpdater: invalid v2 geometry/count");
+    }
+    committed_.store(n, std::memory_order_release);
+    allocated_points_.store(n, std::memory_order_release);
+    next_append_id_.store(static_cast<PID>(n), std::memory_order_release);
+    qg_.num_points_ = n;
+
+    deleted_.clear();
+    std::vector<PID> free_ids;
+    const size_t pages = (n + npp_ - 1) / npp_;
+    AlignedBuf page(page_size_);
+    for (size_t pi = 0; pi < pages; ++pi) {
+      read_at(kSectorLen + pi * page_size_, page.data(), page_size_);
+      for (size_t slot = 0; slot < npp_; ++slot) {
+        const size_t raw_id = pi * npp_ + slot;
+        if (raw_id >= n) break;
+        const PID id = static_cast<PID>(raw_id);
+        const QGRowTrailer trailer = qg_read_page_trailer(page.data(), page_size_, npp_, slot);
+        if (trailer.valid_degree > deg_) {
+          throw std::runtime_error("QGUpdater: v2 trailer valid_degree exceeds degree bound");
+        }
+        if ((trailer.flags & kQGRowFree) != 0) free_ids.push_back(id);
+        if ((trailer.flags & (kQGRowTombstone | kQGRowFree)) != 0) deleted_.insert(id);
+      }
+    }
+    live_count_.store(n - deleted_.size(), std::memory_order_release);
+
+    bool chain_ok = sb.free_count == free_ids.size();
+    std::vector<uint8_t> seen(n, 0);
+    PID cur = sb.free_list_head;
+    size_t chain_len = 0;
+    while (chain_ok && cur != kPidMax) {
+      if (cur >= n || seen[cur] != 0 || chain_len >= free_ids.size()) {
+        chain_ok = false;
+        break;
+      }
+      seen[cur] = 1;
+      read_at(page_offset(cur), page.data(), page_size_);
+      const QGRowTrailer trailer = row_trailer(page.data(), cur);
+      if ((trailer.flags & kQGRowFree) == 0) {
+        chain_ok = false;
+        break;
+      }
+      uint64_t next64 = kPidMax;
+      std::memcpy(&next64, page.data() + node_offset_in_page(cur), sizeof(next64));
+      if (next64 != kPidMax && next64 >= n) {
+        chain_ok = false;
+        break;
+      }
+      cur = static_cast<PID>(next64);
+      ++chain_len;
+    }
+    chain_ok = chain_ok && chain_len == free_ids.size() && cur == kPidMax;
+    if (chain_ok) {
+      for (PID id : free_ids) chain_ok = chain_ok && seen[id] != 0;
+    }
+    if (chain_ok) {
+      free_list_head_.store(sb.free_list_head, std::memory_order_release);
+      free_count_.store(sb.free_count, std::memory_order_release);
+    } else {
+      std::clog << "[QGUpdater] free-list chain invalid; rebuilding from trailer flags\n";
+      rebuild_free_chain(free_ids);
+      flush_dirty(1);
+    }
+    if (sb.live_count != live_count_.load(std::memory_order_acquire)) {
+      std::clog << "[QGUpdater] superblock live_count mismatch; trailer scan is authoritative\n";
+    }
+  }
+
+  void load_or_migrate_format() {
+    std::array<char, kSectorLen> header{};
+    read_at(0, header.data(), header.size());
+    QGSuperblockV2 sb;
+    const int slot = select_qg_superblock(header.data(), sb);
+    if (slot >= 0) {
+      superblock_ = sb;
+      active_superblock_slot_ = slot;
+      load_v2_state(sb);
+      repair_routing_roots(kPidMax);
+      return;
+    }
+    if (qg_header_has_v2_magic(header.data())) {
+      throw std::runtime_error("QGUpdater: both v2 superblocks have invalid checksums");
+    }
+    migrate_v1(header.data());
+  }
+
+  void repair_routing_roots(PID newly_deleted) {
+    // A reused routing seed is especially dangerous: while dark it cannot be
+    // selected as a live insertion neighbor, so its freshly assembled row can
+    // be isolated.  Remove deleted medoid seeds and relocate the global entry
+    // point before the row becomes free/reusable.
+    for (size_t i = qg_.medoids_.size(); i > 0; --i) {
+      const size_t idx = i - 1;
+      const PID medoid = qg_.medoids_[idx];
+      if (medoid != newly_deleted && deleted_.count(medoid) == 0) continue;
+      qg_.medoids_.erase(qg_.medoids_.begin() + static_cast<int64_t>(idx));
+      const auto first = qg_.medoids_vector_.begin() +
+                         static_cast<int64_t>(idx * full_dim_);
+      qg_.medoids_vector_.erase(first, first + static_cast<int64_t>(full_dim_));
+    }
+    if (qg_.entry_point_ != newly_deleted && deleted_.count(qg_.entry_point_) == 0) return;
+    const size_t n = committed_.load(std::memory_order_acquire);
+    if (n == 0) return;
+    const size_t start = (static_cast<size_t>(qg_.entry_point_) + 1) % n;
+    for (size_t offset = 0; offset < n; ++offset) {
+      const PID candidate = static_cast<PID>((start + offset) % n);
+      if (deleted_.count(candidate) == 0) {
+        qg_.entry_point_ = candidate;
+        return;
+      }
+    }
+  }
+
+  void push_free_slot(PID id) {
+    bool pushed = false;
+    const std::lock_guard<std::mutex> guard(page_lock(id));
+    modify_node_page(id, [&](char *page) {
+      QGRowTrailer trailer = row_trailer(page, id);
+      if ((trailer.flags & kQGRowTombstone) == 0 || (trailer.flags & kQGRowFree) != 0) {
+        return false;
+      }
+      char *row = page + node_offset_in_page(id);
+      PID expected = free_list_head_.load(std::memory_order_acquire);
+      for (;;) {
+        const uint64_t next64 = expected;
+        std::memcpy(row, &next64, sizeof(next64));
+        if (free_list_head_.compare_exchange_weak(
+                expected, id, std::memory_order_acq_rel, std::memory_order_acquire)) {
+          break;
+        }
+      }
+      trailer.valid_degree = 0;
+      trailer.flags |= kQGRowFree;
+      set_row_trailer(page, id, trailer);
+      pushed = true;
+      return true;
+    });
+    if (pushed) {
+      free_count_.fetch_add(1, std::memory_order_acq_rel);
+      stats_.freed_slots++;
+    }
+  }
+
+  PID pop_free_slot() {
+    for (;;) {
+      PID head = free_list_head_.load(std::memory_order_acquire);
+      if (head == kPidMax) return kPidMax;
+      const std::lock_guard<std::mutex> guard(page_lock(head));
+      if (head != free_list_head_.load(std::memory_order_acquire)) continue;
+      AlignedBuf page(page_size_);
+      read_rmw_page(head, page.data());
+      const QGRowTrailer trailer = row_trailer(page.data(), head);
+      if ((trailer.flags & (kQGRowTombstone | kQGRowFree)) !=
+          (kQGRowTombstone | kQGRowFree)) {
+        throw std::runtime_error("QGUpdater: free-list head lacks free/tombstone flags");
+      }
+      uint64_t next64 = kPidMax;
+      std::memcpy(&next64, page.data() + node_offset_in_page(head), sizeof(next64));
+      if (next64 != kPidMax && next64 >= allocated_points()) {
+        throw std::runtime_error("QGUpdater: corrupt next_free PID");
+      }
+      PID expected = head;
+      const PID next = static_cast<PID>(next64);
+      if (!free_list_head_.compare_exchange_strong(
+              expected, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        continue;
+      }
+      free_count_.fetch_sub(1, std::memory_order_acq_rel);
+      return head;
+    }
+  }
+
   /**
-   * @brief Write-only, sharded dirty-page cache.
-   *
-   * Entries live for one batch. Search deliberately never consults this
-   * cache: the on-disk image is the committed snapshot until flush/publish.
+   * @brief Sharded resident dirty-page cache used by update searches and RMWs.
    */
   class PageWriteCache {
    public:
@@ -1258,15 +1800,9 @@ class QGUpdater {
                                   reinterpret_cast<const uint8_t *>(row + code_off_bytes()),
                                   reinterpret_cast<const float *>(row + factor_off_bytes()));
       const auto *nbs = reinterpret_cast<const PID *>(row + neighbor_off_bytes());
-      const auto *fac = reinterpret_cast<const float *>(row + factor_off_bytes());
-      for (size_t j = 0; j < deg_; ++j) {
+      const size_t degree = row_trailer(page.data(), cur).valid_degree;
+      for (size_t j = 0; j < degree; ++j) {
         const PID nb = nbs[j];
-        // ghost-slot fast path: zero id + zero factors (full code check not
-        // needed on the search path; a real zero-distance edge to node 0 would
-        // just re-enqueue an already-visited node)
-        if (nb == 0 && fac[j] == 0 && fac[deg_ + j] == 0 && fac[2 * deg_ + j] == 0) {
-          continue;
-        }
         if (nb >= snapshot || visited.count(nb) != 0 || sp.is_full(appro[j])) {
           continue;
         }
@@ -1317,13 +1853,24 @@ class QGUpdater {
     }
   }
 
-  void append_node(PID id, const char *row) {
+  void append_node(PID id, const char *row, size_t degree, bool reused) {
     const std::lock_guard<std::mutex> guard(page_lock(id));
     modify_node_page(id, [&](char *page) {
       // A newly-created one-row page has deterministic zero tail padding;
       // read_at already zero-fills an EOF cache miss.
+      QGRowTrailer trailer = row_trailer(page, id);
+      if (reused &&
+          (trailer.flags & (kQGRowTombstone | kQGRowFree)) !=
+              (kQGRowTombstone | kQGRowFree)) {
+        throw std::runtime_error("QGUpdater: reused row lost tombstone/free state");
+      }
       std::memcpy(page + node_offset_in_page(id), row, node_len_);
-      add_row_indegree(row, 1);
+      trailer.valid_degree = static_cast<uint16_t>(degree);
+      trailer.flags = reused ? static_cast<uint16_t>(trailer.flags |
+                                                      kQGRowTombstone | kQGRowFree)
+                             : 0;
+      set_row_trailer(page, id, trailer);
+      add_row_indegree(row, degree, 1);
       return true;
     });
   }
@@ -1348,6 +1895,11 @@ class QGUpdater {
       const auto *row_f = reinterpret_cast<const float *>(row);
       auto *ids = reinterpret_cast<PID *>(row + neighbor_off_bytes());
       auto *fac = reinterpret_cast<float *>(row + factor_off_bytes());
+      QGRowTrailer trailer = row_trailer(page, v.id);
+      size_t degree = trailer.valid_degree;
+      for (size_t j = 0; j < degree; ++j) {
+        if (ids[j] == x_id) return true;
+      }
 
       // residual-consistent comparison value for the new edge (v,x)
       float x_res_sqr = 0;
@@ -1365,8 +1917,8 @@ class QGUpdater {
         const float d_vx =
             space::l2_sqr(row_f, x_vec, dim_) +
             (res_dim_ > 0 ? space::l2_sqr(row_f + dim_, x_vec + dim_, res_dim_) : 0.0F);
-        for (size_t j = 0; j < deg_ && checked < params_.alpha_check_max; ++j) {
-          if (ids[j] == x_id || is_free_fast(fac, ids, j)) {
+        for (size_t j = 0; j < degree && checked < params_.alpha_check_max; ++j) {
+          if (ids[j] == x_id) {
             continue;
           }
           auto it = captured.find(ids[j]);
@@ -1385,20 +1937,14 @@ class QGUpdater {
         }
       }
 
-      // choose a slot: first ghost slot, else evict farthest by FastScan estimate
-      size_t slot = deg_;
-      for (size_t j = 0; j < deg_; ++j) {
-        if (is_free_fast(fac, ids, j) && is_ghost_slot(row, j)) {
-          slot = j;
-          break;
-        }
-      }
+      // valid_degree owns a packed prefix: append at its tail, or evict when full.
+      size_t slot = degree;
       bool evicted = false;
       bool tel_pending = false;
       bool tel_agree = false;
       size_t tel_rank = 0;
       double tel_relerr = 0;
-      if (slot == deg_) {
+      if (degree == deg_) {
         // Reused per-thread query object: constructing a QGQuery here means an
         // aligned lut_ allocation per evict decision (millions per drain).
         thread_local std::unique_ptr<QGQuery> vq_holder;
@@ -1423,10 +1969,7 @@ class QGUpdater {
                                     fac);
         float worst = -1;
         size_t estimated_slot = deg_;
-        for (size_t j = 0; j < deg_; ++j) {
-          if (ids[j] == x_id) {
-            return true;  // already linked (shouldn't happen for a fresh id)
-          }
+        for (size_t j = 0; j < degree; ++j) {
           if (appro[j] > worst) {
             worst = appro[j];
             estimated_slot = j;
@@ -1450,7 +1993,7 @@ class QGUpdater {
         if (exact_mode || sample) {
           exact.resize(deg_);
           AlignedBuf nb_page(page_size_);
-          for (size_t j = 0; j < deg_; ++j) {
+          for (size_t j = 0; j < degree; ++j) {
             read_rmw_page(ids[j], nb_page.data());
             stats_.patch_page_reads++;
             const auto *nb_f = reinterpret_cast<const float *>(
@@ -1488,7 +2031,7 @@ class QGUpdater {
           tel_pending = true;
           tel_agree = estimated_slot == exact_slot;
           size_t rank = 0;
-          for (size_t j = 0; j < deg_; ++j) {
+          for (size_t j = 0; j < degree; ++j) {
             if (exact[j] > exact[estimated_slot]) ++rank;
           }
           tel_rank = std::min<size_t>(rank, 3);
@@ -1499,7 +2042,7 @@ class QGUpdater {
         }
       }
 
-      if (!patch_slot(row, slot, x_id, x_vec, x_res_sqr)) {
+      if (!patch_slot(row, slot, x_id, x_vec, x_res_sqr, evicted)) {
         stats_.degenerate_skips++;
         return false;
       }
@@ -1513,6 +2056,8 @@ class QGUpdater {
               static_cast<uint64_t>(std::min(tel_relerr, 1e9) * 1e9));
         }
       } else {
+        trailer.valid_degree = static_cast<uint16_t>(degree + 1);
+        set_row_trailer(page, v.id, trailer);
         stats_.free_slot_fills++;
       }
       return true;
@@ -1530,6 +2075,8 @@ class QGUpdater {
       char *row = page + node_offset_in_page(v.id);
       const auto *row_f = reinterpret_cast<const float *>(row);
       auto *ids = reinterpret_cast<PID *>(row + neighbor_off_bytes());
+      QGRowTrailer trailer = row_trailer(page, v.id);
+      const size_t old_degree = trailer.valid_degree;
 
       const size_t snapshot = committed_.load(std::memory_order_acquire);
 
@@ -1542,10 +2089,9 @@ class QGUpdater {
       std::vector<Cand> cands;
       cands.reserve(deg_ + 1);
       AlignedBuf nb_page(page_size_);
-      for (size_t j = 0; j < deg_; ++j) {
+      for (size_t j = 0; j < old_degree; ++j) {
         const PID nb = ids[j];
-        if ((nb >= snapshot && nb != x_id) || is_ghost_slot(row, j) || nb == v.id ||
-            deleted_.count(nb) != 0) {
+        if ((nb >= snapshot && nb != x_id) || nb == v.id || deleted_.count(nb) != 0) {
           continue;
         }
         bool dup = false;
@@ -1609,9 +2155,11 @@ class QGUpdater {
         nb_ids.push_back(cands[s].id);
         x_survived = x_survived || (cands[s].id == x_id);
       }
-      add_row_indegree(row, -1);
+      add_row_indegree(row, old_degree, -1);
       assemble_row(row, v_vec.data(), nb_vecs, nb_ids);
-      add_row_indegree(row, 1);
+      trailer.valid_degree = static_cast<uint16_t>(nb_ids.size());
+      set_row_trailer(page, v.id, trailer);
+      add_row_indegree(row, nb_ids.size(), 1);
       survived = x_survived;
       return true;
     });
@@ -1626,9 +2174,10 @@ class QGUpdater {
     const auto *u_raw = reinterpret_cast<const float *>(old_row);
     std::vector<float> u_vec(u_raw, u_raw + full_dim_);
     const auto *old_ids = reinterpret_cast<const PID *>(old_row + neighbor_off_bytes());
+    const size_t old_degree = row_trailer(old_page.data(), u).valid_degree;
     std::unordered_set<PID> old_set;
-    for (size_t j = 0; j < deg_; ++j) {
-      if (!is_ghost_slot(old_row, j) && old_ids[j] != u && deleted_.count(old_ids[j]) == 0) {
+    for (size_t j = 0; j < old_degree; ++j) {
+      if (old_ids[j] != u && deleted_.count(old_ids[j]) == 0) {
         old_set.insert(old_ids[j]);
       }
     }
@@ -1687,9 +2236,12 @@ class QGUpdater {
       const std::lock_guard<std::mutex> guard(page_lock(u));
       modify_node_page(u, [&](char *page) {
         char *row = page + node_offset_in_page(u);
-        add_row_indegree(row, -1);
+        QGRowTrailer trailer = row_trailer(page, u);
+        add_row_indegree(row, trailer.valid_degree, -1);
         assemble_row(row, u_vec.data(), nb_vecs, nb_ids);
-        add_row_indegree(row, 1);
+        trailer.valid_degree = static_cast<uint16_t>(nb_ids.size());
+        set_row_trailer(page, u, trailer);
+        add_row_indegree(row, nb_ids.size(), 1);
         return true;
       });
     }
@@ -1715,23 +2267,21 @@ class QGUpdater {
       char *row = page + node_offset_in_page(u);
       const auto *row_f = reinterpret_cast<const float *>(row);
       auto *ids = reinterpret_cast<PID *>(row + neighbor_off_bytes());
+      QGRowTrailer trailer = row_trailer(page, u);
+      size_t degree = trailer.valid_degree;
 
-      // collect dead slots and current live adjacency
-      std::vector<size_t> dead_slots;
+      // Collect the current live adjacency.  The v2 row invariant is a packed
+      // prefix [0, valid_degree), so removal below swaps the last valid slot
+      // into the hole and keeps processing the same index.
       std::unordered_set<PID> chosen;
-      for (size_t j = 0; j < deg_; ++j) {
-        if (is_ghost_slot(row, j)) {
-          continue;
-        }
-        if (deleted_.count(ids[j]) != 0) {
-          dead_slots.push_back(j);
-        } else {
+      bool has_dead = false;
+      for (size_t j = 0; j < degree; ++j) {
+        if (deleted_.count(ids[j]) != 0)
+          has_dead = true;
+        else
           chosen.insert(ids[j]);
-        }
       }
-      if (dead_slots.empty()) {
-        return false;
-      }
+      if (!has_dead) return false;
       size_t live_degree = chosen.size();
 
       float u_res_sqr = 0;
@@ -1746,12 +2296,18 @@ class QGUpdater {
       AlignedBuf cand_page(page_size_);
       std::vector<float> appro(deg_);
       bool dirty = false;
-      for (size_t j : dead_slots) {
+      size_t j = 0;
+      while (j < degree) {
+        if (deleted_.count(ids[j]) == 0) {
+          ++j;
+          continue;
+        }
         const PID d = ids[j];
         // Headroom preservation: only splice back up to r_target live edges;
-        // surplus dead slots become free ghost slots.
+        // surplus dead slots are removed from the packed prefix.
         if (live_degree >= r_target) {
-          zero_slot(row, j);
+          erase_slot(row, j, degree);
+          --degree;
           stats_.ghosted_slots++;
           dirty = true;
           continue;
@@ -1761,6 +2317,7 @@ class QGUpdater {
         read_rmw_page(d, d_page.data());
         stats_.patch_page_reads++;
         const char *d_row = d_page.data() + node_offset_in_page(d);
+        const size_t d_degree = row_trailer(d_page.data(), d).valid_degree;
         qg_.scanner_.scan_neighbors(appro.data(),
                                     uq.lut().data(),
                                     space::l2_sqr(row_f,
@@ -1774,10 +2331,10 @@ class QGUpdater {
                                     reinterpret_cast<const float *>(d_row + factor_off_bytes()));
         const auto *d_ids = reinterpret_cast<const PID *>(d_row + neighbor_off_bytes());
         std::vector<std::pair<float, PID>> recalled;
-        for (size_t k = 0; k < deg_; ++k) {
+        for (size_t k = 0; k < d_degree; ++k) {
           const PID cand = d_ids[k];
           if (cand == u || cand >= snapshot || !std::isfinite(appro[k]) ||
-              is_ghost_slot(d_row, k) || deleted_.count(cand) != 0 || chosen.count(cand) != 0) {
+              deleted_.count(cand) != 0 || chosen.count(cand) != 0) {
             continue;
           }
           recalled.emplace_back(appro[k], cand);
@@ -1810,21 +2367,25 @@ class QGUpdater {
           for (size_t r = 0; r < res_dim_; ++r) {
             cand_res_sqr += best_vec[dim_ + r] * best_vec[dim_ + r];
           }
-          if (patch_slot(row, j, best, best_vec.data(), cand_res_sqr)) {
+          if (patch_slot(row, j, best, best_vec.data(), cand_res_sqr, true)) {
             chosen.insert(best);
             ++live_degree;
             stats_.spliced_slots++;
             dirty = true;
             patched = true;
+            ++j;
           }
         }
         if (!patched) {
-          zero_slot(row, j);
+          erase_slot(row, j, degree);
+          --degree;
           stats_.ghosted_slots++;
           dirty = true;
         }
       }
       if (dirty) {
+        trailer.valid_degree = static_cast<uint16_t>(degree);
+        set_row_trailer(page, u, trailer);
         stats_.consolidated_rows++;
       }
       return dirty;
@@ -1832,8 +2393,12 @@ class QGUpdater {
   }
 
   /** @brief Replace one slot's code + factors + id inside a row buffer. */
-  bool patch_slot(char *row, size_t slot, PID x_id, const float *x_vec, float x_res_sqr) {
-    const bool had_old = params_.maintain_indegree && !is_ghost_slot(row, slot);
+  bool patch_slot(char *row,
+                  size_t slot,
+                  PID x_id,
+                  const float *x_vec,
+                  float x_res_sqr,
+                  bool had_old) {
     const PID old_id = reinterpret_cast<const PID *>(row + neighbor_off_bytes())[slot];
     const auto *row_f = reinterpret_cast<const float *>(row);
     // thread_local scratch: one patch_slot per staged backlink — per-call heap
@@ -1880,42 +2445,56 @@ class QGUpdater {
     return true;
   }
 
-  /** @brief Zero a slot back into ghost/free state (code + factors + id). */
-  void zero_slot(char *row, size_t slot) {
-    const bool had_old = params_.maintain_indegree && !is_ghost_slot(row, slot);
+  /** Remove one valid slot while preserving the packed-prefix invariant. */
+  void erase_slot(char *row, size_t slot, size_t degree) {
+    assert(degree > 0 && slot < degree);
     const PID old_id = reinterpret_cast<const PID *>(row + neighbor_off_bytes())[slot];
-    const size_t block_idx = slot / kBatchSize;
-    const size_t in_block = slot % kBatchSize;
-    uint8_t *block = reinterpret_cast<uint8_t *>(row + code_off_bytes()) + block_idx * pd_ * 4;
-    std::vector<uint64_t> bins(kBatchSize * pd_ / 64);
-    unpack_codes_block(pd_, block, bins.data());
-    std::fill(bins.begin() + in_block * (pd_ / 64),
-              bins.begin() + (in_block + 1) * (pd_ / 64),
-              uint64_t{0});
-    pack_codes(pd_, bins.data(), kBatchSize, block);
+    const size_t last = degree - 1;
+    const size_t words = pd_ / 64;
+    thread_local std::vector<uint64_t> bins;
+    bins.resize(deg_ * words);
+    auto *codes = reinterpret_cast<uint8_t *>(row + code_off_bytes());
+    for (size_t block = 0; block < deg_ / kBatchSize; ++block) {
+      unpack_codes_block(pd_,
+                         codes + block * pd_ * 4,
+                         bins.data() + block * kBatchSize * words);
+    }
+    if (slot != last) {
+      std::copy(bins.begin() + last * words,
+                bins.begin() + (last + 1) * words,
+                bins.begin() + slot * words);
+    }
+    std::fill(bins.begin() + last * words, bins.begin() + (last + 1) * words, uint64_t{0});
+    for (size_t block = 0; block < deg_ / kBatchSize; ++block) {
+      pack_codes(pd_,
+                 bins.data() + block * kBatchSize * words,
+                 kBatchSize,
+                 codes + block * pd_ * 4);
+    }
     auto *fac = reinterpret_cast<float *>(row + factor_off_bytes());
-    fac[slot] = 0;
-    fac[deg_ + slot] = 0;
-    fac[2 * deg_ + slot] = 0;
+    if (slot != last) {
+      fac[slot] = fac[last];
+      fac[deg_ + slot] = fac[deg_ + last];
+      fac[2 * deg_ + slot] = fac[2 * deg_ + last];
+    }
+    fac[last] = 0;
+    fac[deg_ + last] = 0;
+    fac[2 * deg_ + last] = 0;
     auto *ids = reinterpret_cast<PID *>(row + neighbor_off_bytes());
-    ids[slot] = 0;
-    if (params_.maintain_indegree && had_old && old_id < indegree_.size()) {
+    if (slot != last) ids[slot] = ids[last];
+    ids[last] = 0;
+    if (params_.maintain_indegree && old_id < indegree_.size()) {
       indegree_[old_id].fetch_sub(1, std::memory_order_relaxed);
     }
   }
 
-  void add_row_indegree(const char *row, int delta) {
+  void add_row_indegree(const char *row, size_t degree, int delta) {
     if (!params_.maintain_indegree) return;
     const auto *ids = reinterpret_cast<const PID *>(row + neighbor_off_bytes());
-    for (size_t j = 0; j < deg_; ++j) {
-      if (is_ghost_slot(row, j) || ids[j] >= indegree_.size()) continue;
+    for (size_t j = 0; j < degree; ++j) {
+      if (ids[j] >= indegree_.size()) continue;
       indegree_[ids[j]].fetch_add(delta, std::memory_order_relaxed);
     }
-  }
-
-  /** @brief Cheap free-slot pre-filter (id==0 && factors==0); confirm with is_ghost_slot. */
-  [[nodiscard]] bool is_free_fast(const float *fac, const PID *ids, size_t j) const {
-    return ids[j] == 0 && fac[j] == 0 && fac[deg_ + j] == 0 && fac[2 * deg_ + j] == 0;
   }
 
   QuantizedGraph &qg_;
@@ -1924,8 +2503,18 @@ class QGUpdater {
   int wfd_ = -1;            // O_DIRECT write fd (parallel inode-shared overwrites)
   bool direct_io_ = false;  // wfd_ opened successfully and writes routed to it
   std::atomic<size_t> committed_;
+  std::atomic<size_t> allocated_points_;
+  std::atomic<PID> next_append_id_;
+  std::atomic<uint64_t> live_count_;
+  std::atomic<PID> free_list_head_{kPidMax};
+  std::atomic<uint64_t> free_count_{0};
   size_t dim_, res_dim_, full_dim_, pd_, deg_, node_len_, page_size_, npp_;
   std::unordered_set<PID> deleted_;
+  QGSuperblockV2 superblock_{};
+  int active_superblock_slot_ = -1;
+  std::mutex checkpoint_mutex_;
+  std::mutex pending_reused_mutex_;
+  std::vector<PID> pending_reused_;
   AtomicStats stats_;
   PageWriteCache write_cache_;
   std::array<StagedStripe, 64> staged_;
