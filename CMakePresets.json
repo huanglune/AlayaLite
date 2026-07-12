@@ -40,6 +40,19 @@
       }
     },
     {
+      "name": "tsan",
+      "displayName": "ThreadSanitizer",
+      "description": "Debug collection concurrency tests with ThreadSanitizer; LASER and Python are outside this focused race preset.",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/TSan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "BUILD_PYTHON": "OFF",
+        "ALAYA_ENABLE_LASER": "OFF",
+        "CMAKE_CXX_FLAGS": "-fsanitize=thread -fno-omit-frame-pointer -O1"
+      }
+    },
+    {
       "name": "coverage",
       "displayName": "Coverage",
       "inherits": "base",
@@ -54,6 +67,7 @@
     { "name": "release", "configurePreset": "release" },
     { "name": "debug", "configurePreset": "debug" },
     { "name": "asan", "configurePreset": "asan" },
+    { "name": "tsan", "configurePreset": "tsan" },
     { "name": "coverage", "configurePreset": "coverage" }
   ],
   "testPresets": [
@@ -74,6 +88,15 @@
       "configurePreset": "asan",
       "output": { "outputOnFailure": true },
       "filter": { "exclude": { "label": "performance" } }
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan",
+      "output": { "outputOnFailure": true },
+      "filter": { "include": { "label": "tsan" } },
+      "environment": {
+        "TSAN_OPTIONS": "halt_on_error=1:history_size=7"
+      }
     }
   ]
 }

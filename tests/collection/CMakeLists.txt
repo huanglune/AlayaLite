@@ -20,3 +20,11 @@ alaya_add_test(
   LABELS unit collection
   TIMEOUT 60
 )
+
+alaya_cc_target(segmented_collection_stress_test SRCS segmented_collection_stress_test.cpp GTEST)
+alaya_add_test(
+  NAME segmented_collection_stress_test
+  TARGET segmented_collection_stress_test
+  LABELS collection stress tsan
+  TIMEOUT 120
+)
