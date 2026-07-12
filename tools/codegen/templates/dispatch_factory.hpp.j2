@@ -9,8 +9,8 @@
 // It must be included from exactly ONE translation unit (python/src/index_factory.cpp)
 // to avoid duplicate-symbol errors and to amortize the 33-template-specialization
 // compile cost over a single .o file.
-// Current and legacy branches intentionally share PyIndex until a Gate 5 row
-// migrates; that migration replaces only its current factory branch.
+// Each migrated Gate 5 row names distinct current and legacy runtime types.
+// The feature bit selects both the reported identity and the implementation.
 
 #pragma once
 
@@ -40,23 +40,25 @@ auto IndexFactory::create(const IndexParams &params,
     if (params.has_scalar_data_) {
       using BuildSpaceType = {{ expand_build_space(c, scalar_with) }};
       using SearchSpaceType = {{ expand_search_space(c, scalar_with) }};
-      using GraphBuilderType = {{ expand_builder(c, "BuildSpaceType") }};
+      using CurrentRuntimeType = {{ expand_current_runtime(c, "SearchSpaceType", "BuildSpaceType") }};
+      using LegacyRuntimeType = {{ expand_legacy_runtime(c, "SearchSpaceType", "BuildSpaceType") }};
       if (registration.use_legacy(features)) {
-        return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
-                                                                           registration.legacy);
+        return std::make_unique<PyIndex<LegacyRuntimeType, SearchSpaceType>>(params,
+                                                                            registration.legacy);
       }
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
-                                                                         registration.current);
+      return std::make_unique<PyIndex<CurrentRuntimeType, SearchSpaceType>>(params,
+                                                                           registration.current);
     }
     using BuildSpaceType = {{ expand_build_space(c, scalar_without) }};
     using SearchSpaceType = {{ expand_search_space(c, scalar_without) }};
-    using GraphBuilderType = {{ expand_builder(c, "BuildSpaceType") }};
+    using CurrentRuntimeType = {{ expand_current_runtime(c, "SearchSpaceType", "BuildSpaceType") }};
+    using LegacyRuntimeType = {{ expand_legacy_runtime(c, "SearchSpaceType", "BuildSpaceType") }};
     if (registration.use_legacy(features)) {
-      return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
-                                                                         registration.legacy);
+      return std::make_unique<PyIndex<LegacyRuntimeType, SearchSpaceType>>(params,
+                                                                          registration.legacy);
     }
-    return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params,
-                                                                       registration.current);
+    return std::make_unique<PyIndex<CurrentRuntimeType, SearchSpaceType>>(params,
+                                                                         registration.current);
   }
 {% endfor %}
   throw std::runtime_error(

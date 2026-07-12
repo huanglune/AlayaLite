@@ -82,7 +82,7 @@ def _validate(config: dict[str, Any]) -> None:
             raise ValueError(f"Invalid implementation key: {implementation_key!r}")
         if not isinstance(registration, dict):
             raise ValueError(f"Implementation registration must be a mapping: {implementation_key}")
-        required = {"engine_factory_key", "artifact_identity"}
+        required = {"engine_factory_key", "artifact_identity", "runtime_template"}
         missing = required - set(registration)
         if missing:
             raise ValueError(f"Implementation '{implementation_key}' missing keys {sorted(missing)}")
@@ -90,6 +90,8 @@ def _validate(config: dict[str, Any]) -> None:
             raise ValueError(f"Implementation '{implementation_key}' has an invalid engine key")
         if not isinstance(registration["artifact_identity"], str) or not registration["artifact_identity"]:
             raise ValueError(f"Implementation '{implementation_key}' has an invalid artifact identity")
+        if not isinstance(registration["runtime_template"], str) or not registration["runtime_template"]:
+            raise ValueError(f"Implementation '{implementation_key}' has an invalid runtime template")
 
     for engine_factory_key, registration in engine_factories.items():
         if not isinstance(engine_factory_key, str) or not engine_factory_key:
@@ -221,6 +223,22 @@ def _expand_builder(config: dict[str, Any], combo: dict[str, str], space: str) -
     return template.format(space=space)
 
 
+def _expand_runtime(
+    config: dict[str, Any],
+    combo: dict[str, str],
+    implementation_key: str,
+    search_space: str,
+    build_space: str,
+) -> str:
+    registration = config["implementation_registry"][implementation_key]
+    declared_runtime = _expand_builder(config, combo, build_space)
+    return str(registration["runtime_template"]).format(
+        search_space=search_space,
+        build_space=build_space,
+        declared_runtime=declared_runtime,
+    )
+
+
 def _to_numpy_dtype(cpp_dtype: str) -> str:
     try:
         return NUMPY_DTYPE_MAP[cpp_dtype]
@@ -258,7 +276,16 @@ def _render(config: dict[str, Any]) -> tuple[str, str]:
     )
     env.globals["expand_search_space"] = lambda combo, scalar: _expand_search_space(config, combo, scalar)
     env.globals["expand_build_space"] = lambda combo, scalar: _expand_build_space(config, combo, scalar)
-    env.globals["expand_builder"] = lambda combo, space: _expand_builder(config, combo, space)
+    env.globals["expand_current_runtime"] = lambda combo, search_space, build_space: _expand_runtime(
+        config, combo, combo["implementation_key"], search_space, build_space
+    )
+    env.globals["expand_legacy_runtime"] = lambda combo, search_space, build_space: _expand_runtime(
+        config,
+        combo,
+        _engine_registration(config, combo)["legacy_implementation_key"],
+        search_space,
+        build_space,
+    )
     env.globals["scalar_with"] = config["search_scalar_types"]["with_scalar"]
     env.globals["scalar_without"] = config["search_scalar_types"]["without_scalar"]
     env.globals["to_numpy_dtype"] = _to_numpy_dtype

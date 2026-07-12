@@ -24,6 +24,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from alayalite import Index
+from alayalite._alayalitepy import PyIndexInterface as _NativeIndex
 from alayalite.schema import IndexParams
 
 from ._dispatch_matrix_params import _FULL_PARAMS, _IMPLEMENTATION_IDENTITIES
@@ -36,6 +37,8 @@ MAX_NBRS = 16
 
 ARTIFACT_IDENTITY_BY_IMPLEMENTATION_KEY = {
     "hnsw_segment": "hnsw",
+    "nsg_segment": "nsg",
+    "fusion_segment": "fusion",
     "legacy_qg_model": "qg",
 }
 
@@ -140,9 +143,23 @@ def _build_and_observe(case, has_scalar_data: bool, case_dir: Path) -> tuple[str
             cpp_index.get_implementation_key(),
             cpp_index.get_engine_factory_key(),
         )
+        assert index.search(vectors[0], topk=5, ef_search=64).shape == (5,)
         save_dir = case_dir / "saved"
         index.save(save_dir)
-        return _persisted_identity(save_dir, id_type, quant), runtime_identity
+        persisted_identity = _persisted_identity(save_dir, id_type, quant)
+        index.close()
+
+        reopened = _NativeIndex(params.to_cpp_params())
+        try:
+            reopened.load(
+                params.index_path(save_dir),
+                params.data_path(save_dir),
+                params.quant_path(save_dir),
+            )
+            assert reopened.search(vectors[0], 5, 64).shape == (5,)
+        finally:
+            reopened.close_db()
+        return persisted_identity, runtime_identity
     finally:
         index.close()
 
@@ -173,15 +190,16 @@ def test_full_dispatch_matrix_persisted_algorithm_identity(case, declared_identi
     assert engine_factory_key == declared_artifact_identity
     assert observed_artifacts == [declared_artifact_identity, declared_artifact_identity]
 
-    # Task W / MUST-11 runtime evidence (2026-07-12): fit ignores the
-    # generated GraphBuilderType. Non-RaBitQ rows build HNSW; RaBitQ rows build
-    # QG irrespective of the configured index_type. The fix belongs to Gate 5.
-    legacy_actual = "qg" if quant == "rabitq" else "hnsw"
-    assert declared_artifact_identity == legacy_actual
-    if legacy_actual != requested_index_type:
+    # Gate 5 fixes every non-RaBitQ NSG/Fusion row. The three RaBitQ rows retain
+    # their Task-W characterization until Z2 decides whether QG becomes an
+    # explicit index type or the allowlist is narrowed.
+    if quant == "rabitq":
+        assert declared_artifact_identity == "qg"
+        assert observed_artifacts == ["qg", "qg"]
         pytest.xfail(
-            "Task W / MUST-11: legacy fit silently builds "
-            f"{legacy_actual} for requested {requested_index_type}; fix deferred to Gate 5"
+            "Task W / MUST-11: RaBitQ still builds QG for requested "
+            f"{requested_index_type}; decision deferred to Z2"
         )
 
+    assert declared_artifact_identity == requested_index_type
     assert observed_artifacts == [requested_index_type, requested_index_type]

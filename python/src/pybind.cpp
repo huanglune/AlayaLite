@@ -179,11 +179,28 @@ PYBIND11_MODULE(_alayalitepy, m) {
            py::arg("data_path") = std::string(),  //
            py::arg("quant_path") = std::string());
 
+  py::class_<alaya::internal::memory::MemoryEngineFeatureFlags>(m, "_MemoryEngineFeatureFlags")
+      .def(py::init<>())
+      .def_readwrite("knng_segment",
+                     &alaya::internal::memory::MemoryEngineFeatureFlags::knng_segment)
+      .def_readwrite("nsg_segment", &alaya::internal::memory::MemoryEngineFeatureFlags::nsg_segment)
+      .def_readwrite("fusion_segment",
+                     &alaya::internal::memory::MemoryEngineFeatureFlags::fusion_segment)
+      .def_readwrite("qg_segment", &alaya::internal::memory::MemoryEngineFeatureFlags::qg_segment)
+      .def_readwrite("vamana_memory_segment",
+                     &alaya::internal::memory::MemoryEngineFeatureFlags::vamana_memory_segment);
+
   py::class_<alaya::BasePyIndex, std::unique_ptr<alaya::BasePyIndex>>(m, "PyIndexInterface")
       .def(py::init([](const alaya::IndexParams &params) {
              return alaya::IndexFactory::create(params);
            }),
            py::arg("params"))
+      .def(py::init([](const alaya::IndexParams &params,
+                       const alaya::internal::memory::MemoryEngineFeatureFlags &features) {
+             return alaya::IndexFactory::create(params, features);
+           }),
+           py::arg("params"),
+           py::arg("features"))
       .def("to_string", &alaya::BasePyIndex::to_string)
       .def("has_scalar_data", &alaya::BasePyIndex::has_scalar_data)
       .def("get_declared_index_type", &alaya::BasePyIndex::get_declared_index_type)

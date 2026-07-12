@@ -38,11 +38,13 @@
 #include "executor/jobs/graph_search_job.hpp"
 #include "executor/jobs/graph_update_job.hpp"
 #include "executor/scheduler.hpp"
-#include "index/graph/fusion_graph.hpp"
+#include "index/graph/fusion/detail/fusion_builder_kernel.hpp"
+#include "index/graph/fusion/fusion_segment.hpp"
 #include "index/graph/graph.hpp"
 #include "index/graph/hnsw/detail/hnsw_segment_bridge.hpp"
 #include "index/graph/hnsw/hnsw_segment.hpp"
-#include "index/graph/nsg/nsg_builder.hpp"
+#include "index/graph/nsg/detail/nsg_builder_kernel.hpp"
+#include "index/graph/nsg/nsg_segment.hpp"
 #include "index/graph/qg/qg_builder.hpp"
 #include "index_factory.hpp"
 #include "materialized_view.hpp"
@@ -78,13 +80,25 @@ struct RegisteredBuildSpace<RuntimeType, std::void_t<typename RuntimeType::Build
   using type = typename RuntimeType::BuildSpaceTypeAlias;
 };
 
-template <typename GraphBuilderType, typename SearchSpaceType>
+template <typename RuntimeType, typename = void>
+struct IsGate5MemoryGraphSegment : std::false_type {};
+
+template <typename RuntimeType>
+struct IsGate5MemoryGraphSegment<RuntimeType,
+                                 std::void_t<typename RuntimeType::Gate5MemoryGraphSegmentTag>>
+    : std::true_type {};
+
+template <typename RuntimeType>
+inline constexpr bool is_gate5_memory_graph_segment_v =
+    IsGate5MemoryGraphSegment<RuntimeType>::value;
+
+template <typename RuntimeType, typename SearchSpaceType>
 class PyIndex : public BasePyIndex {
  public:
   using IDType = typename SearchSpaceType::IDTypeAlias;
   using DataType = typename SearchSpaceType::DataTypeAlias;
   using DistanceType = typename SearchSpaceType::DistanceTypeAlias;
-  using BuildSpaceType = typename RegisteredBuildSpace<GraphBuilderType>::type;
+  using BuildSpaceType = typename RegisteredBuildSpace<RuntimeType>::type;
   using MaterializedViewManagerType = MaterializedViewManager<SearchSpaceType, BuildSpaceType>;
   using HnswSegmentType = HnswSegment<SearchSpaceType, BuildSpaceType>;
 
@@ -141,13 +155,72 @@ class PyIndex : public BasePyIndex {
     return hybrid_batch_pool_;
   }
 
-  static auto hnsw_artifact_locations(std::string_view graph_path,
-                                      std::string_view data_path,
-                                      std::string_view quant_path)
+  template <typename SegmentType>
+  static auto memory_graph_artifact_locations(std::string_view graph_path,
+                                              std::string_view data_path,
+                                              std::string_view quant_path)
       -> std::array<core::ArtifactLocation, 3> {
-    return {{{HnswSegmentType::kGraphArtifactName, graph_path},
-             {HnswSegmentType::kDataArtifactName, data_path},
-             {HnswSegmentType::kQuantArtifactName, quant_path}}};
+    return {{{SegmentType::kGraphArtifactName, graph_path},
+             {SegmentType::kDataArtifactName, data_path},
+             {SegmentType::kQuantArtifactName, quant_path}}};
+  }
+
+  struct SegmentSearchBuffers {
+    std::vector<core::SearchHit> hits;
+    std::vector<core::RowCount> offsets;
+    std::vector<core::RowCount> counts;
+    std::vector<core::Status> statuses;
+    std::vector<core::SearchCompleteness> completeness;
+  };
+
+  auto execute_segment_search(const DataType *queries,
+                              core::RowCount query_count,
+                              uint32_t topk,
+                              uint32_t effort,
+                              bool single) const -> SegmentSearchBuffers {
+    static_assert(is_gate5_memory_graph_segment_v<RuntimeType>);
+    if (runtime_segment_ == nullptr) {
+      throw std::runtime_error("memory graph segment is not initialized");
+    }
+
+    SegmentSearchBuffers buffers;
+    buffers.hits.resize(static_cast<std::size_t>(query_count) * topk);
+    buffers.offsets.resize(static_cast<std::size_t>(query_count) + 1);
+    buffers.counts.resize(query_count);
+    buffers.statuses.resize(query_count);
+    buffers.completeness.resize(query_count);
+
+    typename RuntimeType::SearchExtension search_options;
+    search_options.effort = effort;
+    auto extension = RuntimeType::make_search_extension(search_options);
+    core::SearchContext context;
+    core::SearchResponse response;
+    response.hits = buffers.hits;
+    response.offsets = buffers.offsets;
+    response.valid_counts = buffers.counts;
+    response.statuses = buffers.statuses;
+    response.completeness = buffers.completeness;
+    core::SearchRequest request;
+    request.queries = core::TypedTensorView::contiguous(queries,
+                                                        query_count,
+                                                        static_cast<std::uint32_t>(data_dim_));
+    request.options.top_k = topk;
+    request.options.extensions =
+        std::span<const core::AlgorithmSearchExtension>(std::addressof(extension), 1);
+    request.context = std::addressof(context);
+    request.response = std::addressof(response);
+
+    const auto status =
+        single ? runtime_segment_->search(request) : runtime_segment_->batch_search(request);
+    if (!status.ok()) {
+      throw std::runtime_error(status.diagnostic());
+    }
+    for (const auto &query_status : buffers.statuses) {
+      if (!query_status.ok()) {
+        throw std::runtime_error(query_status.diagnostic());
+      }
+    }
+    return buffers;
   }
 
 #if defined(__linux__)
@@ -211,9 +284,22 @@ class PyIndex : public BasePyIndex {
     std::string_view quant_path_view{quant_path};
 
     if constexpr (!is_rabitq_space_v<SearchSpaceType>) {
-      if (params_.index_type_ == IndexType::HNSW && hnsw_segment_ != nullptr) {
-        const auto locations =
-            hnsw_artifact_locations(index_path_view, data_path_view, quant_path_view);
+      if constexpr (is_gate5_memory_graph_segment_v<RuntimeType>) {
+        const auto locations = memory_graph_artifact_locations<RuntimeType>(index_path_view,
+                                                                            data_path_view,
+                                                                            quant_path_view);
+        core::ArtifactWriter writer{std::span<const core::ArtifactLocation>(locations)};
+        core::ArtifactManifest manifest;
+        const auto status = runtime_segment_->save(writer, {}, manifest);
+        if (!status.ok()) {
+          throw std::runtime_error(status.diagnostic());
+        }
+        return;
+      }
+      if (hnsw_segment_ != nullptr) {
+        const auto locations = memory_graph_artifact_locations<HnswSegmentType>(index_path_view,
+                                                                                data_path_view,
+                                                                                quant_path_view);
         core::ArtifactWriter writer{std::span<const core::ArtifactLocation>(locations)};
         core::ArtifactManifest manifest;
         const auto status = hnsw_segment_->save(writer, {}, manifest);
@@ -255,10 +341,24 @@ class PyIndex : public BasePyIndex {
                                                                         nullptr,
                                                                         build_space_);
     } else {
-      if (params_.index_type_ == IndexType::HNSW) {
+      if constexpr (is_gate5_memory_graph_segment_v<RuntimeType>) {
         core::OpenContext open_context;
-        const auto locations =
-            hnsw_artifact_locations(index_path_view, data_path_view, quant_path_view);
+        const auto locations = memory_graph_artifact_locations<RuntimeType>(index_path_view,
+                                                                            data_path_view,
+                                                                            quant_path_view);
+        runtime_segment_ =
+            RuntimeType::open(core::ArtifactView(
+                                  std::span<const core::ArtifactLocation>(locations)),
+                              {},
+                              open_context);
+        graph_index_ = detail::MemoryGraphSegmentBridge::graph(*runtime_segment_);
+        search_space_ = detail::MemoryGraphSegmentBridge::search_space(*runtime_segment_);
+        build_space_ = detail::MemoryGraphSegmentBridge::build_space(*runtime_segment_);
+      } else {
+        core::OpenContext open_context;
+        const auto locations = memory_graph_artifact_locations<HnswSegmentType>(index_path_view,
+                                                                                data_path_view,
+                                                                                quant_path_view);
         hnsw_segment_ =
             HnswSegmentType::open(core::ArtifactView(
                                       std::span<const core::ArtifactLocation>(locations)),
@@ -270,21 +370,6 @@ class PyIndex : public BasePyIndex {
             *hnsw_segment_);
         build_space_ =
             detail::HnswSegmentBridge<SearchSpaceType, BuildSpaceType>::build_space(*hnsw_segment_);
-      } else {
-        graph_index_ = std::make_shared<Graph<DataType, IDType>>();
-        graph_index_->load(index_path_view);
-        if (!data_path.empty()) {
-          build_space_ = std::make_shared<BuildSpaceType>();
-          build_space_->load(data_path_view);
-          build_space_->set_metric_function();
-        }
-        if constexpr (std::is_same<BuildSpaceType, SearchSpaceType>::value) {
-          search_space_ = build_space_;
-        } else {
-          search_space_ = std::make_shared<SearchSpaceType>();
-          search_space_->load(quant_path_view);
-          search_space_->set_metric_function();
-        }
       }
 
       data_size_ = build_space_->get_data_size();
@@ -709,19 +794,33 @@ class PyIndex : public BasePyIndex {
 
       auto build_start = std::chrono::steady_clock::now();
       core::BuildContext build_context;
-      hnsw_segment_ = HnswSegmentType::build({core::TypedTensorView::contiguous(vectors_,
-                                                                                data_size_,
-                                                                                data_dim_),
-                                              search_space_,
-                                              build_space_},
-                                             {.max_neighbors = params_.max_nbrs_,
-                                              .ef_construction = ef_construction,
-                                              .thread_count = num_threads},
-                                             build_context);
-      graph_index_ =
-          detail::HnswSegmentBridge<SearchSpaceType, BuildSpaceType>::graph(*hnsw_segment_);
+      if constexpr (is_gate5_memory_graph_segment_v<RuntimeType>) {
+        typename RuntimeType::BuildOptions build_options;
+        build_options.max_neighbors = params_.max_nbrs_;
+        build_options.ef_construction = ef_construction;
+        build_options.thread_count = num_threads;
+        runtime_segment_ =
+            RuntimeType::build({core::TypedTensorView::contiguous(vectors_, data_size_, data_dim_),
+                                search_space_,
+                                build_space_},
+                               build_options,
+                               build_context);
+        graph_index_ = detail::MemoryGraphSegmentBridge::graph(*runtime_segment_);
+      } else {
+        hnsw_segment_ = HnswSegmentType::build({core::TypedTensorView::contiguous(vectors_,
+                                                                                  data_size_,
+                                                                                  data_dim_),
+                                                search_space_,
+                                                build_space_},
+                                               {.max_neighbors = params_.max_nbrs_,
+                                                .ef_construction = ef_construction,
+                                                .thread_count = num_threads},
+                                               build_context);
+        graph_index_ =
+            detail::HnswSegmentBridge<SearchSpaceType, BuildSpaceType>::graph(*hnsw_segment_);
+      }
 
-      LOG_INFO("The time of building hnsw is {}s.",
+      LOG_INFO("The time of building memory graph is {}s.",
                static_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() -
                                                           build_start)
                    .count());
@@ -737,7 +836,10 @@ class PyIndex : public BasePyIndex {
           alaya::GraphHybridSearchJob<SearchSpaceType, BuildSpaceType>>(search_space_,
                                                                         graph_index_,
                                                                         build_space_);
-      update_job_ = std::make_shared<GraphUpdateJob<SearchSpaceType, BuildSpaceType>>(search_job_);
+      if constexpr (!is_gate5_memory_graph_segment_v<RuntimeType>) {
+        update_job_ =
+            std::make_shared<GraphUpdateJob<SearchSpaceType, BuildSpaceType>>(search_job_);
+      }
     }
     materialized_view_manager_.rebuild(params_,
                                        data_dim_,
@@ -960,11 +1062,17 @@ class PyIndex : public BasePyIndex {
 
   auto search(py::array_t<DataType> query, uint32_t topk, uint32_t ef) -> py::array_t<IDType> {
     auto *query_ptr = static_cast<DataType *>(query.request().ptr);
-    std::vector<IDType> result_ids(topk);
+    std::vector<IDType> result_ids(topk, std::numeric_limits<IDType>::max());
 
     {
       py::gil_scoped_release release;
-      if constexpr (is_rabitq_space_v<SearchSpaceType>) {
+      if constexpr (is_gate5_memory_graph_segment_v<RuntimeType>) {
+        auto result = execute_segment_search(query_ptr, 1, topk, ef, true);
+        for (core::RowCount hit = 0; hit < result.counts[0]; ++hit) {
+          result_ids[hit] = static_cast<IDType>(
+              static_cast<std::uint64_t>(result.hits[result.offsets[0] + hit].row_id));
+        }
+      } else if constexpr (is_rabitq_space_v<SearchSpaceType>) {
         search_job_->rabitq_search_solo(query_ptr, topk, result_ids.data(), ef);
       } else {
         search_job_->search_solo(query_ptr, result_ids.data(), topk, ef);
@@ -989,6 +1097,18 @@ class PyIndex : public BasePyIndex {
 
     auto ret_dists = py::array_t<DistanceType>(static_cast<size_t>(topk));
     auto ret_dist_ptr = static_cast<DistanceType *>(ret_dists.request().ptr);
+
+    if constexpr (is_gate5_memory_graph_segment_v<RuntimeType>) {
+      std::fill_n(ret_id_ptr, topk, std::numeric_limits<IDType>::max());
+      std::fill_n(ret_dist_ptr, topk, std::numeric_limits<DistanceType>::max());
+      auto result = execute_segment_search(query_ptr, 1, topk, ef, true);
+      for (core::RowCount hit = 0; hit < result.counts[0]; ++hit) {
+        const auto &source = result.hits[result.offsets[0] + hit];
+        ret_id_ptr[hit] = static_cast<IDType>(static_cast<std::uint64_t>(source.row_id));
+        ret_dist_ptr[hit] = static_cast<DistanceType>(source.score);
+      }
+      return py::make_tuple(ret_ids, ret_dists);
+    }
 
     search_job_->search_solo(query_ptr, ret_id_ptr, ret_dist_ptr, topk, ef);
 
@@ -1145,6 +1265,26 @@ class PyIndex : public BasePyIndex {
 
     auto *query_ptr = static_cast<DataType *>(queries.request().ptr);
 
+    if constexpr (is_gate5_memory_graph_segment_v<RuntimeType>) {
+      SegmentSearchBuffers result;
+      {
+        py::gil_scoped_release release;
+        result = execute_segment_search(query_ptr, query_size, topk, ef, false);
+      }
+      auto ret = py::array_t<IDType>({query_size, static_cast<size_t>(topk)});
+      auto ret_ptr = static_cast<IDType *>(ret.request().ptr);
+      std::fill_n(ret_ptr,
+                  query_size * static_cast<std::size_t>(topk),
+                  std::numeric_limits<IDType>::max());
+      for (core::RowCount row = 0; row < query_size; ++row) {
+        for (core::RowCount hit = 0; hit < result.counts[row]; ++hit) {
+          ret_ptr[row * topk + hit] = static_cast<IDType>(
+              static_cast<std::uint64_t>(result.hits[result.offsets[row] + hit].row_id));
+        }
+      }
+      return ret;
+    }
+
 #if defined(__linux__)
     std::vector<std::vector<IDType>> res_pool(query_size, std::vector<IDType>(topk));
 
@@ -1222,6 +1362,27 @@ class PyIndex : public BasePyIndex {
     size_t query_dim = queries.shape(1);
 
     auto *query_ptr = static_cast<DataType *>(queries.request().ptr);
+
+    if constexpr (is_gate5_memory_graph_segment_v<RuntimeType>) {
+      SegmentSearchBuffers result;
+      {
+        py::gil_scoped_release release;
+        result = execute_segment_search(query_ptr, query_size, topk, ef, false);
+      }
+      std::vector<std::vector<IDType>>
+          topk_ids(query_size, std::vector<IDType>(topk, std::numeric_limits<IDType>::max()));
+      std::vector<std::vector<DistanceType>>
+          topk_dists(query_size,
+                     std::vector<DistanceType>(topk, std::numeric_limits<DistanceType>::max()));
+      for (core::RowCount row = 0; row < query_size; ++row) {
+        for (core::RowCount hit = 0; hit < result.counts[row]; ++hit) {
+          const auto &source = result.hits[result.offsets[row] + hit];
+          topk_ids[row][hit] = static_cast<IDType>(static_cast<std::uint64_t>(source.row_id));
+          topk_dists[row][hit] = static_cast<DistanceType>(source.score);
+        }
+      }
+      return py::make_tuple(get_topk_array(topk_ids, topk), get_topk_array(topk_dists, topk));
+    }
 
 #if defined(__linux__)
     // Arrays to store topk results (search now returns topk directly)
@@ -1410,6 +1571,7 @@ class PyIndex : public BasePyIndex {
 
   std::shared_ptr<Graph<DataType, IDType>> graph_index_{nullptr};
   std::unique_ptr<HnswSegmentType> hnsw_segment_{nullptr};
+  std::unique_ptr<RuntimeType> runtime_segment_{nullptr};
   std::shared_ptr<BuildSpaceType> build_space_{nullptr};
   std::shared_ptr<SearchSpaceType> search_space_{nullptr};
 

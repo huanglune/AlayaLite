@@ -11,7 +11,7 @@
 // #include "index.hpp"
 #include "index/graph/graph.hpp"
 #include "index/graph/hnsw/hnsw_segment.hpp"
-#include "index/graph/nsg/nsg_builder.hpp"
+#include "index/graph/nsg/nsg_segment.hpp"
 #include "index/index_type.hpp"
 #include "space/raw_space.hpp"
 #include "space/sq4_space.hpp"
@@ -99,14 +99,14 @@ struct SQ8SearchIndex<std::variant<Builders...>> {
 
 using RawSpaceVariant = typename ExpandBoth<DataTypes, IdTypes, RawSpaceVariantType>::type;
 using HnswSegmentVariant = typename ExpandSingle<RawSpaceVariant, HnswSegment>::type;
-using NSGBuilderVariant = typename ExpandSingle<RawSpaceVariant, NSGBuilder>::type;
+using NsgSegmentVariant = typename ExpandSingle<RawSpaceVariant, NsgSegment>::type;
 
 // using BasePyIndex =
 //     MergeVariants<RawSearchIndex<HnswSegmentVariant>::type,
-//     RawSearchIndex<NSGBuilderVariant>::type,
+//     RawSearchIndex<NsgSegmentVariant>::type,
 //                   SQ4SearchIndex<HnswSegmentVariant>::type,
-//                   SQ4SearchIndex<NSGBuilderVariant>::type,
-//                   SQ8SearchIndex<NSGBuilderVariant>::type,
+//                   SQ4SearchIndex<NsgSegmentVariant>::type,
+//                   SQ8SearchIndex<NsgSegmentVariant>::type,
 //                   SQ8SearchIndex<HnswSegmentVariant>::type>;
 
 using BasePyIndex = MergeVariants<RawSearchIndex<HnswSegmentVariant>::type>;

@@ -46,7 +46,9 @@ def test_dispatch_yaml_is_the_frozen_33_row_allowlist():
     assert {row[3] for row in by_name} == {"HNSW", "NSG", "FUSION"}
     assert {row[2] for row in by_name if row[0] != "float"} == {"NONE"}
     assert {key: sum(row[4:] == key for row in by_name) for key in {row[4:] for row in by_name}} == {
-        ("hnsw_segment", "hnsw"): 30,
+        ("hnsw_segment", "hnsw"): 10,
+        ("nsg_segment", "nsg"): 10,
+        ("fusion_segment", "fusion"): 10,
         ("legacy_qg_model", "qg"): 3,
     }
 
@@ -62,5 +64,7 @@ def test_dispatch_yaml_is_the_frozen_33_row_allowlist():
     generated = (ROOT / "python/tests/client/_dispatch_matrix_params.py").read_text(encoding="utf-8")
     assert "Source: tools/codegen/dispatch.yaml (33 combinations)." in generated
     assert generated.count("False),") == 33
-    assert generated.count('("hnsw_segment", "hnsw", "hnsw"),') == 30
+    assert generated.count('("hnsw_segment", "hnsw", "hnsw"),') == 10
+    assert generated.count('("nsg_segment", "nsg", "nsg"),') == 10
+    assert generated.count('("fusion_segment", "fusion", "fusion"),') == 10
     assert generated.count('("legacy_qg_model", "qg", "qg"),') == 3
