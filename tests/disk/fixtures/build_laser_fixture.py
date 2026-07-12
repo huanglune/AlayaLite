@@ -9,13 +9,28 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import shutil
 import struct
 import sys
+import tempfile
 from pathlib import Path
 
-import numpy as np
+# Pin numerical-library worker pools before importing numpy/faiss. The native
+# builders have their own explicit thread-count arguments below.
+for _thread_env in (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "BLIS_NUM_THREADS",
+):
+    os.environ[_thread_env] = "1"
+
+import numpy as np  # noqa: E402
 
 DEFAULT_COUNT = 2048
 DEFAULT_DIM = 128
@@ -23,6 +38,7 @@ DEFAULT_R = 64
 DEFAULT_SEED = 42
 DEFAULT_PREFIX = "dsqg_seg_00000001"
 DEFAULT_MEDOIDS = 64
+STAMP_NAME = ".laser_fixture_provenance.json"
 
 _VAMANA_HEADER_BYTES = 24
 _LASER_SECTOR_BYTES = 4096
@@ -32,35 +48,56 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
-def _ensure_python_path() -> None:
-    _maybe_stage_built_extension()
-    src = _repo_root() / "python" / "src"
-    if str(src) not in sys.path:
-        sys.path.append(str(src))
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def _maybe_stage_built_extension() -> None:
-    build_dir_env = os.environ.get("ALAYALITE_LASER_BUILD_DIR")
-    if not build_dir_env:
-        return
-    build_dir = Path(build_dir_env)
-    candidates = sorted((build_dir / "python").glob("_alayalitepy*.so"))
-    if not candidates:
-        return
-
-    stage_root = build_dir / "tests" / "disk" / "fixtures" / "python_stage"
+def _stage_build_tree_package(extension: Path, stage_root: Path) -> Path:
     stage_pkg = stage_root / "alayalite"
     src_pkg = _repo_root() / "python" / "src" / "alayalite"
-    if not stage_pkg.exists():
-        shutil.copytree(
-            src_pkg,
-            stage_pkg,
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "_alayalitepy*.so"),
-            dirs_exist_ok=True,
-        )
-    shutil.copy2(candidates[0], stage_pkg / candidates[0].name)
+    shutil.copytree(
+        src_pkg,
+        stage_pkg,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "_alayalitepy*.so"),
+    )
+    staged_extension = stage_pkg / extension.name
+    staged_extension.symlink_to(extension)
     if str(stage_root) not in sys.path:
         sys.path.insert(0, str(stage_root))
+    return staged_extension
+
+
+def _load_build_tree_modules(extension: Path, stage_root: Path) -> tuple[object, object]:
+    extension = extension.resolve(strict=True)
+    if extension.suffix != ".so":
+        _die(f"--extension must name a build-tree .so: {extension}")
+    staged_extension = _stage_build_tree_package(extension, stage_root)
+    # Some Python launchers preload the installed package. Purge it after the
+    # build-tree stage has been placed first so provenance cannot depend on
+    # interpreter startup state.
+    for module_name in tuple(sys.modules):
+        if module_name == "alayalite" or module_name.startswith("alayalite."):
+            del sys.modules[module_name]
+    sys.meta_path[:] = [
+        finder
+        for finder in sys.meta_path
+        if not type(finder).__module__.startswith("_editable_")
+    ]
+    try:
+        from alayalite import _alayalitepy, vamana  # pylint: disable=import-outside-toplevel
+        from alayalite.laser import RawIndex  # pylint: disable=import-outside-toplevel
+    except ImportError as exc:
+        _die(f"could not import the explicitly selected build-tree extension {extension}: {exc}")
+
+    loaded = Path(_alayalitepy.__file__).resolve(strict=True)
+    if loaded != extension or Path(staged_extension).resolve(strict=True) != extension:
+        _die(f"extension provenance mismatch: requested={extension}, loaded={loaded}")
+    print(f"[laser-fixture] loaded build-tree extension: {loaded}")
+    return RawIndex, vamana
 
 
 def _die(message: str) -> None:
@@ -166,26 +203,6 @@ def _ensure_input_vectors(path: Path, count: int, dim: int, seed: int) -> None:
     _write_fbin_atomic(path, _generate_vectors(count, dim, seed))
 
 
-def _ensure_required_imports() -> tuple[object, object]:
-    try:
-        from alayalite import vamana  # pylint: disable=import-outside-toplevel
-        from alayalite.laser import RawIndex  # pylint: disable=import-outside-toplevel
-    except ImportError as exc:
-        first_error = exc
-        _ensure_python_path()
-        try:
-            from alayalite import vamana  # pylint: disable=import-outside-toplevel
-            from alayalite.laser import RawIndex  # pylint: disable=import-outside-toplevel
-        except ImportError as retry_exc:
-            _die(
-                "requires the AlayaLite Python extension with LASER enabled. "
-                "Build/install the Python module first, or run from an environment "
-                "where `import alayalite.laser` succeeds. "
-                f"Original import error: {first_error}; retry after adding python/src: {retry_exc}"
-            )
-    return RawIndex, vamana
-
-
 def _ensure_optional_imports() -> tuple[object, object, object]:
     try:
         from alayalite.laser._io import read_fbin  # pylint: disable=import-outside-toplevel
@@ -198,25 +215,17 @@ def _ensure_optional_imports() -> tuple[object, object, object]:
             save_pca_params,
         )
     except ImportError as exc:
-        first_error = exc
-        _ensure_python_path()
-        try:
-            from alayalite.laser._io import read_fbin  # pylint: disable=import-outside-toplevel
-            from alayalite.laser._medoid import (  # pylint: disable=import-outside-toplevel
-                generate_and_save_medoids,
-            )
-            from alayalite.laser._pca import (  # pylint: disable=import-outside-toplevel
-                fit_incremental_pca,
-                pca_transform_and_save,
-                save_pca_params,
-            )
-        except ImportError as retry_exc:
-            _die(
-                "optional LASER sidecar generation requires numpy, sklearn, faiss, "
-                "and the alayalite.laser Python helpers. Re-run with "
-                "`--no-optional-sidecars` for a required-artifacts-only fixture. "
-                f"Original import error: {first_error}; retry after adding python/src: {retry_exc}"
-            )
+        _die(
+            "optional LASER sidecar generation requires numpy, sklearn, faiss, "
+            "and the alayalite.laser Python helpers. Re-run with "
+            f"`--no-optional-sidecars` for a required-artifacts-only fixture: {exc}"
+        )
+    try:
+        import faiss  # pylint: disable=import-outside-toplevel
+
+        faiss.omp_set_num_threads(1)
+    except (ImportError, AttributeError) as exc:
+        _die(f"could not pin FAISS to one thread: {exc}")
     return (
         read_fbin,
         generate_and_save_medoids,
@@ -382,6 +391,15 @@ def _ensure_laser_artifacts(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--extension",
+        type=Path,
+        required=True,
+        help="Exact build-tree _alayalitepy shared object to load.",
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="Regenerate even when provenance matches."
+    )
     parser.add_argument("--prefix", default=DEFAULT_PREFIX)
     parser.add_argument("--count", type=int, default=DEFAULT_COUNT)
     parser.add_argument("--dim", type=int, default=DEFAULT_DIM)
@@ -410,6 +428,76 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _provenance(args: argparse.Namespace, extension: Path, main_dim: int) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "generator_sha256": _sha256(Path(__file__).resolve()),
+        "extension": {
+            "filename": extension.name,
+            "sha256": _sha256(extension),
+        },
+        "parameters": {
+            "prefix": args.prefix,
+            "count": args.count,
+            "dim": args.dim,
+            "R": args.R,
+            "main_dim": main_dim,
+            "seed": args.seed,
+            "medoids": args.medoids,
+            "build_L": args.build_L,
+            "alpha": args.alpha,
+            "build_threads": args.build_threads,
+            "ef_indexing": args.ef_indexing,
+            "dram_budget_gb": args.dram_budget_gb,
+            "optional_sidecars": args.optional_sidecars,
+            "faiss_blas_omp_threads": 1,
+        },
+    }
+
+
+def _fixture_valid(output_dir: Path, args: argparse.Namespace, main_dim: int) -> bool:
+    prefix = args.prefix
+    required = _laser_required_paths(output_dir, prefix, args.R, main_dim)
+    valid = (
+        _valid_fbin(output_dir / f"{prefix}_input.fbin", args.count, args.dim)
+        and _valid_fbin(output_dir / f"{prefix}_pca_base.fbin", args.count, args.dim)
+        and _valid_vamana_index(output_dir / f"{prefix}_vamana_graph.index", args.R)
+        and _laser_required_valid(required, args.count, main_dim)
+    )
+    if args.optional_sidecars:
+        valid = (
+            valid
+            and _valid_pca_params(output_dir / f"{prefix}_pca.bin", args.dim)
+            and _valid_ibin(output_dir / f"{prefix}_medoids_indices", args.medoids, 1)
+            and _valid_fbin(output_dir / f"{prefix}_medoids", args.medoids, args.dim)
+        )
+    return valid
+
+
+def _stamp_matches(output_dir: Path, expected: dict[str, object]) -> bool:
+    try:
+        actual = json.loads((output_dir / STAMP_NAME).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return actual == expected
+
+
+def _replace_fixture(output_dir: Path, generated_dir: Path) -> None:
+    backup = output_dir.with_name(f".{output_dir.name}.old-{os.getpid()}")
+    if backup.exists():
+        shutil.rmtree(backup)
+    if output_dir.exists():
+        os.replace(output_dir, backup)
+    try:
+        os.replace(generated_dir, output_dir)
+    except BaseException:
+        if backup.exists() and not output_dir.exists():
+            os.replace(backup, output_dir)
+        raise
+    if backup.exists():
+        shutil.rmtree(backup)
+
+
 def main() -> int:
     args = _parse_args()
     if args.count != DEFAULT_COUNT or args.dim != DEFAULT_DIM or args.R != DEFAULT_R:
@@ -422,21 +510,35 @@ def main() -> int:
     if args.medoids <= 0 or args.medoids > int(args.count * 0.10):
         _die("--medoids must be > 0 and <= floor(count * 0.10) for faiss IVF training")
 
-    output_dir = args.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = args.output_dir.resolve()
+    extension = args.extension.resolve(strict=True)
     main_dim = args.main_dim or args.dim
     if main_dim != args.dim:
         _die("v1 fixture generation requires --main-dim to equal --dim")
 
-    prefix = args.prefix
-    input_path = output_dir / f"{prefix}_input.fbin"
-    pca_base_path = output_dir / f"{prefix}_pca_base.fbin"
-    pca_params_path = output_dir / f"{prefix}_pca.bin"
-    medoid_indices_path = output_dir / f"{prefix}_medoids_indices"
-    medoid_vectors_path = output_dir / f"{prefix}_medoids"
-    vamana_graph_path = output_dir / f"{prefix}_vamana_graph.index"
+    expected_stamp = _provenance(args, extension, main_dim)
+    python_stage = tempfile.TemporaryDirectory(prefix="alaya-laser-python-stage-")
+    raw_index_cls, vamana_module = _load_build_tree_modules(extension, Path(python_stage.name))
+    if (
+        not args.force
+        and _stamp_matches(output_dir, expected_stamp)
+        and _fixture_valid(output_dir, args, main_dim)
+    ):
+        print(f"[laser-fixture] provenance matches, reusing: {output_dir}")
+        return 0
 
-    raw_index_cls, vamana_module = _ensure_required_imports()
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    generated_dir = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.tmp-", dir=output_dir.parent))
+
+    prefix = args.prefix
+    input_path = generated_dir / f"{prefix}_input.fbin"
+    pca_base_path = generated_dir / f"{prefix}_pca_base.fbin"
+    pca_params_path = generated_dir / f"{prefix}_pca.bin"
+    medoid_indices_path = generated_dir / f"{prefix}_medoids_indices"
+    medoid_vectors_path = generated_dir / f"{prefix}_medoids"
+    vamana_graph_path = generated_dir / f"{prefix}_vamana_graph.index"
+
+    print(f"[laser-fixture] regenerating snapshot: {output_dir}")
     _ensure_input_vectors(input_path, args.count, args.dim, args.seed)
     _ensure_pca_artifacts(
         input_path,
@@ -470,7 +572,7 @@ def main() -> int:
     _ensure_laser_artifacts(
         raw_index_cls,
         vamana_graph_path,
-        output_dir,
+        generated_dir,
         prefix,
         args.count,
         args.dim,
@@ -480,6 +582,10 @@ def main() -> int:
         args.ef_indexing,
         args.build_threads,
     )
+    (generated_dir / STAMP_NAME).write_text(
+        json.dumps(expected_stamp, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    _replace_fixture(output_dir, generated_dir)
     print(f"[laser-fixture] ready: {output_dir}")
     return 0
 

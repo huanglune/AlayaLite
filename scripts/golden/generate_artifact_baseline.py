@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import shutil
 import struct
 import subprocess
 import sys
@@ -114,15 +113,48 @@ def _generate_python_artifacts(out: Path) -> None:
         del collection
 
 
-def _copy_laser_fixture(out: Path, build_dir: Path) -> bool:
-    source = build_dir / "tests/disk/fixtures/laser_segment"
-    if not source.is_dir():
+def _build_tree_extension(build_dir: Path) -> Path | None:
+    candidates = sorted((build_dir / "python").glob("_alayalitepy*.so"))
+    if len(candidates) != 1:
+        return None
+
+    return candidates[0]
+
+
+def _generate_laser_fixture(out: Path, build_dir: Path) -> bool:
+    extension = _build_tree_extension(build_dir)
+    if extension is None:
+        print(
+            f"LASER fixture omitted: expected exactly one build-tree extension under {build_dir / 'python'}",
+            file=sys.stderr,
+        )
         return False
     target = out / "laser_fixture"
-    target.mkdir()
-    for path in source.iterdir():
-        if path.is_file():
-            shutil.copy2(path, target / path.name)
+    command = [
+        sys.executable,
+        str(ROOT / "tests/disk/fixtures/build_laser_fixture.py"),
+        "--output-dir",
+        str(target),
+        "--extension",
+        str(extension),
+        "--force",
+        "--prefix",
+        "dsqg_seg_00000001",
+        "--count",
+        "2048",
+        "--dim",
+        "128",
+        "--R",
+        "64",
+        "--seed",
+        "42",
+        "--optional-sidecars",
+    ]
+    try:
+        subprocess.run(command, check=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"LASER fixture omitted: generation unavailable: {exc}", file=sys.stderr)
+        return False
     return True
 
 
@@ -149,7 +181,7 @@ def generate(build_dir: Path) -> dict[str, object]:
         subprocess.run(
             [str(memory_vamana_generator), str(out / "memory_vamana")], check=True
         )
-        laser_present = _copy_laser_fixture(out, build_dir)
+        laser_present = _generate_laser_fixture(out, build_dir)
         artifacts = {
             name: _inventory(path)
             for name, path in sorted((p.name, p) for p in out.iterdir() if p.is_dir())
