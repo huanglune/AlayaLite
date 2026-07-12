@@ -81,6 +81,30 @@ struct ClusterStats {
 };
 
 constexpr size_t kSectorLen = 4096;
+constexpr size_t kQGRowTrailerSize = 4;
+
+struct QGPageGeometry {
+  size_t node_per_page;
+  size_t page_size;
+};
+
+/** Derive page geometry for newly built indexes, reserving one v2 trailer per row. */
+inline QGPageGeometry qg_page_geometry(size_t node_len) {
+  if (node_len == 0) {
+    throw std::invalid_argument("qg_page_geometry: node_len must be > 0");
+  }
+  size_t node_per_page = std::max<size_t>(1, kSectorLen / node_len);
+  size_t page_size =
+      (node_per_page * node_len + kSectorLen - 1) / kSectorLen * kSectorLen;
+  while (node_per_page > 1 &&
+         page_size - node_per_page * node_len < node_per_page * kQGRowTrailerSize) {
+    --node_per_page;
+  }
+  if (node_per_page == 1 && page_size - node_len < kQGRowTrailerSize) {
+    page_size += kSectorLen;
+  }
+  return {node_per_page, page_size};
+}
 
 // LASER QG format-v2 metadata.  The two copies occupy [0, 512) and
 // [512, 1024) of the existing 4 KiB metadata sector.  The compatibility
@@ -367,8 +391,9 @@ inline QuantizedGraph::QuantizedGraph(size_t num,
   if (node_len_ == 0) {
     throw std::invalid_argument("QuantizedGraph: node_len_ must be > 0");
   }
-  node_per_page_ = std::max<size_t>(1, kSectorLen / node_len_);
-  page_size_ = (node_per_page_ * node_len_ + kSectorLen - 1) / kSectorLen * kSectorLen;
+  const QGPageGeometry geometry = qg_page_geometry(node_len_);
+  node_per_page_ = geometry.node_per_page;
+  page_size_ = geometry.page_size;
 
   // FHT/RaBitQ/FastScan operate on padded_dim_; raw vectors and exact-distance
   // terms keep using dimension_. The rotator zero-fills [dimension_, padded_dim_),
@@ -385,13 +410,14 @@ inline QuantizedGraph::QuantizedGraph(size_t num,
   if (node_per_page_ * node_len_ > page_size_) {
     throw std::invalid_argument("QuantizedGraph: node_per_page_ * node_len_ must be <= page_size_");
   }
-  if (node_per_page_ != std::max<size_t>(1, kSectorLen / node_len_)) {
-    throw std::invalid_argument("QuantizedGraph: node_per_page_ geometry mismatch");
+  if (node_per_page_ != geometry.node_per_page || page_size_ != geometry.page_size) {
+    throw std::invalid_argument("QuantizedGraph: page geometry mismatch");
   }
   assert(node_len_ > 0);
   assert(page_size_ % kSectorLen == 0);
   assert(node_per_page_ * node_len_ <= page_size_);
-  assert(node_per_page_ == std::max<size_t>(1, kSectorLen / node_len_));
+  assert(node_per_page_ == geometry.node_per_page);
+  assert(page_size_ == geometry.page_size);
   std::cout << "main_dim: " << main_dim << ", dim: " << dim << ", dimension_: " << dimension_
             << ", residual_dimension_: " << residual_dimension_ << std::endl;
   initialize();
@@ -972,11 +998,34 @@ inline void QuantizedGraph::load_disk_index(const char *filename, float search_D
     }
     std::array<uint64_t, kSectorLen / sizeof(uint64_t)> metas{};
     std::memcpy(metas.data(), header.data(), header.size());
-    assert(metas[0] == num_points_);
-    assert(metas[1] == dimension_);
-    assert(metas[3] == node_len_);
-    assert(metas[4] == node_per_page_);
-    assert(metas[8] == std::filesystem::file_size(index_file_name_));
+    const uint64_t file_size = std::filesystem::file_size(index_file_name_);
+    if (metas[0] != num_points_ || metas[1] != dimension_ || metas[3] != node_len_ ||
+        metas[4] == 0 || metas[8] != file_size) {
+      throw std::runtime_error("QuantizedGraph::load_disk_index: invalid v1 metadata");
+    }
+
+    const size_t loaded_npp = static_cast<size_t>(metas[4]);
+    const size_t page_count = (num_points_ + loaded_npp - 1) / loaded_npp;
+    if (page_count == 0 || file_size < kSectorLen ||
+        (file_size - kSectorLen) % page_count != 0) {
+      throw std::runtime_error("QuantizedGraph::load_disk_index: invalid v1 file geometry");
+    }
+    const size_t loaded_page_size = static_cast<size_t>((file_size - kSectorLen) / page_count);
+    const QGPageGeometry new_geometry = qg_page_geometry(node_len_);
+    const size_t legacy_npp = std::max<size_t>(1, kSectorLen / node_len_);
+    const size_t legacy_page_size =
+        (legacy_npp * node_len_ + kSectorLen - 1) / kSectorLen * kSectorLen;
+    const bool is_new_geometry = loaded_npp == new_geometry.node_per_page &&
+                                 loaded_page_size == new_geometry.page_size;
+    const bool is_legacy_geometry =
+        loaded_npp == legacy_npp && loaded_page_size == legacy_page_size;
+    if (loaded_page_size % kSectorLen != 0 ||
+        loaded_npp * node_len_ > loaded_page_size ||
+        (!is_new_geometry && !is_legacy_geometry)) {
+      throw std::runtime_error("QuantizedGraph::load_disk_index: unsupported v1 page geometry");
+    }
+    node_per_page_ = loaded_npp;
+    page_size_ = loaded_page_size;
     entry_point_ = static_cast<PID>(metas[2]);
   }
 

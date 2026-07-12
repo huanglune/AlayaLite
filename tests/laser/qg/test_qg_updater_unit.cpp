@@ -79,7 +79,29 @@ void write_fbin(const std::string &path, const float *data, int32_t n, int32_t d
   out.write(reinterpret_cast<const char *>(&n), 4);
   out.write(reinterpret_cast<const char *>(&dim), 4);
   out.write(reinterpret_cast<const char *>(data),
-            static_cast<std::streamsize>(sizeof(float) * n * dim));
+              static_cast<std::streamsize>(sizeof(float) * n * dim));
+}
+
+void write_ring_vamana(const std::string &path, size_t n, uint32_t degree) {
+  const size_t header_size =
+      sizeof(size_t) + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(size_t);
+  const size_t record_size = sizeof(uint32_t) * (static_cast<size_t>(degree) + 1);
+  const size_t expected_file_size = header_size + n * record_size;
+  const uint32_t start = 0;
+  const size_t frozen_points = 0;
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  ASSERT_TRUE(out.is_open());
+  out.write(reinterpret_cast<const char *>(&expected_file_size), sizeof(expected_file_size));
+  out.write(reinterpret_cast<const char *>(&degree), sizeof(degree));
+  out.write(reinterpret_cast<const char *>(&start), sizeof(start));
+  out.write(reinterpret_cast<const char *>(&frozen_points), sizeof(frozen_points));
+  for (uint32_t i = 0; i < n; ++i) {
+    out.write(reinterpret_cast<const char *>(&degree), sizeof(degree));
+    for (uint32_t j = 0; j < degree; ++j) {
+      const uint32_t neighbor = (i + j + 1) % static_cast<uint32_t>(n);
+      out.write(reinterpret_cast<const char *>(&neighbor), sizeof(neighbor));
+    }
+  }
 }
 
 struct TinyIndex {
@@ -216,7 +238,7 @@ TEST(QGUpdaterUnit, TrailerRoundTripThreeRowsPerPage) {
 
 TEST(QGUpdaterUnit, UnpackRoundTrip) {
   std::mt19937_64 gen(42);
-  for (size_t pd : {64UL, 128UL, 256UL}) {
+  for (size_t pd : {64UL, 128UL, 256UL, 1024UL, 2048UL}) {
     std::vector<uint64_t> bins(kBatchSize * pd / 64);
     for (auto &w : bins) {
       w = gen();
@@ -272,6 +294,89 @@ TEST(QGUpdaterUnit, EdgePayloadMatchesRabitqCodes) {
   for (size_t w = 0; w < pd / 64; ++w) {
     EXPECT_EQ(bins[w], p.bin[w]) << "word " << w;
   }
+}
+
+TEST(QGUpdaterUnit, ExactTwoRowPageMigratesWithReservedTrailersAndLegacyStillRejects) {
+  constexpr size_t n = 96;
+  constexpr size_t main_dim = 128;
+  constexpr size_t full_dim = 256;
+  constexpr size_t degree = 32;
+  constexpr size_t node_len = 2048;
+  const auto geometry = qg_page_geometry(node_len);
+  ASSERT_EQ(geometry.node_per_page, 1U);
+  ASSERT_EQ(geometry.page_size, kSectorLen);
+
+  const auto dir = std::filesystem::temp_directory_path() /
+                   ("qg_updater_exact_page_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const std::string prefix = (dir / "exact").string();
+  const std::string legacy_prefix = (dir / "legacy").string();
+  const std::string vamana_path = prefix + "_vamana.index";
+  const std::string suffix = "_R32_MD128.index";
+  const std::string index_path = prefix + suffix;
+  const std::string legacy_path = legacy_prefix + suffix;
+
+  const auto data = make_data(n, full_dim, 20260712);
+  write_fbin(prefix + "_pca_base.fbin", data.data(), n, full_dim);
+  write_ring_vamana(vamana_path, n, degree);
+  {
+    QuantizedGraph build_qg(n, degree, main_dim, full_dim, /*rotator_seed=*/19);
+    QGBuilder builder(build_qg, /*ef_build=*/64, /*num_threads=*/kRunningTsan ? 1 : 2);
+    builder.build(vamana_path.c_str(), prefix.c_str());
+  }
+
+  std::array<uint64_t, kSectorLen / sizeof(uint64_t)> metas{};
+  {
+    std::ifstream in(index_path, std::ios::binary);
+    ASSERT_TRUE(in.is_open());
+    in.read(reinterpret_cast<char *>(metas.data()), kSectorLen);
+  }
+  ASSERT_EQ(metas[3], node_len);
+  ASSERT_EQ(metas[4], geometry.node_per_page);
+  ASSERT_EQ(metas[8], kSectorLen + n * geometry.page_size);
+
+  for (const std::string &ext :
+       {suffix, suffix + "_rotator", suffix + "_cache_ids", suffix + "_cache_nodes"}) {
+    std::filesystem::copy_file(
+        prefix + ext, legacy_prefix + ext, std::filesystem::copy_options::overwrite_existing);
+  }
+  // Synthesize the old, byte-full npp2 v1 geometry. Its row bytes are never
+  // touched: the compatibility contract here is read-only load plus updater rejection.
+  metas[4] = 2;
+  metas[8] = kSectorLen + ((n + 1) / 2) * kSectorLen;
+  {
+    std::fstream legacy(legacy_path, std::ios::binary | std::ios::in | std::ios::out);
+    ASSERT_TRUE(legacy.is_open());
+    legacy.write(reinterpret_cast<const char *>(metas.data()), kSectorLen);
+  }
+  std::filesystem::resize_file(legacy_path, metas[8]);
+
+  {
+    QuantizedGraph qg(n, degree, main_dim, full_dim);
+    qg.load_disk_index(prefix.c_str(), 0.0F);
+    UpdateParams params;
+    params.direct_io = false;
+    params.write_cache = false;
+    QGUpdater upd(qg, params);
+    EXPECT_EQ(upd.generation(), 1U);
+    EXPECT_EQ(upd.trailer(0).valid_degree, degree);
+    upd.tombstone(1);
+    upd.checkpoint();
+    EXPECT_NE(upd.trailer(1).flags & kQGRowTombstone, 0U);
+  }
+
+  {
+    QuantizedGraph legacy_qg(n, degree, main_dim, full_dim);
+    EXPECT_NO_THROW(legacy_qg.load_disk_index(legacy_prefix.c_str(), 0.0F));
+    try {
+      QGUpdater rejected(legacy_qg, UpdateParams{});
+      FAIL() << "legacy zero-slack v1 unexpectedly migrated";
+    } catch (const std::invalid_argument &e) {
+      EXPECT_NE(std::string(e.what()).find("insufficient slack"), std::string::npos);
+    }
+  }
+  std::filesystem::remove_all(dir);
 }
 
 class QGUpdaterIndexTest : public ::testing::Test {

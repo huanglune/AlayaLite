@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -18,6 +19,37 @@
 #include "index/graph/laser/qg/qg_builder.hpp"
 
 namespace {
+
+TEST(LaserPageGeometryTest, ReservesV2TrailersWithoutChangingExistingSlackLayouts) {
+  struct GeometryCase {
+    size_t node_len;
+    size_t node_per_page;
+    size_t page_size;
+  };
+  constexpr std::array<GeometryCase, 12> cases{{
+      {4096, 1, 8192},    // exact one-sector row grows by one sector
+      {8192, 1, 12288},   // gte768 main448
+      {12288, 1, 16384},  // gte768 main768
+      {2048, 1, 4096},    // exact two-row page drops from npp2 to npp1
+      {1024, 3, 4096},    // exact four-row page drops only as far as needed
+      {2560, 1, 4096},    // SIFT
+      {1920, 2, 4096},    // D0 64+32
+      {8960, 1, 12288},
+      {13056, 1, 16384},
+      {6912, 1, 8192},
+      {5888, 1, 8192},
+      {15360, 1, 16384},  // dbp1024
+  }};
+
+  for (const auto &c : cases) {
+    SCOPED_TRACE(c.node_len);
+    const auto geometry = alaya::laser::qg_page_geometry(c.node_len);
+    EXPECT_EQ(geometry.node_per_page, c.node_per_page);
+    EXPECT_EQ(geometry.page_size, c.page_size);
+    EXPECT_GE(geometry.page_size - geometry.node_per_page * c.node_len,
+              geometry.node_per_page * alaya::laser::kQGRowTrailerSize);
+  }
+}
 
 constexpr size_t kNumPoints = 1024;
 constexpr size_t kMainDim = 64;

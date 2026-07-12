@@ -161,7 +161,7 @@ struct QGRowTrailer {
   uint16_t valid_degree = 0;
   uint16_t flags = 0;
 };
-static_assert(sizeof(QGRowTrailer) == 4);
+static_assert(sizeof(QGRowTrailer) == kQGRowTrailerSize);
 
 constexpr uint16_t kQGRowTombstone = 1U << 0U;
 constexpr uint16_t kQGRowFree = 1U << 1U;
