@@ -169,6 +169,16 @@ def generate(build_dir: Path) -> dict[str, object]:
         if not diskann_generator.is_file():
             raise RuntimeError(f"build the artifact_diskann_generator target first: {diskann_generator}")
         subprocess.run([str(diskann_generator), str(out / "diskann")], check=True)
+        disk_flat_segment_generator = build_dir / "tests/golden/artifact_disk_flat_segment_generator"
+        if not disk_flat_segment_generator.is_file():
+            raise RuntimeError(
+                "build the artifact_disk_flat_segment_generator target first: "
+                f"{disk_flat_segment_generator}"
+            )
+        subprocess.run(
+            [str(disk_flat_segment_generator), str(out / "disk_flat_segment")],
+            check=True,
+        )
         memory_qg_generator = build_dir / "tests/golden/artifact_memory_qg_generator"
         if not memory_qg_generator.is_file():
             raise RuntimeError(
