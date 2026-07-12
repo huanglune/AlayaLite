@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <fstream>
 
+#include "space/quant/rabitq_core.hpp"
 #include "utils/log.hpp"
 #include "utils/metric_type.hpp"
 #include "utils/rabitq_utils/defines.hpp"
@@ -72,43 +73,13 @@ struct RaBitQQuantizer {
                       DataType &f_add,
                       DataType &f_rescale,
                       const MetricType metric) {
-    // map pointer to array
-    ConstRowMajorArrayMap<DataType> data_arr(data, 1, padded_dim_);
-    ConstRowMajorArrayMap<DataType> cent_arr(centroid, 1, padded_dim_);
-    // P^(-1)·（o_r - c）
-    RowMajorArray<DataType> residual_arr = data_arr - cent_arr;
-    // |P^(-1)·(or-c)|^2 = |or-c|^2 (Orthogonal transformations preserve Euclidean distance)
-    DataType l2_sqr_data_and_centroid = ::alaya::l2_sqr<DataType>(residual_arr.data(), padded_dim_);
-
-    // unsigned representation, modifications to y_u will be cast to binary code as well
-    RowMajorArrayMap<int> y_u(binary_code, 1, static_cast<long>(padded_dim_));  // NOLINT
-    // calculate quantization code
-    y_u = (residual_arr > 0).template cast<int>();  // in fact, y_u = x_b
-
-    DataType cb = -((1 << 1) - 1) / 2.F;
-    // y_bar = y_u + c_b * 1_D
-    RowMajorArray<DataType> y_bar = y_u.template cast<DataType>() + cb;
-    // dot product between centroid and xu_cb, i.e.,<y_bar,P^(-1)·c>
-    DataType ip_rotated_c_and_y_bar = dot_product<DataType>(centroid, y_bar.data(), padded_dim_);
-    // dot product between residual and xu_cb, i.e.,<y_bar,P^(-1)·(or-c)>
-    DataType ip_rotated_resi_and_y_bar =
-        dot_product<DataType>(residual_arr.data(), y_bar.data(), padded_dim_);
-    if (ip_rotated_resi_and_y_bar == 0) {
-      ip_rotated_resi_and_y_bar = std::numeric_limits<DataType>::infinity();
-    }
-
-    if (metric == MetricType::L2) {
-      // calculate factors (for l2 metric type only)
-      f_add = l2_sqr_data_and_centroid +
-              (2 * l2_sqr_data_and_centroid * ip_rotated_c_and_y_bar / ip_rotated_resi_and_y_bar);
-      f_rescale = -2 * l2_sqr_data_and_centroid / ip_rotated_resi_and_y_bar;
-    } else if (metric == MetricType::COS || metric == MetricType::IP) {
-      // calculate factors (for cos or ip metric type only)
-      auto ip_residual_centroid = dot_product<DataType>(residual_arr.data(), centroid, padded_dim_);
-      f_add = 1 - ip_residual_centroid +
-              l2_sqr_data_and_centroid * ip_rotated_c_and_y_bar / ip_rotated_resi_and_y_bar;
-      f_rescale = -l2_sqr_data_and_centroid / ip_rotated_resi_and_y_bar;
-    }
+    const auto factors =
+        RaBitQCore::memory_factors(data, centroid, padded_dim_, binary_code, metric);
+    f_add = factors.base;
+    // The legacy memory scan consumes <s/2,q>. L2 historically stores twice the canonical
+    // <s,q> scale; IP/COS already store the canonical scale and must remain byte-compatible.
+    f_rescale =
+        metric == MetricType::L2 ? 2 * factors.signed_query_scale : factors.signed_query_scale;
   }
 
  public:
