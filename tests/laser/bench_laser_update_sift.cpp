@@ -135,7 +135,7 @@ struct Args {
   float alpha = 1.2F;
   uint64_t seed = 42;
   std::string arm = "alpha";  // none|evict|alpha|full
-  uint32_t direct = 1;        // 1 = O_DIRECT updater fd (fallback buffered), 0 = buffered
+  uint32_t direct = 0;        // 1 = O_DIRECT write fd (P0.1 attribution arm), 0 = buffered (default)
   std::vector<uint32_t> efs = {60, 80, 100, 150, 200, 300};
 };
 

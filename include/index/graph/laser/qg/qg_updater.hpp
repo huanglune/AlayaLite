@@ -227,9 +227,13 @@ struct UpdateParams {
   size_t alpha_check_max = 16;  // captured neighbors tested per reverse edge
   size_t max_points = 0;        // page-version table capacity; 0 -> 2*N + 4096
   size_t splice_rerank = 4;     // consolidation: FastScan-recalled candidates reranked exactly
-  bool direct_io = true;        // O_DIRECT data fd (buffered pwrite serializes on the
-                                // ext4 inode lock); falls back to buffered when the
-                                // filesystem rejects O_DIRECT (e.g. tmpfs)
+  bool direct_io = false;       // route writes through a dedicated O_DIRECT fd.
+                                // P0.1 verdict: synchronous per-patch DIO writes LOSE
+                                // to buffered pwrite (5.9k vs 7.4k inserts/s @64T) —
+                                // the kernel page cache is already a write-back cache.
+                                // Keep buffered until the user-space dirty-page cache
+                                // (P0.2) moves writes off the hot path; the DIO fd is
+                                // meant for its batched flush.
 };
 
 class QGUpdater {
