@@ -30,6 +30,7 @@
 #include "index/graph/qg/detail/qg_segment_bridge.hpp"
 #include "index/graph/qg/qg_segment.hpp"
 #include "space/rabitq_space.hpp"
+#include "utils/openmp.hpp"
 
 namespace alaya {
 namespace {
@@ -110,6 +111,9 @@ class QgSegmentTest : public ::testing::Test {
   static void SetUpTestSuite() { spdlog::set_level(spdlog::level::warn); }
 
   void SetUp() override {
+    // libgomp is not TSan-instrumented. Keep fixture fit/build serial so the
+    // sanitizer run isolates the declared concurrent search-only profile.
+    platform::set_openmp_thread_count(1);
     root_ = std::filesystem::temp_directory_path() /
             ("alayalite-qg-segment-" + std::to_string(reinterpret_cast<std::uintptr_t>(this)));
     std::filesystem::remove_all(root_);
