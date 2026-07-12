@@ -28,6 +28,7 @@
 #include <type_traits>
 
 #include "utils/log.hpp"
+#include "simd/fastscan.hpp"
 #include "utils/rabitq_utils/defines.hpp"
 
 namespace alaya::fastscan {
@@ -55,28 +56,7 @@ inline void accumulate_scalar(const uint8_t *ALAYA_RESTRICT codes,
                               const uint8_t *ALAYA_RESTRICT lp_table,
                               uint16_t *ALAYA_RESTRICT result,
                               size_t dim) {
-  const size_t code_length = dim << 2;
-  std::memset(result, 0, kBatchSize * sizeof(uint16_t));
-
-  for (size_t offset = 0; offset < code_length; offset += 32) {
-    for (size_t lane = 0; lane < 16; ++lane) {
-      const uint8_t code = codes[offset + lane];
-      const uint8_t low_code = code & 0x0F;
-      const uint8_t high_code = code >> 4;
-
-      result[kPerm0[lane]] += static_cast<uint16_t>(lp_table[offset + low_code]);
-      result[kPerm0[lane] + 16] += static_cast<uint16_t>(lp_table[offset + high_code]);
-    }
-
-    for (size_t lane = 0; lane < 16; ++lane) {
-      const uint8_t code = codes[offset + 16 + lane];
-      const uint8_t low_code = code & 0x0F;
-      const uint8_t high_code = code >> 4;
-
-      result[kPerm0[lane]] += static_cast<uint16_t>(lp_table[offset + 16 + low_code]);
-      result[kPerm0[lane] + 16] += static_cast<uint16_t>(lp_table[offset + 16 + high_code]);
-    }
-  }
+  ::alaya::simd::fastscan::accumulate_generic(dim, codes, lp_table, result);
 }
 
 }  // namespace detail

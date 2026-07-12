@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <random>
 #include <vector>
 
 #include "index/graph/laser/qg/qg_scanner.hpp"
@@ -133,6 +134,44 @@ TEST(LaserSimdDispatchTest, GenericKernelsProduceScalarResults) {
             values.size());
   for (size_t i = 0; i < values.size(); ++i) {
     EXPECT_FLOAT_EQ(rotated[i], -values[i]);
+  }
+}
+
+TEST(LaserSimdDispatchTest, FastScanAccumulateDifferentialFuzz) {
+  std::mt19937 rng(0xFA575CAU);
+  std::uniform_int_distribution<int> byte_dist(0, 255);
+  for (size_t dim : {16U, 32U, 64U, 128U, 256U}) {
+    for (size_t trial = 0; trial < 200; ++trial) {
+      std::vector<uint8_t> codes(dim << 2);
+      std::vector<uint8_t> lut(dim << 2);
+      std::generate(codes.begin(), codes.end(), [&] { return byte_dist(rng); });
+      std::generate(lut.begin(), lut.end(), [&] { return byte_dist(rng); });
+      std::array<uint16_t, 32> oracle{};
+      for (size_t off = 0; off < (dim << 2); off += 32) {
+        for (size_t lane = 0; lane < 16; ++lane) {
+          for (size_t half = 0; half < 2; ++half) {
+            const uint8_t code = codes[off + half * 16 + lane];
+            const size_t id = ::alaya::simd::fastscan::kPackedLaneOrder[lane];
+            oracle[id] = static_cast<uint16_t>(oracle[id] + lut[off + half * 16 + (code & 15)]);
+            oracle[id + 16] =
+                static_cast<uint16_t>(oracle[id + 16] + lut[off + half * 16 + (code >> 4)]);
+          }
+        }
+      }
+      std::array<uint16_t, 32> generic{};
+      ::alaya::simd::fastscan::accumulate_generic(dim, codes.data(), lut.data(), generic.data());
+      EXPECT_EQ(generic, oracle) << "dim=" << dim << " trial=" << trial;
+#ifdef ALAYA_ARCH_X86
+      std::array<uint16_t, 32> avx2{};
+      ::alaya::simd::fastscan::accumulate_avx2(dim, codes.data(), lut.data(), avx2.data());
+      EXPECT_EQ(avx2, oracle) << "dim=" << dim << " trial=" << trial;
+      if (has_avx512_bw()) {
+        std::array<uint16_t, 32> avx512{};
+        ::alaya::simd::fastscan::accumulate_avx512(dim, codes.data(), lut.data(), avx512.data());
+        EXPECT_EQ(avx512, oracle) << "dim=" << dim << " trial=" << trial;
+      }
+#endif
+    }
   }
 }
 

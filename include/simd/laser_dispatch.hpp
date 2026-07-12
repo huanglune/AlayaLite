@@ -13,6 +13,7 @@
 #include <stdexcept>
 
 #include "simd/cpu_features.hpp"
+#include "simd/fastscan.hpp"
 #include "utils/log.hpp"
 #include "utils/platform.hpp"
 
@@ -95,33 +96,11 @@ inline auto select_laser_simd(Fn generic_fn, Fn avx512_fn, Fn avx2_fn) -> Fn {
 
 namespace detail {
 
-constexpr std::array<int, 16> kPackedLaneOrder =
-    {0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15};
-
 inline void accumulate_impl_generic(size_t dim,
                                     const uint8_t *ALAYA_RESTRICT codes,
                                     const uint8_t *ALAYA_RESTRICT LUT,
                                     uint16_t *ALAYA_RESTRICT result) {
-  std::fill(result, result + 32, static_cast<uint16_t>(0));
-  const size_t num_codebook = dim >> 2;
-  const uint8_t *packed = codes;
-  for (size_t codebook = 0; codebook < num_codebook; codebook += 2) {
-    const uint8_t *lut0 = LUT + codebook * 16;
-    const uint8_t *lut1 = lut0 + 16;
-    for (size_t lane = 0; lane < kPackedLaneOrder.size(); ++lane) {
-      const int low_id = kPackedLaneOrder[lane];
-      const int high_id = low_id + 16;
-
-      const uint8_t packed0 = packed[lane];
-      result[low_id] = static_cast<uint16_t>(result[low_id] + lut0[packed0 & 0x0FU]);
-      result[high_id] = static_cast<uint16_t>(result[high_id] + lut0[packed0 >> 4U]);
-
-      const uint8_t packed1 = packed[lane + 16];
-      result[low_id] = static_cast<uint16_t>(result[low_id] + lut1[packed1 & 0x0FU]);
-      result[high_id] = static_cast<uint16_t>(result[high_id] + lut1[packed1 >> 4U]);
-    }
-    packed += 32;
-  }
+  ::alaya::simd::fastscan::accumulate_generic(dim, codes, LUT, result);
 }
 
 inline void appro_dist_impl_generic(size_t num_points,
@@ -190,47 +169,7 @@ inline void accumulate_impl_avx512(size_t dim,
                                    const uint8_t *ALAYA_RESTRICT codes,
                                    const uint8_t *ALAYA_RESTRICT LUT,
                                    uint16_t *ALAYA_RESTRICT result) {
-  size_t code_length = dim << 2;
-  __m512i c;
-  __m512i lo;
-  __m512i hi;
-  __m512i lut;
-  __m512i res_lo;
-  __m512i res_hi;
-
-  const __m512i lo_mask = _mm512_set1_epi8(0x0f);
-  __m512i accu0 = _mm512_setzero_si512();
-  __m512i accu1 = _mm512_setzero_si512();
-  __m512i accu2 = _mm512_setzero_si512();
-  __m512i accu3 = _mm512_setzero_si512();
-
-  for (size_t i = 0; i < code_length; i += 64) {
-    c = _mm512_loadu_si512(&codes[i]);
-    lut = _mm512_loadu_si512(&LUT[i]);
-    lo = _mm512_and_si512(c, lo_mask);
-    hi = _mm512_and_si512(_mm512_srli_epi16(c, 4), lo_mask);
-
-    res_lo = _mm512_shuffle_epi8(lut, lo);
-    res_hi = _mm512_shuffle_epi8(lut, hi);
-
-    accu0 = _mm512_add_epi16(accu0, res_lo);
-    accu1 = _mm512_add_epi16(accu1, _mm512_srli_epi16(res_lo, 8));
-    accu2 = _mm512_add_epi16(accu2, res_hi);
-    accu3 = _mm512_add_epi16(accu3, _mm512_srli_epi16(res_hi, 8));
-  }
-  accu0 = _mm512_sub_epi16(accu0, _mm512_slli_epi16(accu1, 8));
-  accu2 = _mm512_sub_epi16(accu2, _mm512_slli_epi16(accu3, 8));
-
-  __m512i ret1 = _mm512_add_epi16(_mm512_mask_blend_epi64(0b11110000, accu0, accu1),
-                                  _mm512_shuffle_i64x2(accu0, accu1, 0b01001110));
-  __m512i ret2 = _mm512_add_epi16(_mm512_mask_blend_epi64(0b11110000, accu2, accu3),
-                                  _mm512_shuffle_i64x2(accu2, accu3, 0b01001110));
-  __m512i ret = _mm512_setzero_si512();
-
-  ret = _mm512_add_epi16(ret, _mm512_shuffle_i64x2(ret1, ret2, 0b10001000));
-  ret = _mm512_add_epi16(ret, _mm512_shuffle_i64x2(ret1, ret2, 0b11011101));
-
-  _mm512_storeu_si512(result, ret);
+  ::alaya::simd::fastscan::accumulate_avx512(dim, codes, LUT, result);
 }
 
 ALAYA_TARGET_AVX2
@@ -238,52 +177,7 @@ inline void accumulate_impl_avx2(size_t dim,
                                  const uint8_t *ALAYA_RESTRICT codes,
                                  const uint8_t *ALAYA_RESTRICT LUT,
                                  uint16_t *ALAYA_RESTRICT result) {
-  size_t code_length = dim << 2;
-  __m256i c, lo, hi, lut, res_lo, res_hi;
-
-  __m256i low_mask = _mm256_set1_epi8(0xf);
-  __m256i accu0 = _mm256_setzero_si256();
-  __m256i accu1 = _mm256_setzero_si256();
-  __m256i accu2 = _mm256_setzero_si256();
-  __m256i accu3 = _mm256_setzero_si256();
-
-  for (size_t i = 0; i < code_length; i += 64) {
-    c = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&codes[i]));
-    lut = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&LUT[i]));
-    lo = _mm256_and_si256(c, low_mask);
-    hi = _mm256_and_si256(_mm256_srli_epi16(c, 4), low_mask);
-
-    res_lo = _mm256_shuffle_epi8(lut, lo);
-    res_hi = _mm256_shuffle_epi8(lut, hi);
-
-    accu0 = _mm256_add_epi16(accu0, res_lo);
-    accu1 = _mm256_add_epi16(accu1, _mm256_srli_epi16(res_lo, 8));
-    accu2 = _mm256_add_epi16(accu2, res_hi);
-    accu3 = _mm256_add_epi16(accu3, _mm256_srli_epi16(res_hi, 8));
-
-    c = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&codes[i + 32]));
-    lut = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&LUT[i + 32]));
-    lo = _mm256_and_si256(c, low_mask);
-    hi = _mm256_and_si256(_mm256_srli_epi16(c, 4), low_mask);
-
-    res_lo = _mm256_shuffle_epi8(lut, lo);
-    res_hi = _mm256_shuffle_epi8(lut, hi);
-
-    accu0 = _mm256_add_epi16(accu0, res_lo);
-    accu1 = _mm256_add_epi16(accu1, _mm256_srli_epi16(res_lo, 8));
-    accu2 = _mm256_add_epi16(accu2, res_hi);
-    accu3 = _mm256_add_epi16(accu3, _mm256_srli_epi16(res_hi, 8));
-  }
-
-  accu0 = _mm256_sub_epi16(accu0, _mm256_slli_epi16(accu1, 8));
-  __m256i dis0 = _mm256_add_epi16(_mm256_permute2f128_si256(accu0, accu1, 0x21),
-                                  _mm256_blend_epi32(accu0, accu1, 0xF0));
-  _mm256_storeu_si256(reinterpret_cast<__m256i *>(result), dis0);
-
-  accu2 = _mm256_sub_epi16(accu2, _mm256_slli_epi16(accu3, 8));
-  __m256i dis1 = _mm256_add_epi16(_mm256_permute2f128_si256(accu2, accu3, 0x21),
-                                  _mm256_blend_epi32(accu2, accu3, 0xF0));
-  _mm256_storeu_si256(reinterpret_cast<__m256i *>(&result[16]), dis1);
+  ::alaya::simd::fastscan::accumulate_avx2(dim, codes, LUT, result);
 }
 
 ALAYA_TARGET_AVX512_BW
