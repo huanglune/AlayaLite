@@ -17,32 +17,34 @@ concept DescriptorProvider = requires(const T &segment) {
 };
 
 template <class T>
-concept Searchable = DescriptorProvider<T> &&
-                     requires(const T &segment, QueryView query, const SearchOptions &options,
-                              SearchSink output) {
-                       { segment.search(query, options, output) } -> std::same_as<SearchResult>;
-                     };
+concept Searchable =
+    DescriptorProvider<T> &&
+    requires(const T &segment, QueryView query, const SearchOptions &options, SearchSink output) {
+      { segment.search(query, options, output) } -> std::same_as<SearchResult>;
+    };
 
 template <class T>
-concept BatchSearchable = Searchable<T> &&
-                          requires(const T &segment, QueryBatchView queries,
-                                   const SearchOptions &options, SearchSink output) {
-                            { segment.batch_search(queries, options, output) }
-                                -> std::same_as<BatchSearchResult>;
-                          };
-
-template <class T>
-concept Mutable = Searchable<T> &&
-                  requires(T &segment, VectorBatchView batch,
-                           std::span<const ExternalId> ids, MutationContext &context) {
-                    { segment.insert(batch, context) } -> std::same_as<MutationResult>;
-                    { segment.erase(ids, context) } -> std::same_as<MutationResult>;
-                  };
-
-template <class T>
-concept Persistable = requires(T &segment, CheckpointContext &context) {
-  { segment.checkpoint(context) } -> std::same_as<CheckpointToken>;
+concept BatchSearchable = Searchable<T> && requires(const T &segment,
+                                                    QueryBatchView queries,
+                                                    const SearchOptions &options,
+                                                    SearchSink output) {
+  { segment.batch_search(queries, options, output) } -> std::same_as<BatchSearchResult>;
 };
+
+template <class T>
+concept Mutable = Searchable<T> && requires(T &segment,
+                                            VectorBatchView batch,
+                                            std::span<const ExternalId> ids,
+                                            MutationContext &context) {
+  { segment.insert(batch, context) } -> std::same_as<MutationResult>;
+  { segment.erase(ids, context) } -> std::same_as<MutationResult>;
+};
+
+template <class T>
+concept Persistable =
+    requires(const T &segment, ArtifactWriter &writer, const SaveOptions &options) {
+      { segment.save(writer, options) } -> std::same_as<ArtifactManifest>;
+    };
 
 template <class T>
 concept Sealable = Mutable<T> && requires(T &segment, SealContext &context) {

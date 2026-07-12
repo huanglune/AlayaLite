@@ -30,7 +30,7 @@ struct FullSegment : SearchOnly {
   }
   auto insert(VectorBatchView, MutationContext &) -> MutationResult { return {}; }
   auto erase(std::span<const ExternalId>, MutationContext &) -> MutationResult { return {}; }
-  auto checkpoint(CheckpointContext &) -> CheckpointToken { return {}; }
+  auto save(ArtifactWriter &, const SaveOptions &) const -> ArtifactManifest { return {}; }
   auto seal(SealContext &) -> SealedArtifact { return {}; }
   auto supports_filter(const void *) const noexcept -> FilterSupport {
     return FilterSupport::traversal;

@@ -106,6 +106,23 @@ struct ArtifactManifest {
   std::span<const Artifact> artifacts{};
 };
 
+// Non-owning filesystem views used by memory segments.  The writer names the
+// destinations selected by the caller; engines keep ownership and atomic
+// publication policy outside the segment.
+struct ArtifactView {
+  std::string_view graph_path{};
+  std::string_view data_path{};
+  std::string_view quant_path{};
+};
+
+using ArtifactWriter = ArtifactView;
+
+struct OpenOptions {};
+struct OpenContext {
+  const void *opaque{};
+};
+struct SaveOptions {};
+
 struct MutationContext {
   const void *opaque{};
 };
