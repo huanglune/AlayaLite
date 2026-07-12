@@ -211,6 +211,15 @@ class DiskFlatSegmentSearcher : public SegmentSearcher {
     return static_cast<const uint64_t *>(ids_mmap_.data());
   }
 
+  // Stable read-only views used by the DiskFlatSegment export cursor. The
+  // mmaps remain owned by this searcher, and export state keeps the searcher
+  // alive for the cursor lifetime.
+  [[nodiscard]] auto vectors() const noexcept -> const float * {
+    return static_cast<const float *>(vectors_mmap_.data());
+  }
+
+  [[nodiscard]] auto manifest() const noexcept -> const SegmentManifest & { return manifest_; }
+
  private:
   static constexpr uint64_t kMaxDim = static_cast<uint64_t>(UINT32_MAX);
 
