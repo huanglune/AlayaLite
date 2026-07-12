@@ -18,6 +18,7 @@ the named public object; “adapter” means that another object supplies it.
 | `DiskANNIndex` static | no | no | `build` creates a file family | `load` | no | single/batch/pipeline | concurrent searches use a bounded scratch pool |
 | `DiskANNIndex` updatable | yes | yes | `flush_pages` / `flush` | `load(updatable=true)` | no | single/batch/pipeline | dark-until-publish inserts, tombstone snapshots and internal locks define visibility; no SDK-wide guarantee |
 | `DiskCollection(disk_flat)` segment | append to pending, then new segment | no | `flush` publishes | `open` | no | yes | published segments are immutable; collection lock is process-exclusive; searches may run concurrently |
+| `DiskFlatSegment` exact oracle | no | no | transactional native-file save | v1/v2 dual-read open | Collection postfilter only | exact single/batch plus export | immutable mmap payload; reentrant search-only profile |
 | `DiskCollection(disk_vamana)` segment | append to pending, then new segment | no | `flush` publishes | `open` | no | yes | same immutable publication model |
 | `DiskCollection(disk_laser)` segment | no (`add` is unsupported) | no | import only | `open` | no | yes | imported segment is immutable; searcher is intended for concurrent search |
 | high-level `Collection` | yes / upsert | yes by item id/filter | yes | yes | yes | vector, hybrid and scalar | delegates to one memory `Index`; no cross-operation transaction or thread-safety contract |
@@ -76,6 +77,7 @@ of acknowledged/searchable/durable.
 | memory facade | graph file, data file, optional quant file; memory QG retains its one-file `rabitq.data` family; Vamana-memory retains `graph.index` plus DiskANN `.fbin` vectors; recovery additionally has `CURRENT`, snapshot manifest/files, RocksDB checkpoint and WAL |
 | generic `Graph` | graph header/body plus optional overlay graph data |
 | DiskFlat segment | `manifest.txt`, `ids.u64.bin`, `vectors.f32.bin` |
+| DiskFlat Segment control plane (writer-gated) | native DiskFlat files plus `ARTIFACTS.v2`, `READY`, and collection manifest v2 |
 | Vamana segment | Flat files plus `graph.index` |
 | LASER segment | imported LASER index and sidecars, external ids file, segment manifest |
 | DiskCollection | `collection_manifest.txt`, `.lock`, `segments/seg_NNNNNNNN/**` |
@@ -101,6 +103,7 @@ checking in 33 redundant copies.
 | Vamana-memory | no Python dispatch row | `VamanaMemSegment` lifecycle/capability/TSan tests | independent `graph.index` + `vectors.fbin` family |
 | DiskANN | no public Python entry | direct `DiskANNIndex` instantiation | complete small DiskANN directory |
 | DiskCollection Flat | yes | direct collection/searcher types | collection + Flat segment |
+| DiskFlat Segment exact oracle | no Python dispatch row | build/open/search/batch/save/export, differential and TSan tests | independent v2-gated golden plus byte equality with native Flat files |
 | DiskCollection Vamana | common facade behavior; engine-specific existing tests | direct collection/Vamana surface | collection + Vamana segment |
 | DiskCollection LASER | common facade behavior; engine-specific existing tests | LASER build closure remains in existing CTest | deterministic LASER fixture/sidecars |
 | high-level Collection | yes | `PyIndex` is Python-layer C++, documented as such | memory artifact + recovery inventory |
@@ -109,6 +112,7 @@ Regenerate and compare artifacts with:
 
 ```bash
 cmake --build build/Release --target artifact_diskann_generator \
+  artifact_disk_flat_segment_generator \
   artifact_memory_qg_generator artifact_memory_vamana_generator
 PYTHONPATH=python/src:build/Release/python \
   python scripts/golden/generate_artifact_baseline.py

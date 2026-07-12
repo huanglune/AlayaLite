@@ -260,6 +260,38 @@ removed before Gate 5, so `hnsw_segment` has no runtime fallback bit and rolls
 back as the Gate 0 source/git revert unit. Feature-bit rollback applies only to
 rows migrated from Gate 5 onward.
 
+## Disk segment variant
+
+DiskFlat establishes the Gate 6 variant of this pattern. A disk migration must
+preserve the engine-native directory as a legacy-readable payload rather than
+re-encode it through a memory `Space` serializer. The retained builder runs
+inside a Collection staging transaction, and the new Segment composes the
+retained searcher over the atomically published directory. Differential tests
+compare native files byte for byte and compare IDs plus float score bit
+patterns against the direct searcher.
+
+Disk `open` has two compatibility directions: a new Segment opens the retained
+v1 collection/segment manifests, and the retained searcher opens a new
+Segment's native payload. Manifest v2 is a Collection control file around that
+payload, not a replacement for its native `manifest.txt`. Its writer has an
+independent default-off feature gate, while its reader is permanent under the
+roll-forward policy.
+
+Disk segments also add the first executable `Exportable` pattern. A cursor
+must keep immutable mmap ownership pinned, yield stable logical IDs and typed
+stored-vector views in native row order, and identify how metadata references
+are resolved. DiskFlat returns empty per-row metadata references because
+Collection owns metadata; it does not add a sidecar that would silently change
+the legacy artifact family. Build/Open/Search resource contexts must reject
+insufficient reservations or credits as `resource_exhausted`. Immutable disk
+engines omit the mutation bundle entirely.
+
+The disk registry is separate from the generated memory dispatch allowlist.
+Each migrated disk engine records new and legacy factory keys plus an
+independent feature bit. Disabling the new factory returns `not_supported` for
+that constructor and leaves `DiskCollection` v1 untouched; it does not silently
+send a new-control-plane request through the legacy mutable facade.
+
 ## Mutation gate outcome
 
 The executable characterization in `tests/index/hnsw_test.cpp` checks the
