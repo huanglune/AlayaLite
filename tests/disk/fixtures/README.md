@@ -24,7 +24,7 @@ Default outputs under the selected output directory:
 - `dsqg_seg_00000001_medoids_indices` - optional medoid indices sidecar
 
 The script also leaves build-only intermediates in the fixture directory:
-`dsqg_seg_00000001_pca_base.fbin` for `QGBuilder::build` and
+`dsqg_seg_00000001_pca_base.fbin` for the disk_laser_qg builder and
 `dsqg_seg_00000001_vamana_graph.index` for the temporary Vamana graph.
 The LASER segment importer ignores these extra files.
 
