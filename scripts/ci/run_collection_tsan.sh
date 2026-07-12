@@ -12,7 +12,16 @@ if [[ -r /proc/sys/fs/aio-nr && -r /proc/sys/fs/aio-max-nr ]]; then
 fi
 
 cmake --preset tsan -S "$ROOT"
-cmake --build --preset tsan --target segmented_collection_stress_test
+cmake --build --preset tsan --target segmented_collection_stress_test nsg_segment_test fusion_segment_test
 
 export TSAN_OPTIONS=${TSAN_OPTIONS:-halt_on_error=1:history_size=7}
 setarch "$ARCH" -R "$ROOT/build/TSan/tests/collection/segmented_collection_stress_test"
+setarch "$ARCH" -R "$ROOT/build/TSan/tests/index/nsg_segment_test" \
+  --gtest_filter=NsgSegmentTest.ConcurrentSearchOnlyIsReentrant
+# The retained HNSW construction kernel used by Fusion has a lock-order cycle
+# in fixture construction. This invocation exercises immutable search only, so
+# keep TSan's race detector and halt-on-error policy while excluding that
+# independent build-time deadlock diagnostic.
+TSAN_OPTIONS="${TSAN_OPTIONS}:detect_deadlocks=0" \
+  setarch "$ARCH" -R "$ROOT/build/TSan/tests/index/fusion_segment_test" \
+  --gtest_filter=FusionSegmentTest.ConcurrentSearchOnlyIsReentrant
