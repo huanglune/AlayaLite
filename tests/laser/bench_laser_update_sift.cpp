@@ -20,6 +20,7 @@
 // The insert mode mutates the index files in place — clone the artifact
 // directory first when comparing arms.
 
+#include <malloc.h>
 #include <omp.h>
 
 #include <algorithm>
@@ -326,6 +327,8 @@ int do_insert(const Args &a) {
   const auto &s = upd.stats();
   std::cout << "[insert] done: " << a.count << " inserts in " << secs << "s = " << a.count / secs
             << " inserts/s (single writer)\n";
+  std::cout << "[insert] phases: drain=" << s.drain_us / 1e6 << "s flush=" << s.flush_us / 1e6
+            << "s\n";
   std::cout << "[insert] io: search_reads=" << s.search_page_reads
             << " patch_reads=" << s.patch_page_reads << " writes=" << s.page_writes
             << " logical_writes=" << s.logical_row_writes
@@ -537,6 +540,14 @@ int do_eval(const Args &a) {
 }  // namespace
 
 int main(int argc, char **argv) {
+  // The updater's staged-backlink drain makes millions of short-lived
+  // (often aligned) allocations per batch; glibc's default heap trim/grow
+  // cycling serializes all threads on mprotect/mmap_sem (measured: drain
+  // 10.9s -> 5.1s at 64T with these settings). See docs §9.2.
+  mallopt(M_TRIM_THRESHOLD, 1 << 30);
+  mallopt(M_TOP_PAD, 1 << 28);
+  mallopt(M_MMAP_THRESHOLD, 1 << 30);
+
   try {
     const Args a = parse(argc, argv);
     if (a.mode == "build") {

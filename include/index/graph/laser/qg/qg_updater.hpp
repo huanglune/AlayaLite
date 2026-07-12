@@ -68,10 +68,12 @@
 #include <cassert>
 #include <cerrno>
 #include <cfloat>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -102,7 +104,10 @@ namespace alaya::laser {
 inline void unpack_codes_block(size_t padded_dim, const uint8_t *block, uint64_t *binary_out) {
   const size_t num_codebook = padded_dim / 4;
   const size_t bytes_per_code = padded_dim / 8;
-  std::vector<uint8_t> tmp(kBatchSize * bytes_per_code);
+  // Reused scratch: this runs millions of times per drain phase, and per-call
+  // heap traffic (with 64 allocating threads) dominated the profile.
+  thread_local std::vector<uint8_t> tmp;
+  tmp.resize(kBatchSize * bytes_per_code);
 
   // Invert pack_codes_helper: nibble columns -> per-code byte rows.
   const uint8_t *codes2 = block;
@@ -159,11 +164,14 @@ struct EdgePayload {
  * @param padded_dim   main (== padded) dimension
  * @param x_res_sqr    ||v_residual||^2, pre-added to triple_x like the builder
  */
-inline EdgePayload make_edge_payload(const float *c_rot,
-                                     const float *x_rot,
-                                     size_t padded_dim,
-                                     float x_res_sqr) {
-  EdgePayload out;
+/// Returns a reference to a thread_local payload (valid until this thread's
+/// next call) — per-edge heap traffic in the drain phase serialized on glibc.
+inline const EdgePayload &make_edge_payload(const float *c_rot,
+                                            const float *x_rot,
+                                            size_t padded_dim,
+                                            float x_res_sqr) {
+  thread_local EdgePayload out;
+  out.degenerate = false;
   out.bin.assign(padded_dim / 64, 0);
 
   // Degeneracy pre-check: identical main-dim vectors cannot be sign-encoded.
@@ -179,14 +187,20 @@ inline EdgePayload make_edge_payload(const float *c_rot,
 
   // Delegate to the builder's own kernel with a 1-row matrix so the patched
   // slot is bit-identical to a builder-written slot (same Eigen accumulation
-  // order and float rounding).
-  RowMatrix<float> x(1, static_cast<int64_t>(padded_dim));
-  RowMatrix<float> c(1, static_cast<int64_t>(padded_dim));
+  // order and float rounding). Scratch is thread_local: Eigen's aligned
+  // alloc/free per edge was the top drain-phase cost at 64 threads.
+  thread_local RowMatrix<float> x;
+  thread_local RowMatrix<float> c;
+  if (x.cols() != static_cast<int64_t>(padded_dim)) {
+    x.resize(1, static_cast<int64_t>(padded_dim));
+    c.resize(1, static_cast<int64_t>(padded_dim));
+  }
   for (size_t j = 0; j < padded_dim; ++j) {
     x(0, static_cast<int64_t>(j)) = x_rot[j];
     c(0, static_cast<int64_t>(j)) = c_rot[j];
   }
-  std::vector<uint8_t> block(padded_dim * 4);  // one 32-slot FastScan block
+  thread_local std::vector<uint8_t> block;
+  block.assign(padded_dim * 4, 0);  // one 32-slot FastScan block
   rabitq_codes(x, c, block.data(), &out.triple_x, &out.factor_dq, &out.factor_vq);
   out.triple_x += x_res_sqr;
 
@@ -209,6 +223,8 @@ struct UpdateStats {
   uint64_t physical_writes = 0;  // explicit P0.2 name; same counter as page_writes
   uint64_t logical_row_writes = 0;
   uint64_t flush_unique_pages = 0;
+  uint64_t drain_us = 0;  // staged-backlink drain wall time (summed over flushes)
+  uint64_t flush_us = 0;  // dirty-page writeback wall time (summed over flushes)
   uint64_t free_slot_fills = 0;
   uint64_t evictions = 0;
   uint64_t est_skips = 0;    // new edge longer than current farthest -> skipped
@@ -237,7 +253,11 @@ struct UpdateParams {
                                 // Keep buffered until the user-space dirty-page cache
                                 // (P0.2) moves writes off the hot path; the DIO fd is
                                 // meant for its batched flush.
-  bool write_cache = true;      // absorb page RMWs and write each dirty page once per batch
+  bool write_cache = true;      // absorb page RMWs in a resident page pool (see cache_cap_pages)
+  size_t cache_cap_pages = 1U << 20;  // pool high watermark (pages). Hub rows are patched by
+                                      // many batches; keeping pages resident coalesces those
+                                      // writes across batches (physical writes happen only on
+                                      // watermark eviction, consolidate() and finalize())
 };
 
 class QGUpdater {
@@ -310,6 +330,8 @@ class QGUpdater {
     s.physical_writes = s.page_writes;
     s.logical_row_writes = stats_.logical_row_writes.load();
     s.flush_unique_pages = stats_.flush_unique_pages.load();
+    s.drain_us = stats_.drain_us.load();
+    s.flush_us = stats_.flush_us.load();
     s.free_slot_fills = stats_.free_slot_fills.load();
     s.evictions = stats_.evictions.load();
     s.est_skips = stats_.est_skips.load();
@@ -349,10 +371,25 @@ class QGUpdater {
     committed_.store(new_committed, std::memory_order_release);
   }
 
-  /** @brief Drain staged backlinks, then persist every dirty cached page. */
+  /**
+   * @brief Batch barrier maintenance: drain staged backlinks, then enforce the
+   * pool watermark. Pages stay resident across batches (searches read through
+   * the pool), so no writeback happens here until the pool exceeds
+   * cache_cap_pages — cross-batch coalescing is the point of the pool.
+   */
   void flush(size_t num_threads) {
+    const auto t0 = std::chrono::steady_clock::now();
     drain_staged_edges(num_threads);
-    flush_dirty(num_threads);
+    const auto t1 = std::chrono::steady_clock::now();
+    if (write_cache_.total_pages() > params_.cache_cap_pages) {
+      flush_dirty(num_threads);
+      evict_clean(params_.cache_cap_pages / 2);
+    }
+    const auto t2 = std::chrono::steady_clock::now();
+    stats_.drain_us.fetch_add(
+        std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+    stats_.flush_us.fetch_add(
+        std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count());
   }
 
   /**
@@ -459,7 +496,8 @@ class QGUpdater {
       }
       consolidate_row(u, n, target);
     }
-    flush(num_threads);
+    drain_staged_edges(num_threads);
+    flush_dirty(num_threads);
   }
 
   /**
@@ -467,7 +505,8 @@ class QGUpdater {
    * fresh QuantizedGraph(num_points(), ...).load_disk_index() accepts the file.
    */
   void finalize() {
-    flush(1);
+    drain_staged_edges(1);
+    flush_dirty(1);
     const size_t n = committed_.load(std::memory_order_acquire);
     std::vector<uint64_t> metas(kSectorLen / sizeof(uint64_t), 0);
     read_at(0, reinterpret_cast<char *>(metas.data()), kSectorLen);
@@ -577,6 +616,8 @@ class QGUpdater {
     std::atomic<uint64_t> page_writes{0};
     std::atomic<uint64_t> logical_row_writes{0};
     std::atomic<uint64_t> flush_unique_pages{0};
+    std::atomic<uint64_t> drain_us{0};
+    std::atomic<uint64_t> flush_us{0};
     std::atomic<uint64_t> free_slot_fills{0};
     std::atomic<uint64_t> evictions{0};
     std::atomic<uint64_t> est_skips{0};
@@ -638,10 +679,14 @@ class QGUpdater {
     explicit PageWriteCache(size_t page_size) : page_size_(page_size) {}
     [[nodiscard]] Shard &shard(size_t page_index) { return shards_[page_index % kShards]; }
     [[nodiscard]] size_t page_size() const { return page_size_; }
+    [[nodiscard]] size_t total_pages() const { return total_pages_.load(std::memory_order_relaxed); }
+    void note_insert() { total_pages_.fetch_add(1, std::memory_order_relaxed); }
+    void note_erase(size_t n) { total_pages_.fetch_sub(n, std::memory_order_relaxed); }
 
    private:
     size_t page_size_;
     std::array<Shard, kShards> shards_;
+    std::atomic<size_t> total_pages_{0};
   };
 
   struct StagedEdge {
@@ -704,13 +749,22 @@ class QGUpdater {
         it->second = std::make_unique<PageWriteCache::CachedPage>(page_size_);
         read_at(kSectorLen + pi * page_size_, it->second->bytes.data(), page_size_);
         stats_.patch_page_reads++;
+        write_cache_.note_insert();
       }
       cached = it->second.get();
     }
     // page_lock(id) serializes this buffer's RMW. Do not retain the shard lock
     // across fn: consolidation/full-prune may consult another cached page,
     // and holding two shard locks would introduce cross-page lock cycles.
-    if (!fn(cached->bytes.data())) {
+    // The seqlock covers the in-cache mutation: overlay readers (searches read
+    // through the pool) validate the page version exactly like disk readers.
+    if (pi >= page_versions_.size()) {
+      throw std::runtime_error("QGUpdater: id exceeds max_points capacity");
+    }
+    page_versions_[pi].fetch_add(1, std::memory_order_acq_rel);
+    const bool changed = fn(cached->bytes.data());
+    page_versions_[pi].fetch_add(1, std::memory_order_release);
+    if (!changed) {
       return false;
     }
     {
@@ -760,8 +814,16 @@ class QGUpdater {
     page_versions_[pi].fetch_add(1, std::memory_order_release);  // -> even
   }
 
-  /** @brief Torn-read-safe page read for lock-free readers (seqlock retry). */
-  void read_node_page(PID id, char *buf) const {
+  /**
+   * @brief Torn-read-safe page read (seqlock retry), reading THROUGH the
+   * resident pool: a cached page is fresher than disk (writeback may not have
+   * happened yet), so overlay hits copy from the pool and only misses touch
+   * the file. Safe for the insert beam search because its snapshot guards
+   * (`cur/nb >= snapshot`) already ignore unpublished ids regardless of how
+   * fresh the row bytes are. External readers (a separate process on its own
+   * fd) must still wait for finalize().
+   */
+  void read_node_page(PID id, char *buf) {
     const size_t pi = page_index(id);
     if (pi >= page_versions_.size()) {
       throw std::runtime_error("QGUpdater: id exceeds max_points capacity");
@@ -772,7 +834,19 @@ class QGUpdater {
         std::this_thread::yield();
         continue;
       }
-      read_at(page_offset(id), buf, page_size_);
+      bool from_pool = false;
+      if (params_.write_cache) {
+        auto &shard = write_cache_.shard(pi);
+        const std::lock_guard<std::mutex> guard(shard.mutex);
+        auto it = shard.pages.find(pi);
+        if (it != shard.pages.end()) {
+          std::memcpy(buf, it->second->bytes.data(), page_size_);
+          from_pool = true;
+        }
+      }
+      if (!from_pool) {
+        read_at(page_offset(id), buf, page_size_);
+      }
       const uint32_t v2 = page_versions_[pi].load(std::memory_order_acquire);
       if (v1 == v2) {
         return;
@@ -827,69 +901,85 @@ class QGUpdater {
    * effectively overlapping. Entries are ordered by exact d(v,x).
    */
   void drain_staged_edges(size_t num_threads) {
-    std::array<std::unordered_map<PID, std::vector<StagedEdge>>, 64> work;
-    std::unordered_map<PID, PID> primary;
-    std::unordered_map<PID, size_t> successes;
-    for (size_t si = 0; si < staged_.size(); ++si) {
-      auto &stripe = staged_[si];
+    struct Group {
+      PID v;
+      std::vector<StagedEdge> edges;
+    };
+    std::vector<Group> groups;
+    PID x_min = std::numeric_limits<PID>::max();
+    PID x_max = 0;
+    for (auto &stripe : staged_) {
       const std::lock_guard<std::mutex> guard(stripe.mutex);
-      work[si].swap(stripe.by_target);
-      for (const auto &[v, edges] : work[si]) {
+      for (auto &[v, edges] : stripe.by_target) {
         for (const auto &edge : edges) {
-          successes.try_emplace(edge.x, 0);
-          if (edge.primary) {
-            primary[edge.x] = v;
-          }
+          x_min = std::min(x_min, edge.x);
+          x_max = std::max(x_max, edge.x);
         }
+        groups.push_back({v, std::move(edges)});
       }
+      stripe.by_target.clear();
     }
-    if (successes.empty()) {
+    if (groups.empty()) {
       return;
     }
 
-    std::mutex result_mutex;
+    // Staged x ids are one dense batch range, so per-x bookkeeping is flat
+    // arrays with atomic counters — a shared map mutex here serializes the
+    // whole drain (~35 successes per insert).
+    static constexpr PID kNoPrimary = std::numeric_limits<PID>::max();
+    const size_t x_range = static_cast<size_t>(x_max - x_min) + 1;
+    std::vector<std::atomic<uint32_t>> successes(x_range);
+    std::vector<PID> primary(x_range, kNoPrimary);
+    for (const auto &group : groups) {
+      for (const auto &edge : group.edges) {
+        if (edge.primary) {
+          primary[edge.x - x_min] = group.v;
+        }
+      }
+    }
+
     const int nt = static_cast<int>(std::max<size_t>(1, num_threads));
-#pragma omp parallel for num_threads(nt) schedule(dynamic, 1)
-    for (int64_t si = 0; si < static_cast<int64_t>(work.size()); ++si) {
-      for (auto &[v_id, edges] : work[static_cast<size_t>(si)]) {
-        std::sort(edges.begin(), edges.end(), [](const StagedEdge &a, const StagedEdge &b) {
-          if (a.dist_vx != b.dist_vx) return a.dist_vx < b.dist_vx;
-          return a.x < b.x;
-        });
-        CapturedNode v;
-        v.id = v_id;
-        const std::unordered_map<PID, const CapturedNode *> no_capture;
-        for (const auto &edge : edges) {
-          std::vector<float> x_vec;
-          // x was appended earlier in this batch. This hits its dirty cache
-          // page (or disk in write_cache=false control mode); no vector is
-          // retained in StagedEdge.
-          const float *x_raw = cached_raw(edge.x);
-          if (x_raw == nullptr) {
-            AlignedBuf x_page(page_size_);
-            read_at(page_offset(edge.x), x_page.data(), page_size_);
-            stats_.patch_page_reads++;
-            const auto *raw =
-                reinterpret_cast<const float *>(x_page.data() + node_offset_in_page(edge.x));
-            x_vec.assign(raw, raw + full_dim_);
-            x_raw = x_vec.data();
-          }
-          if (patch_reverse_edge(v, edge.x, x_raw, no_capture, false)) {
-            const std::lock_guard<std::mutex> guard(result_mutex);
-            ++successes[edge.x];
-          }
+#pragma omp parallel for num_threads(nt) schedule(dynamic, 64)
+    for (int64_t gi = 0; gi < static_cast<int64_t>(groups.size()); ++gi) {
+      auto &group = groups[static_cast<size_t>(gi)];
+      auto &edges = group.edges;
+      std::sort(edges.begin(), edges.end(), [](const StagedEdge &a, const StagedEdge &b) {
+        if (a.dist_vx != b.dist_vx) return a.dist_vx < b.dist_vx;
+        return a.x < b.x;
+      });
+      CapturedNode v;
+      v.id = group.v;
+      const std::unordered_map<PID, const CapturedNode *> no_capture;
+      for (const auto &edge : edges) {
+        std::vector<float> x_vec;
+        // x was appended earlier in this batch. This hits its dirty cache
+        // page (or disk in write_cache=false control mode); no vector is
+        // retained in StagedEdge.
+        const float *x_raw = cached_raw(edge.x);
+        if (x_raw == nullptr) {
+          AlignedBuf x_page(page_size_);
+          read_at(page_offset(edge.x), x_page.data(), page_size_);
+          stats_.patch_page_reads++;
+          const auto *raw =
+              reinterpret_cast<const float *>(x_page.data() + node_offset_in_page(edge.x));
+          x_vec.assign(raw, raw + full_dim_);
+          x_raw = x_vec.data();
+        }
+        if (patch_reverse_edge(v, edge.x, x_raw, no_capture, false)) {
+          successes[edge.x - x_min].fetch_add(1, std::memory_order_relaxed);
         }
       }
     }
 
     // Batch reachability fallback: force the primary backlink only for nodes
     // for which every ordinary staged patch was rejected.
-    for (const auto &[x, count] : successes) {
-      if (count != 0) continue;
-      const auto it = primary.find(x);
-      if (it == primary.end()) continue;
+    for (size_t xi = 0; xi < x_range; ++xi) {
+      if (successes[xi].load(std::memory_order_relaxed) != 0 || primary[xi] == kNoPrimary) {
+        continue;
+      }
+      const PID x = x_min + static_cast<PID>(xi);
       CapturedNode v;
-      v.id = it->second;
+      v.id = primary[xi];
       std::vector<float> x_vec;
       const float *x_raw = cached_raw(x);
       if (x_raw == nullptr) {
@@ -933,10 +1023,15 @@ class QGUpdater {
       write_at(kSectorLen + page.index * page_size_, page.data, page_size_);
       page_versions_[page.index].fetch_add(1, std::memory_order_release);
     }
+    // Pages stay resident (the pool's cross-batch coalescing is the point);
+    // only the dirty flags drop. No mutator runs concurrently with a flush —
+    // phase separation is the caller's contract, same as consolidate().
     for (size_t si = 0; si < PageWriteCache::kShards; ++si) {
       auto &shard = write_cache_.shard(si);
       const std::lock_guard<std::mutex> guard(shard.mutex);
-      shard.pages.clear();
+      for (auto &[pi, page] : shard.pages) {
+        page->dirty = false;
+      }
     }
     // Kick asynchronous writeback now (WB_SYNC_NONE) so the dirty backlog
     // drains overlapped with the next batch instead of piling up until
@@ -944,6 +1039,28 @@ class QGUpdater {
     // finalize()+fsync only.
     if (!direct_io_ && !dirty.empty()) {
       ::sync_file_range(fd_, 0, 0, SYNC_FILE_RANGE_WRITE);
+    }
+  }
+
+  /** @brief Drop clean pages (arbitrary order) until the pool holds at most
+   * @p target pages. Runs at the batch barrier only — cached_raw() pointers
+   * from the drain phase are dead by then. */
+  void evict_clean(size_t target) {
+    for (size_t si = 0; si < PageWriteCache::kShards && write_cache_.total_pages() > target;
+         ++si) {
+      auto &shard = write_cache_.shard(si);
+      const std::lock_guard<std::mutex> guard(shard.mutex);
+      size_t erased = 0;
+      for (auto it = shard.pages.begin();
+           it != shard.pages.end() && write_cache_.total_pages() - erased > target;) {
+        if (!it->second->dirty) {
+          it = shard.pages.erase(it);
+          ++erased;
+        } else {
+          ++it;
+        }
+      }
+      write_cache_.note_erase(erased);
     }
   }
 
@@ -1140,10 +1257,19 @@ class QGUpdater {
       }
       bool evicted = false;
       if (slot == deg_) {
-        QGQuery vq(row_f, pd_);
+        // Reused per-thread query object: constructing a QGQuery here means an
+        // aligned lut_ allocation per evict decision (millions per drain).
+        thread_local std::unique_ptr<QGQuery> vq_holder;
+        if (!vq_holder || vq_holder->padded_dim() != pd_) {
+          vq_holder = std::make_unique<QGQuery>(row_f, pd_);
+        } else {
+          vq_holder->rebind(row_f);
+        }
+        QGQuery &vq = *vq_holder;
         vq.query_prepare(qg_.rotator_, qg_.scanner_);
         vq.set_sqr_qr(v_res_sqr);
-        std::vector<float> appro(deg_);
+        thread_local std::vector<float> appro;
+        appro.resize(deg_);
         qg_.scanner_.scan_neighbors(appro.data(),
                                     vq.lut().data(),
                                     0.0F,
@@ -1407,16 +1533,22 @@ class QGUpdater {
   /** @brief Replace one slot's code + factors + id inside a row buffer. */
   bool patch_slot(char *row, size_t slot, PID x_id, const float *x_vec, float x_res_sqr) {
     const auto *row_f = reinterpret_cast<const float *>(row);
-    std::vector<float> c_pad(pd_, 0.0F);
-    std::vector<float> x_pad(pd_, 0.0F);
+    // thread_local scratch: one patch_slot per staged backlink — per-call heap
+    // traffic here was a top drain cost (see make_edge_payload note).
+    thread_local std::vector<float> c_pad;
+    thread_local std::vector<float> x_pad;
+    thread_local std::vector<float> c_rot;
+    thread_local std::vector<float> x_rot;
+    c_pad.assign(pd_, 0.0F);
+    x_pad.assign(pd_, 0.0F);
+    c_rot.resize(pd_);
+    x_rot.resize(pd_);
     std::copy(row_f, row_f + dim_, c_pad.begin());
     std::copy(x_vec, x_vec + dim_, x_pad.begin());
-    std::vector<float> c_rot(pd_);
-    std::vector<float> x_rot(pd_);
     qg_.rotator_.rotate(c_pad.data(), c_rot.data());
     qg_.rotator_.rotate(x_pad.data(), x_rot.data());
 
-    EdgePayload payload = make_edge_payload(c_rot.data(), x_rot.data(), pd_, x_res_sqr);
+    const EdgePayload &payload = make_edge_payload(c_rot.data(), x_rot.data(), pd_, x_res_sqr);
     if (payload.degenerate) {
       return false;
     }
@@ -1424,7 +1556,8 @@ class QGUpdater {
     const size_t block_idx = slot / kBatchSize;
     const size_t in_block = slot % kBatchSize;
     uint8_t *block = reinterpret_cast<uint8_t *>(row + code_off_bytes()) + block_idx * pd_ * 4;
-    std::vector<uint64_t> bins(kBatchSize * pd_ / 64);
+    thread_local std::vector<uint64_t> bins;
+    bins.resize(kBatchSize * pd_ / 64);
     unpack_codes_block(pd_, block, bins.data());
     std::copy(payload.bin.begin(), payload.bin.end(), bins.begin() + in_block * (pd_ / 64));
     pack_codes(pd_, bins.data(), kBatchSize, block);
