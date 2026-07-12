@@ -1,0 +1,282 @@
+{
+  "build_type": "Release",
+  "dispatch_combinations": [
+    {
+      "attributed_text_symbol_bytes": 455055,
+      "data": "float",
+      "id": "uint32_t",
+      "index": "HNSW",
+      "matched_text_symbols": 803,
+      "quant": "NONE"
+    },
+    {
+      "attributed_text_symbol_bytes": 408304,
+      "data": "float",
+      "id": "uint32_t",
+      "index": "NSG",
+      "matched_text_symbols": 632,
+      "quant": "NONE"
+    },
+    {
+      "attributed_text_symbol_bytes": 204152,
+      "data": "float",
+      "id": "uint32_t",
+      "index": "FUSION",
+      "matched_text_symbols": 316,
+      "quant": "NONE"
+    },
+    {
+      "attributed_text_symbol_bytes": 137656,
+      "data": "float",
+      "id": "uint32_t",
+      "index": "HNSW",
+      "matched_text_symbols": 210,
+      "quant": "SQ8"
+    },
+    {
+      "attributed_text_symbol_bytes": 137656,
+      "data": "float",
+      "id": "uint32_t",
+      "index": "NSG",
+      "matched_text_symbols": 210,
+      "quant": "SQ8"
+    },
+    {
+      "attributed_text_symbol_bytes": 68828,
+      "data": "float",
+      "id": "uint32_t",
+      "index": "FUSION",
+      "matched_text_symbols": 105,
+      "quant": "SQ8"
+    },
+    {
+      "attributed_text_symbol_bytes": 137834,
+      "data": "float",
+      "id": "uint32_t",
+      "index": "HNSW",
+      "matched_text_symbols": 210,
+      "quant": "SQ4"
+    },
+    {
+      "attributed_text_symbol_bytes": 137834,
+      "data": "float",
+      "id": "uint32_t",
+      "index": "NSG",
+      "matched_text_symbols": 210,
+      "quant": "SQ4"
+    },
+    {
+      "attributed_text_symbol_bytes": 68917,
+      "data": "float",
+      "id": "uint32_t",
+      "index": "FUSION",
+      "matched_text_symbols": 105,
+      "quant": "SQ4"
+    },
+    {
+      "attributed_text_symbol_bytes": 126722,
+      "data": "float",
+      "id": "uint32_t",
+      "index": "HNSW",
+      "matched_text_symbols": 214,
+      "quant": "RABITQ"
+    },
+    {
+      "attributed_text_symbol_bytes": 126722,
+      "data": "float",
+      "id": "uint32_t",
+      "index": "NSG",
+      "matched_text_symbols": 214,
+      "quant": "RABITQ"
+    },
+    {
+      "attributed_text_symbol_bytes": 63361,
+      "data": "float",
+      "id": "uint32_t",
+      "index": "FUSION",
+      "matched_text_symbols": 107,
+      "quant": "RABITQ"
+    },
+    {
+      "attributed_text_symbol_bytes": 469823,
+      "data": "float",
+      "id": "uint64_t",
+      "index": "HNSW",
+      "matched_text_symbols": 805,
+      "quant": "NONE"
+    },
+    {
+      "attributed_text_symbol_bytes": 420230,
+      "data": "float",
+      "id": "uint64_t",
+      "index": "NSG",
+      "matched_text_symbols": 632,
+      "quant": "NONE"
+    },
+    {
+      "attributed_text_symbol_bytes": 210115,
+      "data": "float",
+      "id": "uint64_t",
+      "index": "FUSION",
+      "matched_text_symbols": 316,
+      "quant": "NONE"
+    },
+    {
+      "attributed_text_symbol_bytes": 140064,
+      "data": "float",
+      "id": "uint64_t",
+      "index": "HNSW",
+      "matched_text_symbols": 210,
+      "quant": "SQ8"
+    },
+    {
+      "attributed_text_symbol_bytes": 140064,
+      "data": "float",
+      "id": "uint64_t",
+      "index": "NSG",
+      "matched_text_symbols": 210,
+      "quant": "SQ8"
+    },
+    {
+      "attributed_text_symbol_bytes": 70032,
+      "data": "float",
+      "id": "uint64_t",
+      "index": "FUSION",
+      "matched_text_symbols": 105,
+      "quant": "SQ8"
+    },
+    {
+      "attributed_text_symbol_bytes": 140242,
+      "data": "float",
+      "id": "uint64_t",
+      "index": "HNSW",
+      "matched_text_symbols": 210,
+      "quant": "SQ4"
+    },
+    {
+      "attributed_text_symbol_bytes": 140242,
+      "data": "float",
+      "id": "uint64_t",
+      "index": "NSG",
+      "matched_text_symbols": 210,
+      "quant": "SQ4"
+    },
+    {
+      "attributed_text_symbol_bytes": 70121,
+      "data": "float",
+      "id": "uint64_t",
+      "index": "FUSION",
+      "matched_text_symbols": 105,
+      "quant": "SQ4"
+    },
+    {
+      "attributed_text_symbol_bytes": 175048,
+      "data": "int8_t",
+      "id": "uint32_t",
+      "index": "HNSW",
+      "matched_text_symbols": 343,
+      "quant": "NONE"
+    },
+    {
+      "attributed_text_symbol_bytes": 139308,
+      "data": "int8_t",
+      "id": "uint32_t",
+      "index": "NSG",
+      "matched_text_symbols": 212,
+      "quant": "NONE"
+    },
+    {
+      "attributed_text_symbol_bytes": 69654,
+      "data": "int8_t",
+      "id": "uint32_t",
+      "index": "FUSION",
+      "matched_text_symbols": 106,
+      "quant": "NONE"
+    },
+    {
+      "attributed_text_symbol_bytes": 178574,
+      "data": "int8_t",
+      "id": "uint64_t",
+      "index": "HNSW",
+      "matched_text_symbols": 343,
+      "quant": "NONE"
+    },
+    {
+      "attributed_text_symbol_bytes": 141528,
+      "data": "int8_t",
+      "id": "uint64_t",
+      "index": "NSG",
+      "matched_text_symbols": 212,
+      "quant": "NONE"
+    },
+    {
+      "attributed_text_symbol_bytes": 70764,
+      "data": "int8_t",
+      "id": "uint64_t",
+      "index": "FUSION",
+      "matched_text_symbols": 106,
+      "quant": "NONE"
+    },
+    {
+      "attributed_text_symbol_bytes": 174694,
+      "data": "uint8_t",
+      "id": "uint32_t",
+      "index": "HNSW",
+      "matched_text_symbols": 343,
+      "quant": "NONE"
+    },
+    {
+      "attributed_text_symbol_bytes": 138954,
+      "data": "uint8_t",
+      "id": "uint32_t",
+      "index": "NSG",
+      "matched_text_symbols": 212,
+      "quant": "NONE"
+    },
+    {
+      "attributed_text_symbol_bytes": 69477,
+      "data": "uint8_t",
+      "id": "uint32_t",
+      "index": "FUSION",
+      "matched_text_symbols": 106,
+      "quant": "NONE"
+    },
+    {
+      "attributed_text_symbol_bytes": 178267,
+      "data": "uint8_t",
+      "id": "uint64_t",
+      "index": "HNSW",
+      "matched_text_symbols": 343,
+      "quant": "NONE"
+    },
+    {
+      "attributed_text_symbol_bytes": 141238,
+      "data": "uint8_t",
+      "id": "uint64_t",
+      "index": "NSG",
+      "matched_text_symbols": 212,
+      "quant": "NONE"
+    },
+    {
+      "attributed_text_symbol_bytes": 70619,
+      "data": "uint8_t",
+      "id": "uint64_t",
+      "index": "FUSION",
+      "matched_text_symbols": 106,
+      "quant": "NONE"
+    }
+  ],
+  "extension_module": {
+    "bytes": 26554712
+  },
+  "index_factory_object": {
+    "bytes": 15686056,
+    "text_bytes": 5084350
+  },
+  "measurement": "GNU nm symbol attribution; entries may overlap",
+  "schema_version": 1,
+  "wheel": {
+    "bytes": 7403853,
+    "name": "alayalite-1.0.3-cp313-cp313-linux_x86_64.whl"
+  }
+}

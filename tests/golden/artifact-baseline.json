@@ -1,0 +1,359 @@
+{
+  "artifacts": {
+    "disk_flat": {
+      "files": {
+        "collection_manifest.txt": {
+          "bytes": 116,
+          "fields": {
+            "dim": 8,
+            "index_type": "disk_flat",
+            "metric": "L2",
+            "next_segment_id": 2,
+            "segment": "seg_00000001",
+            "version": 1,
+            "x_max_pending_bytes": 536870912
+          },
+          "sha256": "f65dd61c164005f68773a70b2b9f35b4bf66ebd070e1bb0aaf884bb0bc9c7c1a"
+        },
+        "segments/seg_00000001/ids.u64.bin": {
+          "bytes": 512,
+          "header": {
+            "first_32_hex": "e803000000000000e903000000000000ea03000000000000eb03000000000000",
+            "u32le_0_3": [
+              1000,
+              0,
+              1001,
+              0
+            ]
+          },
+          "sha256": "6c9b1e00ce539e33d8cfa43e73a7aa0f83c1ec234a654b25e8d2cc697d616e88"
+        },
+        "segments/seg_00000001/manifest.txt": {
+          "bytes": 130,
+          "fields": {
+            "count": 64,
+            "dim": 8,
+            "ids_file": "ids.u64.bin",
+            "index_type": "disk_flat",
+            "metric": "L2",
+            "segment_id": "seg_00000001",
+            "vectors_file": "vectors.f32.bin",
+            "version": 1
+          },
+          "sha256": "e3978e99bdb12495fe0c00edb2749935c44a867343094dd61f236bee0971be21"
+        },
+        "segments/seg_00000001/vectors.f32.bin": {
+          "bytes": 2048,
+          "header": {
+            "first_32_hex": "52163d3f4d7f2e3fc8ddd53e6437d23e2223d43e9109e93ed0256cbe6fb7043f",
+            "u32le_0_3": [
+              1060968018,
+              1060011853,
+              1054203336,
+              1053964132
+            ]
+          },
+          "sha256": "9172020f6cc588801c3f1bab6b9b86c7e66c562209e97faa1c4f76cc24795fe2"
+        }
+      }
+    },
+    "disk_vamana": {
+      "files": {
+        "collection_manifest.txt": {
+          "bytes": 213,
+          "fields": {
+            "dim": 8,
+            "index_type": "disk_vamana",
+            "metric": "L2",
+            "next_segment_id": 2,
+            "segment": "seg_00000001",
+            "version": 1,
+            "x_max_pending_bytes": 536870912,
+            "x_vamana_L": 24,
+            "x_vamana_R": 8,
+            "x_vamana_alpha": "1.200000",
+            "x_vamana_num_threads": 1,
+            "x_vamana_seed": 424242
+          },
+          "sha256": "9fdfeb3563becb5a65f2aec4890528d0a5a8c9505a36f208184389b57e15afb6"
+        },
+        "segments/seg_00000001/graph.index": {
+          "bytes": 1848,
+          "header": {
+            "first_32_hex": "3807000000000000080000002b00000000000000000000000800000026000000",
+            "u32le_0_3": [
+              1848,
+              0,
+              8,
+              43
+            ]
+          },
+          "sha256": "3a7622d455bac96b15d15f2468207e76e18e17036d79c53512ae5cb99689cb73"
+        },
+        "segments/seg_00000001/ids.u64.bin": {
+          "bytes": 512,
+          "header": {
+            "first_32_hex": "e803000000000000e903000000000000ea03000000000000eb03000000000000",
+            "u32le_0_3": [
+              1000,
+              0,
+              1001,
+              0
+            ]
+          },
+          "sha256": "6c9b1e00ce539e33d8cfa43e73a7aa0f83c1ec234a654b25e8d2cc697d616e88"
+        },
+        "segments/seg_00000001/manifest.txt": {
+          "bytes": 213,
+          "fields": {
+            "count": 64,
+            "dim": 8,
+            "ids_file": "ids.u64.bin",
+            "index_type": "disk_vamana",
+            "metric": "L2",
+            "segment_id": "seg_00000001",
+            "vectors_file": "vectors.f32.bin",
+            "version": 1,
+            "x_L": 24,
+            "x_R": 8,
+            "x_alpha": "1.200000",
+            "x_graph_file": "graph.index",
+            "x_medoid": 43,
+            "x_seed": 424242
+          },
+          "sha256": "a806a9786544598267ffff805bbb316fd6ba162f439ab5cd27b1a472002c544f"
+        },
+        "segments/seg_00000001/vectors.f32.bin": {
+          "bytes": 2048,
+          "header": {
+            "first_32_hex": "52163d3f4d7f2e3fc8ddd53e6437d23e2223d43e9109e93ed0256cbe6fb7043f",
+            "u32le_0_3": [
+              1060968018,
+              1060011853,
+              1054203336,
+              1053964132
+            ]
+          },
+          "sha256": "9172020f6cc588801c3f1bab6b9b86c7e66c562209e97faa1c4f76cc24795fe2"
+        }
+      }
+    },
+    "diskann": {
+      "files": {
+        "cache_ids.bin": {
+          "bytes": 40,
+          "header": {
+            "first_32_hex": "0800000000000000180000003100000032000000390000001d00000011000000",
+            "u32le_0_3": [
+              8,
+              0,
+              24,
+              49
+            ]
+          },
+          "sha256": "df1af5797cc242b1c252428593512aec546ac5e17a1fcfb60d3360b6443a6786"
+        },
+        "cache_nodes.bin": {
+          "bytes": 560,
+          "header": {
+            "first_32_hex": "080000000000000044000000000000006cce4b3dc6d387bdc4b6a93dcc8dcbbd",
+            "u32le_0_3": [
+              8,
+              0,
+              68,
+              0
+            ]
+          },
+          "sha256": "113f4e9b8fd9a55d4e0942765f313d39e980c790db884b1334ae728bf682ac45"
+        },
+        "diskann.index": {
+          "bytes": 12288,
+          "header": {
+            "first_32_hex": "4000000000000000080000000000000018000000080000004400000000000000",
+            "u32le_0_3": [
+              64,
+              0,
+              8,
+              0
+            ]
+          },
+          "sha256": "ffda03c70c368191a5a9039d93a78ba76986e7c125f7815da44681735db06764"
+        },
+        "ids.bin": {
+          "bytes": 520,
+          "header": {
+            "first_32_hex": "4000000000000000e803000000000000e903000000000000ea03000000000000",
+            "u32le_0_3": [
+              64,
+              0,
+              1000,
+              0
+            ]
+          },
+          "sha256": "88943f35a9b99ba2b65b56568bf3c41f49eb3201541530b839cf3cf0d789e6b0"
+        },
+        "meta.bin": {
+          "bytes": 73,
+          "header": {
+            "first_32_hex": "4e4b534441594c41020000004000000000000000080000000000000008000000",
+            "u32le_0_3": [
+              1146309454,
+              1095522625,
+              2,
+              64
+            ]
+          },
+          "sha256": "4175e87e4ea4e6e75309ab1c766fc27e2efbef417255061e08417ec4e99d370f"
+        }
+      }
+    },
+    "laser_fixture": {
+      "files": {
+        "dsqg_seg_00000001_R64_MD128.index": {
+          "bytes": 8392704,
+          "header": {
+            "first_32_hex": "000800000000000080000000000000009901000000000000000a000000000000",
+            "u32le_0_3": [
+              2048,
+              0,
+              128,
+              0
+            ]
+          },
+          "sha256": "cc3b310b6e3d5d531e6d70df319f3887608e42f1573ab9bd43275906b6bc82f3"
+        },
+        "dsqg_seg_00000001_R64_MD128.index_cache_ids": {
+          "bytes": 1236,
+          "sha256": "8997b37abc7f60ff6a0cc49f09b5f1549b5da4968df5e696674974a5dc325252"
+        },
+        "dsqg_seg_00000001_R64_MD128.index_cache_nodes": {
+          "bytes": 785936,
+          "sha256": "831aa27a7a09e9c55d375bacf4efe975fb39686c7940f795a40c8c2f8389c2f8"
+        },
+        "dsqg_seg_00000001_R64_MD128.index_rotator": {
+          "bytes": 512,
+          "sha256": "c9e6444e07a0f03304850d48773fcf974f74400a5220165f367015ddecad4f23"
+        },
+        "dsqg_seg_00000001_input.fbin": {
+          "bytes": 1048584,
+          "sha256": "114d6b77f379d2f9494e5e35ee4e9361140aee8972b856b5409be12bd8a13ee3"
+        },
+        "dsqg_seg_00000001_medoids": {
+          "bytes": 32776,
+          "sha256": "2fd4ecd2a44e5e5783740362c50aaed37aabe7129f059b4ed824ff802fab32ee"
+        },
+        "dsqg_seg_00000001_medoids_indices": {
+          "bytes": 264,
+          "sha256": "5b194abcb96956c623108865a821da5bb499c1a3d10a64b56e00d6f3c9a4077b"
+        },
+        "dsqg_seg_00000001_pca.bin": {
+          "bytes": 66056,
+          "header": {
+            "first_32_hex": "80000000000000000634173bbd2d51bb4abcc7bafb403c3a1323363b93504eba",
+            "u32le_0_3": [
+              128,
+              0,
+              991376390,
+              3142659517
+            ]
+          },
+          "sha256": "53270e13d16512f70c043369ec88a680e7baa4a947b7383bcd19d542944aa28e"
+        },
+        "dsqg_seg_00000001_pca_base.fbin": {
+          "bytes": 1048584,
+          "sha256": "8ad117ce2b004b627ee62406816e651d58adcf4735b449895a217db00498dcf0"
+        },
+        "dsqg_seg_00000001_vamana_graph.index": {
+          "bytes": 532504,
+          "header": {
+            "first_32_hex": "18200800000000004000000099010000000000000000000040000000da030000",
+            "u32le_0_3": [
+              532504,
+              0,
+              64,
+              409
+            ]
+          },
+          "sha256": "e32a5fc74ee8bcd6c16e459e86d25ddf780d0849d2eaa943d421ee836c83411a"
+        }
+      }
+    },
+    "memory_hnsw_none": {
+      "files": {
+        "hnsw_l2_8.index": {
+          "bytes": 6122,
+          "header": {
+            "first_32_hex": "0000000050000000080000002000000000000000400000000000000050000000",
+            "u32le_0_3": [
+              0,
+              80,
+              8,
+              32
+            ]
+          },
+          "sha256": "a07f3fe3eaedf030de6988034a1247f9105fb0b8db765d7a435f78d34da98a2f"
+        },
+        "raw.data": {
+          "bytes": 5194,
+          "header": {
+            "first_32_hex": "0000000020000000080000004000000000000000500000002000000000000000",
+            "u32le_0_3": [
+              0,
+              32,
+              8,
+              64
+            ]
+          },
+          "sha256": "14ed22f20b12894703ce587a1b201147c51fedcf8379e2e6d753dc1f58f270e3"
+        }
+      }
+    },
+    "memory_hnsw_sq8": {
+      "files": {
+        "hnsw_l2_8.index": {
+          "bytes": 6122,
+          "header": {
+            "first_32_hex": "0000000050000000080000002000000000000000400000000000000050000000",
+            "u32le_0_3": [
+              0,
+              80,
+              8,
+              32
+            ]
+          },
+          "sha256": "a07f3fe3eaedf030de6988034a1247f9105fb0b8db765d7a435f78d34da98a2f"
+        },
+        "raw.data": {
+          "bytes": 5194,
+          "header": {
+            "first_32_hex": "0000000020000000080000004000000000000000500000002000000000000000",
+            "u32le_0_3": [
+              0,
+              32,
+              8,
+              64
+            ]
+          },
+          "sha256": "14ed22f20b12894703ce587a1b201147c51fedcf8379e2e6d753dc1f58f270e3"
+        },
+        "sq8.data": {
+          "bytes": 5262,
+          "header": {
+            "first_32_hex": "0000000008000000080000004000000000000000500000000800000000000000",
+            "u32le_0_3": [
+              0,
+              8,
+              8,
+              64
+            ]
+          },
+          "sha256": "fcf6529a12ccfe1430d1c389a09ad3bc60528b56637246a1df15b3cd1540593b"
+        }
+      }
+    }
+  },
+  "generator": "scripts/golden/generate_artifact_baseline.py",
+  "laser_fixture_present": true,
+  "schema_version": 1,
+  "seed": 20260712
+}
