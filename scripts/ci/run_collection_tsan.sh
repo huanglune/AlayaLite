@@ -13,7 +13,8 @@ fi
 
 cmake --preset tsan -S "$ROOT"
 cmake --build --preset tsan --target \
-  segmented_collection_stress_test nsg_segment_test fusion_segment_test qg_segment_test
+  segmented_collection_stress_test nsg_segment_test fusion_segment_test qg_segment_test \
+  vamana_mem_segment_test
 
 export TSAN_OPTIONS=${TSAN_OPTIONS:-halt_on_error=1:history_size=7}
 setarch "$ARCH" -R "$ROOT/build/TSan/tests/collection/segmented_collection_stress_test"
@@ -28,3 +29,5 @@ TSAN_OPTIONS="${TSAN_OPTIONS}:detect_deadlocks=0" \
   --gtest_filter=FusionSegmentTest.ConcurrentSearchOnlyIsReentrant
 setarch "$ARCH" -R "$ROOT/build/TSan/tests/index/qg_segment_test" \
   --gtest_filter=QgSegmentTest.ConcurrentSearchOnlyIsReentrant
+setarch "$ARCH" -R "$ROOT/build/TSan/tests/index/vamana_mem_segment_test" \
+  --gtest_filter=VamanaMemSegmentTest.ConcurrentSearchOnlyIsReentrant
