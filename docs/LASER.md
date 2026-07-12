@@ -350,9 +350,10 @@ configurations, including SIFT-1M-style `main_dim=64` builds, construction
 is no longer refused for the historical write/read mismatch. This fix is
 tracked by PR #88.
 
-### Relationship To AlayaLite QG
+### Relationship To The In-Memory Graph
 
-AlayaLite also has a separate QG builder under
-`include/index/graph/qg/qg_builder.hpp`. That path uses a different
-quantization flow and is not the same component as the Laser port under
-`include/index/graph/laser/`.
+AlayaLite's **memory_qg** builder lives under
+`include/index/graph/qg/qg_builder.hpp`; LASER's disk graph is
+**disk_laser_qg** under `include/index/graph/laser/`. They are different
+components and their serialized RaBitQ formats are not interchangeable. See
+[`rabitq-formats.md`](rabitq-formats.md) for the format and consumer contract.

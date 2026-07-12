@@ -121,3 +121,15 @@ alaya_add_test(
   TARGET rabitq_factor_equivalence_test
   LABELS laser rabitq
 )
+
+alaya_cc_target(
+  qg_naming_contract_test
+  GTEST LASER
+  SRCS qg_naming_contract_test.cpp
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_qg_naming_contract
+  TARGET qg_naming_contract_test
+  LABELS laser rabitq contract
+)

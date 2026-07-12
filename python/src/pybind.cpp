@@ -9,7 +9,7 @@
 #include <pybind11/stl.h>
 
 // Laser port pulls <omp.h> transitively via qg.hpp. Include this before
-// AlayaLite's own QGBuilder header (via index.hpp) so `omp_set_num_threads`
+// AlayaLite's memory_qg Builder header (via index.hpp) so `omp_set_num_threads`
 // is visible at the point AlayaLite's template definition is parsed — the
 // pre-existing `include/index/graph/qg/qg_builder.hpp` uses OMP calls
 // without explicitly including <omp.h>.
