@@ -17,6 +17,11 @@ alaya_cc_target(
   GTEST
   SRCS rocksdb_storage_test.cpp
 )
+alaya_cc_target(
+  page_reader_contract_test
+  GTEST
+  SRCS page_reader_contract_test.cpp
+)
 
 alaya_add_test(
   NAME storage_test_sequential_storage
@@ -31,6 +36,11 @@ alaya_add_test(
 alaya_add_test(
   NAME storage_test_rocksdb_storage
   TARGET rocksdb_storage_test
+  LABELS storage
+)
+alaya_add_test(
+  NAME storage_test_page_reader_contract
+  TARGET page_reader_contract_test
   LABELS storage
 )
 
