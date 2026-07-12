@@ -907,3 +907,47 @@ T3 原跑在 medium 档,V2(max)独立复核结论:**CORRECTED(细节)/ CONFIRMED
 204,000 上界)。裁决:**"drift 尾段确为 12 个最外围 kmeans 簇" = CONFIRMED**。
 簇心/标签已落盘(kmeans_centroids_64x128.fbin / kmeans_labels.u16 + manifest
 `centroid_artifacts`,sklearn 1.8.0),drift_prep.py 此后生成时自动持久化。
+
+## 14. ND1 判决:多线程 eval recall 非确定性根因(2026-07-12,max 档诊断,只诊断未改码)
+
+### 14.1 根因裁决
+
+**(a) 异步 I/O 完成序 = 根因,但"须由精确等距并列触发"被证伪。** 两套系统
+(LASER beam search / DiskANN beam search)都把 I/O 完成序直接变成节点逻辑扩展序,
+有限 ef/L 预算下不同完成序 ⇒ 访问不同图路径 ⇒ top-k 不同。精确 L2 核验:LASER
+ef60 的 2,206 个跑间变化查询中仅 8 个涉及等距并列;DiskANN 1T/关缓存的 672 个变化
+查询中 **0** 个——分岔不需要并列,预算截断本身就把完成序放大成路径分歧。
+LASER 另有放大器:**尾部完成项插入新候选后不重进主循环**(候选被静默丢弃)。
+(b) scratch/visited 残留、(c) 结果聚合竞争、(d) 浮点归约序,均排除。
+DiskANN 侧 1T + 关缓存仍抖;deterministic barrier 或 beam=1 后逐位稳定——收敛证据链。
+
+### 14.2 波动边界(≥3 跑定量)
+
+- LASER 总体 recall:**ef≥100 稳定确认,最大散布 ~0.035pp**;但小查询组 ef100
+  仍可达 **0.204pp**——总体稳定不可外推到分组;
+- DiskANN g2(298 查询):八跑散布 0.302pp 复现,与 V3 观测一致。
+
+### 14.3 对已入档判决的定量核对
+
+| 判决 | 影响 |
+|---|---|
+| A6(§11.1b) | 方向不变;**"ef≥100 逼近上界 ≤0.37pp"不能作逐跑硬上界**,观测包络至 −0.46pp——表述改为"逼近上界(多跑包络 ≤0.5pp)" |
+| JP-1(§11.2b) | **null 判决稳固**;g2 单格点估计可移动 ~0.3pp,已按 ±0.9pp 噪声带解读,无需再改 |
+| §13.2 P2 冒烟 | 空间/吞吐结论稳定;recall 门余量仅 0.057pp ⇒ **已启动外部多进程复评**(3×双臂,冻结 9220b05 二进制 md5 795094be…,协议同 T6:拷 v1 base500k → churn 首开迁移;结果落 §14.5) |
+
+### 14.4 工具账与方法论修订
+
+- **bench 真 bug:`--runs N` 的 recall 只报最后一跑,从不取均**——红线①修订为:
+  **多跑必须是外部独立进程**(进程内重复既不取均、也共享完成序温床)。bench 修复
+  (逐跑输出+均值)排队至 T7 落地后(文件当前归 T7)。
+- 最小正确修复(如需确定性模式):按 submission sequence 做逻辑 commit/reorder
+  buffer + 尾部候选续搜;仅 PID 并列定序不够(并列非主因)。整批 barrier 实测
+  QPS 代价 36.8–40.3%,只配作 eval 专用旗标,不进生产路径。
+- 纪律披露:诊断中 DiskANN bench 在 rounds=0 仍无条件 flush(),原索引 7 个
+  sidecar 的 mtime 被更新(内容与审计前副本逐字节一致,无实质改动)——顺带暴露
+  eval-only 路径应只读打开的 bench 疵点,同排队。
+- 完整材料:data/laser-update/scratch_nd1_20260712/(终报/散布 CSV/逐查询分析)。
+
+### 14.5 P2 冒烟外部复评(待填:3×reuse vs 3×append,门 = 均值差 ≤0.3pp)
+
+(运行中,脚本 data/laser-update/p2smoke/run_p2smoke_repeats.sh)
