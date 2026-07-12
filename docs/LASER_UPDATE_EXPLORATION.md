@@ -620,3 +620,52 @@ SIFT 500k 滑窗 churn,10 轮 100% 换血,recall@100(第 10 轮):
 **P1 定案**:ef_insert 200 + 每轮 garden(lowdeg,frac 0.20,ef_maintenance 200,
 泵 4)= 100% 换血 recall@100 **0.9865(10×50k)/ 0.9878(50×10k)**,门槛 0.985
 通过;质量预算的分配次序:先插入深度,后 garden 剂量,最后泵。
+
+## 10. 下一阶段路线图(2026-07-12 定,故事线定稿后;证据基线 = §9 + LASER_UPDATE_STORY.md)
+
+> 原则:**先赌注后装修**。漂移实验决定论文命题上限,最先做;工程项按"论文刚需"
+> 排序而非工程趣味(协程降级为条件项)。预计全包 6–10 周(并行化后)。
+
+### Phase A(1–2 周,机时便宜)— 下注 + 封便宜攻击
+
+1. **分布漂移实验 v0(全计划最重要一项)**:cluster-holdout 建图(80% 簇)+
+   held-out 簇 OOD 插入流;eval 分新簇/老簇查询两组;对照臂 = 自家 DiskANN 线
+   (冻结 PQ 码本 + 原地更新,同 harness 同 trace)。判决:免码本是否拉开差距
+   → 直接决定标题/摘要档位(激进版 vs 机制版)。
+2. exact-evict 臂 + evict 误差遥测(FastScan argmax vs 精确 argmax 命中率、
+   rank regret、按轮累积曲线);full 臂同池化公平化。堵 A7/A11。
+3. R56 建的 1M 静态上界对照(堵 A6 "headroom 参数巧合")。
+4. 口径脚本化:≥3 seeds、recall@10/@100 双报、插入点/老点/全体三组分层。
+
+### Phase B(2–3 周)— 工程双项,全是论文刚需
+
+5. **P2 槽复用 + 格式 v2**:free-list + 墓碑持久化 + 零入度回收 + valid-degree +
+   A/B superblock。解锁:300%+ 换血、文件大小平台化(A13 "sustained" claim)、
+   大轮次 churn 的数据集回收。
+6. **P3a 读写路径统一 + 并发干扰曲面**:统一读(现 O_DIRECT)写(现 buffered)
+   语义;测 query QPS/p50/p99 × update rate 二维曲面,分 insert/delete/
+   consolidate/garden 四相。堵 A4(系统论文必答)。
+- (P1.5 协程 = **条件项**:若并发曲线难看或 deep10m 吞吐缩水过狠再上——它抬
+  none 上限 20.3k 与 IO 重叠,但不在论文关键路径。)
+
+### Phase C(2–4 周,机时大头)— 规模与基线
+
+7. deep10m 主表复跑 + RAM-cap 扫描(0.5/1/4/16GB,working set > pool,报
+   cache hit/唯一脏页/设备读写);100m 视机时(g03 数据须搬本地 /md1)。堵 A3。
+8. fresh-layer 基线:最小实现(内存 fresh 图 + 周期 merge 全量重打包)或严格
+   成本核算 + FreshDiskANN 文献数字。堵 A2。
+9. 非 2 次幂维度数据集一个(强制走 PCA 残差路径 + npp>1 几何)。堵 A12。
+
+### Phase D — 写作与判决点
+
+10. 按 RQ1–7 重组评测(STORY §7);WAL 设计章 + 微基准(研究轨 scope out 完整
+    恢复);文献精读核查(CleANN/OasisANN/PipeANN)→ novelty 句定稿。
+11. PVLDB rolling(每月 1 号)投稿制,无悬崖:P0 包做完即投。
+
+### 判决点与资源交织
+
+- **JP-1(Phase A 末)**:漂移正向 → 激进标题+免码本主 claim;负向 → 机制主张,
+  论文仍成立。
+- **JP-2(Phase C 初)**:deep10m 吞吐缩水程度 → 是否启动 P1.5 协程。
+- **与工业轨交织**:工业轨冻结线 2026-10(SIGMOD)/12(VLDB);本线 Phase C 机时
+  重头应避开工业轨战役期;Phase A 便宜且决定赌注,建议立即执行。
