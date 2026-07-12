@@ -5,7 +5,7 @@
 #pragma once
 
 #include <omp.h>
-#include <Eigen/Dense>
+#include "kernels/linalg/types.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -24,7 +24,7 @@ namespace alaya::vamana {
 // Row-major float matrix view type. Row-major is required so that
 // `Eigen::Map<RowMajorMat>` can wrap DiskANN-style row-major data buffers
 // (`float[num_points * dim]`) with zero copy; Eigen's default is column-major.
-using KMeansRowMajorMat = Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+using KMeansRowMajorMat = kernels::linalg::RowMajorMatrix<float>;
 
 // k-means driver parameters. Defaults mirror DiskANN's pins (`max_k_means_reps
 // = 10`, `residual_rel_tol = 1e-5`, see `math_utils.cpp:340`). Seed is
@@ -55,10 +55,10 @@ inline void compute_vecs_l2sq(const float *data, size_t num_points, size_t dim, 
   if (num_points == 0 || dim == 0) {
     return;
   }
-  Eigen::Map<const KMeansRowMajorMat> d_view(data,
-                                             static_cast<Eigen::Index>(num_points),
-                                             static_cast<Eigen::Index>(dim));
-  Eigen::Map<Eigen::VectorXf> out_view(l2sq_out, static_cast<Eigen::Index>(num_points));
+  kernels::linalg::ConstRowMajorMatrixMap<float> d_view(
+      data, static_cast<kernels::linalg::Index>(num_points), static_cast<kernels::linalg::Index>(dim));
+  kernels::linalg::VectorMap<float> out_view(l2sq_out,
+                                             static_cast<kernels::linalg::Index>(num_points));
   out_view = d_view.rowwise().squaredNorm();
 }
 
@@ -95,9 +95,9 @@ inline void compute_closest_centers(const float *data,
   std::vector<float> centers_l2sq(num_centers);
   compute_vecs_l2sq(centers, num_centers, dim, centers_l2sq.data());
 
-  Eigen::Map<const KMeansRowMajorMat> c_view(centers,
-                                             static_cast<Eigen::Index>(num_centers),
-                                             static_cast<Eigen::Index>(dim));
+  kernels::linalg::ConstRowMajorMatrixMap<float> c_view(
+      centers, static_cast<kernels::linalg::Index>(num_centers),
+      static_cast<kernels::linalg::Index>(dim));
 
   const size_t block_size = std::min(num_points, detail::kClosestCentersBlockSize);
   const size_t num_blocks = (num_points + block_size - 1) / block_size;
@@ -105,30 +105,30 @@ inline void compute_closest_centers(const float *data,
   // Per-block: ||d||² vector (block_size), dist matrix (block_size × num_centers).
   // Allocate outside the loop to amortize malloc across blocks.
   std::vector<float> block_d_l2sq(block_size);
-  KMeansRowMajorMat dist(static_cast<Eigen::Index>(block_size),
-                         static_cast<Eigen::Index>(num_centers));
+  KMeansRowMajorMat dist(static_cast<kernels::linalg::Index>(block_size),
+                         static_cast<kernels::linalg::Index>(num_centers));
 
   for (size_t b = 0; b < num_blocks; ++b) {
     const size_t start = b * block_size;
     const size_t cur = std::min(block_size, num_points - start);
 
-    Eigen::Map<const KMeansRowMajorMat> d_block(data + start * dim,
-                                                static_cast<Eigen::Index>(cur),
-                                                static_cast<Eigen::Index>(dim));
+    kernels::linalg::ConstRowMajorMatrixMap<float> d_block(
+        data + start * dim, static_cast<kernels::linalg::Index>(cur),
+        static_cast<kernels::linalg::Index>(dim));
 
     compute_vecs_l2sq(data + start * dim, cur, dim, block_d_l2sq.data());
 
-    auto dist_block = dist.topRows(static_cast<Eigen::Index>(cur));
+    auto dist_block = dist.topRows(static_cast<kernels::linalg::Index>(cur));
     // dist = -2 * D * C^T
     dist_block.noalias() = -2.0f * d_block * c_view.transpose();
     // row i += ||d_i||²  (broadcast over columns)
     for (size_t i = 0; i < cur; ++i) {
       const float norm_i = block_d_l2sq[i];
-      dist_block.row(static_cast<Eigen::Index>(i)).array() += norm_i;
+      dist_block.row(static_cast<kernels::linalg::Index>(i)).array() += norm_i;
     }
     // column j += ||c_j||²  (broadcast over rows)
-    Eigen::Map<const Eigen::VectorXf> c_norm_view(centers_l2sq.data(),
-                                                  static_cast<Eigen::Index>(num_centers));
+    kernels::linalg::ConstVectorMap<float> c_norm_view(
+        centers_l2sq.data(), static_cast<kernels::linalg::Index>(num_centers));
     dist_block.rowwise() += c_norm_view.transpose();
 
     // Top-k extraction per row. For k ≤ 4 a linear scan with a sorted small

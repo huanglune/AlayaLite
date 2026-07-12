@@ -28,7 +28,7 @@ namespace alaya {
 
 template <typename T>
 inline void data_range(const T *ALAYA_RESTRICT vec0, size_t dim, T &lo, T &hi) {
-  ConstRowMajorArrayMap<T> v0(vec0, 1, dim);
+  kernels::linalg::ConstRowMajorArrayMap<T> v0(vec0, 1, dim);
   lo = v0.minCoeff();
   hi = v0.maxCoeff();
 }
@@ -43,8 +43,8 @@ inline void scalar_quantize_normal(
   T one_over_delta = 1.0F / delta;
 
   // vec0:lut_float, result:lut_
-  ConstRowMajorArrayMap<T> v0(vec0, 1, static_cast<long>(dim));  // NOLINT
-  RowMajorArrayMap<uint8_t> res(result, 1, dim);
+  kernels::linalg::ConstRowMajorArrayMap<T> v0(vec0, 1, static_cast<long>(dim));  // NOLINT
+  kernels::linalg::RowMajorArrayMap<uint8_t> res(result, 1, dim);
 
   // round to nearest integer, then cast to integer
   res = ((v0 - lo) * one_over_delta).round().template cast<uint8_t>();

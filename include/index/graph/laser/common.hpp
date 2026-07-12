@@ -18,7 +18,7 @@
 #include <cstdint>
 #include <functional>
 
-#include <Eigen/Dense>
+#include "kernels/linalg/types.hpp"
 
 namespace alaya::laser {
 #define RANDOM_QUERY_QUANTIZATION
@@ -39,10 +39,12 @@ constexpr uint32_t kPidMax = 0xFFFFFFFF;  // Maximum valid PID value
 constexpr float kCacheRatio = 0.15;  // Maximum ratio of nodes to cache in memory (15%)
 
 template <typename T>
-using RowMatrix = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+using RowMatrix [[deprecated("use kernels::linalg::RowMajorMatrix")]] =
+    kernels::linalg::RowMajorMatrix<T>;
 
 template <typename T>
-using ColMatrix = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>;
+using ColMatrix [[deprecated("use kernels::linalg::ColMajorMatrix")]] =
+    kernels::linalg::ColMajorMatrix<T>;
 
 template <typename T>
 using DistFunc = std::function<T(const T *, const T *, size_t)>;

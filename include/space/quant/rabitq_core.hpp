@@ -43,16 +43,16 @@ struct RaBitQCore {
                                     size_t dim,
                                     int *sign_bits,
                                     const MetricType metric) -> RaBitQCoreFactors<DataType> {
-    ConstRowMajorArrayMap<DataType> data_arr(data, 1, dim);
-    ConstRowMajorArrayMap<DataType> cent_arr(centroid, 1, dim);
-    RowMajorArray<DataType> residual_arr = data_arr - cent_arr;
+    kernels::linalg::ConstRowMajorArrayMap<DataType> data_arr(data, 1, dim);
+    kernels::linalg::ConstRowMajorArrayMap<DataType> cent_arr(centroid, 1, dim);
+    kernels::linalg::RowMajorArray<DataType> residual_arr = data_arr - cent_arr;
     DataType residual_l2_sqr = ::alaya::l2_sqr<DataType>(residual_arr.data(), dim);
 
-    RowMajorArrayMap<int> bits(sign_bits, 1, static_cast<long>(dim));  // NOLINT
+    kernels::linalg::RowMajorArrayMap<int> bits(sign_bits, 1, static_cast<long>(dim));  // NOLINT
     bits = (residual_arr > 0).template cast<int>();
 
     DataType binary_offset = -((1 << 1) - 1) / 2.F;
-    RowMajorArray<DataType> half_signed = bits.template cast<DataType>() + binary_offset;
+    kernels::linalg::RowMajorArray<DataType> half_signed = bits.template cast<DataType>() + binary_offset;
     DataType centroid_dot_half_signed = dot_product<DataType>(centroid, half_signed.data(), dim);
     DataType residual_dot_half_signed =
         dot_product<DataType>(residual_arr.data(), half_signed.data(), dim);
@@ -82,10 +82,10 @@ struct RaBitQCore {
                                       const int *sign_bits,
                                       int64_t dim,
                                       float fac_norm) -> RaBitQCoreFactors<float> {
-    ConstRowMajorArrayMap<float> residual_arr(residual, 1, dim);
-    ConstRowMajorArrayMap<float> centroid_arr(centroid, 1, dim);
-    ConstRowMajorArrayMap<int> bits(sign_bits, 1, dim);
-    RowMajorArray<float> signed_x = 2 * bits.cast<float>() - 1.F;
+    kernels::linalg::ConstRowMajorArrayMap<float> residual_arr(residual, 1, dim);
+    kernels::linalg::ConstRowMajorArrayMap<float> centroid_arr(centroid, 1, dim);
+    kernels::linalg::ConstRowMajorArrayMap<int> bits(sign_bits, 1, dim);
+    kernels::linalg::RowMajorArray<float> signed_x = 2 * bits.cast<float>() - 1.F;
 
     float fac_x0 = (residual_arr * signed_x * fac_norm).sum();
     float x_rotated_norm = residual_arr.matrix().norm();
