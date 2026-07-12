@@ -32,7 +32,7 @@
 
 namespace alaya {
 // NOLINTBEGIN
-enum class RotatorType : uint8_t { MatrixRotator, FhtKacRotator };
+enum class RotatorType : uint8_t { MatrixRotator, FhtKacRotator, FhtRotator };
 
 // abstract rotator
 template <typename T>
@@ -53,6 +53,14 @@ class Rotator {
 
 namespace rotator_impl {
 
+using FhtRotatorFactory = std::unique_ptr<Rotator<float>> (*)(size_t);
+
+inline FhtRotatorFactory fht_rotator_factory = nullptr;
+
+inline void register_fht_rotator_factory(FhtRotatorFactory factory) {
+  fht_rotator_factory = factory;
+}
+
 inline auto log_rotator_fallback_once() -> void {
   LOG_INFO_ONCE(
       "rabitq fallback: FhtKacRotator is using portable fallback operations for non-AVX512 "
@@ -66,6 +74,9 @@ inline size_t padding_requirement(size_t dim, RotatorType type) {
   }
   if (type == RotatorType::FhtKacRotator) {
     return alaya::math::round_up_pow2(dim, 64);
+  }
+  if (type == RotatorType::FhtRotator) {
+    return size_t{1} << alaya::math::ceil_log2(dim);
   }
   ALAYA_UNREACHABLE;
   // throw std::invalid_argument("Invalid rotator type in padding_requirement()\n");
@@ -373,6 +384,17 @@ std::unique_ptr<Rotator<T>> choose_rotator(size_t dim,
       return std::make_unique<rotator_impl::FhtKacRotator>(dim, padded_dim);
     } else {
       throw std::invalid_argument("FhtKacRotator only supports float type!");
+    }
+  }
+  if (type == RotatorType::FhtRotator) {
+    if constexpr (std::is_same_v<T, float>) {
+      if (rotator_impl::fht_rotator_factory == nullptr) {
+        throw std::invalid_argument("FhtRotator requires index/graph/laser/utils/rotator.hpp");
+      }
+      LOG_DEBUG("FhtRotator is selected\n");
+      return rotator_impl::fht_rotator_factory(dim);
+    } else {
+      throw std::invalid_argument("FhtRotator only supports float type!");
     }
   }
   ALAYA_UNREACHABLE;
