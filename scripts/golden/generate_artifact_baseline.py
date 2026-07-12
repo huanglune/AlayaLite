@@ -134,6 +134,12 @@ def generate(build_dir: Path) -> dict[str, object]:
         if not diskann_generator.is_file():
             raise RuntimeError(f"build the artifact_diskann_generator target first: {diskann_generator}")
         subprocess.run([str(diskann_generator), str(out / "diskann")], check=True)
+        memory_qg_generator = build_dir / "tests/golden/artifact_memory_qg_generator"
+        if not memory_qg_generator.is_file():
+            raise RuntimeError(
+                f"build the artifact_memory_qg_generator target first: {memory_qg_generator}"
+            )
+        subprocess.run([str(memory_qg_generator), str(out / "memory_qg")], check=True)
         laser_present = _copy_laser_fixture(out, build_dir)
         artifacts = {
             name: _inventory(path)

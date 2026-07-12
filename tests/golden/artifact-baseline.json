@@ -496,6 +496,23 @@
           "sha256": "8243da248f64e4ab77e0d705a13fe1e514df48c460fceeada891a39eddd42e72"
         }
       }
+    },
+    "memory_qg": {
+      "files": {
+        "rabitq.data": {
+          "bytes": 43069,
+          "header": {
+            "first_32_hex": "000000004000000030000000300000000100000000a032d3fe909ebf72c7e2fd",
+            "u32le_0_3": [
+              0,
+              64,
+              48,
+              48
+            ]
+          },
+          "sha256": "5b1ea1027dc4933b7181ceef010ecdade6dd2f4fb920cde4898200e247c4136f"
+        }
+      }
     }
   },
   "generator": "scripts/golden/generate_artifact_baseline.py",
