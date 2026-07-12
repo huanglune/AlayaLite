@@ -325,7 +325,13 @@ Yi(原版 `~/workspace/alaya-dev/Yi`,SPDK/io_uring 全异步)与其在 AlayaLite
   迁移版 `DiskUpdateContext::removed_node_nbrs_`),搜索遇 tombstone 经缓存二跳
   绕行(每死邻居最多取 5 个活二跳候选,重连池 heap 上限 degree+32);修图推迟到
   下次插入触达或 safety-net(tombstone 比例 ≥5% 且久无插入时主动重连,
-  `disk_update_context.hpp:35`)。
+  `disk_update_context.hpp:35`)。Yi 另有更激进的 IP-DiskANN 删除变体
+  `co_delete_ipdiskann`:以被删向量搜索候选,对全部受影响活点 fan-out 修复任务
+  (活旧边 + 搜索候选最近 3 个再剪枝)——这是 Yi 里最接近"删除即整形"的路径。
+- **写回调度细节**(codex 读 Yi 原版证实):更新只改内存页版本号,脏页进 dirty
+  LRU;worker 事件循环在队列深度允许时逐页写回,脏页积压超 30k 一次调度 32 页;
+  io_uring 后端 `O_RDWR|O_DIRECT`、每线程深度 256 的 ring,**未用** registered
+  buffer/SQPOLL——Yi 的收益来自"同页多次修改合成一次设备写",不是 io_uring 高级特性。
 - **崩溃一致性**:Yi 与迁移版都没有 WAL;研究系统定位,与我们相同。
 
 ### 8.2 与 LASER 原型逐项对照
@@ -346,47 +352,92 @@ Yi(原版 `~/workspace/alaya-dev/Yi`,SPDK/io_uring 全异步)与其在 AlayaLite
 
 ### 8.3 计划
 
-**P0 写路径改造(照抄 Yi 两件套,目标 evict 臂 8k → 15k+/s)**
-1. 分片脏页缓存:QGUpdater 所有行写改为缓存页内 RMW+标脏,批末/轮末
-   `flush_dirty_pages()`(每页一次,O_DIRECT 对齐写,独立 fd)。批内多插入命中
-   同一反向边页自动合并。可参照/复用 `diskann/disk_page_cache.hpp` 的分片实现。
+**P0 写路径改造(照抄 Yi 两件套,目标 evict 臂 8k → 12–15k/s 或 ≥none 上限的 70%)**
+1. **P0.1 O_DIRECT 归因臂(2–4 人日)**:最小改动——更新 fd 换
+   `O_DIRECT|O_RDWR` + 对齐页 buffer,其余语义不变。若 T=32→64 不再同卡,
+   证实 287k 墙 = buffered inode 锁;若无改善,先 lockstat/perf 重新归因再动大刀。
    附带修正一个现存隐患:LASER 搜索读本来就是 O_DIRECT
    (`utils/aligned_file_reader.hpp:359`),而更新 fd 是 buffered O_RDWR
-   (`qg_updater.hpp:253`)——buffered 脏页对 O_DIRECT 读不可见,目前靠
-   finalize+重开索引规避,并发读写场景必须两侧统一 direct(迁移版
-   `disk_page_io.hpp` 头注即此结论)。flush→publish 顺序保证搜索只见已落盘状态,
-   搜索侧无需查更新缓存。
-2. StagedEdges 反向边暂存:按邻居聚合回链,drain 时该邻居行**解包一次、改 k 槽、
-   打包一次、写一次**(现在是 k 次全套)。
-3. 验证:none/evict 臂 T=32/64 吞吐 + 写计数;单次 10% 插入 recall 与 v2 持平;
-   ctest 全绿。预期写次数 35.8/插入 → ≈批内独立页数,吞吐逼近搜索侧上限 17.7k/s。
-   工程量 2–4 天。
+   (`qg_updater.hpp:253`)——buffered 写对 O_DIRECT 读的可见性靠内核先回写脏区,
+   有隐藏回写税,两侧统一 direct 才干净(迁移版 `disk_page_io.hpp` 头注同一结论)。
+2. **P0.2 分片脏页缓存(1–1.5 人周)**:抽取 `diskann/disk_page_cache.hpp` 的
+   分片 LRU/dirty 语义,QGUpdater 所有行写改为缓存页内 RMW+标脏,批末
+   `flush_dirty_pages()`(每脏页一次 O_DIRECT 对齐写)→ 再 `publish()`。
+   flush 先行保证搜索只见已落盘状态,搜索侧无需查更新缓存;若后续把 flush
+   进一步解耦(跨批合并/后台写回),读路径须加页级 overlay snapshot(不抄
+   diskann 的整节点 NodeCache override——LASER 行大,按页 overlay 才不产生双份行)。
+   同时上 StagedEdges 反向边暂存:按邻居聚合回链,drain 时该邻居行**解包一次、
+   改 k 槽、打包一次、写一次**(现在是 k 次全套)。
+3. 验证:none/evict 臂 T=1/8/16/32/64 吞吐;三层写计数
+   `逻辑页更新 / 唯一脏页 / 物理写`(收益不足时用唯一页比率解释,而不是盲调线程);
+   "同页 N 次 patch 只 1 次 flush"、并发 patch 不丢更新、cache 开关字节等价单测;
+   单次 10% 插入 recall 与 v2 持平;ctest 全绿。
 
-**P1 质量闭环(移植 delete-repair 战役判决,目标残余 1.7pp → ≤1.0pp)**
-1. 更深维护搜索:`ef_insert`/splice 召回深度 100→200 扫描(oracle 判决:残余是
-   边质量欠账,深搜是杠杆;garden 侧 128→200 同理)。
-2. gardening:RAM 入度计数器(uint16/槽,插入/patch/purge 时维护)+ 每轮
-   consolidate 对最低入度 decile 节点做再插入式刷新 + densification(欠满行填满,
-   headroom 臂已证明满行更优)。diskann 判决:砍 ~40% 老化衰减。
+**P1 质量闭环(移植 delete-repair 战役判决,目标稳态 0.9748 → ≥0.985)**
+1. 更深维护搜索:再插入式刷新用独立 `ef_maintenance ∈ {100,200,400}` 消融
+   (oracle 判决:残余是边质量欠账,深搜是杠杆;garden 侧 128→200 同理)。
+   注意仅调大 `splice_rerank` 无效——splice 候选只来自死点旧邻域,改善的是
+   候选内精排,扩不了候选来源;深 beam 才是扩源。
+2. gardening:RAM 入度 delta 计数器(uint16/槽,patch/zero/插入时增减,
+   checkpoint 可扫 id SoA 重建,不必持久化)+ 每轮对最低入度分位(bottom 5%)
+   + 高年龄/高驱逐行做再插入式深搜刷新、整行 `assemble_row` 重写 +
+   densification(欠满行填满,headroom 臂已证明满行更优)。**反向泵要有预算**
+   (B∈{0,4,8},优先填幽灵槽):LASER 每条回链要重算 1-bit 码+三因子,
+   不能像 DiskANN 无预算 fan-out;同页泵靠 P0 页缓存合并。diskann 判决:
+   入度定向刷新砍 ~40% 老化衰减。
 3. 触发策略:tombstone 比例 + ops-since-insert 的 safety-net(照抄
    `needs_safety_net_reconnect` 语义),替代手动每轮调用。
-4. 验证:SIFT1M 100 轮长 churn 稳态(复用 g03 协议:稳态回收 + 永不删固定队列),
-   对照 v2 平台 0.9748。工程量 3–5 天(含实验)。
+4. 验证:六臂消融(purge-only / 现 splice / +浅刷 / +深刷 / 深刷+泵 /
+   **等预算随机刷新对照**),≥3 seeds,跑到 100–300% 换血;同时报结构指标
+   (入度 p1/p5/中位、entry 可达率、活出度、边年龄、新边存活率)。
+   长稳态复用 g03 协议(稳态回收 + 永不删固定队列)。
+   门槛:recall@100 ≥0.985 且维护摊销 ≤前台更新 CPU/IO 的 20%。
+   工程量:观测+消融 4–6 人日(可与 P0.2 并行),胜出臂做成带预算的
+   正式 scheduler 再 1–1.5 人周。
 
-**P2 槽位复用与格式 v2(空间回收,长 churn 文件不再无限涨)**
+**P2 槽位复用与格式 v2(空间回收,长 churn 文件不再无限涨;1–2 人周)**
 1. 移植 SlotAllocator:purge 清净入边的死槽进 free-list(入度计数器守门:入度>0
-   不得复用),插入优先复用,暗至 publish;分配状态随 finalize 持久化。
-2. 格式 v2:行头 valid-degree 字节(替代幽灵槽三条件启发式)+ meta epoch;
-   兼容读 v1。
-3. 验证:长 churn 下文件大小有界;复用槽无旧字节泄漏单测。工程量 3–4 天。
+   不得复用),插入优先复用,暗至 publish;分配状态(free-list+tombstone)随
+   finalize 持久化(照抄 `slot_allocator.hpp` 的 save/load 格式)。
+2. 格式 v2:行头 valid-degree(或槽位位图)替代幽灵槽三条件启发式;A/B 双
+   superblock 存 geometry / allocated-committed N / generation / checksum,给后续
+   WAL 提供锚点;v1 只读兼容 + 离线迁移工具。
+3. 验证:长 churn 下文件大小有界;复用槽无旧字节泄漏、id=0 真边、欠满行、
+   npp>1、旧格式兼容单测。
 
 **P3 生产化(按需)**
-- WAL/崩溃一致性(meta 水位 + flush 顺序,或依赖上层 collection WAL)——Yi 也
-  没做,原型不阻塞;io_uring 异步 flush;collection 集成(id 映射、持久化
-  tombstone、并发 reader 版本)。
+- WAL/崩溃一致性(2–3 人周):full-page redo WAL(batch 级 begin / 页
+  after-image+checksum / commit,先 durable WAL 再写数据页,A/B superblock 翻转
+  提交;**不用 shadow page**——它会把纯 id 算术寻址逼成 page table)。
+  tombstone 位图与 meta 纳入同一事务。Yi 也没做,原型阶段标注 non-durable 不阻塞。
+- io_uring 异步 flush(可选,5–8 人日):页缓存合并之后的写回引擎,有界 QD +
+  固定对齐 buffer 池,隐藏 O_DIRECT 写延迟;profile 证明有收益再上 registered
+  buffer(Yi 自己也没用)。
+- collection 集成:活跃可更新 LASER 段 + 持久 label 映射/tombstone + 后台把老段
+  重建为不可变段、原子发布 manifest(周期全量重建作为质量/空间兜底)。
 
-### 8.4 明确不做
+### 8.4 明确不做(及重启条件)
 
-- fresh 内存增量层(理由见 8.2 尾;触发条件写明,需要时再启)。
-- SPDK/全协程调度移植(Yi 的 io_uring reactor 读路径迁移版已有,LASER 搜索有
-  自己的 IO 栈;写侧只需要 O_DIRECT flush,不需要 reactor)。
+- **fresh 内存增量层**:Yi 本身就是纯 in-place;引入双图要付出双搜索路径合并、
+  merge 时逐边重生成码/因子、manifest 发布、崩溃恢复四份复杂度,而且它不消灭
+  LASER 边码写,只把写延后成更大的 merge。设为触发式备选,满足任一才立项:
+  (a) P0 后 evict 仍 <10k 且瓶颈已被证明是设备随机 IOPS 而非软件;(b) 更新可见
+  延迟 + fsync 成本使按批 in-place 提交不可接受;(c) collection 本就要做多段
+  merge,可复用其框架;(d) 更新分布高度局部而页缓存合并率仍低。即使触发,也做
+  在 collection 层(内存 delta + 不可变 base 段),不把 QGUpdater 改成双图。
+- **分段文件**:与纯 id 算术寻址冲突,留给 collection 层的段管理,不进单段格式。
+- **SPDK/全协程调度移植**:Yi 的 io_uring reactor 读路径迁移版已有,LASER 搜索有
+  自己的 IO 栈;写侧只需要 O_DIRECT flush(+可选 io_uring 写回),不需要 reactor。
+
+### 8.5 执行顺序与判决点
+
+1. P0.1 归因臂先行:O_DIRECT-only 若 T=32→64 仍同卡 ~287k 写/s,暂停页缓存
+   大改,先重新归因;否则立即进 P0.2。
+2. P0.2(写路径)与 P1 观测/消融并行——写路径先解决,gardening 的反向泵成本
+   结论才不被旧墙污染。
+3. P0/P1 末 go/no-go:吞吐 ≥12k 且深刷稳态 ≥0.985 → 锁定纯 in-place,进入
+   P2 格式/复用与 P3 WAL;未达标按唯一页 IOPS / 结构指标分别定位,不直接跳 fresh。
+
+> 详细版(逐文件/行号证据、Yi 并发协议逐段拆解、各方案风险表、验证门槛全文)
+> 见 `docs/LASER_UPDATE_NEXT_PLAN_YI.md`——codex 独立调研终报,与本节交叉核对
+> 后一致;本节采纳了其两处修正:P0 拆归因臂+页缓存两步、工程量估计以其为准。
