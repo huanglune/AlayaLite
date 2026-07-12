@@ -54,6 +54,8 @@ class SQ8Space {
   using DataTypeAlias = DataType;
   using IDTypeAlias = IDType;
   using DistanceTypeAlias = DistanceType;
+  using DistanceFunction = DistanceType (*)(const std::uint8_t *, const std::uint8_t *, std::size_t,
+                                            const DataType *, const DataType *);
 
   using DistDataType = DataType;
 
@@ -195,7 +197,7 @@ class SQ8Space {
    * @brief Get the distance calculation function
    * @return The distance calculation function
    */
-  auto get_dist_func() const -> DistFuncSQ<DataType, DistanceType> { return distance_calu_func_; }
+  auto get_dist_func() const -> DistanceFunction { return distance_calu_func_; }
 
   /**
    * @brief Get scalar data for a specific ID
@@ -476,7 +478,7 @@ class SQ8Space {
   uint32_t dim_{0};                    ///< Dimensionality of the data points
   MetricType metric_{MetricType::L2};  ///< Metric type
 
-  DistFuncSQ<DataType, DistanceType> distance_calu_func_;  ///< Distance calculation function
+  DistanceFunction distance_calu_func_;  ///< Distance calculation function
   uint32_t data_size_{0};                                  ///< Size of each data point in bytes
   IDType item_cnt_{0};                                     ///< Number of data points (nodes)
   IDType delete_cnt_{0};              ///< Number of deleted data points (nodes)

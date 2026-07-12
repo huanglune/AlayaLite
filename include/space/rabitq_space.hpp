@@ -54,7 +54,8 @@ class RaBitQSpace {
   size_t nei_id_offset_{0};
   size_t data_chunk_size_{0};  ///< Size of each node's data chunk
 
-  DistFuncRaBitQ<DataType, DistanceType> distance_cal_func_;  ///< Distance calculation function
+  using DistanceFunction = DistanceType (*)(const DataType *, const DataType *, std::size_t);
+  DistanceFunction distance_cal_func_;  ///< Distance calculation function
 
   StaticStorage<> storage_;  ///< Data Storage
   RocksDBConfig config_;     ///< Configuration for Scalar Data Storage
@@ -450,7 +451,7 @@ class RaBitQSpace {
                : (metric_ == MetricType::IP ? core::Metric::inner_product : core::Metric::cosine);
   }
 
-  auto get_dist_func() const -> DistFuncRaBitQ<DataType, DistanceType> {
+  auto get_dist_func() const -> DistanceFunction {
     return distance_cal_func_;
   }
 
@@ -474,7 +475,7 @@ class RaBitQSpace {
     size_t f_add_offset_;                               ///< f_add offset
     size_t f_rescale_offset_;                           ///< f_rescale offset
     size_t nei_id_offset_;                              ///< Neighbor ID offset
-    DistFuncRaBitQ<DataType, DistanceType> dist_func_;  ///< Distance function
+    DistanceFunction dist_func_;  ///< Distance function
     uint32_t dim_;                                      ///< Original dimension
     size_t padded_dim_;                                 ///< Padded dimension
 

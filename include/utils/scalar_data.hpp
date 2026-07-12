@@ -16,6 +16,8 @@
 #include <vector>
 
 namespace alaya {
+struct EmptyScalarData {};
+
 // NOLINTBEGIN
 /// Supported metadata value types
 using MetadataValue = std::variant<int64_t, double, std::string, bool>;

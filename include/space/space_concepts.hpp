@@ -14,18 +14,6 @@ namespace alaya {
 
 inline constexpr std::uint32_t kAlignment = 64;
 
-struct EmptyScalarData {};
-
-template <typename DataType, typename DistanceType>
-using DistFunc = DistanceType (*)(const DataType *, const DataType *, std::size_t);
-
-template <typename DataType, typename DistanceType>
-using DistFuncSQ =
-    DistanceType (*)(const std::uint8_t *, const std::uint8_t *, std::size_t, const DataType *, const DataType *);
-
-template <typename DataType, typename DistanceType>
-using DistFuncRaBitQ = DistanceType (*)(const DataType *, const DataType *, std::size_t);
-
 // A distance policy owns metric semantics and query preparation. It does not
 // own metadata, persistence, mutation, or graph adjacency.
 template <typename T>

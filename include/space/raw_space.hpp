@@ -52,8 +52,9 @@ class RawSpace {
   using DataTypeAlias = DataType;
   using IDTypeAlias = IDType;
   using DistanceTypeAlias = DistanceType;
+  using DistanceFunction = DistanceType (*)(const DataType *, const DataType *, std::size_t);
 
-  DistFunc<DistDataType, DistanceType> distance_calu_func_;  ///< Distance calculation function
+  DistanceFunction distance_calu_func_;  ///< Distance calculation function
 
   IDType capacity_{0};                 ///< The maximum number of data points (nodes)
   uint32_t dim_{0};                    ///< Dimensionality of the data points
@@ -247,7 +248,7 @@ class RawSpace {
    * @brief Get the distance calculation function
    * @return The distance calculation function
    */
-  auto get_dist_func() const -> DistFunc<DataType, DistanceType> { return distance_calu_func_; }
+  auto get_dist_func() const -> DistanceFunction { return distance_calu_func_; }
 
   /**
    * @brief Get the dimensionality of the data points
