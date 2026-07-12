@@ -395,6 +395,19 @@ Yi(原版 `~/workspace/alaya-dev/Yi`,SPDK/io_uring 全异步)与其在 AlayaLite
    工程量:观测+消融 4–6 人日(可与 P0.2 并行),胜出臂做成带预算的
    正式 scheduler 再 1–1.5 人周。
 
+**P1.5 插入流水线协程化(1–2 人周,P0 判决后,可与 P1 scheduler 并行)**
+- 动机:协程基建在仓已全(C++20 全项目、coro 库、`storage/io/uring_reactor.hpp`,
+  diskann 更新路径已跑在其上);none 臂 17.7k/s 上限含可观 IO 等待,libaio 每线程
+  一个 io context(MAX_EVENTS=1024,全机 ≤64 线程,实测撞过两次);协程 + reactor
+  少数 ring 服务几百并发,并发数与线程数解耦。
+- 做法:给 qg 插入搜索做异步变体,照 `diskann/beam_search_async.hpp` 的契约
+  (cache 命中在挂起前内联吸收、锁不跨挂起点、结果与同步版逐字节一致);bench 的
+  OpenMP parallel-for 换 `coro::thread_pool` + `when_all`
+  (`batch_insert_locked_with_pool` 现成模式);搜索 peek P0.2 分片缓存并按版本
+  协议回填——分片缓存升级为 Yi 式统一 buffer pool。
+- 边界:协程不解决写路径 inode 锁(P0 的事),不加速 FastScan(CPU bound)。
+- 验证:none/evict 吞吐 × 线程数扫描,并发>线程数的扩展性,io context 计数 O(1)。
+
 **P2 槽位复用与格式 v2(空间回收,长 churn 文件不再无限涨;1–2 人周)**
 1. 移植 SlotAllocator:purge 清净入边的死槽进 free-list(入度计数器守门:入度>0
    不得复用),插入优先复用,暗至 publish;分配状态(free-list+tombstone)随
@@ -434,7 +447,8 @@ Yi(原版 `~/workspace/alaya-dev/Yi`,SPDK/io_uring 全异步)与其在 AlayaLite
 1. P0.1 归因臂先行:O_DIRECT-only 若 T=32→64 仍同卡 ~287k 写/s,暂停页缓存
    大改,先重新归因;否则立即进 P0.2。
 2. P0.2(写路径)与 P1 观测/消融并行——写路径先解决,gardening 的反向泵成本
-   结论才不被旧墙污染。
+   结论才不被旧墙污染。P1.5 协程化排在 P0 判决之后:若 P0 后吞吐已贴 none 上限,
+   它是抬上限的下一根杠杆。
 3. P0/P1 末 go/no-go:吞吐 ≥12k 且深刷稳态 ≥0.985 → 锁定纯 in-place,进入
    P2 格式/复用与 P3 WAL;未达标按唯一页 IOPS / 结构指标分别定位,不直接跳 fresh。
 
