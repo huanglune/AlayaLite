@@ -1,5 +1,6 @@
 add_subdirectory(disk)
 add_subdirectory(diskann)
+add_subdirectory(core)
 add_subdirectory(executor)
 add_subdirectory(index)
 add_subdirectory(recovery)
