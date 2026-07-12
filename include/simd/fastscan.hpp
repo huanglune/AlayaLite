@@ -30,6 +30,36 @@ inline void build_lut(size_t dim, const T *ALAYA_RESTRICT query, T *ALAYA_RESTRI
     query += 4;
   }
 }
+
+template <bool LowNibbleFirst>
+inline void pack_codes_bytes(size_t padded_dim,
+                             const uint8_t *codes,
+                             size_t count,
+                             uint8_t *blocks) {
+  const size_t cols = padded_dim / 8;
+  const size_t padded_count = (count + 31) & ~size_t{31};
+  std::array<uint8_t, 32> column{};
+  for (size_t row = 0; row < padded_count; row += 32) {
+    for (size_t col = 0; col < cols; ++col) {
+      const size_t present = std::min<size_t>(32, count - std::min(count, row));
+      for (size_t lane = 0; lane < present; ++lane) column[lane] = codes[(row + lane) * cols + col];
+      std::fill(column.begin() + static_cast<std::ptrdiff_t>(present), column.end(), uint8_t{0});
+      for (size_t lane = 0; lane < 16; ++lane) {
+        const uint8_t first0 = LowNibbleFirst ? (column[kPackedLaneOrder[lane]] & 15)
+                                              : (column[kPackedLaneOrder[lane]] >> 4);
+        const uint8_t first1 = LowNibbleFirst ? (column[kPackedLaneOrder[lane] + 16] & 15)
+                                              : (column[kPackedLaneOrder[lane] + 16] >> 4);
+        const uint8_t second0 = LowNibbleFirst ? (column[kPackedLaneOrder[lane]] >> 4)
+                                               : (column[kPackedLaneOrder[lane]] & 15);
+        const uint8_t second1 = LowNibbleFirst ? (column[kPackedLaneOrder[lane] + 16] >> 4)
+                                               : (column[kPackedLaneOrder[lane] + 16] & 15);
+        blocks[lane] = static_cast<uint8_t>(first0 | (first1 << 4));
+        blocks[lane + 16] = static_cast<uint8_t>(second0 | (second1 << 4));
+      }
+      blocks += 32;
+    }
+  }
+}
 inline void accumulate_generic(size_t dim,
                                const uint8_t *ALAYA_RESTRICT codes,
                                const uint8_t *ALAYA_RESTRICT lut,
