@@ -1,0 +1,315 @@
+// SPDX-FileCopyrightText: 2026 AlayaDB.AI
+//
+// SPDX-License-Identifier: AGPL-3.0-only
+
+#pragma once
+
+#include <compare>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <functional>
+#include <limits>
+#include <map>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include "core/any_segment.hpp"
+
+namespace alaya::internal::collection {
+
+// Gate 4 is deliberately internal. These owner-layer types give semantic
+// meaning to the opaque operation payload frozen by contract v3; they are not
+// a second engine boundary and are not bound into Python.
+
+struct LogicalIdLess {
+  [[nodiscard]] auto operator()(const core::LogicalId &lhs,
+                                const core::LogicalId &rhs) const noexcept -> bool {
+    return lhs.compare(rhs) < 0;
+  }
+};
+
+using ScalarValue = std::variant<bool, std::int64_t, double, std::string>;
+using Metadata = std::map<std::string, ScalarValue, std::less<>>;
+
+class LogicalFilter {
+ public:
+  using Predicate =
+      std::function<bool(const core::LogicalId &, const Metadata &, std::string_view)>;
+
+  LogicalFilter() = default;
+  explicit LogicalFilter(Predicate predicate) : predicate_(std::move(predicate)) {}
+
+  [[nodiscard]] static auto metadata_equals(std::string key, ScalarValue value) -> LogicalFilter {
+    return LogicalFilter([key = std::move(key), value = std::move(value)](const core::LogicalId &,
+                                                                          const Metadata &metadata,
+                                                                          std::string_view) {
+      const auto found = metadata.find(key);
+      return found != metadata.end() && found->second == value;
+    });
+  }
+
+  [[nodiscard]] auto active() const noexcept -> bool { return static_cast<bool>(predicate_); }
+
+  [[nodiscard]] auto matches(const core::LogicalId &id,
+                             const Metadata &metadata,
+                             std::string_view document) const -> bool {
+    return !predicate_ || predicate_(id, metadata, document);
+  }
+
+ private:
+  Predicate predicate_{};
+};
+
+struct CollectionSchema {
+  std::uint32_t dim{};
+  core::Metric metric{core::Metric::l2};
+  core::ScalarType scalar_type{core::ScalarType::float32};
+  std::uint64_t max_logical_id_bytes{64U * 1024U};
+};
+
+class OwnedVector {
+ public:
+  OwnedVector() = default;
+
+  [[nodiscard]] static auto copy_row(const core::TypedTensorView &source, core::RowCount row)
+      -> core::Result<OwnedVector> {
+    if (row >= source.rows) {
+      return core::Status::error(core::StatusCode::invalid_argument,
+                                 core::OperationStage::validation,
+                                 core::StatusDetail::malformed_struct,
+                                 "vector row is outside the tensor view");
+    }
+    std::uint64_t row_bytes{};
+    if (!core::checked_multiply(source.dim,
+                                core::scalar_type_size(source.scalar_type),
+                                row_bytes) ||
+        row_bytes > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+      return core::Status::error(core::StatusCode::invalid_argument,
+                                 core::OperationStage::validation,
+                                 core::StatusDetail::arithmetic_overflow,
+                                 "vector row byte size is not representable");
+    }
+    OwnedVector result;
+    result.scalar_type_ = source.scalar_type;
+    result.dim_ = source.dim;
+    result.bytes_.resize(static_cast<std::size_t>(row_bytes));
+    if (row_bytes != 0) {
+      const auto *source_bytes =
+          static_cast<const std::byte *>(source.data) + row * source.row_stride;
+      std::memcpy(result.bytes_.data(), source_bytes, result.bytes_.size());
+    }
+    return result;
+  }
+
+  [[nodiscard]] auto view() const noexcept -> core::TypedTensorView {
+    return {bytes_.empty() ? nullptr : bytes_.data(),
+            scalar_type_,
+            1,
+            dim_,
+            static_cast<std::uint64_t>(bytes_.size())};
+  }
+
+  [[nodiscard]] auto empty() const noexcept -> bool { return bytes_.empty() && dim_ == 0; }
+  [[nodiscard]] auto scalar_type() const noexcept -> core::ScalarType { return scalar_type_; }
+  [[nodiscard]] auto dim() const noexcept -> std::uint32_t { return dim_; }
+  [[nodiscard]] auto bytes() const noexcept -> std::span<const std::byte> { return bytes_; }
+
+ private:
+  core::ScalarType scalar_type_{core::ScalarType::float32};
+  std::uint32_t dim_{};
+  std::vector<std::byte> bytes_{};
+};
+
+struct RecordPayload {
+  std::optional<OwnedVector> vector{};
+  Metadata metadata{};
+  std::string document{};
+};
+
+struct RowAddress {
+  std::uint64_t segment_id{};
+  std::uint64_t generation{};
+  core::SegmentRowId row_id{};
+
+  auto operator<=>(const RowAddress &) const = default;
+};
+
+enum class VersionState : std::uint8_t { live = 0, tombstone = 1 };
+
+struct VersionEntry {
+  RowAddress address{};
+  std::uint64_t upsert_sequence{};
+  VersionState state{VersionState::live};
+  RecordPayload payload{};
+};
+
+struct ReverseEntry {
+  core::LogicalId logical_id{};
+  std::uint64_t upsert_sequence{};
+};
+
+enum class SegmentRole : std::uint8_t {
+  sealed = 0,
+  active_mutable = 1,
+  legacy_readonly = 2,
+};
+
+using ExactRerank =
+    std::function<core::Result<float>(const core::TypedTensorView &, core::SegmentRowId)>;
+
+struct RegisteredRow {
+  core::LogicalId logical_id{};
+  core::SegmentRowId row_id{};
+  std::uint64_t upsert_sequence{};
+  VersionState state{VersionState::live};
+  RecordPayload payload{};
+};
+
+struct SegmentRegistration {
+  std::uint64_t segment_id{};
+  std::uint64_t generation{1};
+  SegmentRole role{SegmentRole::sealed};
+  core::AnySegment segment{};
+  std::vector<RegisteredRow> rows{};
+  ExactRerank exact_rerank{};
+  std::uint64_t next_row_id{};
+};
+
+struct CollectionHit {
+  core::LogicalId logical_id{};
+  float score{};
+  core::ScoreKind score_kind{core::ScoreKind::distance};
+  core::Metric comparable_metric{core::Metric::l2};
+  core::ResultFlag result_flags{core::ResultFlag::none};
+  std::uint64_t upsert_sequence{};
+  RowAddress source{};
+};
+
+struct CollectionQueryResult {
+  std::vector<CollectionHit> hits{};
+  core::Status status{};
+  core::SearchCompleteness completeness{core::SearchCompleteness::eligible_exhausted};
+};
+
+struct CollectionSearchResult {
+  std::uint64_t visibility_watermark{};
+  std::uint64_t metadata_epoch{};
+  std::vector<CollectionQueryResult> queries{};
+};
+
+struct CollectionSearchRequest {
+  core::TypedTensorView queries{};
+  core::SearchOptions options{};
+  LogicalFilter filter{};
+  core::SearchContext *context{};
+};
+
+enum class Projection : std::uint8_t {
+  identity = 0,
+  vector = 1U << 0U,
+  metadata = 1U << 1U,
+  document = 1U << 2U,
+  all = (1U << 0U) | (1U << 1U) | (1U << 2U),
+};
+
+[[nodiscard]] constexpr auto projection_contains(Projection projection, Projection field) noexcept
+    -> bool {
+  return (static_cast<std::uint8_t>(projection) & static_cast<std::uint8_t>(field)) != 0;
+}
+
+struct CollectionRecord {
+  core::LogicalId logical_id{};
+  std::uint64_t upsert_sequence{};
+  std::optional<OwnedVector> vector{};
+  Metadata metadata{};
+  std::string document{};
+};
+
+enum class WriteMode : std::uint8_t { insert_only = 0, upsert = 1, replace = 2 };
+
+struct WriteRequest {
+  core::LogicalId logical_id{};
+  core::TypedTensorView vector{};
+  Metadata metadata{};
+  std::string document{};
+  WriteMode mode{WriteMode::upsert};
+};
+
+enum class SegmentMutationAction : std::uint8_t { write = 0, erase = 1 };
+
+struct SegmentMutationPayload {
+  core::VersionedStructHeader header{};
+  SegmentMutationAction action{SegmentMutationAction::write};
+  std::uint8_t reserved_bytes[7]{};
+  std::uint64_t op_id{};
+  std::uint64_t upsert_sequence{};
+  RowAddress target{};
+  std::optional<RowAddress> previous{};
+  core::TypedTensorView vector{};
+  std::uint64_t reserved[4]{};
+
+  SegmentMutationPayload() : header(core::current_struct_header<SegmentMutationPayload>()) {}
+};
+
+enum class RowMutationStatus : std::uint8_t {
+  inserted = 0,
+  updated = 1,
+  replaced = 2,
+  deleted = 3,
+  already_exists = 4,
+  not_found = 5,
+  conflict = 6,
+  invalid_argument = 7,
+  aborted = 8,
+};
+
+enum class DurabilityState : std::uint8_t { memory_only = 0 };
+
+struct MutationReceipt {
+  std::uint64_t op_id{};
+  std::uint64_t visibility_watermark{};
+  bool searchable{};
+  DurabilityState durability{DurabilityState::memory_only};
+  RowMutationStatus row_status{RowMutationStatus::aborted};
+};
+
+struct CollectionFeatureFlags {
+  bool collection_shell{true};
+  bool legacy_memory_adapter{true};
+  bool legacy_disk_adapter{true};
+  bool experimental_persistence_writer{};
+};
+
+struct PersistenceOptions {
+  std::filesystem::path root{};
+  std::string namespace_name{"collection_shell_v1"};
+};
+
+struct CollectionConfig {
+  CollectionFeatureFlags features{};
+  PersistenceOptions persistence{};
+};
+
+enum class LifecycleState : std::uint8_t { open = 0, closing = 1, closed = 2 };
+
+struct CollectionStats {
+  core::RowCount size{};
+  core::RowCount accepted_count{};
+  core::RowCount pending_count{};
+  std::uint64_t pending_bytes{};
+  core::RowCount allocated_count{};
+  core::RowCount tombstone_count{};
+  std::uint64_t routing_generation{};
+  std::uint64_t visibility_watermark{};
+  std::uint64_t metadata_epoch{};
+  LifecycleState lifecycle{LifecycleState::open};
+};
+
+}  // namespace alaya::internal::collection

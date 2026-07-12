@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: 2026 AlayaDB.AI
+# SPDX-License-Identifier: AGPL-3.0-only
+
+alaya_cc_target(segmented_collection_header_closure SRCS segmented_collection_header_closure.cpp)
+alaya_cc_target(legacy_memory_adapter_header_closure SRCS legacy_memory_adapter_header_closure.cpp)
+alaya_cc_target(legacy_disk_adapter_header_closure SRCS legacy_disk_adapter_header_closure.cpp)
