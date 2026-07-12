@@ -45,7 +45,10 @@ def _header(path: Path) -> dict[str, object]:
 
 def _inventory(root: Path) -> dict[str, object]:
     files: dict[str, object] = {}
-    for path in sorted(p for p in root.rglob("*") if p.is_file() and p.name != ".lock"):
+    # The provenance stamp gates fixture reuse, embeds an intentionally volatile .so hash,
+    # and is metadata rather than artifact payload.
+    excluded_names = {".lock", ".laser_fixture_provenance.json"}
+    for path in sorted(p for p in root.rglob("*") if p.is_file() and p.name not in excluded_names):
         rel = path.relative_to(root).as_posix()
         entry: dict[str, object] = {"bytes": path.stat().st_size, "sha256": _sha256(path)}
         if path.name.endswith("manifest.txt"):

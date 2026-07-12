@@ -209,10 +209,6 @@
     },
     "laser_fixture": {
       "files": {
-        ".laser_fixture_provenance.json": {
-          "bytes": 621,
-          "sha256": "3fe1b54ee09a1fbbc488b7ded7bb36608587426bf55f5bb40405c7ebe6cb702b"
-        },
         "dsqg_seg_00000001_R64_MD128.index": {
           "bytes": 8392704,
           "header": {
