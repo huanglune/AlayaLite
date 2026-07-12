@@ -40,11 +40,7 @@ def _tokens(row: tuple[str, str, str, str]) -> tuple[str, str, str]:
     data_token = {"float": "float", "int8_t": "signed char", "uint8_t": "unsigned char"}[data]
     id_token = {"uint32_t": "unsigned int", "uint64_t": "unsigned long"}[ident]
     if quant == "RABITQ":
-        builder_token = {
-            "HNSW": "HnswSegment<",
-            "NSG": "NsgBuilderKernel<",
-            "FUSION": "FusionBuilderKernel<",
-        }[index]
+        builder_token = "QgSegment<"
     else:
         builder_token = {
             "HNSW": "HnswSegment<",
