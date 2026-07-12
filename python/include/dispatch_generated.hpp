@@ -332,20 +332,20 @@ auto IndexFactory::create(const IndexParams &params,
                                                                          registration.current);
   }
   // float / uint32_t / RABITQ / HNSW
-  // implementation=legacy_qg_model engine=qg
+  // implementation=qg_segment engine=qg
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint32_t>())
       && params.quantization_type_ == QuantizationType::RABITQ
       && params.index_type_ == IndexType::HNSW) {
     constexpr internal::memory::FactoryRegistration registration{
-        {"hnsw", "legacy_qg_model", "qg"},
+        {"hnsw", "qg_segment", "qg"},
         {"hnsw", "legacy_qg_model", "qg"},
         internal::memory::EngineFeature::qg_segment,
         false};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RaBitQSpace<float,float,uint32_t,ScalarData>;
       using SearchSpaceType = RaBitQSpace<float,float,uint32_t,ScalarData>;
-      using CurrentRuntimeType = HnswSegment<BuildSpaceType>;
+      using CurrentRuntimeType = QgSegment<SearchSpaceType>;
       using LegacyRuntimeType = HnswSegment<BuildSpaceType>;
       if (registration.use_legacy(features)) {
         return std::make_unique<PyIndex<LegacyRuntimeType, SearchSpaceType>>(params,
@@ -356,7 +356,7 @@ auto IndexFactory::create(const IndexParams &params,
     }
     using BuildSpaceType = RaBitQSpace<float,float,uint32_t,EmptyScalarData>;
     using SearchSpaceType = RaBitQSpace<float,float,uint32_t,EmptyScalarData>;
-    using CurrentRuntimeType = HnswSegment<BuildSpaceType>;
+    using CurrentRuntimeType = QgSegment<SearchSpaceType>;
     using LegacyRuntimeType = HnswSegment<BuildSpaceType>;
     if (registration.use_legacy(features)) {
       return std::make_unique<PyIndex<LegacyRuntimeType, SearchSpaceType>>(params,
@@ -366,20 +366,20 @@ auto IndexFactory::create(const IndexParams &params,
                                                                          registration.current);
   }
   // float / uint32_t / RABITQ / NSG
-  // implementation=legacy_qg_model engine=qg
+  // implementation=qg_segment engine=qg
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint32_t>())
       && params.quantization_type_ == QuantizationType::RABITQ
       && params.index_type_ == IndexType::NSG) {
     constexpr internal::memory::FactoryRegistration registration{
-        {"nsg", "legacy_qg_model", "qg"},
+        {"nsg", "qg_segment", "qg"},
         {"nsg", "legacy_qg_model", "qg"},
         internal::memory::EngineFeature::qg_segment,
         false};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RaBitQSpace<float,float,uint32_t,ScalarData>;
       using SearchSpaceType = RaBitQSpace<float,float,uint32_t,ScalarData>;
-      using CurrentRuntimeType = detail::NsgBuilderKernel<BuildSpaceType>;
+      using CurrentRuntimeType = QgSegment<SearchSpaceType>;
       using LegacyRuntimeType = detail::NsgBuilderKernel<BuildSpaceType>;
       if (registration.use_legacy(features)) {
         return std::make_unique<PyIndex<LegacyRuntimeType, SearchSpaceType>>(params,
@@ -390,7 +390,7 @@ auto IndexFactory::create(const IndexParams &params,
     }
     using BuildSpaceType = RaBitQSpace<float,float,uint32_t,EmptyScalarData>;
     using SearchSpaceType = RaBitQSpace<float,float,uint32_t,EmptyScalarData>;
-    using CurrentRuntimeType = detail::NsgBuilderKernel<BuildSpaceType>;
+    using CurrentRuntimeType = QgSegment<SearchSpaceType>;
     using LegacyRuntimeType = detail::NsgBuilderKernel<BuildSpaceType>;
     if (registration.use_legacy(features)) {
       return std::make_unique<PyIndex<LegacyRuntimeType, SearchSpaceType>>(params,
@@ -400,20 +400,20 @@ auto IndexFactory::create(const IndexParams &params,
                                                                          registration.current);
   }
   // float / uint32_t / RABITQ / FUSION
-  // implementation=legacy_qg_model engine=qg
+  // implementation=qg_segment engine=qg
   if (params.data_type_.is(py::dtype::of<float>())
       && params.id_type_.is(py::dtype::of<uint32_t>())
       && params.quantization_type_ == QuantizationType::RABITQ
       && params.index_type_ == IndexType::FUSION) {
     constexpr internal::memory::FactoryRegistration registration{
-        {"fusion", "legacy_qg_model", "qg"},
+        {"fusion", "qg_segment", "qg"},
         {"fusion", "legacy_qg_model", "qg"},
         internal::memory::EngineFeature::qg_segment,
         false};
     if (params.has_scalar_data_) {
       using BuildSpaceType = RaBitQSpace<float,float,uint32_t,ScalarData>;
       using SearchSpaceType = RaBitQSpace<float,float,uint32_t,ScalarData>;
-      using CurrentRuntimeType = detail::FusionBuilderKernel<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,detail::NsgBuilderKernel<BuildSpaceType>>;
+      using CurrentRuntimeType = QgSegment<SearchSpaceType>;
       using LegacyRuntimeType = detail::FusionBuilderKernel<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,detail::NsgBuilderKernel<BuildSpaceType>>;
       if (registration.use_legacy(features)) {
         return std::make_unique<PyIndex<LegacyRuntimeType, SearchSpaceType>>(params,
@@ -424,7 +424,7 @@ auto IndexFactory::create(const IndexParams &params,
     }
     using BuildSpaceType = RaBitQSpace<float,float,uint32_t,EmptyScalarData>;
     using SearchSpaceType = RaBitQSpace<float,float,uint32_t,EmptyScalarData>;
-    using CurrentRuntimeType = detail::FusionBuilderKernel<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,detail::NsgBuilderKernel<BuildSpaceType>>;
+    using CurrentRuntimeType = QgSegment<SearchSpaceType>;
     using LegacyRuntimeType = detail::FusionBuilderKernel<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,detail::NsgBuilderKernel<BuildSpaceType>>;
     if (registration.use_legacy(features)) {
       return std::make_unique<PyIndex<LegacyRuntimeType, SearchSpaceType>>(params,

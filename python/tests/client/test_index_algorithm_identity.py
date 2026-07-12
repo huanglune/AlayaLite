@@ -39,6 +39,7 @@ ARTIFACT_IDENTITY_BY_IMPLEMENTATION_KEY = {
     "hnsw_segment": "hnsw",
     "nsg_segment": "nsg",
     "fusion_segment": "fusion",
+    "qg_segment": "qg",
     "legacy_qg_model": "qg",
 }
 
@@ -190,16 +191,12 @@ def test_full_dispatch_matrix_persisted_algorithm_identity(case, declared_identi
     assert engine_factory_key == declared_artifact_identity
     assert observed_artifacts == [declared_artifact_identity, declared_artifact_identity]
 
-    # Gate 5 fixes every non-RaBitQ NSG/Fusion row. The three RaBitQ rows retain
-    # their Task-W characterization until Z2 decides whether QG becomes an
-    # explicit index type or the allowlist is narrowed.
+    # Z2 pins the legacy-entry compatibility mapping: any declared memory graph
+    # plus quant=RaBitQ builds QG. Gate 9's Collection entry will require an
+    # explicit QG declaration, while this legacy quirk remains compatible.
     if quant == "rabitq":
         assert declared_artifact_identity == "qg"
         assert observed_artifacts == ["qg", "qg"]
-        pytest.xfail(
-            "Task W / MUST-11: RaBitQ still builds QG for requested "
-            f"{requested_index_type}; decision deferred to Z2"
-        )
-
-    assert declared_artifact_identity == requested_index_type
-    assert observed_artifacts == [requested_index_type, requested_index_type]
+    else:
+        assert declared_artifact_identity == requested_index_type
+        assert observed_artifacts == [requested_index_type, requested_index_type]

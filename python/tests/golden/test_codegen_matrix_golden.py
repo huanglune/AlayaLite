@@ -49,7 +49,7 @@ def test_dispatch_yaml_is_the_frozen_33_row_allowlist():
         ("hnsw_segment", "hnsw"): 10,
         ("nsg_segment", "nsg"): 10,
         ("fusion_segment", "fusion"): 10,
-        ("legacy_qg_model", "qg"): 3,
+        ("qg_segment", "qg"): 3,
     }
 
     engine_factories = config["engine_factories"]
@@ -67,4 +67,4 @@ def test_dispatch_yaml_is_the_frozen_33_row_allowlist():
     assert generated.count('("hnsw_segment", "hnsw", "hnsw"),') == 10
     assert generated.count('("nsg_segment", "nsg", "nsg"),') == 10
     assert generated.count('("fusion_segment", "fusion", "fusion"),') == 10
-    assert generated.count('("legacy_qg_model", "qg", "qg"),') == 3
+    assert generated.count('("qg_segment", "qg", "qg"),') == 3
