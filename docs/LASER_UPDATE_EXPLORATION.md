@@ -1041,3 +1041,48 @@ DiskANN bench 零轮运行不再终局 flush(eval-only 不碰 sidecar)。
 
 产物:data/laser-update/shuffleseeds/(变体底座+md5、8 日志、summary.csv、
 generate/run 脚本、final_report.md)。
+
+## 17. D0 判决:LASER 96 维直通,Phase C 闸门放行(2026-07-12,deep1m 侦察)
+
+**裁决:96 维只差一个过时闸门,小补丁后全链路贯通(已入库)。** 旧
+`dimension_ != padded_dim_` 检查(只放行 2 的幂)是死条款——padding 数据流本已
+完整(rotator 零填充 [dim,pd),FHT/RaBitQ/FastScan 全在 pd 上运算);改为真实
+不变量 `pd ≥ dim 且 pd % 64 == 0` 后,全主维 96/pd128 直通。
+
+### 17.1 deep1m(96d)静态质量(R64,--runs 3 均值±散布)
+
+| ef | recall@10 | 散布 | QPS |
+|---:|---:|---:|---:|
+| 60 | 0.9709 | 0.066pp | 10,394 |
+| 100 | **0.9883** | 0.014pp | 8,530 |
+| 200 | 0.9968 | 0.016pp | 6,070 |
+
+对照:raw 64+32 无 PCA 仅 0.7165@ef100;正确 PCA 64+32 也只 0.9198(残差 32 维
+占 10.3% 方差,近似损失非布局错误)。**Phase C 主腿 = 全主维 96,不用残差切分。**
+
+### 17.2 行几何与 P2 约束(96d)
+
+| 路径 | node_len | npp | slack | trailer | 1M 索引 |
+|---|---:|---:|---:|---:|---:|
+| 全主维 96/pd128 | 2,432B | 1 | 1,664B | 4B | 4.10GB |
+| PCA 64+32/pd64 | 1,920B | **2** | 256B | 8B | 2.05GB |
+
+### 17.3 npp=2 churn 冒烟(P2 首次多行页实证)
+
+PCA 64+32 腿,5×20k reuse churn:file_pages 恒 250,000、freed=reused=20k/轮、
+live_frac=1;终态双 superblock CRC 正确、50 万 trailer 全扫通过、flags 全零、
+度分布 4/58/64(min/p50/max)。**P2 回收链路在多行页几何下正确。**
+(全主维 pd128 也做了 100k 两轮探针,严格复用无崩。)
+
+### 17.4 Phase C 执行参数(deep10m 主战役)
+
+- 建图:1M 60.7s ⇒ 10M 预算 10–15 分钟;索引 40.96GB + 等大对齐临时文件,
+  scratch 预留 ≥100GB;
+- **RAM-cap 设计**:cache_cap_pages 现默认 1,048,576 页(4GiB)且 bench 未暴露;
+  eval 读 O_DIRECT 绕页缓存,但 update 搜索 buffered pread 占页缓存,churn 还把
+  base 全量读进匿名内存(deep10m 3.84GB)——**RAM 扫描前置改造:base 改
+  mmap/窗口读、暴露 --cache_cap_pages**;外层 cgroup v2 memory.max +
+  memory.swap.max=0,扫 4/8/16/32GiB,记录 anon/file、refault、PSI、io.stat;
+- v2 迁移一次,各 cell reflink 克隆;
+- Python 前端(Index.fit)仍有 raw_dim≥128 与 main_dim 2 次幂两道闸,bench 之外
+  用到时需同步放开(记入 D 线依赖重构)。
