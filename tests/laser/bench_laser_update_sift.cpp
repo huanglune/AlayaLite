@@ -130,6 +130,8 @@ struct Args {
   uint32_t vamana_R = 0;  // build: Vamana degree < degree_bound leaves free slots ("headroom")
   uint32_t main_dim = 0;  // 0 -> dim
   size_t ef_insert = 100, prune_cap = 300, alpha_check_max = 16;
+  size_t batch = 4096, insert_threads = 32;
+  uint32_t consolidate = 0, r_target = 0;
   float alpha = 1.2F;
   uint64_t seed = 42;
   std::string arm = "alpha";  // none|evict|alpha|full
@@ -168,6 +170,10 @@ Args parse(int argc, char **argv) {
     else if (k == "--ef_insert") a.ef_insert = std::stoull(v);
     else if (k == "--prune_cap") a.prune_cap = std::stoull(v);
     else if (k == "--alpha_check_max") a.alpha_check_max = std::stoull(v);
+    else if (k == "--batch") a.batch = std::stoull(v);
+    else if (k == "--insert_threads") a.insert_threads = std::stoull(v);
+    else if (k == "--consolidate") a.consolidate = std::stoul(v);
+    else if (k == "--r_target") a.r_target = std::stoul(v);
     else if (k == "--alpha") a.alpha = std::stof(v);
     else if (k == "--seed") a.seed = std::stoull(v);
     else if (k == "--arm") a.arm = v;
@@ -247,15 +253,24 @@ int do_insert(const Args &a) {
   std::cout << "[insert] arm=" << a.arm << " ef_insert=" << p.ef_insert << " alpha=" << p.alpha
             << " range=[" << a.from << "," << a.from + a.count << ")\n";
 
+  p.max_points = a.n + a.count + 1024;
   alaya::laser::QGUpdater upd(qg, p);
+  const int ins_threads = static_cast<int>(std::max<size_t>(1, a.insert_threads));
+  std::cout << "[insert] batch=" << a.batch << " insert_threads=" << ins_threads << "\n";
   auto t0 = std::chrono::steady_clock::now();
-  for (uint64_t i = 0; i < a.count; ++i) {
-    upd.insert(base.row(a.from + i));
-    if ((i + 1) % 10000 == 0) {
+  for (uint64_t start = 0; start < a.count; start += a.batch) {
+    const uint64_t end = std::min(a.count, start + a.batch);
+    const int64_t end_signed = static_cast<int64_t>(end);
+#pragma omp parallel for num_threads(ins_threads) schedule(dynamic)
+    for (int64_t i = static_cast<int64_t>(start); i < end_signed; ++i) {
+      upd.insert_with_id(base.row(a.from + static_cast<uint64_t>(i)),
+                         static_cast<alaya::laser::PID>(a.n + static_cast<uint64_t>(i)));
+    }
+    upd.publish(a.n + end);
+    if (end / 10000 != start / 10000) {
       auto now = std::chrono::steady_clock::now();
       const double s = std::chrono::duration<double>(now - t0).count();
-      std::cout << "[insert] " << (i + 1) << "/" << a.count << "  " << (i + 1) / s
-                << " inserts/s\n";
+      std::cout << "[insert] " << end << "/" << a.count << "  " << end / s << " inserts/s\n";
     }
   }
   upd.finalize();
@@ -303,9 +318,11 @@ int do_churn(const Args &a) {
   else if (a.arm == "full") p.backlink_mode = alaya::laser::UpdateParams::Backlink::kFullPrune;
   else throw std::runtime_error("bad --arm " + a.arm);
 
+  p.max_points = a.n + a.runs * a.count + 1024;
   alaya::laser::QGUpdater upd(qg, p);
   std::vector<uint32_t> results(static_cast<size_t>(query.n) * a.topk);
   const uint32_t ef_eval = a.efs.empty() ? 100 : a.efs[0];
+  const int ins_threads = static_cast<int>(std::max<size_t>(1, a.insert_threads));
 
   auto eval_round = [&](uint64_t round) {
     upd.finalize();  // commit num_points so set_params sizes workspaces right
@@ -344,20 +361,35 @@ int do_churn(const Args &a) {
   };
 
   std::cout << "[churn] base_n=" << a.n << " rounds=" << a.runs << " count=" << a.count
-            << " arm=" << a.arm << " ef_eval=" << ef_eval << "\n";
+            << " arm=" << a.arm << " ef_eval=" << ef_eval
+            << " insert_threads=" << ins_threads << " consolidate=" << a.consolidate
+            << " r_target=" << a.r_target << "\n";
   eval_round(0);
   for (uint64_t r = 0; r < a.runs; ++r) {
     for (uint64_t i = 0; i < a.count; ++i) {
       upd.tombstone(static_cast<alaya::laser::PID>(r * a.count + i));
     }
+    auto tc0 = std::chrono::steady_clock::now();
+    if (a.consolidate != 0) {
+      upd.consolidate(a.insert_threads, a.r_target);
+    }
+    auto tc1 = std::chrono::steady_clock::now();
     const uint64_t ins_base = a.n + r * a.count;
     auto t0 = std::chrono::steady_clock::now();
-    for (uint64_t i = 0; i < a.count; ++i) {
-      upd.insert(base.row(ins_base + i));
+    for (uint64_t start = 0; start < a.count; start += a.batch) {
+      const uint64_t end = std::min(a.count, start + a.batch);
+      const int64_t end_signed = static_cast<int64_t>(end);
+#pragma omp parallel for num_threads(ins_threads) schedule(dynamic)
+      for (int64_t i = static_cast<int64_t>(start); i < end_signed; ++i) {
+        upd.insert_with_id(base.row(ins_base + static_cast<uint64_t>(i)),
+                           static_cast<alaya::laser::PID>(ins_base + static_cast<uint64_t>(i)));
+      }
+      upd.publish(ins_base + end);
     }
     auto t1 = std::chrono::steady_clock::now();
     std::cout << "[churn] round " << r + 1 << " insert_qps="
-              << a.count / std::chrono::duration<double>(t1 - t0).count() << "\n";
+              << a.count / std::chrono::duration<double>(t1 - t0).count()
+              << " consolidate_s=" << std::chrono::duration<double>(tc1 - tc0).count() << "\n";
     eval_round(r + 1);
   }
   return 0;

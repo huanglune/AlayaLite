@@ -369,6 +369,88 @@ TEST_F(QGUpdaterIndexTest, InsertPatchTombstoneEndToEnd) {
   }
 }
 
+TEST_F(QGUpdaterIndexTest, ParallelBatchInsertAndConsolidate) {
+  const std::string suffix = "_R" + std::to_string(kDeg) + "_MD" + std::to_string(kDim) + ".index";
+  const std::string copy_prefix = (tiny_->dir / "par").string();
+  for (const std::string &ext : {suffix, suffix + "_rotator", suffix + "_cache_ids",
+                                 suffix + "_cache_nodes"}) {
+    std::filesystem::copy_file(tiny_->prefix + ext, copy_prefix + ext,
+                               std::filesystem::copy_options::overwrite_existing);
+  }
+  const size_t n_insert = 256;
+  auto new_data = make_data(n_insert, kDim, 4242);
+
+  {
+    QuantizedGraph qg(kN, kDeg, kDim, kDim);
+    qg.load_disk_index(copy_prefix.c_str(), 0.0F);
+    qg.set_params(64, 1, 4);
+    UpdateParams params;
+    params.ef_insert = 64;
+    params.backlink_mode = UpdateParams::Backlink::kEvict;
+    params.max_points = kN + n_insert;
+    QGUpdater upd(qg, params);
+
+    // batch three-phase publish, 8 writers per batch of 64
+    for (size_t start = 0; start < n_insert; start += 64) {
+#pragma omp parallel for num_threads(8) schedule(dynamic)
+      for (int64_t i = static_cast<int64_t>(start); i < static_cast<int64_t>(start + 64); ++i) {
+        upd.insert_with_id(new_data.data() + static_cast<size_t>(i) * kDim,
+                           static_cast<PID>(kN + static_cast<size_t>(i)));
+      }
+      upd.publish(kN + start + 64);
+    }
+    EXPECT_EQ(upd.num_points(), kN + n_insert);
+
+    // tombstone a slice of original nodes, then consolidate with headroom target
+    for (PID id = 100; id < 300; ++id) {
+      upd.tombstone(id);
+    }
+    upd.consolidate(8, /*r_target=*/kDeg - 4);
+    upd.finalize();
+    const UpdateStats s = upd.stats();
+    EXPECT_EQ(s.inserts, n_insert);
+    EXPECT_GT(s.spliced_slots + s.ghosted_slots, 0U);
+  }
+
+  // reload: parallel-inserted vectors discoverable; no live row references a
+  // tombstoned neighbor with a live payload
+  {
+    QuantizedGraph qg(kN + n_insert, kDeg, kDim, kDim);
+    qg.load_disk_index(copy_prefix.c_str(), 0.0F);
+    qg.set_params(64, 1, 4);
+    QGUpdater upd(qg, UpdateParams{});
+
+    std::vector<uint32_t> res(10);
+    size_t found = 0;
+    for (size_t i = 0; i < n_insert; ++i) {
+      qg.search(new_data.data() + i * kDim, 10, res.data());
+      if (res[0] == kN + i) {
+        ++found;
+      }
+    }
+    EXPECT_GE(found, n_insert * 9 / 10) << "parallel-inserted vectors must be discoverable";
+
+    const std::string index_path = copy_prefix + suffix;
+    const size_t node_len = (32 * kDim + 128 * kDeg + kDeg * kDim) / 8;
+    const size_t npp = std::max<size_t>(1, 4096 / node_len);
+    const size_t page_size = (npp * node_len + kSectorLen - 1) / kSectorLen * kSectorLen;
+    size_t dead_refs = 0;
+    for (PID u = 0; u < kN + n_insert; ++u) {
+      if (u >= 100 && u < 300) {
+        continue;  // tombstoned rows themselves may keep stale edges
+      }
+      auto row = read_node_row(qg, index_path, u, node_len, page_size, npp);
+      const auto *ids = reinterpret_cast<const PID *>(row.data() + upd.neighbor_off_bytes());
+      for (size_t j = 0; j < kDeg; ++j) {
+        if (!upd.is_ghost_slot(row.data(), j) && ids[j] >= 100 && ids[j] < 300) {
+          ++dead_refs;
+        }
+      }
+    }
+    EXPECT_EQ(dead_refs, 0U) << "consolidate must purge all dead out-edges from live rows";
+  }
+}
+
 TEST_F(QGUpdaterIndexTest, GhostSlotDetection) {
   QuantizedGraph qg(kN, kDeg, kDim, kDim);
   qg.load_disk_index(tiny_->prefix.c_str(), 0.0F);
