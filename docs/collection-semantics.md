@@ -14,7 +14,7 @@ the named public object; “adapter” means that another object supplies it.
 | `Index` backed by Fusion | adapter: generic `GraphUpdateJob` | adapter | yes | yes | as above | yes | same facade behavior; Fusion is a builder composition, not a distinct persisted graph format |
 | KNNG / `NndescentImpl` | no stable public mutation API | no | graph result can be saved | graph result can be loaded | no | no direct SDK object | build accepts a thread count; it is an NSG build tool |
 | memory QG (`index/graph/qg`) | no | no | yes, one logical `qg` artifact | yes | legacy adapter when scalar storage is enabled | yes | immutable `QgSegment`; reentrant search-only profile |
-| Vamana-memory builder/reader/search | no | no | builder writes Vamana files | reader opens files | no | yes | static after build; readers/searchers are used concurrently by callers |
+| Vamana-memory `VamanaMemSegment` | no | no | yes, logical `graph` + `data` | yes | no | single/batch | immutable, reentrant search-only profile |
 | `DiskANNIndex` static | no | no | `build` creates a file family | `load` | no | single/batch/pipeline | concurrent searches use a bounded scratch pool |
 | `DiskANNIndex` updatable | yes | yes | `flush_pages` / `flush` | `load(updatable=true)` | no | single/batch/pipeline | dark-until-publish inserts, tombstone snapshots and internal locks define visibility; no SDK-wide guarantee |
 | `DiskCollection(disk_flat)` segment | append to pending, then new segment | no | `flush` publishes | `open` | no | yes | published segments are immutable; collection lock is process-exclusive; searches may run concurrently |
@@ -73,7 +73,7 @@ of acknowledged/searchable/durable.
 
 | owner | current artifact family |
 |---|---|
-| memory facade | graph file, data file, optional quant file; memory QG retains its one-file `rabitq.data` family; recovery additionally has `CURRENT`, snapshot manifest/files, RocksDB checkpoint and WAL |
+| memory facade | graph file, data file, optional quant file; memory QG retains its one-file `rabitq.data` family; Vamana-memory retains `graph.index` plus DiskANN `.fbin` vectors; recovery additionally has `CURRENT`, snapshot manifest/files, RocksDB checkpoint and WAL |
 | generic `Graph` | graph header/body plus optional overlay graph data |
 | DiskFlat segment | `manifest.txt`, `ids.u64.bin`, `vectors.f32.bin` |
 | Vamana segment | Flat files plus `graph.index` |
@@ -96,9 +96,9 @@ checking in 33 redundant copies.
 | HNSW memory | yes (`Index`) | yes | yes, raw and SQ8 graph/data/quant representatives |
 | NSG memory | facade behavior + 33-row dispatch assertion | header/codegen construction list | shared generic Graph/Space format |
 | Fusion memory | facade behavior + 33-row dispatch assertion | header/codegen construction list | shared generic Graph/Space format |
-| KNNG | documented (not a public Python Index) | graph public surface | shared generic Graph result format |
+| KNNG | documented (not a public Python Index) | detail NN-Descent build kernel | no independent user-index artifact family |
 | memory QG | three pinned legacy declarations, scalar off/on, and feature fallback | `QgSegment` lifecycle/capability/TSan tests | independent reproducible memory QG v1 family |
-| Vamana-memory | documented native behavior | disk/Vamana public surface | Vamana `graph.index` corpus |
+| Vamana-memory | no Python dispatch row | `VamanaMemSegment` lifecycle/capability/TSan tests | independent `graph.index` + `vectors.fbin` family |
 | DiskANN | no public Python entry | direct `DiskANNIndex` instantiation | complete small DiskANN directory |
 | DiskCollection Flat | yes | direct collection/searcher types | collection + Flat segment |
 | DiskCollection Vamana | common facade behavior; engine-specific existing tests | direct collection/Vamana surface | collection + Vamana segment |
@@ -108,7 +108,8 @@ checking in 33 redundant copies.
 Regenerate and compare artifacts with:
 
 ```bash
-cmake --build build/Release --target artifact_diskann_generator artifact_memory_qg_generator
+cmake --build build/Release --target artifact_diskann_generator \
+  artifact_memory_qg_generator artifact_memory_vamana_generator
 PYTHONPATH=python/src:build/Release/python \
   python scripts/golden/generate_artifact_baseline.py
 ```

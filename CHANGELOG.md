@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added immutable C++ `VamanaMemSegment` with typed build/open/search/batch,
+  byte-compatible Vamana graph + `.fbin` persistence, fixed-seed deterministic
+  golden coverage, and a standalone feature-gated factory. NN-Descent is now
+  explicitly a detail-only KNNG build kernel rather than an implied searchable
+  index capability.
+
 ### Changed
 
 - Python memory indexes declared as `nsg` or `fusion` now build, save, open,

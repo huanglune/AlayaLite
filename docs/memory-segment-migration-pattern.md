@@ -137,6 +137,88 @@ bytes are compared, and Segment versus direct search results are checked bit
 for bit. A fixed-rotator/fixed-neighbor QG v1 golden separately provides a
 reproducible format hash without changing the quantization implementation.
 
+## Vamana-memory Gate 5 result
+
+`VamanaMemSegment` is the public float32/L2 memory model for the retained
+Vamana kernels. It owns its vector buffer, a validated `VamanaReader`, and the
+`VamanaGreedySearch` executor, and exposes typed-tensor `build`, `open`,
+`search`, `batch_search`, `save`, `stats`, `descriptor() noexcept`, and
+`into_any`. It satisfies `Searchable`, `BatchSearchable`, `Saveable`, and
+`StatsProvider`, is reentrant for concurrent search, and does not satisfy
+`Mutable`.
+
+The implementation composes `vamana_builder.hpp`, `vamana_writer.hpp`,
+`vamana_reader.hpp`, and `vamana_greedy_search.hpp`; it does not copy a build,
+codec, or greedy-search loop. The retained builder and reader have different
+in-memory shapes, so build performs one temporary writer-to-reader transfer,
+deletes the temporary file after validation, and thereafter remains entirely
+memory resident. All Vamana kernel headers stay at their existing paths for
+the disk, DiskANN, LASER, compatibility, and later-gate consumers.
+
+Vamana-memory format v1 is exactly the retained Vamana `graph.index` encoding
+under logical name `graph` plus the existing DiskANN float32 `.fbin` encoding
+under logical name `data`; `save` returns schema version 1 / format version 1
+without inventing a standalone manifest file. Consequently direct
+`save_graph` + `.fbin` artifacts open in the Segment, and Segment output opens
+with `VamanaReader` + `VamanaGreedySearch`. Independent fixed-seed builds are
+byte deterministic under the existing Vamana `thread_count=1` contract; v1
+rejects other build thread counts rather than promising deterministic parallel
+inter-insert scheduling.
+
+`Descriptor.algorithm_id` and `engine_factory_id` are the frozen `vamana`
+identity (`6`). The standalone C++ factory uses
+`EngineFeature::vamana_memory` (the source-compatible enum alias for the
+pre-provisioned `vamana_memory_segment` bit). Enabled constructs
+`VamanaMemSegment`; disabled returns `not_supported`. There was no public
+legacy memory-Vamana model, so the registration records legacy identity as
+`none`/not applicable and never falls back to the disk adapter or another
+graph engine. Vamana is intentionally absent from the 33-row Python dispatch
+matrix.
+
+## Kernel-only graph variant
+
+Not every graph-building algorithm is a user-searchable Segment. NN-Descent is
+the Gate 5 example: it produces the initial KNNG consumed by NSG, but that
+build-time output and the ability of a test to pass it to a generic graph
+search job do not prove a supported user index lifecycle, persistence family,
+or search quality contract.
+
+Its implementation therefore lives at
+`index/graph/knng/detail/nndescent_kernel.hpp` and is registered with role
+`build_kernel`. It has no `AlgorithmId`, Descriptor, Segment, or searchable
+capability. Per design §7.1, a future user-facing KNNG must independently prove
+those properties before gaining them. `EngineFeature::knng` is only a kernel
+ownership marker: toggling it does not select a different implementation or
+change NSG behavior.
+
+## Gate 5 five-graph final state
+
+| engine | implementation / factory key | proven capabilities | feature-off / rollback semantics |
+|---|---|---|---|
+| KNNG / NN-Descent | `nndescent_kernel / knng` | build kernel only; no Segment or searchable capability | `knng` bit records ownership only; no behavior switch |
+| NSG | `nsg_segment / nsg` | search, batch, save/open, stats; immutable | independent bit selects recorded `hnsw_segment / hnsw` legacy behavior |
+| Fusion | `fusion_segment / fusion` | search, batch, save/open, stats; immutable | independent bit selects recorded `hnsw_segment / hnsw` legacy behavior |
+| memory QG | `qg_segment / qg` | search, batch, save/open, stats; immutable | independent bit selects `legacy_qg_model / qg` |
+| Vamana-memory | `vamana_mem_segment / vamana` | search, batch, save/open, stats; immutable | no legacy memory factory; disabled is `not_supported` |
+
+KNNG and Vamana-memory have no Python dispatch row; the generated 33-row
+allowlist remains unchanged.
+
+## Space physical-ownership audit
+
+This is a read-only fact table for the design §9.7 follow-up. “Segment owns”
+below means the Segment is the lifetime owner; the parenthetical names the
+object that physically stores the state. No responsibility was moved as part
+of this audit.
+
+| Segment | adjacency owner | entry-point owner | vector-storage owner | §9.7 physical peel status |
+|---|---|---|---|---|
+| HNSW | Segment (`Graph::data_storage_` plus `OverlayGraph::lists_`) | Segment (`OverlayGraph::ep_`) | `SearchSpace` / `BuildSpace` owned by Segment | 2/3: graph and entry point are outside Space; vectors remain in Space |
+| NSG | Segment (`Graph::data_storage_`) | Segment (`Graph::eps_`) | `SearchSpace` / `BuildSpace` owned by Segment | 2/3: graph and entry point are outside Space; vectors remain in Space |
+| Fusion | Segment (`Graph::data_storage_` plus retained overlay when HNSW supplies it) | Segment (`OverlayGraph::ep_`, otherwise `Graph::eps_`) | `SearchSpace` / `BuildSpace` owned by Segment | 2/3: graph and entry point are outside Space; vectors remain in Space |
+| memory QG | Segment transitively owns one `RaBitQSpace`; adjacency is physically in `RaBitQSpace::storage_` | physically `RaBitQSpace::ep_` | physically the same `RaBitQSpace::storage_` (plus quantized neighbor data) | 0/3 physically peeled: all three responsibilities remain co-located in Space |
+| Vamana-memory | Segment (`VamanaReader::graph_`) | Segment (`VamanaReader::start_`) | Segment (`VamanaMemSegment::vectors_`), with no Space object | 3/3 for the audited responsibilities |
+
 ## Per-row registry handoff
 
 Gate 5 migrations switch one explicit dispatch row at a time. For each row:
@@ -178,7 +260,10 @@ before `insert`, `erase`, or `core::Mutable` is added.
 
 ## Standard per-graph checklist
 
-Use these steps for KNNG/NSG, Fusion, memory QG, and Vamana-memory:
+Use these steps for searchable NSG, Fusion, memory QG, and Vamana-memory.
+KNNG applies the inventory and format-freeze checks plus the kernel-only
+variant above; it deliberately skips Segment lifecycle/capability steps until
+independent searchability evidence exists.
 
 1. Inventory the public builder, runtime graph/search object, persistence
    codecs, registry/codegen rows, Python binding, factory, executor tests,
