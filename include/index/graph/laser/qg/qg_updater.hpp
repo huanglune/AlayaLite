@@ -538,8 +538,9 @@ class QGUpdater {
   struct CapturedNode {
     PID id = 0;
     float dist = 0;  // exact full-dim squared L2 to the inserted vector
-    std::vector<char> row;
-    [[nodiscard]] const float *raw() const { return reinterpret_cast<const float *>(row.data()); }
+    std::vector<float> vec;  // raw (PCA-domain) vector only — the rest of the
+                             // row is re-read fresh under the page lock
+    [[nodiscard]] const float *raw() const { return vec.data(); }
   };
 
   [[nodiscard]] uint64_t page_offset(PID id) const {
@@ -689,7 +690,7 @@ class QGUpdater {
       CapturedNode cap;
       cap.id = cur;
       cap.dist = sqr_y;
-      cap.row.assign(row, row + node_len_);
+      cap.vec.assign(row_f, row_f + full_dim_);
       pool.push_back(std::move(cap));
     }
 
