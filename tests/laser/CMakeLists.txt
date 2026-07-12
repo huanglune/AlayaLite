@@ -108,3 +108,28 @@ alaya_add_test(
   TARGET laser_simd_dispatch_test
   LABELS laser simd
 )
+
+# Streaming-update research prototype (qg_updater.hpp): patch primitives,
+# builder byte-equality, insert/tombstone end-to-end on a tiny index.
+alaya_cc_target(
+  test_qg_updater_unit
+  BARE GTEST
+  SRCS qg/test_qg_updater_unit.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_qg_updater_unit
+  TARGET test_qg_updater_unit
+  LABELS laser
+)
+
+# SIFT-scale update experiment harness (build / insert / delete / eval modes).
+# Not a ctest — run manually; see the usage string in the source.
+alaya_cc_target(
+  bench_laser_update_sift
+  BARE
+  SRCS bench_laser_update_sift.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)

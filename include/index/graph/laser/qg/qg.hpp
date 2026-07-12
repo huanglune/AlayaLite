@@ -27,6 +27,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -82,6 +83,7 @@ constexpr size_t kSectorLen = 4096;
 
 class QuantizedGraph {
   friend class QGBuilder;
+  friend class QGUpdater;  // research prototype: streaming updates (qg_updater.hpp)
 
  private:
   size_t num_points_ = 0;    // num points
@@ -137,6 +139,11 @@ class QuantizedGraph {
   std::vector<PID> mem_graph_enter_points_;
 
   size_t nthreads_ = 1;
+
+  // Optional tombstone filter (research prototype): ids in this set are
+  // traversed for routing but excluded from search results. Owned by the
+  // caller (see QGUpdater); must outlive searches. nullptr = no filtering.
+  const std::unordered_set<PID> *result_filter_ = nullptr;
 
   /*
    * Position of different data in each row
@@ -208,6 +215,8 @@ class QuantizedGraph {
   [[nodiscard]] auto entry_point() const { return this->entry_point_; }
 
   void set_ep(PID entry) { this->entry_point_ = entry; }
+
+  void set_result_filter(const std::unordered_set<PID> *filter) { result_filter_ = filter; }
 
   void load_disk_index(const char *, float);
 
@@ -523,8 +532,11 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
                              residual_query,
                              residual_dimension_);
     }
-    // Insert current node with exact distance into result pool
-    res_pool.insert(cur_node, sqr_y);
+    // Insert current node with exact distance into result pool (unless the
+    // node is tombstoned; routing still passes through it)
+    if (result_filter_ == nullptr || result_filter_->find(cur_node) == result_filter_->end()) {
+      res_pool.insert(cur_node, sqr_y);
+    }
   };
 
   // ==================== I/O Completion Handler Lambda ====================
