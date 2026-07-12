@@ -209,6 +209,10 @@
     },
     "laser_fixture": {
       "files": {
+        ".laser_fixture_provenance.json": {
+          "bytes": 621,
+          "sha256": "3fe1b54ee09a1fbbc488b7ded7bb36608587426bf55f5bb40405c7ebe6cb702b"
+        },
         "dsqg_seg_00000001_R64_MD128.index": {
           "bytes": 8392704,
           "header": {
@@ -220,7 +224,7 @@
               0
             ]
           },
-          "sha256": "cc3b310b6e3d5d531e6d70df319f3887608e42f1573ab9bd43275906b6bc82f3"
+          "sha256": "7cf03465425445c116fcec0c09c63487f67fe2525f6e0e30375f258eff9e49a0"
         },
         "dsqg_seg_00000001_R64_MD128.index_cache_ids": {
           "bytes": 1236,
@@ -228,7 +232,7 @@
         },
         "dsqg_seg_00000001_R64_MD128.index_cache_nodes": {
           "bytes": 785936,
-          "sha256": "831aa27a7a09e9c55d375bacf4efe975fb39686c7940f795a40c8c2f8389c2f8"
+          "sha256": "90ae8bf580482fdfc2860e40b8054717d9a1be96d546dd40f7f70b89679a58c9"
         },
         "dsqg_seg_00000001_R64_MD128.index_rotator": {
           "bytes": 512,
