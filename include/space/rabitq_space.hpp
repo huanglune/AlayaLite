@@ -314,7 +314,7 @@ class RaBitQSpace {
     }
   }
 
-  auto get_distance(IDType i, IDType j) -> DistanceType {
+  auto get_distance(IDType i, IDType j) const -> DistanceType {
     return distance_cal_func_(get_data_by_id(i), get_data_by_id(j), dim_);
   }
 
@@ -443,6 +443,12 @@ class RaBitQSpace {
   auto get_capacity() const -> size_t { return capacity_; }
 
   auto get_dim() const -> uint32_t { return dim_; }
+
+  auto metric() const -> core::Metric {
+    return metric_ == MetricType::L2
+               ? core::Metric::l2
+               : (metric_ == MetricType::IP ? core::Metric::inner_product : core::Metric::cosine);
+  }
 
   auto get_dist_func() const -> DistFuncRaBitQ<DataType, DistanceType> {
     return distance_cal_func_;

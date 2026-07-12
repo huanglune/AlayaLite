@@ -115,7 +115,7 @@ class SQ4Space {
    * @brief Get the capacity of the space
    * @return The capacity
    */
-  auto get_capacity() -> IDType { return capacity_; }
+  auto get_capacity() const -> IDType { return capacity_; }
 
   /**
    * @brief Fit the data into the space
@@ -172,7 +172,7 @@ class SQ4Space {
    * @param j ID of the second data point
    * @return The calculated distance
    */
-  auto get_distance(IDType i, IDType j) -> DistanceType {
+  auto get_distance(IDType i, IDType j) const -> DistanceType {
     return distance_calu_func_(get_data_by_id(i),
                                get_data_by_id(j),
                                dim_,
@@ -184,7 +184,7 @@ class SQ4Space {
    * @brief Get the number of the vector data
    * @return The number of vector data.
    */
-  auto get_data_num() -> IDType { return item_cnt_; }
+  auto get_data_num() const -> IDType { return item_cnt_; }
 
   /**
    * @brief Get the size of each data point in bytes
@@ -196,7 +196,7 @@ class SQ4Space {
    * @brief Get the distance calculation function
    * @return The distance calculation function
    */
-  auto get_dist_func() -> DistFuncSQ<DataType, DistanceType> { return distance_calu_func_; }
+  auto get_dist_func() const -> DistFuncSQ<DataType, DistanceType> { return distance_calu_func_; }
 
   /**
    * @brief Get ScalarData for a specific ID
@@ -261,6 +261,12 @@ class SQ4Space {
    * @return The dimensionality
    */
   auto get_dim() const -> uint32_t { return dim_; }
+
+  auto metric() const -> core::Metric {
+    return metric_ == MetricType::L2
+               ? core::Metric::l2
+               : (metric_ == MetricType::IP ? core::Metric::inner_product : core::Metric::cosine);
+  }
 
   /**
    * @brief Get the quantizer
@@ -449,9 +455,9 @@ class SQ4Space {
    */
   auto prefetch_by_address(DataType *address) -> void { mem_prefetch_l1(address, data_size_ / 64); }
 
-  auto get_query_computer(const DataType *query) { return QueryComputer(*this, query); }
+  auto get_query_computer(const DataType *query) const { return QueryComputer(*this, query); }
 
-  auto get_query_computer(const IDType id) { return QueryComputer(*this, id); }
+  auto get_query_computer(const IDType id) const { return QueryComputer(*this, id); }
 
   /**
    * @brief Close the RocksDB storage explicitly
