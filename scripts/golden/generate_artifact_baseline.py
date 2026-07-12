@@ -140,6 +140,15 @@ def generate(build_dir: Path) -> dict[str, object]:
                 f"build the artifact_memory_qg_generator target first: {memory_qg_generator}"
             )
         subprocess.run([str(memory_qg_generator), str(out / "memory_qg")], check=True)
+        memory_vamana_generator = build_dir / "tests/golden/artifact_memory_vamana_generator"
+        if not memory_vamana_generator.is_file():
+            raise RuntimeError(
+                "build the artifact_memory_vamana_generator target first: "
+                f"{memory_vamana_generator}"
+            )
+        subprocess.run(
+            [str(memory_vamana_generator), str(out / "memory_vamana")], check=True
+        )
         laser_present = _copy_laser_fixture(out, build_dir)
         artifacts = {
             name: _inventory(path)

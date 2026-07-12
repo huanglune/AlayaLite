@@ -11,3 +11,4 @@ alaya_cc_target(
 
 alaya_cc_target(artifact_diskann_generator SRCS artifact_diskann_generator.cpp)
 alaya_cc_target(artifact_memory_qg_generator SRCS artifact_memory_qg_generator.cpp)
+alaya_cc_target(artifact_memory_vamana_generator SRCS artifact_memory_vamana_generator.cpp)

@@ -14,6 +14,7 @@ def test_artifact_baseline_covers_every_current_family():
         "memory_hnsw_none", "memory_hnsw_sq8",
         "memory_nsg_none", "memory_nsg_sq8",
         "memory_qg",
+        "memory_vamana",
     }
     for artifact in baseline["artifacts"].values():
         assert artifact["files"]
