@@ -5,7 +5,7 @@
 #pragma once
 
 #include <cstddef>
-#include <filesystem>
+#include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
 #include <iomanip>
 #include <string_view>
