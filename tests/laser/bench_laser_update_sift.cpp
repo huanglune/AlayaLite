@@ -224,7 +224,7 @@ Args parse(int argc, char **argv) {
   if (argc < 2) {
     throw std::runtime_error(
         "usage: bench_laser_update_sift <build|insert|churn|eval|mixed> [--k v ...]; "
-        "churn --efs E0,E1,... reports E0 as round and later values as round_ef");
+        "churn --efs E0,E1,... reports E0 as round/round_age and later values as round_ef");
   }
   a.mode = argv[1];
   if (a.mode == "--mixed") a.mode = "mixed";
@@ -614,8 +614,10 @@ int do_churn(const Args &a) {
   const size_t fl_threads = a.flush_threads == 0 ? a.insert_threads : a.flush_threads;
   const bool explicit_cache_cap = a.cache_cap_pages != 0;
   std::vector<alaya::laser::PID> source_to_pid(base.n, alaya::laser::kPidMax);
+  std::vector<uint32_t> source_insert_round(base.n, a.runs + 1);
   for (size_t source = 0; source < a.n; ++source) {
     source_to_pid[source] = static_cast<alaya::laser::PID>(source);
+    source_insert_round[source] = 0;
   }
   alaya::laser::UpdateStats last_round_stats;
 
@@ -630,15 +632,27 @@ int do_churn(const Args &a) {
     uint64_t total = 0;
     std::array<uint64_t, 3> group_hits{};
     std::array<uint64_t, 3> group_total{};
+    std::array<uint64_t, 4> age_hits{};
+    std::array<uint64_t, 4> age_total{};
     for (size_t qi = 0; qi < query.n; ++qi) {
       const uint32_t *truth_row = gt.row(qi);
       std::unordered_set<uint32_t> truth;
+      std::array<std::unordered_set<uint32_t>, 4> age_truth;
       for (uint32_t j = 0; j < gt.dim && truth.size() < a.topk; ++j) {
         const uint32_t source = truth_row[j];
         if (source < source_to_pid.size()) {
           const alaya::laser::PID pid = source_to_pid[source];
           if (pid != alaya::laser::kPidMax && upd.deleted().find(pid) == upd.deleted().end()) {
-            truth.insert(pid);
+            const auto inserted = truth.insert(pid);
+            if (inserted.second) {
+              const uint64_t age = round - source_insert_round[source];
+              size_t bucket = 0;
+              if (source_insert_round[source] != 0) {
+                bucket = age == 0 ? 1 : age <= 3 ? 2 : 3;
+              }
+              age_truth[bucket].insert(pid);
+              ++age_total[bucket];
+            }
           }
         }
       }
@@ -648,6 +662,12 @@ int do_churn(const Args &a) {
       for (uint32_t j = 0; j < a.topk; ++j) {
         if (truth.count(res_row[j]) != 0) {
           ++hits;
+          for (size_t bucket = 0; bucket < age_truth.size(); ++bucket) {
+            if (age_truth[bucket].count(res_row[j]) != 0) {
+              ++age_hits[bucket];
+              break;
+            }
+          }
           if (!query_groups.empty()) ++group_hits[query_groups[qi]];
         }
       }
@@ -687,6 +707,15 @@ int do_churn(const Args &a) {
       }
     }
     print_telemetry(s);
+    std::cout << "\n" << std::flush;
+    const std::array<const char *, 4> age_names = {"base", "fresh", "mid", "old"};
+    std::cout << "round_age," << round;
+    for (size_t bucket = 0; bucket < age_names.size(); ++bucket) {
+      const double value = age_total[bucket] == 0
+                               ? -1
+                               : static_cast<double>(age_hits[bucket]) / age_total[bucket];
+      std::cout << "," << age_names[bucket] << "," << value << "," << age_total[bucket];
+    }
     std::cout << "\n" << std::flush;
     last_round_stats = s;
 
@@ -808,6 +837,7 @@ int do_churn(const Args &a) {
           upd.insert_with_id(base.row(source), pid);
         }
         source_to_pid[source] = pid;
+        source_insert_round[source] = static_cast<uint32_t>(r + 1);
       }
       if (a.shuffle_seed == 0) base.discard_rows(ins_base + start, ins_base + end);
       if (a.reuse != 0) {
