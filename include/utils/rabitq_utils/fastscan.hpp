@@ -28,6 +28,7 @@
 #include <type_traits>
 
 #include "utils/log.hpp"
+#include "simd/fastscan.hpp"
 #include "utils/rabitq_utils/defines.hpp"
 
 namespace alaya::fastscan {
@@ -55,28 +56,7 @@ inline void accumulate_scalar(const uint8_t *ALAYA_RESTRICT codes,
                               const uint8_t *ALAYA_RESTRICT lp_table,
                               uint16_t *ALAYA_RESTRICT result,
                               size_t dim) {
-  const size_t code_length = dim << 2;
-  std::memset(result, 0, kBatchSize * sizeof(uint16_t));
-
-  for (size_t offset = 0; offset < code_length; offset += 32) {
-    for (size_t lane = 0; lane < 16; ++lane) {
-      const uint8_t code = codes[offset + lane];
-      const uint8_t low_code = code & 0x0F;
-      const uint8_t high_code = code >> 4;
-
-      result[kPerm0[lane]] += static_cast<uint16_t>(lp_table[offset + low_code]);
-      result[kPerm0[lane] + 16] += static_cast<uint16_t>(lp_table[offset + high_code]);
-    }
-
-    for (size_t lane = 0; lane < 16; ++lane) {
-      const uint8_t code = codes[offset + 16 + lane];
-      const uint8_t low_code = code & 0x0F;
-      const uint8_t high_code = code >> 4;
-
-      result[kPerm0[lane]] += static_cast<uint16_t>(lp_table[offset + 16 + low_code]);
-      result[kPerm0[lane] + 16] += static_cast<uint16_t>(lp_table[offset + 16 + high_code]);
-    }
-  }
+  ::alaya::simd::fastscan::accumulate_generic(dim, codes, lp_table, result);
 }
 
 }  // namespace detail
@@ -112,40 +92,7 @@ inline void pack_codes(size_t padded_dim,
                        const uint8_t *quantization_code,
                        size_t num,
                        uint8_t *blocks) {
-  size_t num_rd = (num + 31) & ~31;  // round up num of vecs to multiple of batch size(32)
-
-  // consider codes is a matrix
-  // rows = number of vectors
-  // cols = number of uint8_t of one o_r's quantization code
-  size_t cols = padded_dim / 8;
-
-  std::array<uint8_t, 32> col;    // column of a batch of code, 8 bits
-  std::array<uint8_t, 32> col_0;  // upper 4 bits
-  std::array<uint8_t, 32> col_1;  // lower 4 bits
-
-  // pack codes batch by batch
-  // each batch contain codes for 32 vectors
-  for (size_t row = 0; row < num_rd; row += kBatchSize) {
-    // get quantization codes for each column for each batch
-    // i.e., we get the codes for 8 dims of 32 vectors and re-orgnize the data layout
-    // based on the shuffle SIMD instruction used during querying
-    for (size_t i = 0; i < cols; ++i) {
-      get_column(quantization_code, num, cols, row, i, col);  // get a byte
-      for (size_t j = 0; j < 32; ++j) {
-        col_0[j] = col[j] >> 4;
-        col_1[j] = col[j] & 15;
-      }
-      for (size_t j = 0; j < 16; ++j) {
-        // the lower 4 bits represent vector 0 to 15
-        // the upper 4 bits represent vector 16 to 31
-        uint8_t val0 = col_0[kPerm0[j]] | (col_0[kPerm0[j] + 16] << 4);
-        uint8_t val1 = col_1[kPerm0[j]] | (col_1[kPerm0[j] + 16] << 4);
-        blocks[j] = val0;
-        blocks[j + 16] = val1;
-      }
-      blocks += 32;
-    }
-  }
+  ::alaya::simd::fastscan::pack_codes_bytes<false>(padded_dim, quantization_code, num, blocks);
 }
 
 // NOLINTBEGIN
@@ -319,6 +266,10 @@ inline void accumulate_and_estimate_distances(const uint8_t *ALAYA_RESTRICT code
                                               T lut_bias,
                                               T *ALAYA_RESTRICT result,
                                               size_t dim) {
+  // Keep this AVX-512 fused memory-QG hot path separate from LASER's dispatched
+  // accumulate -> convert -> distance pipeline.  Sharing the standalone integer
+  // accumulate kernel does not justify adding an intermediate store/load here;
+  // the two consumers intentionally retain their individually optimized pipelines.
   static_assert(std::is_same_v<T, float>,
                 "fastscan::accumulate_and_estimate_distances only supports float.");
   if ((dim & 0x0FU) != 0U) {
@@ -403,15 +354,7 @@ inline void accumulate_and_estimate_distances(const uint8_t *ALAYA_RESTRICT code
 // ! dim % 4 == 0
 template <typename T>
 inline void pack_lut(size_t dim, const T *ALAYA_RESTRICT query, T *ALAYA_RESTRICT lut) {
-  size_t num_codebook = dim >> 2;
-  for (size_t i = 0; i < num_codebook; ++i) {
-    lut[0] = 0;
-    for (size_t j = 1; j < 16; ++j) {
-      lut[j] = lut[j - LOWBIT(j)] + query[kPos[j]];
-    }
-    lut += 16;
-    query += 4;
-  }
+  ::alaya::simd::fastscan::build_lut(dim, query, lut);
 }
 
 }  // namespace alaya::fastscan

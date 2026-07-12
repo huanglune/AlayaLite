@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "utils/platform.hpp"
+#include "simd/fastscan.hpp"
 
 namespace alaya::laser {
 
@@ -91,31 +92,7 @@ static inline void pack_codes_helper(size_t padded_dim,
                                      const uint8_t *codes,
                                      size_t ncode,
                                      uint8_t *blocks) {
-  size_t ncode_pad = (ncode + 31) & ~31;
-  size_t num_codebook = padded_dim / 4;
-  std::memset(blocks, 0, ncode_pad * num_codebook / 2);
-
-  uint8_t *codes2 = blocks;
-  for (size_t blk = 0; blk < ncode_pad; blk += kBatchSize) {
-    // enumerate i
-    for (size_t i = 0; i < num_codebook; i += 2) {
-      std::array<uint8_t, 32> col;
-      std::array<uint8_t, 32> col_lo;
-      std::array<uint8_t, 32> col_hi;
-      get_column(codes, ncode, num_codebook / 2, blk, i / 2, col);
-      for (int j = 0; j < 32; j++) {
-        col_lo[j] = col[j] & 15;
-        col_hi[j] = col[j] >> 4;
-      }
-      for (int j = 0; j < 16; j++) {
-        auto val0 = col_lo[kPerm0[j]] | (col_lo[kPerm0[j] + 16] << 4);
-        auto val1 = col_hi[kPerm0[j]] | (col_hi[kPerm0[j] + 16] << 4);
-        codes2[j] = val0;
-        codes2[j + 16] = val1;
-      }
-      codes2 += 32;
-    }
-  }
+  ::alaya::simd::fastscan::pack_codes_bytes<true>(padded_dim, codes, ncode, blocks);
 }
 
 inline void pack_codes(size_t padded_dim,
@@ -148,14 +125,6 @@ inline void pack_codes(size_t padded_dim,
 inline void pack_lut_impl(size_t dim,
                           const uint8_t *ALAYA_RESTRICT byte_query,
                           uint8_t *ALAYA_RESTRICT LUT) {
-  size_t num_codebook = dim >> 2;
-  for (size_t i = 0; i < num_codebook; ++i) {
-    LUT[0] = 0;
-    for (int j = 1; j < 16; ++j) {
-      LUT[j] = LUT[j - LOWBIT(j)] + byte_query[kPos[j]];
-    }
-    LUT += 16;
-    byte_query += 4;
-  }
+  ::alaya::simd::fastscan::build_lut(dim, byte_query, LUT);
 }
 }  // namespace alaya::laser
