@@ -135,7 +135,8 @@ struct Args {
   float alpha = 1.2F;
   uint64_t seed = 42;
   std::string arm = "alpha";  // none|evict|alpha|full
-  uint32_t direct = 0;        // 1 = O_DIRECT write fd (P0.1 attribution arm), 0 = buffered (default)
+  uint32_t direct = 0;  // 1 = O_DIRECT write fd (P0.1 attribution arm), 0 = buffered (default)
+  uint32_t write_cache = 1;  // 0 = immediate per-patch writes (P0.1-era control)
   std::vector<uint32_t> efs = {60, 80, 100, 150, 200, 300};
 };
 
@@ -148,37 +149,70 @@ Args parse(int argc, char **argv) {
   for (int i = 2; i + 1 < argc; i += 2) {
     const std::string k = argv[i];
     const std::string v = argv[i + 1];
-    if (k == "--base") a.base = v;
-    else if (k == "--query") a.query = v;
-    else if (k == "--gt") a.gt = v;
-    else if (k == "--prefix") a.prefix = v;
-    else if (k == "--n") a.n = std::stoull(v);
-    else if (k == "--from") a.from = std::stoull(v);
-    else if (k == "--count") a.count = std::stoull(v);
-    else if (k == "--live_max") a.live_max = std::stoull(v);
-    else if (k == "--new_id_split") a.new_id_split = std::stoull(v);
-    else if (k == "--tombstone_from") a.tombstone_from = std::stoull(v);
-    else if (k == "--tombstone_n") a.tombstone_n = std::stoull(v);
-    else if (k == "--R") a.R = std::stoul(v);
-    else if (k == "--vamana_R") a.vamana_R = std::stoul(v);
-    else if (k == "--L") a.L = std::stoul(v);
-    else if (k == "--ef_indexing") a.ef_indexing = std::stoul(v);
-    else if (k == "--threads") a.threads = std::stoul(v);
-    else if (k == "--beam") a.beam = std::stoul(v);
-    else if (k == "--topk") a.topk = std::stoul(v);
-    else if (k == "--runs") a.runs = std::stoul(v);
-    else if (k == "--main_dim") a.main_dim = std::stoul(v);
-    else if (k == "--ef_insert") a.ef_insert = std::stoull(v);
-    else if (k == "--prune_cap") a.prune_cap = std::stoull(v);
-    else if (k == "--alpha_check_max") a.alpha_check_max = std::stoull(v);
-    else if (k == "--batch") a.batch = std::stoull(v);
-    else if (k == "--insert_threads") a.insert_threads = std::stoull(v);
-    else if (k == "--consolidate") a.consolidate = std::stoul(v);
-    else if (k == "--r_target") a.r_target = std::stoul(v);
-    else if (k == "--direct") a.direct = std::stoul(v);
-    else if (k == "--alpha") a.alpha = std::stof(v);
-    else if (k == "--seed") a.seed = std::stoull(v);
-    else if (k == "--arm") a.arm = v;
+    if (k == "--base")
+      a.base = v;
+    else if (k == "--query")
+      a.query = v;
+    else if (k == "--gt")
+      a.gt = v;
+    else if (k == "--prefix")
+      a.prefix = v;
+    else if (k == "--n")
+      a.n = std::stoull(v);
+    else if (k == "--from")
+      a.from = std::stoull(v);
+    else if (k == "--count")
+      a.count = std::stoull(v);
+    else if (k == "--live_max")
+      a.live_max = std::stoull(v);
+    else if (k == "--new_id_split")
+      a.new_id_split = std::stoull(v);
+    else if (k == "--tombstone_from")
+      a.tombstone_from = std::stoull(v);
+    else if (k == "--tombstone_n")
+      a.tombstone_n = std::stoull(v);
+    else if (k == "--R")
+      a.R = std::stoul(v);
+    else if (k == "--vamana_R")
+      a.vamana_R = std::stoul(v);
+    else if (k == "--L")
+      a.L = std::stoul(v);
+    else if (k == "--ef_indexing")
+      a.ef_indexing = std::stoul(v);
+    else if (k == "--threads")
+      a.threads = std::stoul(v);
+    else if (k == "--beam")
+      a.beam = std::stoul(v);
+    else if (k == "--topk")
+      a.topk = std::stoul(v);
+    else if (k == "--runs")
+      a.runs = std::stoul(v);
+    else if (k == "--main_dim")
+      a.main_dim = std::stoul(v);
+    else if (k == "--ef_insert")
+      a.ef_insert = std::stoull(v);
+    else if (k == "--prune_cap")
+      a.prune_cap = std::stoull(v);
+    else if (k == "--alpha_check_max")
+      a.alpha_check_max = std::stoull(v);
+    else if (k == "--batch")
+      a.batch = std::stoull(v);
+    else if (k == "--insert_threads")
+      a.insert_threads = std::stoull(v);
+    else if (k == "--consolidate")
+      a.consolidate = std::stoul(v);
+    else if (k == "--r_target")
+      a.r_target = std::stoul(v);
+    else if (k == "--direct")
+      a.direct = std::stoul(v);
+    else if (k == "--write_cache")
+      a.write_cache = std::stoul(v);
+    else if (k == "--alpha")
+      a.alpha = std::stof(v);
+    else if (k == "--seed")
+      a.seed = std::stoull(v);
+    else if (k == "--arm")
+      a.arm = v;
     else if (k == "--efs") {
       a.efs.clear();
       std::stringstream ss(v);
@@ -218,7 +252,9 @@ int do_build(const Args &a) {
   std::cout << "[build] vamana done in " << std::chrono::duration<double>(t1 - t0).count()
             << "s, medoid=" << vb.medoid() << "\n";
 
-  write_fbin(a.prefix + "_pca_base.fbin", base.data.data(), static_cast<int32_t>(base.n),
+  write_fbin(a.prefix + "_pca_base.fbin",
+             base.data.data(),
+             static_cast<int32_t>(base.n),
              static_cast<int32_t>(dim));
 
   alaya::laser::QuantizedGraph qg(base.n, a.R, main_dim, dim, a.seed);
@@ -246,17 +282,23 @@ int do_insert(const Args &a) {
   p.alpha = a.alpha;
   p.prune_pool_cap = a.prune_cap;
   p.alpha_check_max = a.alpha_check_max;
-  if (a.arm == "none") p.backlink_mode = alaya::laser::UpdateParams::Backlink::kNone;
-  else if (a.arm == "evict") p.backlink_mode = alaya::laser::UpdateParams::Backlink::kEvict;
-  else if (a.arm == "alpha") p.backlink_mode = alaya::laser::UpdateParams::Backlink::kAlphaEvict;
-  else if (a.arm == "full") p.backlink_mode = alaya::laser::UpdateParams::Backlink::kFullPrune;
-  else throw std::runtime_error("bad --arm " + a.arm);
+  if (a.arm == "none")
+    p.backlink_mode = alaya::laser::UpdateParams::Backlink::kNone;
+  else if (a.arm == "evict")
+    p.backlink_mode = alaya::laser::UpdateParams::Backlink::kEvict;
+  else if (a.arm == "alpha")
+    p.backlink_mode = alaya::laser::UpdateParams::Backlink::kAlphaEvict;
+  else if (a.arm == "full")
+    p.backlink_mode = alaya::laser::UpdateParams::Backlink::kFullPrune;
+  else
+    throw std::runtime_error("bad --arm " + a.arm);
 
   std::cout << "[insert] arm=" << a.arm << " ef_insert=" << p.ef_insert << " alpha=" << p.alpha
             << " range=[" << a.from << "," << a.from + a.count << ")\n";
 
   p.max_points = a.n + a.count + 1024;
   p.direct_io = a.direct != 0;
+  p.write_cache = a.write_cache != 0;
   alaya::laser::QGUpdater upd(qg, p);
   const int ins_threads = static_cast<int>(std::max<size_t>(1, a.insert_threads));
   std::cout << "[insert] batch=" << a.batch << " insert_threads=" << ins_threads
@@ -270,6 +312,7 @@ int do_insert(const Args &a) {
       upd.insert_with_id(base.row(a.from + static_cast<uint64_t>(i)),
                          static_cast<alaya::laser::PID>(a.n + static_cast<uint64_t>(i)));
     }
+    upd.flush(a.insert_threads);
     upd.publish(a.n + end);
     if (end / 10000 != start / 10000) {
       auto now = std::chrono::steady_clock::now();
@@ -285,6 +328,8 @@ int do_insert(const Args &a) {
             << " inserts/s (single writer)\n";
   std::cout << "[insert] io: search_reads=" << s.search_page_reads
             << " patch_reads=" << s.patch_page_reads << " writes=" << s.page_writes
+            << " logical_writes=" << s.logical_row_writes
+            << " flush_unique_pages=" << s.flush_unique_pages
             << "  per-insert: search_r=" << static_cast<double>(s.search_page_reads) / a.count
             << " patch_r=" << static_cast<double>(s.patch_page_reads) / a.count
             << " w=" << static_cast<double>(s.page_writes) / a.count << "\n";
@@ -316,14 +361,20 @@ int do_churn(const Args &a) {
   p.ef_insert = a.ef_insert;
   p.alpha = a.alpha;
   p.prune_pool_cap = a.prune_cap;
-  if (a.arm == "none") p.backlink_mode = alaya::laser::UpdateParams::Backlink::kNone;
-  else if (a.arm == "evict") p.backlink_mode = alaya::laser::UpdateParams::Backlink::kEvict;
-  else if (a.arm == "alpha") p.backlink_mode = alaya::laser::UpdateParams::Backlink::kAlphaEvict;
-  else if (a.arm == "full") p.backlink_mode = alaya::laser::UpdateParams::Backlink::kFullPrune;
-  else throw std::runtime_error("bad --arm " + a.arm);
+  if (a.arm == "none")
+    p.backlink_mode = alaya::laser::UpdateParams::Backlink::kNone;
+  else if (a.arm == "evict")
+    p.backlink_mode = alaya::laser::UpdateParams::Backlink::kEvict;
+  else if (a.arm == "alpha")
+    p.backlink_mode = alaya::laser::UpdateParams::Backlink::kAlphaEvict;
+  else if (a.arm == "full")
+    p.backlink_mode = alaya::laser::UpdateParams::Backlink::kFullPrune;
+  else
+    throw std::runtime_error("bad --arm " + a.arm);
 
   p.max_points = a.n + a.runs * a.count + 1024;
   p.direct_io = a.direct != 0;
+  p.write_cache = a.write_cache != 0;
   alaya::laser::QGUpdater upd(qg, p);
   std::cout << "[churn] direct_io=" << (upd.direct_io() ? 1 : 0) << "\n";
   std::vector<uint32_t> results(static_cast<size_t>(query.n) * a.topk);
@@ -367,9 +418,8 @@ int do_churn(const Args &a) {
   };
 
   std::cout << "[churn] base_n=" << a.n << " rounds=" << a.runs << " count=" << a.count
-            << " arm=" << a.arm << " ef_eval=" << ef_eval
-            << " insert_threads=" << ins_threads << " consolidate=" << a.consolidate
-            << " r_target=" << a.r_target << "\n";
+            << " arm=" << a.arm << " ef_eval=" << ef_eval << " insert_threads=" << ins_threads
+            << " consolidate=" << a.consolidate << " r_target=" << a.r_target << "\n";
   eval_round(0);
   for (uint64_t r = 0; r < a.runs; ++r) {
     for (uint64_t i = 0; i < a.count; ++i) {
@@ -390,11 +440,12 @@ int do_churn(const Args &a) {
         upd.insert_with_id(base.row(ins_base + static_cast<uint64_t>(i)),
                            static_cast<alaya::laser::PID>(ins_base + static_cast<uint64_t>(i)));
       }
+      upd.flush(a.insert_threads);
       upd.publish(ins_base + end);
     }
     auto t1 = std::chrono::steady_clock::now();
-    std::cout << "[churn] round " << r + 1 << " insert_qps="
-              << a.count / std::chrono::duration<double>(t1 - t0).count()
+    std::cout << "[churn] round " << r + 1
+              << " insert_qps=" << a.count / std::chrono::duration<double>(t1 - t0).count()
               << " consolidate_s=" << std::chrono::duration<double>(tc1 - tc0).count() << "\n";
     eval_round(r + 1);
   }

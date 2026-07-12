@@ -133,7 +133,8 @@ TEST(QGUpdaterUnit, UnpackRoundTrip) {
     std::vector<uint8_t> repacked = packed;
     std::vector<uint64_t> tmp(bins.size());
     unpack_codes_block(pd, repacked.data(), tmp.data());
-    std::copy(mod.begin() + 17 * (pd / 64), mod.begin() + 18 * (pd / 64),
+    std::copy(mod.begin() + 17 * (pd / 64),
+              mod.begin() + 18 * (pd / 64),
               tmp.begin() + 17 * (pd / 64));
     pack_codes(pd, tmp.data(), kBatchSize, repacked.data());
     std::vector<uint8_t> expect(pd * 4);
@@ -217,7 +218,9 @@ TEST_F(QGUpdaterIndexTest, AssembleRowMatchesBuilder) {
       continue;
     }
     std::vector<char> rebuilt(node_len);
-    upd.assemble_row(rebuilt.data(), tiny_->data.data() + static_cast<size_t>(u) * kDim, nb_vecs,
+    upd.assemble_row(rebuilt.data(),
+                     tiny_->data.data() + static_cast<size_t>(u) * kDim,
+                     nb_vecs,
                      nb_ids);
     EXPECT_EQ(std::memcmp(rebuilt.data(), row.data(), node_len), 0) << "node " << u;
     ++tested;
@@ -230,9 +233,10 @@ TEST_F(QGUpdaterIndexTest, InsertPatchTombstoneEndToEnd) {
   // Work on a copy so other tests see the pristine index.
   const std::string suffix = "_R" + std::to_string(kDeg) + "_MD" + std::to_string(kDim) + ".index";
   const std::string copy_prefix = (tiny_->dir / "copy").string();
-  for (const std::string &ext : {suffix, suffix + "_rotator", suffix + "_cache_ids",
-                                 suffix + "_cache_nodes"}) {
-    std::filesystem::copy_file(tiny_->prefix + ext, copy_prefix + ext,
+  for (const std::string &ext :
+       {suffix, suffix + "_rotator", suffix + "_cache_ids", suffix + "_cache_nodes"}) {
+    std::filesystem::copy_file(tiny_->prefix + ext,
+                               copy_prefix + ext,
                                std::filesystem::copy_options::overwrite_existing);
   }
 
@@ -372,9 +376,10 @@ TEST_F(QGUpdaterIndexTest, InsertPatchTombstoneEndToEnd) {
 TEST_F(QGUpdaterIndexTest, ParallelBatchInsertAndConsolidate) {
   const std::string suffix = "_R" + std::to_string(kDeg) + "_MD" + std::to_string(kDim) + ".index";
   const std::string copy_prefix = (tiny_->dir / "par").string();
-  for (const std::string &ext : {suffix, suffix + "_rotator", suffix + "_cache_ids",
-                                 suffix + "_cache_nodes"}) {
-    std::filesystem::copy_file(tiny_->prefix + ext, copy_prefix + ext,
+  for (const std::string &ext :
+       {suffix, suffix + "_rotator", suffix + "_cache_ids", suffix + "_cache_nodes"}) {
+    std::filesystem::copy_file(tiny_->prefix + ext,
+                               copy_prefix + ext,
                                std::filesystem::copy_options::overwrite_existing);
   }
   const size_t n_insert = 256;
@@ -397,6 +402,7 @@ TEST_F(QGUpdaterIndexTest, ParallelBatchInsertAndConsolidate) {
         upd.insert_with_id(new_data.data() + static_cast<size_t>(i) * kDim,
                            static_cast<PID>(kN + static_cast<size_t>(i)));
       }
+      upd.flush(8);
       upd.publish(kN + start + 64);
     }
     EXPECT_EQ(upd.num_points(), kN + n_insert);
@@ -449,6 +455,56 @@ TEST_F(QGUpdaterIndexTest, ParallelBatchInsertAndConsolidate) {
     }
     EXPECT_EQ(dead_refs, 0U) << "consolidate must purge all dead out-edges from live rows";
   }
+}
+
+TEST_F(QGUpdaterIndexTest, WriteCacheCoalescesAndMatchesImmediateWrites) {
+  const std::string suffix = "_R" + std::to_string(kDeg) + "_MD" + std::to_string(kDim) + ".index";
+  const std::string cached_prefix = (tiny_->dir / "cached").string();
+  const std::string immediate_prefix = (tiny_->dir / "immediate").string();
+  for (const auto &prefix : {cached_prefix, immediate_prefix}) {
+    for (const std::string &ext :
+         {suffix, suffix + "_rotator", suffix + "_cache_ids", suffix + "_cache_nodes"}) {
+      std::filesystem::copy_file(tiny_->prefix + ext,
+                                 prefix + ext,
+                                 std::filesystem::copy_options::overwrite_existing);
+    }
+  }
+
+  constexpr size_t n_insert = 48;
+  auto new_data = make_data(n_insert, kDim, 9917);
+  auto run = [&](const std::string &prefix, bool write_cache) {
+    QuantizedGraph qg(kN, kDeg, kDim, kDim);
+    qg.load_disk_index(prefix.c_str(), 0.0F);
+    qg.set_params(64, 1, 4);
+    UpdateParams params;
+    params.ef_insert = 64;
+    params.backlink_mode = UpdateParams::Backlink::kEvict;
+    params.max_points = kN + n_insert;
+    params.write_cache = write_cache;
+    QGUpdater upd(qg, params);
+    for (size_t i = 0; i < n_insert; ++i) {
+      upd.insert_with_id(new_data.data() + i * kDim, static_cast<PID>(kN + i));
+    }
+    upd.flush(1);
+    upd.publish(kN + n_insert);
+    upd.finalize();
+    return upd.stats();
+  };
+
+  const UpdateStats cached = run(cached_prefix, true);
+  const UpdateStats immediate = run(immediate_prefix, false);
+  EXPECT_GT(cached.logical_row_writes, cached.flush_unique_pages);
+  EXPECT_LT(cached.physical_writes, cached.logical_row_writes);
+  EXPECT_GT(immediate.physical_writes, cached.physical_writes);
+
+  std::ifstream a(cached_prefix + suffix, std::ios::binary);
+  std::ifstream b(immediate_prefix + suffix, std::ios::binary);
+  ASSERT_TRUE(a.is_open());
+  ASSERT_TRUE(b.is_open());
+  const std::vector<char> bytes_a((std::istreambuf_iterator<char>(a)), {});
+  const std::vector<char> bytes_b((std::istreambuf_iterator<char>(b)), {});
+  EXPECT_EQ(bytes_a, bytes_b)
+      << "single-thread staged drain order is deterministic across cache modes";
 }
 
 TEST_F(QGUpdaterIndexTest, GhostSlotDetection) {

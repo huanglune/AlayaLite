@@ -204,8 +204,11 @@ inline EdgePayload make_edge_payload(const float *c_rot,
 struct UpdateStats {
   uint64_t inserts = 0;
   uint64_t search_page_reads = 0;
-  uint64_t patch_page_reads = 0;   // reverse-edge RMW reads (incl. full-prune vector reads)
+  uint64_t patch_page_reads = 0;  // reverse-edge RMW reads (incl. full-prune vector reads)
   uint64_t page_writes = 0;
+  uint64_t physical_writes = 0;  // explicit P0.2 name; same counter as page_writes
+  uint64_t logical_row_writes = 0;
+  uint64_t flush_unique_pages = 0;
   uint64_t free_slot_fills = 0;
   uint64_t evictions = 0;
   uint64_t est_skips = 0;    // new edge longer than current farthest -> skipped
@@ -234,6 +237,7 @@ struct UpdateParams {
                                 // Keep buffered until the user-space dirty-page cache
                                 // (P0.2) moves writes off the hot path; the DIO fd is
                                 // meant for its batched flush.
+  bool write_cache = true;      // absorb page RMWs and write each dirty page once per batch
 };
 
 class QGUpdater {
@@ -250,12 +254,13 @@ class QGUpdater {
         node_len_(qg.node_len_),
         page_size_(qg.page_size_),
         npp_(qg.node_per_page_),
+        write_cache_(page_size_),
         page_locks_(kLockStripes),
-        page_versions_((std::max(params.max_points == 0 ? 2 * qg.num_points_ + 4096
-                                                        : params.max_points,
-                                 qg.num_points_) +
-                        qg.node_per_page_ - 1) /
-                       qg.node_per_page_) {
+        page_versions_(
+            (std::max(params.max_points == 0 ? 2 * qg.num_points_ + 4096 : params.max_points,
+                      qg.num_points_) +
+             qg.node_per_page_ - 1) /
+            qg.node_per_page_) {
     if (qg_.index_file_name_.empty()) {
       throw std::logic_error("QGUpdater: call load_disk_index() first");
     }
@@ -302,6 +307,9 @@ class QGUpdater {
     s.search_page_reads = stats_.search_page_reads.load();
     s.patch_page_reads = stats_.patch_page_reads.load();
     s.page_writes = stats_.page_writes.load();
+    s.physical_writes = s.page_writes;
+    s.logical_row_writes = stats_.logical_row_writes.load();
+    s.flush_unique_pages = stats_.flush_unique_pages.load();
     s.free_slot_fills = stats_.free_slot_fills.load();
     s.evictions = stats_.evictions.load();
     s.est_skips = stats_.est_skips.load();
@@ -327,6 +335,7 @@ class QGUpdater {
   PID insert(const float *vec) {
     const PID id = static_cast<PID>(committed_.load(std::memory_order_acquire));
     insert_with_id(vec, id);
+    flush(1);
     publish(static_cast<size_t>(id) + 1);
     return id;
   }
@@ -338,6 +347,12 @@ class QGUpdater {
   void publish(size_t new_committed) {
     assert(new_committed >= committed_.load(std::memory_order_relaxed));
     committed_.store(new_committed, std::memory_order_release);
+  }
+
+  /** @brief Drain staged backlinks, then persist every dirty cached page. */
+  void flush(size_t num_threads) {
+    drain_staged_edges(num_threads);
+    flush_dirty(num_threads);
   }
 
   /**
@@ -384,6 +399,14 @@ class QGUpdater {
 
     // --- reverse edges ---
     if (params_.backlink_mode != UpdateParams::Backlink::kNone && !sel.empty()) {
+      if (params_.backlink_mode != UpdateParams::Backlink::kFullPrune) {
+        for (size_t rank = 0; rank < sel.size(); ++rank) {
+          const auto &v = pool[sel[rank]];
+          stage_edge({v.id, id, v.dist, rank == 0});
+        }
+        stats_.inserts++;
+        return;
+      }
       std::unordered_map<PID, const CapturedNode *> captured;
       if (params_.backlink_mode == UpdateParams::Backlink::kAlphaEvict) {
         captured.reserve(pool.size());
@@ -436,6 +459,7 @@ class QGUpdater {
       }
       consolidate_row(u, n, target);
     }
+    flush(num_threads);
   }
 
   /**
@@ -443,6 +467,7 @@ class QGUpdater {
    * fresh QuantizedGraph(num_points(), ...).load_disk_index() accepts the file.
    */
   void finalize() {
+    flush(1);
     const size_t n = committed_.load(std::memory_order_acquire);
     std::vector<uint64_t> metas(kSectorLen / sizeof(uint64_t), 0);
     read_at(0, reinterpret_cast<char *>(metas.data()), kSectorLen);
@@ -550,6 +575,8 @@ class QGUpdater {
     std::atomic<uint64_t> search_page_reads{0};
     std::atomic<uint64_t> patch_page_reads{0};
     std::atomic<uint64_t> page_writes{0};
+    std::atomic<uint64_t> logical_row_writes{0};
+    std::atomic<uint64_t> flush_unique_pages{0};
     std::atomic<uint64_t> free_slot_fills{0};
     std::atomic<uint64_t> evictions{0};
     std::atomic<uint64_t> est_skips{0};
@@ -564,7 +591,7 @@ class QGUpdater {
 
   struct CapturedNode {
     PID id = 0;
-    float dist = 0;  // exact full-dim squared L2 to the inserted vector
+    float dist = 0;          // exact full-dim squared L2 to the inserted vector
     std::vector<float> vec;  // raw (PCA-domain) vector only — the rest of the
                              // row is re-read fresh under the page lock
     [[nodiscard]] const float *raw() const { return vec.data(); }
@@ -587,6 +614,45 @@ class QGUpdater {
 
    private:
     char *p_ = nullptr;
+  };
+
+  /**
+   * @brief Write-only, sharded dirty-page cache.
+   *
+   * Entries live for one batch. Search deliberately never consults this
+   * cache: the on-disk image is the committed snapshot until flush/publish.
+   */
+  class PageWriteCache {
+   public:
+    static constexpr size_t kShards = 256;
+    struct CachedPage {
+      explicit CachedPage(size_t len) : bytes(len) {}
+      AlignedBuf bytes;
+      bool dirty = false;
+    };
+    struct Shard {
+      std::mutex mutex;
+      std::unordered_map<size_t, std::unique_ptr<CachedPage>> pages;
+    };
+
+    explicit PageWriteCache(size_t page_size) : page_size_(page_size) {}
+    [[nodiscard]] Shard &shard(size_t page_index) { return shards_[page_index % kShards]; }
+    [[nodiscard]] size_t page_size() const { return page_size_; }
+
+   private:
+    size_t page_size_;
+    std::array<Shard, kShards> shards_;
+  };
+
+  struct StagedEdge {
+    PID v;
+    PID x;
+    float dist_vx;
+    bool primary;
+  };
+  struct StagedStripe {
+    std::mutex mutex;
+    std::unordered_map<PID, std::vector<StagedEdge>> by_target;
   };
 
   /// Thread-local aligned bounce buffer for unaligned caller memory (public
@@ -614,6 +680,74 @@ class QGUpdater {
   }
 
   [[nodiscard]] size_t page_index(PID id) const { return static_cast<size_t>(id) / npp_; }
+
+  template <typename Fn>
+  bool modify_node_page(PID id, Fn &&fn) {
+    const size_t pi = page_index(id);
+    if (!params_.write_cache) {
+      AlignedBuf page(page_size_);
+      read_at(page_offset(id), page.data(), page_size_);
+      stats_.patch_page_reads++;
+      if (!fn(page.data())) {
+        return false;
+      }
+      stats_.logical_row_writes++;
+      write_node_page(id, page.data());
+      return true;
+    }
+    auto &shard = write_cache_.shard(pi);
+    PageWriteCache::CachedPage *cached = nullptr;
+    {
+      const std::lock_guard<std::mutex> cache_guard(shard.mutex);
+      auto [it, inserted] = shard.pages.try_emplace(pi);
+      if (inserted) {
+        it->second = std::make_unique<PageWriteCache::CachedPage>(page_size_);
+        read_at(kSectorLen + pi * page_size_, it->second->bytes.data(), page_size_);
+        stats_.patch_page_reads++;
+      }
+      cached = it->second.get();
+    }
+    // page_lock(id) serializes this buffer's RMW. Do not retain the shard lock
+    // across fn: consolidation/full-prune may consult another cached page,
+    // and holding two shard locks would introduce cross-page lock cycles.
+    if (!fn(cached->bytes.data())) {
+      return false;
+    }
+    {
+      const std::lock_guard<std::mutex> cache_guard(shard.mutex);
+      cached->dirty = true;
+    }
+    stats_.logical_row_writes++;
+    return true;
+  }
+
+  [[nodiscard]] const float *cached_raw(PID id) {
+    const size_t pi = page_index(id);
+    if (params_.write_cache) {
+      auto &shard = write_cache_.shard(pi);
+      const std::lock_guard<std::mutex> guard(shard.mutex);
+      auto it = shard.pages.find(pi);
+      if (it != shard.pages.end()) {
+        return reinterpret_cast<const float *>(it->second->bytes.data() + node_offset_in_page(id));
+      }
+    }
+    return nullptr;
+  }
+
+  /** @brief Page read for update-side dependencies; unlike search, sees dirty RMW state. */
+  void read_rmw_page(PID id, char *out) {
+    const size_t pi = page_index(id);
+    if (params_.write_cache) {
+      auto &shard = write_cache_.shard(pi);
+      const std::lock_guard<std::mutex> guard(shard.mutex);
+      auto it = shard.pages.find(pi);
+      if (it != shard.pages.end()) {
+        std::memcpy(out, it->second->bytes.data(), page_size_);
+        return;
+      }
+    }
+    read_at(page_offset(id), out, page_size_);
+  }
 
   /** @brief Versioned page write; caller must hold the page lock. */
   void write_node_page(PID id, const char *page) {
@@ -677,6 +811,140 @@ class QGUpdater {
       done += static_cast<size_t>(w);
     }
     stats_.page_writes++;
+  }
+
+  void stage_edge(StagedEdge edge) {
+    auto &stripe = staged_[static_cast<size_t>(edge.v) % staged_.size()];
+    const std::lock_guard<std::mutex> guard(stripe.mutex);
+    stripe.by_target[edge.v].push_back(edge);
+  }
+
+  /**
+   * @brief Apply staged kEvict/kAlphaEvict backlinks once per target row.
+   *
+   * AlphaEvict intentionally degrades to Evict here: the insert-local
+   * capture pool is gone at the batch barrier, and E1 found their quality
+   * effectively overlapping. Entries are ordered by exact d(v,x).
+   */
+  void drain_staged_edges(size_t num_threads) {
+    std::array<std::unordered_map<PID, std::vector<StagedEdge>>, 64> work;
+    std::unordered_map<PID, PID> primary;
+    std::unordered_map<PID, size_t> successes;
+    for (size_t si = 0; si < staged_.size(); ++si) {
+      auto &stripe = staged_[si];
+      const std::lock_guard<std::mutex> guard(stripe.mutex);
+      work[si].swap(stripe.by_target);
+      for (const auto &[v, edges] : work[si]) {
+        for (const auto &edge : edges) {
+          successes.try_emplace(edge.x, 0);
+          if (edge.primary) {
+            primary[edge.x] = v;
+          }
+        }
+      }
+    }
+    if (successes.empty()) {
+      return;
+    }
+
+    std::mutex result_mutex;
+    const int nt = static_cast<int>(std::max<size_t>(1, num_threads));
+#pragma omp parallel for num_threads(nt) schedule(dynamic, 1)
+    for (int64_t si = 0; si < static_cast<int64_t>(work.size()); ++si) {
+      for (auto &[v_id, edges] : work[static_cast<size_t>(si)]) {
+        std::sort(edges.begin(), edges.end(), [](const StagedEdge &a, const StagedEdge &b) {
+          if (a.dist_vx != b.dist_vx) return a.dist_vx < b.dist_vx;
+          return a.x < b.x;
+        });
+        CapturedNode v;
+        v.id = v_id;
+        const std::unordered_map<PID, const CapturedNode *> no_capture;
+        for (const auto &edge : edges) {
+          std::vector<float> x_vec;
+          // x was appended earlier in this batch. This hits its dirty cache
+          // page (or disk in write_cache=false control mode); no vector is
+          // retained in StagedEdge.
+          const float *x_raw = cached_raw(edge.x);
+          if (x_raw == nullptr) {
+            AlignedBuf x_page(page_size_);
+            read_at(page_offset(edge.x), x_page.data(), page_size_);
+            stats_.patch_page_reads++;
+            const auto *raw =
+                reinterpret_cast<const float *>(x_page.data() + node_offset_in_page(edge.x));
+            x_vec.assign(raw, raw + full_dim_);
+            x_raw = x_vec.data();
+          }
+          if (patch_reverse_edge(v, edge.x, x_raw, no_capture, false)) {
+            const std::lock_guard<std::mutex> guard(result_mutex);
+            ++successes[edge.x];
+          }
+        }
+      }
+    }
+
+    // Batch reachability fallback: force the primary backlink only for nodes
+    // for which every ordinary staged patch was rejected.
+    for (const auto &[x, count] : successes) {
+      if (count != 0) continue;
+      const auto it = primary.find(x);
+      if (it == primary.end()) continue;
+      CapturedNode v;
+      v.id = it->second;
+      std::vector<float> x_vec;
+      const float *x_raw = cached_raw(x);
+      if (x_raw == nullptr) {
+        AlignedBuf x_page(page_size_);
+        read_at(page_offset(x), x_page.data(), page_size_);
+        stats_.patch_page_reads++;
+        const auto *raw = reinterpret_cast<const float *>(x_page.data() + node_offset_in_page(x));
+        x_vec.assign(raw, raw + full_dim_);
+        x_raw = x_vec.data();
+      }
+      const std::unordered_map<PID, const CapturedNode *> no_capture;
+      if (patch_reverse_edge(v, x, x_raw, no_capture, true)) {
+        stats_.forced_links++;
+      }
+    }
+  }
+
+  void flush_dirty(size_t num_threads) {
+    if (!params_.write_cache) return;
+    struct DirtyPage {
+      size_t index;
+      char *data;
+    };
+    std::vector<DirtyPage> dirty;
+    for (size_t si = 0; si < PageWriteCache::kShards; ++si) {
+      auto &shard = write_cache_.shard(si);
+      const std::lock_guard<std::mutex> guard(shard.mutex);
+      for (auto &[pi, page] : shard.pages) {
+        if (page->dirty) dirty.push_back({pi, page->bytes.data()});
+      }
+    }
+    stats_.flush_unique_pages.fetch_add(dirty.size());
+    const int nt = static_cast<int>(std::max<size_t>(1, num_threads));
+#pragma omp parallel for num_threads(nt) schedule(dynamic, 1)
+    for (int64_t i = 0; i < static_cast<int64_t>(dirty.size()); ++i) {
+      const auto &page = dirty[static_cast<size_t>(i)];
+      if (page.index >= page_versions_.size()) {
+        throw std::runtime_error("QGUpdater: dirty page exceeds max_points capacity");
+      }
+      page_versions_[page.index].fetch_add(1, std::memory_order_acq_rel);
+      write_at(kSectorLen + page.index * page_size_, page.data, page_size_);
+      page_versions_[page.index].fetch_add(1, std::memory_order_release);
+    }
+    for (size_t si = 0; si < PageWriteCache::kShards; ++si) {
+      auto &shard = write_cache_.shard(si);
+      const std::lock_guard<std::mutex> guard(shard.mutex);
+      shard.pages.clear();
+    }
+    // Kick asynchronous writeback now (WB_SYNC_NONE) so the dirty backlog
+    // drains overlapped with the next batch instead of piling up until
+    // balance_dirty_pages throttles some future pwrite. Durability is still
+    // finalize()+fsync only.
+    if (!direct_io_ && !dirty.empty()) {
+      ::sync_file_range(fd_, 0, 0, SYNC_FILE_RANGE_WRITE);
+    }
   }
 
   /** @brief Greedy beam search over the on-disk graph, capturing expanded rows. */
@@ -779,10 +1047,10 @@ class QGUpdater {
       }
       bool occluded = false;
       for (size_t s : sel) {
-        const float d_sc = space::l2_sqr(pool[s].raw(), pool[i].raw(), dim_) +
-                           (res_dim_ > 0 ? space::l2_sqr(pool[s].raw() + dim_,
-                                                         pool[i].raw() + dim_, res_dim_)
-                                         : 0.0F);
+        const float d_sc =
+            space::l2_sqr(pool[s].raw(), pool[i].raw(), dim_) +
+            (res_dim_ > 0 ? space::l2_sqr(pool[s].raw() + dim_, pool[i].raw() + dim_, res_dim_)
+                          : 0.0F);
         // squared-distance domain: alpha^2 * d2(s,c) <= d2(x,c) prunes c
         if (params_.alpha * params_.alpha * d_sc <= pool[i].dist) {
           occluded = true;
@@ -796,16 +1064,13 @@ class QGUpdater {
   }
 
   void append_node(PID id, const char *row) {
-    AlignedBuf page(page_size_);
     const std::lock_guard<std::mutex> guard(page_lock(id));
-    if (npp_ > 1) {
-      read_at(page_offset(id), page.data(), page_size_);
-      stats_.patch_page_reads++;
-    } else {
-      std::memset(page.data(), 0, page_size_);  // deterministic tail padding
-    }
-    std::memcpy(page.data() + node_offset_in_page(id), row, node_len_);
-    write_node_page(id, page.data());
+    modify_node_page(id, [&](char *page) {
+      // A newly-created one-row page has deterministic zero tail padding;
+      // read_at already zero-fills an EOF cache miss.
+      std::memcpy(page + node_offset_in_page(id), row, node_len_);
+      return true;
+    });
   }
 
   /**
@@ -814,109 +1079,108 @@ class QGUpdater {
    * new edge is shorter. kAlphaEvict additionally rejects the new edge when an
    * already-captured current neighbor alpha-occludes it (zero extra I/O).
    */
-  bool patch_reverse_edge(const CapturedNode &v, PID x_id, const float *x_vec,
+  bool patch_reverse_edge(const CapturedNode &v,
+                          PID x_id,
+                          const float *x_vec,
                           const std::unordered_map<PID, const CapturedNode *> &captured,
                           bool force) {
     if (deleted_.count(v.id) != 0) {
       return false;
     }
-    AlignedBuf page(page_size_);
     const std::lock_guard<std::mutex> guard(page_lock(v.id));
-    read_at(page_offset(v.id), page.data(), page_size_);
-    stats_.patch_page_reads++;
-    char *row = page.data() + node_offset_in_page(v.id);
-    const auto *row_f = reinterpret_cast<const float *>(row);
-    auto *ids = reinterpret_cast<PID *>(row + neighbor_off_bytes());
-    auto *fac = reinterpret_cast<float *>(row + factor_off_bytes());
+    return modify_node_page(v.id, [&](char *page) {
+      char *row = page + node_offset_in_page(v.id);
+      const auto *row_f = reinterpret_cast<const float *>(row);
+      auto *ids = reinterpret_cast<PID *>(row + neighbor_off_bytes());
+      auto *fac = reinterpret_cast<float *>(row + factor_off_bytes());
 
-    // residual-consistent comparison value for the new edge (v,x)
-    float x_res_sqr = 0;
-    float v_res_sqr = 0;
-    for (size_t j = 0; j < res_dim_; ++j) {
-      x_res_sqr += x_vec[dim_ + j] * x_vec[dim_ + j];
-      v_res_sqr += row_f[dim_ + j] * row_f[dim_ + j];
-    }
-    const float est_new = space::l2_sqr(row_f, x_vec, dim_) + x_res_sqr + v_res_sqr;
+      // residual-consistent comparison value for the new edge (v,x)
+      float x_res_sqr = 0;
+      float v_res_sqr = 0;
+      for (size_t j = 0; j < res_dim_; ++j) {
+        x_res_sqr += x_vec[dim_ + j] * x_vec[dim_ + j];
+        v_res_sqr += row_f[dim_ + j] * row_f[dim_ + j];
+      }
+      const float est_new = space::l2_sqr(row_f, x_vec, dim_) + x_res_sqr + v_res_sqr;
 
-    // alpha-occlusion test using neighbors already captured by this search
-    if (!force && params_.backlink_mode == UpdateParams::Backlink::kAlphaEvict &&
-        !captured.empty()) {
-      size_t checked = 0;
-      const float d_vx = space::l2_sqr(row_f, x_vec, dim_) +
-                         (res_dim_ > 0 ? space::l2_sqr(row_f + dim_, x_vec + dim_, res_dim_)
-                                       : 0.0F);
-      for (size_t j = 0; j < deg_ && checked < params_.alpha_check_max; ++j) {
-        if (ids[j] == x_id || is_free_fast(fac, ids, j)) {
-          continue;
+      // alpha-occlusion test using neighbors already captured by this search
+      if (!force && params_.backlink_mode == UpdateParams::Backlink::kAlphaEvict &&
+          !captured.empty()) {
+        size_t checked = 0;
+        const float d_vx =
+            space::l2_sqr(row_f, x_vec, dim_) +
+            (res_dim_ > 0 ? space::l2_sqr(row_f + dim_, x_vec + dim_, res_dim_) : 0.0F);
+        for (size_t j = 0; j < deg_ && checked < params_.alpha_check_max; ++j) {
+          if (ids[j] == x_id || is_free_fast(fac, ids, j)) {
+            continue;
+          }
+          auto it = captured.find(ids[j]);
+          if (it == captured.end()) {
+            continue;
+          }
+          ++checked;
+          const float d_sx =
+              space::l2_sqr(it->second->raw(), x_vec, dim_) +
+              (res_dim_ > 0 ? space::l2_sqr(it->second->raw() + dim_, x_vec + dim_, res_dim_)
+                            : 0.0F);
+          if (params_.alpha * params_.alpha * d_sx <= d_vx) {
+            stats_.alpha_skips++;
+            return false;
+          }
         }
-        auto it = captured.find(ids[j]);
-        if (it == captured.end()) {
-          continue;
+      }
+
+      // choose a slot: first ghost slot, else evict farthest by FastScan estimate
+      size_t slot = deg_;
+      for (size_t j = 0; j < deg_; ++j) {
+        if (is_free_fast(fac, ids, j) && is_ghost_slot(row, j)) {
+          slot = j;
+          break;
         }
-        ++checked;
-        const float d_sx =
-            space::l2_sqr(it->second->raw(), x_vec, dim_) +
-            (res_dim_ > 0
-                 ? space::l2_sqr(it->second->raw() + dim_, x_vec + dim_, res_dim_)
-                 : 0.0F);
-        if (params_.alpha * params_.alpha * d_sx <= d_vx) {
-          stats_.alpha_skips++;
+      }
+      bool evicted = false;
+      if (slot == deg_) {
+        QGQuery vq(row_f, pd_);
+        vq.query_prepare(qg_.rotator_, qg_.scanner_);
+        vq.set_sqr_qr(v_res_sqr);
+        std::vector<float> appro(deg_);
+        qg_.scanner_.scan_neighbors(appro.data(),
+                                    vq.lut().data(),
+                                    0.0F,
+                                    vq.lower_val(),
+                                    vq.width(),
+                                    vq.sqr_qr(),
+                                    vq.sumq(),
+                                    reinterpret_cast<const uint8_t *>(row + code_off_bytes()),
+                                    fac);
+        float worst = -1;
+        for (size_t j = 0; j < deg_; ++j) {
+          if (ids[j] == x_id) {
+            return true;  // already linked (shouldn't happen for a fresh id)
+          }
+          if (appro[j] > worst) {
+            worst = appro[j];
+            slot = j;
+          }
+        }
+        if (!force && est_new >= worst) {
+          stats_.est_skips++;
           return false;
         }
+        evicted = true;
       }
-    }
 
-    // choose a slot: first ghost slot, else evict farthest by FastScan estimate
-    size_t slot = deg_;
-    for (size_t j = 0; j < deg_; ++j) {
-      if (is_free_fast(fac, ids, j) && is_ghost_slot(row, j)) {
-        slot = j;
-        break;
-      }
-    }
-    bool evicted = false;
-    if (slot == deg_) {
-      QGQuery vq(row_f, pd_);
-      vq.query_prepare(qg_.rotator_, qg_.scanner_);
-      vq.set_sqr_qr(v_res_sqr);
-      std::vector<float> appro(deg_);
-      qg_.scanner_.scan_neighbors(appro.data(),
-                                  vq.lut().data(),
-                                  0.0F,
-                                  vq.lower_val(),
-                                  vq.width(),
-                                  vq.sqr_qr(),
-                                  vq.sumq(),
-                                  reinterpret_cast<const uint8_t *>(row + code_off_bytes()),
-                                  fac);
-      float worst = -1;
-      for (size_t j = 0; j < deg_; ++j) {
-        if (ids[j] == x_id) {
-          return true;  // already linked (shouldn't happen for a fresh id)
-        }
-        if (appro[j] > worst) {
-          worst = appro[j];
-          slot = j;
-        }
-      }
-      if (!force && est_new >= worst) {
-        stats_.est_skips++;
+      if (!patch_slot(row, slot, x_id, x_vec, x_res_sqr)) {
+        stats_.degenerate_skips++;
         return false;
       }
-      evicted = true;
-    }
-
-    if (!patch_slot(row, slot, x_id, x_vec, x_res_sqr)) {
-      stats_.degenerate_skips++;
-      return false;
-    }
-    write_node_page(v.id, page.data());
-    if (evicted) {
-      stats_.evictions++;
-    } else {
-      stats_.free_slot_fills++;
-    }
-    return true;
+      if (evicted) {
+        stats_.evictions++;
+      } else {
+        stats_.free_slot_fills++;
+      }
+      return true;
+    });
   }
 
   /** @brief Quality-reference arm: full RobustPrune with all neighbor vectors read back. */
@@ -924,218 +1188,220 @@ class QGUpdater {
     if (deleted_.count(v.id) != 0) {
       return false;
     }
-    AlignedBuf page(page_size_);
     const std::lock_guard<std::mutex> guard(page_lock(v.id));
-    read_at(page_offset(v.id), page.data(), page_size_);
-    stats_.patch_page_reads++;
-    char *row = page.data() + node_offset_in_page(v.id);
-    const auto *row_f = reinterpret_cast<const float *>(row);
-    auto *ids = reinterpret_cast<PID *>(row + neighbor_off_bytes());
+    bool survived = false;
+    modify_node_page(v.id, [&](char *page) {
+      char *row = page + node_offset_in_page(v.id);
+      const auto *row_f = reinterpret_cast<const float *>(row);
+      auto *ids = reinterpret_cast<PID *>(row + neighbor_off_bytes());
 
-    const size_t snapshot = committed_.load(std::memory_order_acquire);
+      const size_t snapshot = committed_.load(std::memory_order_acquire);
 
-    // gather live neighbors + the new node as prune candidates
-    struct Cand {
-      PID id;
-      float dist;
-      std::vector<float> vec;
-    };
-    std::vector<Cand> cands;
-    cands.reserve(deg_ + 1);
-    AlignedBuf nb_page(page_size_);
-    for (size_t j = 0; j < deg_; ++j) {
-      const PID nb = ids[j];
-      if ((nb >= snapshot && nb != x_id) || is_ghost_slot(row, j) || nb == v.id ||
-          deleted_.count(nb) != 0) {
-        continue;
+      // gather live neighbors + the new node as prune candidates
+      struct Cand {
+        PID id;
+        float dist;
+        std::vector<float> vec;
+      };
+      std::vector<Cand> cands;
+      cands.reserve(deg_ + 1);
+      AlignedBuf nb_page(page_size_);
+      for (size_t j = 0; j < deg_; ++j) {
+        const PID nb = ids[j];
+        if ((nb >= snapshot && nb != x_id) || is_ghost_slot(row, j) || nb == v.id ||
+            deleted_.count(nb) != 0) {
+          continue;
+        }
+        bool dup = false;
+        for (const auto &c : cands) {
+          if (c.id == nb) {
+            dup = true;
+            break;
+          }
+        }
+        if (dup) {
+          continue;
+        }
+        read_rmw_page(nb, nb_page.data());
+        stats_.patch_page_reads++;
+        const auto *nb_f =
+            reinterpret_cast<const float *>(nb_page.data() + node_offset_in_page(nb));
+        Cand c;
+        c.id = nb;
+        c.vec.assign(nb_f, nb_f + full_dim_);
+        c.dist = space::l2_sqr(row_f, c.vec.data(), dim_) +
+                 (res_dim_ > 0 ? space::l2_sqr(row_f + dim_, c.vec.data() + dim_, res_dim_) : 0.0F);
+        cands.push_back(std::move(c));
       }
-      bool dup = false;
-      for (const auto &c : cands) {
-        if (c.id == nb) {
-          dup = true;
-          break;
+      {
+        Cand c;
+        c.id = x_id;
+        c.vec.assign(x_vec, x_vec + full_dim_);
+        c.dist = space::l2_sqr(row_f, x_vec, dim_) +
+                 (res_dim_ > 0 ? space::l2_sqr(row_f + dim_, x_vec + dim_, res_dim_) : 0.0F);
+        cands.push_back(std::move(c));
+      }
+      std::sort(cands.begin(), cands.end(), [](const Cand &a, const Cand &b) {
+        return a.dist < b.dist;
+      });
+
+      std::vector<size_t> sel;
+      for (size_t i = 0; i < cands.size() && sel.size() < deg_; ++i) {
+        bool occluded = false;
+        for (size_t s : sel) {
+          const float d_sc =
+              space::l2_sqr(cands[s].vec.data(), cands[i].vec.data(), dim_) +
+              (res_dim_ > 0
+                   ? space::l2_sqr(cands[s].vec.data() + dim_, cands[i].vec.data() + dim_, res_dim_)
+                   : 0.0F);
+          if (params_.alpha * params_.alpha * d_sc <= cands[i].dist) {
+            occluded = true;
+            break;
+          }
+        }
+        if (!occluded) {
+          sel.push_back(i);
         }
       }
-      if (dup) {
-        continue;
-      }
-      read_at(page_offset(nb), nb_page.data(), page_size_);
-      stats_.patch_page_reads++;
-      const auto *nb_f =
-          reinterpret_cast<const float *>(nb_page.data() + node_offset_in_page(nb));
-      Cand c;
-      c.id = nb;
-      c.vec.assign(nb_f, nb_f + full_dim_);
-      c.dist = space::l2_sqr(row_f, c.vec.data(), dim_) +
-               (res_dim_ > 0 ? space::l2_sqr(row_f + dim_, c.vec.data() + dim_, res_dim_)
-                             : 0.0F);
-      cands.push_back(std::move(c));
-    }
-    {
-      Cand c;
-      c.id = x_id;
-      c.vec.assign(x_vec, x_vec + full_dim_);
-      c.dist = space::l2_sqr(row_f, x_vec, dim_) +
-               (res_dim_ > 0 ? space::l2_sqr(row_f + dim_, x_vec + dim_, res_dim_) : 0.0F);
-      cands.push_back(std::move(c));
-    }
-    std::sort(cands.begin(), cands.end(),
-              [](const Cand &a, const Cand &b) { return a.dist < b.dist; });
 
-    std::vector<size_t> sel;
-    for (size_t i = 0; i < cands.size() && sel.size() < deg_; ++i) {
-      bool occluded = false;
+      std::vector<float> v_vec(row_f, row_f + full_dim_);  // row buffer is rewritten below
+      std::vector<const float *> nb_vecs;
+      std::vector<PID> nb_ids;
+      bool x_survived = false;
       for (size_t s : sel) {
-        const float d_sc =
-            space::l2_sqr(cands[s].vec.data(), cands[i].vec.data(), dim_) +
-            (res_dim_ > 0 ? space::l2_sqr(cands[s].vec.data() + dim_,
-                                          cands[i].vec.data() + dim_, res_dim_)
-                          : 0.0F);
-        if (params_.alpha * params_.alpha * d_sc <= cands[i].dist) {
-          occluded = true;
-          break;
-        }
+        nb_vecs.push_back(cands[s].vec.data());
+        nb_ids.push_back(cands[s].id);
+        x_survived = x_survived || (cands[s].id == x_id);
       }
-      if (!occluded) {
-        sel.push_back(i);
-      }
-    }
-
-    std::vector<float> v_vec(row_f, row_f + full_dim_);  // row buffer is rewritten below
-    std::vector<const float *> nb_vecs;
-    std::vector<PID> nb_ids;
-    bool x_survived = false;
-    for (size_t s : sel) {
-      nb_vecs.push_back(cands[s].vec.data());
-      nb_ids.push_back(cands[s].id);
-      x_survived = x_survived || (cands[s].id == x_id);
-    }
-    assemble_row(row, v_vec.data(), nb_vecs, nb_ids);
-    write_node_page(v.id, page.data());
+      assemble_row(row, v_vec.data(), nb_vecs, nb_ids);
+      survived = x_survived;
+      return true;
+    });
     stats_.full_recomputes++;
-    return x_survived;
+    return survived;
   }
 
   /** @brief Purge/splice one live row; see consolidate(). */
   void consolidate_row(PID u, size_t snapshot, size_t r_target) {
-    AlignedBuf page(page_size_);
     const std::lock_guard<std::mutex> guard(page_lock(u));
-    read_at(page_offset(u), page.data(), page_size_);
-    char *row = page.data() + node_offset_in_page(u);
-    const auto *row_f = reinterpret_cast<const float *>(row);
-    auto *ids = reinterpret_cast<PID *>(row + neighbor_off_bytes());
+    modify_node_page(u, [&](char *page) {
+      char *row = page + node_offset_in_page(u);
+      const auto *row_f = reinterpret_cast<const float *>(row);
+      auto *ids = reinterpret_cast<PID *>(row + neighbor_off_bytes());
 
-    // collect dead slots and current live adjacency
-    std::vector<size_t> dead_slots;
-    std::unordered_set<PID> chosen;
-    for (size_t j = 0; j < deg_; ++j) {
-      if (is_ghost_slot(row, j)) {
-        continue;
-      }
-      if (deleted_.count(ids[j]) != 0) {
-        dead_slots.push_back(j);
-      } else {
-        chosen.insert(ids[j]);
-      }
-    }
-    if (dead_slots.empty()) {
-      return;
-    }
-    size_t live_degree = chosen.size();
-
-    float u_res_sqr = 0;
-    for (size_t j = 0; j < res_dim_; ++j) {
-      u_res_sqr += row_f[dim_ + j] * row_f[dim_ + j];
-    }
-    QGQuery uq(row_f, pd_);
-    uq.query_prepare(qg_.rotator_, qg_.scanner_);
-    uq.set_sqr_qr(u_res_sqr);
-
-    AlignedBuf d_page(page_size_);
-    AlignedBuf cand_page(page_size_);
-    std::vector<float> appro(deg_);
-    bool dirty = false;
-    for (size_t j : dead_slots) {
-      const PID d = ids[j];
-      // Headroom preservation: only splice back up to r_target live edges;
-      // surplus dead slots become free ghost slots.
-      if (live_degree >= r_target) {
-        zero_slot(row, j);
-        stats_.ghosted_slots++;
-        dirty = true;
-        continue;
-      }
-      // FastScan over the dead node's own row (codes centered at d, but the
-      // estimator still targets ||u - n_i||) recalls candidates cheaply...
-      read_node_page(d, d_page.data());
-      stats_.patch_page_reads++;
-      const char *d_row = d_page.data() + node_offset_in_page(d);
-      qg_.scanner_.scan_neighbors(appro.data(),
-                                  uq.lut().data(),
-                                  space::l2_sqr(row_f,
-                                                reinterpret_cast<const float *>(d_row), dim_),
-                                  uq.lower_val(),
-                                  uq.width(),
-                                  uq.sqr_qr(),
-                                  uq.sumq(),
-                                  reinterpret_cast<const uint8_t *>(d_row + code_off_bytes()),
-                                  reinterpret_cast<const float *>(d_row + factor_off_bytes()));
-      const auto *d_ids = reinterpret_cast<const PID *>(d_row + neighbor_off_bytes());
-      std::vector<std::pair<float, PID>> recalled;
-      for (size_t k = 0; k < deg_; ++k) {
-        const PID cand = d_ids[k];
-        if (cand == u || cand >= snapshot || !std::isfinite(appro[k]) ||
-            is_ghost_slot(d_row, k) || deleted_.count(cand) != 0 || chosen.count(cand) != 0) {
+      // collect dead slots and current live adjacency
+      std::vector<size_t> dead_slots;
+      std::unordered_set<PID> chosen;
+      for (size_t j = 0; j < deg_; ++j) {
+        if (is_ghost_slot(row, j)) {
           continue;
         }
-        recalled.emplace_back(appro[k], cand);
-      }
-      std::sort(recalled.begin(), recalled.end());
-      if (recalled.size() > params_.splice_rerank) {
-        recalled.resize(params_.splice_rerank);
-      }
-      // ...then rerank the recalled few exactly on raw vectors before patching.
-      bool patched = false;
-      PID best = kPidMax;
-      float best_dist = FLT_MAX;
-      std::vector<float> best_vec;
-      for (const auto &[est, cand] : recalled) {
-        read_node_page(cand, cand_page.data());
-        stats_.patch_page_reads++;
-        const auto *cand_f =
-            reinterpret_cast<const float *>(cand_page.data() + node_offset_in_page(cand));
-        const float d_exact =
-            space::l2_sqr(row_f, cand_f, dim_) +
-            (res_dim_ > 0 ? space::l2_sqr(row_f + dim_, cand_f + dim_, res_dim_) : 0.0F);
-        if (d_exact < best_dist) {
-          best_dist = d_exact;
-          best = cand;
-          best_vec.assign(cand_f, cand_f + full_dim_);
+        if (deleted_.count(ids[j]) != 0) {
+          dead_slots.push_back(j);
+        } else {
+          chosen.insert(ids[j]);
         }
       }
-      if (best != kPidMax) {
-        float cand_res_sqr = 0;
-        for (size_t r = 0; r < res_dim_; ++r) {
-          cand_res_sqr += best_vec[dim_ + r] * best_vec[dim_ + r];
-        }
-        if (patch_slot(row, j, best, best_vec.data(), cand_res_sqr)) {
-          chosen.insert(best);
-          ++live_degree;
-          stats_.spliced_slots++;
+      if (dead_slots.empty()) {
+        return false;
+      }
+      size_t live_degree = chosen.size();
+
+      float u_res_sqr = 0;
+      for (size_t j = 0; j < res_dim_; ++j) {
+        u_res_sqr += row_f[dim_ + j] * row_f[dim_ + j];
+      }
+      QGQuery uq(row_f, pd_);
+      uq.query_prepare(qg_.rotator_, qg_.scanner_);
+      uq.set_sqr_qr(u_res_sqr);
+
+      AlignedBuf d_page(page_size_);
+      AlignedBuf cand_page(page_size_);
+      std::vector<float> appro(deg_);
+      bool dirty = false;
+      for (size_t j : dead_slots) {
+        const PID d = ids[j];
+        // Headroom preservation: only splice back up to r_target live edges;
+        // surplus dead slots become free ghost slots.
+        if (live_degree >= r_target) {
+          zero_slot(row, j);
+          stats_.ghosted_slots++;
           dirty = true;
-          patched = true;
+          continue;
+        }
+        // FastScan over the dead node's own row (codes centered at d, but the
+        // estimator still targets ||u - n_i||) recalls candidates cheaply...
+        read_rmw_page(d, d_page.data());
+        stats_.patch_page_reads++;
+        const char *d_row = d_page.data() + node_offset_in_page(d);
+        qg_.scanner_.scan_neighbors(appro.data(),
+                                    uq.lut().data(),
+                                    space::l2_sqr(row_f,
+                                                  reinterpret_cast<const float *>(d_row),
+                                                  dim_),
+                                    uq.lower_val(),
+                                    uq.width(),
+                                    uq.sqr_qr(),
+                                    uq.sumq(),
+                                    reinterpret_cast<const uint8_t *>(d_row + code_off_bytes()),
+                                    reinterpret_cast<const float *>(d_row + factor_off_bytes()));
+        const auto *d_ids = reinterpret_cast<const PID *>(d_row + neighbor_off_bytes());
+        std::vector<std::pair<float, PID>> recalled;
+        for (size_t k = 0; k < deg_; ++k) {
+          const PID cand = d_ids[k];
+          if (cand == u || cand >= snapshot || !std::isfinite(appro[k]) ||
+              is_ghost_slot(d_row, k) || deleted_.count(cand) != 0 || chosen.count(cand) != 0) {
+            continue;
+          }
+          recalled.emplace_back(appro[k], cand);
+        }
+        std::sort(recalled.begin(), recalled.end());
+        if (recalled.size() > params_.splice_rerank) {
+          recalled.resize(params_.splice_rerank);
+        }
+        // ...then rerank the recalled few exactly on raw vectors before patching.
+        bool patched = false;
+        PID best = kPidMax;
+        float best_dist = FLT_MAX;
+        std::vector<float> best_vec;
+        for (const auto &[est, cand] : recalled) {
+          read_rmw_page(cand, cand_page.data());
+          stats_.patch_page_reads++;
+          const auto *cand_f =
+              reinterpret_cast<const float *>(cand_page.data() + node_offset_in_page(cand));
+          const float d_exact =
+              space::l2_sqr(row_f, cand_f, dim_) +
+              (res_dim_ > 0 ? space::l2_sqr(row_f + dim_, cand_f + dim_, res_dim_) : 0.0F);
+          if (d_exact < best_dist) {
+            best_dist = d_exact;
+            best = cand;
+            best_vec.assign(cand_f, cand_f + full_dim_);
+          }
+        }
+        if (best != kPidMax) {
+          float cand_res_sqr = 0;
+          for (size_t r = 0; r < res_dim_; ++r) {
+            cand_res_sqr += best_vec[dim_ + r] * best_vec[dim_ + r];
+          }
+          if (patch_slot(row, j, best, best_vec.data(), cand_res_sqr)) {
+            chosen.insert(best);
+            ++live_degree;
+            stats_.spliced_slots++;
+            dirty = true;
+            patched = true;
+          }
+        }
+        if (!patched) {
+          zero_slot(row, j);
+          stats_.ghosted_slots++;
+          dirty = true;
         }
       }
-      if (!patched) {
-        zero_slot(row, j);
-        stats_.ghosted_slots++;
-        dirty = true;
+      if (dirty) {
+        stats_.consolidated_rows++;
       }
-    }
-    if (dirty) {
-      write_node_page(u, page.data());
-      stats_.consolidated_rows++;
-    }
+      return dirty;
+    });
   }
 
   /** @brief Replace one slot's code + factors + id inside a row buffer. */
@@ -1157,8 +1423,7 @@ class QGUpdater {
 
     const size_t block_idx = slot / kBatchSize;
     const size_t in_block = slot % kBatchSize;
-    uint8_t *block =
-        reinterpret_cast<uint8_t *>(row + code_off_bytes()) + block_idx * pd_ * 4;
+    uint8_t *block = reinterpret_cast<uint8_t *>(row + code_off_bytes()) + block_idx * pd_ * 4;
     std::vector<uint64_t> bins(kBatchSize * pd_ / 64);
     unpack_codes_block(pd_, block, bins.data());
     std::copy(payload.bin.begin(), payload.bin.end(), bins.begin() + in_block * (pd_ / 64));
@@ -1177,11 +1442,11 @@ class QGUpdater {
   void zero_slot(char *row, size_t slot) {
     const size_t block_idx = slot / kBatchSize;
     const size_t in_block = slot % kBatchSize;
-    uint8_t *block =
-        reinterpret_cast<uint8_t *>(row + code_off_bytes()) + block_idx * pd_ * 4;
+    uint8_t *block = reinterpret_cast<uint8_t *>(row + code_off_bytes()) + block_idx * pd_ * 4;
     std::vector<uint64_t> bins(kBatchSize * pd_ / 64);
     unpack_codes_block(pd_, block, bins.data());
-    std::fill(bins.begin() + in_block * (pd_ / 64), bins.begin() + (in_block + 1) * (pd_ / 64),
+    std::fill(bins.begin() + in_block * (pd_ / 64),
+              bins.begin() + (in_block + 1) * (pd_ / 64),
               uint64_t{0});
     pack_codes(pd_, bins.data(), kBatchSize, block);
     auto *fac = reinterpret_cast<float *>(row + factor_off_bytes());
@@ -1206,6 +1471,8 @@ class QGUpdater {
   size_t dim_, res_dim_, full_dim_, pd_, deg_, node_len_, page_size_, npp_;
   std::unordered_set<PID> deleted_;
   AtomicStats stats_;
+  PageWriteCache write_cache_;
+  std::array<StagedStripe, 64> staged_;
   std::vector<std::mutex> page_locks_;
   // Per-page seqlock: odd while a locked writer rewrites the page. Readers
   // outside the page lock validate before/after the pread and retry.
