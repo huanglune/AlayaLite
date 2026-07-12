@@ -36,7 +36,11 @@
 #include "index/graph/laser/quantization/rabitq.hpp"
 #include "index/graph/laser/space/l2.hpp"
 #include "index/graph/laser/utils/aligned_file_reader.hpp"
-#include "index/graph/laser/utils/aligned_file_reader_factory.hpp"
+#if defined(_WIN32)
+  #include "index/graph/laser/utils/aligned_file_reader_factory.hpp"
+#else
+  #include "index/graph/laser/utils/page_reader_adapter.hpp"
+#endif
 #include "index/graph/laser/utils/array.hpp"
 #include "index/graph/laser/utils/buffer.hpp"
 #include "index/graph/laser/utils/concurrent_queue.hpp"
@@ -64,6 +68,9 @@ struct ThreadData {
   HashBasedBooleanSet visited_;
   buffer::SearchBuffer search_pool_;
   IOContext ctx_;
+#if !defined(_WIN32)
+  std::shared_ptr<PageReadCompletions> completions_ = std::make_shared<PageReadCompletions>();
+#endif
   char *sector_scratch_ = nullptr;
   char *neighbor_vector_scratch_ = nullptr;
   char *cur_page_scratch_ = nullptr;
@@ -100,7 +107,11 @@ class QuantizedGraph {
   QGScanner scanner_;
   FHTRotator rotator_;
   PCATransform pca_transform_;  // PCA transform for online query transformation
+#if defined(_WIN32)
   std::unique_ptr<AlignedFileReader> aligned_file_reader_;
+#else
+  std::unique_ptr<storage::io::PageReader> page_reader_;
+#endif
   ConcurrentQueue<ThreadData> thread_data_;
   int dc_count_;
   size_t ef_search_ = 200;
@@ -247,8 +258,12 @@ class QuantizedGraph {
     // close() must run first: under the ThreadPool backend it joins worker
     // threads, eliminating the use-after-free window where a worker can call
     // notify_completion() with a ThreadPoolContext* that was already erased.
+#if defined(_WIN32)
     aligned_file_reader_->close();
     aligned_file_reader_->deregister_all_threads();
+#else
+    if (page_reader_) page_reader_->shutdown();
+#endif
   }
 };
 
@@ -267,7 +282,9 @@ inline QuantizedGraph::QuantizedGraph(size_t num,
       padded_dim_(1 << ceil_log2(dimension_)),
       scanner_(padded_dim_, degree_bound_),
       rotator_(dimension_, rotator_seed),
+#if defined(_WIN32)
       aligned_file_reader_(make_aligned_file_reader()),
+#endif
       node_len_((32 * dimension_ + 32 * residual_dimension_ + 128 * degree_bound_ +
                  degree_bound_ * padded_dim_) /
                 8) {
@@ -318,21 +335,32 @@ inline void QuantizedGraph::set_params(size_t ef_search, size_t num_threads, int
   if (index_file_name_ == "") {
     throw std::logic_error("QuantizedGraph::set_params: call load_disk_index() first");
   }
+#if defined(_WIN32)
   aligned_file_reader_->open(index_file_name_);
+#else
+  page_reader_ = make_laser_page_reader(index_file_name_);
+#endif
 
   const int nthreads_signed = static_cast<int>(nthreads_);
 #pragma omp parallel for num_threads(nthreads_signed)
   for (int thread = 0; thread < nthreads_signed; thread++) {
 #pragma omp critical
     {
-      this->aligned_file_reader_->register_thread();
       ThreadData data;
+#if defined(_WIN32)
+      this->aligned_file_reader_->register_thread();
       data.ctx_ = aligned_file_reader_->get_ctx();
+#endif
       data.search_pool_.resize(ef_search_);
       data.visited_ =
           HashBasedBooleanSet(std::min(this->num_points_ / 10, ef_search_ * ef_search_));
+#if defined(_WIN32)
       data.sector_scratch_ = reinterpret_cast<char *>(
           memory::align_allocate<kSectorLen>(2 * max_beam_width_ * page_size_));
+#else
+      data.sector_scratch_ = static_cast<char *>(
+          allocate_page_read_buffer(*page_reader_, 2 * max_beam_width_ * page_size_));
+#endif
       data.pca_query_scratch_storage_ =
           std::make_shared<std::vector<float>>(dimension_ + residual_dimension_);
       data.pca_query_scratch_ =
@@ -480,7 +508,11 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
 
   // ==================== Asynchronous I/O Data Structures ====================
   // frontier_read_reqs: Batch of aligned read requests to submit to AIO
+#if defined(_WIN32)
   std::vector<AlignedRead> frontier_read_reqs;
+#else
+  std::vector<storage::io::ReadRequest> frontier_read_reqs;
+#endif
   frontier_read_reqs.reserve(2 * max_beam_width_);
 
   // prepared_nodes: Nodes whose data has been fetched and is ready for processing
@@ -496,7 +528,11 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
   }
 
   // Backend-independent event buffer for collecting completed I/O operations.
+#if defined(_WIN32)
   std::vector<AlignedReadEvent> evts;
+#else
+  std::vector<storage::io::ReadResult> evts;
+#endif
 
   // cache_nhoods: Nodes found in memory cache (no disk I/O needed)
   std::vector<PID> cache_nhoods;
@@ -531,11 +567,15 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
   // Collects completed I/O events and moves nodes from ongoing to prepared queue.
   // Uses non-blocking reader polling to check for completed I/O without waiting.
   auto wait_for_nodes = [&]() {
-    const int ret =
-        aligned_file_reader_->poll_events(data.ctx_, static_cast<int>(cur_beam_size), evts);
+#if defined(_WIN32)
+    const auto ret = static_cast<std::size_t>(
+        aligned_file_reader_->poll_events(data.ctx_, static_cast<int>(cur_beam_size), evts));
+#else
+    const auto ret = poll_page_reads(*data.completions_, cur_beam_size, evts);
+#endif
 
     // Process each completed I/O event
-    for (int i = 0; i < ret; i++) {
+    for (std::size_t i = 0; i < ret; i++) {
       int id = static_cast<int>(evts[i].id);
       if (ongoing_nodes.find(id) == ongoing_nodes.end()) {
         throw std::runtime_error(
@@ -597,7 +637,14 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
         free_slots.pop_front();
         ongoing_nodes[cur_node] = slot;
         // Create aligned read request (page-aligned for direct I/O)
+#if defined(_WIN32)
         frontier_read_reqs.emplace_back(get_page_offset(cur_node), page_size_, cur_node, slot);
+#else
+        frontier_read_reqs.push_back(
+            {.id = cur_node,
+             .offset = get_page_offset(cur_node),
+             .buffer = std::span(reinterpret_cast<std::byte *>(slot), page_size_)});
+#endif
       }
       total_read_num_++;
     }
@@ -607,7 +654,11 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
     if (!frontier_read_reqs.empty()) {
       n_hops++;  // Count as one I/O round
       auto submit_start = std::chrono::high_resolution_clock::now();
+#if defined(_WIN32)
       n_ops = aligned_file_reader_->submit_reqs(frontier_read_reqs, data.ctx_);
+#else
+      n_ops = submit_page_reads(*page_reader_, frontier_read_reqs, *data.completions_);
+#endif
       io_num += n_ops;
       auto submit_end = std::chrono::high_resolution_clock::now();
       submit_time +=
@@ -730,21 +781,32 @@ inline void QuantizedGraph::initialize() {
 }
 
 inline void QuantizedGraph::init_workspace() {
+#if defined(_WIN32)
   aligned_file_reader_->open(index_file_name_);
+#else
+  page_reader_ = make_laser_page_reader(index_file_name_);
+#endif
 
   const int nthreads_signed = static_cast<int>(nthreads_);
 #pragma omp parallel for num_threads(nthreads_signed)
   for (int thread = 0; thread < nthreads_signed; thread++) {
 #pragma omp critical
     {
-      this->aligned_file_reader_->register_thread();
       ThreadData data;
+#if defined(_WIN32)
+      this->aligned_file_reader_->register_thread();
       data.ctx_ = aligned_file_reader_->get_ctx();
+#endif
       data.search_pool_.resize(ef_search_);
       data.visited_ =
           HashBasedBooleanSet(std::min(this->num_points_ / 10, ef_search_ * ef_search_));
+#if defined(_WIN32)
       data.sector_scratch_ = reinterpret_cast<char *>(
           memory::align_allocate<kSectorLen>(2 * max_beam_width_ * page_size_));
+#else
+      data.sector_scratch_ = static_cast<char *>(
+          allocate_page_read_buffer(*page_reader_, 2 * max_beam_width_ * page_size_));
+#endif
       data.pca_query_scratch_storage_ =
           std::make_shared<std::vector<float>>(dimension_ + residual_dimension_);
       data.pca_query_scratch_ =

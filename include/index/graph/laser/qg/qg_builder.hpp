@@ -238,6 +238,8 @@ class QGBuilder {
 
     // ==================== PHASE 2: Parallel Out-of-Core Index Construction ====================
     // Open the aligned vector file for direct I/O (bypasses page cache)
+    // Builder batches rely on calling-thread bulk reaping; migrate after storage/io
+    // provides batch-aware or cooperative-reap completion.
     auto vector_reader = make_aligned_file_reader();
     vector_reader->open(tmp_path.c_str());
 

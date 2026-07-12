@@ -4,6 +4,8 @@
 
 /**
  * @file threadpool_file_reader.hpp
+ * @deprecated Legacy compatibility backend; PageReader consumers should use
+ * storage/io/backends/threadpool_page_reader.hpp. Retained until M7.
  * @brief Portable AlignedFileReader backend built from pread and worker threads.
  *
  * This AlayaDB.AI implementation follows the AlignedFileReader interface
