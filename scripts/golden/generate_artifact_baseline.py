@@ -6,16 +6,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
-from pathlib import Path
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 import numpy as np
-
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BASELINE = ROOT / "tests/golden/artifact-baseline.json"
@@ -102,8 +100,13 @@ def _generate_python_artifacts(out: Path) -> None:
         target = out / engine
         kwargs = {}
         if engine == "disk_vamana":
-            kwargs = dict(vamana_R=8, vamana_L=24, vamana_alpha=1.2, vamana_seed=424242,
-                          vamana_num_threads=1)
+            kwargs = {
+                "vamana_R": 8,
+                "vamana_L": 24,
+                "vamana_alpha": 1.2,
+                "vamana_seed": 424242,
+                "vamana_num_threads": 1,
+            }
         collection = DiskCollection(path=str(target), dim=8, metric=MetricType.L2,
                                     index_type=engine, **kwargs)
         collection.add(vectors, ids)

@@ -7,8 +7,10 @@
 from pathlib import Path
 
 import numpy as np
-from alayalite._alayalitepy import (  # pylint: disable=no-name-in-module
+from alayalite._alayalitepy import (
     PyIndexInterface as _NativeIndex,
+)
+from alayalite._alayalitepy import (
     _MemoryEngineFeatureFlags,
 )
 from alayalite.schema import IndexParams
