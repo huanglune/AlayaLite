@@ -852,3 +852,58 @@ T3 原跑在 medium 档,V2(max)独立复核结论:**CORRECTED(细节)/ CONFIRMED
 逐格、小组点估计),数据地基零差错。两条新方法论红线沉淀:① 低 ef / 小查询组
 的单跑 recall 差 <0.5pp 视为噪声,≥3 跑取均;② 多线程 eval 的 recall 非确定性
 (LASER 16T 与 DiskANN 8T 均观测到)值得代码级排查(疑遍历序/并列打破)。
+
+## 13. P2 落地判决:格式 v2 + 槽复用(2026-07-12,T6 max 档实施,commit 9220b05)
+
+### 13.1 实现范围(全部按 §10-P2 设计契约)
+
+- **页尾 trailer**(npp×4B):每行 `{valid_degree:u16, flags:u16(bit0 tombstone, bit1 free)}`,
+  更新侧一律走紧凑有效前缀,删槽尾移。trailer 写在页 slack 区 ⇒ **v2 新增格式约束:
+  页 slack ≥ npp×4B,零 slack 几何(如 R32/d64 恰满 4096B)按契约拒载**(单测夹具
+  因此迁到 R64/d64);SIFT R64/128d slack 1536B,余量充足。
+- **A/B superblock**(512B×2,offset 0/512):magic/version/generation/num_points/
+  live_count/free_list_head/free_count/CRC32 + 镜像几何字段;checkpoint = 数据页
+  flush 后交替单次 pwrite(512)+fsync;开文件选 generation 最大的合法块,两块全坏
+  时拒绝误读为 v1。只读 QuantizedGraph loader 同步认识 v2(几何/文件大小校验)。
+- **v1→v2 原地迁移**(首次 update-open):逐行 ghost 槽压紧 + 写 trailer(只写
+  slack 区,中断后文件仍是合法 v1,重放幂等),superblock 最后写。
+- **LIFO free-list**:死行首 8B 串链;consolidate(reclaim) 在 purge 全部落盘后才
+  入链;链损坏从 trailer flags 重建。entry-point 若被删,入链前先迁移到存活 PID。
+- **暗至发布**:复用 PID 低于水位,靠 `deleted_` 结果过滤压暗;publish 先清
+  trailer 位、再删过滤项(可见点),追加段仍由 committed 水位门控。
+- bench:`--reuse/--checkpoint_every`,复用下维护源 ID→PID 映射保 GT 正确,输出
+  `file_pages/freed/reused/live_frac`。
+
+### 13.2 验收冒烟(500k 底座,10×50k 轮回收 churn,alpha 臂,ef_insert=200,r_target=56,32 写线程)
+
+| 指标 | reuse=1 | append(reuse=0) | 差 | 验收门 |
+|---|---:|---:|---:|---|
+| file_pages 终态 | **500,000(全程恒定)** | 1,000,000(线性涨) | −50% | 平台化 ✓ |
+| 10 轮均值 recall@10 | 0.98417 | 0.98660 | −0.24pp | ≤0.3pp ✓ |
+| 尾轮 recall | 0.98513 | 0.98417 | +0.10pp | — |
+| 平均插入吞吐 | 37,292/s | 40,405/s | −7.7% | ≤10% ✓ |
+
+逐轮瞬时差最大 0.38pp(单轮点估计,按 §11.5 红线不作数);freed=reused=50,000/轮
+严格守恒,live_frac 恒 1。**判决:槽复用把磁盘占用从线性增长钉死为常数,recall 与
+吞吐代价均在验收门内 —— C3(evict 补丁≈full prune)之后,C4(定宽行=原地复用单元)
+也有了实证腿。**
+
+### 13.3 遗留与边界(实施者自报 + 复核确认)
+
+- 尚无 WAL/页撕裂恢复;checkpoint 语义 = 静默点一致性,非任意崩溃点恢复。
+  WAL 叠加路径已勘察(redo 次序:purge 落盘 → free-push 记录;复用 publish 记录
+  reused 集+水位+计数+entry-point,先 fsync WAL 再清 tombstone;superblock reserved
+  区可挂 checkpoint LSN)——留待需要崩溃一致性主张时实施。
+- publish/过滤变更仍要求阶段隔离,与外部搜索的无锁并发留给 P3a(§12)。
+- `allocate_and_insert` 中途异常无 free-pop 回滚(WAL/事务层职责)。
+- 100% 全删瞬间可能无存活路由根;平台测试只覆盖空间指标,不宣称该瞬间搜索质量。
+
+### 13.4 V1 审计尾项关闭(2026-07-12,C1 max 档,commit 9f70035)
+
+§11.5 中 V1 唯一 UNVERIFIABLE 项(manifest 缺 64×128 簇心)已关闭:确定性重放
+`MiniBatchKMeans(k=64, seed=42)` 全链路,五层核对全 PASS——center_dist 64/64
+零偏差、12 簇选择/sizes/skips 逐项一致、**perm.u32 全量 1M 项逐字节复现**(MD5
+一致)、标签分区零违规、外围贪心语义成立(所有更外围被跳簇均因超 heldout_max
+204,000 上界)。裁决:**"drift 尾段确为 12 个最外围 kmeans 簇" = CONFIRMED**。
+簇心/标签已落盘(kmeans_centroids_64x128.fbin / kmeans_labels.u16 + manifest
+`centroid_artifacts`,sklearn 1.8.0),drift_prep.py 此后生成时自动持久化。
