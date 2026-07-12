@@ -285,6 +285,9 @@ struct CollectionFeatureFlags {
   bool legacy_memory_adapter{true};
   bool legacy_disk_adapter{true};
   bool experimental_persistence_writer{};
+  // Roll-forward gate: disabling this bit prevents new manifest-v2
+  // publications but never removes the v2 reader.
+  bool manifest_v2_writer{};
 };
 
 struct PersistenceOptions {
