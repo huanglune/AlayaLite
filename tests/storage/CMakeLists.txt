@@ -22,6 +22,9 @@ alaya_cc_target(
   GTEST
   SRCS page_reader_contract_test.cpp
 )
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_libraries(page_reader_contract_test PRIVATE AIO::aio)
+endif()
 
 alaya_add_test(
   NAME storage_test_sequential_storage
