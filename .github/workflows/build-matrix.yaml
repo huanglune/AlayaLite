@@ -1,0 +1,27 @@
+---
+name: Compile matrix
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  compile:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [core-only, laser-default, portable-no-avx512, portable-no-avx2, python-on]
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install LASER system dependency
+      if: matrix.case == 'laser-default'
+      run: sudo apt-get update && sudo apt-get install -y libaio-dev
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Install Conan
+      run: pip install 'conan>=2,<3'
+    - name: Compile ${{ matrix.case }}
+      run: scripts/build_matrix/run_matrix.sh '${{ matrix.case }}'

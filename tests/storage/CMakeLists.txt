@@ -22,8 +22,9 @@ alaya_cc_target(
   GTEST
   SRCS page_reader_contract_test.cpp
 )
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(TARGET AIO::aio)
   target_link_libraries(page_reader_contract_test PRIVATE AIO::aio)
+  target_compile_definitions(page_reader_contract_test PRIVATE ALAYA_LASER_USE_LIBAIO=1)
 endif()
 
 alaya_add_test(

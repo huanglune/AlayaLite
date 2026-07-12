@@ -40,6 +40,7 @@ function(print_project_options_summary)
   message(STATUS "|   - BUILD_TESTING   : ${BUILD_TESTING}")
   message(STATUS "|   - ENABLE_COVERAGE : ${ENABLE_COVERAGE}")
   message(STATUS "|   - NATIVE_ARCH     : ${ALAYA_NATIVE_ARCH}")
+  message(STATUS "|   - X86_AVX2_BASE   : ${ALAYA_X86_AVX2_BASELINE}")
   message(STATUS "|   - ENABLE_LASER    : ${ALAYA_ENABLE_LASER}")
 endfunction()
 
