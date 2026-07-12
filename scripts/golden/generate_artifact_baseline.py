@@ -77,6 +77,26 @@ def _generate_python_artifacts(out: Path) -> None:
         index.save(memory)
         index.close()
 
+    # NSG's retained NN-Descent kernel requires more than 64 rows. Keep the
+    # pre-existing HNSW corpus untouched and add deterministic per-engine
+    # families with their own fixed shape.
+    graph_vectors = _vectors(80, 8)
+    for engine in ("nsg", "fusion"):
+        for quantization in ("none", "sq8"):
+            memory = out / f"memory_{engine}_{quantization}"
+            index = Index(
+                "golden",
+                IndexParams(
+                    index_type=engine,
+                    capacity=96,
+                    max_nbrs=8,
+                    quantization_type=quantization,
+                ),
+            )
+            index.fit(graph_vectors, ef_construction=32, num_threads=1)
+            index.save(memory)
+            index.close()
+
     ids = np.arange(1000, 1064, dtype=np.uint64)
     for engine in ("disk_flat", "disk_vamana"):
         target = out / engine
