@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Python memory indexes declared as `nsg` or `fusion` now build, save, open,
+  and search the requested algorithm across the 20 non-RaBitQ dispatch rows;
+  earlier releases silently built HNSW. NSG and Fusion now use immutable
+  contract-v3 segments with byte-compatible legacy artifact readers, SQ4/SQ8
+  search spaces, scalar-enabled variants, and independent feature-bit fallback
+  to the former HNSW behavior. The three RaBitQ rows are unchanged.
+
 ## [1.0.3] - 2026-07-07
 
 ### Added

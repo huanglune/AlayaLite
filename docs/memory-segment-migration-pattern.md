@@ -58,6 +58,46 @@ need graph access until their own abstraction steps; their access is isolated
 in `detail/hnsw_segment_bridge.hpp`. Neither detail type is a registry entry or
 a supported user API.
 
+## NSG and Fusion Gate 5 result
+
+`NsgSegment<SearchSpace, BuildSpace>` and
+`FusionSegment<SearchSpace, BuildSpace>` expose the same contract-v3 lifecycle
+as `HnswSegment`: typed-tensor `build`, `open`, `search`, `batch_search`,
+`save`, `stats`, `descriptor() noexcept`, and `into_any`. Both are immutable,
+reentrant for concurrent search, and satisfy `Searchable`, `BatchSearchable`,
+`Saveable`, and `StatsProvider`; neither satisfies `Mutable`.
+
+Each segment consumes `BuildContext`, `OpenContext`, and `SearchContext` and
+uses logical artifact names `graph`, `data`, and, when the search and build
+spaces differ, `quant`. Its returned manifest has schema version 1 and format
+version 1. NSG format v1 is the retained NSG `Graph` codec plus the retained
+space codecs; Fusion format v1 is the retained overlay-graph `Graph` codec plus
+the same space codecs. No persisted bytes or standalone manifest file were
+added, so artifacts written by the former C++ builders remain openable.
+
+Fusion remains a composition of the detail HNSW and NSG construction kernels;
+it does not copy either graph-building implementation. The former public
+`nsg_builder.hpp` and `fusion_graph.hpp` signatures are deleted. Their retained
+construction code now lives under `index/graph/nsg/detail` and
+`index/graph/fusion/detail`, where the still-unmigrated RaBitQ rows may compose
+it without restoring a public builder API.
+
+The Python dispatch matrix now sends all 20 non-RaBitQ NSG and Fusion rows to
+`nsg_segment/nsg` and `fusion_segment/fusion`. `NONE` builds and searches one
+raw space, including its scalar storage when enabled. `SQ4` and `SQ8` build the
+graph in a scalar-free raw build space and search in the selected quantized
+space; scalar-enabled rows attach scalar storage to that search space. The
+three RaBitQ rows remain on `legacy_qg_model/qg`.
+
+This is an intentional compatibility change: `index_type="nsg"` and
+`index_type="fusion"` now build the declared algorithm instead of silently
+building HNSW. The independent `nsg_segment` and `fusion_segment` feature bits
+default on. Disabling either bit selects that row's recorded
+`hnsw_segment/hnsw` legacy factory and therefore reproduces the former behavior
+without changing the other engine. The retained NSG kernel seeds a fixed
+64-neighbor NN-Descent graph, so both segments reject builds with fewer than 65
+vectors instead of entering its out-of-range path.
+
 ## Per-row registry handoff
 
 Gate 5 migrations switch one explicit dispatch row at a time. For each row:
