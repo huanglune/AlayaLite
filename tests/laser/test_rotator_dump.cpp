@@ -16,98 +16,140 @@
 //
 // Exit 0 on pass, non-zero + cerr line on the first failure.
 
+#include <unistd.h>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
-#include <unistd.h>
+#include <type_traits>
 #include <vector>
 
 #include "index/graph/laser/utils/rotator.hpp"
 
 namespace {
 
-std::vector<char> read_all(const std::string& path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) {
-        std::cerr << "cannot open " << path << '\n';
-        std::exit(2);
-    }
-    const auto size = static_cast<std::streamsize>(f.tellg());
-    f.seekg(0);
-    std::vector<char> buf(static_cast<size_t>(size));
-    f.read(buf.data(), size);
-    return buf;
+std::vector<char> read_all(const std::string &path) {
+  std::ifstream f(path, std::ios::binary | std::ios::ate);
+  if (!f) {
+    std::cerr << "cannot open " << path << '\n';
+    std::exit(2);
+  }
+  const auto size = static_cast<std::streamsize>(f.tellg());
+  f.seekg(0);
+  std::vector<char> buf(static_cast<size_t>(size));
+  f.read(buf.data(), size);
+  return buf;
 }
 
-std::string unique_tmp(const std::string& tag, int pid) {
-    namespace fs = std::filesystem;
-    return (fs::temp_directory_path() /
-            ("alaya_fht_rotator_dump_" + tag + "_" + std::to_string(pid) + ".bin")).string();
+std::string unique_tmp(const std::string &tag, int pid) {
+  namespace fs = std::filesystem;
+  return (fs::temp_directory_path() /
+          ("alaya_fht_rotator_dump_" + tag + "_" + std::to_string(pid) + ".bin"))
+      .string();
 }
 
 }  // namespace
 
 int main() {
-    using alaya::laser::FHTRotator;
+  using alaya::laser::FHTRotator;
 
-    const size_t dim = 256;  // already a power of two → paded_dim_ == 256
-    const uint64_t seed_a = 42;
-    const uint64_t seed_b = 43;
-    const int pid = static_cast<int>(::getpid());
+  static_assert(std::is_base_of_v<alaya::Rotator<float>, FHTRotator>);
 
-    // (a) Seeded determinism — two rotators at the same seed.
-    FHTRotator r1(dim, seed_a);
-    FHTRotator r2(dim, seed_a);
+  auto interface_rotator = alaya::choose_rotator<float>(256, alaya::RotatorType::FhtRotator);
+  if (dynamic_cast<FHTRotator *>(interface_rotator.get()) == nullptr ||
+      interface_rotator->size() != 256) {
+    std::cerr << "FAIL: FhtRotator factory did not return the LASER implementation\n";
+    return 1;
+  }
 
-    const std::string path_a = unique_tmp("seeded_a", pid);
-    const std::string path_a2 = unique_tmp("seeded_a2", pid);
-    r1.dump_signs(path_a);
-    r2.dump_signs(path_a2);
+  const size_t dim = 256;  // already a power of two → paded_dim_ == 256
+  const uint64_t seed_a = 42;
+  const uint64_t seed_b = 43;
+  const int pid = static_cast<int>(::getpid());
 
-    const auto bytes_a = read_all(path_a);
-    const auto bytes_a2 = read_all(path_a2);
-    if (bytes_a != bytes_a2) {
-        std::cerr << "FAIL: same-seed dumps differ (seed=" << seed_a
-                  << ", size_a=" << bytes_a.size()
-                  << ", size_a2=" << bytes_a2.size() << ")\n";
-        return 1;
-    }
+  // (a) Seeded determinism — two rotators at the same seed.
+  FHTRotator r1(dim, seed_a);
+  FHTRotator r2(dim, seed_a);
 
-    // (b) Seed sensitivity — different seeds must give different dumps.
-    FHTRotator r3(dim, seed_b);
-    const std::string path_b = unique_tmp("seeded_b", pid);
-    r3.dump_signs(path_b);
-    const auto bytes_b = read_all(path_b);
-    if (bytes_a == bytes_b) {
-        std::cerr << "FAIL: seeds " << seed_a << " and " << seed_b
-                  << " produced identical dumps\n";
-        return 1;
-    }
+  const std::string path_a = unique_tmp("seeded_a", pid);
+  const std::string path_a2 = unique_tmp("seeded_a2", pid);
+  r1.dump_signs(path_a);
+  r2.dump_signs(path_a2);
 
-    // (c) Header + payload layout.
-    const size_t paded_dim = 256;
-    const size_t expected_size = sizeof(uint64_t) + sizeof(float) * paded_dim;
-    if (bytes_a.size() != expected_size) {
-        std::cerr << "FAIL: dump size " << bytes_a.size()
-                  << " != expected " << expected_size << '\n';
-        return 1;
-    }
-    uint64_t header = 0;
-    std::memcpy(&header, bytes_a.data(), sizeof(uint64_t));
-    if (header != paded_dim) {
-        std::cerr << "FAIL: header paded_dim " << header
-                  << " != expected " << paded_dim << '\n';
-        return 1;
-    }
+  const auto bytes_a = read_all(path_a);
+  const auto bytes_a2 = read_all(path_a2);
+  if (bytes_a != bytes_a2) {
+    std::cerr << "FAIL: same-seed dumps differ (seed=" << seed_a << ", size_a=" << bytes_a.size()
+              << ", size_a2=" << bytes_a2.size() << ")\n";
+    return 1;
+  }
 
-    std::filesystem::remove(path_a);
-    std::filesystem::remove(path_a2);
-    std::filesystem::remove(path_b);
+  // (b) Seed sensitivity — different seeds must give different dumps.
+  FHTRotator r3(dim, seed_b);
+  const std::string path_b = unique_tmp("seeded_b", pid);
+  r3.dump_signs(path_b);
+  const auto bytes_b = read_all(path_b);
+  if (bytes_a == bytes_b) {
+    std::cerr << "FAIL: seeds " << seed_a << " and " << seed_b << " produced identical dumps\n";
+    return 1;
+  }
 
-    std::cout << "alaya::laser::FHTRotator::dump_signs round-trip OK "
-              << "(paded_dim=" << paded_dim << ", bytes=" << bytes_a.size() << ")\n";
-    return 0;
+  // (c) Header + payload layout.
+  const size_t paded_dim = 256;
+  const size_t expected_size = sizeof(uint64_t) + sizeof(float) * paded_dim;
+  if (bytes_a.size() != expected_size) {
+    std::cerr << "FAIL: dump size " << bytes_a.size() << " != expected " << expected_size << '\n';
+    return 1;
+  }
+  uint64_t header = 0;
+  std::memcpy(&header, bytes_a.data(), sizeof(uint64_t));
+  if (header != paded_dim) {
+    std::cerr << "FAIL: header paded_dim " << header << " != expected " << paded_dim << '\n';
+    return 1;
+  }
+
+  // The native LASER sidecar remains the raw float payload, with no
+  // interface metadata added. Loading it reproduces the exact rotation.
+  const std::string sidecar = unique_tmp("sidecar", pid);
+  {
+    std::ofstream out(sidecar, std::ios::binary);
+    r1.save(out);
+  }
+  const auto sidecar_bytes = read_all(sidecar);
+  if (sidecar_bytes.size() != sizeof(float) * paded_dim ||
+      !std::equal(sidecar_bytes.begin(),
+                  sidecar_bytes.end(),
+                  bytes_a.begin() + static_cast<std::ptrdiff_t>(sizeof(uint64_t)))) {
+    std::cerr << "FAIL: native save bytes differ from the canonical sign payload\n";
+    return 1;
+  }
+
+  FHTRotator loaded(dim, seed_b);
+  {
+    std::ifstream in(sidecar, std::ios::binary);
+    loaded.load(in);
+  }
+  std::vector<float> input(dim);
+  for (size_t i = 0; i < dim; ++i) {
+    input[i] = static_cast<float>(i) / static_cast<float>(dim);
+  }
+  std::vector<float> expected(paded_dim);
+  std::vector<float> actual(paded_dim);
+  r1.rotate(input.data(), expected.data());
+  loaded.rotate(input.data(), actual.data());
+  if (std::memcmp(expected.data(), actual.data(), sizeof(float) * paded_dim) != 0) {
+    std::cerr << "FAIL: save/load changed rotation output\n";
+    return 1;
+  }
+
+  std::filesystem::remove(path_a);
+  std::filesystem::remove(path_a2);
+  std::filesystem::remove(path_b);
+  std::filesystem::remove(sidecar);
+
+  std::cout << "alaya::laser::FHTRotator::dump_signs round-trip OK "
+            << "(paded_dim=" << paded_dim << ", bytes=" << bytes_a.size() << ")\n";
+  return 0;
 }

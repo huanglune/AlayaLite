@@ -1,3 +1,19 @@
+/*
+ * Copyright 2025 VectorDB.NTU
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 // SPDX-FileCopyrightText: 2025 AlayaDB.AI
 //
 // SPDX-License-Identifier: AGPL-3.0-only
@@ -23,6 +39,7 @@
 #include "index/graph/laser/common.hpp"
 #include "index/graph/laser/quantization/fastscan_impl.hpp"
 #include "index/graph/laser/space/bitwise.hpp"
+#include "space/quant/rabitq_core.hpp"
 
 namespace alaya::laser {
 
@@ -90,37 +107,16 @@ static inline void rabitq_factors(const RowMatrix<float> &rotated_data_residual,
 
   float fac_norm = 1.F / std::sqrt(static_cast<float>(dim));
 
-  // signed quantized vectors
-  RowMatrix<float> ones(num_points, dim);
-  ones.setOnes();
-  RowMatrix<float> signed_x = 2 * bin_x.cast<float>() - ones;
-
-  // fac_x0 (num_points, 1)
-  RowMatrix<float> fac_x0 =
-      (rotated_data_residual.array() * signed_x.array() * fac_norm).rowwise().sum();
-  RowMatrix<float> x_rotated_norm = rotated_data_residual.rowwise().norm();
-  for (int64_t i = 0; i < num_points; ++i) {
-    float cur_x0 = fac_x0(i, 0);
-    fac_x0(i, 0) = cur_x0 / x_rotated_norm(i, 0);
-  }
-
-  // fac_x1: (num_points, 1)
-  RowMatrix<float> fac_x1(num_points, 1);
-  for (int64_t i = 0; i < num_points; ++i) {
-    fac_x1(i, 0) =
-        static_cast<float>((rotated_centroid.array() * signed_x.row(i).array()).sum() * fac_norm);
-  }
-
   for (int64_t j = 0; j < num_points; ++j) {
-    double cur_x = x_rotated_norm(j, 0);  // current dist 2 centroid
-    double cur_x0 = fac_x0(j, 0);         // current <o, o_bar>
-    double cur_x1 = fac_x1(j, 0);         // current <c, o_bar>
-    long double x_x0 = static_cast<long double>(cur_x) / cur_x0;
-
-    triple_x[j] = static_cast<float>((cur_x * cur_x) + (2 * x_x0 * cur_x1));
-    factor_dq[j] = static_cast<float>(-2 * x_x0 * fac_norm);
-    factor_vq[j] =
-        static_cast<float>(-2 * x_x0 * fac_norm * (bin_x.row(j).sum() * 2 - static_cast<int>(dim)));
+    const auto factors = RaBitQCore::laser_l2_factors(rotated_data_residual.row(j).data(),
+                                                      rotated_centroid.data(),
+                                                      bin_x.row(j).data(),
+                                                      dim,
+                                                      fac_norm);
+    triple_x[j] = factors.base;
+    factor_dq[j] = factors.signed_query_scale;
+    factor_vq[j] = static_cast<float>(factors.signed_query_scale *
+                                      (bin_x.row(j).sum() * 2 - static_cast<int>(dim)));
   }
 }
 }  // namespace alaya::laser

@@ -1,3 +1,19 @@
+/*
+ * Copyright 2025 VectorDB.NTU
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 // SPDX-FileCopyrightText: 2025 AlayaDB.AI
 //
 // SPDX-License-Identifier: AGPL-3.0-only
@@ -31,6 +47,7 @@
 #include "index/graph/laser/utils/memory.hpp"
 #include "simd/laser_dispatch.hpp"
 #include "utils/platform.hpp"
+#include "utils/rabitq_utils/rotator.hpp"
 
 #if defined(ALAYA_ARCH_X86) && (defined(__GNUC__) || defined(__clang__))
   #include "third_party/ffht/fht_avx.hpp"
@@ -97,20 +114,19 @@ inline auto select_fht_float(size_t log_b) -> std::function<void(float *)> {
  * Used during both indexing (to rotate neighbor vectors) and search
  * (to rotate query vectors) with the same random signs for consistency.
  */
-class FHTRotator {
+class FHTRotator : public alaya::Rotator<float> {
   using data_type = data::Array<float, std::vector<size_t>, memory::AlignedAllocator<float>>;
 
  private:
   std::function<void(float *)> fht_float_ = detail::select_fht_float(6);
-  size_t dimension_ = 0;
-  size_t paded_dim_ = 0;
   data_type mat_;
 
  public:
   FHTRotator() = default;
 
   explicit FHTRotator(size_t dim, uint64_t seed = 0)
-      : dimension_(dim), paded_dim_(1 << ceil_log2(dim)), mat_(std::vector<size_t>{1, paded_dim_}) {
+      : Rotator<float>(dim, size_t{1} << ceil_log2(dim)),
+        mat_(std::vector<size_t>{1, padded_dim_}) {
     size_t log_b = ceil_log2(dim);
 
     // seed == 0 preserves upstream Laser's pre-change `std::random_device`
@@ -120,14 +136,14 @@ class FHTRotator {
     std::uniform_int_distribution<int> bernoulli(0, 1);
     std::mt19937_64 gen =
         (seed == 0) ? std::mt19937_64(std::random_device()()) : std::mt19937_64(seed);
-    for (size_t i = 0; i < paded_dim_; ++i) {
+    for (size_t i = 0; i < padded_dim_; ++i) {
       mat_[i] =
-          static_cast<float>((2 * bernoulli(gen)) - 1) / std::sqrt(static_cast<float>(paded_dim_));
+          static_cast<float>((2 * bernoulli(gen)) - 1) / std::sqrt(static_cast<float>(padded_dim_));
     }
     this->fht_float_ = detail::select_fht_float(log_b);
   }
 
-  ~FHTRotator() = default;
+  ~FHTRotator() override = default;
 
   /**
    * @brief       rotate the scr vector by FHTRotator
@@ -135,18 +151,18 @@ class FHTRotator {
    * @param src   raw query vector, length dimension_
    * @param dst   rotated query vector, length B
    */
-  void rotate(const float *ALAYA_RESTRICT src, float *ALAYA_RESTRICT dst) const {
-    size_t idx = simd::get_rotate_loop_func()(src, mat_.data(), dimension_, dst);
-    for (; idx < dimension_; ++idx) {
+  void rotate(const float *ALAYA_RESTRICT src, float *ALAYA_RESTRICT dst) const override {
+    size_t idx = simd::get_rotate_loop_func()(src, mat_.data(), dim_, dst);
+    for (; idx < dim_; ++idx) {
       dst[idx] = src[idx] * mat_.at(idx);
     }
-    std::fill(dst + dimension_, dst + paded_dim_, 0.0F);
+    std::fill(dst + dim_, dst + padded_dim_, 0.0F);
     fht_float_(dst);
   }
 
-  void load(std::ifstream &input) { mat_.load(input); }
+  void load(std::ifstream &input) override { mat_.load(input); }
 
-  void save(std::ofstream &output) const { mat_.save(output); }
+  void save(std::ofstream &output) const override { mat_.save(output); }
 
   /**
    * @brief Serialise the sign-scaled `mat_` vector in the Tier A dump format.
@@ -163,9 +179,9 @@ class FHTRotator {
     if (!out) {
       throw std::runtime_error("FHTRotator::dump_signs: cannot open " + path);
     }
-    const uint64_t paded = paded_dim_;
+    const uint64_t paded = padded_dim_;
     out.write(reinterpret_cast<const char *>(&paded), sizeof(uint64_t));
-    for (size_t i = 0; i < paded_dim_; ++i) {
+    for (size_t i = 0; i < padded_dim_; ++i) {
       const float v = mat_.at(i);
       out.write(reinterpret_cast<const char *>(&v), sizeof(float));
     }
@@ -175,3 +191,15 @@ class FHTRotator {
   }
 };
 }  // namespace alaya::laser
+
+namespace alaya::laser::detail {
+
+inline const bool fht_rotator_factory_registered = [] {
+  alaya::rotator_impl::register_fht_rotator_factory(
+      [](size_t dim) -> std::unique_ptr<alaya::Rotator<float>> {
+        return std::make_unique<FHTRotator>(dim);
+      });
+  return true;
+}();
+
+}  // namespace alaya::laser::detail

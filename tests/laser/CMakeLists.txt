@@ -108,3 +108,16 @@ alaya_add_test(
   TARGET laser_simd_dispatch_test
   LABELS laser simd
 )
+
+alaya_cc_target(
+  rabitq_factor_equivalence_test
+  BARE GTEST
+  SRCS rabitq_factor_equivalence_test.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_rabitq_factor_equivalence
+  TARGET rabitq_factor_equivalence_test
+  LABELS laser rabitq
+)
