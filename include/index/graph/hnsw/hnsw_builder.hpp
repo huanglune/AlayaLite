@@ -18,7 +18,7 @@
 #include "hnswlib.hpp"
 #include "space/raw_space.hpp"
 
-namespace alaya {
+namespace alaya::detail {
 /**
  * @brief The structure for HNSW , supports L2, IP distance.
  *
@@ -29,7 +29,7 @@ namespace alaya {
  */
 template <typename DistanceSpaceType>
   requires Space<DistanceSpaceType>
-struct HNSWBuilder {
+struct HnswBuilderKernel {
   using DataType = typename DistanceSpaceType::DataTypeAlias;
   using DistanceType = typename DistanceSpaceType::DistanceTypeAlias;
   using IDType = typename DistanceSpaceType::IDTypeAlias;
@@ -54,18 +54,18 @@ struct HNSWBuilder {
    * out-degree of the overlay graph.
    * @param L      The size of the dynamic candidate list for the construction phase.
    */
-  explicit HNSWBuilder(const std::shared_ptr<DistanceSpaceType> &space,
-                       uint32_t R = 32,
-                       uint32_t L = 200)
+  explicit HnswBuilderKernel(const std::shared_ptr<DistanceSpaceType> &space,
+                             uint32_t R = 32,
+                             uint32_t L = 200)
       : dim_(space->get_dim()), ef_construction_(L), max_nbrs_underlay_(R) {
     max_nbrs_overlay_ = R / 2;
     space_ = space;
   }
 
-  HNSWBuilder(const HNSWBuilder &) = delete;
-  auto operator=(const HNSWBuilder &) -> HNSWBuilder & = delete;
-  HNSWBuilder(HNSWBuilder &&) = delete;
-  auto operator=(HNSWBuilder &&) -> HNSWBuilder & = delete;
+  HnswBuilderKernel(const HnswBuilderKernel &) = delete;
+  auto operator=(const HnswBuilderKernel &) -> HnswBuilderKernel & = delete;
+  HnswBuilderKernel(HnswBuilderKernel &&) = delete;
+  auto operator=(HnswBuilderKernel &&) -> HnswBuilderKernel & = delete;
 
   /**
    * @brief Constructs a graph representation from the provided vector data.
@@ -187,4 +187,4 @@ struct HNSWBuilder {
 // static_assert(GraphBuilder<HNSWBuilder<RawSpace<>>>,
 // "HNSWBuilder does not satisfy GraphBuilder concept");
 
-}  // namespace alaya
+}  // namespace alaya::detail
