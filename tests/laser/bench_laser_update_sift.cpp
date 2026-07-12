@@ -127,6 +127,7 @@ struct Args {
   uint64_t new_id_split = 0;  // eval: also report recall restricted to GT ids >= split
   uint64_t tombstone_from = 0, tombstone_n = 0;
   uint32_t R = 64, L = 200, ef_indexing = 200, threads = 64, beam = 16, topk = 10, runs = 3;
+  uint32_t vamana_R = 0;  // build: Vamana degree < degree_bound leaves free slots ("headroom")
   uint32_t main_dim = 0;  // 0 -> dim
   size_t ef_insert = 100, prune_cap = 300, alpha_check_max = 16;
   float alpha = 1.2F;
@@ -156,6 +157,7 @@ Args parse(int argc, char **argv) {
     else if (k == "--tombstone_from") a.tombstone_from = std::stoull(v);
     else if (k == "--tombstone_n") a.tombstone_n = std::stoull(v);
     else if (k == "--R") a.R = std::stoul(v);
+    else if (k == "--vamana_R") a.vamana_R = std::stoul(v);
     else if (k == "--L") a.L = std::stoul(v);
     else if (k == "--ef_indexing") a.ef_indexing = std::stoul(v);
     else if (k == "--threads") a.threads = std::stoul(v);
@@ -192,13 +194,17 @@ int do_build(const Args &a) {
 
   auto t0 = std::chrono::steady_clock::now();
   alaya::vamana::VamanaBuildParams vp;
-  vp.R = a.R;
+  // Headroom build: grow the Vamana graph at a smaller degree than
+  // degree_bound so every row keeps free (ghost) slots for future backlinks.
+  vp.R = a.vamana_R == 0 ? a.R : a.vamana_R;
   vp.L = a.L;
   vp.alpha = a.alpha;
   vp.num_threads = a.threads;
   alaya::vamana::VamanaBuilder vb(base.data.data(), base.n, dim, vp);
   vb.build();
   const std::string vamana_path = a.prefix + "_vamana.index";
+  // Header max_degree is written as degree_bound (a.R): QGBuilder asserts
+  // header == degree_bound; per-node degrees may be smaller.
   alaya::vamana::save_graph(vb.graph(), vamana_path, a.R, vb.medoid());
   auto t1 = std::chrono::steady_clock::now();
   std::cout << "[build] vamana done in " << std::chrono::duration<double>(t1 - t0).count()
@@ -266,7 +272,94 @@ int do_insert(const Args &a) {
   std::cout << "[insert] backlinks: free_fills=" << s.free_slot_fills
             << " evictions=" << s.evictions << " est_skips=" << s.est_skips
             << " alpha_skips=" << s.alpha_skips << " degenerate=" << s.degenerate_skips
-            << " full_recomputes=" << s.full_recomputes << "\n";
+            << " full_recomputes=" << s.full_recomputes << " forced_links=" << s.forced_links
+            << "\n";
+  return 0;
+}
+
+// Sliding-window churn: tombstone the oldest `count` live ids and insert the
+// next `count` unseen vectors, `runs` rounds; masked recall after each round.
+// Live set after round r: ids [r*count, n + r*count) minus nothing else.
+int do_churn(const Args &a) {
+  FloatMatrix base = read_fbin(a.base);
+  FloatMatrix query = read_fbin(a.query);
+  IntMatrix gt = read_ibin(a.gt);
+  const uint32_t dim = base.dim;
+  const uint32_t main_dim = a.main_dim == 0 ? dim : a.main_dim;
+  if (a.n + a.runs * a.count > base.n) {
+    throw std::runtime_error("churn: not enough vectors for rounds");
+  }
+
+  alaya::laser::QuantizedGraph qg(a.n, a.R, main_dim, dim);
+  qg.load_disk_index(a.prefix.c_str(), 0.0F);
+
+  alaya::laser::UpdateParams p;
+  p.ef_insert = a.ef_insert;
+  p.alpha = a.alpha;
+  p.prune_pool_cap = a.prune_cap;
+  if (a.arm == "none") p.backlink_mode = alaya::laser::UpdateParams::Backlink::kNone;
+  else if (a.arm == "evict") p.backlink_mode = alaya::laser::UpdateParams::Backlink::kEvict;
+  else if (a.arm == "alpha") p.backlink_mode = alaya::laser::UpdateParams::Backlink::kAlphaEvict;
+  else if (a.arm == "full") p.backlink_mode = alaya::laser::UpdateParams::Backlink::kFullPrune;
+  else throw std::runtime_error("bad --arm " + a.arm);
+
+  alaya::laser::QGUpdater upd(qg, p);
+  std::vector<uint32_t> results(static_cast<size_t>(query.n) * a.topk);
+  const uint32_t ef_eval = a.efs.empty() ? 100 : a.efs[0];
+
+  auto eval_round = [&](uint64_t round) {
+    upd.finalize();  // commit num_points so set_params sizes workspaces right
+    qg.set_result_filter(&upd.deleted());
+    qg.set_params(ef_eval, a.threads, static_cast<int>(a.beam));
+    auto t0 = std::chrono::steady_clock::now();
+    qg.batch_search(query.data.data(), a.topk, results.data(), query.n);
+    auto t1 = std::chrono::steady_clock::now();
+    const double qps = query.n / std::chrono::duration<double>(t1 - t0).count();
+    uint64_t hits = 0;
+    uint64_t total = 0;
+    for (size_t qi = 0; qi < query.n; ++qi) {
+      const uint32_t *truth_row = gt.row(qi);
+      std::unordered_set<uint32_t> truth;
+      for (uint32_t j = 0; j < gt.dim && truth.size() < a.topk; ++j) {
+        const uint32_t t = truth_row[j];
+        if (t < upd.num_points() && upd.deleted().find(t) == upd.deleted().end()) {
+          truth.insert(t);
+        }
+      }
+      total += truth.size();
+      const uint32_t *res_row = results.data() + qi * a.topk;
+      for (uint32_t j = 0; j < a.topk; ++j) {
+        if (truth.count(res_row[j]) != 0) {
+          ++hits;
+        }
+      }
+    }
+    const auto &s = upd.stats();
+    std::cout << "round," << round << ",recall,"
+              << (total == 0 ? 0.0 : static_cast<double>(hits) / static_cast<double>(total))
+              << ",qps," << qps << ",live," << upd.num_points() - upd.deleted().size()
+              << ",free_fills," << s.free_slot_fills << ",evictions," << s.evictions
+              << ",est_skips," << s.est_skips << ",forced," << s.forced_links << "\n"
+              << std::flush;
+  };
+
+  std::cout << "[churn] base_n=" << a.n << " rounds=" << a.runs << " count=" << a.count
+            << " arm=" << a.arm << " ef_eval=" << ef_eval << "\n";
+  eval_round(0);
+  for (uint64_t r = 0; r < a.runs; ++r) {
+    for (uint64_t i = 0; i < a.count; ++i) {
+      upd.tombstone(static_cast<alaya::laser::PID>(r * a.count + i));
+    }
+    const uint64_t ins_base = a.n + r * a.count;
+    auto t0 = std::chrono::steady_clock::now();
+    for (uint64_t i = 0; i < a.count; ++i) {
+      upd.insert(base.row(ins_base + i));
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    std::cout << "[churn] round " << r + 1 << " insert_qps="
+              << a.count / std::chrono::duration<double>(t1 - t0).count() << "\n";
+    eval_round(r + 1);
+  }
   return 0;
 }
 
@@ -365,6 +458,9 @@ int main(int argc, char **argv) {
     }
     if (a.mode == "eval") {
       return do_eval(a);
+    }
+    if (a.mode == "churn") {
+      return do_churn(a);
     }
     throw std::runtime_error("unknown mode " + a.mode);
   } catch (const std::exception &e) {
