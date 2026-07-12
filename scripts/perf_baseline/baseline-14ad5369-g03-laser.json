@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "source_revision": "14ad536998828ba4b288685a9606b7c33566dfeb",
+  "recorded_from_commit": "0e8b185dbe13c416f75d1226d458142de3c8625a",
+  "host": "g03",
+  "captured_at": "2026-07-12T08:35:47.742629+00:00",
+  "environment": {
+    "venv_python": "Python 3.13.6",
+    "venv_reused_over_nfs": true,
+    "numa_policy": "numactl --cpunodebind=0 --membind=0",
+    "load_before": "08:27:33 up 42 days, 18:12,  3 users,  load average: 0.64, 1.41, 3.34",
+    "load_after_build": "08:30:58 up 42 days, 18:16,  3 users,  load average: 31.62, 19.41, 10.23",
+    "load_after_search": "08:32:13 up 42 days, 18:17,  3 users,  load average: 10.16, 15.43, 9.54"
+  },
+  "benchmarks": [
+    {
+      "name": "laser_deep1m_l2",
+      "binary": "examples/laser/main.py (alayalite.laser.Index)",
+      "dataset": "deep1M (1,000,000 x 96, L2)",
+      "params": {
+        "R": 64,
+        "main_dim": 64,
+        "L": 200,
+        "alpha": 1.2,
+        "ef_indexing": 200,
+        "topk": 10,
+        "beam_width": 16,
+        "efs": [
+          100,
+          200,
+          300
+        ]
+      },
+      "threads": "build=48; search=1; NUMA node0",
+      "rounds": 5,
+      "build_duration_s": 202.75,
+      "build_peak_rss_kb": 3542324,
+      "search_peak_rss_kb": 472200,
+      "search_process_duration_s_median": 10.72,
+      "qps_recall_curve": [
+        {
+          "ef": 100,
+          "qps_median": 842.7,
+          "recall_at_10_median": 0.9288,
+          "round_values": [
+            {
+              "qps": 821.0,
+              "recall_at_10": 0.9254000000000001
+            },
+            {
+              "qps": 846.5,
+              "recall_at_10": 0.9288
+            },
+            {
+              "qps": 842.5,
+              "recall_at_10": 0.9297
+            },
+            {
+              "qps": 848.7,
+              "recall_at_10": 0.9276000000000001
+            },
+            {
+              "qps": 842.7,
+              "recall_at_10": 0.9294
+            }
+          ]
+        },
+        {
+          "ef": 200,
+          "qps_median": 616.8,
+          "recall_at_10_median": 0.9698,
+          "round_values": [
+            {
+              "qps": 600.4,
+              "recall_at_10": 0.9695999999999999
+            },
+            {
+              "qps": 621.5,
+              "recall_at_10": 0.97
+            },
+            {
+              "qps": 615.7,
+              "recall_at_10": 0.9695
+            },
+            {
+              "qps": 616.8,
+              "recall_at_10": 0.97
+            },
+            {
+              "qps": 619.5,
+              "recall_at_10": 0.9698
+            }
+          ]
+        },
+        {
+          "ef": 300,
+          "qps_median": 493.0,
+          "recall_at_10_median": 0.9834,
+          "round_values": [
+            {
+              "qps": 493.0,
+              "recall_at_10": 0.9832
+            },
+            {
+              "qps": 495.1,
+              "recall_at_10": 0.9834
+            },
+            {
+              "qps": 491.1,
+              "recall_at_10": 0.9834
+            },
+            {
+              "qps": 491.6,
+              "recall_at_10": 0.9834
+            },
+            {
+              "qps": 494.0,
+              "recall_at_10": 0.9837
+            }
+          ]
+        }
+      ],
+      "artifact": "/md1/huangliang/tmp/perf-baseline/14ad5369-laser/output/data/deep1m",
+      "artifact_size_bytes": 5747820235,
+      "artifact_manifest_sha256": "94a7f458606f1b37cec24432c22450ac35da94c97eb3138e0e6707419d7ffc28",
+      "artifact_files": {
+        "dsqg_deep1m_R64_MD64.index": {
+          "size_bytes": 4096004096,
+          "sha256": "acc3e4182d759c27e72c8dc38094a9d10416ad85ce9ecb72b2b02f0c90616aca"
+        },
+        "dsqg_deep1m_R64_MD64.index_cache_ids": {
+          "size_bytes": 600008,
+          "sha256": "dfb56ccae588bd72488515e87b0ee4e555342204baf0cd400fda68e213f18052"
+        },
+        "dsqg_deep1m_R64_MD64.index_cache_nodes": {
+          "size_bytes": 384000016,
+          "sha256": "b1b1c43d31a9661f8de097047b9d204a5c8de2fed51c076193b2290a22a88c2f"
+        },
+        "dsqg_deep1m_R64_MD64.index_rotator": {
+          "size_bytes": 256,
+          "sha256": "f7ccc02d5bca6f300e9e9ee71e77039994a349dae995f22dd388169bd6987190"
+        },
+        "dsqg_deep1m_medoids": {
+          "size_bytes": 307208,
+          "sha256": "22965fe42bc887c355942511da550c94af790dbc3dba2ce15ffcfdd091f63a8c"
+        },
+        "dsqg_deep1m_medoids_indices": {
+          "size_bytes": 1208,
+          "sha256": "7b4cf95395fbf83cebc3cbbfb7e354e94e4816d3a02b58049f0a570bc86eb381"
+        },
+        "dsqg_deep1m_pca.bin": {
+          "size_bytes": 263176,
+          "sha256": "3c3aa9ce16807546ba5a3e00cec57712569e090fced99d4ae7f404c70a6ed275"
+        },
+        "dsqg_deep1m_pca_base.fbin": {
+          "size_bytes": 1024000008,
+          "sha256": "0f30c9abad82adab4a64bebc634565f2f6db950efeb5b11ca69fdec440fa4501"
+        },
+        "dsqg_deep1m_seed.txt": {
+          "size_bytes": 3,
+          "sha256": "084c799cd551dd1d8d5c5f9a5d593b2e931f5e36122ee5c793c1d08a19839cc0"
+        },
+        "dsqg_deep1m_vamana_graph.index": {
+          "size_bytes": 242644256,
+          "sha256": "19644b7aad03d3392859383b676efbf0ec5e675fa44a3585ebbd85d1850d25a2"
+        }
+      }
+    }
+  ],
+  "skipped": [
+    "gist1m: omitted because deep1M satisfied the required dataset and the optional build was unnecessary for the two-hour budget."
+  ]
+}
