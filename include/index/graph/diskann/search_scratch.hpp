@@ -13,7 +13,7 @@
  *   - @c exact_dists: exact L2 distances of nodes actually read from disk/cache,
  *   - @c pq_table: the per-query @c n_chunks x 256 PQ distance table (PQ mode),
  *   - @c sector_scratch: a sector-aligned double buffer for async page reads,
- *   - @c ctx_: the thread's AlignedFileReader I/O context.
+ *   - a PageReader completion queue used to preserve submit/process/poll overlap.
  *
  * The scratch is owned by the index and reused across queries; reset_query()
  * clears only the per-query state.
@@ -22,8 +22,10 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -31,9 +33,9 @@
 
 #include "index/graph/diskann/disk_layout.hpp"
 #include "index/graph/diskann/visited_bitset.hpp"
-#include "index/graph/laser/utils/aligned_file_reader.hpp"
-#include "index/graph/laser/utils/memory.hpp"
 #include "index/graph/vamana/robust_prune.hpp"
+#include "storage/io/page_reader.hpp"
+#include "utils/platform.hpp"
 
 namespace alaya::diskann {
 
@@ -45,6 +47,7 @@ struct ThreadDataScratchConfig {
   uint32_t max_degree = 0;
   uint32_t search_list_size = 0;
   uint64_t query_dim = 0;
+  uint64_t buffer_alignment = 1;
 };
 
 struct NeighborScratchView {
@@ -67,6 +70,8 @@ struct InFlightSlot {
 };
 
 struct ThreadData {
+  ~ThreadData() { free_scratch(); }
+
   // --- Per-query mutable search state ---
   VisitedBitset visited_bits;                   ///< ids popped/seeded
   alaya::vamana::NeighborPriorityQueue retset;  ///< exploration frontier
@@ -81,10 +86,10 @@ struct ThreadData {
   uint32_t nbrs_slot_len = 0;
   std::vector<uint32_t> nbrs_free_offsets;
   std::vector<InFlightSlot> inflight;  ///< indexed by scratch page slot
-  std::vector<AlignedRead> io_reqs;
-  std::vector<AlignedReadEvent> io_events;
+  std::vector<storage::io::ReadRequest> io_reqs;
+  std::vector<storage::io::ReadResult> io_events;
   std::vector<uint64_t> free_page_slots;
-  std::vector<AlignedRead> rerank_reqs;
+  std::vector<storage::io::ReadRequest> rerank_reqs;
   std::vector<uint64_t> slot_versions;    ///< page slot -> shard page version at submit
   std::vector<uint64_t> io_req_versions;  ///< parallel to io_reqs (barrier modes)
 
@@ -103,7 +108,10 @@ struct ThreadData {
                                  ///< by the pipelined searches (consumed immediately by
                                  ///< process/absorb, so a single page suffices).
   uint64_t peek_scratch_bytes = 0;
-  IOContext ctx_{};  ///< AIO context (owned via reader.register_thread())
+  uint64_t buffer_alignment = 1;
+  std::atomic_flag io_lock = ATOMIC_FLAG_INIT;
+  std::atomic_size_t completed_io_count{0};
+  std::deque<storage::io::ReadResult> completed_io;
 
   void resize_slot_capacity(uint64_t max_slot_id) {
     if (max_slot_id <= visited_bits.size_bits()) {
@@ -130,8 +138,10 @@ struct ThreadData {
       throw std::invalid_argument("ThreadData::alloc_scratch: invalid zero-sized config");
     }
     sector_scratch_bytes = config.n_page_slots * config.page_size;
+    buffer_alignment = std::max<uint64_t>(kSectorLen, config.buffer_alignment);
     sector_scratch = reinterpret_cast<char *>(
-        alaya::laser::memory::align_allocate<kSectorLen>(sector_scratch_bytes));
+        alaya_aligned_alloc_impl(sector_scratch_bytes, buffer_alignment));
+    if (sector_scratch == nullptr) throw std::bad_alloc();
     if (config.pq_table_entries > 0) {
       pq_table.assign(config.pq_table_entries, 0.0f);
     }
@@ -162,12 +172,12 @@ struct ThreadData {
       return;
     }
     if (peek_scratch != nullptr) {
-      alaya::laser::memory::align_free(peek_scratch);
+      alaya_aligned_free_impl(peek_scratch);
       peek_scratch = nullptr;
       peek_scratch_bytes = 0;
     }
-    peek_scratch =
-        reinterpret_cast<char *>(alaya::laser::memory::align_allocate<kSectorLen>(bytes));
+    peek_scratch = reinterpret_cast<char *>(alaya_aligned_alloc_impl(bytes, buffer_alignment));
+    if (peek_scratch == nullptr) throw std::bad_alloc();
     peek_scratch_bytes = bytes;
   }
 
@@ -177,12 +187,12 @@ struct ThreadData {
       return;
     }
     if (wave_scratch != nullptr) {
-      alaya::laser::memory::align_free(wave_scratch);
+      alaya_aligned_free_impl(wave_scratch);
       wave_scratch = nullptr;
       wave_scratch_bytes = 0;
     }
-    wave_scratch =
-        reinterpret_cast<char *>(alaya::laser::memory::align_allocate<kSectorLen>(bytes));
+    wave_scratch = reinterpret_cast<char *>(alaya_aligned_alloc_impl(bytes, buffer_alignment));
+    if (wave_scratch == nullptr) throw std::bad_alloc();
     wave_scratch_bytes = bytes;
   }
 
@@ -282,17 +292,17 @@ struct ThreadData {
   /// Release the sector buffer (vectors free with the ThreadData instance).
   void free_scratch() {
     if (sector_scratch != nullptr) {
-      alaya::laser::memory::align_free(sector_scratch);
+      alaya_aligned_free_impl(sector_scratch);
       sector_scratch = nullptr;
     }
     sector_scratch_bytes = 0;
     if (wave_scratch != nullptr) {
-      alaya::laser::memory::align_free(wave_scratch);
+      alaya_aligned_free_impl(wave_scratch);
       wave_scratch = nullptr;
     }
     wave_scratch_bytes = 0;
     if (peek_scratch != nullptr) {
-      alaya::laser::memory::align_free(peek_scratch);
+      alaya_aligned_free_impl(peek_scratch);
       peek_scratch = nullptr;
     }
     peek_scratch_bytes = 0;

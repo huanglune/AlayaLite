@@ -19,7 +19,7 @@
 #include "index/graph/diskann/node_cache.hpp"
 #include "index/graph/diskann/pq_table.hpp"
 #include "index/graph/diskann/search_scratch.hpp"
-#include "index/graph/laser/utils/aligned_file_reader_factory.hpp"
+#include "storage/io/page_reader_factory.hpp"
 #include "simd/distance_l2.hpp"
 
 namespace {
@@ -237,10 +237,12 @@ class BeamSearchTest : public ::testing::Test {
       pq_.encode(vecs_.data(), n);
     }
 
-    reader_ = make_aligned_file_reader();
-    reader_->open(index_path_.string());
-    reader_->register_thread();
-    td_.ctx_ = reader_->get_ctx();
+#if defined(__linux__)
+    constexpr auto backend = alaya::storage::io::PageReaderBackend::libaio;
+#else
+    constexpr auto backend = alaya::storage::io::PageReaderBackend::threadpool;
+#endif
+    reader_ = alaya::storage::io::open_page_reader(index_path_, {}, backend);
     ThreadDataScratchConfig cfg;
     cfg.n_page_slots = 2u * beam;
     cfg.page_size = geom_.page_size;
@@ -249,6 +251,7 @@ class BeamSearchTest : public ::testing::Test {
     cfg.max_degree = r;
     cfg.search_list_size = static_cast<uint32_t>(std::max<uint64_t>(n, 100));
     cfg.query_dim = dim;
+    cfg.buffer_alignment = reader_->constraints().buffer_alignment;
     td_.alloc_scratch(cfg);
     beam_ = beam;
   }
@@ -256,8 +259,7 @@ class BeamSearchTest : public ::testing::Test {
   void TearDown() override {
     td_.free_scratch();
     if (reader_) {
-      reader_->close();
-      reader_->deregister_all_threads();
+      reader_->shutdown();
     }
     std::error_code ec;
     std::filesystem::remove(index_path_, ec);
@@ -294,7 +296,7 @@ class BeamSearchTest : public ::testing::Test {
   NodeCache cache_;
   PQTable pq_;
   std::filesystem::path index_path_;
-  std::unique_ptr<AlignedFileReader> reader_;
+  std::unique_ptr<alaya::storage::io::PageReader> reader_;
   ThreadData td_;
   SearchStats last_stats_;
 };
