@@ -13,6 +13,7 @@
 #include "executor/jobs/graph_search_job.hpp"
 #include "executor/jobs/graph_update_job.hpp"
 #include "index/graph/graph.hpp"
+#include "index/graph/hnsw/detail/hnsw_segment_bridge.hpp"
 #include "index/graph/hnsw/hnsw_segment.hpp"
 #include "space/raw_space.hpp"
 #include "space/sq8_space.hpp"

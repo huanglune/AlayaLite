@@ -9,14 +9,14 @@
 #include <memory>
 #include <utility>
 #include <vector>
-#include "../../../space/space_concepts.hpp"
-#include "../../../utils/log.hpp"
-#include "../../../utils/thread_config.hpp"
-#include "../../../utils/thread_pool.hpp"
-#include "../../../utils/timer.hpp"
-#include "../graph.hpp"
-#include "hnswlib.hpp"
+#include "index/graph/graph.hpp"
+#include "index/graph/hnsw/hnswlib.hpp"
 #include "space/raw_space.hpp"
+#include "space/space_concepts.hpp"
+#include "utils/log.hpp"
+#include "utils/thread_config.hpp"
+#include "utils/thread_pool.hpp"
+#include "utils/timer.hpp"
 
 namespace alaya::detail {
 /**

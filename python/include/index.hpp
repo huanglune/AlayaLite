@@ -8,6 +8,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <concepts>
@@ -22,6 +23,7 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -38,6 +40,7 @@
 #include "executor/scheduler.hpp"
 #include "index/graph/fusion_graph.hpp"
 #include "index/graph/graph.hpp"
+#include "index/graph/hnsw/detail/hnsw_segment_bridge.hpp"
 #include "index/graph/hnsw/hnsw_segment.hpp"
 #include "index/graph/nsg/nsg_builder.hpp"
 #include "index/graph/qg/qg_builder.hpp"
@@ -64,13 +67,23 @@ namespace py = pybind11;
 
 namespace alaya {
 
+template <typename RuntimeType, typename = void>
+struct RegisteredBuildSpace {
+  using type = typename RuntimeType::DistanceSpaceTypeAlias;
+};
+
+template <typename RuntimeType>
+struct RegisteredBuildSpace<RuntimeType, std::void_t<typename RuntimeType::BuildSpaceTypeAlias>> {
+  using type = typename RuntimeType::BuildSpaceTypeAlias;
+};
+
 template <typename GraphBuilderType, typename SearchSpaceType>
 class PyIndex : public BasePyIndex {
  public:
   using IDType = typename SearchSpaceType::IDTypeAlias;
   using DataType = typename SearchSpaceType::DataTypeAlias;
   using DistanceType = typename SearchSpaceType::DistanceTypeAlias;
-  using BuildSpaceType = typename GraphBuilderType::DistanceSpaceTypeAlias;
+  using BuildSpaceType = typename RegisteredBuildSpace<GraphBuilderType>::type;
   using MaterializedViewManagerType = MaterializedViewManager<SearchSpaceType, BuildSpaceType>;
   using HnswSegmentType = HnswSegment<SearchSpaceType, BuildSpaceType>;
 
@@ -122,6 +135,15 @@ class PyIndex : public BasePyIndex {
       hybrid_batch_pool_threads_ = effective_threads;
     }
     return hybrid_batch_pool_;
+  }
+
+  static auto hnsw_artifact_locations(std::string_view graph_path,
+                                      std::string_view data_path,
+                                      std::string_view quant_path)
+      -> std::array<core::ArtifactLocation, 3> {
+    return {{{HnswSegmentType::kGraphArtifactName, graph_path},
+             {HnswSegmentType::kDataArtifactName, data_path},
+             {HnswSegmentType::kQuantArtifactName, quant_path}}};
   }
 
 #if defined(__linux__)
@@ -186,7 +208,9 @@ class PyIndex : public BasePyIndex {
 
     if constexpr (!is_rabitq_space_v<SearchSpaceType>) {
       if (params_.index_type_ == IndexType::HNSW && hnsw_segment_ != nullptr) {
-        core::ArtifactWriter writer{index_path_view, data_path_view, quant_path_view};
+        const auto locations =
+            hnsw_artifact_locations(index_path_view, data_path_view, quant_path_view);
+        core::ArtifactWriter writer{std::span<const core::ArtifactLocation>(locations)};
         (void)hnsw_segment_->save(writer, {});
         return;
       }
@@ -225,15 +249,17 @@ class PyIndex : public BasePyIndex {
     } else {
       if (params_.index_type_ == IndexType::HNSW) {
         core::OpenContext open_context;
-        hnsw_segment_ = HnswSegmentType::open({index_path_view, data_path_view, quant_path_view},
+        const auto locations =
+            hnsw_artifact_locations(index_path_view, data_path_view, quant_path_view);
+        hnsw_segment_ = HnswSegmentType::open({std::span<const core::ArtifactLocation>(locations)},
                                               {},
                                               open_context);
         graph_index_ =
             detail::HnswSegmentBridge<SearchSpaceType, BuildSpaceType>::graph(*hnsw_segment_);
-        auto segment_search =
-            detail::HnswSegmentBridge<SearchSpaceType, BuildSpaceType>::search_job(*hnsw_segment_);
-        search_space_ = segment_search->space_;
-        build_space_ = segment_search->build_space_;
+        search_space_ = detail::HnswSegmentBridge<SearchSpaceType, BuildSpaceType>::search_space(
+            *hnsw_segment_);
+        build_space_ =
+            detail::HnswSegmentBridge<SearchSpaceType, BuildSpaceType>::build_space(*hnsw_segment_);
       } else {
         graph_index_ = std::make_shared<Graph<DataType, IDType>>();
         graph_index_->load(index_path_view);

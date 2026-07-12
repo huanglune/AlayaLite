@@ -15,6 +15,7 @@
   #include "executor/jobs/graph_update_job.hpp"
   #include "executor/scheduler.hpp"
   #include "index/graph/graph.hpp"
+  #include "index/graph/hnsw/detail/hnsw_segment_bridge.hpp"
   #include "index/graph/hnsw/hnsw_segment.hpp"
   #include "space/raw_space.hpp"
   #include "utils/io_utils.hpp"

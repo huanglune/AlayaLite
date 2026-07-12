@@ -22,6 +22,7 @@
 #include "executor/search_info.hpp"
 #include "executor/vector_iterator.hpp"
 #include "index/graph/graph.hpp"
+#include "index/graph/hnsw/detail/hnsw_segment_bridge.hpp"
 #include "index/graph/hnsw/hnsw_segment.hpp"
 #include "index/graph/qg/qg_builder.hpp"
 #include "params.hpp"

@@ -23,7 +23,7 @@
 // builds as well.
 #include "alayalite/vamana/_bindings.hpp"
 
-#include "index/graph/hnsw/hnsw_builder.hpp"
+#include "index/graph/hnsw/hnsw_segment.hpp"
 #include "index/index_type.hpp"
 // #include "reg.hpp"
 #include "params.hpp"

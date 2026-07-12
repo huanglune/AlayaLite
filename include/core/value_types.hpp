@@ -106,13 +106,26 @@ struct ArtifactManifest {
   std::span<const Artifact> artifacts{};
 };
 
-// Non-owning filesystem views used by memory segments.  The writer names the
-// destinations selected by the caller; engines keep ownership and atomic
-// publication policy outside the segment.
+// Artifact locations are keyed by a stable logical name rather than by an
+// engine-specific tuple of paths.  This lets graph/data/quant HNSW artifacts,
+// graph/vector/id Vamana artifacts, and future layouts use the same boundary.
+// Paths are non-owning: Collection/facade code owns publication and lifetime.
+struct ArtifactLocation {
+  std::string_view name{};
+  std::string_view path{};
+};
+
 struct ArtifactView {
-  std::string_view graph_path{};
-  std::string_view data_path{};
-  std::string_view quant_path{};
+  std::span<const ArtifactLocation> locations{};
+
+  [[nodiscard]] constexpr auto find(std::string_view name) const noexcept -> std::string_view {
+    for (const auto &location : locations) {
+      if (location.name == name) {
+        return location.path;
+      }
+    }
+    return {};
+  }
 };
 
 using ArtifactWriter = ArtifactView;

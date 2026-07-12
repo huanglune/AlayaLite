@@ -10,7 +10,7 @@
 #include <variant>
 // #include "index.hpp"
 #include "index/graph/graph.hpp"
-#include "index/graph/hnsw/hnsw_builder.hpp"
+#include "index/graph/hnsw/hnsw_segment.hpp"
 #include "index/graph/nsg/nsg_builder.hpp"
 #include "index/index_type.hpp"
 #include "space/raw_space.hpp"

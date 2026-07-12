@@ -14,6 +14,7 @@
 #include "executor/jobs/graph_hybrid_search_job.hpp"
 #include "executor/jobs/graph_search_job.hpp"
 #include "index/graph/graph.hpp"
+#include "index/graph/hnsw/detail/hnsw_segment_bridge.hpp"
 #include "index/graph/hnsw/hnsw_segment.hpp"
 #include "index/graph/qg/qg_builder.hpp"
 #include "space/rabitq_space.hpp"

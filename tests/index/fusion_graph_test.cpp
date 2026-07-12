@@ -13,7 +13,7 @@
 #include "executor/jobs/graph_search_job.hpp"
 #include "index/graph/fusion_graph.hpp"
 #include "index/graph/graph.hpp"
-#include "index/graph/hnsw/hnsw_builder.hpp"
+#include "index/graph/hnsw/detail/hnsw_builder_kernel.hpp"
 #include "index/graph/nsg/nsg_builder.hpp"
 #include "space/raw_space.hpp"
 #include "utils/dataset_utils.hpp"

@@ -58,6 +58,8 @@ static_assert(std::is_trivially_copyable_v<VectorBatchView>);
 static_assert(std::is_trivially_copyable_v<SearchOptions>);
 static_assert(std::is_trivially_copyable_v<SearchHit>);
 static_assert(std::is_trivially_copyable_v<Descriptor>);
+static_assert(std::is_trivially_copyable_v<ArtifactLocation>);
+static_assert(std::is_trivially_copyable_v<ArtifactView>);
 static_assert(std::is_trivially_copyable_v<ArtifactManifest>);
 
 static_assert(sizeof(QueryView) == 16 && alignof(QueryView) == 8);
@@ -67,6 +69,8 @@ static_assert(sizeof(SearchOptions) == 32 && alignof(SearchOptions) == 8);
 static_assert(sizeof(SearchHit) == 16 && alignof(SearchHit) == 8);
 static_assert(sizeof(Descriptor) == 40 && alignof(Descriptor) == 8);
 static_assert(sizeof(Artifact) == 32 && alignof(Artifact) == 8);
+static_assert(sizeof(ArtifactLocation) == 32 && alignof(ArtifactLocation) == 8);
+static_assert(sizeof(ArtifactView) == 16 && alignof(ArtifactView) == 8);
 static_assert(sizeof(ArtifactManifest) == 32 && alignof(ArtifactManifest) == 8);
 
 static_assert(DescriptorProvider<SearchOnly>);
