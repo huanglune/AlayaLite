@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-#include "index/graph/knng/nndescent.hpp"
+#include "index/graph/knng/detail/nndescent_kernel.hpp"
 #include <gtest/gtest.h>
 #include <cstdint>
 #include <cstdlib>
@@ -13,6 +13,7 @@
 
 #include "executor/jobs/graph_search_job.hpp"
 #include "index/graph/graph.hpp"
+#include "index/memory_engine_registry.hpp"
 #include "space/raw_space.hpp"
 #include "utils/dataset_utils.hpp"
 #include "utils/evaluate.hpp"
@@ -20,6 +21,11 @@
 #include "utils/timer.hpp"
 
 namespace alaya {
+
+static_assert(internal::memory::kKnngKernelRegistration.role ==
+              internal::memory::EngineRole::build_kernel);
+static_assert(!internal::memory::kKnngKernelRegistration.feature_switches_behavior);
+static_assert(!internal::memory::kKnngKernelRegistration.has_legacy_factory);
 
 class NnDescentTest : public ::testing::Test {
  protected:

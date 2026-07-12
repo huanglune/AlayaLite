@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 #include "index/graph/graph.hpp"
-#include "index/graph/knng/nndescent.hpp"
+#include "index/graph/knng/detail/nndescent_kernel.hpp"
 #include "index/neighbor.hpp"
 #include "utils/log.hpp"
 #include "utils/random.hpp"

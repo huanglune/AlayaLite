@@ -99,6 +99,19 @@ struct StandaloneEngineRegistration {
 
 inline constexpr DispatchIdentity kNoLegacyIdentity{"n/a", "none", "none"};
 
+// Design §7.1: NN-Descent is a BuildFactory/kernel.  A future user-facing
+// index must independently prove searchability; this registration must not be
+// used to manufacture a Searchable capability.  Its feature bit records
+// kernel ownership only and therefore never switches runtime behavior.
+inline constexpr StandaloneEngineRegistration kKnngKernelRegistration{
+    {"knng", "nndescent_kernel", "knng"},
+    kNoLegacyIdentity,
+    EngineFeature::knng,
+    EngineRole::build_kernel,
+    false,
+    false,
+};
+
 // Vamana-memory has no prior user-facing memory factory.  Disabling its bit
 // therefore means not_supported, not fallback to the disk adapter or another
 // graph implementation.
