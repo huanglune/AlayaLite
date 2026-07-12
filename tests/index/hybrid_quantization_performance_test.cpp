@@ -265,10 +265,14 @@ auto make_raw_build_space(const std::vector<DataType> &vectors, uint32_t vector_
 auto build_hnsw_graph(const std::shared_ptr<RawBuildSpace> &build_space, uint32_t num_threads)
     -> std::shared_ptr<Graph<DataType, IDType>> {
   core::BuildContext context;
-  auto segment =
-      HnswSegment<RawBuildSpace>::build({build_space, build_space},
-                                        {.max_neighbors = kMaxNbrs, .thread_count = num_threads},
-                                        context);
+  auto segment = HnswSegment<
+      RawBuildSpace>::build({core::TypedTensorView::contiguous(build_space->get_data_by_id(0),
+                                                               build_space->get_data_num(),
+                                                               build_space->get_dim()),
+                             build_space,
+                             build_space},
+                            {.max_neighbors = kMaxNbrs, .thread_count = num_threads},
+                            context);
   return detail::HnswSegmentBridge<RawBuildSpace, RawBuildSpace>::graph(*segment);
 }
 
@@ -292,7 +296,11 @@ auto build_raw_partition_bundle(const std::vector<DataType> &vectors,
                                                            nullptr);
   core::BuildContext context;
   auto segment =
-      HnswSegment<RawSearchSpace>::build({bundle.search_space_, bundle.search_space_},
+      HnswSegment<RawSearchSpace>::build({core::TypedTensorView::contiguous(vectors.data(),
+                                                                            vector_num,
+                                                                            dim),
+                                          bundle.search_space_,
+                                          bundle.search_space_},
                                          {.max_neighbors = kMaxNbrs, .thread_count = num_threads},
                                          context);
   bundle.graph_ = detail::HnswSegmentBridge<RawSearchSpace, RawSearchSpace>::graph(*segment);

@@ -62,7 +62,13 @@ class HNSWCoroutineTest : public ::testing::Test {
     space_->fit(data_.data(), points_num_);
 
     core::BuildContext context;
-    auto segment = HnswSegment<RawSpace<>>::build({space_, space_}, {.thread_count = 64}, context);
+    auto segment = HnswSegment<RawSpace<>>::build({core::TypedTensorView::contiguous(data_.data(),
+                                                                                     points_num_,
+                                                                                     dim_),
+                                                   space_,
+                                                   space_},
+                                                  {.thread_count = 64},
+                                                  context);
     graph_ = detail::HnswSegmentBridge<RawSpace<>, RawSpace<>>::graph(*segment);
   }
 

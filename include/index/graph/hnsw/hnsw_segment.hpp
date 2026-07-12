@@ -32,10 +32,16 @@ struct HnswSegmentBridge;
 }
 
 struct HnswBuildOptions {
+  core::VersionedStructHeader header{56, core::kContractAbiVersion};
   std::uint32_t max_neighbors{32};
   std::uint32_t ef_construction{200};
   std::uint32_t thread_count{1};
+  std::uint32_t reserved_options{};
+  std::uint64_t reserved[4]{};
 };
+
+static_assert(sizeof(HnswBuildOptions) == 56,
+              "same-toolchain layout regression canary for HNSW build options");
 
 struct HnswSearchExtension {
   core::VersionedStructHeader header{};
@@ -81,8 +87,19 @@ class HnswSegment {
   static constexpr std::string_view kQuantArtifactName = "quant";
 
   struct BuildInput {
+    core::VersionedStructHeader header{};
+    core::TypedTensorView vectors{};
     std::shared_ptr<SearchSpaceType> search_space;
     std::shared_ptr<BuildSpaceType> build_space;
+    std::uint64_t reserved[3]{};
+
+    BuildInput(core::TypedTensorView vector_view,
+               std::shared_ptr<SearchSpaceType> search,
+               std::shared_ptr<BuildSpaceType> build)
+        : header(core::current_struct_header<BuildInput>()),
+          vectors(vector_view),
+          search_space(std::move(search)),
+          build_space(std::move(build)) {}
   };
 
   static auto build(BuildInput input, const HnswBuildOptions &options, core::BuildContext &context)
@@ -119,7 +136,7 @@ class HnswSegment {
       search_space->load(quant_path);
       search_space->set_metric_function();
     }
-    validate_spaces({search_space, build_space});
+    validate_loaded_spaces(search_space, build_space);
     auto graph = std::make_shared<GraphType>();
     graph->load(graph_path);
     validate_graph(*graph, build_space->get_data_num());
@@ -224,21 +241,47 @@ class HnswSegment {
                                                                               build_space_)) {}
 
   static void validate_spaces(const BuildInput &input) {
+    if (!core::is_current_struct(input)) {
+      throw std::invalid_argument("HNSW build input has an incompatible size or ABI version");
+    }
     if (input.search_space == nullptr || input.build_space == nullptr) {
       throw std::invalid_argument("HNSW build requires search and build spaces");
     }
-    if (input.search_space->get_dim() != input.build_space->get_dim()) {
+    const auto tensor_status = core::validate_tensor(input.vectors,
+                                                     input.build_space->get_dim(),
+                                                     core::OperationStage::build);
+    if (!tensor_status.ok()) {
+      throw std::invalid_argument(tensor_status.diagnostic());
+    }
+    if (input.vectors.scalar_type != core::scalar_type_for<DataType>) {
+      throw std::invalid_argument("HNSW build tensor scalar type does not match the spaces");
+    }
+    if (input.vectors.rows != input.build_space->get_data_num()) {
+      throw std::invalid_argument("HNSW build tensor row count does not match the spaces");
+    }
+    validate_loaded_spaces(input.search_space, input.build_space);
+  }
+
+  static void validate_loaded_spaces(const std::shared_ptr<SearchSpaceType> &search_space,
+                                     const std::shared_ptr<BuildSpaceType> &build_space) {
+    if (search_space == nullptr || build_space == nullptr) {
+      throw std::invalid_argument("HNSW build requires search and build spaces");
+    }
+    if (search_space->get_dim() != build_space->get_dim()) {
       throw std::invalid_argument("HNSW search/build space dimension mismatch");
     }
-    if (input.search_space->get_data_num() != input.build_space->get_data_num()) {
+    if (search_space->get_data_num() != build_space->get_data_num()) {
       throw std::invalid_argument("HNSW search/build space row-count mismatch");
     }
-    if (input.build_space->get_data_num() == 0) {
+    if (build_space->get_data_num() == 0) {
       throw std::invalid_argument("HNSW requires at least one vector");
     }
   }
 
   static void validate_build_options(const HnswBuildOptions &options) {
+    if (!core::is_current_struct(options)) {
+      throw std::invalid_argument("HNSW build options have an incompatible size or ABI version");
+    }
     if (options.max_neighbors < 2) {
       throw std::invalid_argument("HNSW max_neighbors must be at least 2");
     }
@@ -265,7 +308,7 @@ class HnswSegment {
     }
   }
 
-  static void validate_build_budget(const BuildInput &input, const core::BuildContext &context) {
+  static void validate_build_budget(const BuildInput &input, core::BuildContext &context) {
     std::uint64_t elements{};
     std::uint64_t bytes{};
     if (!core::checked_multiply(input.build_space->get_data_num(),
@@ -274,10 +317,9 @@ class HnswSegment {
         !core::checked_multiply(elements, sizeof(DataType), bytes)) {
       throw std::invalid_argument("HNSW build input byte size overflows uint64");
     }
-    const auto budget = core::require_lease(context.growing_reservation,
-                                            bytes,
-                                            core::OperationStage::build,
-                                            "HNSW build reservation is too small");
+    const auto budget = context.growing_reservation.ensure(bytes,
+                                                           core::OperationStage::build,
+                                                           "HNSW build reservation is too small");
     if (!budget.ok()) {
       throw std::runtime_error("resource_exhausted: HNSW build reservation is too small");
     }

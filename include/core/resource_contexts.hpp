@@ -33,6 +33,45 @@ struct MemoryLease {
   }
 };
 
+struct MemoryReservation {
+  using Grow = Status (*)(void *, std::uint64_t, MemoryLease &) noexcept;
+
+  VersionedStructHeader header{};
+  MemoryLease lease{};
+  void *state{};
+  Grow grow{};
+  std::uint64_t reserved[3]{};
+
+  MemoryReservation() : header(current_struct_header<MemoryReservation>()) {}
+  explicit MemoryReservation(std::uint64_t bytes)
+      : header(current_struct_header<MemoryReservation>()), lease(bytes) {}
+
+  [[nodiscard]] auto permits(std::uint64_t bytes) const noexcept -> bool {
+    return lease.permits(bytes);
+  }
+
+  [[nodiscard]] auto ensure(std::uint64_t bytes, OperationStage stage, const char *diagnostic)
+      -> Status {
+    if (permits(bytes)) {
+      return Status::success();
+    }
+    if (grow != nullptr) {
+      auto status = grow(state, bytes, lease);
+      if (!status.ok()) {
+        return status;
+      }
+      if (permits(bytes)) {
+        return Status::success();
+      }
+    }
+    return Status::error(StatusCode::resource_exhausted,
+                         stage,
+                         StatusDetail::budget_denied,
+                         diagnostic,
+                         Retryability::retryable_with_backoff);
+  }
+};
+
 struct IoCredits {
   VersionedStructHeader header{};
   std::uint64_t available_requests{kUnlimitedResource};
@@ -148,7 +187,7 @@ struct OpenContext {
 
 struct BuildContext {
   VersionedStructHeader header{};
-  MemoryLease growing_reservation{};
+  MemoryReservation growing_reservation{};
   std::pmr::memory_resource *temporary_memory{std::pmr::get_default_resource()};
   IoCredits io_credits{};
   Deadline deadline{};
@@ -162,8 +201,8 @@ struct BuildContext {
 
 struct MutationContext {
   VersionedStructHeader header{};
-  MemoryLease pending_reservation{};
-  MemoryLease stage_reservation{};
+  MemoryReservation pending_reservation{};
+  MemoryReservation stage_reservation{};
   IoCredits wal_io_credits{};
   IoCredits io_credits{};
   Deadline deadline{};
@@ -177,8 +216,8 @@ struct MutationContext {
 
 struct SealContext {
   VersionedStructHeader header{};
-  MemoryLease snapshot_reservation{};
-  MemoryLease build_reservation{};
+  MemoryReservation snapshot_reservation{};
+  MemoryReservation build_reservation{};
   IoCredits io_credits{};
   Deadline deadline{};
   CancellationToken cancellation{};

@@ -137,7 +137,11 @@ class HnswSegmentTest : public ::testing::Test {
     space_ = std::make_shared<Space>(kCapacity, kDim, MetricType::L2);
     space_->fit(data_.data(), kRows);
     core::BuildContext context;
-    segment_ = Segment::build({space_, space_}, build_options(), context);
+    segment_ = Segment::build({core::TypedTensorView::contiguous(data_.data(), kRows, kDim),
+                               space_,
+                               space_},
+                              build_options(),
+                              context);
   }
 
   void TearDown() override { std::filesystem::remove_all(root_); }
@@ -330,9 +334,10 @@ void verify_native_byte_query() {
   auto space = std::make_shared<TypedSpace>(rows, dim, MetricType::L2);
   space->fit(data.data(), rows);
   core::BuildContext context;
-  auto segment = TypedSegment::build({space, space},
-                                     {.max_neighbors = 8, .ef_construction = 24, .thread_count = 1},
-                                     context);
+  auto segment =
+      TypedSegment::build({core::TypedTensorView::contiguous(data.data(), rows, dim), space, space},
+                          {.max_neighbors = 8, .ef_construction = 24, .thread_count = 1},
+                          context);
   SearchCall native(data.data(), 1, dim, 3, 12);
   ASSERT_TRUE(segment->search(native.request).ok());
   ASSERT_EQ(native.counts[0], 3U);
@@ -391,6 +396,17 @@ TEST_F(HnswSegmentTest, RegistersAsFirstRealAnySegmentProducer) {
   ASSERT_TRUE(any.search(call.request).ok());
   EXPECT_EQ(call.counts[0], 4U);
   EXPECT_EQ(static_cast<std::uint64_t>(call.hits.front().row_id), 0U);
+
+  const auto graph = (root_ / "any.graph").string();
+  const auto data = (root_ / "any.data").string();
+  const auto locations = artifact_locations<Segment>(graph, data);
+  core::ArtifactWriter writer{std::span<const core::ArtifactLocation>(locations)};
+  core::ArtifactManifest manifest;
+  ASSERT_TRUE(any.save(writer, {}, manifest).ok());
+  EXPECT_EQ(manifest.algorithm_id, core::algorithm::hnsw);
+  core::CheckpointContext checkpoint_context;
+  core::CheckpointToken checkpoint;
+  EXPECT_EQ(any.checkpoint(checkpoint_context, checkpoint).code(), core::StatusCode::not_supported);
 }
 
 struct InvariantReport {

@@ -121,6 +121,12 @@ struct AsyncOperationState {
 
   void bind_context() {
     context = *request.context;
+    if (request.options.deadline_steady_nanoseconds != 0 &&
+        (!context.deadline.enabled ||
+         request.options.deadline_steady_nanoseconds < context.deadline.steady_clock_nanoseconds)) {
+      context.deadline.enabled = true;
+      context.deadline.steady_clock_nanoseconds = request.options.deadline_steady_nanoseconds;
+    }
     external_cancellation = context.cancellation;
     context.cancellation.state = this;
     context.cancellation.is_cancelled = &combined_cancelled;
@@ -535,6 +541,100 @@ class AnySegment {
       return unsupported(OperationStage::stats);
     }
     return operations_->stats(instance_, stats);
+  }
+
+  [[nodiscard]] auto prepare_mutation(const OpaqueOperationRequest &request,
+                                      MutationContext &context,
+                                      MutationToken &token) -> Status {
+    if (operations_ == nullptr || operations_->prepare_mutation == nullptr ||
+        !capabilities().supports(OperationCapability::mutation)) {
+      return unsupported(OperationStage::mutation_prepare);
+    }
+    return operations_->prepare_mutation(instance_, request, context, &token);
+  }
+
+  [[nodiscard]] auto stage_mutation(MutationToken &token, MutationContext &context) -> Status {
+    if (operations_ == nullptr || operations_->stage_mutation == nullptr ||
+        !capabilities().supports(OperationCapability::mutation)) {
+      return unsupported(OperationStage::mutation_stage);
+    }
+    return operations_->stage_mutation(instance_, token, context);
+  }
+
+  [[nodiscard]] auto publish_mutation(MutationToken &token, MutationContext &context) -> Status {
+    if (operations_ == nullptr || operations_->publish_mutation == nullptr ||
+        !capabilities().supports(OperationCapability::mutation)) {
+      return unsupported(OperationStage::mutation_publish);
+    }
+    return operations_->publish_mutation(instance_, token, context);
+  }
+
+  [[nodiscard]] auto abort_mutation(MutationToken &token, MutationContext &context) -> Status {
+    if (operations_ == nullptr || operations_->abort_mutation == nullptr ||
+        !capabilities().supports(OperationCapability::mutation)) {
+      return unsupported(OperationStage::mutation_abort);
+    }
+    return operations_->abort_mutation(instance_, token, context);
+  }
+
+  [[nodiscard]] auto replay_mutation(const OpaqueOperationRequest &request,
+                                     MutationContext &context) -> Status {
+    if (operations_ == nullptr || operations_->replay_mutation == nullptr ||
+        !capabilities().supports(OperationCapability::mutation)) {
+      return unsupported(OperationStage::mutation_replay);
+    }
+    return operations_->replay_mutation(instance_, request, context, nullptr);
+  }
+
+  [[nodiscard]] auto save(ArtifactWriter &writer,
+                          const SaveOptions &options,
+                          ArtifactManifest &manifest) const -> Status {
+    if (operations_ == nullptr || operations_->save == nullptr ||
+        !capabilities().supports(OperationCapability::save)) {
+      return unsupported(OperationStage::save);
+    }
+    return operations_->save(instance_, writer, options, manifest);
+  }
+
+  [[nodiscard]] auto export_rows(const OpaqueOperationRequest &request, ExportCursor &cursor) const
+      -> Status {
+    if (operations_ == nullptr || operations_->export_rows == nullptr ||
+        !capabilities().supports(OperationCapability::export_rows)) {
+      return unsupported(OperationStage::export_rows);
+    }
+    return operations_->export_rows(instance_, request, cursor);
+  }
+
+  [[nodiscard]] auto checkpoint(CheckpointContext &context, CheckpointToken &token) -> Status {
+    if (operations_ == nullptr || operations_->checkpoint == nullptr ||
+        !capabilities().supports(OperationCapability::checkpoint)) {
+      return unsupported(OperationStage::checkpoint);
+    }
+    return operations_->checkpoint(instance_, context, token);
+  }
+
+  [[nodiscard]] auto freeze_snapshot(SealContext &context, FreezeToken &token) -> Status {
+    if (operations_ == nullptr || operations_->freeze_snapshot == nullptr ||
+        !capabilities().supports(OperationCapability::freeze)) {
+      return unsupported(OperationStage::freeze);
+    }
+    return operations_->freeze_snapshot(instance_, context, token);
+  }
+
+  [[nodiscard]] auto close() -> Status {
+    if (operations_ == nullptr || operations_->close == nullptr ||
+        !capabilities().supports(OperationCapability::close)) {
+      return unsupported(OperationStage::close);
+    }
+    return operations_->close(instance_);
+  }
+
+  [[nodiscard]] auto drain(const Deadline &deadline) -> Status {
+    if (operations_ == nullptr || operations_->drain == nullptr ||
+        !capabilities().supports(OperationCapability::drain)) {
+      return unsupported(OperationStage::drain);
+    }
+    return operations_->drain(instance_, deadline);
   }
 
  private:

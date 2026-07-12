@@ -81,10 +81,11 @@ static_assert(sizeof(SearchHit) == 64 && alignof(SearchHit) == 8);
 static_assert(sizeof(SearchResponse) == 144 && alignof(SearchResponse) == 8);
 static_assert(sizeof(SearchRequest) == 312 && alignof(SearchRequest) == 8);
 static_assert(sizeof(Descriptor) == 80 && alignof(Descriptor) == 8);
+static_assert(sizeof(MemoryReservation) == 96 && alignof(MemoryReservation) == 8);
 static_assert(sizeof(OpenContext) == 384 && alignof(OpenContext) == 8);
-static_assert(sizeof(BuildContext) == 304 && alignof(BuildContext) == 8);
-static_assert(sizeof(MutationContext) == 400 && alignof(MutationContext) == 8);
-static_assert(sizeof(SealContext) == 352 && alignof(SealContext) == 8);
+static_assert(sizeof(BuildContext) == 352 && alignof(BuildContext) == 8);
+static_assert(sizeof(MutationContext) == 496 && alignof(MutationContext) == 8);
+static_assert(sizeof(SealContext) == 448 && alignof(SealContext) == 8);
 static_assert(sizeof(SearchContext) == 296 && alignof(SearchContext) == 8);
 static_assert(sizeof(CheckpointContext) == 304 && alignof(CheckpointContext) == 8);
 static_assert(sizeof(SegmentStats) == 144 && alignof(SegmentStats) == 8);
@@ -180,6 +181,25 @@ TEST(CoreV3TypedTensor, AppliesEmptyNullStrideAndOverflowRules) {
                                  std::numeric_limits<std::uint64_t>::max());
   EXPECT_EQ(validate_tensor(overflow, 1, OperationStage::validation).detail(),
             StatusDetail::arithmetic_overflow);
+}
+
+TEST(CoreV3Resources, GrowingReservationHasAStableDenialAndGrowthPath) {
+  MemoryReservation denied(0);
+  auto status = denied.ensure(64, OperationStage::build, "test reservation denied");
+  EXPECT_EQ(status.code(), StatusCode::resource_exhausted);
+  EXPECT_EQ(status.detail(), StatusDetail::budget_denied);
+
+  MemoryReservation growing(0);
+  std::uint64_t observed{};
+  growing.state = &observed;
+  growing.grow = [](void *raw, std::uint64_t bytes, MemoryLease &lease) noexcept {
+    *static_cast<std::uint64_t *>(raw) = bytes;
+    lease.available_bytes = bytes;
+    return Status::success();
+  };
+  EXPECT_TRUE(growing.ensure(96, OperationStage::build, "unused").ok());
+  EXPECT_EQ(observed, 96U);
+  EXPECT_TRUE(growing.permits(96));
 }
 
 TEST(CoreV3Response, EnforcesPerQueryOffsetsCountsAndFailureInvalidation) {

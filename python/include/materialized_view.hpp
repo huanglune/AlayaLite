@@ -821,15 +821,14 @@ class MaterializedViewManager {
 
     constexpr bool kBuildSpaceNeedsFit = !is_raw_subset_space_v<MaterializedViewBuildSpaceType>;
     constexpr bool kSearchSpaceNeedsFit = !is_raw_subset_space_v<MaterializedViewSearchSpaceType>;
+    std::vector<DataType> partition_vectors(partition_size * static_cast<size_t>(data_dim_));
+    for (size_t i = 0; i < partition_size; ++i) {
+      copy_source_vector(partition.local_to_global_ids_[i],
+                         partition_vectors.data() + (i * static_cast<size_t>(data_dim_)));
+    }
     if constexpr (kBuildSpaceNeedsFit || (!std::is_same_v<MaterializedViewBuildSpaceType,
                                                           MaterializedViewSearchSpaceType> &&
                                           kSearchSpaceNeedsFit)) {
-      std::vector<DataType> partition_vectors(partition_size * static_cast<size_t>(data_dim_));
-      for (size_t i = 0; i < partition_size; ++i) {
-        copy_source_vector(partition.local_to_global_ids_[i],
-                           partition_vectors.data() + (i * static_cast<size_t>(data_dim_)));
-      }
-
       if constexpr (kBuildSpaceNeedsFit) {
         partition.build_space_->fit(partition_vectors.data(), partition_capacity);
       }
@@ -861,7 +860,13 @@ class MaterializedViewManager {
         using SegmentType =
             HnswSegment<MaterializedViewSearchSpaceType, MaterializedViewBuildSpaceType>;
         core::BuildContext build_context;
-        auto segment = SegmentType::build({partition.search_space_, partition.build_space_},
+        typename SegmentType::BuildInput input(core::TypedTensorView::contiguous(partition_vectors
+                                                                                     .data(),
+                                                                                 partition_capacity,
+                                                                                 data_dim_),
+                                               partition.search_space_,
+                                               partition.build_space_);
+        auto segment = SegmentType::build(std::move(input),
                                           {.max_neighbors = params_->max_nbrs_,
                                            .ef_construction = ef_construction_,
                                            .thread_count = build_threads_},

@@ -50,7 +50,12 @@ TEST_F(UpdateTest, HalfInsertTest) {
   auto build_start = std::chrono::steady_clock::now();
 
   alaya::core::BuildContext build_context;
-  auto segment = alaya::HnswSegment<alaya::RawSpace<>>::build({space, space}, {}, build_context);
+  auto segment = alaya::HnswSegment<alaya::RawSpace<>>::
+      build({alaya::core::TypedTensorView::contiguous(ds_.data_.data(), half_size, ds_.dim_),
+             space,
+             space},
+            {},
+            build_context);
   std::shared_ptr<alaya::Graph<>> hnsw_graph =
       alaya::detail::HnswSegmentBridge<alaya::RawSpace<>, alaya::RawSpace<>>::graph(*segment);
 
@@ -151,9 +156,13 @@ TEST(GraphUpdateJobSplitSpaceTest, IncrementalInsertKeepsBuildAndSearchSpacesCon
   search_space->fit(base_vectors, 2, base_scalar);
 
   core::BuildContext build_context;
-  auto segment = HnswSegment<SearchSpaceType, BuildSpaceType>::build({search_space, build_space},
-                                                                     {},
-                                                                     build_context);
+  auto segment =
+      HnswSegment<SearchSpaceType,
+                  BuildSpaceType>::build({core::TypedTensorView::contiguous(base_vectors, 2, 2),
+                                          search_space,
+                                          build_space},
+                                         {},
+                                         build_context);
   auto graph = detail::HnswSegmentBridge<SearchSpaceType, BuildSpaceType>::graph(*segment);
   auto job_context = std::make_shared<JobContext<IDType>>();
   auto search_job = std::make_shared<GraphSearchJob<SearchSpaceType, BuildSpaceType>>(search_space,

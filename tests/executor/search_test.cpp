@@ -185,9 +185,14 @@ auto load_or_build_hnsw_graph(const Dataset &ds, const std::shared_ptr<RawSpaceT
       auto build_start = std::chrono::steady_clock::now();
 
       core::BuildContext build_context;
-      auto segment = HnswSegment<RawSpaceType>::build({space, space},
-                                                      {.thread_count = max_thread_num()},
-                                                      build_context);
+      auto segment =
+          HnswSegment<RawSpaceType>::build({core::TypedTensorView::contiguous(ds.data_.data(),
+                                                                              ds.data_num_,
+                                                                              ds.dim_),
+                                            space,
+                                            space},
+                                           {.thread_count = max_thread_num()},
+                                           build_context);
       auto hnsw_graph = detail::HnswSegmentBridge<RawSpaceType, RawSpaceType>::graph(*segment);
 
       auto build_end = std::chrono::steady_clock::now();

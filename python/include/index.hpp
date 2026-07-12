@@ -705,7 +705,11 @@ class PyIndex : public BasePyIndex {
 
       auto build_start = std::chrono::steady_clock::now();
       core::BuildContext build_context;
-      hnsw_segment_ = HnswSegmentType::build({search_space_, build_space_},
+      hnsw_segment_ = HnswSegmentType::build({core::TypedTensorView::contiguous(vectors_,
+                                                                                data_size_,
+                                                                                data_dim_),
+                                              search_space_,
+                                              build_space_},
                                              {.max_neighbors = params_.max_nbrs_,
                                               .ef_construction = ef_construction,
                                               .thread_count = num_threads},
