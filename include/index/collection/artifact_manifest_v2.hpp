@@ -215,13 +215,11 @@ namespace artifact_manifest_v2_detail {
   std::uint64_t result{};
   for (char digit : value) {
     if (digit < '0' || digit > '9') {
-      throw std::invalid_argument("manifest numeric field is not decimal: " +
-                                  std::string(field));
+      throw std::invalid_argument("manifest numeric field is not decimal: " + std::string(field));
     }
     const auto component = static_cast<std::uint64_t>(digit - '0');
     if (result > (std::numeric_limits<std::uint64_t>::max() - component) / 10U) {
-      throw std::invalid_argument("manifest numeric field overflows uint64: " +
-                                  std::string(field));
+      throw std::invalid_argument("manifest numeric field overflows uint64: " + std::string(field));
     }
     result = result * 10U + component;
   }
@@ -232,8 +230,7 @@ namespace artifact_manifest_v2_detail {
     -> std::uint32_t {
   const auto parsed = parse_u64(value, field);
   if (parsed > std::numeric_limits<std::uint32_t>::max()) {
-    throw std::invalid_argument("manifest numeric field overflows uint32: " +
-                                std::string(field));
+    throw std::invalid_argument("manifest numeric field overflows uint32: " + std::string(field));
   }
   return static_cast<std::uint32_t>(parsed);
 }
@@ -274,8 +271,8 @@ namespace artifact_manifest_v2_detail {
   return result;
 }
 
-[[nodiscard]] inline auto take(std::map<std::string, std::string> &values,
-                               const std::string &key) -> std::string {
+[[nodiscard]] inline auto take(std::map<std::string, std::string> &values, const std::string &key)
+    -> std::string {
   auto found = values.find(key);
   if (found == values.end()) {
     throw std::invalid_argument("manifest v2 missing required key '" + key + "'");
@@ -364,8 +361,9 @@ struct ArtifactManifestV2 {
     for (const auto &segment : segments) {
       if (segment.segment_id.empty() || segment.segment_id.find('\0') != std::string::npos ||
           segment.generation == 0 || segment.algorithm_id == 0 || segment.format_version == 0 ||
-          segment.factory_key.empty() || segment.row_versions.minimum > segment.row_versions.maximum ||
-          !segment.ready || !artifact_manifest_v2_detail::safe_relative_path(segment.ready_marker) ||
+          segment.factory_key.empty() ||
+          segment.row_versions.minimum > segment.row_versions.maximum || !segment.ready ||
+          !artifact_manifest_v2_detail::safe_relative_path(segment.ready_marker) ||
           segment.reader_compatibility.minimum_reader_version == 0 ||
           segment.reader_compatibility.minimum_reader_version >
               segment.reader_compatibility.maximum_reader_version ||
@@ -383,8 +381,7 @@ struct ArtifactManifestV2 {
                                    "manifest v2 segment contains no artifacts");
       }
       for (const auto &artifact : segment.artifacts) {
-        if (artifact.logical_name.empty() ||
-            !logical_names.insert(artifact.logical_name).second ||
+        if (artifact.logical_name.empty() || !logical_names.insert(artifact.logical_name).second ||
             !artifact_paths.insert(artifact.relative_path).second ||
             !artifact_manifest_v2_detail::safe_relative_path(artifact.relative_path) ||
             artifact.checksum_algorithm != ChecksumAlgorithmV2::sha256 || !artifact.ready ||
@@ -471,7 +468,9 @@ struct ArtifactManifestV2 {
       detail::append(output,
                      prefix + "capabilities.freeze_with_search",
                      segment.capabilities.freeze_with_search);
-      detail::append(output, prefix + "capabilities.native_async", segment.capabilities.native_async);
+      detail::append(output,
+                     prefix + "capabilities.native_async",
+                     segment.capabilities.native_async);
       detail::append(output,
                      prefix + "capabilities.cooperative_cancel",
                      segment.capabilities.cooperative_cancel);
@@ -497,12 +496,12 @@ struct ArtifactManifestV2 {
       detail::append(output,
                      prefix + "reader.features.count",
                      segment.reader_compatibility.required_features.size());
-      for (std::size_t feature = 0;
-           feature < segment.reader_compatibility.required_features.size();
+      for (std::size_t feature = 0; feature < segment.reader_compatibility.required_features.size();
            ++feature) {
         detail::append(output,
                        prefix + "reader.feature." + std::to_string(feature),
-                       detail::encode_string(segment.reader_compatibility.required_features[feature]));
+                       detail::encode_string(
+                           segment.reader_compatibility.required_features[feature]));
       }
       detail::append(output, prefix + "source_retention.count", segment.source_retention.size());
       for (std::size_t retained = 0; retained < segment.source_retention.size(); ++retained) {
@@ -523,8 +522,7 @@ struct ArtifactManifestV2 {
       detail::append(output, prefix + "artifacts.count", segment.artifacts.size());
       for (std::size_t artifact_index = 0; artifact_index < segment.artifacts.size();
            ++artifact_index) {
-        const auto artifact_prefix =
-            prefix + "artifact." + std::to_string(artifact_index) + ".";
+        const auto artifact_prefix = prefix + "artifact." + std::to_string(artifact_index) + ".";
         const auto &artifact = segment.artifacts[artifact_index];
         detail::append(output,
                        artifact_prefix + "logical_name",
@@ -585,38 +583,43 @@ struct ArtifactManifestV2 {
     }
     manifest.collection.schema_name =
         detail::decode_string(detail::take(values, "collection.schema_name"));
-    manifest.collection.schema_version = detail::parse_u32(
-        detail::take(values, "collection.schema_version"), "collection.schema_version");
+    manifest.collection.schema_version =
+        detail::parse_u32(detail::take(values, "collection.schema_version"),
+                          "collection.schema_version");
     manifest.collection.dim =
         detail::parse_u32(detail::take(values, "collection.dim"), "collection.dim");
-    manifest.collection.metric = detail::parse_enum<core::Metric>(
-        detail::take(values, "collection.metric"), "collection.metric", 2);
-    manifest.collection.scalar_type = detail::parse_enum<core::ScalarType>(
-        detail::take(values, "collection.scalar_type"), "collection.scalar_type", 3);
-    manifest.collection.logical_id_encoding = detail::parse_enum<LogicalIdEncodingV2>(
-        detail::take(values, "collection.logical_id_encoding"),
-        "collection.logical_id_encoding",
-        1);
-    manifest.collection.logical_id_encoding_version = detail::parse_u32(
-        detail::take(values, "collection.logical_id_encoding_version"),
-        "collection.logical_id_encoding_version");
+    manifest.collection.metric =
+        detail::parse_enum<core::Metric>(detail::take(values, "collection.metric"),
+                                         "collection.metric",
+                                         2);
+    manifest.collection.scalar_type =
+        detail::parse_enum<core::ScalarType>(detail::take(values, "collection.scalar_type"),
+                                             "collection.scalar_type",
+                                             3);
+    manifest.collection.logical_id_encoding =
+        detail::parse_enum<LogicalIdEncodingV2>(detail::take(values,
+                                                             "collection.logical_id_encoding"),
+                                                "collection.logical_id_encoding",
+                                                1);
+    manifest.collection.logical_id_encoding_version =
+        detail::parse_u32(detail::take(values, "collection.logical_id_encoding_version"),
+                          "collection.logical_id_encoding_version");
     manifest.collection.metadata_checkpoint =
         detail::decode_string(detail::take(values, "collection.metadata_checkpoint"));
-    manifest.collection.metadata_epoch = detail::parse_u64(
-        detail::take(values, "collection.metadata_epoch"), "collection.metadata_epoch");
-    manifest.publication.generation = detail::parse_u64(
-        detail::take(values, "publication.generation"), "publication.generation");
-    manifest.publication.parent =
-        detail::decode_string(detail::take(values, "publication.parent"));
+    manifest.collection.metadata_epoch =
+        detail::parse_u64(detail::take(values, "collection.metadata_epoch"),
+                          "collection.metadata_epoch");
+    manifest.publication.generation =
+        detail::parse_u64(detail::take(values, "publication.generation"), "publication.generation");
+    manifest.publication.parent = detail::decode_string(detail::take(values, "publication.parent"));
     manifest.wal_cut = detail::parse_u64(detail::take(values, "wal_cut"), "wal_cut");
-    manifest.row_versions.minimum = detail::parse_u64(
-        detail::take(values, "row_versions.minimum"), "row_versions.minimum");
-    manifest.row_versions.maximum = detail::parse_u64(
-        detail::take(values, "row_versions.maximum"), "row_versions.maximum");
-    manifest.id_map_checkpoint =
-        detail::decode_string(detail::take(values, "id_map_checkpoint"));
-    manifest.next_segment_id_hint = detail::parse_u64(
-        detail::take(values, "next_segment_id_hint"), "next_segment_id_hint");
+    manifest.row_versions.minimum =
+        detail::parse_u64(detail::take(values, "row_versions.minimum"), "row_versions.minimum");
+    manifest.row_versions.maximum =
+        detail::parse_u64(detail::take(values, "row_versions.maximum"), "row_versions.maximum");
+    manifest.id_map_checkpoint = detail::decode_string(detail::take(values, "id_map_checkpoint"));
+    manifest.next_segment_id_hint =
+        detail::parse_u64(detail::take(values, "next_segment_id_hint"), "next_segment_id_hint");
     const auto extension_count =
         detail::parse_u64(detail::take(values, "extensions.count"), "extensions.count");
     if (extension_count > 1'000'000U) {
@@ -642,69 +645,70 @@ struct ArtifactManifestV2 {
       segment.segment_id = detail::decode_string(detail::take(values, prefix + "id"));
       segment.generation =
           detail::parse_u64(detail::take(values, prefix + "generation"), prefix + "generation");
-      segment.role = detail::parse_enum<SegmentRoleV2>(
-          detail::take(values, prefix + "role"), prefix + "role", 2);
-      segment.algorithm_id = detail::parse_u64(detail::take(values, prefix + "algorithm_id"),
-                                               prefix + "algorithm_id");
-      segment.format_version = detail::parse_u32(
-          detail::take(values, prefix + "format_version"), prefix + "format_version");
-      segment.factory_key =
-          detail::decode_string(detail::take(values, prefix + "factory_key"));
-      segment.capabilities.operations = detail::parse_u64(
-          detail::take(values, prefix + "capabilities.operations"),
-          prefix + "capabilities.operations");
-      segment.capabilities.reentrant_search = detail::parse_bool(
-          detail::take(values, prefix + "capabilities.reentrant_search"),
-          prefix + "capabilities.reentrant_search");
-      segment.capabilities.search_with_stage = detail::parse_bool(
-          detail::take(values, prefix + "capabilities.search_with_stage"),
-          prefix + "capabilities.search_with_stage");
-      segment.capabilities.search_with_publish = detail::parse_bool(
-          detail::take(values, prefix + "capabilities.search_with_publish"),
-          prefix + "capabilities.search_with_publish");
-      segment.capabilities.serial_mutation = detail::parse_bool(
-          detail::take(values, prefix + "capabilities.serial_mutation"),
-          prefix + "capabilities.serial_mutation");
-      segment.capabilities.checkpoint_with_search = detail::parse_bool(
-          detail::take(values, prefix + "capabilities.checkpoint_with_search"),
-          prefix + "capabilities.checkpoint_with_search");
-      segment.capabilities.freeze_with_search = detail::parse_bool(
-          detail::take(values, prefix + "capabilities.freeze_with_search"),
-          prefix + "capabilities.freeze_with_search");
-      segment.capabilities.native_async = detail::parse_bool(
-          detail::take(values, prefix + "capabilities.native_async"),
-          prefix + "capabilities.native_async");
-      segment.capabilities.cooperative_cancel = detail::parse_bool(
-          detail::take(values, prefix + "capabilities.cooperative_cancel"),
-          prefix + "capabilities.cooperative_cancel");
-      segment.capabilities.explicit_drain = detail::parse_bool(
-          detail::take(values, prefix + "capabilities.explicit_drain"),
-          prefix + "capabilities.explicit_drain");
-      segment.lifecycle = detail::parse_enum<SegmentLifecycleV2>(
-          detail::take(values, prefix + "lifecycle"), prefix + "lifecycle", 4);
+      segment.role = detail::parse_enum<SegmentRoleV2>(detail::take(values, prefix + "role"),
+                                                       prefix + "role",
+                                                       2);
+      segment.algorithm_id =
+          detail::parse_u64(detail::take(values, prefix + "algorithm_id"), prefix + "algorithm_id");
+      segment.format_version = detail::parse_u32(detail::take(values, prefix + "format_version"),
+                                                 prefix + "format_version");
+      segment.factory_key = detail::decode_string(detail::take(values, prefix + "factory_key"));
+      segment.capabilities.operations =
+          detail::parse_u64(detail::take(values, prefix + "capabilities.operations"),
+                            prefix + "capabilities.operations");
+      segment.capabilities.reentrant_search =
+          detail::parse_bool(detail::take(values, prefix + "capabilities.reentrant_search"),
+                             prefix + "capabilities.reentrant_search");
+      segment.capabilities.search_with_stage =
+          detail::parse_bool(detail::take(values, prefix + "capabilities.search_with_stage"),
+                             prefix + "capabilities.search_with_stage");
+      segment.capabilities.search_with_publish =
+          detail::parse_bool(detail::take(values, prefix + "capabilities.search_with_publish"),
+                             prefix + "capabilities.search_with_publish");
+      segment.capabilities.serial_mutation =
+          detail::parse_bool(detail::take(values, prefix + "capabilities.serial_mutation"),
+                             prefix + "capabilities.serial_mutation");
+      segment.capabilities.checkpoint_with_search =
+          detail::parse_bool(detail::take(values, prefix + "capabilities.checkpoint_with_search"),
+                             prefix + "capabilities.checkpoint_with_search");
+      segment.capabilities.freeze_with_search =
+          detail::parse_bool(detail::take(values, prefix + "capabilities.freeze_with_search"),
+                             prefix + "capabilities.freeze_with_search");
+      segment.capabilities.native_async =
+          detail::parse_bool(detail::take(values, prefix + "capabilities.native_async"),
+                             prefix + "capabilities.native_async");
+      segment.capabilities.cooperative_cancel =
+          detail::parse_bool(detail::take(values, prefix + "capabilities.cooperative_cancel"),
+                             prefix + "capabilities.cooperative_cancel");
+      segment.capabilities.explicit_drain =
+          detail::parse_bool(detail::take(values, prefix + "capabilities.explicit_drain"),
+                             prefix + "capabilities.explicit_drain");
+      segment.lifecycle =
+          detail::parse_enum<SegmentLifecycleV2>(detail::take(values, prefix + "lifecycle"),
+                                                 prefix + "lifecycle",
+                                                 4);
       segment.wal_cut =
           detail::parse_u64(detail::take(values, prefix + "wal_cut"), prefix + "wal_cut");
-      segment.row_versions.minimum = detail::parse_u64(
-          detail::take(values, prefix + "row_versions.minimum"),
-          prefix + "row_versions.minimum");
-      segment.row_versions.maximum = detail::parse_u64(
-          detail::take(values, prefix + "row_versions.maximum"),
-          prefix + "row_versions.maximum");
+      segment.row_versions.minimum =
+          detail::parse_u64(detail::take(values, prefix + "row_versions.minimum"),
+                            prefix + "row_versions.minimum");
+      segment.row_versions.maximum =
+          detail::parse_u64(detail::take(values, prefix + "row_versions.maximum"),
+                            prefix + "row_versions.maximum");
       segment.id_map_checkpoint =
           detail::decode_string(detail::take(values, prefix + "id_map_checkpoint"));
-      segment.ready =
-          detail::parse_bool(detail::take(values, prefix + "ready"), prefix + "ready");
-      segment.ready_marker =
-          detail::decode_string(detail::take(values, prefix + "ready_marker"));
-      segment.ready_digest =
-          Sha256Digest::from_hex(detail::take(values, prefix + "ready_sha256"));
-      segment.reader_compatibility.minimum_reader_version = detail::parse_u32(
-          detail::take(values, prefix + "reader.minimum"), prefix + "reader.minimum");
-      segment.reader_compatibility.maximum_reader_version = detail::parse_u32(
-          detail::take(values, prefix + "reader.maximum"), prefix + "reader.maximum");
-      const auto segment_feature_count = detail::parse_u64(
-          detail::take(values, prefix + "reader.features.count"),
-          prefix + "reader.features.count");
+      segment.ready = detail::parse_bool(detail::take(values, prefix + "ready"), prefix + "ready");
+      segment.ready_marker = detail::decode_string(detail::take(values, prefix + "ready_marker"));
+      segment.ready_digest = Sha256Digest::from_hex(detail::take(values, prefix + "ready_sha256"));
+      segment.reader_compatibility.minimum_reader_version =
+          detail::parse_u32(detail::take(values, prefix + "reader.minimum"),
+                            prefix + "reader.minimum");
+      segment.reader_compatibility.maximum_reader_version =
+          detail::parse_u32(detail::take(values, prefix + "reader.maximum"),
+                            prefix + "reader.maximum");
+      const auto segment_feature_count =
+          detail::parse_u64(detail::take(values, prefix + "reader.features.count"),
+                            prefix + "reader.features.count");
       if (segment_feature_count > 1'000'000U) {
         throw std::invalid_argument("manifest v2 segment feature count exceeds safety limit");
       }
@@ -712,9 +716,9 @@ struct ArtifactManifestV2 {
         segment.reader_compatibility.required_features.push_back(detail::decode_string(
             detail::take(values, prefix + "reader.feature." + std::to_string(feature))));
       }
-      const auto retention_count = detail::parse_u64(
-          detail::take(values, prefix + "source_retention.count"),
-          prefix + "source_retention.count");
+      const auto retention_count =
+          detail::parse_u64(detail::take(values, prefix + "source_retention.count"),
+                            prefix + "source_retention.count");
       if (retention_count > 1'000'000U) {
         throw std::invalid_argument("manifest v2 source retention count exceeds safety limit");
       }
@@ -722,68 +726,69 @@ struct ArtifactManifestV2 {
         segment.source_retention.push_back(detail::decode_string(
             detail::take(values, prefix + "source_retention." + std::to_string(retained))));
       }
-      const auto segment_extension_count = detail::parse_u64(
-          detail::take(values, prefix + "extensions.count"), prefix + "extensions.count");
+      const auto segment_extension_count =
+          detail::parse_u64(detail::take(values, prefix + "extensions.count"),
+                            prefix + "extensions.count");
       if (segment_extension_count > 1'000'000U) {
         throw std::invalid_argument("manifest v2 segment extension count exceeds safety limit");
       }
       for (std::size_t extension = 0; extension < segment_extension_count; ++extension) {
-        const auto extension_prefix =
-            prefix + "extension." + std::to_string(extension) + ".";
+        const auto extension_prefix = prefix + "extension." + std::to_string(extension) + ".";
         auto key = detail::decode_string(detail::take(values, extension_prefix + "key"));
         auto value = detail::decode_string(detail::take(values, extension_prefix + "value"));
         if (!segment.extensions.emplace(std::move(key), std::move(value)).second) {
           throw std::invalid_argument("manifest v2 segment contains duplicate extension key");
         }
       }
-      const auto artifact_count = detail::parse_u64(
-          detail::take(values, prefix + "artifacts.count"), prefix + "artifacts.count");
+      const auto artifact_count =
+          detail::parse_u64(detail::take(values, prefix + "artifacts.count"),
+                            prefix + "artifacts.count");
       if (artifact_count > 1'000'000U) {
         throw std::invalid_argument("manifest v2 artifact count exceeds safety limit");
       }
       segment.artifacts.resize(static_cast<std::size_t>(artifact_count));
       for (std::size_t artifact_index = 0; artifact_index < segment.artifacts.size();
            ++artifact_index) {
-        const auto artifact_prefix =
-            prefix + "artifact." + std::to_string(artifact_index) + ".";
+        const auto artifact_prefix = prefix + "artifact." + std::to_string(artifact_index) + ".";
         auto &artifact = segment.artifacts[artifact_index];
         artifact.logical_name =
             detail::decode_string(detail::take(values, artifact_prefix + "logical_name"));
         artifact.relative_path =
             detail::decode_string(detail::take(values, artifact_prefix + "relative_path"));
-        artifact.required = detail::parse_bool(
-            detail::take(values, artifact_prefix + "required"), artifact_prefix + "required");
-        artifact.size_bytes = detail::parse_u64(
-            detail::take(values, artifact_prefix + "size_bytes"), artifact_prefix + "size_bytes");
-        artifact.checksum_algorithm = detail::parse_enum<ChecksumAlgorithmV2>(
-            detail::take(values, artifact_prefix + "checksum_algorithm"),
-            artifact_prefix + "checksum_algorithm",
-            1);
-        artifact.digest =
-            Sha256Digest::from_hex(detail::take(values, artifact_prefix + "sha256"));
-        artifact.ready = detail::parse_bool(
-            detail::take(values, artifact_prefix + "ready"), artifact_prefix + "ready");
-        artifact.reader_compatibility.minimum_reader_version = detail::parse_u32(
-            detail::take(values, artifact_prefix + "reader.minimum"),
-            artifact_prefix + "reader.minimum");
-        artifact.reader_compatibility.maximum_reader_version = detail::parse_u32(
-            detail::take(values, artifact_prefix + "reader.maximum"),
-            artifact_prefix + "reader.maximum");
-        const auto feature_count = detail::parse_u64(
-            detail::take(values, artifact_prefix + "reader.features.count"),
-            artifact_prefix + "reader.features.count");
+        artifact.required = detail::parse_bool(detail::take(values, artifact_prefix + "required"),
+                                               artifact_prefix + "required");
+        artifact.size_bytes =
+            detail::parse_u64(detail::take(values, artifact_prefix + "size_bytes"),
+                              artifact_prefix + "size_bytes");
+        artifact.checksum_algorithm =
+            detail::parse_enum<ChecksumAlgorithmV2>(detail::take(values,
+                                                                 artifact_prefix +
+                                                                     "checksum_algorithm"),
+                                                    artifact_prefix + "checksum_algorithm",
+                                                    1);
+        artifact.digest = Sha256Digest::from_hex(detail::take(values, artifact_prefix + "sha256"));
+        artifact.ready = detail::parse_bool(detail::take(values, artifact_prefix + "ready"),
+                                            artifact_prefix + "ready");
+        artifact.reader_compatibility.minimum_reader_version =
+            detail::parse_u32(detail::take(values, artifact_prefix + "reader.minimum"),
+                              artifact_prefix + "reader.minimum");
+        artifact.reader_compatibility.maximum_reader_version =
+            detail::parse_u32(detail::take(values, artifact_prefix + "reader.maximum"),
+                              artifact_prefix + "reader.maximum");
+        const auto feature_count =
+            detail::parse_u64(detail::take(values, artifact_prefix + "reader.features.count"),
+                              artifact_prefix + "reader.features.count");
         if (feature_count > 1'000'000U) {
           throw std::invalid_argument("manifest v2 artifact feature count exceeds safety limit");
         }
         for (std::size_t feature = 0; feature < feature_count; ++feature) {
           artifact.reader_compatibility.required_features.push_back(detail::decode_string(
-              detail::take(values, artifact_prefix + "reader.feature." +
-                                       std::to_string(feature))));
+              detail::take(values, artifact_prefix + "reader.feature." + std::to_string(feature))));
         }
       }
     }
-    manifest.gc.phase = detail::parse_enum<GcPhaseV2>(
-        detail::take(values, "gc.phase"), "gc.phase", 2);
+    manifest.gc.phase =
+        detail::parse_enum<GcPhaseV2>(detail::take(values, "gc.phase"), "gc.phase", 2);
     manifest.gc.generation =
         detail::parse_u64(detail::take(values, "gc.generation"), "gc.generation");
     const auto pending_count =
@@ -792,8 +797,8 @@ struct ArtifactManifestV2 {
       throw std::invalid_argument("manifest v2 GC pending count exceeds safety limit");
     }
     for (std::size_t index = 0; index < pending_count; ++index) {
-      manifest.gc.pending_segment_ids.push_back(detail::decode_string(
-          detail::take(values, "gc.pending." + std::to_string(index))));
+      manifest.gc.pending_segment_ids.push_back(
+          detail::decode_string(detail::take(values, "gc.pending." + std::to_string(index))));
     }
     const auto retained_count =
         detail::parse_u64(detail::take(values, "gc.retained.count"), "gc.retained.count");
@@ -801,8 +806,8 @@ struct ArtifactManifestV2 {
       throw std::invalid_argument("manifest v2 GC retained count exceeds safety limit");
     }
     for (std::size_t index = 0; index < retained_count; ++index) {
-      manifest.gc.retained_sources.push_back(detail::decode_string(
-          detail::take(values, "gc.retained." + std::to_string(index))));
+      manifest.gc.retained_sources.push_back(
+          detail::decode_string(detail::take(values, "gc.retained." + std::to_string(index))));
     }
     if (!values.empty()) {
       throw std::invalid_argument("manifest v2 contains unknown key '" + values.begin()->first +

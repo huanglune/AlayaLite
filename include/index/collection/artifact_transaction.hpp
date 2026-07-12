@@ -21,9 +21,9 @@
 #include "core/resource_contexts.hpp"
 #include "core/value_types.hpp"
 #include "index/collection/artifact_manifest_v2.hpp"
+#include "utils/log.hpp"
 #include "utils/platform.hpp"
 #include "utils/platform_fs.hpp"
-#include "utils/log.hpp"
 
 namespace alaya::internal::collection {
 
@@ -62,8 +62,7 @@ class ArtifactControlPlaneTransaction {
   auto operator=(const ArtifactControlPlaneTransaction &)
       -> ArtifactControlPlaneTransaction & = delete;
   ArtifactControlPlaneTransaction(ArtifactControlPlaneTransaction &&) = delete;
-  auto operator=(ArtifactControlPlaneTransaction &&)
-      -> ArtifactControlPlaneTransaction & = delete;
+  auto operator=(ArtifactControlPlaneTransaction &&) -> ArtifactControlPlaneTransaction & = delete;
 
   ~ArtifactControlPlaneTransaction() {
     if (state_ != State::published && state_ != State::aborted &&
@@ -81,10 +80,10 @@ class ArtifactControlPlaneTransaction {
     if (!control.ok()) {
       return control;
     }
-    auto reservation = context.growing_reservation.ensure(
-        4096,
-        core::OperationStage::build,
-        "artifact transaction staging reservation is too small");
+    auto reservation =
+        context.growing_reservation.ensure(4096,
+                                           core::OperationStage::build,
+                                           "artifact transaction staging reservation is too small");
     if (!reservation.ok()) {
       return reservation;
     }
@@ -107,8 +106,8 @@ class ArtifactControlPlaneTransaction {
       }
       if (options.transaction_id.empty()) {
         const auto ticks = std::chrono::steady_clock::now().time_since_epoch().count();
-        options.transaction_id = "tx_" + std::to_string(platform::get_pid()) + "_" +
-                                 std::to_string(ticks);
+        options.transaction_id =
+            "tx_" + std::to_string(platform::get_pid()) + "_" + std::to_string(ticks);
       }
       if (!safe_component(options.transaction_id)) {
         return core::Status::error(core::StatusCode::invalid_argument,
@@ -135,13 +134,11 @@ class ArtifactControlPlaneTransaction {
     }
   }
 
-  [[nodiscard]] auto staging_payload_directory() const noexcept
-      -> const std::filesystem::path & {
+  [[nodiscard]] auto staging_payload_directory() const noexcept -> const std::filesystem::path & {
     return staging_payload_;
   }
 
-  [[nodiscard]] auto final_payload_directory() const noexcept
-      -> const std::filesystem::path & {
+  [[nodiscard]] auto final_payload_directory() const noexcept -> const std::filesystem::path & {
     return final_payload_;
   }
 
@@ -150,8 +147,7 @@ class ArtifactControlPlaneTransaction {
   [[nodiscard]] auto writer(std::vector<LogicalArtifactSpec> specs) noexcept
       -> core::Result<core::ArtifactWriter> {
     if (state_ != State::created) {
-      return invalid_state(core::OperationStage::save,
-                           "artifact writer can only be created once");
+      return invalid_state(core::OperationStage::save, "artifact writer can only be created once");
     }
     try {
       auto status = install_specs(std::move(specs));
@@ -186,8 +182,7 @@ class ArtifactControlPlaneTransaction {
     }
   }
 
-  [[nodiscard]] auto prepare(SegmentEntryV2 segment) noexcept
-      -> core::Result<SegmentEntryV2> {
+  [[nodiscard]] auto prepare(SegmentEntryV2 segment) noexcept -> core::Result<SegmentEntryV2> {
     if (state_ != State::created || bindings_.empty()) {
       return invalid_state(core::OperationStage::save,
                            "artifact transaction has no adopted logical artifacts");
@@ -277,8 +272,7 @@ class ArtifactControlPlaneTransaction {
       const auto ready_path = staging_payload_ / kReadyFilename;
       platform::write_all_fsync(ready_path, ready_body.data(), ready_body.size());
       segment.ready = true;
-      segment.ready_marker =
-          (options_.target_relative_directory / kReadyFilename).generic_string();
+      segment.ready_marker = (options_.target_relative_directory / kReadyFilename).generic_string();
       segment.ready_digest = sha256(ready_body);
       platform::sync_directory_or_throw(staging_payload_);
       platform::sync_directory_or_throw(staging_root_);
@@ -307,8 +301,7 @@ class ArtifactControlPlaneTransaction {
   // only when collection_manifest.txt is atomically replaced. A crash in
   // between leaves an owned, READY orphan that restart cleanup can identify.
   [[nodiscard]] auto publish(ArtifactManifestV2 manifest) noexcept -> core::Status {
-    const auto expected_state =
-        options_.manifest_v2_writer ? State::ready : State::prepared;
+    const auto expected_state = options_.manifest_v2_writer ? State::ready : State::prepared;
     if (state_ != expected_state) {
       return invalid_state(core::OperationStage::save,
                            "artifact transaction is not ready to publish");
@@ -341,8 +334,8 @@ class ArtifactControlPlaneTransaction {
           *found = prepared_segment_;
         }
         const auto body = manifest.serialize();
-        const auto pending_manifest = options_.collection_root /
-                                      (".collection_manifest.v2." + options_.transaction_id);
+        const auto pending_manifest =
+            options_.collection_root / (".collection_manifest.v2." + options_.transaction_id);
         platform::write_all_fsync(pending_manifest, body.data(), body.size());
         platform::atomic_replace(pending_manifest,
                                  options_.collection_root / kCollectionManifestFilename);
@@ -497,10 +490,11 @@ class ArtifactControlPlaneTransaction {
           !artifact_manifest_v2_detail::safe_relative_path(relative) ||
           !relative_paths.insert(relative).second) {
         bindings_.clear();
-        return core::Status::error(core::StatusCode::invalid_argument,
-                                   core::OperationStage::save,
-                                   core::StatusDetail::malformed_struct,
-                                   "logical artifact names/paths must be unique safe relative paths");
+        return core::Status::
+            error(core::StatusCode::invalid_argument,
+                  core::OperationStage::save,
+                  core::StatusDetail::malformed_struct,
+                  "logical artifact names/paths must be unique safe relative paths");
       }
       Binding binding;
       binding.absolute_path = staging_payload_ / spec.relative_path;
@@ -526,17 +520,17 @@ class ArtifactControlPlaneTransaction {
 
   [[nodiscard]] static auto serialize_owned_artifacts(const SegmentEntryV2 &segment)
       -> std::string {
-    std::string body = "version=2\nsegment=" +
-                       artifact_manifest_v2_detail::encode_string(segment.segment_id) +
-                       "\ngeneration=" + std::to_string(segment.generation) +
-                       "\nartifacts=" + std::to_string(segment.artifacts.size()) + "\n";
+    std::string body =
+        "version=2\nsegment=" + artifact_manifest_v2_detail::encode_string(segment.segment_id) +
+        "\ngeneration=" + std::to_string(segment.generation) +
+        "\nartifacts=" + std::to_string(segment.artifacts.size()) + "\n";
     for (std::size_t index = 0; index < segment.artifacts.size(); ++index) {
       const auto &artifact = segment.artifacts[index];
       const auto prefix = "artifact." + std::to_string(index) + ".";
-      body += prefix + "name=" +
-              artifact_manifest_v2_detail::encode_string(artifact.logical_name) + "\n";
-      body += prefix + "path=" +
-              artifact_manifest_v2_detail::encode_string(artifact.relative_path) + "\n";
+      body += prefix + "name=" + artifact_manifest_v2_detail::encode_string(artifact.logical_name) +
+              "\n";
+      body += prefix +
+              "path=" + artifact_manifest_v2_detail::encode_string(artifact.relative_path) + "\n";
       body += prefix + "required=" + (artifact.required ? "1\n" : "0\n");
       body += prefix + "bytes=" + std::to_string(artifact.size_bytes) + "\n";
       body += prefix + "checksum=sha256\n";

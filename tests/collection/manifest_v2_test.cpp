@@ -49,12 +49,11 @@ class TemporaryDirectory {
   segment.algorithm_id = core::algorithm::flat;
   segment.format_version = 1;
   segment.factory_key = "flat";
-  segment.capabilities.operations =
-      core::capability_bit(core::OperationCapability::search) |
-      core::capability_bit(core::OperationCapability::batch_search) |
-      core::capability_bit(core::OperationCapability::save) |
-      core::capability_bit(core::OperationCapability::export_rows) |
-      core::capability_bit(core::OperationCapability::stats);
+  segment.capabilities.operations = core::capability_bit(core::OperationCapability::search) |
+                                    core::capability_bit(core::OperationCapability::batch_search) |
+                                    core::capability_bit(core::OperationCapability::save) |
+                                    core::capability_bit(core::OperationCapability::export_rows) |
+                                    core::capability_bit(core::OperationCapability::stats);
   segment.lifecycle = SegmentLifecycleV2::sealed;
   segment.wal_cut = 11;
   segment.row_versions = {3, 9};
@@ -128,8 +127,7 @@ class TemporaryDirectory {
 }
 
 TEST(Sha256, KnownVectorsAndOwnedDigest) {
-  EXPECT_EQ(sha256("").hex(),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+  EXPECT_EQ(sha256("").hex(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
   EXPECT_EQ(sha256("abc").hex(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
   const auto parsed = Sha256Digest::from_hex(sha256("abc").hex());
@@ -169,16 +167,14 @@ TEST(CollectionManifestDualReader, MapsV1ToExplicitDefaultedEquivalentView) {
   const auto &view = opened.value();
   EXPECT_EQ(view.source_version, ManifestSourceVersion::disk_collection_v1);
   EXPECT_EQ(view.manifest.collection.dim, 2);
-  EXPECT_EQ(view.manifest.collection.logical_id_encoding,
-            LogicalIdEncodingV2::legacy_u64_le);
+  EXPECT_EQ(view.manifest.collection.logical_id_encoding, LogicalIdEncodingV2::legacy_u64_le);
   EXPECT_EQ(view.manifest.next_segment_id_hint, 2);
   ASSERT_EQ(view.manifest.segments.size(), 1);
   EXPECT_EQ(view.manifest.segments[0].algorithm_id, core::algorithm::flat);
   EXPECT_EQ(view.manifest.extensions.at("x_preserved"), "yes");
   EXPECT_TRUE(view.field_was_defaulted("collection.metadata_epoch"));
   EXPECT_TRUE(view.field_was_defaulted("segments[0].artifacts[0].sha256_ready"));
-  EXPECT_EQ(view.manifest.segments[0].artifacts[0].checksum_algorithm,
-            ChecksumAlgorithmV2::none);
+  EXPECT_EQ(view.manifest.segments[0].artifacts[0].checksum_algorithm, ChecksumAlgorithmV2::none);
 }
 
 TEST(ArtifactControlPlaneTransaction, DefaultGatePublishesNoV2ControlFiles) {

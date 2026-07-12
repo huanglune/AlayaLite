@@ -169,14 +169,12 @@ class CollectionManifestDualReader {
     artifact.checksum_algorithm = ChecksumAlgorithmV2::none;
     artifact.ready = false;
     artifact.reader_compatibility.minimum_reader_version = 1;
-    artifact.reader_compatibility.maximum_reader_version =
-        kArtifactManifestV2SchemaVersion;
+    artifact.reader_compatibility.maximum_reader_version = kArtifactManifestV2SchemaVersion;
     entry.artifacts.push_back(std::move(artifact));
   }
 
   [[nodiscard]] static auto map_v1(const std::filesystem::path &collection_root,
-                                   const disk::CollectionManifest &legacy)
-      -> UnifiedManifestView {
+                                   const disk::CollectionManifest &legacy) -> UnifiedManifestView {
     UnifiedManifestView view;
     view.source_version = ManifestSourceVersion::disk_collection_v1;
     auto &mapped = view.manifest;
@@ -225,17 +223,10 @@ class CollectionManifestDualReader {
       entry.capabilities.explicit_drain = false;
       entry.lifecycle = SegmentLifecycleV2::sealed;
       entry.reader_compatibility.minimum_reader_version = 1;
-      entry.reader_compatibility.maximum_reader_version =
-          kArtifactManifestV2SchemaVersion;
+      entry.reader_compatibility.maximum_reader_version = kArtifactManifestV2SchemaVersion;
       entry.extensions = legacy_segment.x_extras;
-      add_v1_artifact(entry,
-                      "manifest",
-                      segment_relative / "manifest.txt",
-                      collection_root);
-      add_v1_artifact(entry,
-                      "ids",
-                      segment_relative / legacy_segment.ids_file,
-                      collection_root);
+      add_v1_artifact(entry, "manifest", segment_relative / "manifest.txt", collection_root);
+      add_v1_artifact(entry, "ids", segment_relative / legacy_segment.ids_file, collection_root);
       if (!legacy_segment.vectors_file.empty()) {
         add_v1_artifact(entry,
                         "vectors",
@@ -264,24 +255,23 @@ class CollectionManifestDualReader {
       mark_default(view, prefix + "reader_compatibility");
       mark_default(view, prefix + "source_retention");
       for (std::size_t artifact = 0; artifact < entry.artifacts.size(); ++artifact) {
-        mark_default(view,
-                     prefix + "artifacts[" + std::to_string(artifact) + "].sha256_ready");
+        mark_default(view, prefix + "artifacts[" + std::to_string(artifact) + "].sha256_ready");
       }
       mapped.segments.push_back(std::move(entry));
     }
     return view;
   }
 
-  [[nodiscard]] static auto compatibility_supported(
-      const ReaderCompatibilityV2 &compatibility,
-      const ManifestReaderOptions &options,
-      std::string_view subject) -> core::Status {
+  [[nodiscard]] static auto compatibility_supported(const ReaderCompatibilityV2 &compatibility,
+                                                    const ManifestReaderOptions &options,
+                                                    std::string_view subject) -> core::Status {
     if (options.reader_version < compatibility.minimum_reader_version ||
         options.reader_version > compatibility.maximum_reader_version) {
       return core::Status::error(core::StatusCode::not_supported,
                                  core::OperationStage::open,
                                  core::StatusDetail::unsupported_abi_version,
-                                 std::string(subject) + " reader compatibility range excludes this reader");
+                                 std::string(subject) +
+                                     " reader compatibility range excludes this reader");
     }
     for (const auto &feature : compatibility.required_features) {
       if (!options.available_features.contains(feature)) {
@@ -295,9 +285,9 @@ class CollectionManifestDualReader {
     return core::Status::success();
   }
 
-  [[nodiscard]] static auto validate_reader_compatibility(
-      const ArtifactManifestV2 &manifest,
-      const ManifestReaderOptions &options) -> core::Status {
+  [[nodiscard]] static auto validate_reader_compatibility(const ArtifactManifestV2 &manifest,
+                                                          const ManifestReaderOptions &options)
+      -> core::Status {
     for (const auto &segment : manifest.segments) {
       auto compatible = compatibility_supported(segment.reader_compatibility, options, "segment");
       if (!compatible.ok()) {
@@ -331,8 +321,7 @@ class CollectionManifestDualReader {
         return corrupt("manifest v2 segment READY marker is missing: " + segment.segment_id);
       }
       constexpr std::size_t kMaximumReadyBytes = 4096;
-      const auto ready_body =
-          platform::read_regular_file_bounded(ready_path, kMaximumReadyBytes);
+      const auto ready_body = platform::read_regular_file_bounded(ready_path, kMaximumReadyBytes);
       if (sha256(ready_body) != segment.ready_digest) {
         return corrupt("manifest v2 segment READY checksum mismatch: " + segment.segment_id);
       }
@@ -367,7 +356,8 @@ class CollectionManifestDualReader {
           owned_manifest = std::addressof(artifact);
         }
       }
-      if (owned_manifest == nullptr || expected_owned_digest->second != owned_manifest->digest.hex()) {
+      if (owned_manifest == nullptr ||
+          expected_owned_digest->second != owned_manifest->digest.hex()) {
         return corrupt("manifest v2 READY marker is not bound to its owned artifact manifest");
       }
     }
