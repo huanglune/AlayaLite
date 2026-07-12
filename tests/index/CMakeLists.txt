@@ -8,6 +8,11 @@ alaya_cc_target(
   SRCS fusion_graph_test.cpp
 )
 alaya_cc_target(
+  fusion_segment_test
+  GTEST
+  SRCS fusion_segment_test.cpp
+)
+alaya_cc_target(
   graph_test
   GTEST
   SRCS graph_test.cpp
@@ -51,6 +56,13 @@ alaya_cc_target(
 )
 
 alaya_add_test(NAME index_test_fusion_graph TARGET fusion_graph_test)
+alaya_add_test(NAME index_test_fusion_segment TARGET fusion_segment_test)
+alaya_add_test(
+  NAME index_test_fusion_segment_tsan
+  TARGET fusion_segment_test
+  FILTER FusionSegmentTest.ConcurrentSearchOnlyIsReentrant
+  LABELS tsan
+)
 alaya_add_test(NAME index_test_graph TARGET graph_test)
 alaya_add_test(NAME index_test_hnsw TARGET hnsw_test)
 alaya_add_test(NAME index_test_nndescent TARGET nndescent_test)

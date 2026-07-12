@@ -11,10 +11,10 @@
 #include <string_view>
 
 #include "executor/jobs/graph_search_job.hpp"
-#include "index/graph/fusion_graph.hpp"
+#include "index/graph/fusion/detail/fusion_builder_kernel.hpp"
 #include "index/graph/graph.hpp"
 #include "index/graph/hnsw/detail/hnsw_builder_kernel.hpp"
-#include "index/graph/nsg/nsg_builder.hpp"
+#include "index/graph/nsg/detail/nsg_builder_kernel.hpp"
 #include "space/raw_space.hpp"
 #include "utils/dataset_utils.hpp"
 #include "utils/evaluate.hpp"
@@ -32,9 +32,10 @@ class FusionGraphTest : public ::testing::Test {
     space_ = std::make_shared<RawSpace<>>(ds_.data_num_, ds_.dim_, MetricType::L2);
     space_->fit(ds_.data_.data(), ds_.data_num_);
     nsg_ = std::make_unique<
-        alaya::FusionGraphBuilder<alaya::RawSpace<>,
-                                  alaya::detail::HnswBuilderKernel<alaya::RawSpace<>>,
-                                  alaya::NSGBuilder<alaya::RawSpace<>>>>(space_);
+        alaya::detail::FusionBuilderKernel<alaya::RawSpace<>,
+                                           alaya::detail::HnswBuilderKernel<alaya::RawSpace<>>,
+                                           alaya::detail::NsgBuilderKernel<alaya::RawSpace<>>>>(
+        space_);
   }
 
   void TearDown() override {
@@ -45,9 +46,10 @@ class FusionGraphTest : public ::testing::Test {
 
   uint32_t max_thread_num_ = configured_thread_limit();
   Dataset ds_;
-  std::unique_ptr<alaya::FusionGraphBuilder<alaya::RawSpace<>,
-                                            alaya::detail::HnswBuilderKernel<alaya::RawSpace<>>,
-                                            alaya::NSGBuilder<alaya::RawSpace<>>>>
+  std::unique_ptr<
+      alaya::detail::FusionBuilderKernel<alaya::RawSpace<>,
+                                         alaya::detail::HnswBuilderKernel<alaya::RawSpace<>>,
+                                         alaya::detail::NsgBuilderKernel<alaya::RawSpace<>>>>
       nsg_ = nullptr;
   std::shared_ptr<RawSpace<>> space_ = nullptr;
   std::string_view filename_ = "fusion_graph_test.graph";
@@ -87,13 +89,13 @@ TEST_F(FusionGraphSearchTest, SimpleSearchTest) {
   if (!std::filesystem::exists(index_file)) {
     auto build_start = Timer();
 
-    alaya::FusionGraphBuilder<alaya::RawSpace<>,
-                              alaya::detail::HnswBuilderKernel<alaya::RawSpace<>>,
-                              alaya::NSGBuilder<alaya::RawSpace<>>>
-        fusion_graph =
-            alaya::FusionGraphBuilder<alaya::RawSpace<>,
-                                      alaya::detail::HnswBuilderKernel<alaya::RawSpace<>>,
-                                      alaya::NSGBuilder<alaya::RawSpace<>>>(space, kM);
+    alaya::detail::FusionBuilderKernel<alaya::RawSpace<>,
+                                       alaya::detail::HnswBuilderKernel<alaya::RawSpace<>>,
+                                       alaya::detail::NsgBuilderKernel<alaya::RawSpace<>>>
+        fusion_graph = alaya::detail::FusionBuilderKernel<
+            alaya::RawSpace<>,
+            alaya::detail::HnswBuilderKernel<alaya::RawSpace<>>,
+            alaya::detail::NsgBuilderKernel<alaya::RawSpace<>>>(space, kM);
     auto graph = fusion_graph.build_graph(max_thread_num_);
 
     LOG_INFO("The time of building hnsw is {}s.", build_start.elapsed() / 1000000.0);
