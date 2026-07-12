@@ -29,6 +29,7 @@
 #include <fstream>
 #include <numeric>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -104,6 +105,33 @@ void write_ring_vamana(const std::string &path, size_t n, uint32_t degree) {
   }
 }
 
+void write_uniform_vamana(const std::string &path,
+                          size_t n,
+                          uint32_t max_degree,
+                          uint32_t row_degree) {
+  if (row_degree == 0 || row_degree > max_degree || row_degree >= n) {
+    throw std::invalid_argument("write_uniform_vamana: invalid degree geometry");
+  }
+  const size_t header_size = sizeof(size_t) + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(size_t);
+  const size_t record_size = sizeof(uint32_t) * (static_cast<size_t>(row_degree) + 1);
+  const size_t expected_file_size = header_size + n * record_size;
+  const uint32_t start = 0;
+  const size_t frozen_points = 0;
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  if (!out.is_open()) throw std::runtime_error("cannot create uniform Vamana fixture");
+  out.write(reinterpret_cast<const char *>(&expected_file_size), sizeof(expected_file_size));
+  out.write(reinterpret_cast<const char *>(&max_degree), sizeof(max_degree));
+  out.write(reinterpret_cast<const char *>(&start), sizeof(start));
+  out.write(reinterpret_cast<const char *>(&frozen_points), sizeof(frozen_points));
+  for (uint32_t i = 0; i < n; ++i) {
+    out.write(reinterpret_cast<const char *>(&row_degree), sizeof(row_degree));
+    for (uint32_t j = 0; j < row_degree; ++j) {
+      const uint32_t neighbor = (i + j + 1) % static_cast<uint32_t>(n);
+      out.write(reinterpret_cast<const char *>(&neighbor), sizeof(neighbor));
+    }
+  }
+}
+
 struct TinyIndex {
   std::filesystem::path dir;
   std::string prefix;
@@ -173,6 +201,76 @@ std::vector<char> read_node_row(const QuantizedGraph &qg_meta,
   ::close(fd);
   return {page.begin() + static_cast<int64_t>((id % npp) * node_len),
           page.begin() + static_cast<int64_t>((id % npp + 1) * node_len)};
+}
+
+uint64_t fnv1a(const void *data, size_t size, uint64_t hash = 14695981039346656037ULL) {
+  const auto *bytes = static_cast<const uint8_t *>(data);
+  for (size_t i = 0; i < size; ++i) {
+    hash ^= bytes[i];
+    hash *= 1099511628211ULL;
+  }
+  return hash;
+}
+
+std::vector<uint64_t> logical_slot_hashes(const char *row,
+                                          size_t padded_dim,
+                                          size_t degree,
+                                          size_t code_off,
+                                          size_t factor_off,
+                                          size_t neighbor_off) {
+  const size_t words = padded_dim / 64;
+  std::vector<uint64_t> hashes(degree, 14695981039346656037ULL);
+  std::vector<uint64_t> bins(kBatchSize * words);
+  const auto *codes = reinterpret_cast<const uint8_t *>(row + code_off);
+  const auto *factors = reinterpret_cast<const float *>(row + factor_off);
+  const auto *ids = reinterpret_cast<const PID *>(row + neighbor_off);
+  for (size_t block = 0; block < degree / kBatchSize; ++block) {
+    unpack_codes_block(padded_dim, codes + block * padded_dim * 4, bins.data());
+    for (size_t local = 0; local < kBatchSize; ++local) {
+      const size_t slot = block * kBatchSize + local;
+      uint64_t hash = fnv1a(bins.data() + local * words, words * sizeof(uint64_t));
+      hash = fnv1a(&factors[slot], sizeof(float), hash);
+      hash = fnv1a(&factors[degree + slot], sizeof(float), hash);
+      hash = fnv1a(&factors[2 * degree + slot], sizeof(float), hash);
+      hashes[slot] = fnv1a(&ids[slot], sizeof(PID), hash);
+    }
+  }
+  return hashes;
+}
+
+std::vector<uint64_t> unpacked_row_codes(const char *row,
+                                         size_t padded_dim,
+                                         size_t degree,
+                                         size_t code_off) {
+  const size_t words = padded_dim / 64;
+  std::vector<uint64_t> codes(degree * words);
+  const auto *packed = reinterpret_cast<const uint8_t *>(row + code_off);
+  for (size_t block = 0; block < degree / kBatchSize; ++block) {
+    unpack_codes_block(padded_dim,
+                       packed + block * padded_dim * 4,
+                       codes.data() + block * kBatchSize * words);
+  }
+  return codes;
+}
+
+std::vector<uint64_t> index_page_hashes(const std::string &path, size_t page_size) {
+  const uintmax_t size = std::filesystem::file_size(path);
+  if (size < kSectorLen || (size - kSectorLen) % page_size != 0) {
+    throw std::runtime_error("patch audit: malformed terminal index size");
+  }
+  std::ifstream in(path, std::ios::binary);
+  if (!in.is_open()) throw std::runtime_error("patch audit: cannot open terminal index");
+  in.seekg(kSectorLen);
+  std::vector<uint64_t> hashes;
+  std::vector<char> page(page_size);
+  for (uintmax_t off = kSectorLen; off < size; off += page_size) {
+    in.read(page.data(), static_cast<std::streamsize>(page.size()));
+    if (in.gcount() != static_cast<std::streamsize>(page.size())) {
+      throw std::runtime_error("patch audit: short terminal page read");
+    }
+    hashes.push_back(fnv1a(page.data(), page.size()));
+  }
+  return hashes;
 }
 
 std::string index_suffix() {
@@ -653,6 +751,266 @@ TEST_F(QGUpdaterIndexTest, InsertPatchTombstoneEndToEnd) {
     }
     qg.set_result_filter(nullptr);
   }
+}
+
+TEST(QGUpdaterPd512PatchAudit, FillEvictRebuildResidualAndParallelPageHashes) {
+  constexpr size_t raw_dim = 960;
+  constexpr size_t main_dim = 512;
+  constexpr size_t residual_dim = raw_dim - main_dim;
+  constexpr size_t degree = 64;
+  constexpr size_t initial_degree = 63;
+  constexpr size_t base_n = 2048;
+  constexpr size_t insert_n = 384;
+  constexpr size_t batch_size = 64;
+  constexpr size_t total_n = base_n + insert_n;
+  constexpr size_t node_len = (32 * raw_dim + 128 * degree + degree * main_dim) / 8;
+  const QGPageGeometry geometry = qg_page_geometry(node_len);
+  ASSERT_EQ(geometry.node_per_page, 1U);
+  ASSERT_EQ(geometry.page_size, 3 * kSectorLen);
+
+  const auto dir = std::filesystem::temp_directory_path() /
+                   ("qg_updater_pd512_patch_audit_" + std::to_string(::getpid()));
+  struct Cleanup {
+    std::filesystem::path dir;
+    ~Cleanup() {
+      std::error_code ec;
+      std::filesystem::remove_all(dir, ec);
+    }
+  } cleanup{dir};
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+
+  const std::string source_prefix = (dir / "source").string();
+  const std::string vamana_path = source_prefix + "_vamana.index";
+  const std::string suffix = "_R64_MD512.index";
+  const auto base_data = make_data(base_n, raw_dim, 512448);
+  const auto insert_data = make_data(insert_n, raw_dim, 96064);
+  write_fbin(source_prefix + "_pca_base.fbin", base_data.data(), base_n, raw_dim);
+  // R64 rows start at degree 63: the first successful backlink is a fill and
+  // later backlinks to the same row must take the full-row eviction path.
+  write_uniform_vamana(vamana_path, base_n, degree, initial_degree);
+  {
+    QuantizedGraph qg(base_n, degree, main_dim, raw_dim, /*rotator_seed=*/29);
+    QGBuilder builder(qg, /*ef_build=*/96, /*num_threads=*/kRunningTsan ? 1 : 4);
+    builder.build(vamana_path.c_str(), source_prefix.c_str());
+  }
+
+  auto copy_artifact = [&](const std::string &to) {
+    for (const std::string &ext :
+         {suffix, suffix + "_rotator", suffix + "_cache_ids", suffix + "_cache_nodes"}) {
+      std::filesystem::copy_file(source_prefix + ext,
+                                 to + ext,
+                                 std::filesystem::copy_options::overwrite_existing);
+    }
+  };
+  const std::string serial_prefix = (dir / "serial").string();
+  const std::string parallel_prefix = (dir / "parallel").string();
+  copy_artifact(serial_prefix);
+  copy_artifact(parallel_prefix);
+
+  struct AuditResult {
+    UpdateStats stats;
+    std::vector<uint64_t> page_hashes;
+    size_t patched_rows = 0;
+    size_t untouched_slots = 0;
+  };
+
+  auto run = [&](const std::string &prefix, int thread_count) -> AuditResult {
+    QuantizedGraph qg(base_n, degree, main_dim, raw_dim);
+    qg.load_disk_index(prefix.c_str(), 0.0F);
+    UpdateParams params;
+    params.ef_insert = 96;
+    params.prune_pool_cap = 96;
+    params.backlink_mode = UpdateParams::Backlink::kEvict;
+    params.stage_backlinks = true;
+    params.write_cache = true;
+    params.max_points = total_n + 64;
+    QGUpdater upd(qg, params);
+
+    const std::string index_path = prefix + suffix;
+    std::vector<std::vector<char>> baseline(total_n);
+    std::vector<uint16_t> baseline_degree(total_n);
+    for (PID id = 0; id < base_n; ++id) {
+      baseline[id] =
+          read_node_row(qg, index_path, id, node_len, geometry.page_size, geometry.node_per_page);
+      baseline_degree[id] = upd.trailer(id).valid_degree;
+      EXPECT_EQ(baseline_degree[id], initial_degree)
+          << "pd512 audit migration degree mismatch id=" << id << " threads=" << thread_count;
+    }
+
+    for (size_t start = 0; start < insert_n; start += batch_size) {
+      const size_t end = std::min(insert_n, start + batch_size);
+#pragma omp parallel for num_threads(thread_count) schedule(dynamic)
+      for (int64_t raw_i = static_cast<int64_t>(start); raw_i < static_cast<int64_t>(end);
+           ++raw_i) {
+        const size_t i = static_cast<size_t>(raw_i);
+        upd.insert_with_id(insert_data.data() + i * raw_dim, static_cast<PID>(base_n + i));
+      }
+      // writeback exercises the real staged fill/evict patch RMW, then makes
+      // the page snapshot below independent of the resident update cache.
+      upd.writeback(static_cast<size_t>(thread_count));
+      upd.publish(base_n + end);
+      for (size_t i = start; i < end; ++i) {
+        const PID id = static_cast<PID>(base_n + i);
+        baseline[id] =
+            read_node_row(qg, index_path, id, node_len, geometry.page_size, geometry.node_per_page);
+        baseline_degree[id] = upd.trailer(id).valid_degree;
+      }
+    }
+    upd.finalize();
+
+    AuditResult result;
+    result.stats = upd.stats();
+    EXPECT_EQ(result.stats.inserts, insert_n) << "threads=" << thread_count;
+    EXPECT_GT(result.stats.free_slot_fills, 0U)
+        << "fill path was not exercised threads=" << thread_count;
+    EXPECT_GT(result.stats.evictions, 0U)
+        << "evict path was not exercised threads=" << thread_count;
+
+    auto vec_of = [&](PID id) -> const float * {
+      if (id < base_n) return base_data.data() + static_cast<size_t>(id) * raw_dim;
+      if (id < total_n) {
+        return insert_data.data() + (static_cast<size_t>(id) - base_n) * raw_dim;
+      }
+      return nullptr;
+    };
+
+    for (PID id = 0; id < total_n; ++id) {
+      const auto current =
+          read_node_row(qg, index_path, id, node_len, geometry.page_size, geometry.node_per_page);
+      if (baseline[id].size() != node_len) {
+        ADD_FAILURE() << "missing baseline id=" << id << " threads=" << thread_count;
+        continue;
+      }
+      if (std::memcmp(baseline[id].data(), current.data(), node_len) == 0) continue;
+      ++result.patched_rows;
+
+      const uint16_t current_degree = upd.trailer(id).valid_degree;
+      const auto *baseline_ids =
+          reinterpret_cast<const PID *>(baseline[id].data() + upd.neighbor_off_bytes());
+      const auto *current_ids =
+          reinterpret_cast<const PID *>(current.data() + upd.neighbor_off_bytes());
+      const auto before_hash = logical_slot_hashes(baseline[id].data(),
+                                                   main_dim,
+                                                   degree,
+                                                   upd.code_off_bytes(),
+                                                   upd.factor_off_bytes(),
+                                                   upd.neighbor_off_bytes());
+      const auto after_hash = logical_slot_hashes(current.data(),
+                                                  main_dim,
+                                                  degree,
+                                                  upd.code_off_bytes(),
+                                                  upd.factor_off_bytes(),
+                                                  upd.neighbor_off_bytes());
+      for (size_t slot = 0; slot < degree; ++slot) {
+        const bool before_valid = slot < baseline_degree[id];
+        const bool after_valid = slot < current_degree;
+        const bool untouched = before_valid == after_valid &&
+                               (!before_valid || baseline_ids[slot] == current_ids[slot]);
+        if (untouched) {
+          ++result.untouched_slots;
+          EXPECT_EQ(before_hash[slot], after_hash[slot])
+              << "untouched-slot hash mismatch id=" << id << " slot=" << slot
+              << " threads=" << thread_count;
+        }
+      }
+
+      EXPECT_EQ(std::memcmp(baseline[id].data() + main_dim * sizeof(float),
+                            current.data() + main_dim * sizeof(float),
+                            residual_dim * sizeof(float)),
+                0)
+          << "residual [main,raw) changed id=" << id << " threads=" << thread_count;
+
+      std::vector<PID> neighbor_ids;
+      std::vector<const float *> neighbor_vecs;
+      neighbor_ids.reserve(current_degree);
+      neighbor_vecs.reserve(current_degree);
+      bool valid_ids = true;
+      for (size_t slot = 0; slot < current_degree; ++slot) {
+        const float *neighbor_vec = vec_of(current_ids[slot]);
+        if (neighbor_vec == nullptr) {
+          ADD_FAILURE() << "out-of-range neighbor id=" << current_ids[slot] << " owner=" << id
+                        << " slot=" << slot << " threads=" << thread_count;
+          valid_ids = false;
+          break;
+        }
+        neighbor_ids.push_back(current_ids[slot]);
+        neighbor_vecs.push_back(neighbor_vec);
+      }
+      if (!valid_ids) continue;
+
+      std::vector<char> rebuilt(node_len);
+      upd.assemble_row(rebuilt.data(), vec_of(id), neighbor_vecs, neighbor_ids);
+      EXPECT_EQ(std::memcmp(current.data(), rebuilt.data(), raw_dim * sizeof(float)), 0)
+          << "raw vector mismatch vs rebuild id=" << id << " threads=" << thread_count;
+      EXPECT_EQ(std::memcmp(current.data() + upd.code_off_bytes(),
+                            rebuilt.data() + upd.code_off_bytes(),
+                            upd.factor_off_bytes() - upd.code_off_bytes()),
+                0)
+          << "packed code mismatch vs rebuild id=" << id << " threads=" << thread_count;
+
+      const auto current_codes =
+          unpacked_row_codes(current.data(), main_dim, degree, upd.code_off_bytes());
+      const auto rebuilt_codes =
+          unpacked_row_codes(rebuilt.data(), main_dim, degree, upd.code_off_bytes());
+      const size_t words = main_dim / 64;
+      for (size_t slot = 0; slot < degree; ++slot) {
+        for (size_t word = 0; word < words; ++word) {
+          EXPECT_EQ(current_codes[slot * words + word], rebuilt_codes[slot * words + word])
+              << "code mismatch id=" << id << " slot=" << slot << " word=" << word
+              << " threads=" << thread_count;
+        }
+      }
+
+      const auto *rebuilt_ids =
+          reinterpret_cast<const PID *>(rebuilt.data() + upd.neighbor_off_bytes());
+      for (size_t slot = 0; slot < degree; ++slot) {
+        EXPECT_EQ(current_ids[slot], rebuilt_ids[slot])
+            << "neighbor mismatch id=" << id << " slot=" << slot << " threads=" << thread_count;
+      }
+      const auto *current_factors =
+          reinterpret_cast<const float *>(current.data() + upd.factor_off_bytes());
+      const auto *rebuilt_factors =
+          reinterpret_cast<const float *>(rebuilt.data() + upd.factor_off_bytes());
+      for (size_t channel = 0; channel < 3; ++channel) {
+        for (size_t slot = 0; slot < degree; ++slot) {
+          const size_t index = channel * degree + slot;
+          const float denom = std::max(1.0F,
+                                       std::max(std::fabs(current_factors[index]),
+                                                std::fabs(rebuilt_factors[index])));
+          EXPECT_LE(std::fabs(current_factors[index] - rebuilt_factors[index]) / denom, 1e-5F)
+              << "factor mismatch id=" << id << " slot=" << slot << " channel=" << channel
+              << " threads=" << thread_count << " patched=" << current_factors[index]
+              << " rebuilt=" << rebuilt_factors[index];
+        }
+      }
+    }
+    EXPECT_GT(result.patched_rows, 0U) << "threads=" << thread_count;
+    EXPECT_GT(result.untouched_slots, 0U) << "threads=" << thread_count;
+    result.page_hashes = index_page_hashes(index_path, geometry.page_size);
+    return result;
+  };
+
+  const AuditResult serial = run(serial_prefix, 1);
+  const AuditResult parallel = run(parallel_prefix, 32);
+  EXPECT_EQ(serial.stats.free_slot_fills, parallel.stats.free_slot_fills);
+  EXPECT_EQ(serial.stats.evictions, parallel.stats.evictions);
+  EXPECT_EQ(serial.stats.forced_links, parallel.stats.forced_links);
+  EXPECT_EQ(serial.page_hashes.size(), parallel.page_hashes.size());
+  const size_t common_pages = std::min(serial.page_hashes.size(), parallel.page_hashes.size());
+  for (size_t page = 0; page < common_pages; ++page) {
+    EXPECT_EQ(serial.page_hashes[page], parallel.page_hashes[page])
+        << "single-thread vs 32-thread terminal page mismatch page=" << page;
+  }
+  EXPECT_EQ(serial.page_hashes, parallel.page_hashes);
+  std::cout << "pd512_patch_audit,serial_fills," << serial.stats.free_slot_fills
+            << ",serial_evictions," << serial.stats.evictions << ",serial_patched_rows,"
+            << serial.patched_rows << ",parallel_fills," << parallel.stats.free_slot_fills
+            << ",parallel_evictions," << parallel.stats.evictions << ",parallel_patched_rows,"
+            << parallel.patched_rows << ",untouched_slots," << parallel.untouched_slots
+            << ",terminal_pages," << parallel.page_hashes.size() << ",page_hash_vector,"
+            << fnv1a(parallel.page_hashes.data(), parallel.page_hashes.size() * sizeof(uint64_t))
+            << "\n";
 }
 
 TEST_F(QGUpdaterIndexTest, ParallelBatchInsertAndConsolidate) {
