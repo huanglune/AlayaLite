@@ -1399,3 +1399,27 @@ pd≤1024 典型和 15-18K 未触雷(全部既有数据集无恙,A/B 证实 pd10
 **Phase C 影响**:dbp1536 全主维与 main1146(98% 方差切点)臂全部可行;
 嵌入正式 cell 不再有几何/量化拦路虎。附注:8de2823 的 +109 行 updater 测试
 含 W2 的 pd1024/2048 pack round-trip(并行任务共树,提交归属混批,记录在案)。
+
+### 21.6 E7 判决:RAM-cap 预飞通过(g03 委托 cgroup),最小可行 8GiB,夹住后零可测退化(2026-07-12)
+
+g03 探明可用(systemd PID1,user scope memory.max/swap.max 实测精确生效,
+/md1 22T,空转)。500k SIFT §16 缩配 3 轮 churn,冻结二进制 bench_frozen_w1w2
+(md5 d791…,含 W1+W2),数据全部 g03 本地 /md1。产物 data/laser-update/ramcap-g03/。
+
+| MemoryMax | 池档 | 结果 |
+|---:|---|---|
+| 不限 | 0 / 65k | 通过(对照) |
+| **8GiB** | 65k / 131k | **通过** |
+| 6GiB | 65k | 第 2 轮 insert OOM |
+| 4 / 2GiB | 65k | 第 1 轮 insert OOM |
+
+- **8GiB/65k vs 不限/65k:recall +0.02pp、吞吐 +2.16%——页缓存被夹住后零可测
+  退化**;refault 174k 次、full PSI 185ms(131k 池:refault 89k/PSI 168ms,
+  池越大 refault 越少,机制方向正确);
+- OOM 地板=insert/maintenance 匿名峰值(T8 §17.5 已知边界的实测确认),
+  不是页缓存——mmap base(file 页可回收)按设计工作;
+- 池压到 65k 的代价与 T8 一致(−88.3% 插入吞吐,malloc_trim 体制);
+- g03 限制:io controller 未委托 ⇒ 无 scope io.stat,退化用 /proc/<pid>/io;
+- **E8 已发**:deep10m(41GB 索引)正式扫描,g03 本地 build,粗轴
+  不限/32/16/8/4GiB × 池档,3 轮 cell,预算 7-12h——"索引 5× 于 RAM"的
+  堵缓存玩具主战役。
