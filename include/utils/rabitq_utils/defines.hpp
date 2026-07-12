@@ -16,8 +16,7 @@
 
 #pragma once
 
-#include <Eigen/Dense>
-
+#include "kernels/linalg/types.hpp"
 #include "utils/platform.hpp"
 
 #define LOWBIT(x) ((x) & (-(x)))
@@ -39,49 +38,56 @@ namespace alaya {
 // copying. Ideal for interoperability and performance-critical code. Modifying the Map modifies the
 // original memory.
 template <typename T>
-using RowMajorMatrix = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+using RowMajorMatrix [[deprecated("use kernels::linalg::RowMajorMatrix")]] =
+    kernels::linalg::RowMajorMatrix<T>;
 
 template <typename T>
-using RowMajorMatrixMap = Eigen::Map<RowMajorMatrix<T>>;
+using RowMajorMatrixMap [[deprecated("use kernels::linalg::RowMajorMatrixMap")]] =
+    kernels::linalg::RowMajorMatrixMap<T>;
 
 template <typename T>
-using ConstRowMajorMatrixMap = Eigen::Map<const RowMajorMatrix<T>>;
+using ConstRowMajorMatrixMap [[deprecated("use kernels::linalg::ConstRowMajorMatrixMap")]] =
+    kernels::linalg::ConstRowMajorMatrixMap<T>;
 
 template <typename T>
-using RowMajorArray = Eigen::Array<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
+using RowMajorArray [[deprecated("use kernels::linalg::RowMajorArray")]] =
+    kernels::linalg::RowMajorArray<T>;
 
 template <typename T>
-using Vector = Eigen::Matrix<T, Eigen::Dynamic, 1>;
+using Vector [[deprecated("use kernels::linalg::Vector")]] = kernels::linalg::Vector<T>;
 
 template <typename T>
-using RowMajorArrayMap = Eigen::Map<RowMajorArray<T>>;
+using RowMajorArrayMap [[deprecated("use kernels::linalg::RowMajorArrayMap")]] =
+    kernels::linalg::RowMajorArrayMap<T>;
 
 template <typename T>
-using ConstRowMajorArrayMap = Eigen::Map<const RowMajorArray<T>>;
+using ConstRowMajorArrayMap [[deprecated("use kernels::linalg::ConstRowMajorArrayMap")]] =
+    kernels::linalg::ConstRowMajorArrayMap<T>;
 
 template <typename T>
-using VectorMap = Eigen::Map<Vector<T>>;
+using VectorMap [[deprecated("use kernels::linalg::VectorMap")]] = kernels::linalg::VectorMap<T>;
 
 template <typename T>
-using ConstVectorMap = Eigen::Map<const Vector<T>>;
+using ConstVectorMap [[deprecated("use kernels::linalg::ConstVectorMap")]] =
+    kernels::linalg::ConstVectorMap<T>;
 
 template <typename T>
 auto dot_product(const T *ALAYA_RESTRICT vec0, const T *ALAYA_RESTRICT vec1, size_t dim) -> T {
-  ConstVectorMap<T> v0(vec0, dim);
-  ConstVectorMap<T> v1(vec1, dim);
+  kernels::linalg::ConstVectorMap<T> v0(vec0, dim);
+  kernels::linalg::ConstVectorMap<T> v1(vec1, dim);
   return v0.dot(v1);
 }
 
 template <typename T>
 inline auto l2_sqr(const T *ALAYA_RESTRICT vec0, size_t dim) -> T {
-  ConstVectorMap<T> v0(vec0, dim);
+  kernels::linalg::ConstVectorMap<T> v0(vec0, dim);
   return v0.dot(v0);
 }
 
 template <typename T>
 inline auto l2_sqr(const T *ALAYA_RESTRICT vec0, const T *ALAYA_RESTRICT vec1, size_t dim) -> T {
-  ConstVectorMap<T> v0(vec0, dim);
-  ConstVectorMap<T> v1(vec1, dim);
+  kernels::linalg::ConstVectorMap<T> v0(vec0, dim);
+  kernels::linalg::ConstVectorMap<T> v1(vec1, dim);
   return (v0 - v1).dot(v0 - v1);
 }
 }  // namespace alaya

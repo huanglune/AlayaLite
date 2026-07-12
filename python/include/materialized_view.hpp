@@ -131,6 +131,8 @@ class RawSubsetSpaceView<RawSpace<DataType, DistanceType, IDType, DataStorage, S
 
   auto get_dim() const -> uint32_t { return base_space_->get_dim(); }
 
+  auto metric() const -> core::Metric { return base_space_->metric(); }
+
   auto get_distance(IDType lhs, IDType rhs) const -> DistanceType {
     return base_space_->get_distance(map_id(lhs), map_id(rhs));
   }

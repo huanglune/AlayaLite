@@ -833,8 +833,8 @@ inline void QuantizedGraph::update_qg_out_of_memory(
                           kSectorLen * kSectorLen;
   size_t main_page_size = (dimension_ * sizeof(float) + kSectorLen - 1) / kSectorLen * kSectorLen;
 
-  RowMatrix<float> x_pad(cur_degree, padded_dim_);  // padded neighbors mat
-  RowMatrix<float> c_pad(1, padded_dim_);           // padded duplicate centroid mat
+  kernels::linalg::RowMajorMatrix<float> x_pad(cur_degree, padded_dim_);  // padded neighbors mat
+  kernels::linalg::RowMajorMatrix<float> c_pad(1, padded_dim_);           // padded duplicate centroid mat
   x_pad.setZero();
   c_pad.setZero();
 
@@ -879,8 +879,8 @@ inline void QuantizedGraph::update_qg_out_of_memory(
   std::copy(cur_cent, cur_cent + dimension_, &c_pad(0, 0));
 
   /* rotate Matrix */
-  RowMatrix<float> x_rotated(cur_degree, padded_dim_);
-  RowMatrix<float> c_rotated(1, padded_dim_);
+  kernels::linalg::RowMajorMatrix<float> x_rotated(cur_degree, padded_dim_);
+  kernels::linalg::RowMajorMatrix<float> c_rotated(1, padded_dim_);
   for (int64_t i = 0; i < static_cast<int64_t>(cur_degree); ++i) {
     this->rotator_.rotate(&x_pad(i, 0), &x_rotated(i, 0));
   }

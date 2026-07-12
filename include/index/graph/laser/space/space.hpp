@@ -94,11 +94,11 @@ inline auto compute_centroid(const float *data, size_t num_points, size_t dim, s
 
 /** @brief Pads matrix columns to required alignment (e.g., power of 2). */
 template <typename T>
-inline void matrix_padding(const RowMatrix<T> &mat, RowMatrix<T> &padded_mat, size_t padded_dim) {
+inline void matrix_padding(const kernels::linalg::RowMajorMatrix<T> &mat, kernels::linalg::RowMajorMatrix<T> &padded_mat, size_t padded_dim) {
   size_t num_rows = mat.rows();
   size_t dim = mat.cols();
 
-  padded_mat = RowMatrix<T>(num_rows, padded_dim);
+  padded_mat = kernels::linalg::RowMajorMatrix<T>(num_rows, padded_dim);
   padded_mat.setZero();
 
   for (size_t i = 0; i < num_rows; ++i) {

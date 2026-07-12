@@ -32,6 +32,7 @@ template <typename DataType = float,
           typename NodeIDType = uint32_t,
           typename DataStorage = SequentialStorage<NodeIDType, NodeIDType>>
 struct Graph {
+  using NodeIDTypeAlias = NodeIDType;
   using EdgeIDType = uint32_t;
   constexpr static NodeIDType kEmptyId = -1;
   using OverlayGraphType = OverlayGraph<NodeIDType>;  ///< the overlay graph type

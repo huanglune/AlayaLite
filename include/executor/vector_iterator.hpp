@@ -293,7 +293,8 @@ class RaBitQVectorIterator final : public VectorIterator<IDType, DistanceType> {
   DynamicBitset expanded_;
   QueryComputer q_computer_;
   const DynamicBitset *blocked_mask_ = nullptr;
-  DistFuncRaBitQ<DataType, DistanceType> dist_func_;
+  using DistanceFunction = DistanceType (*)(const DataType *, const DataType *, std::size_t);
+  DistanceFunction dist_func_;
   uint32_t dim_ = 0;
   bool supplement_built_ = false;
   bool supplement_logged_ = false;

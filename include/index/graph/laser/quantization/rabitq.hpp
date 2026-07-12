@@ -43,9 +43,9 @@
 
 namespace alaya::laser {
 
-static inline void rabitq_factors(const RowMatrix<float> &rotated_data,
-                                  const RowMatrix<float> &rotated_centroid,
-                                  const RowMatrix<int> &bin_x,
+static inline void rabitq_factors(const kernels::linalg::RowMajorMatrix<float> &rotated_data,
+                                  const kernels::linalg::RowMajorMatrix<float> &rotated_centroid,
+                                  const kernels::linalg::RowMajorMatrix<int> &bin_x,
                                   float *triple_x,
                                   float *factor_dq,
                                   float *factor_vq);
@@ -60,8 +60,8 @@ static inline void rabitq_factors(const RowMatrix<float> &rotated_data,
  * @param factor_dq       Output: factor for delta * ||q_r|| term
  * @param factor_vq       Output: factor for v_l * ||q_r|| term
  */
-inline void rabitq_codes(RowMatrix<float> &rotated_data,
-                         const RowMatrix<float> &rotated_centroid,
+inline void rabitq_codes(kernels::linalg::RowMajorMatrix<float> &rotated_data,
+                         const kernels::linalg::RowMajorMatrix<float> &rotated_centroid,
                          uint8_t *packed_code,
                          float *triple_x,
                          float *factor_dq,
@@ -78,7 +78,7 @@ inline void rabitq_codes(RowMatrix<float> &rotated_data,
   }
 
   // binary representation
-  RowMatrix<int> bin_x(num_points, dim);
+  kernels::linalg::RowMajorMatrix<int> bin_x(num_points, dim);
   for (int64_t i = 0; i < num_points; ++i) {
     for (int64_t j = 0; j < dim; ++j) {
       bin_x(i, j) = static_cast<int>(rotated_data(i, j) > 0);
@@ -96,9 +96,9 @@ inline void rabitq_codes(RowMatrix<float> &rotated_data,
   rabitq_factors(rotated_data, rotated_centroid, bin_x, triple_x, factor_dq, factor_vq);
 }
 
-static inline void rabitq_factors(const RowMatrix<float> &rotated_data_residual,
-                                  const RowMatrix<float> &rotated_centroid,
-                                  const RowMatrix<int> &bin_x,
+static inline void rabitq_factors(const kernels::linalg::RowMajorMatrix<float> &rotated_data_residual,
+                                  const kernels::linalg::RowMajorMatrix<float> &rotated_centroid,
+                                  const kernels::linalg::RowMajorMatrix<int> &bin_x,
                                   float *triple_x,
                                   float *factor_dq,
                                   float *factor_vq) {

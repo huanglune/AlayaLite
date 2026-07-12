@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 #include "index/graph/graph.hpp"
+#include "space/space_concepts.hpp"
 
 #include <cstdint>
 #include <type_traits>
 
 using GoldenGraph = alaya::Graph<float, uint32_t>;
 static_assert(std::is_constructible_v<GoldenGraph, uint32_t, uint32_t>);
+static_assert(alaya::GraphStore<GoldenGraph>);
 
 auto golden_graph_compile() -> int {
   GoldenGraph graph(4, 2);

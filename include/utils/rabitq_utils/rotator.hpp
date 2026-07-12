@@ -83,8 +83,8 @@ inline size_t padding_requirement(size_t dim, RotatorType type) {
 }
 
 template <typename T>
-RowMajorMatrix<T> random_gaussian_matrix(size_t rows, size_t cols) {
-  RowMajorMatrix<T> rand(rows, cols);
+kernels::linalg::RowMajorMatrix<T> random_gaussian_matrix(size_t rows, size_t cols) {
+  kernels::linalg::RowMajorMatrix<T> rand(rows, cols);
   static std::random_device rd;
   static std::mt19937 gen(rd());
   std::normal_distribution<T> dist(0, 1);
@@ -101,13 +101,13 @@ RowMajorMatrix<T> random_gaussian_matrix(size_t rows, size_t cols) {
 template <typename T = float>
 class MatrixRotator : public Rotator<T> {
  private:
-  RowMajorMatrix<T> rand_mat_;  // Rotation Maxtrix
+  kernels::linalg::RowMajorMatrix<T> rand_mat_;  // Rotation Maxtrix
  public:
   explicit MatrixRotator(size_t dim, size_t padded_dim)
       : Rotator<T>(dim, padded_dim), rand_mat_(dim, padded_dim) {
-    RowMajorMatrix<T> rand = random_gaussian_matrix<T>(padded_dim, padded_dim);
-    Eigen::HouseholderQR<RowMajorMatrix<T>> qr(rand);
-    RowMajorMatrix<T> q_inv =
+    kernels::linalg::RowMajorMatrix<T> rand = random_gaussian_matrix<T>(padded_dim, padded_dim);
+    Eigen::HouseholderQR<kernels::linalg::RowMajorMatrix<T>> qr(rand);
+    kernels::linalg::RowMajorMatrix<T> q_inv =
         qr.householderQ().transpose();  // inverse of orthogonal mat is its inverse
 
     // the random matrix only need the first dim rows, since we just pad zeros for
@@ -135,8 +135,8 @@ class MatrixRotator : public Rotator<T> {
   }
 
   void rotate(const T *vec, T *rotated_vec) const override {
-    ConstRowMajorMatrixMap<T> v(vec, 1, this->dim_);
-    RowMajorMatrixMap<T> rv(rotated_vec, 1, this->padded_dim_);
+    kernels::linalg::ConstRowMajorMatrixMap<T> v(vec, 1, this->dim_);
+    kernels::linalg::RowMajorMatrixMap<T> rv(rotated_vec, 1, this->padded_dim_);
     rv = v * this->rand_mat_;
   }
 };
@@ -193,7 +193,7 @@ static inline void flip_sign(const uint8_t *flip, float *data, size_t dim) {
 
 template <typename T>
 static inline void vec_rescale(T *data, size_t dim, T val) {
-  RowMajorArrayMap<T> data_arr(data, 1, dim);
+  kernels::linalg::RowMajorArrayMap<T> data_arr(data, 1, dim);
   data_arr *= val;
 }
 

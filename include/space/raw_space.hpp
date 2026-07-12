@@ -52,8 +52,9 @@ class RawSpace {
   using DataTypeAlias = DataType;
   using IDTypeAlias = IDType;
   using DistanceTypeAlias = DistanceType;
+  using DistanceFunction = DistanceType (*)(const DataType *, const DataType *, std::size_t);
 
-  DistFunc<DistDataType, DistanceType> distance_calu_func_;  ///< Distance calculation function
+  DistanceFunction distance_calu_func_;  ///< Distance calculation function
 
   IDType capacity_{0};                 ///< The maximum number of data points (nodes)
   uint32_t dim_{0};                    ///< Dimensionality of the data points
@@ -214,7 +215,7 @@ class RawSpace {
    * @param j ID of the second data point
    * @return The calculated distance
    */
-  auto get_distance(IDType i, IDType j) -> DistanceType {
+  auto get_distance(IDType i, IDType j) const -> DistanceType {
     return distance_calu_func_(get_data_by_id(i), get_data_by_id(j), dim_);
   }
 
@@ -222,7 +223,7 @@ class RawSpace {
    * @brief Get the number of the vector data
    * @return The number of vector data.
    */
-  auto get_data_num() -> IDType { return item_cnt_; }
+  auto get_data_num() const -> IDType { return item_cnt_; }
 
   /**
    * @brief Get the number of the available vector data
@@ -235,25 +236,31 @@ class RawSpace {
    *
    * @return IDType The capacity of the space.
    */
-  auto get_capacity() -> IDType { return capacity_; }
+  auto get_capacity() const -> IDType { return capacity_; }
 
   /**
    * @brief Get the size of each data point in bytes
    * @return The size of each data point
    */
-  auto get_data_size() -> size_t { return data_size_; }
+  auto get_data_size() const -> size_t { return data_size_; }
 
   /**
    * @brief Get the distance calculation function
    * @return The distance calculation function
    */
-  auto get_dist_func() -> DistFunc<DataType, DistanceType> { return distance_calu_func_; }
+  auto get_dist_func() const -> DistanceFunction { return distance_calu_func_; }
 
   /**
    * @brief Get the dimensionality of the data points
    * @return The dimensionality
    */
-  auto get_dim() -> uint32_t { return dim_; }
+  auto get_dim() const -> uint32_t { return dim_; }
+
+  auto metric() const -> core::Metric {
+    return metric_ == MetricType::L2
+               ? core::Metric::l2
+               : (metric_ == MetricType::IP ? core::Metric::inner_product : core::Metric::cosine);
+  }
 
   auto get_scalar_data(IDType id) const -> ScalarDataType {
     if constexpr (has_scalar_data) {
@@ -468,9 +475,9 @@ class RawSpace {
    */
   auto prefetch_by_address(DataType *address) -> void { mem_prefetch_l1(address, data_size_ / 64); }
 
-  auto get_query_computer(const DataType *query) { return QueryComputer(*this, query); }
+  auto get_query_computer(const DataType *query) const { return QueryComputer(*this, query); }
 
-  auto get_query_computer(IDType id) { return QueryComputer(*this, id); }
+  auto get_query_computer(IDType id) const { return QueryComputer(*this, id); }
 
   /**
    * @brief Close the RocksDB storage explicitly
