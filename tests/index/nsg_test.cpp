@@ -9,7 +9,7 @@
 #include <filesystem>
 #include <memory>
 #include <string_view>
-#include "index/graph/nsg/nsg_builder.hpp"
+#include "index/graph/nsg/detail/nsg_builder_kernel.hpp"
 
 #include "executor/jobs/graph_search_job.hpp"
 #include "index/graph/graph.hpp"
@@ -39,7 +39,7 @@ class NSGTest : public ::testing::Test {
 
     space_ = std::make_shared<RawSpace<>>(ds_.data_num_, ds_.dim_, MetricType::L2);
     space_->fit(ds_.data_.data(), ds_.data_num_);
-    nsg_ = std::make_unique<NSGBuilder<RawSpace<>>>(space_);
+    nsg_ = std::make_unique<detail::NsgBuilderKernel<RawSpace<>>>(space_);
   }
 
   void TearDown() override {
@@ -49,7 +49,7 @@ class NSGTest : public ::testing::Test {
   }
 
   Dataset ds_;
-  std::unique_ptr<NSGBuilder<RawSpace<>>> nsg_ = nullptr;
+  std::unique_ptr<detail::NsgBuilderKernel<RawSpace<>>> nsg_ = nullptr;
   std::shared_ptr<RawSpace<>> space_ = nullptr;
   std::string_view filename_ = "nsg_test.graph";
 };
@@ -61,7 +61,7 @@ TEST_F(NSGTest, BuildGraphTest) {
 
 TEST(NSGInternalTest, SyncPruneOccludesLongerNeighbor) {
   auto space = make_one_dim_space({0.0F, 1.0F, 2.0F});
-  NSGBuilder<RawSpace<>> builder(space, 2, 4);
+  detail::NsgBuilderKernel<RawSpace<>> builder(space, 2, 4);
 
   auto knng = std::make_unique<Graph<>>(3, 1);
   Graph<> graph(3, 2);
@@ -76,7 +76,7 @@ TEST(NSGInternalTest, SyncPruneOccludesLongerNeighbor) {
 
 TEST(NSGInternalTest, AddReverseLinksPrunesWhenDestinationIsFull) {
   auto space = make_one_dim_space({0.0F, 1.0F, 2.0F, 10.0F});
-  NSGBuilder<RawSpace<>> builder(space, 2, 4);
+  detail::NsgBuilderKernel<RawSpace<>> builder(space, 2, 4);
 
   Graph<> graph(4, 2);
   graph.at(0, 0) = 1;
@@ -92,7 +92,7 @@ TEST(NSGInternalTest, AddReverseLinksPrunesWhenDestinationIsFull) {
 
 TEST(NSGInternalTest, AttachUnlinkedFallsBackToRandomAvailableNode) {
   auto space = make_one_dim_space({0.0F, 1.0F, 2.0F, 3.0F});
-  NSGBuilder<RawSpace<>> builder(space, 1, 1);
+  detail::NsgBuilderKernel<RawSpace<>> builder(space, 1, 1);
 
   builder.final_graph_ = std::make_unique<Graph<>>(4, 1);
   builder.final_graph_->eps_.push_back(0);
@@ -113,7 +113,7 @@ TEST(NSGInternalTest, AttachUnlinkedFallsBackToRandomAvailableNode) {
 
 TEST(NSGInternalTest, InsertIntoPoolRejectsDuplicateAndFarNeighbor) {
   auto space = make_one_dim_space({0.0F, 1.0F});
-  NSGBuilder<RawSpace<>> builder(space, 2, 4);
+  detail::NsgBuilderKernel<RawSpace<>> builder(space, 2, 4);
 
   Neighbor<uint32_t> pool[4] = {
       Neighbor<uint32_t>(0, 1.0F),
@@ -158,7 +158,7 @@ TEST_F(NSGSearchTest, SimpleSearchTest) {
   if (!std::filesystem::exists(index_file)) {
     auto t1 = Timer();
 
-    alaya::NSGBuilder<alaya::RawSpace<>> nsg = alaya::NSGBuilder<alaya::RawSpace<>>(space, kM);
+    alaya::detail::NsgBuilderKernel<alaya::RawSpace<>> nsg(space, kM);
     auto graph = nsg.build_graph();
 
     LOG_INFO("The time of building hnsw is {}s.", t1.elapsed() / 1000000.0);

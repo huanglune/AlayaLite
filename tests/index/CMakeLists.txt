@@ -28,6 +28,11 @@ alaya_cc_target(
   SRCS nsg_test.cpp
 )
 alaya_cc_target(
+  nsg_segment_test
+  GTEST
+  SRCS nsg_segment_test.cpp
+)
+alaya_cc_target(
   rabitq_test
   GTEST
   SRCS rabitq_test.cpp
@@ -50,6 +55,13 @@ alaya_add_test(NAME index_test_graph TARGET graph_test)
 alaya_add_test(NAME index_test_hnsw TARGET hnsw_test)
 alaya_add_test(NAME index_test_nndescent TARGET nndescent_test)
 alaya_add_test(NAME index_test_nsg TARGET nsg_test)
+alaya_add_test(NAME index_test_nsg_segment TARGET nsg_segment_test)
+alaya_add_test(
+  NAME index_test_nsg_segment_tsan
+  TARGET nsg_segment_test
+  FILTER NsgSegmentTest.ConcurrentSearchOnlyIsReentrant
+  LABELS tsan
+)
 alaya_add_test(NAME index_test_rabitq TARGET rabitq_test)
 alaya_add_test(
   NAME index_test_rabitq_performance
