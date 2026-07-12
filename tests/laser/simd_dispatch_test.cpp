@@ -136,6 +136,20 @@ TEST(LaserSimdDispatchTest, GenericKernelsProduceScalarResults) {
   }
 }
 
+TEST(LaserSimdDispatchTest, ConvertAccumulatorDoesNotSignExtendAboveInt16Max) {
+  constexpr size_t kN = 32;
+  std::array<uint16_t, kN> accum{};
+  std::array<float, kN> converted{};
+  for (size_t i = 0; i < kN; ++i) {
+    accum[i] = static_cast<uint16_t>(32768U + i * 1000U);
+  }
+
+  simd::get_convert_func()(kN, accum.data(), 65536, converted.data());
+  for (size_t i = 0; i < kN; ++i) {
+    EXPECT_FLOAT_EQ(converted[i], static_cast<float>(2 * static_cast<int32_t>(accum[i]) - 65536));
+  }
+}
+
 TEST(LaserSimdDispatchTest, PortableFhtProducesHadamardOrder) {
   std::array<float, 8> values = {1.0F, 2.0F, 3.0F, 4.0F, 5.0F, 6.0F, 7.0F, 8.0F};
 
