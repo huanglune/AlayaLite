@@ -5,7 +5,6 @@
 #pragma once
 
 #include <concepts>
-#include <span>
 
 #include "core/value_types.hpp"
 
@@ -18,47 +17,81 @@ concept DescriptorProvider = requires(const T &segment) {
 
 template <class T>
 concept Searchable =
-    DescriptorProvider<T> &&
-    requires(const T &segment, QueryView query, const SearchOptions &options, SearchSink output) {
-      { segment.search(query, options, output) } -> std::same_as<SearchResult>;
+    DescriptorProvider<T> && requires(const T &segment, const SearchRequest &request) {
+      { segment.search(request) } -> std::same_as<Status>;
     };
 
 template <class T>
-concept BatchSearchable = Searchable<T> && requires(const T &segment,
-                                                    QueryBatchView queries,
-                                                    const SearchOptions &options,
-                                                    SearchSink output) {
-  { segment.batch_search(queries, options, output) } -> std::same_as<BatchSearchResult>;
-};
+concept BatchSearchable =
+    Searchable<T> && requires(const T &segment, const SearchRequest &request) {
+      { segment.batch_search(request) } -> std::same_as<Status>;
+    };
+
+template <class T>
+concept AsyncSearchable =
+    DescriptorProvider<T> && requires(const T &segment, SearchRequest request, void *completion) {
+      { segment.start_search(std::move(request), completion) };
+    };
 
 template <class T>
 concept Mutable = Searchable<T> && requires(T &segment,
-                                            VectorBatchView batch,
-                                            std::span<const ExternalId> ids,
-                                            MutationContext &context) {
-  { segment.insert(batch, context) } -> std::same_as<MutationResult>;
-  { segment.erase(ids, context) } -> std::same_as<MutationResult>;
+                                            const OpaqueOperationRequest &request,
+                                            MutationContext &context,
+                                            MutationToken &token) {
+  { segment.prepare_mutation(request, context, token) } -> std::same_as<Status>;
+  { segment.stage_mutation(token, context) } -> std::same_as<Status>;
+  { segment.publish_mutation(token, context) } -> std::same_as<Status>;
+  { segment.abort_mutation(token, context) } -> std::same_as<Status>;
+  { segment.replay_mutation(request, context) } -> std::same_as<Status>;
 };
 
 template <class T>
-concept Persistable =
-    requires(const T &segment, ArtifactWriter &writer, const SaveOptions &options) {
-      { segment.save(writer, options) } -> std::same_as<ArtifactManifest>;
+concept Saveable = requires(const T &segment,
+                            ArtifactWriter &writer,
+                            const SaveOptions &options,
+                            ArtifactManifest &manifest) {
+  { segment.save(writer, options, manifest) } -> std::same_as<Status>;
+};
+
+template <class T>
+concept Exportable =
+    requires(const T &segment, const OpaqueOperationRequest &request, ExportCursor &cursor) {
+      { segment.export_rows(request, cursor) } -> std::same_as<Status>;
     };
 
 template <class T>
-concept Sealable = Mutable<T> && requires(T &segment, SealContext &context) {
-  { segment.seal(context) } -> std::same_as<SealedArtifact>;
+concept Checkpointable = requires(T &segment, CheckpointContext &context, CheckpointToken &token) {
+  { segment.checkpoint(context, token) } -> std::same_as<Status>;
 };
 
 template <class T>
-concept Filterable = Searchable<T> && requires(const T &segment, const void *filter_plan) {
-  { segment.supports_filter(filter_plan) } noexcept -> std::same_as<FilterSupport>;
+concept Freezable = requires(T &segment, SealContext &context, FreezeToken &token) {
+  { segment.freeze_snapshot(context, token) } -> std::same_as<Status>;
 };
 
 template <class T>
-concept SegmentBuilder = requires(T &builder, VectorBatchView batch, BuildContext &context) {
-  { builder.build(batch, context) } -> std::same_as<SealedArtifact>;
+concept SnapshotExportable =
+    Freezable<T> && requires(T &segment, const FreezeToken &token, ExportCursor &cursor) {
+      { segment.export_snapshot(token, cursor) } -> std::same_as<Status>;
+    };
+
+template <class T>
+concept StatsProvider = requires(const T &segment, SegmentStats &stats) {
+  { segment.stats(stats) } noexcept -> std::same_as<Status>;
+};
+
+template <class T>
+concept Closable = requires(T &segment, const Deadline &deadline) {
+  { segment.close() } -> std::same_as<Status>;
+  { segment.drain(deadline) } -> std::same_as<Status>;
+};
+
+template <class T>
+concept BuildFactory = requires(T &factory,
+                                const OpaqueOperationRequest &request,
+                                BuildContext &context,
+                                SealedArtifact &artifact) {
+  { factory.build(request, context, artifact) } -> std::same_as<Status>;
 };
 
 }  // namespace alaya::core
