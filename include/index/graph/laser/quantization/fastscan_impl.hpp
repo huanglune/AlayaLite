@@ -1,12 +1,19 @@
+// SPDX-FileCopyrightText: Meta Platforms, Inc. and affiliates
+// SPDX-FileCopyrightText: 2025 VectorDB.NTU
 // SPDX-FileCopyrightText: 2025 AlayaDB.AI
-//
-// SPDX-License-Identifier: AGPL-3.0-only
+// SPDX-License-Identifier: MIT AND Apache-2.0
+
+// The packing implementation is derived from Faiss FastScan (MIT) and the
+// RaBitQ-Library implementation by VectorDB.NTU (Apache-2.0). AlayaDB.AI
+// adapted the code for LASER's binary-code layout and SIMD lookup pipeline.
+// The license expression and lineage await final legal determination.
 
 /**
  * @file fastscan_impl.hpp
  * @brief SIMD-optimized fast scan for accumulating quantization codes.
  *
- * Based on Faiss FastScan implementation for efficient product quantization.
+ * Based on Faiss FastScan and VectorDB.NTU's RaBitQ-Library implementation
+ * for efficient product quantization.
  * Packs binary codes into a format suitable for SIMD lookup table accumulation,
  * enabling batch processing of 32 codes simultaneously using AVX2/AVX512.
  *

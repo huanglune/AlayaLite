@@ -1,6 +1,6 @@
-// SPDX-FileCopyrightText: 2025 AlayaDB.AI
-//
-// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT license.
+// Modifications Copyright 2025 AlayaDB.AI.
 
 /**
  * @file aligned_file_reader.hpp
