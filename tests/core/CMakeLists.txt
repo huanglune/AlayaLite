@@ -1,0 +1,6 @@
+alaya_cc_target(core_value_types_test SRCS core_value_types_test.cpp GTEST)
+alaya_add_test(NAME core_value_types_test TARGET core_value_types_test LABELS unit core)
+
+alaya_cc_target(core_value_types_header_closure SRCS value_types_header_closure.cpp)
+alaya_cc_target(core_capabilities_header_closure SRCS capabilities_header_closure.cpp)
+alaya_cc_target(core_compat_header_closure SRCS compat_header_closure.cpp)
