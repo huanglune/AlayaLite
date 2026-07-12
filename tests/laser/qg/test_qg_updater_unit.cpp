@@ -39,6 +39,7 @@
 #include "index/graph/laser/qg/qg_updater.hpp"
 #include "index/graph/vamana/vamana_builder.hpp"
 #include "index/graph/vamana/vamana_writer.hpp"
+#include "../bench_laser_update_sift_support.hpp"
 
 namespace alaya::laser {
 namespace {
@@ -386,6 +387,23 @@ TEST_F(QGUpdaterIndexTest, AssembleRowMatchesBuilder) {
   }
   EXPECT_GE(tested, 10U);
   qg.set_result_filter(nullptr);
+}
+
+TEST_F(QGUpdaterIndexTest, BenchCacheCapPagesFlagReachesUpdater) {
+  const std::string prefix = (tiny_->dir / "cache_cap_flag").string();
+  copy_index_artifact(tiny_->prefix, prefix);
+
+  QuantizedGraph qg(kN, kDeg, kDim, kDim);
+  qg.load_disk_index(prefix.c_str(), 0.0F);
+  UpdateParams params;
+  const size_t default_cap = params.cache_cap_pages;
+  bench::apply_cache_cap_pages(0, params);
+  EXPECT_EQ(params.cache_cap_pages, default_cap);
+  bench::apply_cache_cap_pages(bench::parse_cache_cap_pages("17"), params);
+
+  QGUpdater upd(qg, params);
+  EXPECT_EQ(upd.cache_cap_pages(), 17U);
+  EXPECT_EQ(upd.pool_pages(), 0U);
 }
 
 TEST_F(QGUpdaterIndexTest, InsertPatchTombstoneEndToEnd) {

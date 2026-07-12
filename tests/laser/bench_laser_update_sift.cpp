@@ -48,8 +48,13 @@
 #include "index/graph/laser/qg/qg_updater.hpp"
 #include "index/graph/vamana/vamana_builder.hpp"
 #include "index/graph/vamana/vamana_writer.hpp"
+#include "bench_laser_update_sift_support.hpp"
 
 namespace {
+
+using alaya::laser::bench::MappedFloatMatrix;
+using alaya::laser::bench::apply_cache_cap_pages;
+using alaya::laser::bench::parse_cache_cap_pages;
 
 struct FloatMatrix {
   std::vector<float> data;
@@ -201,6 +206,7 @@ struct Args {
   uint64_t shuffle_seed = 0;
   uint32_t direct = 0;  // 1 = O_DIRECT write fd (P0.1 attribution arm), 0 = buffered (default)
   uint32_t write_cache = 1;  // 0 = immediate per-patch writes (P0.1-era control)
+  size_t cache_cap_pages = 0;  // 0 = retain UpdateParams default
   uint32_t pipeline = 0;     // staged mode only: overlap drain(i) with batch i+1 (2-batch isolation)
   uint32_t stage = 0;        // 1 = stage backlinks + barrier drain; 0 = inline patches into pool
   size_t flush_threads = 0;  // threads for the overlapped flush; 0 = insert_threads
@@ -304,6 +310,8 @@ Args parse(int argc, char **argv) {
       a.direct = std::stoul(v);
     else if (k == "--write_cache")
       a.write_cache = std::stoul(v);
+    else if (k == "--cache_cap_pages")
+      a.cache_cap_pages = parse_cache_cap_pages(v);
     else if (k == "--pipeline")
       a.pipeline = std::stoul(v);
     else if (k == "--stage")
@@ -359,6 +367,14 @@ Args parse(int argc, char **argv) {
     throw std::runtime_error("--mixed_full_rate is required for the 25/50 token-bucket legs");
   }
   return a;
+}
+
+void flush_update_pool(alaya::laser::QGUpdater &upd, size_t num_threads, bool explicit_cache_cap) {
+  upd.flush(num_threads);
+  // The default bench allocator tuning deliberately retains large arenas for
+  // throughput. Under an explicit RAM-scan cap, return pages released by the
+  // pool's high->low watermark eviction to the OS at each batch barrier.
+  if (explicit_cache_cap) ::malloc_trim(0);
 }
 
 int do_build(const Args &a) {
@@ -421,7 +437,7 @@ int do_build(const Args &a) {
 }
 
 int do_insert(const Args &a) {
-  FloatMatrix base = read_fbin(a.base);
+  MappedFloatMatrix base(a.base);
   if (a.from + a.count > base.n) {
     throw std::runtime_error("insert range exceeds base file");
   }
@@ -457,11 +473,14 @@ int do_insert(const Args &a) {
   p.direct_io = a.direct != 0;
   p.write_cache = a.write_cache != 0;
   p.stage_backlinks = a.stage != 0;
+  apply_cache_cap_pages(a.cache_cap_pages, p);
   alaya::laser::QGUpdater upd(qg, p);
   const int ins_threads = static_cast<int>(std::max<size_t>(1, a.insert_threads));
   std::cout << "[insert] batch=" << a.batch << " insert_threads=" << ins_threads
-            << " direct_io=" << (upd.direct_io() ? 1 : 0) << "\n";
+            << " direct_io=" << (upd.direct_io() ? 1 : 0)
+            << " cache_cap_pages=" << upd.cache_cap_pages() << "\n";
   const size_t fl_threads = a.flush_threads == 0 ? a.insert_threads : a.flush_threads;
+  const bool explicit_cache_cap = a.cache_cap_pages != 0;
   auto t0 = std::chrono::steady_clock::now();
   // Two-batch pipeline: while batch k's searches run, batch k-1's staged
   // backlinks drain on a helper thread. publish(k-1) happens only after that
@@ -487,15 +506,18 @@ int do_insert(const Args &a) {
       upd.insert_with_id(base.row(a.from + static_cast<uint64_t>(i)),
                          static_cast<alaya::laser::PID>(a.n + static_cast<uint64_t>(i)));
     }
+    if (a.shuffle_seed == 0) base.discard_rows(a.from + start, a.from + end);
     if (pending.valid()) {
       pending.get();
       if (a.shuffle_seed == 0) upd.publish(pending_publish);
     }
     if (a.pipeline != 0) {
-      pending = std::async(std::launch::async, [&upd, fl_threads] { upd.flush(fl_threads); });
+      pending = std::async(std::launch::async, [&upd, fl_threads, explicit_cache_cap] {
+        flush_update_pool(upd, fl_threads, explicit_cache_cap);
+      });
       pending_publish = a.n + end;
     } else {
-      upd.flush(fl_threads);
+      flush_update_pool(upd, fl_threads, explicit_cache_cap);
       if (a.shuffle_seed == 0) upd.publish(a.n + end);
     }
     if (end / 10000 != start / 10000) {
@@ -539,7 +561,7 @@ int do_insert(const Args &a) {
 // next `count` unseen vectors, `runs` rounds; masked recall after each round.
 // Live set after round r: ids [r*count, n + r*count) minus nothing else.
 int do_churn(const Args &a) {
-  FloatMatrix base = read_fbin(a.base);
+  MappedFloatMatrix base(a.base);
   FloatMatrix query = read_fbin(a.query);
   IntMatrix gt = read_ibin(a.gt);
   const uint32_t dim = base.dim;
@@ -578,13 +600,18 @@ int do_churn(const Args &a) {
   p.write_cache = a.write_cache != 0;
   p.stage_backlinks = a.stage != 0;
   p.maintain_indegree = a.garden != 0;
+  apply_cache_cap_pages(a.cache_cap_pages, p);
   alaya::laser::QGUpdater upd(qg, p);
   if (a.garden != 0) upd.init_indegree(a.insert_threads);
-  std::cout << "[churn] direct_io=" << (upd.direct_io() ? 1 : 0) << "\n";
+  std::cout << "[churn] direct_io=" << (upd.direct_io() ? 1 : 0)
+            << " cache_cap_pages=" << upd.cache_cap_pages()
+            << " cache_low_pages=" << upd.cache_cap_pages() / 2 << "\n";
   std::vector<uint32_t> results(static_cast<size_t>(query.n) * a.topk);
   const std::vector<int> query_groups = read_query_groups(a.query_groups, query.n);
   const uint32_t ef_eval = a.efs.empty() ? 100 : a.efs[0];
   const int ins_threads = static_cast<int>(std::max<size_t>(1, a.insert_threads));
+  const size_t fl_threads = a.flush_threads == 0 ? a.insert_threads : a.flush_threads;
+  const bool explicit_cache_cap = a.cache_cap_pages != 0;
   std::vector<alaya::laser::PID> source_to_pid(base.n, alaya::laser::kPidMax);
   for (size_t source = 0; source < a.n; ++source) {
     source_to_pid[source] = static_cast<alaya::laser::PID>(source);
@@ -641,22 +668,20 @@ int do_churn(const Args &a) {
     };
     std::cout << "round," << round << ",recall,"
               << (total == 0 ? 0.0 : static_cast<double>(hits) / static_cast<double>(total))
-              << ",qps," << qps << ",live," << upd.live_count()
-              << ",free_fills," << s.free_slot_fills << ",evictions," << s.evictions
-              << ",est_skips," << s.est_skips << ",forced," << s.forced_links
-              << ",indeg_p1," << pct(0.01) << ",indeg_p5," << pct(0.05)
-              << ",indeg_p50," << pct(0.50) << ",file_pages," << upd.file_pages()
-              << ",freed," << s.freed_slots - last_round_stats.freed_slots
-              << ",reused," << s.reused_slots - last_round_stats.reused_slots
-              << ",live_frac,"
+              << ",qps," << qps << ",live," << upd.live_count() << ",free_fills,"
+              << s.free_slot_fills << ",evictions," << s.evictions << ",est_skips," << s.est_skips
+              << ",forced," << s.forced_links << ",indeg_p1," << pct(0.01) << ",indeg_p5,"
+              << pct(0.05) << ",indeg_p50," << pct(0.50) << ",file_pages," << upd.file_pages()
+              << ",pool_pages," << upd.pool_pages() << ",freed,"
+              << s.freed_slots - last_round_stats.freed_slots << ",reused,"
+              << s.reused_slots - last_round_stats.reused_slots << ",live_frac,"
               << (upd.allocated_points() == 0
                       ? 0.0
                       : static_cast<double>(upd.live_count()) / upd.allocated_points());
     if (!query_groups.empty()) {
       for (size_t g = 0; g < 3; ++g) {
-        const double value = group_total[g] == 0
-                                 ? -1
-                                 : static_cast<double>(group_hits[g]) / group_total[g];
+        const double value =
+            group_total[g] == 0 ? -1 : static_cast<double>(group_hits[g]) / group_total[g];
         std::cout << ",recall_g" << g << "," << value;
       }
     }
@@ -683,6 +708,7 @@ int do_churn(const Args &a) {
     auto tc0 = std::chrono::steady_clock::now();
     if (a.consolidate != 0 || a.reuse != 0) {
       upd.consolidate(a.insert_threads, a.r_target, a.reuse != 0);
+      if (explicit_cache_cap) flush_update_pool(upd, fl_threads, true);
     }
     auto tc1 = std::chrono::steady_clock::now();
     const auto garden_before = upd.stats();
@@ -700,12 +726,12 @@ int do_churn(const Args &a) {
       else
         throw std::runtime_error("bad --garden_policy " + a.garden_policy);
       upd.garden(a.insert_threads, gp);
+      if (explicit_cache_cap) flush_update_pool(upd, fl_threads, true);
     }
     auto tg1 = std::chrono::steady_clock::now();
     const auto garden_after = upd.stats();
     const uint64_t ins_base = a.n + r * a.count;
     auto t0 = std::chrono::steady_clock::now();
-    const size_t fl_threads = a.flush_threads == 0 ? a.insert_threads : a.flush_threads;
     std::future<void> pending;
     uint64_t pending_publish = 0;
     std::vector<uint64_t> insert_order(a.count);
@@ -730,8 +756,9 @@ int do_churn(const Args &a) {
         }
         source_to_pid[source] = pid;
       }
+      if (a.shuffle_seed == 0) base.discard_rows(ins_base + start, ins_base + end);
       if (a.reuse != 0) {
-        upd.flush(fl_threads);
+        flush_update_pool(upd, fl_threads, explicit_cache_cap);
         upd.publish(upd.allocated_points());
         continue;
       }
@@ -740,10 +767,12 @@ int do_churn(const Args &a) {
         if (a.shuffle_seed == 0) upd.publish(pending_publish);
       }
       if (a.pipeline != 0) {
-        pending = std::async(std::launch::async, [&upd, fl_threads] { upd.flush(fl_threads); });
+        pending = std::async(std::launch::async, [&upd, fl_threads, explicit_cache_cap] {
+          flush_update_pool(upd, fl_threads, explicit_cache_cap);
+        });
         pending_publish = ins_base + end;
       } else {
-        upd.flush(fl_threads);
+        flush_update_pool(upd, fl_threads, explicit_cache_cap);
         if (a.shuffle_seed == 0) upd.publish(ins_base + end);
       }
     }
@@ -757,8 +786,8 @@ int do_churn(const Args &a) {
               << " insert_qps=" << a.count / std::chrono::duration<double>(t1 - t0).count()
               << " consolidate_s=" << std::chrono::duration<double>(tc1 - tc0).count()
               << " garden_s=" << std::chrono::duration<double>(tg1 - tg0).count()
-              << " gardened_rows="
-              << garden_after.gardened_rows - garden_before.gardened_rows << "\n";
+              << " gardened_rows=" << garden_after.gardened_rows - garden_before.gardened_rows
+              << "\n";
     if ((r + 1) % a.checkpoint_every == 0) {
       upd.checkpoint();
     } else {
@@ -1006,7 +1035,7 @@ void write_mixed_csv(const Args &a, const std::vector<MixedPhaseMetrics> &phases
 }
 
 int do_mixed(const Args &a) {
-  FloatMatrix base = read_fbin(a.base);
+  MappedFloatMatrix base(a.base);
   FloatMatrix query = read_fbin(a.query);
   IntMatrix gt = read_ibin(a.gt);
   if (query.n == 0 || gt.n != query.n || base.dim != query.dim) {
@@ -1044,17 +1073,18 @@ int do_mixed(const Args &a) {
   p.write_cache = a.write_cache != 0;
   p.stage_backlinks = a.stage != 0;
   p.maintain_indegree = true;
+  apply_cache_cap_pages(a.cache_cap_pages, p);
   alaya::laser::QGUpdater upd(qg, p);
   upd.init_indegree(a.insert_threads);
 
-  const double target_rate =
-      a.mixed_rate_pct == 25 || a.mixed_rate_pct == 50
-          ? a.mixed_full_rate * static_cast<double>(a.mixed_rate_pct) / 100.0
-          : 0.0;
+  const double target_rate = a.mixed_rate_pct == 25 || a.mixed_rate_pct == 50
+                                 ? a.mixed_full_rate * static_cast<double>(a.mixed_rate_pct) / 100.0
+                                 : 0.0;
   uint64_t source_cursor = a.from;
   const uint64_t source_end = a.from + a.count;
   const int insert_threads = static_cast<int>(std::max<size_t>(1, a.insert_threads));
   const size_t flush_threads = a.flush_threads == 0 ? a.insert_threads : a.flush_threads;
+  const bool explicit_cache_cap = a.cache_cap_pages != 0;
 
   auto insert_window = [&]() -> uint64_t {
     const auto deadline = std::chrono::steady_clock::now() +
@@ -1067,8 +1097,7 @@ int do_mixed(const Args &a) {
     TokenBucket bucket(target_rate);
     uint64_t inserted = 0;
     while (std::chrono::steady_clock::now() < deadline && source_cursor < source_end) {
-      const size_t batch_cap =
-          a.mixed_rate_pct == 100 ? a.batch : std::min<size_t>(a.batch, 512);
+      const size_t batch_cap = a.mixed_rate_pct == 100 ? a.batch : std::min<size_t>(a.batch, 512);
       const uint64_t batch_n = std::min<uint64_t>(batch_cap, source_end - source_cursor);
       const uint64_t pid_base = upd.allocated_points();
       if (pid_base != source_cursor) {
@@ -1081,8 +1110,9 @@ int do_mixed(const Args &a) {
         upd.insert_with_id(base.row(source),
                            static_cast<alaya::laser::PID>(pid_base + static_cast<uint64_t>(i)));
       }
-      upd.flush(flush_threads);
+      flush_update_pool(upd, flush_threads, explicit_cache_cap);
       upd.publish(pid_base + batch_n);
+      base.discard_rows(source_cursor, source_cursor + batch_n);
       source_cursor += batch_n;
       inserted += batch_n;
     }
@@ -1092,14 +1122,8 @@ int do_mixed(const Args &a) {
 
   std::unordered_set<alaya::laser::PID> dead(upd.deleted().begin(), upd.deleted().end());
   std::vector<MixedPhaseMetrics> phases;
-  phases.push_back(measure_mixed_phase("pure_insert",
-                                       false,
-                                       upd,
-                                       query,
-                                       gt,
-                                       a,
-                                       dead,
-                                       insert_window));
+  phases.push_back(
+      measure_mixed_phase("pure_insert", false, upd, query, gt, a, dead, insert_window));
 
   std::vector<alaya::laser::PID> scheduled_delete;
   std::unordered_set<alaya::laser::PID> delete_boundary = dead;
@@ -1109,30 +1133,24 @@ int do_mixed(const Args &a) {
     const auto id = static_cast<alaya::laser::PID>(raw);
     if (delete_boundary.insert(id).second) scheduled_delete.push_back(id);
   }
-  phases.push_back(measure_mixed_phase(
-      "insert_delete",
-      false,
-      upd,
-      query,
-      gt,
-      a,
-      delete_boundary,
-      [&]() -> uint64_t {
-        for (alaya::laser::PID id : scheduled_delete) upd.tombstone(id);
-        dead = delete_boundary;
-        return insert_window();
-      }));
+  phases.push_back(measure_mixed_phase("insert_delete",
+                                       false,
+                                       upd,
+                                       query,
+                                       gt,
+                                       a,
+                                       delete_boundary,
+                                       [&]() -> uint64_t {
+                                         for (alaya::laser::PID id : scheduled_delete)
+                                           upd.tombstone(id);
+                                         dead = delete_boundary;
+                                         return insert_window();
+                                       }));
 
-  phases.push_back(measure_mixed_phase(
-      "consolidate",
-      true,
-      upd,
-      query,
-      gt,
-      a,
-      dead,
-      [&]() -> uint64_t {
+  phases.push_back(
+      measure_mixed_phase("consolidate", true, upd, query, gt, a, dead, [&]() -> uint64_t {
         upd.consolidate(a.insert_threads, a.r_target, a.reuse != 0);
+        if (explicit_cache_cap) flush_update_pool(upd, flush_threads, true);
         return 0;
       }));
 
@@ -1147,17 +1165,19 @@ int do_mixed(const Args &a) {
     gp.policy = alaya::laser::GardenParams::Policy::kRandom;
   else
     throw std::runtime_error("bad --garden_policy " + a.garden_policy);
-  phases.push_back(measure_mixed_phase(
-      "garden", true, upd, query, gt, a, dead, [&]() -> uint64_t {
-        upd.garden(a.insert_threads, gp);
-        return 0;
-      }));
+  phases.push_back(measure_mixed_phase("garden", true, upd, query, gt, a, dead, [&]() -> uint64_t {
+    upd.garden(a.insert_threads, gp);
+    if (explicit_cache_cap) flush_update_pool(upd, flush_threads, true);
+    return 0;
+  }));
 
   upd.checkpoint();
   write_mixed_csv(a, phases);
   std::cout << "[mixed] rate_pct=" << a.mixed_rate_pct << " query_threads=" << a.query_threads
             << " inserted=" << source_cursor - a.from << " final_watermark=" << upd.num_points()
-            << " direct_io=" << (upd.direct_io() ? 1 : 0) << "\n";
+            << " direct_io=" << (upd.direct_io() ? 1 : 0)
+            << " cache_cap_pages=" << upd.cache_cap_pages() << " pool_pages=" << upd.pool_pages()
+            << "\n";
   return 0;
 }
 
@@ -1258,14 +1278,12 @@ int do_eval(const Args &a) {
       const double new_recall =
           new_total == 0 ? 0.0 : static_cast<double>(new_hits) / static_cast<double>(new_total);
       // new_total stays in per-run units for cross-config sanity checks.
-      std::cout << ",new_recall=" << new_recall
-                << ",new_total=" << new_total / run_recalls.size();
+      std::cout << ",new_recall=" << new_recall << ",new_total=" << new_total / run_recalls.size();
     }
     if (!query_groups.empty()) {
       for (size_t g = 0; g < 3; ++g) {
-        const double value = group_total[g] == 0
-                                 ? -1
-                                 : static_cast<double>(group_hits[g]) / group_total[g];
+        const double value =
+            group_total[g] == 0 ? -1 : static_cast<double>(group_hits[g]) / group_total[g];
         std::cout << "," << value;
       }
     }
@@ -1283,16 +1301,17 @@ int do_eval(const Args &a) {
 }  // namespace
 
 int main(int argc, char **argv) {
-  // The updater's staged-backlink drain makes millions of short-lived
-  // (often aligned) allocations per batch; glibc's default heap trim/grow
-  // cycling serializes all threads on mprotect/mmap_sem (measured: drain
-  // 10.9s -> 5.1s at 64T with these settings). See docs §9.2.
-  mallopt(M_TRIM_THRESHOLD, 1 << 30);
-  mallopt(M_TOP_PAD, 1 << 28);
-  mallopt(M_MMAP_THRESHOLD, 1 << 30);
-
   try {
     const Args a = parse(argc, argv);
+    // The updater's staged-backlink drain makes millions of short-lived
+    // (often aligned) allocations per batch; glibc's default heap trim/grow
+    // cycling serializes all threads on mprotect/mmap_sem (measured: drain
+    // 10.9s -> 5.1s at 64T with these settings). See docs §9.2. An explicit
+    // pool cap selects the RAM-scan regime instead: small arena padding and
+    // prompt trimming make evicted pool pages leave anonymous RSS.
+    mallopt(M_TRIM_THRESHOLD, a.cache_cap_pages == 0 ? 1 << 30 : 1 << 20);
+    mallopt(M_TOP_PAD, a.cache_cap_pages == 0 ? 1 << 28 : 1 << 20);
+    mallopt(M_MMAP_THRESHOLD, 1 << 30);
     if (a.mode == "build") {
       return do_build(a);
     }

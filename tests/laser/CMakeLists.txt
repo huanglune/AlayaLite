@@ -124,6 +124,20 @@ alaya_add_test(
   LABELS laser
 )
 
+# Bench-only fbin mmap view used by update modes under cgroup RAM caps.
+alaya_cc_target(
+  test_bench_laser_update_sift_support
+  BARE GTEST
+  SRCS test_bench_laser_update_sift_support.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_bench_laser_update_sift_support
+  TARGET test_bench_laser_update_sift_support
+  LABELS laser
+)
+
 # SIFT-scale update experiment harness (build / insert / delete / eval modes).
 # Not a ctest — run manually; see the usage string in the source.
 alaya_cc_target(

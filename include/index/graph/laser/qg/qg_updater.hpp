@@ -468,6 +468,10 @@ class QGUpdater {
   /** @brief True when writes go through the O_DIRECT fd (false = buffered fallback). */
   [[nodiscard]] bool direct_io() const { return direct_io_; }
 
+  /** Current resident update-pool size and its configured high watermark. */
+  [[nodiscard]] size_t pool_pages() const { return write_cache_.total_pages(); }
+  [[nodiscard]] size_t cache_cap_pages() const { return params_.cache_cap_pages; }
+
   /** @brief Snapshot of the (atomic) counters. */
   [[nodiscard]] UpdateStats stats() const {
     UpdateStats s;
