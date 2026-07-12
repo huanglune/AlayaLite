@@ -114,7 +114,7 @@ class PageReaderContract : public testing::TestWithParam<PageReaderBackend> {
   }
 };
 
-#if defined(__linux__)
+#if defined(__linux__) && defined(ALAYA_LASER_USE_LIBAIO) && ALAYA_LASER_USE_LIBAIO
 INSTANTIATE_TEST_SUITE_P(AllBackends,
                          PageReaderContract,
                          testing::Values(PageReaderBackend::sync,
@@ -281,7 +281,7 @@ TEST_P(PageReaderContract, EmptyAwaitableDoesNotUseExecutor) {
   EXPECT_TRUE(executor.empty());
 }
 
-#if defined(__linux__)
+#if defined(__linux__) && defined(ALAYA_LASER_USE_LIBAIO) && ALAYA_LASER_USE_LIBAIO
 TEST(LibaioPageReaderTest, RejectsMisalignedDirectIo) {
   TemporaryFile file;
   LibaioPageReader reader(file.path());

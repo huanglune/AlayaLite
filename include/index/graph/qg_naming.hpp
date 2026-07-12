@@ -4,8 +4,10 @@
 
 #pragma once
 
-#include "index/graph/laser/qg/qg_builder.hpp"
 #include "index/graph/qg/qg_builder.hpp"
+#if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER
+  #include "index/graph/laser/qg/qg_builder.hpp"
+#endif
 
 // These facade names disambiguate AlayaLite's two unrelated QG surfaces without
 // changing their historical names or physical include paths.
@@ -21,10 +23,12 @@ using Quantizer = ::alaya::RaBitQQuantizer<DataType>;
 
 namespace alaya::disk_laser_qg {
 
+#if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER
 using Builder = ::alaya::laser::QGBuilder;
 using Factor = ::alaya::laser::Factor;
 using Graph = ::alaya::laser::QuantizedGraph;
 using Query = ::alaya::laser::QGQuery;
 using Scanner = ::alaya::laser::QGScanner;
+#endif
 
 }  // namespace alaya::disk_laser_qg

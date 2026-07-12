@@ -6,7 +6,7 @@
 
 #include <memory>
 
-#if defined(__linux__)
+#if defined(__linux__) && defined(ALAYA_LASER_USE_LIBAIO) && ALAYA_LASER_USE_LIBAIO
   #include "storage/io/backends/libaio_page_reader.hpp"
 #endif
 #include "storage/io/backends/threadpool_page_reader.hpp"
@@ -26,7 +26,7 @@ enum class PageReaderBackend : std::uint8_t { sync, libaio, threadpool, io_uring
     case PageReaderBackend::threadpool:
       return std::make_unique<ThreadpoolPageReader>(path, options);
     case PageReaderBackend::libaio:
-#if defined(__linux__)
+#if defined(__linux__) && defined(ALAYA_LASER_USE_LIBAIO) && ALAYA_LASER_USE_LIBAIO
       return std::make_unique<LibaioPageReader>(path, options);
 #else
       throw std::runtime_error("libaio PageReader is unavailable on this platform");
