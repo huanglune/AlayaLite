@@ -100,10 +100,12 @@ vectors instead of entering its out-of-range path.
 
 ## Memory QG Gate 5 result
 
-`QgSegment<RaBitQSpace<...>>` owns the space containing QG adjacency, raw
-vectors, quantized neighbor codes, factors, entry point, and its search
-executor. It exposes typed-tensor `build`, `open`, `search`, `batch_search`,
-`save`, `stats`, `descriptor() noexcept`, and `into_any`. It satisfies
+`QgSegment<RaBitQSpace<...>>` owns a `detail::QgGraph` containing the QG
+adjacency authority and entry point, plus the `RaBitQSpace` containing raw
+vectors, quantized neighbor codes, factors, the retained format-v1 graph
+slots, and its search executor. It exposes typed-tensor `build`, `open`,
+`search`, `batch_search`, `save`, `stats`, `descriptor() noexcept`, and
+`into_any`. It satisfies
 `Searchable`, `BatchSearchable`, `Saveable`, and `StatsProvider`, is reentrant
 for concurrent search, and explicitly does not satisfy `Mutable`.
 
@@ -111,9 +113,24 @@ The segment consumes `BuildContext`, `OpenContext`, and `SearchContext`.
 `Descriptor.algorithm_id` and `engine_factory_id` are the stable core `qg`
 identity (`5`), and preprocessing is reported as engine-quantized. `save` uses
 the logical artifact name `qg` and returns schema version 1 / format version 1;
-`open` also accepts the former logical name `quant`. Both operations delegate
-to the retained `RaBitQSpace` codec, so existing one-file memory QG artifacts
-remain openable and save/open/save is byte-stable.
+`open` also accepts the former logical name `quant`. Both operations retain the
+`RaBitQSpace` codec, so existing one-file memory QG artifacts remain openable
+and save/open/save is byte-stable.
+
+Task Z4 (2026-07-12) completed the design §7.1 / §9.7 ownership handoff without
+changing format v1. That format interleaves each node's neighbor IDs with its
+raw vector, packed codes, and factors, so `detail::QgGraph` uses a zero-copy
+adjacency view over the retained neighbor-ID codec slots. It owns the graph API
+used by Segment build, validation, and search, and stores the authoritative
+entry point. `RaBitQSpace::ep_` is refreshed from that authority on save and is
+otherwise retained as a serialization/legacy mirror. The default
+`QgBuilderKernel<RaBitQSpace>` and `GraphSearchJob<RaBitQSpace>` specializations
+still access `RaBitQSpace` directly, preserving their source and object layout
+for the feature-off `legacy_qg_model` path. Segment build/search instantiate
+those retained kernels over `detail::QgSegmentSpaceView`, which delegates
+vector and quantization operations to `RaBitQSpace` and graph operations to
+`detail::QgGraph`. No rotator, factor, fastscan, packed-code, neighbor-ID layout,
+or prefetch position changed.
 
 The former public `index/graph/qg/qg_builder.hpp` signature is deleted. The
 retained construction implementation is
@@ -216,7 +233,7 @@ of this audit.
 | HNSW | Segment (`Graph::data_storage_` plus `OverlayGraph::lists_`) | Segment (`OverlayGraph::ep_`) | `SearchSpace` / `BuildSpace` owned by Segment | 2/3: graph and entry point are outside Space; vectors remain in Space |
 | NSG | Segment (`Graph::data_storage_`) | Segment (`Graph::eps_`) | `SearchSpace` / `BuildSpace` owned by Segment | 2/3: graph and entry point are outside Space; vectors remain in Space |
 | Fusion | Segment (`Graph::data_storage_` plus retained overlay when HNSW supplies it) | Segment (`OverlayGraph::ep_`, otherwise `Graph::eps_`) | `SearchSpace` / `BuildSpace` owned by Segment | 2/3: graph and entry point are outside Space; vectors remain in Space |
-| memory QG | Segment transitively owns one `RaBitQSpace`; adjacency is physically in `RaBitQSpace::storage_` | physically `RaBitQSpace::ep_` | physically the same `RaBitQSpace::storage_` (plus quantized neighbor data) | 0/3 physically peeled: all three responsibilities remain co-located in Space |
+| memory QG | Segment (`detail::QgGraph`, with a zero-copy view over the format-v1 neighbor-ID slots in `RaBitQSpace::storage_`) | Segment (`detail::QgGraph::entry_point_`); `RaBitQSpace::ep_` is only the v1 codec/legacy mirror | `RaBitQSpace` (`storage_`, including raw vectors and quantized neighbor data) | 2/3 as of Task Z4 (2026-07-12): adjacency authority and entry point are in Segment; vectors remain in Space |
 | Vamana-memory | Segment (`VamanaReader::graph_`) | Segment (`VamanaReader::start_`) | Segment (`VamanaMemSegment::vectors_`), with no Space object | 3/3 for the audited responsibilities |
 
 ## Per-row registry handoff
@@ -277,6 +294,11 @@ independent searchability evidence exists.
 4. Implement `open` as a factory returning a fully initialized segment. Keep
    the old codec as a versioned reader; do not expose default-construct plus
    `load` as the new lifecycle.
+   If a frozen codec interleaves graph bytes with vector/quantization bytes,
+   transfer graph authority through a Segment-owned zero-copy view and keep
+   codec fields only as serialization/legacy mirrors; do not duplicate the
+   adjacency or perturb the hot layout merely to make physical buffers
+   separate.
 5. Implement `search` and `batch_search` against `TypedTensorView` and the
    caller-owned response. Convert internal node IDs to `core::SegmentRowId`,
    fill offsets/count/status/completeness without valid sentinels, and never
