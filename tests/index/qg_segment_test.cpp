@@ -37,6 +37,12 @@ namespace {
 
 using Space = RaBitQSpace<>;
 using Segment = QgSegment<Space>;
+using QgGraph = typename Segment::GraphType;
+using SegmentSpaceView = typename Segment::SpaceViewType;
+
+static_assert(!std::same_as<QgGraph, Space>);
+static_assert(::alaya::Space<SegmentSpaceView>);
+static_assert(is_rabitq_space_v<SegmentSpaceView>);
 
 template <typename T>
 concept CompleteQgLifecycle = requires(typename T::BuildInput input,
@@ -220,6 +226,45 @@ TEST_F(QgSegmentTest, RetainedCodecAndLegacyReaderRoundTripByteForByte) {
       std::span<const core::ArtifactLocation>(roundtrip_locations)};
   ASSERT_TRUE(reopened->save(roundtrip_writer, {}, manifest).ok());
   EXPECT_EQ(read_bytes(segment_path), read_bytes(roundtrip_path));
+}
+
+TEST_F(QgSegmentTest, SegmentOwnsGraphViewAndEntryPointWhileSpaceRetainsCodecBytes) {
+  auto graph = detail::QgSegmentBridge<Space>::graph(*segment_);
+  auto legacy_space = detail::QgSegmentBridge<Space>::space(*segment_);
+  ASSERT_NE(graph, nullptr);
+  ASSERT_NE(legacy_space, nullptr);
+
+  // Adjacency remains zero-copy in the interleaved v1 codec slots, but the
+  // Segment owns the graph object through which Segment build/search operate.
+  EXPECT_EQ(graph->get_edges(0), legacy_space->get_edges(0));
+  EXPECT_EQ(graph->get_ep(), legacy_space->get_ep());
+
+  SearchCall before(data_.data(), 1, kDim, 8, 64);
+  ASSERT_TRUE(segment_->search(before.request).ok());
+  const auto owned_entry = graph->get_ep();
+  legacy_space->set_ep((owned_entry + 1) % kRows);
+  EXPECT_EQ(graph->get_ep(), owned_entry);
+  EXPECT_NE(graph->get_ep(), legacy_space->get_ep());
+
+  SearchCall after(data_.data(), 1, kDim, 8, 64);
+  ASSERT_TRUE(segment_->search(after.request).ok());
+  ASSERT_EQ(before.counts, after.counts);
+  for (std::size_t hit = 0; hit < before.counts[0]; ++hit) {
+    EXPECT_EQ(static_cast<std::uint64_t>(before.hits[hit].row_id),
+              static_cast<std::uint64_t>(after.hits[hit].row_id));
+    EXPECT_EQ(std::bit_cast<std::uint32_t>(before.hits[hit].score),
+              std::bit_cast<std::uint32_t>(after.hits[hit].score));
+  }
+
+  // save() serializes the Segment authority back into the legacy v1 field.
+  const auto artifact_path = (root_ / "owned-entry.qg").string();
+  const auto locations = artifact_location(artifact_path);
+  core::ArtifactWriter writer{std::span<const core::ArtifactLocation>(locations)};
+  core::ArtifactManifest manifest;
+  ASSERT_TRUE(segment_->save(writer, {}, manifest).ok());
+  Space loaded;
+  loaded.load(artifact_path);
+  EXPECT_EQ(loaded.get_ep(), owned_entry);
 }
 
 TEST_F(QgSegmentTest, LoadedArtifactMatchesLegacySearchBitForBitAndMeetsRecallSanity) {

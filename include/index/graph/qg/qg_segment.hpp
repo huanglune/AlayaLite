@@ -21,6 +21,7 @@
 #include "core/any_segment.hpp"
 #include "executor/jobs/graph_search_job.hpp"
 #include "index/graph/qg/detail/qg_builder_kernel.hpp"
+#include "index/graph/qg/detail/qg_graph.hpp"
 #include "space/rabitq_space.hpp"
 #include "space/space_concepts.hpp"
 
@@ -71,6 +72,9 @@ class QgSegment {
   using IDType = typename SpaceType::IDTypeAlias;
   using BuildOptions = QgBuildOptions;
   using SearchExtension = QgSearchExtension;
+  using GraphType = detail::QgGraph<SpaceType>;
+  using SpaceViewType = detail::QgSegmentSpaceView<SpaceType>;
+  using SearchJobType = GraphSearchJob<SpaceViewType>;
   using Gate5MemoryGraphSegmentTag = void;
   using QgSegmentTag = void;
 
@@ -102,11 +106,14 @@ class QgSegment {
     validate_build_options(options);
     validate_build_budget(input, context);
 
-    detail::QgBuilderKernel<SpaceType> builder(input.space, options.thread_count);
+    auto graph = std::make_shared<GraphType>(input.space);
+    auto space_view = std::make_shared<SpaceViewType>(*input.space, *graph);
+    detail::QgBuilderKernel<SpaceViewType> builder(space_view, options.thread_count);
     builder.set_ef_build(options.ef_build);
     builder.build_graph();
-    validate_loaded_space(*input.space);
-    return std::unique_ptr<QgSegment>(new QgSegment(std::move(input.space)));
+    validate_loaded_graph(*input.space, *graph);
+    return std::unique_ptr<QgSegment>(
+        new QgSegment(std::move(input.space), std::move(graph), std::move(space_view)));
   }
 
   static auto open(core::ArtifactView artifact,
@@ -117,8 +124,11 @@ class QgSegment {
     validate_open_budget(artifact_path, context);
     auto space = std::make_shared<SpaceType>();
     space->load(artifact_path);
-    validate_loaded_space(*space);
-    return std::unique_ptr<QgSegment>(new QgSegment(std::move(space)));
+    auto graph = std::make_shared<GraphType>(space, space->get_ep());
+    auto space_view = std::make_shared<SpaceViewType>(*space, *graph);
+    validate_loaded_graph(*space, *graph);
+    return std::unique_ptr<QgSegment>(
+        new QgSegment(std::move(space), std::move(graph), std::move(space_view)));
   }
 
   [[nodiscard]] auto descriptor() const noexcept -> core::Descriptor {
@@ -158,6 +168,10 @@ class QgSegment {
             const core::SaveOptions &,
             core::ArtifactManifest &manifest) const -> core::Status {
     const auto artifact_path = required_output_artifact(writer);
+    // QgSegment owns the authoritative entry point. Refresh the retained v1
+    // codec mirror before serialization in case an internal legacy view was
+    // used while the Segment was alive.
+    space_->set_ep(graph_->get_ep());
     space_->save(artifact_path);
     artifact_ = core::Artifact(kArtifactName,
                                static_cast<std::uint64_t>(std::filesystem::file_size(
@@ -205,10 +219,13 @@ class QgSegment {
     std::vector<IDType> ids;
   };
 
-  explicit QgSegment(std::shared_ptr<SpaceType> space)
+  explicit QgSegment(std::shared_ptr<SpaceType> space,
+                     std::shared_ptr<GraphType> graph,
+                     std::shared_ptr<SpaceViewType> space_view)
       : space_(std::move(space)),
-        search_job_(std::make_shared<GraphSearchJob<SpaceType>>(space_, nullptr, nullptr, space_)) {
-  }
+        graph_(std::move(graph)),
+        space_view_(std::move(space_view)),
+        search_job_(std::make_shared<SearchJobType>(space_view_, nullptr, nullptr, space_view_)) {}
 
   static void validate_build_input(const BuildInput &input) {
     if (!core::is_current_struct(input)) {
@@ -245,14 +262,14 @@ class QgSegment {
     }
   }
 
-  static void validate_loaded_space(SpaceType &space) {
+  static void validate_loaded_graph(SpaceType &space, const GraphType &graph) {
     const auto rows = static_cast<core::RowCount>(space.get_data_num());
     if (rows <= SpaceType::kDegreeBound || space.get_dim() == 0 ||
-        static_cast<core::RowCount>(space.get_ep()) >= rows) {
+        static_cast<core::RowCount>(graph.get_ep()) >= rows) {
       throw std::runtime_error("Invalid QG artifact");
     }
     for (core::RowCount row = 0; row < rows; ++row) {
-      const auto *edges = space.get_edges(static_cast<IDType>(row));
+      const auto *edges = graph.get_edges(static_cast<IDType>(row));
       for (std::size_t edge = 0; edge < SpaceType::kDegreeBound; ++edge) {
         if (static_cast<core::RowCount>(edges[edge]) >= rows) {
           throw std::runtime_error("Invalid QG artifact neighbor ID");
@@ -490,7 +507,9 @@ class QgSegment {
   }
 
   std::shared_ptr<SpaceType> space_;
-  std::shared_ptr<GraphSearchJob<SpaceType>> search_job_;
+  std::shared_ptr<GraphType> graph_;
+  std::shared_ptr<SpaceViewType> space_view_;
+  std::shared_ptr<SearchJobType> search_job_;
   mutable core::Artifact artifact_{};
 };
 

@@ -7,13 +7,14 @@
 
 namespace alaya::detail {
 
-// Temporary access for legacy Python hybrid/materialized-view plumbing.  QG's
-// graph is embedded in RaBitQSpace, so the bridge exposes only that owned space.
+// Temporary access for legacy Python hybrid/materialized-view plumbing. The
+// Space accessor preserves those consumers; Segment-native code uses graph().
 template <typename SpaceType>
 struct QgSegmentBridge {
   using Segment = QgSegment<SpaceType>;
 
   static auto space(const Segment &segment) { return segment.space_; }
+  static auto graph(const Segment &segment) { return segment.graph_; }
 };
 
 }  // namespace alaya::detail
