@@ -70,9 +70,11 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -225,6 +227,9 @@ struct UpdateParams {
   size_t alpha_check_max = 16;  // captured neighbors tested per reverse edge
   size_t max_points = 0;        // page-version table capacity; 0 -> 2*N + 4096
   size_t splice_rerank = 4;     // consolidation: FastScan-recalled candidates reranked exactly
+  bool direct_io = true;        // O_DIRECT data fd (buffered pwrite serializes on the
+                                // ext4 inode lock); falls back to buffered when the
+                                // filesystem rejects O_DIRECT (e.g. tmpfs)
 };
 
 class QGUpdater {
@@ -250,10 +255,22 @@ class QGUpdater {
     if (qg_.index_file_name_.empty()) {
       throw std::logic_error("QGUpdater: call load_disk_index() first");
     }
+    // Reads stay buffered: the OS page cache serves the ~ef_insert row reads
+    // per insert from RAM. Writes get their own O_DIRECT fd — buffered pwrite
+    // serializes on the ext4 exclusive inode lock (~287k pwrites/s measured),
+    // while aligned O_DIRECT overwrites of allocated blocks take it shared.
+    // The per-page seqlock orders the buffered read against the completed DIO
+    // write (the version flips to even only after pwrite returned, and the DIO
+    // write invalidates the stale page-cache range), so mixed-mode IO on the
+    // two fds stays coherent inside the process.
     fd_ = ::open(qg_.index_file_name_.c_str(), O_RDWR);
     if (fd_ < 0) {
       throw std::runtime_error("QGUpdater: cannot open for write: " + qg_.index_file_name_ +
                                " errno=" + std::to_string(errno));
+    }
+    if (params_.direct_io) {
+      wfd_ = ::open(qg_.index_file_name_.c_str(), O_RDWR | O_DIRECT);
+      direct_io_ = wfd_ >= 0;  // unsupported (e.g. tmpfs) -> buffered writes on fd_
     }
   }
 
@@ -264,9 +281,15 @@ class QGUpdater {
     if (fd_ >= 0) {
       ::close(fd_);
     }
+    if (wfd_ >= 0) {
+      ::close(wfd_);
+    }
   }
 
   [[nodiscard]] size_t num_points() const { return committed_.load(std::memory_order_acquire); }
+
+  /** @brief True when writes go through the O_DIRECT fd (false = buffered fallback). */
+  [[nodiscard]] bool direct_io() const { return direct_io_; }
 
   /** @brief Snapshot of the (atomic) counters. */
   [[nodiscard]] UpdateStats stats() const {
@@ -543,6 +566,41 @@ class QGUpdater {
     [[nodiscard]] const float *raw() const { return vec.data(); }
   };
 
+  /// O_DIRECT alignment unit (buffer address, file offset, and length).
+  static constexpr size_t kDioAlign = 4096;
+
+  /// Page-aligned IO buffer; O_DIRECT rejects unaligned user memory.
+  struct AlignedBuf {
+    explicit AlignedBuf(size_t len) {
+      if (::posix_memalign(reinterpret_cast<void **>(&p_), kDioAlign, len) != 0) {
+        throw std::bad_alloc();
+      }
+    }
+    AlignedBuf(const AlignedBuf &) = delete;
+    auto operator=(const AlignedBuf &) -> AlignedBuf & = delete;
+    ~AlignedBuf() { ::free(p_); }
+    [[nodiscard]] char *data() const { return p_; }
+
+   private:
+    char *p_ = nullptr;
+  };
+
+  /// Thread-local aligned bounce buffer for unaligned caller memory (public
+  /// read_node_page/assemble_row users, tests) under O_DIRECT.
+  [[nodiscard]] static char *tls_bounce(size_t len) {
+    thread_local std::unique_ptr<char, decltype(&::free)> buf(nullptr, &::free);
+    thread_local size_t cap = 0;
+    if (cap < len) {
+      char *p = nullptr;
+      if (::posix_memalign(reinterpret_cast<void **>(&p), kDioAlign, len) != 0) {
+        throw std::bad_alloc();
+      }
+      buf.reset(p);
+      cap = len;
+    }
+    return buf.get();
+  }
+
   [[nodiscard]] uint64_t page_offset(PID id) const {
     return kSectorLen + page_size_ * (static_cast<uint64_t>(id) / npp_);
   }
@@ -600,9 +658,15 @@ class QGUpdater {
   }
 
   void write_at(uint64_t off, const char *buf, size_t len) {
+    const int fd = direct_io_ ? wfd_ : fd_;
+    if (direct_io_ && (reinterpret_cast<uintptr_t>(buf) & (kDioAlign - 1)) != 0) {
+      char *b = tls_bounce(len);
+      std::memcpy(b, buf, len);
+      buf = b;
+    }
     size_t done = 0;
     while (done < len) {
-      const ssize_t w = ::pwrite(fd_, buf + done, len - done, static_cast<off_t>(off + done));
+      const ssize_t w = ::pwrite(fd, buf + done, len - done, static_cast<off_t>(off + done));
       if (w < 0) {
         throw std::runtime_error("QGUpdater: pwrite failed errno=" + std::to_string(errno));
       }
@@ -642,7 +706,7 @@ class QGUpdater {
     sp.insert(qg_.entry_point_, FLT_MAX);
 
     std::vector<float> appro(deg_);
-    std::vector<char> page(page_size_);
+    AlignedBuf page(page_size_);
     while (sp.has_next()) {
       const PID cur = sp.pop();
       if (visited.count(cur) != 0) {
@@ -728,11 +792,13 @@ class QGUpdater {
   }
 
   void append_node(PID id, const char *row) {
-    std::vector<char> page(page_size_);
+    AlignedBuf page(page_size_);
     const std::lock_guard<std::mutex> guard(page_lock(id));
     if (npp_ > 1) {
       read_at(page_offset(id), page.data(), page_size_);
       stats_.patch_page_reads++;
+    } else {
+      std::memset(page.data(), 0, page_size_);  // deterministic tail padding
     }
     std::memcpy(page.data() + node_offset_in_page(id), row, node_len_);
     write_node_page(id, page.data());
@@ -750,7 +816,7 @@ class QGUpdater {
     if (deleted_.count(v.id) != 0) {
       return false;
     }
-    std::vector<char> page(page_size_);
+    AlignedBuf page(page_size_);
     const std::lock_guard<std::mutex> guard(page_lock(v.id));
     read_at(page_offset(v.id), page.data(), page_size_);
     stats_.patch_page_reads++;
@@ -854,7 +920,7 @@ class QGUpdater {
     if (deleted_.count(v.id) != 0) {
       return false;
     }
-    std::vector<char> page(page_size_);
+    AlignedBuf page(page_size_);
     const std::lock_guard<std::mutex> guard(page_lock(v.id));
     read_at(page_offset(v.id), page.data(), page_size_);
     stats_.patch_page_reads++;
@@ -872,7 +938,7 @@ class QGUpdater {
     };
     std::vector<Cand> cands;
     cands.reserve(deg_ + 1);
-    std::vector<char> nb_page(page_size_);
+    AlignedBuf nb_page(page_size_);
     for (size_t j = 0; j < deg_; ++j) {
       const PID nb = ids[j];
       if ((nb >= snapshot && nb != x_id) || is_ghost_slot(row, j) || nb == v.id ||
@@ -948,7 +1014,7 @@ class QGUpdater {
 
   /** @brief Purge/splice one live row; see consolidate(). */
   void consolidate_row(PID u, size_t snapshot, size_t r_target) {
-    std::vector<char> page(page_size_);
+    AlignedBuf page(page_size_);
     const std::lock_guard<std::mutex> guard(page_lock(u));
     read_at(page_offset(u), page.data(), page_size_);
     char *row = page.data() + node_offset_in_page(u);
@@ -981,8 +1047,8 @@ class QGUpdater {
     uq.query_prepare(qg_.rotator_, qg_.scanner_);
     uq.set_sqr_qr(u_res_sqr);
 
-    std::vector<char> d_page(page_size_);
-    std::vector<char> cand_page(page_size_);
+    AlignedBuf d_page(page_size_);
+    AlignedBuf cand_page(page_size_);
     std::vector<float> appro(deg_);
     bool dirty = false;
     for (size_t j : dead_slots) {
@@ -1129,7 +1195,9 @@ class QGUpdater {
 
   QuantizedGraph &qg_;
   UpdateParams params_;
-  int fd_ = -1;
+  int fd_ = -1;             // buffered fd: all reads (page-cache served) + fallback writes
+  int wfd_ = -1;            // O_DIRECT write fd (parallel inode-shared overwrites)
+  bool direct_io_ = false;  // wfd_ opened successfully and writes routed to it
   std::atomic<size_t> committed_;
   size_t dim_, res_dim_, full_dim_, pd_, deg_, node_len_, page_size_, npp_;
   std::unordered_set<PID> deleted_;

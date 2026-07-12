@@ -135,6 +135,7 @@ struct Args {
   float alpha = 1.2F;
   uint64_t seed = 42;
   std::string arm = "alpha";  // none|evict|alpha|full
+  uint32_t direct = 1;        // 1 = O_DIRECT updater fd (fallback buffered), 0 = buffered
   std::vector<uint32_t> efs = {60, 80, 100, 150, 200, 300};
 };
 
@@ -174,6 +175,7 @@ Args parse(int argc, char **argv) {
     else if (k == "--insert_threads") a.insert_threads = std::stoull(v);
     else if (k == "--consolidate") a.consolidate = std::stoul(v);
     else if (k == "--r_target") a.r_target = std::stoul(v);
+    else if (k == "--direct") a.direct = std::stoul(v);
     else if (k == "--alpha") a.alpha = std::stof(v);
     else if (k == "--seed") a.seed = std::stoull(v);
     else if (k == "--arm") a.arm = v;
@@ -254,9 +256,11 @@ int do_insert(const Args &a) {
             << " range=[" << a.from << "," << a.from + a.count << ")\n";
 
   p.max_points = a.n + a.count + 1024;
+  p.direct_io = a.direct != 0;
   alaya::laser::QGUpdater upd(qg, p);
   const int ins_threads = static_cast<int>(std::max<size_t>(1, a.insert_threads));
-  std::cout << "[insert] batch=" << a.batch << " insert_threads=" << ins_threads << "\n";
+  std::cout << "[insert] batch=" << a.batch << " insert_threads=" << ins_threads
+            << " direct_io=" << (upd.direct_io() ? 1 : 0) << "\n";
   auto t0 = std::chrono::steady_clock::now();
   for (uint64_t start = 0; start < a.count; start += a.batch) {
     const uint64_t end = std::min(a.count, start + a.batch);
@@ -319,7 +323,9 @@ int do_churn(const Args &a) {
   else throw std::runtime_error("bad --arm " + a.arm);
 
   p.max_points = a.n + a.runs * a.count + 1024;
+  p.direct_io = a.direct != 0;
   alaya::laser::QGUpdater upd(qg, p);
+  std::cout << "[churn] direct_io=" << (upd.direct_io() ? 1 : 0) << "\n";
   std::vector<uint32_t> results(static_cast<size_t>(query.n) * a.topk);
   const uint32_t ef_eval = a.efs.empty() ? 100 : a.efs[0];
   const int ins_threads = static_cast<int>(std::max<size_t>(1, a.insert_threads));
