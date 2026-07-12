@@ -79,15 +79,15 @@ Fusion remains a composition of the detail HNSW and NSG construction kernels;
 it does not copy either graph-building implementation. The former public
 `nsg_builder.hpp` and `fusion_graph.hpp` signatures are deleted. Their retained
 construction code now lives under `index/graph/nsg/detail` and
-`index/graph/fusion/detail`, where the still-unmigrated RaBitQ rows may compose
-it without restoring a public builder API.
+`index/graph/fusion/detail` for remaining internal consumers; neither detail
+kernel is restored as a public builder API.
 
 The Python dispatch matrix now sends all 20 non-RaBitQ NSG and Fusion rows to
 `nsg_segment/nsg` and `fusion_segment/fusion`. `NONE` builds and searches one
 raw space, including its scalar storage when enabled. `SQ4` and `SQ8` build the
 graph in a scalar-free raw build space and search in the selected quantized
 space; scalar-enabled rows attach scalar storage to that search space. The
-three RaBitQ rows remain on `legacy_qg_model/qg`.
+three RaBitQ rows are governed by the separate pinned QG mapping below.
 
 This is an intentional compatibility change: `index_type="nsg"` and
 `index_type="fusion"` now build the declared algorithm instead of silently
@@ -97,6 +97,45 @@ default on. Disabling either bit selects that row's recorded
 without changing the other engine. The retained NSG kernel seeds a fixed
 64-neighbor NN-Descent graph, so both segments reject builds with fewer than 65
 vectors instead of entering its out-of-range path.
+
+## Memory QG Gate 5 result
+
+`QgSegment<RaBitQSpace<...>>` owns the space containing QG adjacency, raw
+vectors, quantized neighbor codes, factors, entry point, and its search
+executor. It exposes typed-tensor `build`, `open`, `search`, `batch_search`,
+`save`, `stats`, `descriptor() noexcept`, and `into_any`. It satisfies
+`Searchable`, `BatchSearchable`, `Saveable`, and `StatsProvider`, is reentrant
+for concurrent search, and explicitly does not satisfy `Mutable`.
+
+The segment consumes `BuildContext`, `OpenContext`, and `SearchContext`.
+`Descriptor.algorithm_id` and `engine_factory_id` are the stable core `qg`
+identity (`5`), and preprocessing is reported as engine-quantized. `save` uses
+the logical artifact name `qg` and returns schema version 1 / format version 1;
+`open` also accepts the former logical name `quant`. Both operations delegate
+to the retained `RaBitQSpace` codec, so existing one-file memory QG artifacts
+remain openable and save/open/save is byte-stable.
+
+The former public `index/graph/qg/qg_builder.hpp` signature is deleted. The
+retained construction implementation is
+`index/graph/qg/detail/qg_builder_kernel.hpp`; legacy fallback,
+materialized-view, executor, benchmark, and characterization consumers use
+that detail-only kernel until their own abstraction steps.
+
+The three legacy Python rows
+`{hnsw,nsg,fusion} x quant=rabitq` deliberately retain their historical
+behavior of building QG. Their current identity is `qg_segment/qg`; disabling
+the independent `qg_segment` feature bit selects
+`legacy_qg_model/qg`. Scalar-off and scalar-on variants use the same handoff.
+This is an introspection correction, not a request-type behavior change, and
+does not invent HNSW-over-RaBitQ. The complete pinned table and Gate 9 rule are
+in [Memory QG legacy dispatch contract](memory-qg-legacy-dispatch.md).
+
+Production QG construction retains historical random sources, so independent
+builds are not byte-deterministic. Differential coverage therefore uses the
+documented fallback: a legacy artifact is opened by `QgSegment`, save/open/save
+bytes are compared, and Segment versus direct search results are checked bit
+for bit. A fixed-rotator/fixed-neighbor QG v1 golden separately provides a
+reproducible format hash without changing the quantization implementation.
 
 ## Per-row registry handoff
 

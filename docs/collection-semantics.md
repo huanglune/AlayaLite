@@ -13,7 +13,7 @@ the named public object; “adapter” means that another object supplies it.
 | `Index` backed by NSG | adapter: generic `GraphUpdateJob` | adapter | yes | yes | as above | yes | same facade behavior; NSG does not publish an algorithm-specific online-update protocol |
 | `Index` backed by Fusion | adapter: generic `GraphUpdateJob` | adapter | yes | yes | as above | yes | same facade behavior; Fusion is a builder composition, not a distinct persisted graph format |
 | KNNG / `NndescentImpl` | no stable public mutation API | no | graph result can be saved | graph result can be loaded | no | no direct SDK object | build accepts a thread count; it is an NSG build tool |
-| memory QG (`index/graph/qg`) | no stable public mutation API | no | partial/self-owned artifact behavior | partial | no | yes, its own path | internal parallel build/search; no facade-level safety promise |
+| memory QG (`index/graph/qg`) | no | no | yes, one logical `qg` artifact | yes | legacy adapter when scalar storage is enabled | yes | immutable `QgSegment`; reentrant search-only profile |
 | Vamana-memory builder/reader/search | no | no | builder writes Vamana files | reader opens files | no | yes | static after build; readers/searchers are used concurrently by callers |
 | `DiskANNIndex` static | no | no | `build` creates a file family | `load` | no | single/batch/pipeline | concurrent searches use a bounded scratch pool |
 | `DiskANNIndex` updatable | yes | yes | `flush_pages` / `flush` | `load(updatable=true)` | no | single/batch/pipeline | dark-until-publish inserts, tombstone snapshots and internal locks define visibility; no SDK-wide guarantee |
@@ -22,18 +22,19 @@ the named public object; “adapter” means that another object supplies it.
 | `DiskCollection(disk_laser)` segment | no (`add` is unsupported) | no | import only | `open` | no | yes | imported segment is immutable; searcher is intended for concurrent search |
 | high-level `Collection` | yes / upsert | yes by item id/filter | yes | yes | yes | vector, hybrid and scalar | delegates to one memory `Index`; no cross-operation transaction or thread-safety contract |
 
-The 33 generated memory combinations are HNSW/NSG/Fusion only.  KNNG, memory
-QG, Vamana, DiskANN and the three `DiskCollection` engines do not go through
-that dispatch table.
+The 33 generated memory combinations retain HNSW/NSG/Fusion as the legacy
+declared names. Three `quant=rabitq` rows actually select memory QG and report
+`qg_segment/qg`; KNNG, Vamana, DiskANN and the three `DiskCollection` engines
+do not go through that dispatch table.
 
 ## State and visibility
 
 ### Memory `Index` and high-level `Collection`
 
-`python/include/index.hpp::PyIndex<Builder, Space>` owns the graph, vector/quant
-spaces, jobs, scalar RocksDB storage, and (when a recovery root can be derived)
-`RecoveryManager`.  Recovery is therefore attached to the Python adapter, not
-to a C++ Collection abstraction.
+`python/include/index.hpp::PyIndex<Runtime, Space>` owns the Segment or legacy
+runtime, vector/quant spaces, jobs, scalar RocksDB storage, and (when a
+recovery root can be derived) `RecoveryManager`. Recovery is therefore
+attached to the Python adapter, not to a C++ Collection abstraction.
 
 For a successful memory mutation today:
 
@@ -72,7 +73,7 @@ of acknowledged/searchable/durable.
 
 | owner | current artifact family |
 |---|---|
-| memory facade | graph file, data file, optional quant file, JSON schema at the Python save layer; recovery additionally has `CURRENT`, snapshot manifest/files, RocksDB checkpoint and WAL |
+| memory facade | graph file, data file, optional quant file; memory QG retains its one-file `rabitq.data` family; recovery additionally has `CURRENT`, snapshot manifest/files, RocksDB checkpoint and WAL |
 | generic `Graph` | graph header/body plus optional overlay graph data |
 | DiskFlat segment | `manifest.txt`, `ids.u64.bin`, `vectors.f32.bin` |
 | Vamana segment | Flat files plus `graph.index` |
@@ -96,7 +97,7 @@ checking in 33 redundant copies.
 | NSG memory | facade behavior + 33-row dispatch assertion | header/codegen construction list | shared generic Graph/Space format |
 | Fusion memory | facade behavior + 33-row dispatch assertion | header/codegen construction list | shared generic Graph/Space format |
 | KNNG | documented (not a public Python Index) | graph public surface | shared generic Graph result format |
-| memory QG | documented native behavior | QG remains covered by existing closure/CTest | LASER/QG fixture family |
+| memory QG | three pinned legacy declarations, scalar off/on, and feature fallback | `QgSegment` lifecycle/capability/TSan tests | independent reproducible memory QG v1 family |
 | Vamana-memory | documented native behavior | disk/Vamana public surface | Vamana `graph.index` corpus |
 | DiskANN | no public Python entry | direct `DiskANNIndex` instantiation | complete small DiskANN directory |
 | DiskCollection Flat | yes | direct collection/searcher types | collection + Flat segment |
@@ -107,7 +108,7 @@ checking in 33 redundant copies.
 Regenerate and compare artifacts with:
 
 ```bash
-cmake --build build/Release --target artifact_diskann_generator
+cmake --build build/Release --target artifact_diskann_generator artifact_memory_qg_generator
 PYTHONPATH=python/src:build/Release/python \
   python scripts/golden/generate_artifact_baseline.py
 ```

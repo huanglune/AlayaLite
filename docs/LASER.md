@@ -352,8 +352,9 @@ tracked by PR #88.
 
 ### Relationship To The In-Memory Graph
 
-AlayaLite's **memory_qg** builder lives under
-`include/index/graph/qg/qg_builder.hpp`; LASER's disk graph is
+AlayaLite's **memory_qg** public surface is
+`include/index/graph/qg/qg_segment.hpp` (with its retained build kernel under
+`include/index/graph/qg/detail/`); LASER's disk graph is
 **disk_laser_qg** under `include/index/graph/laser/`. They are different
 components and their serialized RaBitQ formats are not interchangeable. See
 [`rabitq-formats.md`](rabitq-formats.md) for the format and consumer contract.

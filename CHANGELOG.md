@@ -14,7 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   earlier releases silently built HNSW. NSG and Fusion now use immutable
   contract-v3 segments with byte-compatible legacy artifact readers, SQ4/SQ8
   search spaces, scalar-enabled variants, and independent feature-bit fallback
-  to the former HNSW behavior. The three RaBitQ rows are unchanged.
+  to the former HNSW behavior.
+- Legacy Python memory rows declared as `hnsw`, `nsg`, or `fusion` with
+  `quantization_type="rabitq"` still build the same memory QG as before. They
+  now run through immutable `QgSegment`, report the honest `qg_segment/qg`
+  runtime identity and QG descriptor/artifact fingerprint, and fall back to
+  `legacy_qg_model/qg` when the QG feature bit is disabled. This changes
+  introspection, not index behavior. Gate 9's canonical `Collection` entry will
+  require an explicit QG declaration while preserving this legacy-wrapper
+  compatibility quirk.
 
 ## [1.0.3] - 2026-07-07
 
