@@ -29,7 +29,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -56,6 +58,8 @@
 #include "index/graph/diskann/disk_layout.hpp"
 #include "index/graph/diskann/disk_page_cache.hpp"
 #include "index/graph/laser/utils/memory.hpp"
+#include "storage/io/page_awaitable.hpp"
+#include "storage/io/page_reader_factory.hpp"
 #include "storage/io/uring_reactor.hpp"
 
 namespace alaya::diskann {
@@ -70,7 +74,8 @@ class DiskPageIO {
 
   DiskPageIO(const std::string &index_path,
              const DiskLayoutGeometry &geom,
-             size_t page_cache_capacity = 0)
+             size_t page_cache_capacity = 0,
+             alaya::storage::io::PageReader *page_reader = nullptr)
       : geom_(geom) {
     try {
       // Tiny caches keep the single-cache eviction semantics (one shard per
@@ -88,13 +93,28 @@ class DiskPageIO {
         shards_.push_back(std::make_unique<Shard>(shard_capacity, geom_.page_size));
       }
       open_rw(index_path);  // sets fd_ + file_size_
+#if defined(__linux__)
+      if (page_reader == nullptr) {
+        owned_page_reader_ = alaya::storage::io::
+            open_page_reader(index_path,
+                             alaya::storage::io::ReaderOptions{alaya::storage::io::OpenMode::direct,
+                                                               128},
+                             alaya::storage::io::PageReaderBackend::libaio);
+        page_reader = owned_page_reader_.get();
+      }
+#endif
+      page_reader_ = page_reader;
     } catch (...) {
+      if (owned_page_reader_ != nullptr) owned_page_reader_->shutdown();
       close_fd();
       throw;
     }
   }
 
-  ~DiskPageIO() { close_fd(); }
+  ~DiskPageIO() {
+    if (owned_page_reader_ != nullptr) owned_page_reader_->shutdown();
+    close_fd();
+  }
 
   DiskPageIO(const DiskPageIO &) = delete;
   DiskPageIO &operator=(const DiskPageIO &) = delete;
@@ -417,8 +437,8 @@ class DiskPageIO {
     }
     {
       Shard &shard = shard_for(geom_.get_page_offset(id));
-      std::lock_guard<std::mutex> lock(shard.mutex);
-      load_page_for_write_locked(shard, id);
+      std::unique_lock<std::mutex> lock(shard.mutex);
+      load_page_for_write_locked(shard, id, lock);
       char *rec = shard.page_buf + geom_.offset_to_node(id);
       std::memset(rec, 0, geom_.node_len);  // clear stale bytes (esp. a reused slot's tail)
       pack_node_record(rec, coords, nbr_ids, n_nbrs, geom_.dim);
@@ -434,8 +454,8 @@ class DiskPageIO {
       throw std::invalid_argument("DiskPageIO::write_node_neighbors: n_nbrs exceeds max_degree");
     }
     Shard &shard = shard_for(geom_.get_page_offset(id));
-    std::lock_guard<std::mutex> lock(shard.mutex);
-    read_page_locked(shard, id);  // must read first to preserve coords + co-resident nodes
+    std::unique_lock<std::mutex> lock(shard.mutex);
+    load_existing_page_for_write(shard, id, lock);
     char *rec = shard.page_buf + geom_.offset_to_node(id);
     const uint64_t coords_bytes = geom_.dim * sizeof(float);
     // Zero the whole neighbor region first so no stale trailing ids survive.
@@ -522,6 +542,15 @@ class DiskPageIO {
     std::mutex mutex;
     DiskPageCache cache;
     std::unordered_map<uint64_t, uint64_t> versions;
+    struct FillState {
+      ~FillState() { std::free(buffer); }
+      uint64_t version = 0;
+      char *buffer = nullptr;
+      bool done = false;
+      std::exception_ptr error;
+      std::condition_variable cv;
+    };
+    std::unordered_map<uint64_t, std::shared_ptr<FillState>> fills;
     char *page_buf = nullptr;   ///< RMW scratch, guarded by mutex
     char *flush_buf = nullptr;  ///< aligned bounce buffer for O_DIRECT cache flushes
   };
@@ -869,11 +898,11 @@ class DiskPageIO {
   /// current content (existing page: RMW) or zeros (freshly extended page).
   /// Caller holds the shard mutex; extension takes file_mutex_ (shard -> file
   /// lock order, always).
-  void load_page_for_write_locked(Shard &shard, uint32_t id) {
+  void load_page_for_write_locked(Shard &shard, uint32_t id, std::unique_lock<std::mutex> &lock) {
     const uint64_t page_off = geom_.get_page_offset(id);
     const uint64_t page_end = page_off + geom_.page_size;
     if (page_end <= file_size_.load(std::memory_order_acquire)) {
-      read_page_locked(shard, id);
+      load_existing_page_for_write(shard, id, lock);
       return;
     }
     {
@@ -884,8 +913,12 @@ class DiskPageIO {
         return;
       }
     }
-    read_page_locked(shard, id);  // another thread extended past us meanwhile
+    load_existing_page_for_write(shard, id, lock);  // another thread extended meanwhile
   }
+
+  /// Populate shard.page_buf for a write-side RMW without holding the shard
+  /// mutex across the device read. Same-page misses share one FillState.
+  void load_existing_page_for_write(Shard &shard, uint32_t id, std::unique_lock<std::mutex> &lock);
 
   // ---- platform-gated syscalls (Linux O_DIRECT) ----
   void open_rw(const std::string &path);
@@ -906,6 +939,8 @@ class DiskPageIO {
   std::unordered_map<uint32_t, std::vector<float>> vec_cache_;
   mutable std::mutex vec_mutex_;
   std::mutex file_mutex_;  ///< serializes ftruncate extension (after shard lock)
+  std::unique_ptr<alaya::storage::io::PageReader> owned_page_reader_;
+  alaya::storage::io::PageReader *page_reader_ = nullptr;  ///< borrowed, or owned above
 #if defined(__linux__)
   UringReactor *reactor_ = nullptr;  ///< not owned; nullptr = blocking pread paths
 #endif
@@ -926,6 +961,94 @@ inline void DiskPageIO::open_rw(const std::string &path) {
     throw std::runtime_error("DiskPageIO::open_rw: fstat failed " + path);
   }
   file_size_.store(static_cast<uint64_t>(st.st_size), std::memory_order_release);
+}
+
+inline void DiskPageIO::load_existing_page_for_write(Shard &shard,
+                                                     uint32_t id,
+                                                     std::unique_lock<std::mutex> &lock) {
+  const uint64_t page_off = geom_.get_page_offset(id);
+  for (;;) {
+    if (shard.cache.read(page_off, shard.page_buf, geom_.page_size)) {
+      return;
+    }
+
+    std::shared_ptr<Shard::FillState> fill;
+    bool leader = false;
+    const auto pending = shard.fills.find(page_off);
+    if (pending != shard.fills.end()) {
+      fill = pending->second;
+    } else {
+      fill = std::make_shared<Shard::FillState>();
+      fill->version = page_version_locked(shard, page_off);
+      const auto constraints = page_reader_->constraints();
+      if (geom_.page_size % constraints.size_alignment != 0 ||
+          page_off % constraints.offset_alignment != 0 ||
+          ::posix_memalign(reinterpret_cast<void **>(&fill->buffer),
+                           constraints.buffer_alignment,
+                           geom_.page_size) != 0) {
+        throw std::runtime_error("DiskPageIO: update page does not meet PageReader alignment");
+      }
+      shard.fills.emplace(page_off, fill);
+      leader = true;
+    }
+
+    if (!leader) {
+      fill->cv.wait(lock, [&fill] {
+        return fill->done;
+      });
+      if (fill->error != nullptr) std::rethrow_exception(fill->error);
+      continue;
+    }
+
+    lock.unlock();
+    std::exception_ptr read_error;
+    try {
+      alaya::storage::io::ReadRequest request{page_off,
+                                              page_off,
+                                              std::span<std::byte>(reinterpret_cast<std::byte *>(
+                                                                       fill->buffer),
+                                                                   geom_.page_size)};
+      const auto results =
+          alaya::storage::io::read_pages_blocking(*page_reader_, std::span(&request, 1));
+      if (results.size() != 1 || results[0].status != alaya::storage::io::ReadStatus::ok ||
+          results[0].bytes != geom_.page_size) {
+        throw std::runtime_error(
+            "DiskPageIO::load_existing_page_for_write: failed PageReader "
+            "read at " +
+            std::to_string(page_off));
+      }
+    } catch (...) {
+      read_error = std::current_exception();
+    }
+    lock.lock();
+
+    // Publish completion before waking followers. Erase only our generation;
+    // the shard lock makes this check defensive rather than racy.
+    const auto current = shard.fills.find(page_off);
+    if (current != shard.fills.end() && current->second == fill) {
+      shard.fills.erase(current);
+    }
+    fill->error = read_error;
+    fill->done = true;
+    fill->cv.notify_all();
+    if (read_error != nullptr) std::rethrow_exception(read_error);
+
+    if (shard.cache.read(page_off, shard.page_buf, geom_.page_size)) {
+      return;  // a concurrent install/write is authoritative
+    }
+    if (page_version_locked(shard, page_off) != fill->version) {
+      continue;  // discard stale device bytes and start/join a new generation
+    }
+    shard.cache.write(page_off,
+                      fill->buffer,
+                      geom_.page_size,
+                      false,
+                      [this, &shard](uint64_t off, const char *page) {
+                        write_page_to_disk(shard, off, page);
+                      });
+    std::memcpy(shard.page_buf, fill->buffer, geom_.page_size);
+    return;
+  }
 }
 
 inline void DiskPageIO::read_page_locked(Shard &shard, uint32_t id) {

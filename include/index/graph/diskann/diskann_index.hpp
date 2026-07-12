@@ -59,10 +59,10 @@
 #include "index/graph/diskann/slot_allocator.hpp"
 #include "index/graph/diskann/tombstone_bitmap.hpp"
 #include "index/graph/laser/utils/concurrent_queue.hpp"
-#include "storage/io/page_reader_factory.hpp"
 #include "index/graph/vamana/robust_prune.hpp"
 #include "index/graph/vamana/vamana_builder.hpp"
 #include "simd/distance_l2.hpp"
+#include "storage/io/page_reader_factory.hpp"
 #include "storage/io/uring_reactor.hpp"
 #include "utils/coro_gate.hpp"
 
@@ -1090,7 +1090,8 @@ class DiskANNIndex {
 
     page_io_ = std::make_unique<DiskPageIO>(path(index_dir, "diskann.index"),
                                             geom_,
-                                            params.page_cache_capacity);
+                                            params.page_cache_capacity,
+                                            reader_.get());
     update_reactor_.reset();
     if (params.update_io != DiskANNUpdateIO::kBlocking) {
       if (alaya::UringReactor::is_available()) {
@@ -2072,6 +2073,10 @@ class DiskANNIndex {
   }
 
   void teardown() {
+    // Update operations are quiesced by the caller. Drop the borrower before
+    // shutting down its PageReader, then drop the reactor raw-pointer target.
+    page_io_.reset();
+    update_reactor_.reset();
     if (reader_) {
       reader_->shutdown();
     }
@@ -2088,8 +2093,6 @@ class DiskANNIndex {
     while (thread_data_pool_.pop() != nullptr) {
     }
     reader_.reset();
-    page_io_.reset();
-    update_reactor_.reset();  // after page_io_: it holds a raw pointer to the reactor
     update_ctx_.clear();
     updatable_ = false;
     loaded_ = false;
