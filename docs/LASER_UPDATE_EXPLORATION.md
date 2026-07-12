@@ -455,3 +455,37 @@ Yi(原版 `~/workspace/alaya-dev/Yi`,SPDK/io_uring 全异步)与其在 AlayaLite
 > 详细版(逐文件/行号证据、Yi 并发协议逐段拆解、各方案风险表、验证门槛全文)
 > 见 `docs/LASER_UPDATE_NEXT_PLAN_YI.md`——codex 独立调研终报,与本节交叉核对
 > 后一致;本节采纳了其两处修正:P0 拆归因臂+页缓存两步、工程量估计以其为准。
+
+## 9. P0 执行记录
+
+### 9.1 P0.1 O_DIRECT 归因臂:判决与意外(2026-07-12)
+
+实现:双 fd——读保持 buffered(OS 页缓存伺服 ~82 页读/插入),写路由到独立
+`O_RDWR|O_DIRECT` fd(`UpdateParams::direct_io`,bench `--direct`);页缓冲全部
+换 4K 对齐 `AlignedBuf`,非对齐公共调用者走线程本地 bounce。seqlock 版本序
+(写完 pwrite 返回后才翻偶,DIO 写自带页缓存失效)保证 buffered 读 + DIO 写
+进程内一致。质量 eval 与 buffered 完全重合(0.965@60 / 0.988@100 / 0.997@200)。
+
+吞吐(SIFT1M 900k+100k,evict 臂 35.8 页写/插入,NVMe ext4):
+
+| 配置 | inserts/s |
+|---|---|
+| buffered(对照,当日复现) | 7439 (64T) |
+| 每补丁同步 DIO,克隆未 sync | 2030 (64T) / 2269 (32T) |
+| 每补丁同步 DIO,克隆后 sync | 5934 (64T) |
+| none 臂 DIO(1 追加写/插入) | **18559** (64T) |
+
+**判决:每补丁同步 O_DIRECT 写不可行,且推翻了"inode 锁是主敌"的原始归因。**
+1. 未 sync 坍塌 3.7×:DIO 写命中脏页缓存区间强制同步回写
+   (`filemap_write_and_wait_range`)——克隆刚 cp 完 3.4GB 全脏。教训:凡 DIO
+   写实验,克隆后必须 `sync`。
+2. sync 后仍输 buffered ~20%:同步设备往返(~25-100µs)压在页锁临界区与插入
+   关键路径里,替代的是 buffered 的 ~µs 级页缓存 memcpy——**内核页缓存本来就是
+   写回缓存**,287k pwrites/s 平台是 buffered 写路径(页拷贝+ilock+脏页记账)的
+   软件成本,不是设备。
+3. 真正的解法与 Yi 一致:P0.2 用户态脏页缓存——热路径零 syscall、批内同页
+   RMW 去重、批末受控 flush(DIO fd 留作 flush 通道)。none 臂 18.6k/s 说明
+   搜索侧上限还在,追加写(含 DIO)无碍。
+
+默认值已回翻 buffered(`direct_io=false`);P0.2 进行中(实现已按简报派发 codex,
+DIO flush 模式选型另有并行诊断)。
