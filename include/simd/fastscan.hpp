@@ -15,6 +15,21 @@ namespace alaya::simd::fastscan {
 
 constexpr std::array<int, 16> kPackedLaneOrder =
     {0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15};
+constexpr std::array<int, 16> kLutPosition =
+    {3, 3, 2, 3, 1, 3, 2, 3, 0, 3, 2, 3, 1, 3, 2, 3};
+
+template <typename T>
+inline void build_lut(size_t dim, const T *ALAYA_RESTRICT query, T *ALAYA_RESTRICT lut) {
+  for (size_t codebook = 0; codebook < (dim >> 2); ++codebook) {
+    lut[0] = 0;
+    for (size_t j = 1; j < 16; ++j) {
+      const size_t lowbit = j & (~j + 1);
+      lut[j] = lut[j - lowbit] + query[kLutPosition[j]];
+    }
+    lut += 16;
+    query += 4;
+  }
+}
 inline void accumulate_generic(size_t dim,
                                const uint8_t *ALAYA_RESTRICT codes,
                                const uint8_t *ALAYA_RESTRICT lut,

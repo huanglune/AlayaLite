@@ -33,6 +33,7 @@
 #include <vector>
 
 #include "utils/platform.hpp"
+#include "simd/fastscan.hpp"
 
 namespace alaya::laser {
 
@@ -148,14 +149,6 @@ inline void pack_codes(size_t padded_dim,
 inline void pack_lut_impl(size_t dim,
                           const uint8_t *ALAYA_RESTRICT byte_query,
                           uint8_t *ALAYA_RESTRICT LUT) {
-  size_t num_codebook = dim >> 2;
-  for (size_t i = 0; i < num_codebook; ++i) {
-    LUT[0] = 0;
-    for (int j = 1; j < 16; ++j) {
-      LUT[j] = LUT[j - LOWBIT(j)] + byte_query[kPos[j]];
-    }
-    LUT += 16;
-    byte_query += 4;
-  }
+  ::alaya::simd::fastscan::build_lut(dim, byte_query, LUT);
 }
 }  // namespace alaya::laser

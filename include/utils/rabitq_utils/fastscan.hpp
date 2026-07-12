@@ -383,15 +383,7 @@ inline void accumulate_and_estimate_distances(const uint8_t *ALAYA_RESTRICT code
 // ! dim % 4 == 0
 template <typename T>
 inline void pack_lut(size_t dim, const T *ALAYA_RESTRICT query, T *ALAYA_RESTRICT lut) {
-  size_t num_codebook = dim >> 2;
-  for (size_t i = 0; i < num_codebook; ++i) {
-    lut[0] = 0;
-    for (size_t j = 1; j < 16; ++j) {
-      lut[j] = lut[j - LOWBIT(j)] + query[kPos[j]];
-    }
-    lut += 16;
-    query += 4;
-  }
+  ::alaya::simd::fastscan::build_lut(dim, query, lut);
 }
 
 }  // namespace alaya::fastscan

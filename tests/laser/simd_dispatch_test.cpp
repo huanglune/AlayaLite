@@ -21,6 +21,7 @@
 #include "index/graph/laser/utils/scalar_quantize.hpp"
 #include "simd/cpu_features.hpp"
 #include "simd/laser_dispatch.hpp"
+#include "utils/rabitq_utils/fastscan.hpp"
 
 namespace alaya::laser {
 namespace {
@@ -171,6 +172,33 @@ TEST(LaserSimdDispatchTest, FastScanAccumulateDifferentialFuzz) {
         EXPECT_EQ(avx512, oracle) << "dim=" << dim << " trial=" << trial;
       }
 #endif
+    }
+  }
+}
+
+TEST(LaserSimdDispatchTest, FastScanLutDifferentialFuzz) {
+  std::mt19937 rng(0x1A7B01DU);
+  std::uniform_int_distribution<int> byte_dist(0, 31);
+  for (size_t dim : {4U, 16U, 64U, 128U, 256U}) {
+    for (size_t trial = 0; trial < 200; ++trial) {
+      std::vector<uint8_t> query(dim);
+      std::generate(query.begin(), query.end(), [&] { return byte_dist(rng); });
+      std::vector<uint8_t> oracle(dim * 4);
+      for (size_t book = 0; book < dim / 4; ++book) {
+        for (size_t mask = 0; mask < 16; ++mask) {
+          uint8_t sum = 0;
+          for (size_t bit = 0; bit < 4; ++bit) {
+            if ((mask & (8U >> bit)) != 0) sum = static_cast<uint8_t>(sum + query[book * 4 + bit]);
+          }
+          oracle[book * 16 + mask] = sum;
+        }
+      }
+      std::vector<uint8_t> memory(oracle.size());
+      std::vector<uint8_t> laser(oracle.size());
+      ::alaya::fastscan::pack_lut(dim, query.data(), memory.data());
+      pack_lut_impl(dim, query.data(), laser.data());
+      EXPECT_EQ(memory, oracle) << "dim=" << dim << " trial=" << trial;
+      EXPECT_EQ(laser, oracle) << "dim=" << dim << " trial=" << trial;
     }
   }
 }
