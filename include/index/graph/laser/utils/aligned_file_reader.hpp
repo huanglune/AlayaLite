@@ -14,6 +14,10 @@
  * - Keeps concrete backend APIs out of QG consumer code
  * - Preserves the 512-byte aligned read contract for all backends
  * - Requires 512-byte alignment for all buffers, offsets, and lengths
+ *
+ * @deprecated Compatibility surface for DiskANN and the Windows IOCP path.
+ * New LASER consumers use storage/io/page_reader.hpp.  Keep this forwarding /
+ * legacy adapter header until the M7 removal window.
  */
 
 #pragma once

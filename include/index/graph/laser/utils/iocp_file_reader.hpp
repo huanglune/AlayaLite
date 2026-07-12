@@ -4,6 +4,8 @@
 
 /**
  * @file iocp_file_reader.hpp
+ * @deprecated Legacy compatibility backend retained for the Windows IOCP path
+ * until storage/io gains IOCP support and the M7 removal window opens.
  * @brief Windows IOCP (I/O Completion Port) AlignedFileReader backend.
  *
  * Counterpart to LinuxAlignedFileReader (libaio) and ThreadPoolFileReader

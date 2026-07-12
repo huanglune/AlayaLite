@@ -4,6 +4,9 @@
 
 #pragma once
 
+// Deprecated compatibility factory. New LASER consumers explicitly select a
+// storage::io::PageReaderBackend; retain this forwarding/legacy seam until M7.
+
 #include <memory>
 
 #include "index/graph/laser/utils/aligned_file_reader.hpp"
