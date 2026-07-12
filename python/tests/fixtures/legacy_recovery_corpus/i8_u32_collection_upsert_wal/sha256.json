@@ -1,0 +1,53 @@
+{
+  "files": {
+    "expected.json": {
+      "bytes": 1283,
+      "sha256": "53add7fd54f6d764de1b77a9aff772c92cfbdc6154f79ce1f81187f10436e145"
+    },
+    "generation.json": {
+      "bytes": 527,
+      "sha256": "a969e952140e83fac8d8c80ebcac822bb4994daca598290aea6eccc6b8e00453"
+    },
+    "recovery/CURRENT": {
+      "bytes": 16,
+      "sha256": "58248130df5b8e47f6c231209acc237b8f91367bd067ba665a576d8d726a9a5f"
+    },
+    "recovery/snapshots/snapshot-legacy/data.snapshot": {
+      "bytes": 2192,
+      "sha256": "79d6d077caf27f9dbe0cf3cea4b9c5dd116c90e359f47435f51f094e54cb8fc7"
+    },
+    "recovery/snapshots/snapshot-legacy/graph.snapshot": {
+      "bytes": 2276,
+      "sha256": "64bdb9393d48e4133486e18bb9255a67324d16e216f349a27eda9789baeeb940"
+    },
+    "recovery/snapshots/snapshot-legacy/manifest.txt": {
+      "bytes": 185,
+      "sha256": "b26f4a62d4d0466ca4c44c77f3009e6ebdbd28ce47308b8509c7df637b375412"
+    },
+    "recovery/snapshots/snapshot-legacy/rocksdb/000008.log": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "recovery/snapshots/snapshot-legacy/rocksdb/000009.sst": {
+      "bytes": 1786,
+      "sha256": "68a538f6b452e4839cfc5735cb6e5b37b83f9ac1fd1cdff0333037c7638e65cc"
+    },
+    "recovery/snapshots/snapshot-legacy/rocksdb/CURRENT": {
+      "bytes": 16,
+      "sha256": "9c283f6e81028b9eb0760d918ee4bc0aa256ed3b926393c1734c760c4bd724fd"
+    },
+    "recovery/snapshots/snapshot-legacy/rocksdb/MANIFEST-000005": {
+      "bytes": 228,
+      "sha256": "9499c44f0c0e2e16da03ae55cd759ff1b38655ad284b13718d63397a34c84b5c"
+    },
+    "recovery/wal.bin": {
+      "bytes": 176,
+      "sha256": "00529fd40818d2b81a52da08fd4dea9628ad4a209b0a5f36f1f38ee19fec5ea9"
+    },
+    "schema.json": {
+      "bytes": 383,
+      "sha256": "e5966496f3ce9b3d7adc2684dbeeaef6838e1e435187f52f5301cbf79dc800f8"
+    }
+  },
+  "format_version": 1
+}

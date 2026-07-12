@@ -1,0 +1,40 @@
+{
+  "expected_applied_through_op_id": 2,
+  "expected_count": 8,
+  "queries": [
+    {
+      "expected_internal_ids": [
+        0
+      ],
+      "topk": 1,
+      "vector": [
+        19,
+        74,
+        22,
+        33,
+        0,
+        3,
+        72,
+        17
+      ]
+    },
+    {
+      "expected_internal_ids": [
+        7
+      ],
+      "topk": 1,
+      "vector": [
+        72,
+        22,
+        57,
+        59,
+        67,
+        67,
+        50,
+        18
+      ]
+    }
+  ],
+  "reader_behavior": "load snapshot at op 1, replay op 2, publish post_recovery snapshot",
+  "wal_after_writer": "one committed insert after snapshot applied through op 1"
+}

@@ -1,0 +1,41 @@
+{
+  "files": {
+    "expected.json": {
+      "bytes": 864,
+      "sha256": "59afc5b26883c4e8cf1296627c5cc7455730177398a2b6210ba677d3f114aeaf"
+    },
+    "generation.json": {
+      "bytes": 514,
+      "sha256": "6385c5c93191b53189814aa3143ba5aad4c190739e5ffc0f9e7463474281f773"
+    },
+    "hnsw_l2_8.index": {
+      "bytes": 2276,
+      "sha256": "b545329baed49336083c3993aaa0f3792f107d4a0b3dfcffcddd7967c6e3a0df"
+    },
+    "raw.data": {
+      "bytes": 2116,
+      "sha256": "3386acf02d5d56b80709f709e5e961f3f238bf13a17906fc949fd54d07af12a0"
+    },
+    "recovery/CURRENT": {
+      "bytes": 16,
+      "sha256": "58248130df5b8e47f6c231209acc237b8f91367bd067ba665a576d8d726a9a5f"
+    },
+    "recovery/snapshots/snapshot-legacy/data.snapshot": {
+      "bytes": 2116,
+      "sha256": "3386acf02d5d56b80709f709e5e961f3f238bf13a17906fc949fd54d07af12a0"
+    },
+    "recovery/snapshots/snapshot-legacy/graph.snapshot": {
+      "bytes": 2276,
+      "sha256": "b545329baed49336083c3993aaa0f3792f107d4a0b3dfcffcddd7967c6e3a0df"
+    },
+    "recovery/snapshots/snapshot-legacy/manifest.txt": {
+      "bytes": 181,
+      "sha256": "faeba1dcc25727e322b73c2101347225df00e97c5836d75ac991c0e877da25de"
+    },
+    "schema.json": {
+      "bytes": 382,
+      "sha256": "05a56cbce6cbd56e26495be7f4107ba2bf773d7cb947575c0d1b9a612103bf0f"
+    }
+  },
+  "format_version": 1
+}
