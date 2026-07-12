@@ -5,6 +5,10 @@
 /**
  * @file threadpool_file_reader.hpp
  * @brief Portable AlignedFileReader backend built from pread and worker threads.
+ *
+ * This AlayaDB.AI implementation follows the AlignedFileReader interface
+ * lineage originating in Microsoft DiskANN; the backend implementation is
+ * original to AlayaLite and remains AGPL-3.0-only.
  */
 
 #pragma once

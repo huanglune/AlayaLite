@@ -23,7 +23,7 @@ class AlayaLiteConan(ConanFile):
     settings = "os", "compiler", "build_type", "arch"
     package_type = "header-library"
     exports = "pyproject.toml"
-    exports_sources = "include/*"
+    exports_sources = "include/*", "LICENSE", "LICENSES/*", "REUSE.toml", "THIRD_PARTY_NOTICES.md"
     platform_tool_requires = "cmake/3.23.5"  # cmake version
 
     def layout(self):
@@ -100,6 +100,16 @@ class AlayaLiteConan(ConanFile):
             src=os.path.join(self.export_sources_folder, "include"),
             dst=os.path.join(self.package_folder, "include"),
         )
+        licenses_dir = os.path.join(self.package_folder, "licenses")
+        copy(self, "LICENSE", src=self.export_sources_folder, dst=licenses_dir)
+        copy(
+            self,
+            "*.txt",
+            src=os.path.join(self.export_sources_folder, "LICENSES"),
+            dst=os.path.join(licenses_dir, "LICENSES"),
+        )
+        copy(self, "REUSE.toml", src=self.export_sources_folder, dst=licenses_dir)
+        copy(self, "THIRD_PARTY_NOTICES.md", src=self.export_sources_folder, dst=licenses_dir)
 
     def package_info(self):
         self.cpp_info.bindirs = []

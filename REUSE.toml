@@ -59,3 +59,32 @@ path = [
 precedence = "override"
 SPDX-FileCopyrightText = "2025 VectorDB.NTU"
 SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = [
+  "include/utils/rabitq_utils/search_utils/epoch_visited.hpp",
+  "include/utils/rabitq_utils/search_utils/visited_pool.hpp",
+  "include/index/graph/laser/qg/qg_builder.hpp",
+  "include/index/graph/laser/qg/qg.hpp",
+  "include/index/graph/laser/quantization/rabitq.hpp",
+  "include/index/graph/laser/utils/array.hpp",
+  "include/index/graph/laser/utils/buffer.hpp",
+  "include/index/graph/laser/utils/io.hpp",
+  "include/index/graph/laser/utils/memory.hpp",
+  "include/index/graph/laser/utils/rotator.hpp",
+  "include/index/graph/laser/utils/stopw.hpp",
+  "include/index/graph/laser/utils/tools.hpp",
+]
+precedence = "override"
+SPDX-FileCopyrightText = ["2025 VectorDB.NTU", "2025 AlayaDB.AI"]
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = [
+  "include/index/graph/laser/utils/aligned_file_reader.hpp",
+  "include/index/graph/laser/utils/aligned_file_reader_factory.hpp",
+  "include/index/graph/laser/utils/iocp_file_reader.hpp",
+]
+precedence = "override"
+SPDX-FileCopyrightText = ["Microsoft Corporation", "2025 AlayaDB.AI"]
+SPDX-License-Identifier = "MIT"
