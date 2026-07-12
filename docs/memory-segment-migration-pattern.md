@@ -5,8 +5,9 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 # Memory graph to Segment migration pattern
 
-HNSW is the reference migration for abstraction step 4. The pattern is a
-direct C++ API replacement: a public builder plus public `Graph` is not kept in
+HNSW is the reference migration for Gate 0 and the first producer adapted to
+the frozen [core contract v3](contract-v3.md) in Gate 2. The pattern is a direct
+C++ API replacement: a public builder plus public `Graph` is not kept in
 parallel with the Segment API.
 
 ## HNSW result
@@ -20,19 +21,27 @@ static std::unique_ptr<HnswSegment> build(
 static std::unique_ptr<HnswSegment> open(
     core::ArtifactView, const core::OpenOptions&, core::OpenContext&);
 
-core::SearchResult search(
-    core::QueryView, const core::SearchOptions&, core::SearchSink) const;
-core::BatchSearchResult batch_search(
-    core::QueryBatchView, const core::SearchOptions&, core::SearchSink) const;
-core::ArtifactManifest save(
-    core::ArtifactWriter&, const core::SaveOptions&) const;
+core::Status search(const core::SearchRequest&) const;
+core::Status batch_search(const core::SearchRequest&) const;
+core::Status save(core::ArtifactWriter&, const core::SaveOptions&,
+                  core::ArtifactManifest&) const;
+core::Status stats(core::SegmentStats&) const noexcept;
 core::Descriptor descriptor() const noexcept;
+static core::Result<core::AnySegment> into_any(
+    std::unique_ptr<HnswSegment>);
 ```
 
-The type satisfies `Searchable`, `BatchSearchable`, and `Persistable`. It does
-not satisfy `Mutable`: `insert` and `erase` are absent rather than implemented
-as unsupported operations. The descriptor therefore reports a sealed memory
-segment.
+The type satisfies `Searchable`, `BatchSearchable`, `Saveable`, and
+`StatsProvider`. It does not satisfy `Mutable`: the complete
+prepare/stage/publish/abort/replay bundle is absent. `Descriptor` reports only
+static identity; row counts and health are returned by `SegmentStats`.
+
+`TypedTensorView` requires the native float32/int8/uint8 scalar type of the
+instantiation. HNSW no longer silently converts float queries into byte
+queries. Search writes flat `SearchHit` values and per-query
+offset/count/status/completeness metadata. The AnySegment registration uses the
+sync runtime adapter, exposes search/batch/save/stats slots, and derives
+`mutable=false` from the absent bundle plus readonly instance configuration.
 
 Artifact views and writers use logical-name mappings (`graph`, `data`, and,
 for a distinct search space, `quant`) instead of an HNSW-specific tuple of
@@ -80,16 +89,18 @@ Use these steps for KNNG/NSG, Fusion, memory QG, and Vamana-memory:
 4. Implement `open` as a factory returning a fully initialized segment. Keep
    the old codec as a versioned reader; do not expose default-construct plus
    `load` as the new lifecycle.
-5. Implement `search` and `batch_search` against caller-owned sinks. Convert
-   internal node IDs to `core::ExternalId`; never expose graph storage or node
-   IDs in the public signature. Batch orchestration belongs in C++, not in a
-   Python loop.
+5. Implement `search` and `batch_search` against `TypedTensorView` and the
+   caller-owned response. Convert internal node IDs to `core::SegmentRowId`,
+   fill offsets/count/status/completeness without valid sentinels, and never
+   expose graph storage in the public signature. Batch orchestration belongs in
+   C++, not in a Python loop.
 6. Implement `save(ArtifactWriter&, SaveOptions)` with logical artifact names
    and return a versioned `ArtifactManifest`. Reuse the old codecs byte for
    byte. Add a manifest file only when the design specifies its durable format.
-7. Add `descriptor() noexcept` and positive static assertions for each real
-   capability. Add negative assertions for tempting but unproven capabilities;
-   never add methods that throw “not supported” merely to satisfy a concept.
+7. Add static `descriptor() noexcept`, dynamic `stats()`, an AnySegment
+   producer, and positive assertions for each real capability. Add negative
+   assertions for tempting but unproven capabilities; never add methods that
+   throw “not supported” merely to satisfy a concept.
 8. Write build/open/search/batch/save contract tests plus legacy-reader and
    legacy-open tests for every raw/quantized artifact family of the graph.
 9. Before declaring mutation, test insertion and deletion for live-entry
