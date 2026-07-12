@@ -370,9 +370,12 @@ inline QuantizedGraph::QuantizedGraph(size_t num,
   node_per_page_ = std::max<size_t>(1, kSectorLen / node_len_);
   page_size_ = (node_per_page_ * node_len_ + kSectorLen - 1) / kSectorLen * kSectorLen;
 
-  if (dimension_ != padded_dim_) {  // Currently only supports dimension that is a power of 2
-                                    // (dimension_ must equal padded_dim_)
-    throw std::invalid_argument("QuantizedGraph: dimension must be a power of two");
+  // FHT/RaBitQ/FastScan operate on padded_dim_; raw vectors and exact-distance
+  // terms keep using dimension_. The rotator zero-fills [dimension_, padded_dim_),
+  // so a non-power-of-two main dimension is a supported padded layout.
+  if (padded_dim_ < dimension_ || padded_dim_ % 64 != 0) {
+    throw std::invalid_argument(
+        "QuantizedGraph: padded dimension must cover the main dimension and be a multiple of 64");
   }
   // The disk write path packs node_per_page_ nodes per page in id order, matching
   // get_page_offset() and offset_to_node().

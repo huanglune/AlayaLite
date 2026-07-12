@@ -30,6 +30,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -183,6 +184,7 @@ struct Args {
   uint32_t R = 64, L = 200, ef_indexing = 200, threads = 64, beam = 16, topk = 10, runs = 3;
   uint32_t vamana_R = 0;  // build: Vamana degree < degree_bound leaves free slots ("headroom")
   uint32_t main_dim = 0;  // 0 -> dim
+  uint32_t pca_preprocessed = 0;  // build: reuse <prefix>_pca_{base.fbin,bin}
   size_t ef_insert = 100, prune_cap = 300, alpha_check_max = 16;
   size_t batch = 4096, insert_threads = 32;
   uint32_t consolidate = 0, r_target = 0;
@@ -264,6 +266,8 @@ Args parse(int argc, char **argv) {
       a.runs = std::stoul(v);
     else if (k == "--main_dim")
       a.main_dim = std::stoul(v);
+    else if (k == "--pca_preprocessed")
+      a.pca_preprocessed = std::stoul(v);
     else if (k == "--ef_insert")
       a.ef_insert = std::stoull(v);
     else if (k == "--prune_cap")
@@ -341,6 +345,9 @@ Args parse(int argc, char **argv) {
   if (a.reuse > 1) {
     throw std::runtime_error("--reuse must be 0 or 1");
   }
+  if (a.pca_preprocessed > 1) {
+    throw std::runtime_error("--pca_preprocessed must be 0 or 1");
+  }
   if (a.query_threads == 0 || a.mixed_ef == 0 || !(a.mixed_seconds > 0)) {
     throw std::runtime_error("mixed query_threads/mixed_ef/mixed_seconds must be positive");
   }
@@ -379,10 +386,30 @@ int do_build(const Args &a) {
   std::cout << "[build] vamana done in " << std::chrono::duration<double>(t1 - t0).count()
             << "s, medoid=" << vb.medoid() << "\n";
 
-  write_fbin(a.prefix + "_pca_base.fbin",
-             base.data.data(),
-             static_cast<int32_t>(base.n),
-             static_cast<int32_t>(dim));
+  const std::string pca_base_path = a.prefix + "_pca_base.fbin";
+  if (a.pca_preprocessed == 0) {
+    write_fbin(pca_base_path,
+               base.data.data(),
+               static_cast<int32_t>(base.n),
+               static_cast<int32_t>(dim));
+  } else {
+    std::ifstream pca_base(pca_base_path, std::ios::binary);
+    int32_t pca_n = 0;
+    int32_t pca_dim = 0;
+    pca_base.read(reinterpret_cast<char *>(&pca_n), sizeof(pca_n));
+    pca_base.read(reinterpret_cast<char *>(&pca_dim), sizeof(pca_dim));
+    const uintmax_t expected_size =
+        8 + static_cast<uintmax_t>(base.n) * dim * sizeof(float);
+    if (!pca_base || pca_n != static_cast<int32_t>(base.n) ||
+        pca_dim != static_cast<int32_t>(dim) ||
+        std::filesystem::file_size(pca_base_path) != expected_size) {
+      throw std::runtime_error("invalid preprocessed PCA base: " + pca_base_path);
+    }
+    if (main_dim < dim && !std::filesystem::exists(a.prefix + "_pca.bin")) {
+      throw std::runtime_error("missing preprocessed PCA params: " + a.prefix + "_pca.bin");
+    }
+    std::cout << "[build] using preprocessed PCA base " << pca_base_path << "\n";
+  }
 
   alaya::laser::QuantizedGraph qg(base.n, a.R, main_dim, dim, a.seed);
   alaya::laser::QGBuilder builder(qg, a.ef_indexing, a.threads);
