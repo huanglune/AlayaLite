@@ -1094,3 +1094,42 @@ live_frac=1;终态双 superblock CRC 正确、50 万 trailer 全扫通过、flag
 - v2 迁移一次,各 cell reflink 克隆;
 - Python 前端(Index.fit)仍有 raw_dim≥128 与 main_dim 2 次幂两道闸,bench 之外
   用到时需同步放开(记入 D 线依赖重构)。
+
+### 17.5 T8 落地:RAM-cap 前置改造完成,cgroup 试跑被容器权限阻塞(2026-07-12,max 档,commit 343e173)
+
+§17.4 的两项前置全部落地,bench 更新模式(insert/churn/mixed)具备 RAM 扫描效度:
+
+- **base 改 mmap**:`MappedFloatMatrix`(bench-only 头,PROT_READ+MAP_PRIVATE+
+  MADV_SEQUENTIAL,顺序批完成后对整页窗口 MADV_DONTNEED;--shuffle_seed 下访问
+  乱序,跳过主动丢页,交内核回收)。base 从匿名 vector 变 file-backed 可回收页;
+  build 模式保持全内存(随机访问,不在扫描范围)。峰值 RssAnon −693MiB
+  (payload 本身 488MiB)。
+- **--cache_cap_pages 暴露**(0=默认 1,048,576 页;low 水位=库内既有 high/2),
+  churn 轮行输出 `pool_pages` 供扫描核对。cap=65536(256MiB)实测三轮
+  pool_pages≤high ✓。显式 cap 时 bench 切 RAM-scan 分配器体制(capped flush 后
+  malloc_trim + 小 trim/top-pad;consolidate/garden 相位边界水位执行);cap=0
+  旧路径逐字节不变。
+- **行为不变性**:§16 同配置 500k×10 轮,r10 recall 改造前后 −0.012pp
+  (门 ±0.05pp),复拍 +0.002pp;free_fills/evictions 计数吻合。ctest -R laser
+  14/14(新增 mmap 三测 + cap 透传测)。
+
+**已知边界(Phase C 设计输入):**
+
+1. **maintenance 相位内部峰值不受池 cap 约束**:cap=256MiB 下峰值 RssAnon 仍
+   6.27GiB——consolidate/garden 单次调用内部触页在相位边界 enforcement 之前。
+   ⇒ 4GiB cell 定位为 OOM 边界探针而非可行点;若要求全程 hard-cap,需
+   consolidate/garden 按行区间分块(挂 P3b 邻项,本次不做)。
+2. **capped 吞吐代价**:256MiB 池插入 2.8k/s vs 默认池 31.7k/s(×11)——扫描
+   cell 的时间预算按此放大。
+3. **本容器无法建 cgroup cell**:PID 1=tini 无 systemd bus、cgroup2 只读挂载、
+   无 CAP_SYS_ADMIN,sudo 也无济于事。委托环境一键脚本
+   `data/laser-update/ramcap-prep/run_delegated_cgroup_trial.sh` 已备;
+   **候选宿主:g03**(稳定性对照战役已在其上跑通;数据须搬其本地盘)。
+   不限内存 anon 峰值 6.27GiB ⇒ delegated preflight 从 8GiB 起步,向下探 7/6。
+4. 建议 cell 表(MemoryMax × cache_cap_pages)与逐 cell 记录项
+   (memory.events/stat、workingset_refault_file、PSI、io.stat)见
+   `data/laser-update/ramcap-prep/final_report.md`。
+
+插入吞吐参考值注意:mmap 化后 bench 的 insert/s 基线整体与旧二进制不可比
+(单轮带宽本就 30–38k/s 摆动,且冻结二进制协议本禁止跨二进制比吞吐);recall
+不变性是唯一门槛,已过。
