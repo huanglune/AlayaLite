@@ -301,6 +301,9 @@ enum class LifecycleState : std::uint8_t { open = 0, closing = 1, closed = 2 };
 
 struct CollectionStats {
   core::RowCount size{};
+  // Current accepted logical rows: searchable live IDs plus admitted inserts
+  // still in dark stage. Historical versions and delete operations are not
+  // counted; pending_count independently tracks every in-flight mutation.
   core::RowCount accepted_count{};
   core::RowCount pending_count{};
   std::uint64_t pending_bytes{};

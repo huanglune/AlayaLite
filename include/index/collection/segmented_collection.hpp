@@ -337,6 +337,7 @@ class SegmentedCollection {
   }
 
   [[nodiscard]] auto drain(const core::Deadline &deadline = {}) -> core::Status {
+    std::lock_guard drain_lock(drain_mutex_);
     {
       std::unique_lock lock(lifecycle_mutex_);
       if (lifecycle_ == LifecycleState::open) {
@@ -438,6 +439,35 @@ class SegmentedCollection {
     std::uint64_t bytes_{};
   };
 
+  class AcceptedGuard {
+   public:
+    AcceptedGuard(SegmentedCollection *owner, RowMutationStatus status)
+        : owner_(owner), status_(status) {
+      if (status_ == RowMutationStatus::inserted) {
+        owner_->accepted_count_.fetch_add(1, std::memory_order_acq_rel);
+      }
+    }
+    AcceptedGuard(const AcceptedGuard &) = delete;
+    auto operator=(const AcceptedGuard &) -> AcceptedGuard & = delete;
+    ~AcceptedGuard() {
+      if (!committed_ && status_ == RowMutationStatus::inserted) {
+        owner_->accepted_count_.fetch_sub(1, std::memory_order_acq_rel);
+      }
+    }
+
+    void commit() {
+      if (status_ == RowMutationStatus::deleted) {
+        owner_->accepted_count_.fetch_sub(1, std::memory_order_acq_rel);
+      }
+      committed_ = true;
+    }
+
+   private:
+    SegmentedCollection *owner_{};
+    RowMutationStatus status_{RowMutationStatus::aborted};
+    bool committed_{};
+  };
+
   struct SegmentSearchStorage {
     SegmentSearchStorage(core::RowCount rows, core::RowCount top_k)
         : hits(static_cast<std::size_t>(rows * top_k)),
@@ -472,7 +502,6 @@ class SegmentedCollection {
   [[nodiscard]] auto initialize(std::vector<SegmentRegistration> registrations) -> core::Status {
     auto snapshot = std::make_shared<RoutingSnapshot>();
     std::uint64_t maximum_sequence{};
-    core::RowCount accepted{};
     for (auto &registration : registrations) {
       const auto descriptor = registration.segment.descriptor();
       if (!registration.segment.capabilities().supports(core::OperationCapability::search) ||
@@ -550,7 +579,6 @@ class SegmentedCollection {
                                 VersionEntry{address, row.upsert_sequence, row.state, row.payload});
         }
         maximum_sequence = std::max(maximum_sequence, row.upsert_sequence);
-        ++accepted;
       }
       snapshot->segments.push_back(
           std::make_shared<SegmentEntry>(registration.segment_id,
@@ -563,7 +591,7 @@ class SegmentedCollection {
     recalculate_counts(*snapshot);
     snapshot->visibility_watermark = maximum_sequence;
     next_op_id_.store(maximum_sequence + 1, std::memory_order_release);
-    accepted_count_.store(accepted, std::memory_order_release);
+    accepted_count_.store(snapshot->searchable_live_count, std::memory_order_release);
     publish_snapshot(std::move(snapshot));
     return core::Status::success();
   }
@@ -914,7 +942,7 @@ class SegmentedCollection {
                                  "collection has no active mutable segment");
     }
     const auto op_id = next_op_id_.fetch_add(1, std::memory_order_acq_rel);
-    accepted_count_.fetch_add(1, std::memory_order_acq_rel);
+    AcceptedGuard accepted(this, row_status);
     const auto row_value = target->next_row_id.fetch_add(1, std::memory_order_acq_rel);
     if (row_value == std::numeric_limits<std::uint64_t>::max()) {
       return core::Status::error(core::StatusCode::resource_exhausted,
@@ -997,6 +1025,7 @@ class SegmentedCollection {
     // There is deliberately no WAL or durability acknowledgement here; Gate 7
     // inserts COMMIT between dark stage and this publication.
     publish_snapshot(std::move(next));
+    accepted.commit();
     return MutationReceipt{op_id, op_id, true, DurabilityState::memory_only, row_status};
   }
 
@@ -1196,6 +1225,7 @@ class SegmentedCollection {
   std::condition_variable lifecycle_changed_{};
   LifecycleState lifecycle_{LifecycleState::open};
   std::uint64_t inflight_operations_{};
+  std::mutex drain_mutex_{};
   std::mutex mutation_mutex_{};
   std::atomic_uint64_t next_op_id_{1};
   std::atomic_uint64_t accepted_count_{};

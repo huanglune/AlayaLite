@@ -261,7 +261,39 @@ TEST(SegmentedCollection, StringLogicalIdInsertGetUpsertDeleteVisibility) {
   ASSERT_TRUE(search.ok());
   EXPECT_TRUE(search.value().queries[0].hits.empty());
   EXPECT_EQ(collection->stats().size, 0U);
+  EXPECT_EQ(collection->stats().accepted_count, 0U);
   EXPECT_EQ(collection->stats().tombstone_count, 1U);
+}
+
+TEST(SegmentedCollection, ShellFlagAndWriteModesHaveExplicitStatus) {
+  auto producer = std::make_shared<FakeMutableSegment>();
+  CollectionConfig disabled;
+  disabled.features.collection_shell = false;
+  auto unavailable = SegmentedCollection::open({2, core::Metric::l2, core::ScalarType::float32},
+                                               {fake_registration(producer)},
+                                               disabled);
+  ASSERT_FALSE(unavailable.ok());
+  EXPECT_EQ(unavailable.status().code(), core::StatusCode::not_supported);
+
+  const auto collection = open_fake_collection();
+  core::MutationContext context;
+  const auto id = core::LogicalId::from_utf8("mode");
+  const auto missing = core::LogicalId::from_utf8("missing");
+  const std::array<float, 2> vector{1.0F, 2.0F};
+  auto replace_missing =
+      collection->write(write_request(missing, vector, {}, {}, WriteMode::replace), context);
+  EXPECT_FALSE(replace_missing.ok());
+  EXPECT_EQ(replace_missing.status().code(), core::StatusCode::not_found);
+  ASSERT_TRUE(
+      collection->write(write_request(id, vector, {}, {}, WriteMode::insert_only), context).ok());
+  auto duplicate =
+      collection->write(write_request(id, vector, {}, {}, WriteMode::insert_only), context);
+  EXPECT_FALSE(duplicate.ok());
+  EXPECT_EQ(duplicate.status().code(), core::StatusCode::conflict);
+  auto replaced = collection->write(write_request(id, vector, {}, {}, WriteMode::replace), context);
+  ASSERT_TRUE(replaced.ok());
+  EXPECT_EQ(replaced.value().row_status, RowMutationStatus::replaced);
+  EXPECT_EQ(collection->stats().accepted_count, 1U);
 }
 
 TEST(SegmentedCollection, LegacyUint64IdentityMapsLabelsWithoutChangingCanonicalBytes) {
@@ -380,6 +412,7 @@ TEST(SegmentedCollection, DarkStageAbortAndPendingStatsNeverBecomeVisible) {
   EXPECT_EQ(producer->abort_count(), 1U);
   EXPECT_EQ(collection->get_by_id(aborted_id).status().code(), core::StatusCode::not_found);
   EXPECT_EQ(collection->stats().size, 1U);
+  EXPECT_EQ(collection->stats().accepted_count, 1U);
 }
 
 TEST(SegmentedCollection, WatermarkAtAdmissionSuppressesRowsPublishedDuringSearch) {
