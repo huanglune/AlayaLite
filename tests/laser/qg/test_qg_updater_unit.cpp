@@ -393,7 +393,9 @@ TEST_F(QGUpdaterIndexTest, ParallelBatchInsertAndConsolidate) {
     params.ef_insert = 64;
     params.backlink_mode = UpdateParams::Backlink::kEvict;
     params.max_points = kN + n_insert;
+    params.maintain_indegree = true;
     QGUpdater upd(qg, params);
+    upd.init_indegree(8);
 
     // batch three-phase publish, 8 writers per batch of 64
     for (size_t start = 0; start < n_insert; start += 64) {
@@ -412,6 +414,18 @@ TEST_F(QGUpdaterIndexTest, ParallelBatchInsertAndConsolidate) {
       upd.tombstone(id);
     }
     upd.consolidate(8, /*r_target=*/kDeg - 4);
+    GardenParams garden;
+    garden.frac = 0.02;
+    garden.ef_maintenance = 64;
+    garden.pump_budget = 2;
+    garden.r_target = kDeg - 4;
+    upd.garden(8, garden);
+    std::vector<int32_t> incremental(kN + n_insert);
+    for (PID id = 0; id < kN + n_insert; ++id) incremental[id] = upd.indegree(id);
+    upd.init_indegree(8);
+    for (PID id = 0; id < kN + n_insert; ++id) {
+      EXPECT_EQ(upd.indegree(id), incremental[id]) << "indegree mismatch at id " << id;
+    }
     upd.finalize();
     const UpdateStats s = upd.stats();
     EXPECT_EQ(s.inserts, n_insert);

@@ -21,6 +21,7 @@
 // directory first when comparing arms.
 
 #include <malloc.h>
+#include <future>
 #include <omp.h>
 
 #include <algorithm>
@@ -133,11 +134,18 @@ struct Args {
   size_t ef_insert = 100, prune_cap = 300, alpha_check_max = 16;
   size_t batch = 4096, insert_threads = 32;
   uint32_t consolidate = 0, r_target = 0;
+  uint32_t garden = 0;
+  double garden_frac = 0.05;
+  size_t ef_maintenance = 200, pump_budget = 4;
+  std::string garden_policy = "lowdeg";
   float alpha = 1.2F;
   uint64_t seed = 42;
   std::string arm = "alpha";  // none|evict|alpha|full
   uint32_t direct = 0;  // 1 = O_DIRECT write fd (P0.1 attribution arm), 0 = buffered (default)
   uint32_t write_cache = 1;  // 0 = immediate per-patch writes (P0.1-era control)
+  uint32_t pipeline = 0;     // staged mode only: overlap drain(i) with batch i+1 (2-batch isolation)
+  uint32_t stage = 0;        // 1 = stage backlinks + barrier drain; 0 = inline patches into pool
+  size_t flush_threads = 0;  // threads for the overlapped flush; 0 = insert_threads
   std::vector<uint32_t> efs = {60, 80, 100, 150, 200, 300};
 };
 
@@ -204,10 +212,26 @@ Args parse(int argc, char **argv) {
       a.consolidate = std::stoul(v);
     else if (k == "--r_target")
       a.r_target = std::stoul(v);
+    else if (k == "--garden")
+      a.garden = std::stoul(v);
+    else if (k == "--garden_frac")
+      a.garden_frac = std::stod(v);
+    else if (k == "--ef_maintenance")
+      a.ef_maintenance = std::stoull(v);
+    else if (k == "--pump_budget")
+      a.pump_budget = std::stoull(v);
+    else if (k == "--garden_policy")
+      a.garden_policy = v;
     else if (k == "--direct")
       a.direct = std::stoul(v);
     else if (k == "--write_cache")
       a.write_cache = std::stoul(v);
+    else if (k == "--pipeline")
+      a.pipeline = std::stoul(v);
+    else if (k == "--stage")
+      a.stage = std::stoul(v);
+    else if (k == "--flush_threads")
+      a.flush_threads = std::stoull(v);
     else if (k == "--alpha")
       a.alpha = std::stof(v);
     else if (k == "--seed")
@@ -300,11 +324,22 @@ int do_insert(const Args &a) {
   p.max_points = a.n + a.count + 1024;
   p.direct_io = a.direct != 0;
   p.write_cache = a.write_cache != 0;
+  p.stage_backlinks = a.stage != 0;
   alaya::laser::QGUpdater upd(qg, p);
   const int ins_threads = static_cast<int>(std::max<size_t>(1, a.insert_threads));
   std::cout << "[insert] batch=" << a.batch << " insert_threads=" << ins_threads
             << " direct_io=" << (upd.direct_io() ? 1 : 0) << "\n";
+  const size_t fl_threads = a.flush_threads == 0 ? a.insert_threads : a.flush_threads;
   auto t0 = std::chrono::steady_clock::now();
+  // Two-batch pipeline: while batch k's searches run, batch k-1's staged
+  // backlinks drain on a helper thread. publish(k-1) happens only after that
+  // flush joins, so visibility semantics are unchanged; batch k simply
+  // searches the snapshot from before batch k-1 (2-batch isolation, the
+  // quality-equivalent of doubling --batch). Edges batch k stages while the
+  // drain is swapping stripes may drain one cycle early — harmless, searches
+  // filter ids >= snapshot until publish.
+  std::future<void> pending;
+  uint64_t pending_publish = 0;
   for (uint64_t start = 0; start < a.count; start += a.batch) {
     const uint64_t end = std::min(a.count, start + a.batch);
     const int64_t end_signed = static_cast<int64_t>(end);
@@ -313,13 +348,26 @@ int do_insert(const Args &a) {
       upd.insert_with_id(base.row(a.from + static_cast<uint64_t>(i)),
                          static_cast<alaya::laser::PID>(a.n + static_cast<uint64_t>(i)));
     }
-    upd.flush(a.insert_threads);
-    upd.publish(a.n + end);
+    if (pending.valid()) {
+      pending.get();
+      upd.publish(pending_publish);
+    }
+    if (a.pipeline != 0) {
+      pending = std::async(std::launch::async, [&upd, fl_threads] { upd.flush(fl_threads); });
+      pending_publish = a.n + end;
+    } else {
+      upd.flush(fl_threads);
+      upd.publish(a.n + end);
+    }
     if (end / 10000 != start / 10000) {
       auto now = std::chrono::steady_clock::now();
       const double s = std::chrono::duration<double>(now - t0).count();
       std::cout << "[insert] " << end << "/" << a.count << "  " << end / s << " inserts/s\n";
     }
+  }
+  if (pending.valid()) {
+    pending.get();
+    upd.publish(pending_publish);
   }
   upd.finalize();
   auto t1 = std::chrono::steady_clock::now();
@@ -378,7 +426,10 @@ int do_churn(const Args &a) {
   p.max_points = a.n + a.runs * a.count + 1024;
   p.direct_io = a.direct != 0;
   p.write_cache = a.write_cache != 0;
+  p.stage_backlinks = a.stage != 0;
+  p.maintain_indegree = a.garden != 0;
   alaya::laser::QGUpdater upd(qg, p);
+  if (a.garden != 0) upd.init_indegree(a.insert_threads);
   std::cout << "[churn] direct_io=" << (upd.direct_io() ? 1 : 0) << "\n";
   std::vector<uint32_t> results(static_cast<size_t>(query.n) * a.topk);
   const uint32_t ef_eval = a.efs.empty() ? 100 : a.efs[0];
@@ -412,11 +463,27 @@ int do_churn(const Args &a) {
       }
     }
     const auto &s = upd.stats();
+    std::vector<int32_t> indegrees;
+    if (a.garden != 0) {
+      indegrees.reserve(upd.num_points() - upd.deleted().size());
+      for (size_t id = 0; id < upd.num_points(); ++id) {
+        if (upd.deleted().count(static_cast<alaya::laser::PID>(id)) == 0) {
+          indegrees.push_back(upd.indegree(static_cast<alaya::laser::PID>(id)));
+        }
+      }
+      std::sort(indegrees.begin(), indegrees.end());
+    }
+    auto pct = [&](double pctl) {
+      if (indegrees.empty()) return int32_t{0};
+      return indegrees[static_cast<size_t>(pctl * static_cast<double>(indegrees.size() - 1))];
+    };
     std::cout << "round," << round << ",recall,"
               << (total == 0 ? 0.0 : static_cast<double>(hits) / static_cast<double>(total))
               << ",qps," << qps << ",live," << upd.num_points() - upd.deleted().size()
               << ",free_fills," << s.free_slot_fills << ",evictions," << s.evictions
-              << ",est_skips," << s.est_skips << ",forced," << s.forced_links << "\n"
+              << ",est_skips," << s.est_skips << ",forced," << s.forced_links
+              << ",indeg_p1," << pct(0.01) << ",indeg_p5," << pct(0.05)
+              << ",indeg_p50," << pct(0.50) << "\n"
               << std::flush;
   };
 
@@ -433,8 +500,29 @@ int do_churn(const Args &a) {
       upd.consolidate(a.insert_threads, a.r_target);
     }
     auto tc1 = std::chrono::steady_clock::now();
+    const auto garden_before = upd.stats();
+    auto tg0 = std::chrono::steady_clock::now();
+    if (a.garden != 0) {
+      alaya::laser::GardenParams gp;
+      gp.frac = a.garden_frac;
+      gp.ef_maintenance = a.ef_maintenance;
+      gp.pump_budget = a.pump_budget;
+      gp.r_target = a.r_target;
+      if (a.garden_policy == "lowdeg")
+        gp.policy = alaya::laser::GardenParams::Policy::kLowIndegree;
+      else if (a.garden_policy == "random")
+        gp.policy = alaya::laser::GardenParams::Policy::kRandom;
+      else
+        throw std::runtime_error("bad --garden_policy " + a.garden_policy);
+      upd.garden(a.insert_threads, gp);
+    }
+    auto tg1 = std::chrono::steady_clock::now();
+    const auto garden_after = upd.stats();
     const uint64_t ins_base = a.n + r * a.count;
     auto t0 = std::chrono::steady_clock::now();
+    const size_t fl_threads = a.flush_threads == 0 ? a.insert_threads : a.flush_threads;
+    std::future<void> pending;
+    uint64_t pending_publish = 0;
     for (uint64_t start = 0; start < a.count; start += a.batch) {
       const uint64_t end = std::min(a.count, start + a.batch);
       const int64_t end_signed = static_cast<int64_t>(end);
@@ -443,13 +531,29 @@ int do_churn(const Args &a) {
         upd.insert_with_id(base.row(ins_base + static_cast<uint64_t>(i)),
                            static_cast<alaya::laser::PID>(ins_base + static_cast<uint64_t>(i)));
       }
-      upd.flush(a.insert_threads);
-      upd.publish(ins_base + end);
+      if (pending.valid()) {
+        pending.get();
+        upd.publish(pending_publish);
+      }
+      if (a.pipeline != 0) {
+        pending = std::async(std::launch::async, [&upd, fl_threads] { upd.flush(fl_threads); });
+        pending_publish = ins_base + end;
+      } else {
+        upd.flush(fl_threads);
+        upd.publish(ins_base + end);
+      }
+    }
+    if (pending.valid()) {
+      pending.get();
+      upd.publish(pending_publish);
     }
     auto t1 = std::chrono::steady_clock::now();
     std::cout << "[churn] round " << r + 1
               << " insert_qps=" << a.count / std::chrono::duration<double>(t1 - t0).count()
-              << " consolidate_s=" << std::chrono::duration<double>(tc1 - tc0).count() << "\n";
+              << " consolidate_s=" << std::chrono::duration<double>(tc1 - tc0).count()
+              << " garden_s=" << std::chrono::duration<double>(tg1 - tg0).count()
+              << " gardened_rows="
+              << garden_after.gardened_rows - garden_before.gardened_rows << "\n";
     eval_round(r + 1);
   }
   return 0;

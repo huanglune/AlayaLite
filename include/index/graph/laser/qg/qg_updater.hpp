@@ -77,6 +77,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -235,6 +236,17 @@ struct UpdateStats {
   uint64_t consolidated_rows = 0;
   uint64_t spliced_slots = 0;
   uint64_t ghosted_slots = 0;
+  uint64_t gardened_rows = 0;
+  uint64_t garden_pump_links = 0;
+  uint64_t garden_us = 0;
+};
+
+struct GardenParams {
+  double frac = 0.05;
+  size_t ef_maintenance = 200;
+  size_t pump_budget = 4;
+  size_t r_target = 0;
+  enum class Policy { kLowIndegree, kRandom } policy = Policy::kLowIndegree;
 };
 
 struct UpdateParams {
@@ -246,6 +258,7 @@ struct UpdateParams {
   size_t alpha_check_max = 16;  // captured neighbors tested per reverse edge
   size_t max_points = 0;        // page-version table capacity; 0 -> 2*N + 4096
   size_t splice_rerank = 4;     // consolidation: FastScan-recalled candidates reranked exactly
+  bool maintain_indegree = false;
   bool direct_io = false;       // route writes through a dedicated O_DIRECT fd.
                                 // P0.1 verdict: synchronous per-patch DIO writes LOSE
                                 // to buffered pwrite (5.9k vs 7.4k inserts/s @64T) —
@@ -254,6 +267,11 @@ struct UpdateParams {
                                 // (P0.2) moves writes off the hot path; the DIO fd is
                                 // meant for its batched flush.
   bool write_cache = true;      // absorb page RMWs in a resident page pool (see cache_cap_pages)
+  bool stage_backlinks = false;  // false: patch reverse edges inline at insert time (they land
+                                 // in the pool, so same-page coalescing happens regardless, the
+                                 // insert threads overlap patch CPU with search IO, and the
+                                 // kAlphaEvict capture-pool check works); true: stage per target
+                                 // and drain at the batch barrier (phase-separated variant)
   size_t cache_cap_pages = 1U << 20;  // pool high watermark (pages). Hub rows are patched by
                                       // many batches; keeping pages resident coalesces those
                                       // writes across batches (physical writes happen only on
@@ -276,6 +294,8 @@ class QGUpdater {
         npp_(qg.node_per_page_),
         write_cache_(page_size_),
         page_locks_(kLockStripes),
+        indegree_(std::max(params.max_points == 0 ? 2 * qg.num_points_ + 4096 : params.max_points,
+                           qg.num_points_)),
         page_versions_(
             (std::max(params.max_points == 0 ? 2 * qg.num_points_ + 4096 : params.max_points,
                       qg.num_points_) +
@@ -342,16 +362,50 @@ class QGUpdater {
     s.consolidated_rows = stats_.consolidated_rows.load();
     s.spliced_slots = stats_.spliced_slots.load();
     s.ghosted_slots = stats_.ghosted_slots.load();
+    s.gardened_rows = stats_.gardened_rows.load();
+    s.garden_pump_links = stats_.garden_pump_links.load();
+    s.garden_us = stats_.garden_us.load();
     return s;
   }
 
   [[nodiscard]] const std::unordered_set<PID> &deleted() const { return deleted_; }
 
+  [[nodiscard]] int32_t indegree(PID id) const {
+    if (!params_.maintain_indegree || id >= indegree_.size()) return 0;
+    return indegree_[id].load(std::memory_order_relaxed);
+  }
+
+  /** Rebuild the optional RAM indegree index from the current committed graph. */
+  void init_indegree(size_t num_threads) {
+    if (!params_.maintain_indegree) return;
+    for (auto &v : indegree_) v.store(0, std::memory_order_relaxed);
+    const size_t n = committed_.load(std::memory_order_acquire);
+    const int nt = static_cast<int>(std::max<size_t>(1, num_threads));
+#pragma omp parallel for num_threads(nt) schedule(dynamic, 256)
+    for (int64_t ui = 0; ui < static_cast<int64_t>(n); ++ui) {
+      if (deleted_.count(static_cast<PID>(ui)) != 0) continue;
+      AlignedBuf page(page_size_);
+      read_node_page(static_cast<PID>(ui), page.data());
+      const char *row = page.data() + node_offset_in_page(static_cast<PID>(ui));
+      const auto *ids = reinterpret_cast<const PID *>(row + neighbor_off_bytes());
+      for (size_t j = 0; j < deg_; ++j) {
+        if (!is_ghost_slot(row, j) && ids[j] < indegree_.size()) {
+          indegree_[ids[j]].fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    }
+  }
+
   /**
    * @brief Tombstone a node: routing still passes through, results filter it.
    * NOT safe concurrently with inserts/consolidate (phase separation).
    */
-  void tombstone(PID id) { deleted_.insert(id); }
+  void tombstone(PID id) {
+    if (!deleted_.insert(id).second || !params_.maintain_indegree || id >= num_points()) return;
+    AlignedBuf page(page_size_);
+    read_node_page(id, page.data());
+    add_row_indegree(page.data() + node_offset_in_page(id), -1);
+  }
 
   /** @brief Serial insert; assigns the next dense id and publishes it. */
   PID insert(const float *vec) {
@@ -436,7 +490,7 @@ class QGUpdater {
 
     // --- reverse edges ---
     if (params_.backlink_mode != UpdateParams::Backlink::kNone && !sel.empty()) {
-      if (params_.backlink_mode != UpdateParams::Backlink::kFullPrune) {
+      if (params_.stage_backlinks && params_.backlink_mode != UpdateParams::Backlink::kFullPrune) {
         for (size_t rank = 0; rank < sel.size(); ++rank) {
           const auto &v = pool[sel[rank]];
           stage_edge({v.id, id, v.dist, rank == 0});
@@ -498,6 +552,43 @@ class QGUpdater {
     }
     drain_staged_edges(num_threads);
     flush_dirty(num_threads);
+  }
+
+  /** Refresh a deterministic budget of live rows; phase-separated from updates. */
+  void garden(size_t num_threads, const GardenParams &gp) {
+    if (!params_.maintain_indegree) {
+      throw std::logic_error("QGUpdater::garden requires maintain_indegree");
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const size_t n = committed_.load(std::memory_order_acquire);
+    std::vector<PID> live;
+    live.reserve(n - std::min(n, deleted_.size()));
+    for (size_t i = 0; i < n; ++i) {
+      if (deleted_.count(static_cast<PID>(i)) == 0) live.push_back(static_cast<PID>(i));
+    }
+    const double frac = std::clamp(gp.frac, 0.0, 1.0);
+    size_t k = static_cast<size_t>(std::ceil(frac * static_cast<double>(live.size())));
+    k = std::min(k, live.size());
+    if (gp.policy == GardenParams::Policy::kLowIndegree) {
+      std::sort(live.begin(), live.end(), [&](PID a, PID b) {
+        const int32_t ia = indegree(a), ib = indegree(b);
+        return ia != ib ? ia < ib : a < b;
+      });
+    } else {
+      std::mt19937_64 rng(0x4c41534552ULL);
+      std::shuffle(live.begin(), live.end(), rng);
+    }
+    live.resize(k);
+    const size_t target = gp.r_target == 0 ? deg_ : std::min(gp.r_target, deg_);
+    const int nt = static_cast<int>(std::max<size_t>(1, num_threads));
+#pragma omp parallel for num_threads(nt) schedule(dynamic, 1)
+    for (int64_t i = 0; i < static_cast<int64_t>(live.size()); ++i) {
+      garden_row(live[static_cast<size_t>(i)], gp, target);
+    }
+    flush_dirty(num_threads);
+    stats_.garden_us.fetch_add(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0)
+            .count());
   }
 
   /**
@@ -628,6 +719,9 @@ class QGUpdater {
     std::atomic<uint64_t> consolidated_rows{0};
     std::atomic<uint64_t> spliced_slots{0};
     std::atomic<uint64_t> ghosted_slots{0};
+    std::atomic<uint64_t> gardened_rows{0};
+    std::atomic<uint64_t> garden_pump_links{0};
+    std::atomic<uint64_t> garden_us{0};
   };
 
   struct CapturedNode {
@@ -1065,7 +1159,10 @@ class QGUpdater {
   }
 
   /** @brief Greedy beam search over the on-disk graph, capturing expanded rows. */
-  void search_for_insert(const float *tvec, std::vector<CapturedNode> &pool) {
+  void search_for_insert(const float *tvec,
+                         std::vector<CapturedNode> &pool,
+                         size_t ef_override = 0,
+                         size_t cap_override = 0) {
     const size_t snapshot = committed_.load(std::memory_order_acquire);
     QGQuery q_obj(tvec, pd_);
     q_obj.query_prepare(qg_.rotator_, qg_.scanner_);
@@ -1076,9 +1173,10 @@ class QGUpdater {
     }
     q_obj.set_sqr_qr(sqr_qr);
 
-    buffer::SearchBuffer sp(params_.ef_insert);
+    const size_t ef = ef_override == 0 ? params_.ef_insert : ef_override;
+    buffer::SearchBuffer sp(ef);
     std::unordered_set<PID> visited;
-    visited.reserve(params_.ef_insert * 8);
+    visited.reserve(ef * 8);
 
     if (!qg_.medoids_.empty()) {
       PID best_medoid = 0;
@@ -1150,8 +1248,9 @@ class QGUpdater {
     std::sort(pool.begin(), pool.end(), [](const CapturedNode &a, const CapturedNode &b) {
       return a.dist < b.dist;
     });
-    if (pool.size() > params_.prune_pool_cap) {
-      pool.resize(params_.prune_pool_cap);
+    const size_t cap = cap_override == 0 ? params_.prune_pool_cap : cap_override;
+    if (pool.size() > cap) {
+      pool.resize(cap);
     }
   }
 
@@ -1186,6 +1285,7 @@ class QGUpdater {
       // A newly-created one-row page has deterministic zero tail padding;
       // read_at already zero-fills an EOF cache miss.
       std::memcpy(page + node_offset_in_page(id), row, node_len_);
+      add_row_indegree(row, 1);
       return true;
     });
   }
@@ -1399,12 +1499,103 @@ class QGUpdater {
         nb_ids.push_back(cands[s].id);
         x_survived = x_survived || (cands[s].id == x_id);
       }
+      add_row_indegree(row, -1);
       assemble_row(row, v_vec.data(), nb_vecs, nb_ids);
+      add_row_indegree(row, 1);
       survived = x_survived;
       return true;
     });
     stats_.full_recomputes++;
     return survived;
+  }
+
+  void garden_row(PID u, const GardenParams &gp, size_t r_target) {
+    AlignedBuf old_page(page_size_);
+    read_rmw_page(u, old_page.data());
+    const char *old_row = old_page.data() + node_offset_in_page(u);
+    const auto *u_raw = reinterpret_cast<const float *>(old_row);
+    std::vector<float> u_vec(u_raw, u_raw + full_dim_);
+    const auto *old_ids = reinterpret_cast<const PID *>(old_row + neighbor_off_bytes());
+    std::unordered_set<PID> old_set;
+    for (size_t j = 0; j < deg_; ++j) {
+      if (!is_ghost_slot(old_row, j) && old_ids[j] != u && deleted_.count(old_ids[j]) == 0) {
+        old_set.insert(old_ids[j]);
+      }
+    }
+
+    std::vector<CapturedNode> pool;
+    search_for_insert(u_vec.data(), pool, gp.ef_maintenance,
+                      std::max(params_.prune_pool_cap, gp.ef_maintenance));
+    std::unordered_set<PID> present;
+    for (const auto &c : pool) present.insert(c.id);
+    AlignedBuf nb_page(page_size_);
+    for (PID nb : old_set) {
+      if (present.count(nb) != 0) continue;
+      read_rmw_page(nb, nb_page.data());
+      const auto *raw = reinterpret_cast<const float *>(nb_page.data() + node_offset_in_page(nb));
+      CapturedNode c;
+      c.id = nb;
+      c.vec.assign(raw, raw + full_dim_);
+      c.dist = space::l2_sqr(u_vec.data(), raw, dim_) +
+               (res_dim_ > 0 ? space::l2_sqr(u_vec.data() + dim_, raw + dim_, res_dim_) : 0.0F);
+      pool.push_back(std::move(c));
+    }
+    pool.erase(std::remove_if(pool.begin(), pool.end(), [&](const CapturedNode &c) {
+                 return c.id == u || deleted_.count(c.id) != 0;
+               }),
+               pool.end());
+    std::sort(pool.begin(), pool.end(), [](const CapturedNode &a, const CapturedNode &b) {
+      return a.dist != b.dist ? a.dist < b.dist : a.id < b.id;
+    });
+    pool.erase(std::unique(pool.begin(), pool.end(), [](const CapturedNode &a, const CapturedNode &b) {
+                 return a.id == b.id;
+               }),
+               pool.end());
+
+    std::vector<size_t> sel;
+    for (size_t i = 0; i < pool.size() && sel.size() < r_target; ++i) {
+      bool occluded = false;
+      for (size_t s : sel) {
+        const float d = space::l2_sqr(pool[s].raw(), pool[i].raw(), dim_) +
+                        (res_dim_ > 0 ? space::l2_sqr(pool[s].raw() + dim_,
+                                                     pool[i].raw() + dim_, res_dim_)
+                                      : 0.0F);
+        if (params_.alpha * params_.alpha * d <= pool[i].dist) {
+          occluded = true;
+          break;
+        }
+      }
+      if (!occluded) sel.push_back(i);
+    }
+    std::vector<const float *> nb_vecs;
+    std::vector<PID> nb_ids;
+    for (size_t s : sel) {
+      nb_vecs.push_back(pool[s].raw());
+      nb_ids.push_back(pool[s].id);
+    }
+    {
+      const std::lock_guard<std::mutex> guard(page_lock(u));
+      modify_node_page(u, [&](char *page) {
+        char *row = page + node_offset_in_page(u);
+        add_row_indegree(row, -1);
+        assemble_row(row, u_vec.data(), nb_vecs, nb_ids);
+        add_row_indegree(row, 1);
+        return true;
+      });
+    }
+    stats_.gardened_rows++;
+
+    size_t attempted = 0;
+    const std::unordered_map<PID, const CapturedNode *> no_capture;
+    for (size_t s : sel) {
+      if (attempted >= gp.pump_budget) break;
+      const auto &v = pool[s];
+      if (old_set.count(v.id) != 0) continue;
+      ++attempted;
+      if (patch_reverse_edge(v, u, u_vec.data(), no_capture, false)) {
+        stats_.garden_pump_links++;
+      }
+    }
   }
 
   /** @brief Purge/splice one live row; see consolidate(). */
@@ -1532,6 +1723,8 @@ class QGUpdater {
 
   /** @brief Replace one slot's code + factors + id inside a row buffer. */
   bool patch_slot(char *row, size_t slot, PID x_id, const float *x_vec, float x_res_sqr) {
+    const bool had_old = params_.maintain_indegree && !is_ghost_slot(row, slot);
+    const PID old_id = reinterpret_cast<const PID *>(row + neighbor_off_bytes())[slot];
     const auto *row_f = reinterpret_cast<const float *>(row);
     // thread_local scratch: one patch_slot per staged backlink — per-call heap
     // traffic here was a top drain cost (see make_edge_payload note).
@@ -1568,11 +1761,19 @@ class QGUpdater {
     fac[2 * deg_ + slot] = payload.factor_vq;
     auto *ids = reinterpret_cast<PID *>(row + neighbor_off_bytes());
     ids[slot] = x_id;
+    if (params_.maintain_indegree) {
+      if (had_old && old_id < indegree_.size()) {
+        indegree_[old_id].fetch_sub(1, std::memory_order_relaxed);
+      }
+      if (x_id < indegree_.size()) indegree_[x_id].fetch_add(1, std::memory_order_relaxed);
+    }
     return true;
   }
 
   /** @brief Zero a slot back into ghost/free state (code + factors + id). */
   void zero_slot(char *row, size_t slot) {
+    const bool had_old = params_.maintain_indegree && !is_ghost_slot(row, slot);
+    const PID old_id = reinterpret_cast<const PID *>(row + neighbor_off_bytes())[slot];
     const size_t block_idx = slot / kBatchSize;
     const size_t in_block = slot % kBatchSize;
     uint8_t *block = reinterpret_cast<uint8_t *>(row + code_off_bytes()) + block_idx * pd_ * 4;
@@ -1588,6 +1789,18 @@ class QGUpdater {
     fac[2 * deg_ + slot] = 0;
     auto *ids = reinterpret_cast<PID *>(row + neighbor_off_bytes());
     ids[slot] = 0;
+    if (params_.maintain_indegree && had_old && old_id < indegree_.size()) {
+      indegree_[old_id].fetch_sub(1, std::memory_order_relaxed);
+    }
+  }
+
+  void add_row_indegree(const char *row, int delta) {
+    if (!params_.maintain_indegree) return;
+    const auto *ids = reinterpret_cast<const PID *>(row + neighbor_off_bytes());
+    for (size_t j = 0; j < deg_; ++j) {
+      if (is_ghost_slot(row, j) || ids[j] >= indegree_.size()) continue;
+      indegree_[ids[j]].fetch_add(delta, std::memory_order_relaxed);
+    }
   }
 
   /** @brief Cheap free-slot pre-filter (id==0 && factors==0); confirm with is_ghost_slot. */
@@ -1607,6 +1820,7 @@ class QGUpdater {
   PageWriteCache write_cache_;
   std::array<StagedStripe, 64> staged_;
   std::vector<std::mutex> page_locks_;
+  std::vector<std::atomic<int32_t>> indegree_;
   // Per-page seqlock: odd while a locked writer rewrites the page. Readers
   // outside the page lock validate before/after the pread and retry.
   std::vector<std::atomic<uint32_t>> page_versions_;
