@@ -1133,3 +1133,86 @@ live_frac=1;终态双 superblock CRC 正确、50 万 trailer 全扫通过、flag
 插入吞吐参考值注意:mmap 化后 bench 的 insert/s 基线整体与旧二进制不可比
 (单轮带宽本就 30–38k/s 摆动,且冻结二进制协议本禁止跨二进制比吞吐);recall
 不变性是唯一门槛,已过。
+
+## 18. D1 判决:高维设计点成立,GIST 主臂 main_dim=512;多扇区页全档点火(2026-07-12,max 档,GIST1M 960d)
+
+数据:GIST1M(1M×960d,ann-benchmarks 全量精确 GT-100,`data/gist-fbin/`)。
+四臂 main_dim ∈ {960 全主维, 512, 256, 128},R64/L200,外部 PCA(D0 工具链,
+250k 训练样本 IncrementalPCA,方差降序,单一正交基四臂共用)。产物
+`data/laser-update/gist-scout/`(static_recall/geometry/build_summary/churn_smoke/
+pca_variance_summary/embedding_candidates.csv + final_report.md)。**零仓库补丁。**
+
+### 18.1 main_dim 档位扫描:残差切分在高维进入设计甜点
+
+| main_dim | 主维方差 | ef60 | ef100 | ef200 | 页 | 1M 索引 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 960(全主维) | 100% | 0.9158 | 0.9510 | **0.9780** | 16KiB | 16.38GB |
+| **512(主臂)** | **98.34%** | 0.8909 | 0.9391 | **0.9740** | **12KiB** | **12.29GB** |
+| 256 | 93.58% | 0.8610 | 0.9169 | 0.9647 | 8KiB | 8.19GB |
+| 128 | 86.40% | 0.8052 | 0.8793 | 0.9462 | 8KiB | 8.19GB |
+
+(recall@10,3 跑均值;SD ≤0.4pp,ef200 全臂 ≤0.12pp。)
+
+**裁决:主臂 main_dim=512**——ef200 距全主维仅 −0.403pp,索引/每跳页省 25%。
+与 96d 判决(§17)的对照叙事:DEEP96 残差 32 维承载 10.33% 方差 ⇒ ef100 塌
+6.85pp,必须全主维;GIST960 残差 448 维只承载 1.66% ⇒ ef200 仅 −0.40pp,跨过
+16→12KiB 页档。**PCA 主/残差切分正是为高维设计的,96d"全主维更好"是低维特例
+(证实用户定位校正)。**选档经验规则:主维解释方差 ≥98% 处切。pd128 与 pd256
+同页大小、质量更差、QPS 无优势=严格劣化点,弃。ef60/100 档 512 还差 2.7/1.2pp,
+残差不是免费——headline 用 ef200,ef100 留吞吐膝点。
+
+### 18.2 多扇区页几何:四档全点火
+
+node_len 5,888–13,056B,npp=1,page_size ∈ {8192, 12288, 16384}B,P2 trailer
+余量 1,276–3,324B 全正;v1 header/node_len/npp/file_size 与 stat 逐字节相等,
+build/eval/churn 全链路无断言/错址/短读。**LASER 行几何在 node_len>4KiB 的
+多扇区页(含非 2 幂 12KiB 三扇区页)下结构完好。**
+
+### 18.3 500k pd512 回收 churn:P2 首次多扇区实测通过
+
+5×20k reuse churn(§16 缩配,garden f.20/ef200/泵4,ef_insert200):freed=reused
+=20k/轮、file_pages 恒 500k、live_frac=1;终态文件字节精确、双 superblock CRC
+正确、50 万 trailer 全扫 flags 全零、degree 1/56/64(min/p50/max)。recall
+0.9533→0.9433(5 轮 −1.00pp,无单调崩塌但比 SIFT 同协议陡)——高维维护深度
+(garden/ef_insert 剂量)是 Phase C 正式战役的调参课题。插入 16.9k/s
+(SIFT 同配方 ~38k/s 的 0.44×);**caveat:round1 后 pool_pages=500k=整索引驻池,
+后四轮属驻留池逻辑成本,不可冒充冷 NVMe 稳态**(正式战役配 RAM-cap,T8 已备)。
+
+### 18.4 行内码免费距离信号:相对收益随维度放大(定量线索)
+
+五轮 3.04M 次满行 evict 决策,行内 FastScan 估距拒绝 51.2%(逐轮 41%→56%),
+按逻辑页避免 ~17.8GiB 写候选流量;exact-evict 对照的逻辑读上界 2,224.8GiB
+(3.04M×64 邻×12KiB)+960d 精确 L2。页 4→12KiB、精确距离 128→960d 都推高
+exact 成本,行内信号零额外页 I/O。Phase C 待加 `evict_scan_ns` 计时器 +
+5% exact 抽检遥测,把决策计数拆成 CPU/缓存命中/真实避免 I/O。
+
+### 18.5 Phase C 战役参数(高维第一梯队)
+
+- **GIST 正式 cell**:pd512 主臂,ef200 headline + ef100 膝点;churn 500k+10×50k
+  100% 唯一换血,identity+3 tail-shuffle seeds(§16 口径,GT source-id 重标);
+  全主维 960 只留静态 oracle,pd256 留 8KiB 容量控制腿;GIST1M 只够一次 100%
+  换血,300% 战役上更大嵌入集。
+- **bench 缺口:do_churn 只取 --efs 首项**——正式战役要同一 checkpoint 双 ef
+  读出,避免为不同 ef 重跑更新轨迹(排 E2 小改,round 行格式保持兼容)。
+- **RAM-cap cell 按页大小换算**:pd512 页 12KiB ⇒ 默认池 cap 1,048,576 页=
+  12GiB high/6GiB low(非 SIFT 的 4/2GiB);cgroup 4/8/16/32GiB 起跑池档
+  65,536/131,072/262,144/524,288 页。
+- **AIO 配额协调必须覆盖 build**:48T QGBuilder 注册 49,152 aio 事件,与并行
+  churn(32,768)相加超 fs.aio-max-nr=65,536 ⇒ io_setup EAGAIN(D1 实测两次,
+  等待重试原参数全过)。Phase C 驱动脚本用全局锁串行化 build/eval/churn 的
+  AIO 重段。
+- **嵌入集清单(核对过行数/体积/license,均无 GT,须自造:1k 查询 holdout+
+  精确 top-100,注意归一化口径)**:768d 首选 Qdrant gte-multilingual-ads-1M
+  (1.008M 行,2.98GB 单 parquet,原生 f32,Apache-2.0);1536d 首选
+  Qdrant/dbpedia-entities-openai3-text-embedding-3-large-1536-1M(1M 行,
+  9.55GB 26 shards,f64,MIT);1024d 备选 dbpedia-openai-1024d(8.7GB,
+  license 未标)或 BGE-m3(19.4GB 下载,dense 仅 4.1GB)。首轮 main_dim 臂:
+  768→{512,全};1024→{512,全};1536→{1024,全};加档按"主维方差 ≥98%"规则。
+- **I/O 形态对比 SIFT128**:pd512 每跳 3× 字节,静态 QPS 64–69%(非线性跌,
+  AIO 并发/CPU 仍占大头);consolidate/garden ~6.7/6.3s(SIFT ~4/2.8s,批量
+  不同只作量级对照)。
+
+方法论记录:T8 与 D1 共享 worktree/build 并行,bench 中途重链(pd960/pd256 与
+pd512/pd128/churn 二进制不同,身份存 binary_identity.csv)——T8 的差异仅更新
+模式 mmap/cap 旋钮且本次未传 cap,build/eval 函数未改,判决不受影响;但重申
+冻结二进制纪律:正式战役每 cell 锚定单一 md5。
