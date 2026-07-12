@@ -223,7 +223,8 @@ Args parse(int argc, char **argv) {
   Args a;
   if (argc < 2) {
     throw std::runtime_error(
-        "usage: bench_laser_update_sift <build|insert|churn|eval|mixed> [--k v ...]");
+        "usage: bench_laser_update_sift <build|insert|churn|eval|mixed> [--k v ...]; "
+        "churn --efs E0,E1,... reports E0 as round and later values as round_ef");
   }
   a.mode = argv[1];
   if (a.mode == "--mixed") a.mode = "mixed";
@@ -688,6 +689,58 @@ int do_churn(const Args &a) {
     print_telemetry(s);
     std::cout << "\n" << std::flush;
     last_round_stats = s;
+
+    for (size_t ef_index = 1; ef_index < a.efs.size(); ++ef_index) {
+      const uint32_t ef = a.efs[ef_index];
+      qg.set_params(ef, a.threads, static_cast<int>(a.beam));
+      auto ef_t0 = std::chrono::steady_clock::now();
+      qg.batch_search(query.data.data(), a.topk, results.data(), query.n);
+      auto ef_t1 = std::chrono::steady_clock::now();
+      const double ef_qps =
+          query.n / std::chrono::duration<double>(ef_t1 - ef_t0).count();
+      uint64_t ef_hits = 0;
+      uint64_t ef_total = 0;
+      std::array<uint64_t, 3> ef_group_hits{};
+      std::array<uint64_t, 3> ef_group_total{};
+      for (size_t qi = 0; qi < query.n; ++qi) {
+        const uint32_t *truth_row = gt.row(qi);
+        std::unordered_set<uint32_t> truth;
+        for (uint32_t j = 0; j < gt.dim && truth.size() < a.topk; ++j) {
+          const uint32_t source = truth_row[j];
+          if (source < source_to_pid.size()) {
+            const alaya::laser::PID pid = source_to_pid[source];
+            if (pid != alaya::laser::kPidMax &&
+                upd.deleted().find(pid) == upd.deleted().end()) {
+              truth.insert(pid);
+            }
+          }
+        }
+        ef_total += truth.size();
+        if (!query_groups.empty()) ef_group_total[query_groups[qi]] += truth.size();
+        const uint32_t *res_row = results.data() + qi * a.topk;
+        for (uint32_t j = 0; j < a.topk; ++j) {
+          if (truth.count(res_row[j]) != 0) {
+            ++ef_hits;
+            if (!query_groups.empty()) ++ef_group_hits[query_groups[qi]];
+          }
+        }
+      }
+      std::cout << "round_ef," << round << "," << ef << ",recall,"
+                << (ef_total == 0
+                        ? 0.0
+                        : static_cast<double>(ef_hits) / static_cast<double>(ef_total))
+                << ",qps," << ef_qps;
+      if (!query_groups.empty()) {
+        for (size_t g = 0; g < 3; ++g) {
+          const double value = ef_group_total[g] == 0
+                                   ? -1
+                                   : static_cast<double>(ef_group_hits[g]) / ef_group_total[g];
+          std::cout << ",recall_g" << g << "," << value;
+        }
+      }
+      std::cout << "\n" << std::flush;
+    }
+    qg.set_params(ef_eval, a.threads, static_cast<int>(a.beam));
   };
 
   std::cout << "[churn] base_n=" << a.n << " rounds=" << a.runs << " count=" << a.count
