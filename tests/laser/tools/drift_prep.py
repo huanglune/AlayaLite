@@ -10,14 +10,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import struct
 import time
 from pathlib import Path
 
 import numpy as np
+from sklearn import __version__ as sklearn_version
 from sklearn.cluster import MiniBatchKMeans
-
 
 DEFAULT_DATA = Path("/home/huangliang/workspace/alaya-dev/data/sift-fbin")
 DEFAULT_OUT = Path("/home/huangliang/workspace/alaya-dev/data/laser-update/drift")
@@ -272,6 +271,11 @@ def main() -> None:
         raise AssertionError("drift permutation is not bijective")
     log(f"selected {len(heldout)} held-out clusters, heldout={heldout_n}, n_build={n_build}")
 
+    centroids_path = a.out_dir / "kmeans_centroids_64x128.fbin"
+    labels_path = a.out_dir / "kmeans_labels.u16"
+    write_matrix(centroids_path, model.cluster_centers_, None, np.float32)
+    np.asarray(labels, dtype="<u2").tofile(labels_path)
+
     drift_base_path = a.out_dir / "sift_drift_base.fbin"
     perm_path = a.out_dir / "perm.u32"
     write_matrix(drift_base_path, base, perm, np.float32)
@@ -319,6 +323,24 @@ def main() -> None:
     paths = [drift_base_path, drift_gt_path, drift_groups_path, perm_path,
              ctrl_base_path, ctrl_gt_path, ctrl_groups_path]
     artifacts = {p.name: {"bytes": p.stat().st_size, "md5": md5(p)} for p in paths}
+    centroid_artifacts = {
+        "centroids": {
+            "filename": centroids_path.name, "bytes": centroids_path.stat().st_size,
+            "md5": md5(centroids_path), "dtype": "float32",
+            "byte_order": "little-endian",
+            "layout": "fbin int32 n,dim header followed by row-major coordinates",
+        },
+        "labels": {
+            "filename": labels_path.name, "bytes": labels_path.stat().st_size,
+            "md5": md5(labels_path), "dtype": "uint16",
+            "byte_order": "little-endian",
+            "layout": "headerless labels in original base row order",
+        },
+        "label_semantics": "MiniBatchKMeans.predict on original base rows",
+        "predict_block_rows": a.base_block,
+        "sklearn_version": sklearn_version,
+        "verification_summary": "same-run centers, labels, sizes, selection, and permutation derive from one fitted model",
+    }
     held_profiles = [{"cluster_id": int(c), "size": int(sizes[c]),
                       "center_distance_to_global_mean": float(center_dist[c])}
                      for c in sorted(heldout.tolist(), key=lambda x: (-center_dist[x], x))]
@@ -337,7 +359,7 @@ def main() -> None:
         "sanity": {"coordinate_sum": coord, "gt_overlap": overlap,
                    "group_nondegenerate": nondegenerate, "nearest_neighbor": nn_sanity},
         "control": {"method": "numpy default_rng(seed=43) permutation; first n_build is build"},
-        "artifacts": artifacts,
+        "artifacts": artifacts, "centroid_artifacts": centroid_artifacts,
     }
     manifest_path = a.out_dir / "manifest.json"
     # The manifest cannot truthfully contain its own MD5; all other deliverables are included.
