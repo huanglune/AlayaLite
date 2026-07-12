@@ -32,7 +32,8 @@ class FusionGraphTest : public ::testing::Test {
     space_ = std::make_shared<RawSpace<>>(ds_.data_num_, ds_.dim_, MetricType::L2);
     space_->fit(ds_.data_.data(), ds_.data_num_);
     nsg_ = std::make_unique<
-        alaya::FusionGraphBuilder<alaya::RawSpace<>, alaya::HNSWBuilder<alaya::RawSpace<>>,
+        alaya::FusionGraphBuilder<alaya::RawSpace<>,
+                                  alaya::detail::HnswBuilderKernel<alaya::RawSpace<>>,
                                   alaya::NSGBuilder<alaya::RawSpace<>>>>(space_);
   }
 
@@ -44,9 +45,9 @@ class FusionGraphTest : public ::testing::Test {
 
   uint32_t max_thread_num_ = configured_thread_limit();
   Dataset ds_;
-  std::unique_ptr<
-      alaya::FusionGraphBuilder<alaya::RawSpace<>, alaya::HNSWBuilder<alaya::RawSpace<>>,
-                                alaya::NSGBuilder<alaya::RawSpace<>>>>
+  std::unique_ptr<alaya::FusionGraphBuilder<alaya::RawSpace<>,
+                                            alaya::detail::HnswBuilderKernel<alaya::RawSpace<>>,
+                                            alaya::NSGBuilder<alaya::RawSpace<>>>>
       nsg_ = nullptr;
   std::shared_ptr<RawSpace<>> space_ = nullptr;
   std::string_view filename_ = "fusion_graph_test.graph";
@@ -86,10 +87,12 @@ TEST_F(FusionGraphSearchTest, SimpleSearchTest) {
   if (!std::filesystem::exists(index_file)) {
     auto build_start = Timer();
 
-    alaya::FusionGraphBuilder<alaya::RawSpace<>, alaya::HNSWBuilder<alaya::RawSpace<>>,
+    alaya::FusionGraphBuilder<alaya::RawSpace<>,
+                              alaya::detail::HnswBuilderKernel<alaya::RawSpace<>>,
                               alaya::NSGBuilder<alaya::RawSpace<>>>
         fusion_graph =
-            alaya::FusionGraphBuilder<alaya::RawSpace<>, alaya::HNSWBuilder<alaya::RawSpace<>>,
+            alaya::FusionGraphBuilder<alaya::RawSpace<>,
+                                      alaya::detail::HnswBuilderKernel<alaya::RawSpace<>>,
                                       alaya::NSGBuilder<alaya::RawSpace<>>>(space, kM);
     auto graph = fusion_graph.build_graph(max_thread_num_);
 

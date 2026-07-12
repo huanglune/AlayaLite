@@ -21,7 +21,7 @@
 
 #include "executor/jobs/graph_hybrid_search_job.hpp"
 #include "index/graph/graph.hpp"
-#include "index/graph/hnsw/hnsw_builder.hpp"
+#include "index/graph/hnsw/hnsw_segment.hpp"
 #include "index/graph/qg/qg_builder.hpp"
 #include "space/rabitq_space.hpp"
 #include "space/raw_space.hpp"
@@ -261,10 +261,14 @@ auto make_raw_build_space(const std::vector<DataType> &vectors, uint32_t vector_
   return build_space;
 }
 
-auto build_hnsw_graph(const std::shared_ptr<RawBuildSpace> &build_space,
-                      uint32_t num_threads) -> std::shared_ptr<Graph<DataType, IDType>> {
-  HNSWBuilder<RawBuildSpace> hnsw(build_space, kMaxNbrs, 200);
-  return std::shared_ptr<Graph<DataType, IDType>>(hnsw.build_graph(num_threads).release());
+auto build_hnsw_graph(const std::shared_ptr<RawBuildSpace> &build_space, uint32_t num_threads)
+    -> std::shared_ptr<Graph<DataType, IDType>> {
+  core::BuildContext context;
+  auto segment =
+      HnswSegment<RawBuildSpace>::build({build_space, build_space},
+                                        {.max_neighbors = kMaxNbrs, .thread_count = num_threads},
+                                        context);
+  return detail::HnswSegmentBridge<RawBuildSpace, RawBuildSpace>::graph(*segment);
 }
 
 auto build_raw_partition_bundle(const std::vector<DataType> &vectors,
@@ -278,11 +282,19 @@ auto build_raw_partition_bundle(const std::vector<DataType> &vectors,
   bundle.name_ = "raw_mv";
 
   Timer timer;
-  bundle.search_space_ = make_search_space<RawSearchSpace>(
-      vectors, vector_num, dim, scalar_data, db_path, {"label", "id"}, nullptr);
-  HNSWBuilder<RawSearchSpace> hnsw(bundle.search_space_, kMaxNbrs, 200);
-  bundle.graph_ =
-      std::shared_ptr<Graph<DataType, IDType>>(hnsw.build_graph(num_threads).release());
+  bundle.search_space_ = make_search_space<RawSearchSpace>(vectors,
+                                                           vector_num,
+                                                           dim,
+                                                           scalar_data,
+                                                           db_path,
+                                                           {"label", "id"},
+                                                           nullptr);
+  core::BuildContext context;
+  auto segment =
+      HnswSegment<RawSearchSpace>::build({bundle.search_space_, bundle.search_space_},
+                                         {.max_neighbors = kMaxNbrs, .thread_count = num_threads},
+                                         context);
+  bundle.graph_ = detail::HnswSegmentBridge<RawSearchSpace, RawSearchSpace>::graph(*segment);
   bundle.build_space_ = bundle.search_space_;
   bundle.build_seconds_ = timer.elapsed_us() / 1e6;
   return bundle;
@@ -301,8 +313,13 @@ auto build_sq8_partition_bundle(const std::vector<DataType> &vectors,
   Timer timer;
   bundle.build_space_ = make_raw_build_space(vectors, vector_num, dim);
   bundle.graph_ = build_hnsw_graph(bundle.build_space_, num_threads);
-  bundle.search_space_ = make_search_space<SQ8SearchSpace>(
-      vectors, vector_num, dim, scalar_data, db_path, {"id"}, nullptr);
+  bundle.search_space_ = make_search_space<SQ8SearchSpace>(vectors,
+                                                           vector_num,
+                                                           dim,
+                                                           scalar_data,
+                                                           db_path,
+                                                           {"id"},
+                                                           nullptr);
   bundle.build_seconds_ = timer.elapsed_us() / 1e6;
   return bundle;
 }
@@ -320,8 +337,13 @@ auto build_sq4_partition_bundle(const std::vector<DataType> &vectors,
   Timer timer;
   bundle.build_space_ = make_raw_build_space(vectors, vector_num, dim);
   bundle.graph_ = build_hnsw_graph(bundle.build_space_, num_threads);
-  bundle.search_space_ = make_search_space<SQ4SearchSpace>(
-      vectors, vector_num, dim, scalar_data, db_path, {"id"}, nullptr);
+  bundle.search_space_ = make_search_space<SQ4SearchSpace>(vectors,
+                                                           vector_num,
+                                                           dim,
+                                                           scalar_data,
+                                                           db_path,
+                                                           {"id"},
+                                                           nullptr);
   bundle.build_seconds_ = timer.elapsed_us() / 1e6;
   return bundle;
 }
@@ -365,10 +387,13 @@ auto benchmark_global_bruteforce(const Dataset &ds,
                                  double build_seconds) -> BaselineResult {
   BaselineResult result;
   result.build_seconds_ = build_seconds;
-  result.ids_.resize(static_cast<size_t>(ds.query_num_) * kTopK, std::numeric_limits<IDType>::max());
+  result.ids_.resize(static_cast<size_t>(ds.query_num_) * kTopK,
+                     std::numeric_limits<IDType>::max());
 
-  auto job = std::make_shared<GraphHybridSearchJob<RawSearchSpace, RawSearchSpace>>(
-      space, make_dummy_graph(), space);
+  auto job =
+      std::make_shared<GraphHybridSearchJob<RawSearchSpace, RawSearchSpace>>(space,
+                                                                             make_dummy_graph(),
+                                                                             space);
 
   std::vector<std::string> item_ids(kTopK);
   Timer timer;
@@ -411,18 +436,28 @@ auto benchmark_partition_bundle(const Dataset &ds,
     for (uint32_t i = 0; i < ds.query_num_; ++i) {
       auto *query = const_cast<DataType *>(ds.queries_.data() + static_cast<size_t>(i) * ds.dim_);
       std::fill(local_ids.begin(), local_ids.end(), std::numeric_limits<IDType>::max());
-      job->rabitq_hybrid_search_solo(
-          query, kTopK, local_ids.data(), kEfSearch, residual_filter, item_ids.data());
+      job->rabitq_hybrid_search_solo(query,
+                                     kTopK,
+                                     local_ids.data(),
+                                     kEfSearch,
+                                     residual_filter,
+                                     item_ids.data());
       decode_item_ids_to_global_ids(item_ids, all_ids.data() + static_cast<size_t>(i) * kTopK);
     }
   } else {
-    auto job = std::make_shared<GraphHybridSearchJob<SearchSpaceType, BuildSpaceType>>(
-        bundle.search_space_, bundle.graph_, bundle.build_space_);
+    auto job = std::make_shared<
+        GraphHybridSearchJob<SearchSpaceType, BuildSpaceType>>(bundle.search_space_,
+                                                               bundle.graph_,
+                                                               bundle.build_space_);
     for (uint32_t i = 0; i < ds.query_num_; ++i) {
       auto *query = const_cast<DataType *>(ds.queries_.data() + static_cast<size_t>(i) * ds.dim_);
       std::fill(local_ids.begin(), local_ids.end(), std::numeric_limits<IDType>::max());
-      job->hybrid_search_solo(
-          query, local_ids.data(), kTopK, kEfSearch, residual_filter, item_ids.data());
+      job->hybrid_search_solo(query,
+                              local_ids.data(),
+                              kTopK,
+                              kEfSearch,
+                              residual_filter,
+                              item_ids.data());
       decode_item_ids_to_global_ids(item_ids, all_ids.data() + static_cast<size_t>(i) * kTopK);
     }
   }
@@ -452,7 +487,8 @@ void print_results(const Dataset &ds,
                            target_count,
                            static_cast<double>(target_count) * 100.0 /
                                static_cast<double>(ds.data_num_));
-  std::cout << "mv_model=manual route on label partition, residual filter evaluated inside partition\n";
+  std::cout
+      << "mv_model=manual route on label partition, residual filter evaluated inside partition\n";
   std::cout << fmt::format("filter={}\n", scenario.label_);
   std::cout << fmt::format("bf_exact\tbuild_s={:.3f}\tquery_s={:.3f}\tavg_ms={:.3f}\tqps={:.1f}\n",
                            baseline.build_seconds_,
@@ -462,9 +498,7 @@ void print_results(const Dataset &ds,
   std::cout << "quant\tmv_build_s\tmv_query_s\tavg_ms\tqps\tspeedup_vs_bf\trecall_vs_bf\tnote\n";
   for (const auto &result : results) {
     if (!result.available_) {
-      std::cout << fmt::format("{}\t-\t-\t-\t-\t-\t-\t{}\n",
-                               result.name_,
-                               result.note_);
+      std::cout << fmt::format("{}\t-\t-\t-\t-\t-\t-\t{}\n", result.name_, result.note_);
       continue;
     }
     std::cout << fmt::format("{}\t{:.3f}\t{:.3f}\t{:.3f}\t{:.1f}\t{:.2f}x\t{:.4f}\t{}\n",
@@ -549,28 +583,35 @@ TEST_F(HybridQuantizationPerformanceTest, CompareSimpleMvAgainstBruteForceAcross
   ASSERT_GE(settings_.target_count_, kTopK);
 
   double raw_full_build_seconds = 0.0;
-  auto raw_full_space = make_search_space<RawSearchSpace>(
-      ds_.data_, ds_.data_num_, ds_.dim_, scalar_data_, work_dir_ / "raw_full_db", {"label", "id"},
-      &raw_full_build_seconds);
+  auto raw_full_space = make_search_space<RawSearchSpace>(ds_.data_,
+                                                          ds_.data_num_,
+                                                          ds_.dim_,
+                                                          scalar_data_,
+                                                          work_dir_ / "raw_full_db",
+                                                          {"label", "id"},
+                                                          &raw_full_build_seconds);
 
-  auto raw_bundle = build_raw_partition_bundle(target_vectors_,
-                                               settings_.target_count_,
-                                               ds_.dim_,
-                                               target_scalar_data_,
-                                               work_dir_ / "raw_partition_db",
-                                               std::max<uint32_t>(1, std::thread::hardware_concurrency()));
-  auto sq8_bundle = build_sq8_partition_bundle(target_vectors_,
-                                               settings_.target_count_,
-                                               ds_.dim_,
-                                               target_scalar_data_,
-                                               work_dir_ / "sq8_partition_db",
-                                               std::max<uint32_t>(1, std::thread::hardware_concurrency()));
-  auto sq4_bundle = build_sq4_partition_bundle(target_vectors_,
-                                               settings_.target_count_,
-                                               ds_.dim_,
-                                               target_scalar_data_,
-                                               work_dir_ / "sq4_partition_db",
-                                               std::max<uint32_t>(1, std::thread::hardware_concurrency()));
+  auto raw_bundle =
+      build_raw_partition_bundle(target_vectors_,
+                                 settings_.target_count_,
+                                 ds_.dim_,
+                                 target_scalar_data_,
+                                 work_dir_ / "raw_partition_db",
+                                 std::max<uint32_t>(1, std::thread::hardware_concurrency()));
+  auto sq8_bundle =
+      build_sq8_partition_bundle(target_vectors_,
+                                 settings_.target_count_,
+                                 ds_.dim_,
+                                 target_scalar_data_,
+                                 work_dir_ / "sq8_partition_db",
+                                 std::max<uint32_t>(1, std::thread::hardware_concurrency()));
+  auto sq4_bundle =
+      build_sq4_partition_bundle(target_vectors_,
+                                 settings_.target_count_,
+                                 ds_.dim_,
+                                 target_scalar_data_,
+                                 work_dir_ / "sq4_partition_db",
+                                 std::max<uint32_t>(1, std::thread::hardware_concurrency()));
   auto rabitq_bundle = build_rabitq_partition_bundle(target_vectors_,
                                                      settings_.target_count_,
                                                      ds_.dim_,
@@ -578,18 +619,32 @@ TEST_F(HybridQuantizationPerformanceTest, CompareSimpleMvAgainstBruteForceAcross
                                                      work_dir_ / "rabitq_partition_db");
 
   for (const auto &scenario : scenarios_) {
-    auto baseline = benchmark_global_bruteforce(
-        ds_, scenario.full_filter_, raw_full_space, raw_full_build_seconds);
+    auto baseline = benchmark_global_bruteforce(ds_,
+                                                scenario.full_filter_,
+                                                raw_full_space,
+                                                raw_full_build_seconds);
 
     std::vector<BenchmarkResult> results;
-    results.push_back(benchmark_partition_bundle(
-        ds_, scenario.residual_filter_, baseline.ids_, raw_bundle, baseline.query_seconds_));
-    results.push_back(benchmark_partition_bundle(
-        ds_, scenario.residual_filter_, baseline.ids_, sq8_bundle, baseline.query_seconds_));
-    results.push_back(benchmark_partition_bundle(
-        ds_, scenario.residual_filter_, baseline.ids_, sq4_bundle, baseline.query_seconds_));
-    results.push_back(benchmark_partition_bundle(
-        ds_, scenario.residual_filter_, baseline.ids_, rabitq_bundle, baseline.query_seconds_));
+    results.push_back(benchmark_partition_bundle(ds_,
+                                                 scenario.residual_filter_,
+                                                 baseline.ids_,
+                                                 raw_bundle,
+                                                 baseline.query_seconds_));
+    results.push_back(benchmark_partition_bundle(ds_,
+                                                 scenario.residual_filter_,
+                                                 baseline.ids_,
+                                                 sq8_bundle,
+                                                 baseline.query_seconds_));
+    results.push_back(benchmark_partition_bundle(ds_,
+                                                 scenario.residual_filter_,
+                                                 baseline.ids_,
+                                                 sq4_bundle,
+                                                 baseline.query_seconds_));
+    results.push_back(benchmark_partition_bundle(ds_,
+                                                 scenario.residual_filter_,
+                                                 baseline.ids_,
+                                                 rabitq_bundle,
+                                                 baseline.query_seconds_));
 
     print_results(ds_, settings_.target_count_, scenario, baseline, results);
 

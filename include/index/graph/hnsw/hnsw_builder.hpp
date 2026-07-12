@@ -184,7 +184,4 @@ struct HnswBuilderKernel {
   }
 };
 
-// static_assert(GraphBuilder<HNSWBuilder<RawSpace<>>>,
-// "HNSWBuilder does not satisfy GraphBuilder concept");
-
 }  // namespace alaya::detail

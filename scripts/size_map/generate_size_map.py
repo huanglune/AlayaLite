@@ -42,7 +42,7 @@ def _tokens(row: tuple[str, str, str, str]) -> tuple[str, str, str]:
     data, ident, quant, index = row
     data_token = {"float": "float", "int8_t": "signed char", "uint8_t": "unsigned char"}[data]
     id_token = {"uint32_t": "unsigned int", "uint64_t": "unsigned long"}[ident]
-    builder_token = {"HNSW": "HNSWBuilder<", "NSG": "NSGBuilder<", "FUSION": "FusionGraphBuilder<"}[index]
+    builder_token = {"HNSW": "HnswSegment<", "NSG": "NSGBuilder<", "FUSION": "FusionGraphBuilder<"}[index]
     space_token = {"NONE": "RawSpace<", "SQ8": "SQ8Space<", "SQ4": "SQ4Space<", "RABITQ": "RaBitQSpace<"}[quant]
     return builder_token, f"{space_token}{data_token}, float, {id_token}", id_token
 

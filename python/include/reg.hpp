@@ -98,17 +98,17 @@ struct SQ8SearchIndex<std::variant<Builders...>> {
 };
 
 using RawSpaceVariant = typename ExpandBoth<DataTypes, IdTypes, RawSpaceVariantType>::type;
-using HNSWBuilderVariant = typename ExpandSingle<RawSpaceVariant, HNSWBuilder>::type;
+using HnswSegmentVariant = typename ExpandSingle<RawSpaceVariant, HnswSegment>::type;
 using NSGBuilderVariant = typename ExpandSingle<RawSpaceVariant, NSGBuilder>::type;
 
 // using BasePyIndex =
-//     MergeVariants<RawSearchIndex<HNSWBuilderVariant>::type,
+//     MergeVariants<RawSearchIndex<HnswSegmentVariant>::type,
 //     RawSearchIndex<NSGBuilderVariant>::type,
-//                   SQ4SearchIndex<HNSWBuilderVariant>::type,
+//                   SQ4SearchIndex<HnswSegmentVariant>::type,
 //                   SQ4SearchIndex<NSGBuilderVariant>::type,
 //                   SQ8SearchIndex<NSGBuilderVariant>::type,
-//                   SQ8SearchIndex<HNSWBuilderVariant>::type>;
+//                   SQ8SearchIndex<HnswSegmentVariant>::type>;
 
-using BasePyIndex = MergeVariants<RawSearchIndex<HNSWBuilderVariant>::type>;
+using BasePyIndex = MergeVariants<RawSearchIndex<HnswSegmentVariant>::type>;
 }  // namespace alaya
 */

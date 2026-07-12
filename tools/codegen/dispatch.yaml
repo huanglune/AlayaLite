@@ -56,9 +56,9 @@ build_spaces       :
   RABITQ: RaBitQSpace<{data},{distance},{id},{scalar}>
 
 builders           :
-  HNSW: HNSWBuilder<{space}>
+  HNSW: HnswSegment<{space}>
   NSG: NSGBuilder<{space}>
-  FUSION: FusionGraphBuilder<{space},HNSWBuilder<{space}>,NSGBuilder<{space}>>
+  FUSION: FusionGraphBuilder<{space},detail::HnswBuilderKernel<{space}>,NSGBuilder<{space}>>
 
 distance_type      : float
 build_scalar_type  : EmptyScalarData

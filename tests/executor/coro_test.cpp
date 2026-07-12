@@ -3,22 +3,22 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 #if defined(__linux__)
-#include <gtest/gtest.h>
-#include <atomic>
-#include <filesystem>
-#include <memory>
-#include <unordered_set>
-#include <vector>
-#include "coro/mutex.hpp"
-#include "coro/task.hpp"
-#include "executor/jobs/graph_search_job.hpp"
-#include "executor/jobs/graph_update_job.hpp"
-#include "executor/scheduler.hpp"
-#include "index/graph/graph.hpp"
-#include "index/graph/hnsw/hnsw_builder.hpp"
-#include "space/raw_space.hpp"
-#include "utils/io_utils.hpp"
-#include "utils/log.hpp"
+  #include <gtest/gtest.h>
+  #include <atomic>
+  #include <filesystem>
+  #include <memory>
+  #include <unordered_set>
+  #include <vector>
+  #include "coro/mutex.hpp"
+  #include "coro/task.hpp"
+  #include "executor/jobs/graph_search_job.hpp"
+  #include "executor/jobs/graph_update_job.hpp"
+  #include "executor/scheduler.hpp"
+  #include "index/graph/graph.hpp"
+  #include "index/graph/hnsw/hnsw_segment.hpp"
+  #include "space/raw_space.hpp"
+  #include "utils/io_utils.hpp"
+  #include "utils/log.hpp"
 
 namespace alaya {
 
@@ -60,8 +60,9 @@ class HNSWCoroutineTest : public ::testing::Test {
     space_ = std::make_shared<RawSpace<>>(points_num_, dim_, MetricType::L2);
     space_->fit(data_.data(), points_num_);
 
-    HNSWBuilder<RawSpace<>> builder(space_);
-    graph_ = builder.build_graph(64);
+    core::BuildContext context;
+    auto segment = HnswSegment<RawSpace<>>::build({space_, space_}, {.thread_count = 64}, context);
+    graph_ = detail::HnswSegmentBridge<RawSpace<>, RawSpace<>>::graph(*segment);
   }
 
   void init_scheduler() {

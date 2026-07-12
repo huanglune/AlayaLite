@@ -14,7 +14,7 @@
 #include "executor/jobs/graph_hybrid_search_job.hpp"
 #include "executor/jobs/graph_search_job.hpp"
 #include "index/graph/graph.hpp"
-#include "index/graph/hnsw/hnsw_builder.hpp"
+#include "index/graph/hnsw/hnsw_segment.hpp"
 #include "index/graph/qg/qg_builder.hpp"
 #include "space/rabitq_space.hpp"
 #include "space/raw_space.hpp"
@@ -73,9 +73,7 @@ struct ScopedTempDbDir {
   std::filesystem::path path_;
 };
 
-auto max_thread_num() -> uint32_t {
-  return configured_thread_limit();
-}
+auto max_thread_num() -> uint32_t { return configured_thread_limit(); }
 
 auto make_test_metadata(uint32_t item_cnt) -> std::vector<ScalarData> {
   std::vector<ScalarData> metadata(item_cnt);
@@ -185,8 +183,11 @@ auto load_or_build_hnsw_graph(const Dataset &ds, const std::shared_ptr<RawSpaceT
     if (!std::filesystem::exists(graph_path)) {
       auto build_start = std::chrono::steady_clock::now();
 
-      HNSWBuilder<RawSpaceType> hnsw(space);
-      auto hnsw_graph = hnsw.build_graph(max_thread_num());
+      core::BuildContext build_context;
+      auto segment = HnswSegment<RawSpaceType>::build({space, space},
+                                                      {.thread_count = max_thread_num()},
+                                                      build_context);
+      auto hnsw_graph = detail::HnswSegmentBridge<RawSpaceType, RawSpaceType>::graph(*segment);
 
       auto build_end = std::chrono::steady_clock::now();
       auto build_time = static_cast<std::chrono::duration<double>>(build_end - build_start).count();
@@ -212,7 +213,8 @@ auto run_parallel_search(SearchJobPtr &search_job, Dataset &ds, uint32_t topk, u
   Timer timer{};
   std::vector<std::vector<uint32_t>> res_pool(ds.query_num_, std::vector<uint32_t>(topk));
   const size_t search_thread_num =
-      std::min<size_t>(cap_thread_count(16), std::max<size_t>(1, static_cast<size_t>(ds.query_num_)));
+      std::min<size_t>(cap_thread_count(16),
+                       std::max<size_t>(1, static_cast<size_t>(ds.query_num_)));
   std::vector<std::thread> tasks(search_thread_num);
 
   auto search_knn = [&](uint32_t i) {

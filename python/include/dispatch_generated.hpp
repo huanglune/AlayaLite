@@ -25,12 +25,12 @@ auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIn
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,ScalarData>;
       using SearchSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,ScalarData>;
-      using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
+      using GraphBuilderType = HnswSegment<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
     using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
-    using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
+    using GraphBuilderType = HnswSegment<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint32_t / NONE / NSG
@@ -57,12 +57,12 @@ auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIn
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,ScalarData>;
       using SearchSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,ScalarData>;
-      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
+      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
     using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
-    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
+    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint32_t / SQ8 / HNSW
@@ -73,12 +73,12 @@ auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIn
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
       using SearchSpaceType = SQ8Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
-      using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
+      using GraphBuilderType = HnswSegment<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
     using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = SQ8Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
-    using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
+    using GraphBuilderType = HnswSegment<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint32_t / SQ8 / NSG
@@ -105,12 +105,12 @@ auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIn
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
       using SearchSpaceType = SQ8Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
-      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
+      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
     using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = SQ8Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
-    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
+    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint32_t / SQ4 / HNSW
@@ -121,12 +121,12 @@ auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIn
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
       using SearchSpaceType = SQ4Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
-      using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
+      using GraphBuilderType = HnswSegment<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
     using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = SQ4Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
-    using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
+    using GraphBuilderType = HnswSegment<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint32_t / SQ4 / NSG
@@ -153,12 +153,12 @@ auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIn
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
       using SearchSpaceType = SQ4Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
-      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
+      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
     using BuildSpaceType = RawSpace<float,float,uint32_t,SequentialStorage<float,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = SQ4Space<float,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
-    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
+    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint32_t / RABITQ / HNSW
@@ -169,12 +169,12 @@ auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIn
     if (params.has_scalar_data_) {
       using BuildSpaceType = RaBitQSpace<float,float,uint32_t,ScalarData>;
       using SearchSpaceType = RaBitQSpace<float,float,uint32_t,ScalarData>;
-      using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
+      using GraphBuilderType = HnswSegment<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
     using BuildSpaceType = RaBitQSpace<float,float,uint32_t,EmptyScalarData>;
     using SearchSpaceType = RaBitQSpace<float,float,uint32_t,EmptyScalarData>;
-    using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
+    using GraphBuilderType = HnswSegment<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint32_t / RABITQ / NSG
@@ -201,12 +201,12 @@ auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIn
     if (params.has_scalar_data_) {
       using BuildSpaceType = RaBitQSpace<float,float,uint32_t,ScalarData>;
       using SearchSpaceType = RaBitQSpace<float,float,uint32_t,ScalarData>;
-      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
+      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
     using BuildSpaceType = RaBitQSpace<float,float,uint32_t,EmptyScalarData>;
     using SearchSpaceType = RaBitQSpace<float,float,uint32_t,EmptyScalarData>;
-    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
+    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint64_t / NONE / HNSW
@@ -217,12 +217,12 @@ auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIn
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,ScalarData>;
       using SearchSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,ScalarData>;
-      using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
+      using GraphBuilderType = HnswSegment<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
     using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
-    using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
+    using GraphBuilderType = HnswSegment<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint64_t / NONE / NSG
@@ -249,12 +249,12 @@ auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIn
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,ScalarData>;
       using SearchSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,ScalarData>;
-      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
+      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
     using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
-    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
+    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint64_t / SQ8 / HNSW
@@ -265,12 +265,12 @@ auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIn
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
       using SearchSpaceType = SQ8Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
-      using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
+      using GraphBuilderType = HnswSegment<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
     using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = SQ8Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
-    using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
+    using GraphBuilderType = HnswSegment<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint64_t / SQ8 / NSG
@@ -297,12 +297,12 @@ auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIn
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
       using SearchSpaceType = SQ8Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
-      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
+      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
     using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = SQ8Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
-    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
+    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint64_t / SQ4 / HNSW
@@ -313,12 +313,12 @@ auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIn
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
       using SearchSpaceType = SQ4Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
-      using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
+      using GraphBuilderType = HnswSegment<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
     using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = SQ4Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
-    using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
+    using GraphBuilderType = HnswSegment<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // float / uint64_t / SQ4 / NSG
@@ -345,12 +345,12 @@ auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIn
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
       using SearchSpaceType = SQ4Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
-      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
+      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
     using BuildSpaceType = RawSpace<float,float,uint64_t,SequentialStorage<float,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = SQ4Space<float,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
-    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
+    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // int8_t / uint32_t / NONE / HNSW
@@ -361,12 +361,12 @@ auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIn
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,ScalarData>;
       using SearchSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,ScalarData>;
-      using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
+      using GraphBuilderType = HnswSegment<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
     using BuildSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,EmptyScalarData>;
-    using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
+    using GraphBuilderType = HnswSegment<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // int8_t / uint32_t / NONE / NSG
@@ -393,12 +393,12 @@ auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIn
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,ScalarData>;
       using SearchSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,ScalarData>;
-      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
+      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
     using BuildSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<int8_t,float,uint32_t,SequentialStorage<int8_t,uint32_t>,EmptyScalarData>;
-    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
+    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // int8_t / uint64_t / NONE / HNSW
@@ -409,12 +409,12 @@ auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIn
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,ScalarData>;
       using SearchSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,ScalarData>;
-      using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
+      using GraphBuilderType = HnswSegment<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
     using BuildSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,EmptyScalarData>;
-    using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
+    using GraphBuilderType = HnswSegment<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // int8_t / uint64_t / NONE / NSG
@@ -441,12 +441,12 @@ auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIn
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,ScalarData>;
       using SearchSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,ScalarData>;
-      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
+      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
     using BuildSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<int8_t,float,uint64_t,SequentialStorage<int8_t,uint64_t>,EmptyScalarData>;
-    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
+    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // uint8_t / uint32_t / NONE / HNSW
@@ -457,12 +457,12 @@ auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIn
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
       using SearchSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
-      using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
+      using GraphBuilderType = HnswSegment<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
     using BuildSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
-    using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
+    using GraphBuilderType = HnswSegment<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // uint8_t / uint32_t / NONE / NSG
@@ -489,12 +489,12 @@ auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIn
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
       using SearchSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,ScalarData>;
-      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
+      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
     using BuildSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<uint8_t,float,uint32_t,SequentialStorage<uint8_t,uint32_t>,EmptyScalarData>;
-    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
+    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // uint8_t / uint64_t / NONE / HNSW
@@ -505,12 +505,12 @@ auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIn
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
       using SearchSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
-      using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
+      using GraphBuilderType = HnswSegment<BuildSpaceType>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
     using BuildSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
-    using GraphBuilderType = HNSWBuilder<BuildSpaceType>;
+    using GraphBuilderType = HnswSegment<BuildSpaceType>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   // uint8_t / uint64_t / NONE / NSG
@@ -537,12 +537,12 @@ auto IndexFactory::create(const IndexParams &params) -> std::unique_ptr<BasePyIn
     if (params.has_scalar_data_) {
       using BuildSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
       using SearchSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,ScalarData>;
-      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
+      using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
       return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
     }
     using BuildSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
     using SearchSpaceType = RawSpace<uint8_t,float,uint64_t,SequentialStorage<uint8_t,uint64_t>,EmptyScalarData>;
-    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,HNSWBuilder<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
+    using GraphBuilderType = FusionGraphBuilder<BuildSpaceType,detail::HnswBuilderKernel<BuildSpaceType>,NSGBuilder<BuildSpaceType>>;
     return std::make_unique<PyIndex<GraphBuilderType, SearchSpaceType>>(params);
   }
   throw std::runtime_error(

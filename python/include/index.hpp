@@ -38,7 +38,7 @@
 #include "executor/scheduler.hpp"
 #include "index/graph/fusion_graph.hpp"
 #include "index/graph/graph.hpp"
-#include "index/graph/hnsw/hnsw_builder.hpp"
+#include "index/graph/hnsw/hnsw_segment.hpp"
 #include "index/graph/nsg/nsg_builder.hpp"
 #include "index/graph/qg/qg_builder.hpp"
 #include "index_factory.hpp"
@@ -72,6 +72,7 @@ class PyIndex : public BasePyIndex {
   using DistanceType = typename SearchSpaceType::DistanceTypeAlias;
   using BuildSpaceType = typename GraphBuilderType::DistanceSpaceTypeAlias;
   using MaterializedViewManagerType = MaterializedViewManager<SearchSpaceType, BuildSpaceType>;
+  using HnswSegmentType = HnswSegment<SearchSpaceType, BuildSpaceType>;
 
   PyIndex() = delete;
   explicit PyIndex(IndexParams params) : params_(std::move(params)) { initialize_recovery(); }
@@ -184,6 +185,11 @@ class PyIndex : public BasePyIndex {
     std::string_view quant_path_view{quant_path};
 
     if constexpr (!is_rabitq_space_v<SearchSpaceType>) {
+      if (params_.index_type_ == IndexType::HNSW && hnsw_segment_ != nullptr) {
+        core::ArtifactWriter writer{index_path_view, data_path_view, quant_path_view};
+        (void)hnsw_segment_->save(writer, {});
+        return;
+      }
       graph_index_->save(index_path_view);
       if (!data_path.empty()) {
         build_space_->save(data_path_view);
@@ -217,21 +223,32 @@ class PyIndex : public BasePyIndex {
                                                                         nullptr,
                                                                         build_space_);
     } else {
-      graph_index_ = std::make_shared<Graph<DataType, IDType>>();
-      graph_index_->load(index_path_view);
-
-      if (!data_path.empty()) {
-        build_space_ = std::make_shared<BuildSpaceType>();
-        build_space_->load(data_path_view);
-        build_space_->set_metric_function();
-      }
-
-      if constexpr (std::is_same<BuildSpaceType, SearchSpaceType>::value) {
-        search_space_ = build_space_;
+      if (params_.index_type_ == IndexType::HNSW) {
+        core::OpenContext open_context;
+        hnsw_segment_ = HnswSegmentType::open({index_path_view, data_path_view, quant_path_view},
+                                              {},
+                                              open_context);
+        graph_index_ =
+            detail::HnswSegmentBridge<SearchSpaceType, BuildSpaceType>::graph(*hnsw_segment_);
+        auto segment_search =
+            detail::HnswSegmentBridge<SearchSpaceType, BuildSpaceType>::search_job(*hnsw_segment_);
+        search_space_ = segment_search->space_;
+        build_space_ = segment_search->build_space_;
       } else {
-        search_space_ = std::make_shared<SearchSpaceType>();
-        search_space_->load(quant_path_view);
-        search_space_->set_metric_function();
+        graph_index_ = std::make_shared<Graph<DataType, IDType>>();
+        graph_index_->load(index_path_view);
+        if (!data_path.empty()) {
+          build_space_ = std::make_shared<BuildSpaceType>();
+          build_space_->load(data_path_view);
+          build_space_->set_metric_function();
+        }
+        if constexpr (std::is_same<BuildSpaceType, SearchSpaceType>::value) {
+          search_space_ = build_space_;
+        } else {
+          search_space_ = std::make_shared<SearchSpaceType>();
+          search_space_->load(quant_path_view);
+          search_space_->set_metric_function();
+        }
       }
 
       data_size_ = build_space_->get_data_size();
@@ -655,10 +672,14 @@ class PyIndex : public BasePyIndex {
       }
 
       auto build_start = std::chrono::steady_clock::now();
-      auto graph_builder = std::make_shared<HNSWBuilder<BuildSpaceType>>(build_space_,
-                                                                         params_.max_nbrs_,
-                                                                         ef_construction);
-      graph_index_ = graph_builder->build_graph(num_threads);
+      core::BuildContext build_context;
+      hnsw_segment_ = HnswSegmentType::build({search_space_, build_space_},
+                                             {.max_neighbors = params_.max_nbrs_,
+                                              .ef_construction = ef_construction,
+                                              .thread_count = num_threads},
+                                             build_context);
+      graph_index_ =
+          detail::HnswSegmentBridge<SearchSpaceType, BuildSpaceType>::graph(*hnsw_segment_);
 
       LOG_INFO("The time of building hnsw is {}s.",
                static_cast<std::chrono::duration<double>>(std::chrono::steady_clock::now() -
@@ -1348,6 +1369,7 @@ class PyIndex : public BasePyIndex {
   std::filesystem::path index_path_;
 
   std::shared_ptr<Graph<DataType, IDType>> graph_index_{nullptr};
+  std::unique_ptr<HnswSegmentType> hnsw_segment_{nullptr};
   std::shared_ptr<BuildSpaceType> build_space_{nullptr};
   std::shared_ptr<SearchSpaceType> search_space_{nullptr};
 

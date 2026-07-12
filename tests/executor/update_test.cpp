@@ -13,7 +13,7 @@
 #include "executor/jobs/graph_search_job.hpp"
 #include "executor/jobs/graph_update_job.hpp"
 #include "index/graph/graph.hpp"
-#include "index/graph/hnsw/hnsw_builder.hpp"
+#include "index/graph/hnsw/hnsw_segment.hpp"
 #include "space/raw_space.hpp"
 #include "space/sq8_space.hpp"
 #include "utils/dataset_utils.hpp"
@@ -48,8 +48,10 @@ TEST_F(UpdateTest, HalfInsertTest) {
 
   auto build_start = std::chrono::steady_clock::now();
 
-  alaya::HNSWBuilder<alaya::RawSpace<>> hnsw = alaya::HNSWBuilder<alaya::RawSpace<>>(space);
-  std::shared_ptr<alaya::Graph<>> hnsw_graph = hnsw.build_graph();
+  alaya::core::BuildContext build_context;
+  auto segment = alaya::HnswSegment<alaya::RawSpace<>>::build({space, space}, {}, build_context);
+  std::shared_ptr<alaya::Graph<>> hnsw_graph =
+      alaya::detail::HnswSegmentBridge<alaya::RawSpace<>, alaya::RawSpace<>>::graph(*segment);
 
   auto build_end = std::chrono::steady_clock::now();
   auto build_time = static_cast<std::chrono::duration<double>>(build_end - build_start).count();
@@ -103,11 +105,14 @@ TEST_F(UpdateTest, HalfInsertTest) {
   auto recall_after_delete = calc_recall(ids.data(), full_gt.data(), ds_.query_num_, topk, topk);
   LOG_INFO("The recall after delete is {}", recall_after_delete);
 
-  auto gt_after_delete =
-      find_exact_gt<>(ds_.queries_, ds_.data_, ds_.dim_, topk,
-                      &update_job->job_context_->removed_vertices_);
+  auto gt_after_delete = find_exact_gt<>(ds_.queries_,
+                                         ds_.data_,
+                                         ds_.dim_,
+                                         topk,
+                                         &update_job->job_context_->removed_vertices_);
 
-  auto recall_after_delete_gt = calc_recall(ids.data(), gt_after_delete.data(), ds_.query_num_, topk, topk);
+  auto recall_after_delete_gt =
+      calc_recall(ids.data(), gt_after_delete.data(), ds_.query_num_, topk, topk);
   LOG_INFO("The recall after delete gt is {}", recall_after_delete_gt);
 }
 
@@ -115,12 +120,10 @@ TEST(GraphUpdateJobSplitSpaceTest, IncrementalInsertKeepsBuildAndSearchSpacesCon
   namespace fs = std::filesystem;
 
   using IDType = uint32_t;
-  using BuildSpaceType = RawSpace<float, float, IDType, SequentialStorage<float, IDType>, EmptyScalarData>;
-  using SearchSpaceType = SQ8Space<float,
-                                   float,
-                                   IDType,
-                                   SequentialStorage<uint8_t, IDType>,
-                                   ScalarData>;
+  using BuildSpaceType =
+      RawSpace<float, float, IDType, SequentialStorage<float, IDType>, EmptyScalarData>;
+  using SearchSpaceType =
+      SQ8Space<float, float, IDType, SequentialStorage<uint8_t, IDType>, ScalarData>;
 
   auto temp_dir = fs::temp_directory_path() / "graph_update_job_split_space_test";
   fs::remove_all(temp_dir);
@@ -133,8 +136,10 @@ TEST(GraphUpdateJobSplitSpaceTest, IncrementalInsertKeepsBuildAndSearchSpacesCon
   auto search_space = std::make_shared<SearchSpaceType>(8, 2, MetricType::L2, config);
 
   float base_vectors[] = {
-      0.0F, 0.0F,
-      1.0F, 1.0F,
+      0.0F,
+      0.0F,
+      1.0F,
+      1.0F,
   };
   ScalarData base_scalar[] = {
       {"seed_0", "doc0", {}},
@@ -144,13 +149,16 @@ TEST(GraphUpdateJobSplitSpaceTest, IncrementalInsertKeepsBuildAndSearchSpacesCon
   build_space->fit(base_vectors, 2);
   search_space->fit(base_vectors, 2, base_scalar);
 
-  auto graph_builder = std::make_shared<HNSWBuilder<BuildSpaceType>>(build_space);
-  auto graph = std::shared_ptr<Graph<>>(graph_builder->build_graph(1).release());
+  core::BuildContext build_context;
+  auto segment = HnswSegment<SearchSpaceType, BuildSpaceType>::build({search_space, build_space},
+                                                                     {},
+                                                                     build_context);
+  auto graph = detail::HnswSegmentBridge<SearchSpaceType, BuildSpaceType>::graph(*segment);
   auto job_context = std::make_shared<JobContext<IDType>>();
   auto search_job = std::make_shared<GraphSearchJob<SearchSpaceType, BuildSpaceType>>(search_space,
-                                                                                       graph,
-                                                                                       job_context,
-                                                                                       build_space);
+                                                                                      graph,
+                                                                                      job_context,
+                                                                                      build_space);
   auto update_job = std::make_shared<GraphUpdateJob<SearchSpaceType, BuildSpaceType>>(search_job);
 
   float new_vector[] = {0.05F, 0.05F};

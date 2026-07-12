@@ -22,7 +22,7 @@
 #include "executor/search_info.hpp"
 #include "executor/vector_iterator.hpp"
 #include "index/graph/graph.hpp"
-#include "index/graph/hnsw/hnsw_builder.hpp"
+#include "index/graph/hnsw/hnsw_segment.hpp"
 #include "index/graph/qg/qg_builder.hpp"
 #include "params.hpp"
 #include "space/rabitq_space.hpp"
@@ -857,11 +857,17 @@ class MaterializedViewManager {
             std::make_shared<Graph<DataType, IDType>>(partition_capacity, params_->max_nbrs_);
         partition.graph_->eps_.push_back(0);
       } else {
-        HNSWBuilder<MaterializedViewBuildSpaceType> graph_builder(partition.build_space_,
-                                                                  params_->max_nbrs_,
-                                                                  ef_construction_);
-        partition.graph_ = std::shared_ptr<Graph<DataType, IDType>>(
-            graph_builder.build_graph(build_threads_).release());
+        using SegmentType =
+            HnswSegment<MaterializedViewSearchSpaceType, MaterializedViewBuildSpaceType>;
+        core::BuildContext build_context;
+        auto segment = SegmentType::build({partition.search_space_, partition.build_space_},
+                                          {.max_neighbors = params_->max_nbrs_,
+                                           .ef_construction = ef_construction_,
+                                           .thread_count = build_threads_},
+                                          build_context);
+        partition.graph_ =
+            detail::HnswSegmentBridge<MaterializedViewSearchSpaceType,
+                                      MaterializedViewBuildSpaceType>::graph(*segment);
       }
       partition.search_job_ =
           std::make_shared<GraphSearchJob<MaterializedViewSearchSpaceType,
