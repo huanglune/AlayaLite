@@ -211,7 +211,11 @@ class PyIndex : public BasePyIndex {
         const auto locations =
             hnsw_artifact_locations(index_path_view, data_path_view, quant_path_view);
         core::ArtifactWriter writer{std::span<const core::ArtifactLocation>(locations)};
-        (void)hnsw_segment_->save(writer, {});
+        core::ArtifactManifest manifest;
+        const auto status = hnsw_segment_->save(writer, {}, manifest);
+        if (!status.ok()) {
+          throw std::runtime_error(status.diagnostic());
+        }
         return;
       }
       graph_index_->save(index_path_view);
@@ -251,9 +255,11 @@ class PyIndex : public BasePyIndex {
         core::OpenContext open_context;
         const auto locations =
             hnsw_artifact_locations(index_path_view, data_path_view, quant_path_view);
-        hnsw_segment_ = HnswSegmentType::open({std::span<const core::ArtifactLocation>(locations)},
-                                              {},
-                                              open_context);
+        hnsw_segment_ =
+            HnswSegmentType::open(core::ArtifactView(
+                                      std::span<const core::ArtifactLocation>(locations)),
+                                  {},
+                                  open_context);
         graph_index_ =
             detail::HnswSegmentBridge<SearchSpaceType, BuildSpaceType>::graph(*hnsw_segment_);
         search_space_ = detail::HnswSegmentBridge<SearchSpaceType, BuildSpaceType>::search_space(
