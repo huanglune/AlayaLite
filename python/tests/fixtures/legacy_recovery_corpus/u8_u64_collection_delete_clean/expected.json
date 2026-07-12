@@ -1,0 +1,70 @@
+{
+  "expected_applied_through_op_id": 1,
+  "expected_count": 5,
+  "expected_items": [
+    {
+      "document": "document-0",
+      "id": "item-0",
+      "metadata": {
+        "group": "base",
+        "ordinal": 0,
+        "version": 1
+      }
+    },
+    {
+      "document": "document-1",
+      "id": "item-1",
+      "metadata": {
+        "group": "base",
+        "ordinal": 1,
+        "version": 1
+      }
+    },
+    {
+      "document": "document-2",
+      "id": "item-2",
+      "metadata": {
+        "group": "base",
+        "ordinal": 2,
+        "version": 1
+      }
+    },
+    {
+      "document": "document-4",
+      "id": "item-4",
+      "metadata": {
+        "group": "base",
+        "ordinal": 4,
+        "version": 1
+      }
+    }
+  ],
+  "expected_live_count": 4,
+  "item_lookup_order": [
+    "item-0",
+    "item-1",
+    "item-2",
+    "item-3",
+    "item-4"
+  ],
+  "queries": [
+    {
+      "expected_item_ids": [
+        "item-0"
+      ],
+      "topk": 1,
+      "vector": [
+        78,
+        16,
+        56,
+        45,
+        18,
+        62,
+        56,
+        76
+      ]
+    }
+  ],
+  "reader_behavior": "load graph/data/RocksDB snapshot with item-3 already deleted",
+  "wal_after_writer": "absent_after_checkpoint"
+}

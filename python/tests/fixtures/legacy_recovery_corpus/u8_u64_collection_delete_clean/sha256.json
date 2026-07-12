@@ -1,0 +1,61 @@
+{
+  "files": {
+    "expected.json": {
+      "bytes": 1229,
+      "sha256": "8c803ffc05e2e0e7723f8624e2a58cc856fbae1544d626b87ad9c6e01c44339c"
+    },
+    "generation.json": {
+      "bytes": 562,
+      "sha256": "a3dd9a18ae673027eb379c6ece03fe454f236062a2506115724f78d8e6044a10"
+    },
+    "hnsw_l2_8.index": {
+      "bytes": 2284,
+      "sha256": "a814a3af47d0515ad83be27e74ea90679cb39b36ac0d2029922306bb7e7e0c56"
+    },
+    "raw.data": {
+      "bytes": 2204,
+      "sha256": "7a3923450d3fb2615176c7eb4de62ddbbe98aa4c0ab670b923371f0d108f36c4"
+    },
+    "recovery/CURRENT": {
+      "bytes": 16,
+      "sha256": "58248130df5b8e47f6c231209acc237b8f91367bd067ba665a576d8d726a9a5f"
+    },
+    "recovery/snapshots/snapshot-legacy/data.snapshot": {
+      "bytes": 2204,
+      "sha256": "7a3923450d3fb2615176c7eb4de62ddbbe98aa4c0ab670b923371f0d108f36c4"
+    },
+    "recovery/snapshots/snapshot-legacy/graph.snapshot": {
+      "bytes": 2284,
+      "sha256": "a814a3af47d0515ad83be27e74ea90679cb39b36ac0d2029922306bb7e7e0c56"
+    },
+    "recovery/snapshots/snapshot-legacy/manifest.txt": {
+      "bytes": 188,
+      "sha256": "3d99245031453f8abaa07ba07276c42d71f578c921888af0330bde325ebf05ca"
+    },
+    "recovery/snapshots/snapshot-legacy/rocksdb/000009.sst": {
+      "bytes": 1930,
+      "sha256": "e72d35ece4032a9805bac0eda36a00bdcc22d9ca819158247af6d91249cfe74b"
+    },
+    "recovery/snapshots/snapshot-legacy/rocksdb/000010.log": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "recovery/snapshots/snapshot-legacy/rocksdb/000011.sst": {
+      "bytes": 1358,
+      "sha256": "9d71c63b9d4e978b29cd70a268f43c8832802673dee1f54a8b02e5c00f42331e"
+    },
+    "recovery/snapshots/snapshot-legacy/rocksdb/CURRENT": {
+      "bytes": 16,
+      "sha256": "9c283f6e81028b9eb0760d918ee4bc0aa256ed3b926393c1734c760c4bd724fd"
+    },
+    "recovery/snapshots/snapshot-legacy/rocksdb/MANIFEST-000005": {
+      "bytes": 340,
+      "sha256": "45dc780c6d8d3d667f67951121e38e44708a39cf8f0bf6cae069b883cb8f78cb"
+    },
+    "schema.json": {
+      "bytes": 384,
+      "sha256": "c7bd0456b23b95d9b0f9649a5a207bd5e9fc7235c42c98182b6075c00629eb22"
+    }
+  },
+  "format_version": 1
+}

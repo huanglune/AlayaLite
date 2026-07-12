@@ -1,0 +1,40 @@
+{
+  "expected_applied_through_op_id": 1,
+  "expected_count": 7,
+  "queries": [
+    {
+      "expected_internal_ids": [
+        0
+      ],
+      "topk": 1,
+      "vector": [
+        0.3963296711444855,
+        -0.6160615086555481,
+        0.4568794071674347,
+        0.89295494556427,
+        0.2994349002838135,
+        -0.02534353733062744,
+        0.29691022634506226,
+        1.3644663095474243
+      ]
+    },
+    {
+      "expected_internal_ids": [
+        6
+      ],
+      "topk": 1,
+      "vector": [
+        0.21184393763542175,
+        1.1280043125152588,
+        -0.1314399689435959,
+        -0.6276628971099854,
+        1.3263581991195679,
+        0.45297789573669434,
+        -0.769725501537323,
+        0.8527395129203796
+      ]
+    }
+  ],
+  "reader_behavior": "stop at the torn COMMIT, replay only op 1, publish post_recovery snapshot, and discard writer-live id 7",
+  "wal_after_writer": "op 1 complete; op 2 PREPARE complete but COMMIT trailer torn"
+}

@@ -1,0 +1,21 @@
+{
+  "base_count": 4,
+  "capacity": 32,
+  "case": "i8_u32_collection_upsert_wal",
+  "data_type": "int8",
+  "dim": 8,
+  "has_scalar_data": true,
+  "id_type": "uint32",
+  "index_type": "hnsw",
+  "kind": "collection",
+  "max_nbrs": 8,
+  "metric": "l2",
+  "operations": [
+    "collection.insert(4 string IDs + documents + metadata)",
+    "upsert(item-1)"
+  ],
+  "quantization_type": "none",
+  "seed": 505,
+  "terminal_shape": "committed_wal_tail",
+  "writer": "legacy PyIndex Graph/Space + custom WAL + snapshot manifest/CURRENT"
+}

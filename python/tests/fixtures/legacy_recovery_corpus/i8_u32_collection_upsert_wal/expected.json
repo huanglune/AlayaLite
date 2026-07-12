@@ -1,0 +1,70 @@
+{
+  "expected_applied_through_op_id": 1,
+  "expected_count": 5,
+  "expected_items": [
+    {
+      "document": "document-0",
+      "id": "item-0",
+      "metadata": {
+        "group": "base",
+        "ordinal": 0,
+        "version": 1
+      }
+    },
+    {
+      "document": "document-1-v2",
+      "id": "item-1",
+      "metadata": {
+        "group": "updated",
+        "ordinal": 1,
+        "version": 2
+      }
+    },
+    {
+      "document": "document-2",
+      "id": "item-2",
+      "metadata": {
+        "group": "base",
+        "ordinal": 2,
+        "version": 1
+      }
+    },
+    {
+      "document": "document-3",
+      "id": "item-3",
+      "metadata": {
+        "group": "base",
+        "ordinal": 3,
+        "version": 1
+      }
+    }
+  ],
+  "expected_live_count": 4,
+  "item_lookup_order": [
+    "item-0",
+    "item-1",
+    "item-2",
+    "item-3",
+    "missing"
+  ],
+  "queries": [
+    {
+      "expected_item_ids": [
+        "item-1"
+      ],
+      "topk": 1,
+      "vector": [
+        -18,
+        -24,
+        20,
+        24,
+        0,
+        22,
+        32,
+        -2
+      ]
+    }
+  ],
+  "reader_behavior": "restore RocksDB checkpoint, replay upsert, and retain the rewritten scalar record",
+  "wal_after_writer": "one committed upsert after the post-fit snapshot"
+}

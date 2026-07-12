@@ -1,0 +1,17 @@
+{
+  "index": {
+    "build_threads": 1,
+    "capacity": 32,
+    "data_type": "int8",
+    "has_scalar_data": true,
+    "id_type": "uint32",
+    "index_type": "hnsw",
+    "indexed_fields": [],
+    "materialized_view_build_threads": null,
+    "max_nbrs": 8,
+    "metric": "l2",
+    "quantization_type": "none",
+    "rocksdb_path": "__CORPUS_ROOT__/rocksdb"
+  },
+  "type": "collection"
+}
