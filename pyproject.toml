@@ -128,6 +128,8 @@ dev = [
 cmake.version = ">=3.24,<=3.31"
 cmake.build-type = "Release"
 wheel.packages = ["python/src/alayalite"]
+wheel.license-files = ["LICENSE", "LICENSES/*.txt", "REUSE.toml", "THIRD_PARTY_NOTICES.md"]
+sdist.include = ["LICENSE", "LICENSES/*.txt", "REUSE.toml", "THIRD_PARTY_NOTICES.md"]
 
 [tool.scikit-build.cmake.define]
 BUILD_TESTING="OFF"
