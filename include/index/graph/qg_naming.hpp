@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include "index/graph/qg/qg_builder.hpp"
+#include "index/graph/qg/qg_segment.hpp"
 #if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER
   #include "index/graph/laser/qg/qg_builder.hpp"
 #endif
@@ -13,8 +13,8 @@
 // changing their historical names or physical include paths.
 namespace alaya::memory_qg {
 
-template <typename DistanceSpaceType>
-using Builder = ::alaya::QGBuilder<DistanceSpaceType>;
+template <typename SpaceType>
+using Segment = ::alaya::QgSegment<SpaceType>;
 
 template <typename DataType>
 using Quantizer = ::alaya::RaBitQQuantizer<DataType>;

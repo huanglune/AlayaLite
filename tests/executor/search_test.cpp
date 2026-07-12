@@ -16,7 +16,7 @@
 #include "index/graph/graph.hpp"
 #include "index/graph/hnsw/detail/hnsw_segment_bridge.hpp"
 #include "index/graph/hnsw/hnsw_segment.hpp"
-#include "index/graph/qg/qg_builder.hpp"
+#include "index/graph/qg/detail/qg_builder_kernel.hpp"
 #include "space/rabitq_space.hpp"
 #include "space/raw_space.hpp"
 #include "space/sq8_space.hpp"
@@ -363,7 +363,7 @@ struct RaBitQHybridResources {
                                                                 RotatorType::MatrixRotator);
     search_space->fit(ds_.data_.data(), ds_.data_num_, metadata.data());
 
-    QGBuilder<RaBitQSpaceWithScalar> qg(search_space);
+    detail::QgBuilderKernel<RaBitQSpaceWithScalar> qg(search_space);
     qg.build_graph();
     return search_space;
   }

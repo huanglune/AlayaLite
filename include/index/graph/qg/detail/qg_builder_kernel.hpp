@@ -27,10 +27,10 @@
 #include "utils/random.hpp"
 #include "utils/thread_config.hpp"
 
-namespace alaya {
+namespace alaya::detail {
 template <typename DistanceSpaceType>
   requires Space<DistanceSpaceType>
-class QGBuilder {
+class QgBuilderKernel {
   // static_assert(is_rabitq_space_v<DistanceSpaceType>, "qg only supports RaBitQSpace
   // specializations");
 
@@ -42,11 +42,11 @@ class QGBuilder {
   using CandidateList = std::vector<Neighbor<IDType, DistanceType>>;
 
  public:
-  explicit QGBuilder(std::shared_ptr<DistanceSpaceType> &space,
-                     size_t num_threads = std::numeric_limits<size_t>::max())
+  explicit QgBuilderKernel(std::shared_ptr<DistanceSpaceType> &space,
+                           size_t num_threads = std::numeric_limits<size_t>::max())
       : space_(space) {
     if (space_ == nullptr) {
-      fprintf(stderr, "FATAL: (qg_builder.hpp) space_ is null!\n");
+      fprintf(stderr, "FATAL: (qg_builder_kernel.hpp) space_ is null!\n");
       std::abort();
     }
     num_nodes_ = space_->get_data_num();
@@ -524,4 +524,4 @@ class QGBuilder {
     }
   }
 };
-}  // namespace alaya
+}  // namespace alaya::detail

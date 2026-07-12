@@ -45,7 +45,9 @@
 #include "index/graph/hnsw/hnsw_segment.hpp"
 #include "index/graph/nsg/detail/nsg_builder_kernel.hpp"
 #include "index/graph/nsg/nsg_segment.hpp"
-#include "index/graph/qg/qg_builder.hpp"
+#include "index/graph/qg/detail/qg_builder_kernel.hpp"
+#include "index/graph/qg/detail/qg_segment_bridge.hpp"
+#include "index/graph/qg/qg_segment.hpp"
 #include "index_factory.hpp"
 #include "materialized_view.hpp"
 #include "memory_engine_registry.hpp"
@@ -91,6 +93,15 @@ struct IsGate5MemoryGraphSegment<RuntimeType,
 template <typename RuntimeType>
 inline constexpr bool is_gate5_memory_graph_segment_v =
     IsGate5MemoryGraphSegment<RuntimeType>::value;
+
+template <typename RuntimeType, typename = void>
+struct IsQgSegment : std::false_type {};
+
+template <typename RuntimeType>
+struct IsQgSegment<RuntimeType, std::void_t<typename RuntimeType::QgSegmentTag>> : std::true_type {};
+
+template <typename RuntimeType>
+inline constexpr bool is_qg_segment_v = IsQgSegment<RuntimeType>::value;
 
 template <typename RuntimeType, typename SearchSpaceType>
 class PyIndex : public BasePyIndex {
@@ -163,6 +174,12 @@ class PyIndex : public BasePyIndex {
     return {{{SegmentType::kGraphArtifactName, graph_path},
              {SegmentType::kDataArtifactName, data_path},
              {SegmentType::kQuantArtifactName, quant_path}}};
+  }
+
+  template <typename SegmentType>
+  static auto qg_artifact_locations(std::string_view artifact_path)
+      -> std::array<core::ArtifactLocation, 1> {
+    return {core::ArtifactLocation(SegmentType::kArtifactName, artifact_path)};
   }
 
   struct SegmentSearchBuffers {
@@ -283,6 +300,17 @@ class PyIndex : public BasePyIndex {
     std::string_view data_path_view{data_path};
     std::string_view quant_path_view{quant_path};
 
+    if constexpr (is_qg_segment_v<RuntimeType>) {
+      const auto locations = qg_artifact_locations<RuntimeType>(quant_path_view);
+      core::ArtifactWriter writer{std::span<const core::ArtifactLocation>(locations)};
+      core::ArtifactManifest manifest;
+      const auto status = runtime_segment_->save(writer, {}, manifest);
+      if (!status.ok()) {
+        throw std::runtime_error(status.diagnostic());
+      }
+      return;
+    }
+
     if constexpr (!is_rabitq_space_v<SearchSpaceType>) {
       if constexpr (is_gate5_memory_graph_segment_v<RuntimeType>) {
         const auto locations = memory_graph_artifact_locations<RuntimeType>(index_path_view,
@@ -326,7 +354,27 @@ class PyIndex : public BasePyIndex {
     std::string_view data_path_view{data_path};
     std::string_view quant_path_view{quant_path};
 
-    if constexpr (is_rabitq_space_v<SearchSpaceType>) {
+    if constexpr (is_qg_segment_v<RuntimeType>) {
+      core::OpenContext open_context;
+      const auto locations = qg_artifact_locations<RuntimeType>(quant_path_view);
+      runtime_segment_ =
+          RuntimeType::open(core::ArtifactView(
+                                std::span<const core::ArtifactLocation>(locations)),
+                            {},
+                            open_context);
+      search_space_ = detail::QgSegmentBridge<SearchSpaceType>::space(*runtime_segment_);
+      data_size_ = search_space_->get_data_size();
+      data_dim_ = search_space_->get_dim();
+      search_job_ =
+          std::make_shared<alaya::GraphSearchJob<SearchSpaceType, BuildSpaceType>>(search_space_,
+                                                                                   nullptr,
+                                                                                   nullptr,
+                                                                                   build_space_);
+      hybrid_search_job_ = std::make_shared<
+          alaya::GraphHybridSearchJob<SearchSpaceType, BuildSpaceType>>(search_space_,
+                                                                        nullptr,
+                                                                        build_space_);
+    } else if constexpr (is_rabitq_space_v<SearchSpaceType>) {
       search_space_ = std::make_shared<SearchSpaceType>();
       search_space_->load(quant_path_view);
       data_size_ = search_space_->get_data_size();
@@ -746,8 +794,21 @@ class PyIndex : public BasePyIndex {
             std::make_shared<SearchSpaceType>(params_.capacity_, data_dim_, params_.metric_);
         search_space_->fit(vectors_, data_size_);
       }
-      auto graph_builder = std::make_shared<QGBuilder<SearchSpaceType>>(search_space_);
-      graph_builder->build_graph();
+      if constexpr (is_qg_segment_v<RuntimeType>) {
+        core::BuildContext build_context;
+        QgBuildOptions build_options;
+        // The legacy Python QG path has always used the builder defaults for
+        // ef_build and thread selection. Neither legacy parameter is
+        // reinterpreted during the Segment handoff.
+        runtime_segment_ = RuntimeType::build(
+            {core::TypedTensorView::contiguous(vectors_, data_size_, data_dim_), search_space_},
+            build_options,
+            build_context);
+      } else {
+        auto graph_builder =
+            std::make_shared<detail::QgBuilderKernel<SearchSpaceType>>(search_space_);
+        graph_builder->build_graph();
+      }
       search_job_ =
           std::make_shared<alaya::GraphSearchJob<SearchSpaceType, BuildSpaceType>>(search_space_,
                                                                                    nullptr,

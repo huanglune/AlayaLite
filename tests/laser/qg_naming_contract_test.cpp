@@ -17,18 +17,21 @@ namespace alaya {
 namespace {
 
 using MemorySpace = RaBitQSpace<>;
-using MemoryBuilder = memory_qg::Builder<MemorySpace>;
+using MemorySegment = memory_qg::Segment<MemorySpace>;
 
-static_assert(std::is_same_v<MemoryBuilder, QGBuilder<MemorySpace>>);
+static_assert(std::is_same_v<MemorySegment, QgSegment<MemorySpace>>);
 static_assert(std::is_same_v<disk_laser_qg::Builder, laser::QGBuilder>);
 static_assert(std::is_same_v<disk_laser_qg::Graph, laser::QuantizedGraph>);
 
-static_assert(std::is_constructible_v<MemoryBuilder, std::shared_ptr<MemorySpace> &, size_t>);
-static_assert(!std::is_constructible_v<MemoryBuilder, disk_laser_qg::Graph &, uint32_t, size_t>);
+static_assert(core::Searchable<MemorySegment>);
+static_assert(!core::Mutable<MemorySegment>);
+static_assert(!std::is_constructible_v<MemorySegment, disk_laser_qg::Graph &, uint32_t, size_t>);
 static_assert(
     std::is_constructible_v<disk_laser_qg::Builder, disk_laser_qg::Graph &, uint32_t, size_t>);
-static_assert(
-    !std::is_constructible_v<disk_laser_qg::Builder, std::shared_ptr<MemorySpace> &, size_t>);
+static_assert(!std::is_constructible_v<disk_laser_qg::Builder,
+                                       typename MemorySegment::BuildInput,
+                                       QgBuildOptions,
+                                       core::BuildContext &>);
 
 // Golden anchors for the LASER v1 factor field order. The disk payload stores
 // three structure-of-arrays blocks in this same order, not Factor objects.

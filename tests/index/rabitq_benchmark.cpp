@@ -19,7 +19,7 @@
 #include <vector>
 
 #include "executor/jobs/graph_search_job.hpp"
-#include "index/graph/qg/qg_builder.hpp"
+#include "index/graph/qg/detail/qg_builder_kernel.hpp"
 #include "space/rabitq_space.hpp"
 #include "utils/evaluate.hpp"
 #include "utils/io_utils.hpp"
@@ -136,7 +136,7 @@ void build_index(const DatasetSpec &spec) {
   auto space = std::make_shared<alaya::RaBitQSpace<>>(data_num, dim, spec.metric_);
   space->fit(data.data(), data_num);
 
-  auto builder = alaya::QGBuilder<alaya::RaBitQSpace<>>(space);
+  auto builder = alaya::detail::QgBuilderKernel<alaya::RaBitQSpace<>>(space);
   builder.set_ef_build(kEfBuild);
   builder.build_graph();
 

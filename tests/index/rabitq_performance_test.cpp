@@ -14,7 +14,7 @@
 #include <vector>
 
 #include "executor/jobs/graph_search_job.hpp"
-#include "index/graph/qg/qg_builder.hpp"
+#include "index/graph/qg/detail/qg_builder_kernel.hpp"
 #include "space/rabitq_space.hpp"
 #include "utils/dataset_utils.hpp"
 #include "utils/evaluate.hpp"
@@ -50,7 +50,7 @@ TEST_F(RaBitQDeep1MTest, Deep1MQGTest) {
     space->fit(ds_.data_.data(), ds_.data_num_);
     LOG_INFO("Successfully fit data into space, data_num={}, dim={}", ds_.data_num_, ds_.dim_);
 
-    auto qg = alaya::QGBuilder<RaBitQSpace<>>(space);
+    auto qg = alaya::detail::QgBuilderKernel<RaBitQSpace<>>(space);
     qg.build_graph();
 
     space->save(path);
@@ -140,7 +140,7 @@ TEST_F(RaBitQT2I1MTest, DISABLED_T2I1MQGTest) {
     space->fit(ds_.data_.data(), ds_.data_num_);
     LOG_INFO("Successfully fit data into space, data_num={}, dim={}", ds_.data_num_, ds_.dim_);
 
-    auto qg = alaya::QGBuilder<RaBitQSpace<>>(space);
+    auto qg = alaya::detail::QgBuilderKernel<RaBitQSpace<>>(space);
     qg.build_graph();
 
     space->save(path);

@@ -24,7 +24,7 @@
 #include "index/graph/graph.hpp"
 #include "index/graph/hnsw/detail/hnsw_segment_bridge.hpp"
 #include "index/graph/hnsw/hnsw_segment.hpp"
-#include "index/graph/qg/qg_builder.hpp"
+#include "index/graph/qg/detail/qg_builder_kernel.hpp"
 #include "params.hpp"
 #include "space/rabitq_space.hpp"
 #include "space/raw_space.hpp"
@@ -842,7 +842,7 @@ class MaterializedViewManager {
     // todo: small partitions may not need a child index; choose a threshold with benchmarks.
     if constexpr (is_rabitq_space_v<MaterializedViewSearchSpaceType>) {
       if (partition_size > kRaBitQExactPartitionThreshold) {
-        QGBuilder<MaterializedViewSearchSpaceType> graph_builder(partition.search_space_);
+        detail::QgBuilderKernel<MaterializedViewSearchSpaceType> graph_builder(partition.search_space_);
         graph_builder.build_graph();
         partition.search_job_ = std::make_shared<
             GraphSearchJob<MaterializedViewSearchSpaceType,

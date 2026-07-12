@@ -14,7 +14,7 @@
 #include <vector>
 
 #include "executor/jobs/graph_search_job.hpp"
-#include "index/graph/qg/qg_builder.hpp"
+#include "index/graph/qg/detail/qg_builder_kernel.hpp"
 #include "space/rabitq_space.hpp"
 #include "utils/dataset_utils.hpp"
 #include "utils/evaluate.hpp"
@@ -50,7 +50,7 @@ TEST_F(RaBitQSiftSmallTest, SiftSmallQGTest) {  // for code coverage
     space->fit(ds_.data_.data(), ds_.data_num_);
     LOG_INFO("Successfully fit data into space");
 
-    auto qg = alaya::QGBuilder<RaBitQSpace<>>(space);
+    auto qg = alaya::detail::QgBuilderKernel<RaBitQSpace<>>(space);
     qg.build_graph();
 
     space->save(path);
@@ -66,7 +66,7 @@ TEST_F(RaBitQSiftSmallTest, SiftSmallQGTest) {  // for code coverage
   // space->fit(ds_.data_.data(), ds_.data_num_);
   // LOG_INFO("Successfully fit data into space");
 
-  // auto qg = alaya::QGBuilder<RaBitQSpace<>>(space);
+  // auto qg = alaya::detail::QgBuilderKernel<RaBitQSpace<>>(space);
   // qg.build_graph();
   // auto search_job = std::make_unique<alaya::GraphSearchJob<RaBitQSpace<>>>(space, nullptr);
 
@@ -129,7 +129,7 @@ TEST_F(RaBitQSiftSmallTest, InvalidParameterTest) {
         std::make_shared<alaya::RaBitQSpace<>>(ds_.data_num_, ds_.dim_, MetricType::L2);
     space->fit(ds_.data_.data(), ds_.data_num_);
 
-    auto qg = alaya::QGBuilder<RaBitQSpace<>>(space);
+    auto qg = alaya::detail::QgBuilderKernel<RaBitQSpace<>>(space);
     qg.build_graph();
     space->save(path);
   }

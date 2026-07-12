@@ -23,7 +23,7 @@
 #include "index/graph/graph.hpp"
 #include "index/graph/hnsw/detail/hnsw_segment_bridge.hpp"
 #include "index/graph/hnsw/hnsw_segment.hpp"
-#include "index/graph/qg/qg_builder.hpp"
+#include "index/graph/qg/detail/qg_builder_kernel.hpp"
 #include "space/rabitq_space.hpp"
 #include "space/raw_space.hpp"
 #include "space/sq4_space.hpp"
@@ -373,7 +373,7 @@ auto build_rabitq_partition_bundle(const std::vector<DataType> &vectors,
   bundle.search_space_ =
       std::make_shared<RaBitQSearchSpace>(vector_num, dim, MetricType::L2, config);
   bundle.search_space_->fit(vectors.data(), vector_num, scalar_data.data());
-  QGBuilder<RaBitQSearchSpace> qg_builder(bundle.search_space_);
+  detail::QgBuilderKernel<RaBitQSearchSpace> qg_builder(bundle.search_space_);
   qg_builder.build_graph();
   bundle.build_space_ = bundle.search_space_;
   bundle.build_seconds_ = timer.elapsed_us() / 1e6;
