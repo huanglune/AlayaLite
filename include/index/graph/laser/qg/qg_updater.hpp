@@ -332,8 +332,10 @@ struct UpdateParams {
   Backlink backlink_mode = Backlink::kAlphaEvict;
   size_t alpha_check_max = 16;  // captured neighbors tested per reverse edge
   double evict_telemetry = 0;   // kEvict decision sampling probability
+  double evict_margin = 0;      // require (worst-new) > margin*abs(worst); 0 preserves behavior
   size_t max_points = 0;        // page-version table capacity; 0 -> 2*N + 4096
   size_t splice_rerank = 4;     // consolidation: FastScan-recalled candidates reranked exactly
+  bool splice_enabled = true;   // false: purge dead edges without splice reconnection
   bool maintain_indegree = false;
   bool direct_io = false;       // route writes through a dedicated O_DIRECT fd.
                                 // P0.1 verdict: synchronous per-patch DIO writes LOSE
@@ -2331,7 +2333,12 @@ class QGUpdater {
                            ? space::l2_sqr(row_f + dim_, x_vec + dim_, res_dim_)
                            : 0.0F)
                 : est_new;
-        if (!force && new_distance >= worst) {
+        const double improvement =
+            static_cast<double>(worst) - static_cast<double>(new_distance);
+        const double required_margin =
+            params_.evict_margin * std::abs(static_cast<double>(worst));
+        if ((!force && improvement <= 0) ||
+            (params_.evict_margin > 0 && improvement <= required_margin)) {
           stats_.est_skips++;
           return false;
         }
@@ -2617,7 +2624,7 @@ class QGUpdater {
         const PID d = ids[j];
         // Headroom preservation: only splice back up to r_target live edges;
         // surplus dead slots are removed from the packed prefix.
-        if (live_degree >= r_target) {
+        if (!params_.splice_enabled || live_degree >= r_target) {
           erase_slot(row, j, degree);
           --degree;
           stats_.ghosted_slots++;

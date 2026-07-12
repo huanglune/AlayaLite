@@ -753,6 +753,57 @@ TEST_F(QGUpdaterIndexTest, ParallelBatchInsertAndConsolidate) {
   }
 }
 
+TEST_F(QGUpdaterIndexTest, ConsolidateWithoutSpliceLeavesDegreeHeadroom) {
+  const std::string prefix = (tiny_->dir / "no_splice").string();
+  copy_index_artifact(tiny_->v1_prefix, prefix);
+  QuantizedGraph qg(kN, kDeg, kDim, kDim);
+  qg.load_disk_index(prefix.c_str(), 0.0F);
+  qg.set_params(64, 1, 4);
+  UpdateParams params;
+  params.max_points = kN + 64;
+  params.splice_enabled = false;
+  QGUpdater upd(qg, params);
+
+  std::unordered_set<PID> dead;
+  for (PID id = 100; id < 200; ++id) {
+    upd.tombstone(id);
+    dead.insert(id);
+  }
+
+  const std::string path = prefix + index_suffix();
+  const size_t node_len = (32 * kDim + 128 * kDeg + kDeg * kDim) / 8;
+  const size_t npp = std::max<size_t>(1, 4096 / node_len);
+  const size_t page_size = (npp * node_len + kSectorLen - 1) / kSectorLen * kSectorLen;
+  std::vector<size_t> before_degree(kN);
+  std::vector<size_t> dead_refs(kN);
+  size_t total_dead_refs = 0;
+  for (PID u = 0; u < kN; ++u) {
+    if (dead.count(u) != 0) continue;
+    const auto row = read_node_row(qg, path, u, node_len, page_size, npp);
+    before_degree[u] = upd.trailer(u).valid_degree;
+    const auto *ids = reinterpret_cast<const PID *>(row.data() + upd.neighbor_off_bytes());
+    for (size_t j = 0; j < before_degree[u]; ++j) {
+      dead_refs[u] += dead.count(ids[j]);
+    }
+    total_dead_refs += dead_refs[u];
+  }
+  ASSERT_GT(total_dead_refs, 0U);
+
+  upd.consolidate(4, /*r_target=*/kDeg, /*reclaim_slots=*/false);
+  for (PID u = 0; u < kN; ++u) {
+    if (dead.count(u) != 0) continue;
+    const auto row = read_node_row(qg, path, u, node_len, page_size, npp);
+    const size_t after_degree = upd.trailer(u).valid_degree;
+    EXPECT_EQ(after_degree, before_degree[u] - dead_refs[u]) << "row " << u;
+    const auto *ids = reinterpret_cast<const PID *>(row.data() + upd.neighbor_off_bytes());
+    for (size_t j = 0; j < after_degree; ++j) {
+      EXPECT_EQ(dead.count(ids[j]), 0U) << "row " << u << " slot " << j;
+    }
+  }
+  EXPECT_EQ(upd.stats().spliced_slots, 0U);
+  EXPECT_EQ(upd.stats().ghosted_slots, total_dead_refs);
+}
+
 TEST_F(QGUpdaterIndexTest, WriteCacheCoalescesAndMatchesImmediateWrites) {
   const std::string suffix = "_R" + std::to_string(kDeg) + "_MD" + std::to_string(kDim) + ".index";
   const std::string cached_prefix = (tiny_->dir / "cached").string();
@@ -857,6 +908,24 @@ TEST_F(QGUpdaterIndexTest, ExactEvictRemovesExactFarthestNeighbor) {
   }
   EXPECT_EQ(checked, upd.stats().evictions);
   EXPECT_GT(checked, 0U);
+}
+
+TEST_F(QGUpdaterIndexTest, HugeEvictMarginPreventsAllEvictions) {
+  const std::string prefix = (tiny_->dir / "evict_margin").string();
+  copy_index_artifact(tiny_->v1_prefix, prefix);
+  QuantizedGraph qg(kN, kDeg, kDim, kDim);
+  qg.load_disk_index(prefix.c_str(), 0.0F);
+  qg.set_params(64, 1, 4);
+  UpdateParams params;
+  params.ef_insert = 64;
+  params.backlink_mode = UpdateParams::Backlink::kEvict;
+  params.evict_margin = 1e30;
+  params.max_points = kN + 8;
+  QGUpdater upd(qg, params);
+  const auto inserted = make_data(8, kDim, 89231);
+  for (size_t i = 0; i < 8; ++i) upd.insert(inserted.data() + i * kDim);
+  EXPECT_EQ(upd.stats().evictions, 0U);
+  EXPECT_GT(upd.stats().est_skips, 0U);
 }
 
 TEST_F(QGUpdaterIndexTest, EvictTelemetryP1MatchesManualReplay) {

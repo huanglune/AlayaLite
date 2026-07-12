@@ -203,6 +203,8 @@ struct Args {
   uint64_t seed = 42;
   std::string arm = "alpha";  // none|evict|alpha|full
   double evict_telemetry = 0;
+  double evict_margin = 0;
+  uint32_t splice = 1;
   uint64_t shuffle_seed = 0;
   uint32_t direct = 0;  // 1 = O_DIRECT write fd (P0.1 attribution arm), 0 = buffered (default)
   uint32_t write_cache = 1;  // 0 = immediate per-patch writes (P0.1-era control)
@@ -283,6 +285,10 @@ Args parse(int argc, char **argv) {
       a.alpha_check_max = std::stoull(v);
     else if (k == "--evict_telemetry")
       a.evict_telemetry = std::stod(v);
+    else if (k == "--evict_margin")
+      a.evict_margin = std::stod(v);
+    else if (k == "--splice")
+      a.splice = std::stoul(v);
     else if (k == "--shuffle_seed")
       a.shuffle_seed = std::stoull(v);
     else if (k == "--batch")
@@ -353,6 +359,12 @@ Args parse(int argc, char **argv) {
   }
   if (a.reuse > 1) {
     throw std::runtime_error("--reuse must be 0 or 1");
+  }
+  if (a.splice > 1) {
+    throw std::runtime_error("--splice must be 0 or 1");
+  }
+  if (!std::isfinite(a.evict_margin) || a.evict_margin < 0) {
+    throw std::runtime_error("--evict_margin must be finite and nonnegative");
   }
   if (a.pca_preprocessed > 1) {
     throw std::runtime_error("--pca_preprocessed must be 0 or 1");
@@ -454,6 +466,8 @@ int do_insert(const Args &a) {
   p.prune_pool_cap = a.prune_cap;
   p.alpha_check_max = a.alpha_check_max;
   p.evict_telemetry = a.evict_telemetry;
+  p.evict_margin = a.evict_margin;
+  p.splice_enabled = a.splice != 0;
   if (a.arm == "none")
     p.backlink_mode = alaya::laser::UpdateParams::Backlink::kNone;
   else if (a.arm == "evict")
@@ -583,6 +597,8 @@ int do_churn(const Args &a) {
   p.prune_pool_cap = a.prune_cap;
   p.alpha_check_max = a.alpha_check_max;
   p.evict_telemetry = a.evict_telemetry;
+  p.evict_margin = a.evict_margin;
+  p.splice_enabled = a.splice != 0;
   if (a.arm == "none")
     p.backlink_mode = alaya::laser::UpdateParams::Backlink::kNone;
   else if (a.arm == "evict")
@@ -606,7 +622,8 @@ int do_churn(const Args &a) {
   if (a.garden != 0) upd.init_indegree(a.insert_threads);
   std::cout << "[churn] direct_io=" << (upd.direct_io() ? 1 : 0)
             << " cache_cap_pages=" << upd.cache_cap_pages()
-            << " cache_low_pages=" << upd.cache_cap_pages() / 2 << "\n";
+            << " cache_low_pages=" << upd.cache_cap_pages() / 2
+            << " splice=" << a.splice << " evict_margin=" << a.evict_margin << "\n";
   std::vector<uint32_t> results(static_cast<size_t>(query.n) * a.topk);
   const std::vector<int> query_groups = read_query_groups(a.query_groups, query.n);
   const uint32_t ef_eval = a.efs.empty() ? 100 : a.efs[0];
@@ -1139,6 +1156,8 @@ int do_mixed(const Args &a) {
   p.prune_pool_cap = a.prune_cap;
   p.alpha_check_max = a.alpha_check_max;
   p.evict_telemetry = a.evict_telemetry;
+  p.evict_margin = a.evict_margin;
+  p.splice_enabled = a.splice != 0;
   if (a.arm == "none")
     p.backlink_mode = alaya::laser::UpdateParams::Backlink::kNone;
   else if (a.arm == "evict")
