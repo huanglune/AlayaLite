@@ -51,6 +51,7 @@
 #include <deque>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -60,9 +61,9 @@
 #include "index/graph/diskann/pq_table.hpp"
 #include "index/graph/diskann/search_scratch.hpp"
 #include "index/graph/diskann/tombstone_bitmap.hpp"
-#include "index/graph/laser/utils/aligned_file_reader.hpp"
 #include "index/graph/vamana/robust_prune.hpp"
 #include "simd/distance_l2.hpp"
+#include "storage/io/page_reader.hpp"
 
 namespace alaya::diskann {
 
@@ -80,7 +81,7 @@ struct SearchParams {
 
 /// Immutable per-index context the search borrows (no ownership).
 struct SearchContext {
-  AlignedFileReader *reader = nullptr;
+  storage::io::PageReader *reader = nullptr;
   const DiskLayoutGeometry *geom = nullptr;
   const NodeCache *cache = nullptr;
   const PQTable *pq = nullptr;  ///< nullptr => index has no PQ
@@ -113,6 +114,54 @@ struct SearchStats {
   uint64_t fillpg_us = 0;            ///< time in search_fill_page
   std::vector<uint32_t> read_order;  ///< ids in the order first processed
 };
+
+namespace beam_io_detail {
+inline auto request(uint64_t offset, uint64_t size, uint32_t id, char *buffer)
+    -> storage::io::ReadRequest {
+  return {.id = id,
+          .offset = offset,
+          .buffer = std::span<std::byte>(reinterpret_cast<std::byte *>(buffer), size)};
+}
+
+inline void complete(void *context, storage::io::ReadResult result) noexcept {
+  auto &td = *static_cast<ThreadData *>(context);
+  while (td.io_lock.test_and_set(std::memory_order_acquire)) {}
+  td.completed_io.push_back(std::move(result));
+  td.io_lock.clear(std::memory_order_release);
+  td.completed_io_count.fetch_add(1, std::memory_order_release);
+  td.completed_io_count.notify_one();
+}
+
+inline void submit(storage::io::PageReader &reader,
+                   ThreadData &td,
+                   std::span<const storage::io::ReadRequest> requests) {
+  (void)reader.submit(requests, {complete, &td});
+}
+
+inline void wait(ThreadData &td, size_t count, std::vector<storage::io::ReadResult> &out) {
+  out.clear();
+  size_t available = td.completed_io_count.load(std::memory_order_acquire);
+  // PageReader's libaio completion is delivered by its reaper thread. Give it
+  // a short cooperative window before entering the futex-backed atomic wait;
+  // this avoids a wake/sleep round trip for the usual sub-millisecond page
+  // completion while still parking promptly on a genuinely slow device.
+  for (uint32_t spin = 0; available < count && spin < 64; ++spin) {
+    std::this_thread::yield();
+    available = td.completed_io_count.load(std::memory_order_acquire);
+  }
+  while (available < count) {
+    td.completed_io_count.wait(available, std::memory_order_acquire);
+    available = td.completed_io_count.load(std::memory_order_acquire);
+  }
+  while (td.io_lock.test_and_set(std::memory_order_acquire)) {}
+  while (count-- != 0) {
+    out.push_back(std::move(td.completed_io.front()));
+    td.completed_io.pop_front();
+  }
+  td.io_lock.clear(std::memory_order_release);
+  td.completed_io_count.fetch_sub(out.size(), std::memory_order_release);
+}
+}  // namespace beam_io_detail
 
 /**
  * @brief Scan a node's neighbors and insert the unvisited ones into the frontier
@@ -187,7 +236,7 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
                                                                   const SearchParams &params,
                                                                   ThreadData &td,
                                                                   SearchStats *stats) {
-  AlignedFileReader &reader = *ctx.reader;
+  storage::io::PageReader &reader = *ctx.reader;
   const DiskLayoutGeometry &geom = *ctx.geom;
   const NodeCache &cache = *ctx.cache;
   const uint64_t dim = geom.dim;
@@ -245,9 +294,10 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
       }
       return td.sector_scratch + geom.offset_to_node(id);
     }
-    std::vector<AlignedRead> r1;
-    r1.emplace_back(off, page_size, id, td.sector_scratch);
-    reader.read(r1, td.ctx_);
+    std::vector<storage::io::ReadRequest> r1;
+    r1.push_back(beam_io_detail::request(off, page_size, id, td.sector_scratch));
+    beam_io_detail::submit(reader, td, r1);
+    beam_io_detail::wait(td, r1.size(), td.io_events);
     if (page_io != nullptr) {
       page_io->search_fill_page(off, td.sector_scratch, version);
     }
@@ -272,7 +322,7 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
   visited.set(ctx.medoid);
   absorb(ctx.medoid, read_seed(ctx.medoid));
 
-  std::vector<AlignedRead> reqs;
+  std::vector<storage::io::ReadRequest> reqs;
 
   if (params.deterministic) {
     // Batched barrier: expand strictly closest-first. For each expansion, read
@@ -328,15 +378,16 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
           }
           chunk_ids.push_back(m);
           chunk_recs.push_back(buf + geom.offset_to_node(m));
-          reqs.emplace_back(page_off, page_size, m, buf);
+          reqs.push_back(beam_io_detail::request(page_off, page_size, m, buf));
           td.io_req_versions.push_back(version);
         }
         if (!reqs.empty()) {
-          reader.read(reqs, td.ctx_);  // blocking; kernel runs the batch concurrently
+          beam_io_detail::submit(reader, td, reqs);
+          beam_io_detail::wait(td, reqs.size(), td.io_events);
           if (page_io != nullptr) {
             for (size_t r = 0; r < reqs.size(); ++r) {
               page_io->search_fill_page(reqs[r].offset,
-                                        static_cast<char *>(reqs[r].buf),
+                                        reinterpret_cast<char *>(reqs[r].buffer.data()),
                                         td.io_req_versions[r]);
             }
           }
@@ -361,7 +412,7 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
       free_slots.push_back(s);
     }
     std::deque<uint32_t> pending;
-    std::vector<AlignedReadEvent> evts;
+    std::vector<storage::io::ReadResult> evts;
 
     // Expand closest-unexpanded nodes into `pending` until there is enough queued
     // to fill the free slots (relaxed greedy: may expand before a closer in-flight
@@ -411,10 +462,10 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
         char *buf = td.sector_scratch + slot * page_size;
         td.set_inflight(slot, m, buf + geom.offset_to_node(m));
         td.slot_versions[slot] = version;
-        reqs.emplace_back(page_off, page_size, m, buf);
+        reqs.push_back(beam_io_detail::request(page_off, page_size, m, buf));
       }
       if (!reqs.empty()) {
-        reader.submit_reqs(reqs, td.ctx_);
+        beam_io_detail::submit(reader, td, reqs);
         if (stats != nullptr) {
           stats->n_ios += reqs.size();
         }
@@ -428,11 +479,10 @@ inline std::vector<std::pair<uint32_t, float>> disk_greedy_search(const SearchCo
     // without ever entering `inflight`).
     while (td.has_inflight() || !pending.empty() || frontier.has_unexpanded_node()) {
       if (td.has_inflight()) {
-        reader.get_events(td.ctx_, 1, evts);  // get_events clears + fills `evts`
+        beam_io_detail::wait(td, 1, evts);
         for (const auto &e : evts) {
-          if (e.result != static_cast<int64_t>(page_size)) {
-            throw std::runtime_error("disk_greedy_search: short/failed read, result=" +
-                                     std::to_string(e.result));
+          if (e.status != storage::io::ReadStatus::ok || e.bytes != page_size) {
+            throw std::runtime_error("disk_greedy_search: short/failed PageReader read");
           }
           InFlightSlot completed;
           if (!td.remove_inflight(static_cast<uint32_t>(e.id), completed)) {
@@ -483,7 +533,7 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
     return disk_greedy_search(ctx, query, top_k, params, td, stats);
   }
 
-  AlignedFileReader &reader = *ctx.reader;
+  storage::io::PageReader &reader = *ctx.reader;
   const DiskLayoutGeometry &geom = *ctx.geom;
   const NodeCache &cache = *ctx.cache;
   const PQTable &pq = *ctx.pq;
@@ -583,26 +633,25 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
           continue;  // slot consumed, no device read
         }
         batch_recs.push_back(buf + geom.offset_to_node(id));
-        reqs.emplace_back(page_off, page_size, id, buf);
+        reqs.push_back(beam_io_detail::request(page_off, page_size, id, buf));
         td.io_req_versions.push_back(version);
       }
 
       if (!reqs.empty()) {
-        reader.submit_reqs(reqs, td.ctx_);
-        reader.get_events(td.ctx_, static_cast<int>(reqs.size()), evts);
+        beam_io_detail::submit(reader, td, reqs);
+        beam_io_detail::wait(td, reqs.size(), evts);
         if (stats != nullptr) {
           stats->n_ios += reqs.size();
         }
         for (const auto &e : evts) {
-          if (e.result != static_cast<int64_t>(page_size)) {
-            throw std::runtime_error("cached_beam_search: short/failed read, result=" +
-                                     std::to_string(e.result));
+          if (e.status != storage::io::ReadStatus::ok || e.bytes != page_size) {
+            throw std::runtime_error("cached_beam_search: short/failed PageReader read");
           }
         }
         if (page_io != nullptr) {
           for (size_t r = 0; r < reqs.size(); ++r) {
             page_io->search_fill_page(reqs[r].offset,
-                                      static_cast<char *>(reqs[r].buf),
+                                      reinterpret_cast<char *>(reqs[r].buffer.data()),
                                       td.io_req_versions[r]);
           }
         }
@@ -667,10 +716,10 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
         char *buf = td.sector_scratch + slot * page_size;
         td.set_inflight(slot, id, buf + geom.offset_to_node(id));
         td.slot_versions[slot] = version;
-        reqs.emplace_back(page_off, page_size, id, buf);
+        reqs.push_back(beam_io_detail::request(page_off, page_size, id, buf));
       }
       if (!reqs.empty()) {
-        reader.submit_reqs(reqs, td.ctx_);
+        beam_io_detail::submit(reader, td, reqs);
         if (stats != nullptr) {
           stats->n_ios += reqs.size();
         }
@@ -688,7 +737,7 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
         stats->n_waits++;
         stats->inflight_sum += beam - free_slots.size();
       }
-      reader.get_events(td.ctx_, 1, evts);
+      beam_io_detail::wait(td, 1, evts);
       if (stats != nullptr) {
         stats->wait_us +=
             static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
@@ -696,9 +745,8 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
                                       .count());
       }
       for (const auto &e : evts) {
-        if (e.result != static_cast<int64_t>(page_size)) {
-          throw std::runtime_error("cached_beam_search: short/failed read, result=" +
-                                   std::to_string(e.result));
+        if (e.status != storage::io::ReadStatus::ok || e.bytes != page_size) {
+          throw std::runtime_error("cached_beam_search: short/failed PageReader read");
         }
         InFlightSlot completed;
         if (!td.remove_inflight(static_cast<uint32_t>(e.id), completed)) {
@@ -741,8 +789,9 @@ inline std::vector<std::pair<uint32_t, float>> cached_beam_search(const SearchCo
     uint64_t version = 0;
     const bool peeked = page_io != nullptr && page_io->search_peek_page(page_off, buf, &version);
     if (!peeked) {
-      rerank_req[0] = {page_off, page_size, id, buf};
-      reader.read(rerank_req, td.ctx_);
+      rerank_req[0] = beam_io_detail::request(page_off, page_size, id, buf);
+      beam_io_detail::submit(reader, td, rerank_req);
+      beam_io_detail::wait(td, rerank_req.size(), td.io_events);
       if (page_io != nullptr) {
         page_io->search_fill_page(page_off, buf, version);
       }

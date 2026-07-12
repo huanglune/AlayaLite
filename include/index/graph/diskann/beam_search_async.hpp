@@ -21,8 +21,8 @@
  * tie-ordering, not recall; with no cache hits the absorb sequence — and
  * therefore the result — is byte-identical to the sync deterministic variant.
  *
- * Reads go through the reader's O_DIRECT fd (AlignedFileReader::get_fd);
- * DiskPageIO's own fd is equally O_DIRECT but is left to the write path.
+ * Reads go through the index-neutral PageReader awaitable. DiskPageIO's own
+ * O_DIRECT fd remains private to the unchanged update/write path.
  * When ctx.page_io is set, both searches peek the update shard cache before
  * each device read and offer the pages they read back through the versioned
  * fill protocol — the shard cache then behaves like Yi's unified buffer
@@ -47,25 +47,35 @@
   #include "coro/thread_pool.hpp"
   #include "index/graph/diskann/beam_search.hpp"
   #include "index/graph/diskann/disk_page_io.hpp"
+  #include "storage/io/page_awaitable.hpp"
   #include "storage/io/uring_reactor.hpp"
 
 namespace alaya::diskann {
 
 namespace beam_async_detail {
-[[noreturn]] inline void throw_wave_failure(const std::vector<alaya::IORequest> &reqs) {
-  for (const auto &req : reqs) {
-    if (!req.is_success()) {
-      throw std::runtime_error("beam_search_async: short/failed read, result=" +
-                               std::to_string(req.result_));
+inline void check_wave(const std::vector<storage::io::ReadResult> &results,
+                       uint64_t page_size) {
+  for (const auto &result : results) {
+    if (result.status != storage::io::ReadStatus::ok || result.bytes != page_size) {
+      throw std::runtime_error("beam_search_async: short/failed PageReader read");
     }
   }
-  throw std::runtime_error("beam_search_async: wave reported failures");
 }
+
+class PoolExecutor final : public storage::io::ResumeExecutor {
+ public:
+  explicit PoolExecutor(coro::thread_pool &pool) : pool_(pool) {}
+  auto execute(std::coroutine_handle<> handle) noexcept -> bool override {
+    return pool_.resume(handle);
+  }
+
+ private:
+  coro::thread_pool &pool_;
+};
 }  // namespace beam_async_detail
 
 /// Coroutine No-PQ greedy search: one reactor wave per expansion.
-/// Preconditions: ctx describes a No-PQ index, @p fd is the reader's O_DIRECT
-/// descriptor, and @p td is exclusively owned by this coroutine until it
+/// Preconditions: ctx describes a No-PQ index and @p td is exclusively owned by this coroutine until it
 /// completes (acquire it through a suspending gate, never a thread-blocking
 /// pool — a blocked pool thread cannot run the resume that frees a td).
 inline auto disk_greedy_search_async(const SearchContext &ctx,
@@ -78,6 +88,10 @@ inline auto disk_greedy_search_async(const SearchContext &ctx,
                                      coro::thread_pool &pool,
                                      int fd)
     -> coro::task<std::vector<std::pair<uint32_t, float>>> {
+  (void)reactor;
+  (void)fd;
+  beam_async_detail::PoolExecutor executor(pool);
+  auto &reader = *ctx.reader;
   const DiskLayoutGeometry &geom = *ctx.geom;
   const NodeCache &cache = *ctx.cache;
   DiskPageIO *page_io = ctx.page_io;  ///< unified-pool peek + fill (may be null)
@@ -148,11 +162,10 @@ inline auto disk_greedy_search_async(const SearchContext &ctx,
         seeded = true;
       }
       if (!seeded) {
-        std::vector<alaya::IORequest> seed_req;
-        seed_req.emplace_back(td.wave_scratch, page_size, seed_off);
-        if (co_await reactor.read_batch(pool, fd, seed_req.data(), 1) != 0) {
-          beam_async_detail::throw_wave_failure(seed_req);
-        }
+        std::vector<storage::io::ReadRequest> seed_req;
+        seed_req.push_back(beam_io_detail::request(seed_off, page_size, ctx.medoid, td.wave_scratch));
+        auto seed_results = co_await storage::io::read_pages(reader, executor, seed_req);
+        beam_async_detail::check_wave(seed_results, page_size);
         if (page_io != nullptr) {
           page_io->search_fill_page(seed_off, td.wave_scratch, seed_version);
         }
@@ -167,7 +180,7 @@ inline auto disk_greedy_search_async(const SearchContext &ctx,
   std::vector<uint32_t> todo;
   std::vector<uint32_t> miss_ids;
   std::vector<uint64_t> miss_versions;
-  std::vector<alaya::IORequest> reqs;
+  std::vector<storage::io::ReadRequest> reqs;
   miss_ids.reserve(wave_slots);
   miss_versions.reserve(wave_slots);
   reqs.reserve(wave_slots);
@@ -208,22 +221,20 @@ inline auto disk_greedy_search_async(const SearchContext &ctx,
       ++slot;
       miss_ids.push_back(m);
       miss_versions.push_back(version);
-      reqs.emplace_back(buf, page_size, page_off);
+      reqs.push_back(beam_io_detail::request(page_off, page_size, m, buf));
     }
     if (!reqs.empty()) {
-      if (co_await reactor.read_batch(pool, fd, reqs.data(), static_cast<uint32_t>(reqs.size())) !=
-          0) {
-        beam_async_detail::throw_wave_failure(reqs);
-      }
+      auto results = co_await storage::io::read_pages(reader, executor, reqs);
+      beam_async_detail::check_wave(results, page_size);
       if (stats != nullptr) {
         stats->n_ios += reqs.size();
       }
       for (size_t j = 0; j < miss_ids.size(); ++j) {
-        char *buf = static_cast<char *>(reqs[j].buffer_);
+        char *buf = reinterpret_cast<char *>(reqs[j].buffer.data());
         if (page_io != nullptr) {
           // Offer the read page to the pool BEFORE parsing: a conflicting
           // writer refreshes buf instead of the pool taking stale bytes.
-          page_io->search_fill_page(reqs[j].offset_, buf, miss_versions[j]);
+          page_io->search_fill_page(reqs[j].offset, buf, miss_versions[j]);
         }
         absorb(miss_ids[j], buf + geom.offset_to_node(miss_ids[j]));
       }
@@ -268,6 +279,10 @@ inline auto pq_beam_search_async(const SearchContext &ctx,
   if (params.rerank) {
     throw std::invalid_argument("pq_beam_search_async: rerank is not supported");
   }
+  (void)reactor;
+  (void)fd;
+  beam_async_detail::PoolExecutor executor(pool);
+  auto &reader = *ctx.reader;
   const DiskLayoutGeometry &geom = *ctx.geom;
   const NodeCache &cache = *ctx.cache;
   DiskPageIO *page_io = ctx.page_io;  ///< unified-pool peek + fill (may be null)
@@ -309,7 +324,7 @@ inline auto pq_beam_search_async(const SearchContext &ctx,
 
   std::vector<uint32_t> miss_ids;
   std::vector<uint64_t> miss_versions;
-  std::vector<alaya::IORequest> reqs;
+  std::vector<storage::io::ReadRequest> reqs;
   miss_ids.reserve(beam);
   miss_versions.reserve(beam);
   reqs.reserve(beam);
@@ -343,22 +358,20 @@ inline auto pq_beam_search_async(const SearchContext &ctx,
       ++slot;
       miss_ids.push_back(id);
       miss_versions.push_back(version);
-      reqs.emplace_back(buf, page_size, page_off);
+      reqs.push_back(beam_io_detail::request(page_off, page_size, id, buf));
     }
     if (!reqs.empty()) {
-      if (co_await reactor.read_batch(pool, fd, reqs.data(), static_cast<uint32_t>(reqs.size())) !=
-          0) {
-        beam_async_detail::throw_wave_failure(reqs);
-      }
+      auto results = co_await storage::io::read_pages(reader, executor, reqs);
+      beam_async_detail::check_wave(results, page_size);
       if (stats != nullptr) {
         stats->n_ios += reqs.size();
       }
       for (size_t j = 0; j < miss_ids.size(); ++j) {
-        char *buf = static_cast<char *>(reqs[j].buffer_);
+        char *buf = reinterpret_cast<char *>(reqs[j].buffer.data());
         if (page_io != nullptr) {
           // Offer the read page to the pool BEFORE parsing: a conflicting
           // writer refreshes buf instead of the pool taking stale bytes.
-          page_io->search_fill_page(reqs[j].offset_, buf, miss_versions[j]);
+          page_io->search_fill_page(reqs[j].offset, buf, miss_versions[j]);
         }
         process_node(miss_ids[j], buf + geom.offset_to_node(miss_ids[j]));
       }

@@ -25,6 +25,7 @@
 #include "index/graph/diskann/disk_layout.hpp"
 #include "index/graph/diskann/diskann_index.hpp"
 #include "index/graph/diskann/search_scratch.hpp"
+#include "storage/io/page_reader_factory.hpp"
 #include "storage/io/uring_reactor.hpp"
 
 namespace {
@@ -557,9 +558,8 @@ TEST_F(DiskPageIOTest, AsyncGreedySearchMatchesDeterministicSync) {
   }
   build(300, 16, 24);
 
-  LinuxAlignedFileReader reader;
-  reader.open(index_path());
-  reader.register_thread();
+  auto reader = alaya::storage::io::open_page_reader(
+      index_path(), {}, alaya::storage::io::PageReaderBackend::libaio);
 
   // Medoid lives at byte 16 of the header sector.
   uint32_t medoid = 0;
@@ -572,7 +572,7 @@ TEST_F(DiskPageIOTest, AsyncGreedySearchMatchesDeterministicSync) {
 
   const alaya::diskann::NodeCache cache;  // empty: every read is a miss
   alaya::diskann::SearchContext ctx;
-  ctx.reader = &reader;
+  ctx.reader = reader.get();
   ctx.geom = &geom_;
   ctx.cache = &cache;
   ctx.pq = nullptr;
@@ -593,9 +593,9 @@ TEST_F(DiskPageIOTest, AsyncGreedySearchMatchesDeterministicSync) {
   cfg.max_degree = r_;
   cfg.search_list_size = sp.search_list_size;
   cfg.query_dim = dim_;
+  cfg.buffer_alignment = reader->constraints().buffer_alignment;
   alaya::diskann::ThreadData td_sync;
   td_sync.alloc_scratch(cfg);
-  td_sync.ctx_ = reader.get_ctx();
   alaya::diskann::ThreadData td_async;
   td_async.alloc_scratch(cfg);
 
@@ -603,8 +603,7 @@ TEST_F(DiskPageIOTest, AsyncGreedySearchMatchesDeterministicSync) {
   coro::thread_pool pool{{.thread_count = 2,
                           .on_thread_start_functor = nullptr,
                           .on_thread_stop_functor = nullptr}};
-  const int fd = reader.get_fd();
-  ASSERT_GE(fd, 0);
+  constexpr int fd = -1;
 
   const std::vector<float> queries = make_vectors(24, dim_, /*seed=*/777);
   uint32_t top_k = 10;
@@ -627,8 +626,7 @@ TEST_F(DiskPageIOTest, AsyncGreedySearchMatchesDeterministicSync) {
 
   td_sync.free_scratch();
   td_async.free_scratch();
-  reader.deregister_all_threads();
-  reader.close();
+  reader->shutdown();
 }
 
 // Same contract for the PQ beam variant: with an empty NodeCache the async
@@ -641,9 +639,8 @@ TEST_F(DiskPageIOTest, AsyncPqBeamSearchMatchesDeterministicSync) {
   const uint32_t pq_chunks = 4;
   build(300, 16, 24, pq_chunks);
 
-  LinuxAlignedFileReader reader;
-  reader.open(index_path());
-  reader.register_thread();
+  auto reader = alaya::storage::io::open_page_reader(
+      index_path(), {}, alaya::storage::io::PageReaderBackend::libaio);
 
   uint32_t medoid = 0;
   {
@@ -662,7 +659,7 @@ TEST_F(DiskPageIOTest, AsyncPqBeamSearchMatchesDeterministicSync) {
 
   const alaya::diskann::NodeCache cache;  // empty: every read is a miss
   alaya::diskann::SearchContext ctx;
-  ctx.reader = &reader;
+  ctx.reader = reader.get();
   ctx.geom = &geom_;
   ctx.cache = &cache;
   ctx.pq = &pq;
@@ -683,9 +680,9 @@ TEST_F(DiskPageIOTest, AsyncPqBeamSearchMatchesDeterministicSync) {
   cfg.max_degree = r_;
   cfg.search_list_size = sp.search_list_size;
   cfg.query_dim = dim_;
+  cfg.buffer_alignment = reader->constraints().buffer_alignment;
   alaya::diskann::ThreadData td_sync;
   td_sync.alloc_scratch(cfg);
-  td_sync.ctx_ = reader.get_ctx();
   alaya::diskann::ThreadData td_async;
   td_async.alloc_scratch(cfg);
 
@@ -693,8 +690,7 @@ TEST_F(DiskPageIOTest, AsyncPqBeamSearchMatchesDeterministicSync) {
   coro::thread_pool pool{{.thread_count = 2,
                           .on_thread_start_functor = nullptr,
                           .on_thread_stop_functor = nullptr}};
-  const int fd = reader.get_fd();
-  ASSERT_GE(fd, 0);
+  constexpr int fd = -1;
 
   const std::vector<float> queries = make_vectors(24, dim_, /*seed=*/888);
   uint32_t top_k = 10;
@@ -717,8 +713,7 @@ TEST_F(DiskPageIOTest, AsyncPqBeamSearchMatchesDeterministicSync) {
 
   td_sync.free_scratch();
   td_async.free_scratch();
-  reader.deregister_all_threads();
-  reader.close();
+  reader->shutdown();
 }
 // With ctx.page_io set, a search FILLS the shard cache with every page it
 // reads; repeating the identical deterministic query is then served entirely
@@ -728,9 +723,8 @@ TEST_F(DiskPageIOTest, SearchFillMakesRepeatSearchHitThePool) {
   build(300, 16, 24);
   DiskPageIO io(index_path(), geom_, /*page_cache_capacity=*/4096);
 
-  LinuxAlignedFileReader reader;
-  reader.open(index_path());
-  reader.register_thread();
+  auto reader = alaya::storage::io::open_page_reader(
+      index_path(), {}, alaya::storage::io::PageReaderBackend::libaio);
 
   uint32_t medoid = 0;
   {
@@ -742,7 +736,7 @@ TEST_F(DiskPageIOTest, SearchFillMakesRepeatSearchHitThePool) {
 
   const alaya::diskann::NodeCache cache;  // empty BFS cache: only the pool can hit
   alaya::diskann::SearchContext ctx;
-  ctx.reader = &reader;
+  ctx.reader = reader.get();
   ctx.geom = &geom_;
   ctx.cache = &cache;
   ctx.pq = nullptr;
@@ -764,9 +758,9 @@ TEST_F(DiskPageIOTest, SearchFillMakesRepeatSearchHitThePool) {
   cfg.max_degree = r_;
   cfg.search_list_size = sp.search_list_size;
   cfg.query_dim = dim_;
+  cfg.buffer_alignment = reader->constraints().buffer_alignment;
   alaya::diskann::ThreadData td;
   td.alloc_scratch(cfg);
-  td.ctx_ = reader.get_ctx();
 
   const std::vector<float> query = make_vectors(1, dim_, /*seed=*/4242);
   alaya::diskann::SearchStats cold;
@@ -787,8 +781,7 @@ TEST_F(DiskPageIOTest, SearchFillMakesRepeatSearchHitThePool) {
   }
 
   td.free_scratch();
-  reader.deregister_all_threads();
-  reader.close();
+  reader->shutdown();
 }
 
 #endif  // ALAYA_LASER_USE_LIBAIO

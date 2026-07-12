@@ -58,8 +58,8 @@
 #include "index/graph/diskann/search_scratch.hpp"
 #include "index/graph/diskann/slot_allocator.hpp"
 #include "index/graph/diskann/tombstone_bitmap.hpp"
-#include "index/graph/laser/utils/aligned_file_reader_factory.hpp"
 #include "index/graph/laser/utils/concurrent_queue.hpp"
+#include "storage/io/page_reader_factory.hpp"
 #include "index/graph/vamana/robust_prune.hpp"
 #include "index/graph/vamana/vamana_builder.hpp"
 #include "simd/distance_l2.hpp"
@@ -334,15 +334,18 @@ class DiskANNIndex {
                pq_n_chunks_);
     }
 
-    // Open the disk index and pre-register one libaio I/O context + scratch
-    // buffer per pool slot. Each context is created on a short-lived
-    // registration thread, then borrowed by whichever search thread pops the
-    // slot. A libaio context is a process-wide handle, and the slot pool
-    // guarantees only one thread uses a given context at a time, so this is safe
-    // (verified by the concurrency stress test). The deterministic beam loop
-    // (beam_search.hpp) makes results independent of I/O completion timing.
-    reader_ = make_aligned_file_reader();
-    reader_->open(path(index_dir, "diskann.index"));
+    // Open the disk index through the explicitly selected storage backend.
+    // PageReader owns completion progress; each pool slot only owns aligned
+    // buffers and its completion queue.
+#if defined(__linux__)
+    constexpr auto reader_backend = storage::io::PageReaderBackend::libaio;
+#else
+    constexpr auto reader_backend = storage::io::PageReaderBackend::threadpool;
+#endif
+    reader_ = storage::io::open_page_reader(path(index_dir, "diskann.index"),
+                                            {.mode = storage::io::OpenMode::automatic,
+                                             .queue_depth = 1024},
+                                            reader_backend);
     beam_width_ = std::max<uint32_t>(1, params.beam_width);
     uint32_t pool = std::max<uint32_t>(1, params.num_threads);
     if (params.updatable) {
@@ -374,24 +377,14 @@ class DiskANNIndex {
     scratch_config.max_degree = max_degree_;
     scratch_config.search_list_size = scratch_list_size;
     scratch_config.query_dim = dim_;
+    scratch_config.buffer_alignment = reader_->constraints().buffer_alignment;
     scratch_config_ = scratch_config;  // reused by init_updatable's gate ThreadData set
     search_page_cache_ = params.search_page_cache;
     thread_data_storage_.resize(pool);
-    {
-      std::vector<std::thread> regs;
-      regs.reserve(pool);
-      for (uint32_t t = 0; t < pool; ++t) {
-        regs.emplace_back([this, t, scratch_config]() {
-          reader_->register_thread();
-          auto td = std::make_unique<ThreadData>();
-          td->ctx_ = reader_->get_ctx();
-          td->alloc_scratch(scratch_config);
-          thread_data_storage_[t] = std::move(td);
-        });
-      }
-      for (auto &th : regs) {
-        th.join();
-      }
+    for (uint32_t t = 0; t < pool; ++t) {
+      auto td = std::make_unique<ThreadData>();
+      td->alloc_scratch(scratch_config);
+      thread_data_storage_[t] = std::move(td);
     }
     for (auto &td : thread_data_storage_) {
       ThreadData *p = td.get();
@@ -617,7 +610,7 @@ class DiskANNIndex {
     if (params.rerank) {
       throw std::invalid_argument("DiskANNIndex::search_pipelined: rerank is not supported");
     }
-    if (!update_reactor_ || !reader_ || reader_->get_fd() < 0) {
+    if (!update_reactor_ || !reader_) {
       throw std::runtime_error(
           "DiskANNIndex::search_pipelined: requires an updatable load with "
           "update_io=uring (shared reactor)");
@@ -629,7 +622,7 @@ class DiskANNIndex {
     const bool use_pq = params.use_pq && has_pq_;
     const uint32_t inflight = std::max<uint32_t>(1, std::min(pipeline, n_queries));
     const uint32_t workers = std::max<uint32_t>(1, num_threads);
-    const int fd = reader_->get_fd();
+    constexpr int fd = -1;  // PageReader owns and hides its native handle.
     // Rerank-pool semantics without rerank reads: ask the traversal for the
     // full search list (every entry carries its exact distance by the time it
     // is expanded), then cut the exact-sorted list to top_k below. Requesting
@@ -1122,7 +1115,7 @@ class DiskANNIndex {
     // they cost no fs.aio-max-nr quota.
     update_search_td_gate_.clear();
     update_search_async_ = false;
-    if (update_reactor_ && reader_ && reader_->get_fd() >= 0) {
+    if (update_reactor_ && reader_) {
       const uint32_t gate_tds = params.update_search_concurrency != 0
                                     ? params.update_search_concurrency
                                     : 4 * params.update_insert_threads;
@@ -1239,7 +1232,7 @@ class DiskANNIndex {
                                                   nullptr,
                                                   *update_reactor_,
                                                   pool,
-                                                  reader_->get_fd());
+                                                  -1);
         } else {
           results = co_await disk_greedy_search_async(ctx,
                                                       query,
@@ -1249,7 +1242,7 @@ class DiskANNIndex {
                                                       nullptr,
                                                       *update_reactor_,
                                                       pool,
-                                                      reader_->get_fd());
+                                                      -1);
         }
         st_greedy_us_.fetch_add(stage_us_since(mark), std::memory_order_relaxed);
       } catch (...) {
@@ -2080,8 +2073,7 @@ class DiskANNIndex {
 
   void teardown() {
     if (reader_) {
-      reader_->close();
-      reader_->deregister_all_threads();
+      reader_->shutdown();
     }
     // Gate holds raw pointers into thread_data_storage_: drop them before the
     // storage goes away. Updates are quiesced here, so no waiter is parked.
@@ -2223,7 +2215,7 @@ class DiskANNIndex {
   std::vector<uint64_t> labels_;
   NodeCache cache_;
   PQTable pq_;
-  std::unique_ptr<AlignedFileReader> reader_;
+  std::unique_ptr<storage::io::PageReader> reader_;
 
   // thread-scratch pool
   std::vector<std::unique_ptr<ThreadData>> thread_data_storage_;
