@@ -261,6 +261,11 @@ inline const EdgePayload &make_edge_payload(const float *c_rot,
 struct UpdateStats {
   uint64_t inserts = 0;
   uint64_t search_page_reads = 0;
+  uint64_t query_page_reads = 0;
+  uint64_t seqlock_read_calls = 0;
+  uint64_t seqlock_read_retries = 0;
+  uint64_t query_seqlock_read_calls = 0;
+  uint64_t query_seqlock_read_retries = 0;
   uint64_t patch_page_reads = 0;  // reverse-edge RMW reads (incl. full-prune vector reads)
   uint64_t page_writes = 0;
   uint64_t physical_writes = 0;  // explicit P0.2 name; same counter as page_writes
@@ -374,7 +379,12 @@ class QGUpdater {
             (std::max(params.max_points == 0 ? 2 * qg.num_points_ + 4096 : params.max_points,
                       qg.num_points_) +
              qg.node_per_page_ - 1) /
-            qg.node_per_page_) {
+            qg.node_per_page_),
+        hidden_words_((std::max(params.max_points == 0 ? 2 * qg.num_points_ + 4096
+                                                       : params.max_points,
+                                qg.num_points_) +
+                       63) /
+                      64) {
     if (qg_.index_file_name_.empty()) {
       throw std::logic_error("QGUpdater: call load_disk_index() first");
     }
@@ -385,6 +395,7 @@ class QGUpdater {
       throw std::invalid_argument(
           "QGUpdater: page has insufficient slack for format-v2 row trailers");
     }
+    for (auto &word : hidden_words_) word.store(0, std::memory_order_relaxed);
     // Reads stay buffered: the OS page cache serves the ~ef_insert row reads
     // per insert from RAM. Writes get their own O_DIRECT fd — buffered pwrite
     // serializes on the ext4 exclusive inode lock (~287k pwrites/s measured),
@@ -411,6 +422,7 @@ class QGUpdater {
       fd_ = -1;
       throw;
     }
+    refresh_routing_snapshot();
     qg_.set_result_filter(&deleted_);
   }
 
@@ -461,6 +473,11 @@ class QGUpdater {
     UpdateStats s;
     s.inserts = stats_.inserts.load();
     s.search_page_reads = stats_.search_page_reads.load();
+    s.query_page_reads = stats_.query_page_reads.load();
+    s.seqlock_read_calls = stats_.seqlock_read_calls.load();
+    s.seqlock_read_retries = stats_.seqlock_read_retries.load();
+    s.query_seqlock_read_calls = stats_.query_seqlock_read_calls.load();
+    s.query_seqlock_read_retries = stats_.query_seqlock_read_retries.load();
     s.patch_page_reads = stats_.patch_page_reads.load();
     s.page_writes = stats_.page_writes.load();
     s.physical_writes = s.page_writes;
@@ -493,7 +510,143 @@ class QGUpdater {
     return s;
   }
 
+  /**
+   * Legacy phase-boundary view used only by QuantizedGraph's static eval path.
+   * Mixed/concurrent callers must use QGUpdater::search(), whose visibility
+   * checks use the atomic hidden bitmap instead of this container.
+   */
   [[nodiscard]] const std::unordered_set<PID> &deleted() const { return deleted_; }
+
+  /**
+   * @brief Pool-coherent top-k search with exact reranking of expanded rows.
+   *
+   * The traversal matches search_for_insert(): FastScan supplies frontier
+   * distances and every expanded row is reranked by exact full-dimensional
+   * L2. The query takes one committed watermark snapshot. Appends published
+   * after that snapshot are intentionally invisible; reused PIDs below the
+   * watermark may become visible during the query at their hidden-bit clear.
+   * Tombstoned/free/dark rows remain traversable but are never results.
+   */
+  [[nodiscard]] std::vector<PID> search(const float *query_vec, size_t k, size_t ef) {
+    if (query_vec == nullptr) throw std::invalid_argument("QGUpdater::search null query");
+    if (k == 0) return {};
+    const size_t snapshot = committed_.load(std::memory_order_acquire);
+    if (snapshot == 0) return {};
+
+    const float *tvec = query_vec;
+    std::vector<float> pca_buf;
+    if (qg_.pca_transform_.is_loaded()) {
+      pca_buf.resize(full_dim_);
+      qg_.pca_transform_.transform(query_vec, pca_buf.data());
+      tvec = pca_buf.data();
+    }
+
+    QGQuery q_obj(tvec, pd_);
+    q_obj.query_prepare(qg_.rotator_, qg_.scanner_);
+    const float *res_query = tvec + dim_;
+    float sqr_qr = 0;
+    for (size_t i = 0; i < res_dim_; ++i) sqr_qr += res_query[i] * res_query[i];
+    q_obj.set_sqr_qr(sqr_qr);
+
+    const size_t search_ef = std::max(k, ef);
+    buffer::SearchBuffer sp(search_ef);
+    std::unordered_set<PID> visited;
+    visited.reserve(search_ef * 8);
+    bool seeded = false;
+    const RoutingSnapshot *routing = routing_snapshot_.load(std::memory_order_acquire);
+    if (routing != nullptr && !routing->medoids.empty() &&
+        routing->medoid_vectors.size() == routing->medoids.size() * full_dim_) {
+      PID best_medoid = kPidMax;
+      float best = FLT_MAX;
+      for (size_t m = 0; m < routing->medoids.size(); ++m) {
+        if (routing->medoids[m] >= snapshot) continue;
+        const float d =
+            space::l2_sqr(tvec, routing->medoid_vectors.data() + full_dim_ * m, dim_);
+        if (d < best) {
+          best = d;
+          best_medoid = routing->medoids[m];
+        }
+      }
+      if (best_medoid != kPidMax) {
+        sp.insert(best_medoid, FLT_MAX);
+        seeded = true;
+      }
+    }
+    if (routing != nullptr && routing->entry_point < snapshot) {
+      sp.insert(routing->entry_point, FLT_MAX);
+      seeded = true;
+    }
+    if (!seeded) return {};
+
+    struct QueryCandidate {
+      PID id;
+      float distance;
+    };
+    std::vector<QueryCandidate> candidates;
+    candidates.reserve(search_ef);
+    std::vector<float> appro(deg_);
+    AlignedBuf page(page_size_);
+    size_t beam_width = 1;
+    while (sp.has_next()) {
+      // Match QuantizedGraph's current eval traversal cadence: dequeue a
+      // growing beam before any row in that beam contributes neighbors. The
+      // reads themselves stay synchronous through the updater pool, but this
+      // preserves the diversity effect of the native async beam (2,4,8,16).
+      beam_width = std::min<size_t>(16, beam_width * 2);
+      std::vector<PID> frontier;
+      frontier.reserve(beam_width);
+      while (sp.has_next() && frontier.size() < beam_width) {
+        const PID cur = sp.pop();
+        if (!visited.insert(cur).second || cur >= snapshot) continue;
+        frontier.push_back(cur);
+      }
+      for (PID cur : frontier) {
+        read_node_page(cur, page.data(), /*query_read=*/true);
+        stats_.query_page_reads.fetch_add(1, std::memory_order_relaxed);
+        const char *row = page.data() + node_offset_in_page(cur);
+        const auto *row_f = reinterpret_cast<const float *>(row);
+        const QGRowTrailer trailer = row_trailer(page.data(), cur);
+
+        float sqr_y = space::l2_sqr(tvec, row_f, dim_);
+        qg_.scanner_.scan_neighbors(appro.data(),
+                                    q_obj.lut().data(),
+                                    sqr_y,
+                                    q_obj.lower_val(),
+                                    q_obj.width(),
+                                    q_obj.sqr_qr(),
+                                    q_obj.sumq(),
+                                    reinterpret_cast<const uint8_t *>(row + code_off_bytes()),
+                                    reinterpret_cast<const float *>(row + factor_off_bytes()));
+        const auto *nbs = reinterpret_cast<const PID *>(row + neighbor_off_bytes());
+        for (size_t j = 0; j < trailer.valid_degree; ++j) {
+          const PID nb = nbs[j];
+          if (nb >= snapshot || visited.count(nb) != 0 || sp.is_full(appro[j])) continue;
+          sp.insert(nb, appro[j]);
+        }
+
+        if (res_dim_ > 0) sqr_y += space::l2_sqr(row_f + dim_, res_query, res_dim_);
+        // A hidden bit is checked after the row copy, so a concurrent tombstone
+        // cannot leak an old live row. Trailer flags independently reject the
+        // safe-side publish intermediate (cleared hidden is always last).
+        if ((trailer.flags & (kQGRowTombstone | kQGRowFree)) == 0 && !is_hidden(cur)) {
+          candidates.push_back({cur, sqr_y});
+        }
+      }
+    }
+
+    std::sort(candidates.begin(), candidates.end(), [](const auto &a, const auto &b) {
+      return a.distance != b.distance ? a.distance < b.distance : a.id < b.id;
+    });
+    std::vector<PID> out;
+    out.reserve(std::min(k, candidates.size()));
+    for (const auto &candidate : candidates) {
+      // Close the row-read -> return window for tombstones. A tombstone that
+      // begins after this acquire may linearize after the query return.
+      if (candidate.id < snapshot && !is_hidden(candidate.id)) out.push_back(candidate.id);
+      if (out.size() == k) break;
+    }
+    return out;
+  }
 
   [[nodiscard]] int32_t indegree(PID id) const {
     if (!params_.maintain_indegree || id >= indegree_.size()) return 0;
@@ -508,7 +661,7 @@ class QGUpdater {
     const int nt = static_cast<int>(std::max<size_t>(1, num_threads));
 #pragma omp parallel for num_threads(nt) schedule(dynamic, 256)
     for (int64_t ui = 0; ui < static_cast<int64_t>(n); ++ui) {
-      if (deleted_.count(static_cast<PID>(ui)) != 0) continue;
+      if (is_hidden(static_cast<PID>(ui))) continue;
       AlignedBuf page(page_size_);
       read_node_page(static_cast<PID>(ui), page.data());
       const char *row = page.data() + node_offset_in_page(static_cast<PID>(ui));
@@ -524,13 +677,17 @@ class QGUpdater {
 
   /**
    * @brief Tombstone a node: routing still passes through, results filter it.
-   * NOT safe concurrently with inserts/consolidate (phase separation).
+   * Safe concurrently with QGUpdater::search(). Inserts/consolidate remain
+   * phase-separated update operations.
    */
   void tombstone(PID id) {
     if (id >= allocated_points()) {
       throw std::out_of_range("QGUpdater::tombstone id outside allocated range");
     }
-    if (!deleted_.insert(id).second) return;
+    // This is the deletion visibility point. A racing reader that still has
+    // the old row may route through it, but can no longer return the PID.
+    if (!mark_hidden(id)) return;
+    mirror_deleted_insert(id);
     repair_routing_roots(id);
     const std::lock_guard<std::mutex> guard(page_lock(id));
     modify_node_page(id, [&](char *page) {
@@ -598,7 +755,11 @@ class QGUpdater {
         set_row_trailer(page, id, trailer);
         return true;
       });
-      deleted_.erase(id);
+      // Preserve the P2 ordering under concurrent readers: trailer first,
+      // then both legacy and lock-free filters. Observing any intermediate
+      // state therefore keeps the row dark (safe-side false negative).
+      mirror_deleted_erase(id);
+      clear_hidden(id);
     }
     live_count_.fetch_add(reused.size() + (new_committed - old_committed),
                           std::memory_order_acq_rel);
@@ -744,7 +905,7 @@ class QGUpdater {
 #pragma omp parallel for num_threads(nt) schedule(dynamic, 256)
     for (int64_t ui = 0; ui < static_cast<int64_t>(n); ++ui) {
       const PID u = static_cast<PID>(ui);
-      if (deleted_.count(u) != 0) {
+      if (is_hidden(u)) {
         continue;
       }
       consolidate_row(u, n, target);
@@ -754,11 +915,11 @@ class QGUpdater {
     if (reclaim_slots) {
       // Only after every live row has purged dead out-edges and that purge has
       // reached the file may a tombstoned row become a reusable free slot.
-      std::vector<PID> eligible;
-      eligible.reserve(deleted_.size());
-      for (PID id : deleted_) {
-        if (id < n) eligible.push_back(id);
-      }
+      std::vector<PID> eligible = deleted_snapshot();
+      eligible.erase(std::remove_if(eligible.begin(), eligible.end(), [n](PID id) {
+                       return id >= n;
+                     }),
+                     eligible.end());
       std::sort(eligible.begin(), eligible.end());
       for (PID id : eligible) push_free_slot(id);
       flush_dirty(num_threads);
@@ -773,9 +934,9 @@ class QGUpdater {
     const auto t0 = std::chrono::steady_clock::now();
     const size_t n = committed_.load(std::memory_order_acquire);
     std::vector<PID> live;
-    live.reserve(n - std::min(n, deleted_.size()));
+    live.reserve(std::min<uint64_t>(n, live_count_.load(std::memory_order_acquire)));
     for (size_t i = 0; i < n; ++i) {
-      if (deleted_.count(static_cast<PID>(i)) == 0) live.push_back(static_cast<PID>(i));
+      if (!is_hidden(static_cast<PID>(i))) live.push_back(static_cast<PID>(i));
     }
     const double frac = std::clamp(gp.frac, 0.0, 1.0);
     size_t k = static_cast<size_t>(std::ceil(frac * static_cast<double>(live.size())));
@@ -934,6 +1095,11 @@ class QGUpdater {
   struct AtomicStats {
     std::atomic<uint64_t> inserts{0};
     std::atomic<uint64_t> search_page_reads{0};
+    std::atomic<uint64_t> query_page_reads{0};
+    std::atomic<uint64_t> seqlock_read_calls{0};
+    std::atomic<uint64_t> seqlock_read_retries{0};
+    std::atomic<uint64_t> query_seqlock_read_calls{0};
+    std::atomic<uint64_t> query_seqlock_read_retries{0};
     std::atomic<uint64_t> patch_page_reads{0};
     std::atomic<uint64_t> page_writes{0};
     std::atomic<uint64_t> logical_row_writes{0};
@@ -969,6 +1135,12 @@ class QGUpdater {
     [[nodiscard]] const float *raw() const { return vec.data(); }
   };
 
+  struct RoutingSnapshot {
+    PID entry_point = kPidMax;
+    std::vector<PID> medoids;
+    std::vector<float> medoid_vectors;
+  };
+
   /// O_DIRECT alignment unit (buffer address, file offset, and length).
   static constexpr size_t kDioAlign = 4096;
 
@@ -997,6 +1169,72 @@ class QGUpdater {
       throw std::runtime_error("QGUpdater: corrupt valid_degree");
     }
     qg_write_page_trailer(page, page_size_, npp_, id % npp_, trailer);
+  }
+
+  [[nodiscard]] bool is_hidden(PID id) const {
+    const size_t wi = static_cast<size_t>(id) >> 6U;
+    if (wi >= hidden_words_.size()) return true;
+    const uint64_t mask = uint64_t{1} << (id & 63U);
+    return (hidden_words_[wi].load(std::memory_order_acquire) & mask) != 0;
+  }
+
+  /** Mark tombstone/free/dark before touching any mutable row state. */
+  bool mark_hidden(PID id) {
+    const size_t wi = static_cast<size_t>(id) >> 6U;
+    if (wi >= hidden_words_.size()) {
+      throw std::runtime_error("QGUpdater: visibility id exceeds max_points capacity");
+    }
+    const uint64_t mask = uint64_t{1} << (id & 63U);
+    const uint64_t old = hidden_words_[wi].fetch_or(mask, std::memory_order_acq_rel);
+    return (old & mask) == 0;
+  }
+
+  /**
+   * Publish a reused row. The release clear is its visibility point: all row
+   * bytes and the cleared trailer happen-before a query that observes live.
+   */
+  void clear_hidden(PID id) {
+    const size_t wi = static_cast<size_t>(id) >> 6U;
+    if (wi >= hidden_words_.size()) {
+      throw std::runtime_error("QGUpdater: visibility id exceeds max_points capacity");
+    }
+    const uint64_t mask = uint64_t{1} << (id & 63U);
+    hidden_words_[wi].fetch_and(~mask, std::memory_order_release);
+  }
+
+  void reset_hidden() {
+    for (auto &word : hidden_words_) word.store(0, std::memory_order_relaxed);
+  }
+
+  void mirror_deleted_insert(PID id) {
+    const std::lock_guard<std::mutex> guard(deleted_mutex_);
+    deleted_.insert(id);
+  }
+
+  void mirror_deleted_erase(PID id) {
+    const std::lock_guard<std::mutex> guard(deleted_mutex_);
+    deleted_.erase(id);
+  }
+
+  [[nodiscard]] std::vector<PID> deleted_snapshot() const {
+    const std::lock_guard<std::mutex> guard(deleted_mutex_);
+    return {deleted_.begin(), deleted_.end()};
+  }
+
+  /**
+   * Publish immutable routing seeds without a query-side lock. Old snapshots
+   * stay owned until updater destruction, so an in-flight query can safely
+   * finish even when tombstone() relocates a seed concurrently.
+   */
+  void refresh_routing_snapshot() {
+    auto next = std::make_unique<RoutingSnapshot>();
+    next->entry_point = qg_.entry_point_;
+    next->medoids = qg_.medoids_;
+    next->medoid_vectors = qg_.medoids_vector_;
+    const RoutingSnapshot *published = next.get();
+    const std::lock_guard<std::mutex> guard(routing_snapshot_mutex_);
+    routing_snapshots_.push_back(std::move(next));
+    routing_snapshot_.store(published, std::memory_order_release);
   }
 
   void note_allocated(size_t end) {
@@ -1133,6 +1371,7 @@ class QGUpdater {
     live_count_.store(n, std::memory_order_release);
     free_list_head_.store(kPidMax, std::memory_order_release);
     free_count_.store(0, std::memory_order_release);
+    reset_hidden();
     std::clog << "[QGUpdater] migration complete: generation=1\n";
   }
 
@@ -1168,7 +1407,11 @@ class QGUpdater {
     next_append_id_.store(static_cast<PID>(n), std::memory_order_release);
     qg_.num_points_ = n;
 
-    deleted_.clear();
+    {
+      const std::lock_guard<std::mutex> guard(deleted_mutex_);
+      deleted_.clear();
+    }
+    reset_hidden();
     std::vector<PID> free_ids;
     const size_t pages = (n + npp_ - 1) / npp_;
     AlignedBuf page(page_size_);
@@ -1183,10 +1426,13 @@ class QGUpdater {
           throw std::runtime_error("QGUpdater: v2 trailer valid_degree exceeds degree bound");
         }
         if ((trailer.flags & kQGRowFree) != 0) free_ids.push_back(id);
-        if ((trailer.flags & (kQGRowTombstone | kQGRowFree)) != 0) deleted_.insert(id);
+        if ((trailer.flags & (kQGRowTombstone | kQGRowFree)) != 0) {
+          mark_hidden(id);
+          mirror_deleted_insert(id);
+        }
       }
     }
-    live_count_.store(n - deleted_.size(), std::memory_order_release);
+    live_count_.store(n - deleted_snapshot().size(), std::memory_order_release);
 
     bool chain_ok = sb.free_count == free_ids.size();
     std::vector<uint8_t> seen(n, 0);
@@ -1253,26 +1499,32 @@ class QGUpdater {
     // selected as a live insertion neighbor, so its freshly assembled row can
     // be isolated.  Remove deleted medoid seeds and relocate the global entry
     // point before the row becomes free/reusable.
+    bool changed = false;
     for (size_t i = qg_.medoids_.size(); i > 0; --i) {
       const size_t idx = i - 1;
       const PID medoid = qg_.medoids_[idx];
-      if (medoid != newly_deleted && deleted_.count(medoid) == 0) continue;
+      if (medoid != newly_deleted && !is_hidden(medoid)) continue;
       qg_.medoids_.erase(qg_.medoids_.begin() + static_cast<int64_t>(idx));
       const auto first = qg_.medoids_vector_.begin() +
                          static_cast<int64_t>(idx * full_dim_);
       qg_.medoids_vector_.erase(first, first + static_cast<int64_t>(full_dim_));
+      changed = true;
     }
-    if (qg_.entry_point_ != newly_deleted && deleted_.count(qg_.entry_point_) == 0) return;
-    const size_t n = committed_.load(std::memory_order_acquire);
-    if (n == 0) return;
-    const size_t start = (static_cast<size_t>(qg_.entry_point_) + 1) % n;
-    for (size_t offset = 0; offset < n; ++offset) {
-      const PID candidate = static_cast<PID>((start + offset) % n);
-      if (deleted_.count(candidate) == 0) {
-        qg_.entry_point_ = candidate;
-        return;
+    if (qg_.entry_point_ == newly_deleted || is_hidden(qg_.entry_point_)) {
+      const size_t n = committed_.load(std::memory_order_acquire);
+      if (n != 0) {
+        const size_t start = (static_cast<size_t>(qg_.entry_point_) + 1) % n;
+        for (size_t offset = 0; offset < n; ++offset) {
+          const PID candidate = static_cast<PID>((start + offset) % n);
+          if (!is_hidden(candidate)) {
+            qg_.entry_point_ = candidate;
+            changed = true;
+            break;
+          }
+        }
       }
     }
+    if (changed) refresh_routing_snapshot();
   }
 
   void push_free_slot(PID id) {
@@ -1343,6 +1595,11 @@ class QGUpdater {
     struct CachedPage {
       explicit CachedPage(size_t len) : bytes(len) {}
       AlignedBuf bytes;
+      // Update-side dependency reads may inspect this page while another
+      // worker owns its striped writer lock. A separate, try-only byte latch
+      // makes those copies C++/TSan race-free without introducing cross-page
+      // lock cycles inside consolidate/full-prune callbacks.
+      std::mutex bytes_mutex;
       bool dirty = false;
     };
     struct Shard {
@@ -1435,9 +1692,13 @@ class QGUpdater {
     if (pi >= page_versions_.size()) {
       throw std::runtime_error("QGUpdater: id exceeds max_points capacity");
     }
-    page_versions_[pi].fetch_add(1, std::memory_order_acq_rel);
-    const bool changed = fn(cached->bytes.data());
-    page_versions_[pi].fetch_add(1, std::memory_order_release);
+    bool changed = false;
+    {
+      const std::lock_guard<std::mutex> bytes_guard(cached->bytes_mutex);
+      page_versions_[pi].fetch_add(1, std::memory_order_acq_rel);
+      changed = fn(cached->bytes.data());
+      page_versions_[pi].fetch_add(1, std::memory_order_release);
+    }
     if (!changed) {
       return false;
     }
@@ -1470,10 +1731,16 @@ class QGUpdater {
       const std::lock_guard<std::mutex> guard(shard.mutex);
       auto it = shard.pages.find(pi);
       if (it != shard.pages.end()) {
-        std::memcpy(out, it->second->bytes.data(), page_size_);
-        return;
+        std::unique_lock<std::mutex> bytes_guard(it->second->bytes_mutex, std::try_to_lock);
+        if (bytes_guard.owns_lock()) {
+          std::memcpy(out, it->second->bytes.data(), page_size_);
+          return;
+        }
       }
     }
+    // A busy cached page means the caller may already hold another page lock;
+    // waiting here could form A->B/B->A cycles. The on-disk page is an older
+    // but consistent dependency snapshot and is preferable to a torn copy.
     read_at(page_offset(id), out, page_size_);
   }
 
@@ -1497,25 +1764,50 @@ class QGUpdater {
    * fresh the row bytes are. External readers (a separate process on its own
    * fd) must still wait for finalize().
    */
-  void read_node_page(PID id, char *buf) {
+  void read_node_page(PID id, char *buf, bool query_read = false) {
     const size_t pi = page_index(id);
     if (pi >= page_versions_.size()) {
       throw std::runtime_error("QGUpdater: id exceeds max_points capacity");
     }
+    stats_.seqlock_read_calls.fetch_add(1, std::memory_order_relaxed);
+    if (query_read) {
+      stats_.query_seqlock_read_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+    const auto note_retry = [&] {
+      stats_.seqlock_read_retries.fetch_add(1, std::memory_order_relaxed);
+      if (query_read) {
+        stats_.query_seqlock_read_retries.fetch_add(1, std::memory_order_relaxed);
+      }
+    };
     for (;;) {
       const uint32_t v1 = page_versions_[pi].load(std::memory_order_acquire);
       if ((v1 & 1U) != 0) {
+        note_retry();
         std::this_thread::yield();
         continue;
       }
       bool from_pool = false;
-      if (params_.write_cache) {
-        auto &shard = write_cache_.shard(pi);
-        const std::lock_guard<std::mutex> guard(shard.mutex);
-        auto it = shard.pages.find(pi);
-        if (it != shard.pages.end()) {
-          std::memcpy(buf, it->second->bytes.data(), page_size_);
-          from_pool = true;
+      {
+        // A classic seqlock permits a C-level racy copy, but that is undefined
+        // behavior in C++ and is reported by TSan. Writers already hold this
+        // striped page lock; taking it only for the resident-page memcpy keeps
+        // bytes race-free without introducing a global query lock. The outer
+        // version checks still detect a writer/writeback that won the race.
+        const std::lock_guard<std::mutex> page_guard(page_lock(id));
+        const uint32_t locked_version =
+            page_versions_[pi].load(std::memory_order_acquire);
+        if (locked_version != v1 || (locked_version & 1U) != 0) {
+          note_retry();
+          continue;
+        }
+        if (params_.write_cache) {
+          auto &shard = write_cache_.shard(pi);
+          const std::lock_guard<std::mutex> guard(shard.mutex);
+          auto it = shard.pages.find(pi);
+          if (it != shard.pages.end()) {
+            std::memcpy(buf, it->second->bytes.data(), page_size_);
+            from_pool = true;
+          }
         }
       }
       if (!from_pool) {
@@ -1525,6 +1817,7 @@ class QGUpdater {
       if (v1 == v2) {
         return;
       }
+      note_retry();
     }
   }
 
@@ -1686,7 +1979,16 @@ class QGUpdater {
       }
     }
     stats_.flush_unique_pages.fetch_add(dirty.size());
+#if defined(__SANITIZE_THREAD__)
+    // GCC TSan does not model libgomp's publication of the stack-owned dirty
+    // vector into this second, nested parallel region and reports the OpenMP
+    // frame itself as a race. Maintenance row workers remain concurrent in
+    // sanitizer tests; serialize only the disjoint-page writeback loop.
+    (void)num_threads;
+    const int nt = 1;
+#else
     const int nt = static_cast<int>(std::max<size_t>(1, num_threads));
+#endif
 #pragma omp parallel for num_threads(nt) schedule(dynamic, 1)
     for (int64_t i = 0; i < static_cast<int64_t>(dirty.size()); ++i) {
       const auto &page = dirty[static_cast<size_t>(i)];
@@ -1758,19 +2060,25 @@ class QGUpdater {
     std::unordered_set<PID> visited;
     visited.reserve(ef * 8);
 
-    if (!qg_.medoids_.empty()) {
-      PID best_medoid = 0;
+    const RoutingSnapshot *routing = routing_snapshot_.load(std::memory_order_acquire);
+    if (routing != nullptr && !routing->medoids.empty() &&
+        routing->medoid_vectors.size() == routing->medoids.size() * full_dim_) {
+      PID best_medoid = kPidMax;
       float best = FLT_MAX;
-      for (size_t m = 0; m < qg_.medoids_.size(); ++m) {
-        const float d = space::l2_sqr(tvec, qg_.medoids_vector_.data() + full_dim_ * m, dim_);
+      for (size_t m = 0; m < routing->medoids.size(); ++m) {
+        if (routing->medoids[m] >= snapshot) continue;
+        const float d =
+            space::l2_sqr(tvec, routing->medoid_vectors.data() + full_dim_ * m, dim_);
         if (d < best) {
           best = d;
-          best_medoid = qg_.medoids_[m];
+          best_medoid = routing->medoids[m];
         }
       }
-      sp.insert(best_medoid, FLT_MAX);
+      if (best_medoid != kPidMax) sp.insert(best_medoid, FLT_MAX);
     }
-    sp.insert(qg_.entry_point_, FLT_MAX);
+    if (routing != nullptr && routing->entry_point < snapshot) {
+      sp.insert(routing->entry_point, FLT_MAX);
+    }
 
     std::vector<float> appro(deg_);
     AlignedBuf page(page_size_);
@@ -1832,7 +2140,7 @@ class QGUpdater {
   void robust_prune(const std::vector<CapturedNode> &pool, std::vector<size_t> &sel) {
     sel.clear();
     for (size_t i = 0; i < pool.size() && sel.size() < deg_; ++i) {
-      if (deleted_.count(pool[i].id) != 0) {
+      if (is_hidden(pool[i].id)) {
         continue;
       }
       bool occluded = false;
@@ -1886,7 +2194,7 @@ class QGUpdater {
                           const float *x_vec,
                           const std::unordered_map<PID, const CapturedNode *> &captured,
                           bool force) {
-    if (deleted_.count(v.id) != 0) {
+    if (is_hidden(v.id)) {
       return false;
     }
     const std::lock_guard<std::mutex> guard(page_lock(v.id));
@@ -2066,7 +2374,7 @@ class QGUpdater {
 
   /** @brief Quality-reference arm: full RobustPrune with all neighbor vectors read back. */
   bool full_reverse_recompute(const CapturedNode &v, PID x_id, const float *x_vec) {
-    if (deleted_.count(v.id) != 0) {
+    if (is_hidden(v.id)) {
       return false;
     }
     const std::lock_guard<std::mutex> guard(page_lock(v.id));
@@ -2091,7 +2399,7 @@ class QGUpdater {
       AlignedBuf nb_page(page_size_);
       for (size_t j = 0; j < old_degree; ++j) {
         const PID nb = ids[j];
-        if ((nb >= snapshot && nb != x_id) || nb == v.id || deleted_.count(nb) != 0) {
+        if ((nb >= snapshot && nb != x_id) || nb == v.id || is_hidden(nb)) {
           continue;
         }
         bool dup = false;
@@ -2177,7 +2485,7 @@ class QGUpdater {
     const size_t old_degree = row_trailer(old_page.data(), u).valid_degree;
     std::unordered_set<PID> old_set;
     for (size_t j = 0; j < old_degree; ++j) {
-      if (old_ids[j] != u && deleted_.count(old_ids[j]) == 0) {
+      if (old_ids[j] != u && !is_hidden(old_ids[j])) {
         old_set.insert(old_ids[j]);
       }
     }
@@ -2200,7 +2508,7 @@ class QGUpdater {
       pool.push_back(std::move(c));
     }
     pool.erase(std::remove_if(pool.begin(), pool.end(), [&](const CapturedNode &c) {
-                 return c.id == u || deleted_.count(c.id) != 0;
+                 return c.id == u || is_hidden(c.id);
                }),
                pool.end());
     std::sort(pool.begin(), pool.end(), [](const CapturedNode &a, const CapturedNode &b) {
@@ -2276,7 +2584,7 @@ class QGUpdater {
       std::unordered_set<PID> chosen;
       bool has_dead = false;
       for (size_t j = 0; j < degree; ++j) {
-        if (deleted_.count(ids[j]) != 0)
+        if (is_hidden(ids[j]))
           has_dead = true;
         else
           chosen.insert(ids[j]);
@@ -2298,7 +2606,7 @@ class QGUpdater {
       bool dirty = false;
       size_t j = 0;
       while (j < degree) {
-        if (deleted_.count(ids[j]) == 0) {
+        if (!is_hidden(ids[j])) {
           ++j;
           continue;
         }
@@ -2334,7 +2642,7 @@ class QGUpdater {
         for (size_t k = 0; k < d_degree; ++k) {
           const PID cand = d_ids[k];
           if (cand == u || cand >= snapshot || !std::isfinite(appro[k]) ||
-              deleted_.count(cand) != 0 || chosen.count(cand) != 0) {
+              is_hidden(cand) || chosen.count(cand) != 0) {
             continue;
           }
           recalled.emplace_back(appro[k], cand);
@@ -2510,6 +2818,7 @@ class QGUpdater {
   std::atomic<uint64_t> free_count_{0};
   size_t dim_, res_dim_, full_dim_, pd_, deg_, node_len_, page_size_, npp_;
   std::unordered_set<PID> deleted_;
+  mutable std::mutex deleted_mutex_;
   QGSuperblockV2 superblock_{};
   int active_superblock_slot_ = -1;
   std::mutex checkpoint_mutex_;
@@ -2523,6 +2832,12 @@ class QGUpdater {
   // Per-page seqlock: odd while a locked writer rewrites the page. Readers
   // outside the page lock validate before/after the pread and retry.
   std::vector<std::atomic<uint32_t>> page_versions_;
+  // One fixed, atomic bit per PID. Set means tombstoned, free, or a reused row
+  // that is still dark. Fixed sizing makes hot-path reads pointer-stable.
+  std::vector<std::atomic<uint64_t>> hidden_words_;
+  std::mutex routing_snapshot_mutex_;
+  std::vector<std::unique_ptr<RoutingSnapshot>> routing_snapshots_;
+  std::atomic<const RoutingSnapshot *> routing_snapshot_{nullptr};
 };
 
 }  // namespace alaya::laser

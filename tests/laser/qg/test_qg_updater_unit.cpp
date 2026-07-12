@@ -21,6 +21,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -28,6 +30,8 @@
 #include <numeric>
 #include <random>
 #include <string>
+#include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "index/graph/laser/qg/qg.hpp"
@@ -45,6 +49,18 @@ constexpr size_t kDim = 64;
 // while leaving 512B of slack for two row trailers.
 constexpr size_t kDeg = 64;
 constexpr size_t kN = 2000;
+
+#if defined(__SANITIZE_THREAD__)
+constexpr bool kRunningTsan = true;
+#elif defined(__has_feature)
+  #if __has_feature(thread_sanitizer)
+constexpr bool kRunningTsan = true;
+  #else
+constexpr bool kRunningTsan = false;
+  #endif
+#else
+constexpr bool kRunningTsan = false;
+#endif
 
 std::vector<float> make_data(size_t n, size_t dim, uint32_t seed) {
   std::mt19937 gen(seed);
@@ -83,7 +99,10 @@ struct TinyIndex {
     vp.R = kDeg;
     vp.L = 64;
     vp.alpha = 1.2F;
-    vp.num_threads = 4;
+    // Vamana's medoid reduction is intentionally outside this updater test's
+    // TSan scope and has a known racy accumulator; serialize fixture creation
+    // so sanitizer findings belong to the concurrent updater operations below.
+    vp.num_threads = kRunningTsan ? 1 : 4;
     alaya::vamana::VamanaBuilder vb(t.data.data(), kN, kDim, vp);
     vb.build();
     const std::string vamana_path = t.prefix + "_vamana.index";
@@ -92,7 +111,7 @@ struct TinyIndex {
     write_fbin(t.prefix + "_pca_base.fbin", t.data.data(), kN, kDim);
 
     QuantizedGraph qg(kN, kDeg, kDim, kDim, /*rotator_seed=*/7);
-    QGBuilder builder(qg, /*ef_build=*/64, /*num_threads=*/4);
+    QGBuilder builder(qg, /*ef_build=*/64, /*num_threads=*/kRunningTsan ? 1 : 4);
     builder.build(vamana_path.c_str(), t.prefix.c_str());
 
     // Preserve an immutable v1 artifact even though most updater tests migrate
@@ -927,6 +946,186 @@ TEST_F(QGUpdaterIndexTest, ReusePlatformsFileWhileAppendControlGrows) {
   }
   EXPECT_EQ(reuse_stats.reused_slots, 5 * kN);
   EXPECT_EQ(append_stats.reused_slots, 0U);
+}
+
+TEST_F(QGUpdaterIndexTest, ConcurrentSearchNeverReturnsUnpublishedTombstoneOrDarkPid) {
+  const std::string prefix = (tiny_->dir / "concurrent_publish").string();
+  copy_index_artifact(tiny_->v1_prefix, prefix);
+  constexpr size_t kRecycle = 8;
+  const size_t batch_size = kRunningTsan ? 2 : 8;
+  const size_t num_batches = kRunningTsan ? 3 : 8;
+  const auto replacement = make_data(batch_size * num_batches, kDim, 0x713a);
+
+  QuantizedGraph qg(kN, kDeg, kDim, kDim);
+  qg.load_disk_index(prefix.c_str(), 0.0F);
+  UpdateParams params;
+  params.ef_insert = 64;
+  params.prune_pool_cap = 128;
+  params.max_points = kN + replacement.size() / kDim + 64;
+  QGUpdater upd(qg, params);
+
+  // Build reusable slots first, then add permanent tombstones that will not
+  // be reclaimed by this test. Reused slots remain hidden through row rewrite
+  // and only become visible at publish().
+  for (PID id = 100; id < 100 + kRecycle; ++id) upd.tombstone(id);
+  upd.consolidate(kRunningTsan ? 1 : 4, 0, true);
+  std::unordered_set<PID> permanent_dead;
+  for (PID id = 20; id < 28; ++id) {
+    upd.tombstone(id);
+    permanent_dead.insert(id);
+  }
+
+  std::atomic<bool> stop{false};
+  std::atomic<bool> bad_result{false};
+  std::atomic<uint64_t> query_count{0};
+  const size_t query_threads = kRunningTsan ? 2 : 4;
+  std::vector<std::thread> readers;
+  for (size_t tid = 0; tid < query_threads; ++tid) {
+    readers.emplace_back([&, tid] {
+      try {
+        size_t iteration = 0;
+        while (!stop.load(std::memory_order_acquire)) {
+          const size_t qi = (tid + iteration++ * query_threads) % 64;
+          const auto result = upd.search(tiny_->data.data() + qi * kDim, 10, 64);
+          const size_t published_after = upd.num_points();
+          for (PID id : result) {
+            if (id >= published_after || permanent_dead.count(id) != 0 ||
+                (upd.trailer(id).flags & (kQGRowTombstone | kQGRowFree)) != 0) {
+              bad_result.store(true, std::memory_order_release);
+            }
+          }
+          query_count.fetch_add(1, std::memory_order_relaxed);
+        }
+      } catch (...) {
+        bad_result.store(true, std::memory_order_release);
+      }
+    });
+  }
+
+  for (size_t batch = 0; batch < num_batches; ++batch) {
+    std::vector<PID> allocated(batch_size);
+    std::atomic<size_t> next{0};
+    std::vector<std::thread> writers;
+    const size_t writer_count = kRunningTsan ? 2 : 4;
+    for (size_t writer = 0; writer < writer_count; ++writer) {
+      writers.emplace_back([&] {
+        for (;;) {
+          const size_t i = next.fetch_add(1, std::memory_order_relaxed);
+          if (i >= batch_size) return;
+          allocated[i] = upd.allocate_and_insert(
+              replacement.data() + (batch * batch_size + i) * kDim);
+        }
+      });
+    }
+    for (auto &writer : writers) writer.join();
+    upd.flush(kRunningTsan ? 2 : 4);
+
+    // Deterministic visibility check while the batch is deliberately held
+    // before publish: reused PIDs are dark and appended PIDs are above the
+    // committed watermark, even though every row/backlink is already present.
+    for (size_t i = 0; i < batch_size; ++i) {
+      const auto result = upd.search(
+          replacement.data() + (batch * batch_size + i) * kDim, 10, 128);
+      for (PID id : allocated) EXPECT_EQ(std::count(result.begin(), result.end(), id), 0);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(kRunningTsan ? 1 : 3));
+    upd.publish(upd.allocated_points());
+  }
+  stop.store(true, std::memory_order_release);
+  for (auto &reader : readers) reader.join();
+
+  EXPECT_FALSE(bad_result.load());
+  EXPECT_GT(query_count.load(), 0U);
+  const UpdateStats stats = upd.stats();
+  EXPECT_GT(stats.query_seqlock_read_calls, 0U);
+  EXPECT_LE(stats.query_seqlock_read_retries, stats.seqlock_read_retries);
+}
+
+TEST_F(QGUpdaterIndexTest, SearchContinuesDuringConsolidate) {
+  const std::string prefix = (tiny_->dir / "concurrent_consolidate").string();
+  copy_index_artifact(tiny_->v1_prefix, prefix);
+  QuantizedGraph qg(kN, kDeg, kDim, kDim);
+  qg.load_disk_index(prefix.c_str(), 0.0F);
+  UpdateParams params;
+  params.max_points = kN + 64;
+  QGUpdater upd(qg, params);
+  const size_t tombstones = kRunningTsan ? 16 : 96;
+  std::unordered_set<PID> dead;
+  for (size_t i = 0; i < tombstones; ++i) {
+    const PID id = static_cast<PID>(200 + i);
+    upd.tombstone(id);
+    dead.insert(id);
+  }
+
+  std::atomic<bool> stop{false};
+  std::atomic<bool> bad{false};
+  std::atomic<uint64_t> queries{0};
+  std::thread reader([&] {
+    try {
+      size_t i = 0;
+      while (!stop.load(std::memory_order_acquire)) {
+        const auto result = upd.search(tiny_->data.data() + (i++ % 64) * kDim, 10, 64);
+        for (PID id : result) {
+          if (id >= upd.num_points() || dead.count(id) != 0) bad.store(true);
+        }
+        ++queries;
+      }
+    } catch (...) {
+      bad.store(true);
+    }
+  });
+  while (queries.load(std::memory_order_acquire) == 0) std::this_thread::yield();
+  upd.consolidate(kRunningTsan ? 1 : 8, kDeg - 4, false);
+  stop.store(true, std::memory_order_release);
+  reader.join();
+  EXPECT_FALSE(bad.load());
+  EXPECT_GT(queries.load(), 0U);
+  EXPECT_GT(upd.stats().consolidated_rows, 0U);
+}
+
+TEST_F(QGUpdaterIndexTest, SearchContinuesDuringGarden) {
+  const std::string prefix = (tiny_->dir / "concurrent_garden").string();
+  copy_index_artifact(tiny_->v1_prefix, prefix);
+  QuantizedGraph qg(kN, kDeg, kDim, kDim);
+  qg.load_disk_index(prefix.c_str(), 0.0F);
+  UpdateParams params;
+  params.max_points = kN + 64;
+  params.maintain_indegree = true;
+  QGUpdater upd(qg, params);
+  upd.init_indegree(kRunningTsan ? 1 : 8);
+
+  std::atomic<bool> stop{false};
+  std::atomic<bool> bad{false};
+  std::atomic<uint64_t> queries{0};
+  std::thread reader([&] {
+    try {
+      size_t i = 0;
+      while (!stop.load(std::memory_order_acquire)) {
+        const auto result = upd.search(tiny_->data.data() + (i++ % 64) * kDim, 10, 64);
+        for (PID id : result) {
+          if (id >= upd.num_points() ||
+              (upd.trailer(id).flags & (kQGRowTombstone | kQGRowFree)) != 0) {
+            bad.store(true);
+          }
+        }
+        ++queries;
+      }
+    } catch (...) {
+      bad.store(true);
+    }
+  });
+  while (queries.load(std::memory_order_acquire) == 0) std::this_thread::yield();
+  GardenParams garden;
+  garden.frac = kRunningTsan ? 0.01 : 0.10;
+  garden.ef_maintenance = kRunningTsan ? 32 : 64;
+  garden.pump_budget = 2;
+  garden.r_target = kDeg - 4;
+  upd.garden(kRunningTsan ? 1 : 8, garden);
+  stop.store(true, std::memory_order_release);
+  reader.join();
+  EXPECT_FALSE(bad.load());
+  EXPECT_GT(queries.load(), 0U);
+  EXPECT_GT(upd.stats().gardened_rows, 0U);
 }
 
 TEST_F(QGUpdaterIndexTest, GhostSlotDetection) {

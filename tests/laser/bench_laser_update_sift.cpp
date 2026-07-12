@@ -25,15 +25,20 @@
 #include <omp.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iostream>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -197,15 +202,23 @@ struct Args {
   uint32_t pipeline = 0;     // staged mode only: overlap drain(i) with batch i+1 (2-batch isolation)
   uint32_t stage = 0;        // 1 = stage backlinks + barrier drain; 0 = inline patches into pool
   size_t flush_threads = 0;  // threads for the overlapped flush; 0 = insert_threads
+  uint32_t query_threads = 16;      // mixed: closed-loop query clients
+  uint32_t mixed_ef = 100;          // mixed: updater pool-search ef
+  double mixed_seconds = 10.0;      // mixed: duration of each insert/query window
+  uint32_t mixed_rate_pct = 100;    // mixed: 0|25|50|100; 100 is unlimited
+  double mixed_full_rate = 0.0;     // token-bucket 100% reference QPS for 25/50
+  std::string csv;                  // mixed: append one row per phase
   std::vector<uint32_t> efs = {60, 80, 100, 150, 200, 300};
 };
 
 Args parse(int argc, char **argv) {
   Args a;
   if (argc < 2) {
-    throw std::runtime_error("usage: bench_laser_update_sift <build|insert|eval> [--k v ...]");
+    throw std::runtime_error(
+        "usage: bench_laser_update_sift <build|insert|churn|eval|mixed> [--k v ...]");
   }
   a.mode = argv[1];
+  if (a.mode == "--mixed") a.mode = "mixed";
   for (int i = 2; i + 1 < argc; i += 2) {
     const std::string k = argv[i];
     const std::string v = argv[i + 1];
@@ -293,6 +306,18 @@ Args parse(int argc, char **argv) {
       a.stage = std::stoul(v);
     else if (k == "--flush_threads")
       a.flush_threads = std::stoull(v);
+    else if (k == "--query_threads")
+      a.query_threads = std::stoul(v);
+    else if (k == "--mixed_ef")
+      a.mixed_ef = std::stoul(v);
+    else if (k == "--mixed_seconds")
+      a.mixed_seconds = std::stod(v);
+    else if (k == "--mixed_rate_pct")
+      a.mixed_rate_pct = std::stoul(v);
+    else if (k == "--mixed_full_rate")
+      a.mixed_full_rate = std::stod(v);
+    else if (k == "--csv")
+      a.csv = v;
     else if (k == "--alpha")
       a.alpha = std::stof(v);
     else if (k == "--seed")
@@ -315,6 +340,16 @@ Args parse(int argc, char **argv) {
   }
   if (a.reuse > 1) {
     throw std::runtime_error("--reuse must be 0 or 1");
+  }
+  if (a.query_threads == 0 || a.mixed_ef == 0 || !(a.mixed_seconds > 0)) {
+    throw std::runtime_error("mixed query_threads/mixed_ef/mixed_seconds must be positive");
+  }
+  if (a.mixed_rate_pct != 0 && a.mixed_rate_pct != 25 && a.mixed_rate_pct != 50 &&
+      a.mixed_rate_pct != 100) {
+    throw std::runtime_error("--mixed_rate_pct must be one of 0,25,50,100");
+  }
+  if ((a.mixed_rate_pct == 25 || a.mixed_rate_pct == 50) && !(a.mixed_full_rate > 0)) {
+    throw std::runtime_error("--mixed_full_rate is required for the 25/50 token-bucket legs");
   }
   return a;
 }
@@ -708,6 +743,397 @@ int do_churn(const Args &a) {
   return 0;
 }
 
+class TokenBucket {
+ public:
+  explicit TokenBucket(double rate_per_second)
+      : rate_(rate_per_second),
+        capacity_(std::max(1.0, rate_per_second * 0.02)),
+        tokens_(capacity_),
+        last_(std::chrono::steady_clock::now()) {}
+
+  void consume() {
+    if (!(rate_ > 0)) return;
+    for (;;) {
+      std::unique_lock<std::mutex> lock(mutex_);
+      const auto now = std::chrono::steady_clock::now();
+      tokens_ = std::min(capacity_,
+                         tokens_ + std::chrono::duration<double>(now - last_).count() * rate_);
+      last_ = now;
+      if (tokens_ >= 1.0) {
+        tokens_ -= 1.0;
+        return;
+      }
+      const auto wait = std::chrono::duration<double>((1.0 - tokens_) / rate_);
+      lock.unlock();
+      std::this_thread::sleep_for(wait);
+    }
+  }
+
+ private:
+  double rate_;
+  double capacity_;
+  double tokens_;
+  std::chrono::steady_clock::time_point last_;
+  std::mutex mutex_;
+};
+
+struct MixedWorkerMetrics {
+  uint64_t queries = 0;
+  std::vector<uint64_t> latency_ns;
+  std::exception_ptr error;
+};
+
+struct MixedPhaseMetrics {
+  std::string phase;
+  bool maintenance = false;
+  uint64_t eval_watermark = 0;
+  uint64_t query_count = 0;
+  uint64_t hits = 0;
+  uint64_t total = 0;
+  uint64_t inserted = 0;
+  uint64_t seqlock_calls = 0;
+  uint64_t seqlock_retries = 0;
+  uint64_t query_page_reads = 0;
+  double elapsed_s = 0;
+  double query_qps = 0;
+  double p50_us = 0;
+  double p99_us = 0;
+  double recall = 0;
+  double insert_qps = 0;
+};
+
+double percentile_us(std::vector<uint64_t> &latencies, double percentile) {
+  if (latencies.empty()) return 0;
+  std::sort(latencies.begin(), latencies.end());
+  const size_t rank = static_cast<size_t>(
+      std::ceil(percentile * static_cast<double>(latencies.size())));
+  const size_t index = std::min(latencies.size() - 1, std::max<size_t>(1, rank) - 1);
+  return static_cast<double>(latencies[index]) / 1000.0;
+}
+
+std::pair<uint64_t, uint64_t> evaluate_boundary_recall(
+    alaya::laser::QGUpdater &upd,
+    const FloatMatrix &query,
+    const IntMatrix &gt,
+    const Args &a,
+    uint64_t eval_watermark,
+    const std::unordered_set<alaya::laser::PID> &eval_dead) {
+  uint64_t hits = 0;
+  uint64_t total = 0;
+  const int threads = static_cast<int>(a.query_threads);
+#pragma omp parallel for num_threads(threads) schedule(dynamic, 16) reduction(+ : hits, total)
+  for (int64_t raw_qi = 0; raw_qi < static_cast<int64_t>(query.n); ++raw_qi) {
+    const size_t qi = static_cast<size_t>(raw_qi);
+    const std::vector<alaya::laser::PID> result =
+        upd.search(query.row(qi), a.topk, a.mixed_ef);
+    std::vector<alaya::laser::PID> truth;
+    truth.reserve(a.topk);
+    for (uint32_t j = 0; j < gt.dim && truth.size() < a.topk; ++j) {
+      const auto id = static_cast<alaya::laser::PID>(gt.row(qi)[j]);
+      if (id >= eval_watermark || eval_dead.count(id) != 0 ||
+          std::find(truth.begin(), truth.end(), id) != truth.end()) {
+        continue;
+      }
+      truth.push_back(id);
+    }
+    total += truth.size();
+    for (alaya::laser::PID id : truth) {
+      hits += static_cast<uint64_t>(std::find(result.begin(), result.end(), id) != result.end());
+    }
+  }
+  return {hits, total};
+}
+
+MixedPhaseMetrics measure_mixed_phase(
+    const std::string &phase,
+    bool maintenance,
+    alaya::laser::QGUpdater &upd,
+    const FloatMatrix &query,
+    const IntMatrix &gt,
+    const Args &a,
+    const std::unordered_set<alaya::laser::PID> &eval_dead,
+    const std::function<uint64_t()> &work) {
+  std::atomic<bool> start{false};
+  std::atomic<bool> stop{false};
+  std::atomic<uint32_t> ready{0};
+  std::vector<MixedWorkerMetrics> worker(a.query_threads);
+  std::vector<std::thread> threads;
+  threads.reserve(a.query_threads);
+  for (uint32_t tid = 0; tid < a.query_threads; ++tid) {
+    threads.emplace_back([&, tid] {
+      try {
+        ready.fetch_add(1, std::memory_order_release);
+        while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+        uint64_t iteration = 0;
+        auto &local = worker[tid];
+        local.latency_ns.reserve(4096);
+        while (!stop.load(std::memory_order_acquire)) {
+          const size_t qi =
+              (static_cast<size_t>(tid) + iteration * a.query_threads) % query.n;
+          ++iteration;
+          const auto t0 = std::chrono::steady_clock::now();
+          const std::vector<alaya::laser::PID> result =
+              upd.search(query.row(qi), a.topk, a.mixed_ef);
+          (void)result;
+          const auto t1 = std::chrono::steady_clock::now();
+          local.latency_ns.push_back(static_cast<uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+          ++local.queries;
+        }
+      } catch (...) {
+        worker[tid].error = std::current_exception();
+        stop.store(true, std::memory_order_release);
+      }
+    });
+  }
+  while (ready.load(std::memory_order_acquire) != a.query_threads) std::this_thread::yield();
+
+  const alaya::laser::UpdateStats before = upd.stats();
+  const auto phase_start = std::chrono::steady_clock::now();
+  start.store(true, std::memory_order_release);
+  uint64_t inserted = 0;
+  std::exception_ptr work_error;
+  try {
+    inserted = work();
+  } catch (...) {
+    work_error = std::current_exception();
+  }
+  stop.store(true, std::memory_order_release);
+  for (auto &thread : threads) thread.join();
+  const auto phase_end = std::chrono::steady_clock::now();
+  const alaya::laser::UpdateStats after = upd.stats();
+  if (work_error) std::rethrow_exception(work_error);
+  for (const auto &local : worker) {
+    if (local.error) std::rethrow_exception(local.error);
+  }
+
+  // Recall is deliberately not accumulated from the latency window: that
+  // window spans multiple publish watermarks, so either a start or end GT
+  // would score some queries against the wrong live set. Close the workload,
+  // freeze the phase-end published watermark/live mask, then run the same
+  // pool search as a separate boundary evaluation. Its work is excluded from
+  // QPS, latency, and phase seqlock deltas captured above.
+  const uint64_t boundary_watermark = upd.num_points();
+  const auto [boundary_hits, boundary_total] =
+      evaluate_boundary_recall(upd, query, gt, a, boundary_watermark, eval_dead);
+
+  MixedPhaseMetrics out;
+  out.phase = phase;
+  out.maintenance = maintenance;
+  out.eval_watermark = boundary_watermark;
+  out.inserted = inserted;
+  out.elapsed_s = std::chrono::duration<double>(phase_end - phase_start).count();
+  std::vector<uint64_t> latencies;
+  for (auto &local : worker) {
+    out.query_count += local.queries;
+    latencies.insert(latencies.end(), local.latency_ns.begin(), local.latency_ns.end());
+  }
+  out.hits = boundary_hits;
+  out.total = boundary_total;
+  out.query_qps = out.elapsed_s == 0 ? 0 : out.query_count / out.elapsed_s;
+  out.insert_qps = out.elapsed_s == 0 ? 0 : out.inserted / out.elapsed_s;
+  out.recall = out.total == 0 ? 0 : static_cast<double>(out.hits) / out.total;
+  out.p50_us = percentile_us(latencies, 0.50);
+  out.p99_us = percentile_us(latencies, 0.99);
+  out.seqlock_calls = after.query_seqlock_read_calls - before.query_seqlock_read_calls;
+  out.seqlock_retries =
+      after.query_seqlock_read_retries - before.query_seqlock_read_retries;
+  out.query_page_reads = after.query_page_reads - before.query_page_reads;
+  return out;
+}
+
+void write_mixed_csv(const Args &a, const std::vector<MixedPhaseMetrics> &phases) {
+  static constexpr const char *header =
+      "phase,insert_rate_pct,query_threads,insert_threads,eval_watermark,query_count,"
+      "query_qps,query_p50_us,query_p99_us,recall,insert_count,insert_qps,"
+      "maintenance_query_p50_us,maintenance_query_p99_us,seqlock_read_calls,"
+      "seqlock_read_retries,seqlock_retry_rate,query_page_reads,elapsed_s\n";
+  std::ofstream file;
+  std::ostream *out = &std::cout;
+  bool need_header = true;
+  if (!a.csv.empty()) {
+    std::error_code ec;
+    need_header =
+        !std::filesystem::exists(a.csv, ec) || std::filesystem::file_size(a.csv, ec) == 0;
+    file.open(a.csv, std::ios::app);
+    if (!file) throw std::runtime_error("cannot append mixed csv " + a.csv);
+    out = &file;
+  }
+  if (need_header) *out << header;
+  for (const auto &phase : phases) {
+    const double retry_rate =
+        phase.seqlock_calls + phase.seqlock_retries == 0
+            ? 0
+            : static_cast<double>(phase.seqlock_retries) /
+                  static_cast<double>(phase.seqlock_calls + phase.seqlock_retries);
+    *out << phase.phase << ',' << a.mixed_rate_pct << ',' << a.query_threads << ','
+         << a.insert_threads << ',' << phase.eval_watermark << ',' << phase.query_count << ','
+         << phase.query_qps << ',' << phase.p50_us << ',' << phase.p99_us << ','
+         << phase.recall << ',' << phase.inserted << ',' << phase.insert_qps << ','
+         << (phase.maintenance ? phase.p50_us : -1.0) << ','
+         << (phase.maintenance ? phase.p99_us : -1.0) << ',' << phase.seqlock_calls << ','
+         << phase.seqlock_retries << ',' << retry_rate << ',' << phase.query_page_reads << ','
+         << phase.elapsed_s << '\n';
+  }
+  out->flush();
+}
+
+int do_mixed(const Args &a) {
+  FloatMatrix base = read_fbin(a.base);
+  FloatMatrix query = read_fbin(a.query);
+  IntMatrix gt = read_ibin(a.gt);
+  if (query.n == 0 || gt.n != query.n || base.dim != query.dim) {
+    throw std::runtime_error("mixed: base/query/gt shape mismatch");
+  }
+  if (a.from != a.n || a.from + a.count > base.n) {
+    throw std::runtime_error(
+        "mixed: append-only GT mapping requires --from == --n and a valid --count range");
+  }
+  const uint32_t dim = base.dim;
+  const uint32_t main_dim = a.main_dim == 0 ? dim : a.main_dim;
+  alaya::laser::QuantizedGraph qg(a.n, a.R, main_dim, dim);
+  qg.load_disk_index(a.prefix.c_str(), 0.0F);
+
+  alaya::laser::UpdateParams p;
+  p.ef_insert = a.ef_insert;
+  p.alpha = a.alpha;
+  p.prune_pool_cap = a.prune_cap;
+  p.alpha_check_max = a.alpha_check_max;
+  p.evict_telemetry = a.evict_telemetry;
+  if (a.arm == "none")
+    p.backlink_mode = alaya::laser::UpdateParams::Backlink::kNone;
+  else if (a.arm == "evict")
+    p.backlink_mode = alaya::laser::UpdateParams::Backlink::kEvict;
+  else if (a.arm == "exact")
+    p.backlink_mode = alaya::laser::UpdateParams::Backlink::kExactEvict;
+  else if (a.arm == "alpha")
+    p.backlink_mode = alaya::laser::UpdateParams::Backlink::kAlphaEvict;
+  else if (a.arm == "full")
+    p.backlink_mode = alaya::laser::UpdateParams::Backlink::kFullPrune;
+  else
+    throw std::runtime_error("bad --arm " + a.arm);
+  p.max_points = a.n + a.count + 1024;
+  p.direct_io = a.direct != 0;
+  p.write_cache = a.write_cache != 0;
+  p.stage_backlinks = a.stage != 0;
+  p.maintain_indegree = true;
+  alaya::laser::QGUpdater upd(qg, p);
+  upd.init_indegree(a.insert_threads);
+
+  const double target_rate =
+      a.mixed_rate_pct == 25 || a.mixed_rate_pct == 50
+          ? a.mixed_full_rate * static_cast<double>(a.mixed_rate_pct) / 100.0
+          : 0.0;
+  uint64_t source_cursor = a.from;
+  const uint64_t source_end = a.from + a.count;
+  const int insert_threads = static_cast<int>(std::max<size_t>(1, a.insert_threads));
+  const size_t flush_threads = a.flush_threads == 0 ? a.insert_threads : a.flush_threads;
+
+  auto insert_window = [&]() -> uint64_t {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                              std::chrono::duration<double>(a.mixed_seconds));
+    if (a.mixed_rate_pct == 0) {
+      std::this_thread::sleep_until(deadline);
+      return 0;
+    }
+    TokenBucket bucket(target_rate);
+    uint64_t inserted = 0;
+    while (std::chrono::steady_clock::now() < deadline && source_cursor < source_end) {
+      const size_t batch_cap =
+          a.mixed_rate_pct == 100 ? a.batch : std::min<size_t>(a.batch, 512);
+      const uint64_t batch_n = std::min<uint64_t>(batch_cap, source_end - source_cursor);
+      const uint64_t pid_base = upd.allocated_points();
+      if (pid_base != source_cursor) {
+        throw std::runtime_error("mixed: source id/PID mapping diverged");
+      }
+#pragma omp parallel for num_threads(insert_threads) schedule(dynamic)
+      for (int64_t i = 0; i < static_cast<int64_t>(batch_n); ++i) {
+        if (a.mixed_rate_pct != 100) bucket.consume();
+        const uint64_t source = source_cursor + static_cast<uint64_t>(i);
+        upd.insert_with_id(base.row(source),
+                           static_cast<alaya::laser::PID>(pid_base + static_cast<uint64_t>(i)));
+      }
+      upd.flush(flush_threads);
+      upd.publish(pid_base + batch_n);
+      source_cursor += batch_n;
+      inserted += batch_n;
+    }
+    if (std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_until(deadline);
+    return inserted;
+  };
+
+  std::unordered_set<alaya::laser::PID> dead(upd.deleted().begin(), upd.deleted().end());
+  std::vector<MixedPhaseMetrics> phases;
+  phases.push_back(measure_mixed_phase("pure_insert",
+                                       false,
+                                       upd,
+                                       query,
+                                       gt,
+                                       a,
+                                       dead,
+                                       insert_window));
+
+  std::vector<alaya::laser::PID> scheduled_delete;
+  std::unordered_set<alaya::laser::PID> delete_boundary = dead;
+  for (uint64_t i = 0; i < a.tombstone_n; ++i) {
+    const uint64_t raw = a.tombstone_from + i;
+    if (raw >= upd.num_points()) break;
+    const auto id = static_cast<alaya::laser::PID>(raw);
+    if (delete_boundary.insert(id).second) scheduled_delete.push_back(id);
+  }
+  phases.push_back(measure_mixed_phase(
+      "insert_delete",
+      false,
+      upd,
+      query,
+      gt,
+      a,
+      delete_boundary,
+      [&]() -> uint64_t {
+        for (alaya::laser::PID id : scheduled_delete) upd.tombstone(id);
+        dead = delete_boundary;
+        return insert_window();
+      }));
+
+  phases.push_back(measure_mixed_phase(
+      "consolidate",
+      true,
+      upd,
+      query,
+      gt,
+      a,
+      dead,
+      [&]() -> uint64_t {
+        upd.consolidate(a.insert_threads, a.r_target, a.reuse != 0);
+        return 0;
+      }));
+
+  alaya::laser::GardenParams gp;
+  gp.frac = a.garden_frac;
+  gp.ef_maintenance = a.ef_maintenance;
+  gp.pump_budget = a.pump_budget;
+  gp.r_target = a.r_target;
+  if (a.garden_policy == "lowdeg")
+    gp.policy = alaya::laser::GardenParams::Policy::kLowIndegree;
+  else if (a.garden_policy == "random")
+    gp.policy = alaya::laser::GardenParams::Policy::kRandom;
+  else
+    throw std::runtime_error("bad --garden_policy " + a.garden_policy);
+  phases.push_back(measure_mixed_phase(
+      "garden", true, upd, query, gt, a, dead, [&]() -> uint64_t {
+        upd.garden(a.insert_threads, gp);
+        return 0;
+      }));
+
+  upd.checkpoint();
+  write_mixed_csv(a, phases);
+  std::cout << "[mixed] rate_pct=" << a.mixed_rate_pct << " query_threads=" << a.query_threads
+            << " inserted=" << source_cursor - a.from << " final_watermark=" << upd.num_points()
+            << " direct_io=" << (upd.direct_io() ? 1 : 0) << "\n";
+  return 0;
+}
+
 int do_eval(const Args &a) {
   FloatMatrix query = read_fbin(a.query);
   IntMatrix gt = read_ibin(a.gt);
@@ -829,6 +1255,9 @@ int main(int argc, char **argv) {
     }
     if (a.mode == "churn") {
       return do_churn(a);
+    }
+    if (a.mode == "mixed") {
+      return do_mixed(a);
     }
     throw std::runtime_error("unknown mode " + a.mode);
   } catch (const std::exception &e) {
