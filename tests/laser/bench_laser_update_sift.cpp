@@ -1171,6 +1171,48 @@ int do_eval(const Args &a) {
   for (uint32_t ef : a.efs) {
     qg.set_params(ef, a.threads, static_cast<int>(a.beam));
     double best_qps = 0;
+    // Async I/O completion order makes each run's traversal (and its recall at
+    // low ef) nondeterministic — docs §14. Score every timed run and report
+    // the mean in the CSV row; the trailing "# recall_runs" line exposes the
+    // per-run spread. Denominators are identical across runs (fixed mask), so
+    // summing hits/totals over runs yields the mean exactly.
+    uint64_t hits = 0;
+    uint64_t total = 0;
+    uint64_t new_hits = 0;
+    uint64_t new_total = 0;
+    std::array<uint64_t, 3> group_hits{};
+    std::array<uint64_t, 3> group_total{};
+    std::vector<double> run_recalls;
+    const auto score_run = [&]() {
+      uint64_t run_hits = 0;
+      uint64_t run_total = 0;
+      for (size_t qi = 0; qi < query.n; ++qi) {
+        const uint32_t *truth_row = gt.row(qi);
+        std::unordered_set<uint32_t> truth;
+        for (uint32_t j = 0; j < gt.dim && truth.size() < a.topk; ++j) {
+          if (is_live(truth_row[j])) {
+            truth.insert(truth_row[j]);
+          }
+        }
+        run_total += truth.size();
+        if (!query_groups.empty()) group_total[query_groups[qi]] += truth.size();
+        const uint32_t *res_row = results.data() + qi * a.topk;
+        std::unordered_set<uint32_t> res_set(res_row, res_row + a.topk);
+        for (uint32_t t : truth) {
+          const bool hit = res_set.count(t) != 0;
+          run_hits += static_cast<uint64_t>(hit);
+          if (!query_groups.empty()) group_hits[query_groups[qi]] += static_cast<uint64_t>(hit);
+          if (a.new_id_split != 0 && t >= a.new_id_split) {
+            ++new_total;
+            new_hits += static_cast<uint64_t>(hit);
+          }
+        }
+      }
+      hits += run_hits;
+      total += run_total;
+      run_recalls.push_back(
+          run_total == 0 ? 0.0 : static_cast<double>(run_hits) / static_cast<double>(run_total));
+    };
     for (uint32_t r = 0; r < a.runs + 1; ++r) {  // first run = warmup
       auto t0 = std::chrono::steady_clock::now();
       qg.batch_search(query.data.data(), a.topk, results.data(), query.n);
@@ -1178,44 +1220,19 @@ int do_eval(const Args &a) {
       const double secs = std::chrono::duration<double>(t1 - t0).count();
       if (r > 0) {
         best_qps = std::max(best_qps, query.n / secs);
+        score_run();
       }
     }
-    // masked recall on the final run's results
-    uint64_t hits = 0;
-    uint64_t total = 0;
-    uint64_t new_hits = 0;
-    uint64_t new_total = 0;
-    std::array<uint64_t, 3> group_hits{};
-    std::array<uint64_t, 3> group_total{};
-    for (size_t qi = 0; qi < query.n; ++qi) {
-      const uint32_t *truth_row = gt.row(qi);
-      std::unordered_set<uint32_t> truth;
-      for (uint32_t j = 0; j < gt.dim && truth.size() < a.topk; ++j) {
-        if (is_live(truth_row[j])) {
-          truth.insert(truth_row[j]);
-        }
-      }
-      total += truth.size();
-      if (!query_groups.empty()) group_total[query_groups[qi]] += truth.size();
-      const uint32_t *res_row = results.data() + qi * a.topk;
-      std::unordered_set<uint32_t> res_set(res_row, res_row + a.topk);
-      for (uint32_t t : truth) {
-        const bool hit = res_set.count(t) != 0;
-        hits += static_cast<uint64_t>(hit);
-        if (!query_groups.empty()) group_hits[query_groups[qi]] += static_cast<uint64_t>(hit);
-        if (a.new_id_split != 0 && t >= a.new_id_split) {
-          ++new_total;
-          new_hits += static_cast<uint64_t>(hit);
-        }
-      }
-    }
+    if (run_recalls.empty()) score_run();  // --runs 0: score the only pass
     const double recall = total == 0 ? 0.0 : static_cast<double>(hits) / static_cast<double>(total);
     const double mean_us = 1e6 * static_cast<double>(a.threads) / best_qps;
     std::cout << ef << "," << recall << "," << best_qps << "," << mean_us;
     if (a.new_id_split != 0) {
       const double new_recall =
           new_total == 0 ? 0.0 : static_cast<double>(new_hits) / static_cast<double>(new_total);
-      std::cout << ",new_recall=" << new_recall << ",new_total=" << new_total;
+      // new_total stays in per-run units for cross-config sanity checks.
+      std::cout << ",new_recall=" << new_recall
+                << ",new_total=" << new_total / run_recalls.size();
     }
     if (!query_groups.empty()) {
       for (size_t g = 0; g < 3; ++g) {
@@ -1226,6 +1243,11 @@ int do_eval(const Args &a) {
       }
     }
     std::cout << "\n";
+    if (run_recalls.size() > 1) {
+      std::cout << "# recall_runs," << ef;
+      for (const double v : run_recalls) std::cout << "," << v;
+      std::cout << "\n";
+    }
   }
   qg.set_result_filter(nullptr);
   return 0;

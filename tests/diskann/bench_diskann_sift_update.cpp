@@ -1301,7 +1301,11 @@ int main(int argc, char **argv) {
         throw;
       }
     }
-    idx.flush();
+    // A zero-round run mutates nothing; flushing would still rewrite every
+    // sidecar and churn mtimes on a read-only evaluation (§14 discipline note).
+    if (rounds > 0) {
+      idx.flush();
+    }
     std::cout << "[update_bench] wrote " << opt.out_csv << "\n";
     return 0;
   } catch (const std::exception &e) {
