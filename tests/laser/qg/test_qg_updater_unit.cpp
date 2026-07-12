@@ -521,6 +521,98 @@ TEST_F(QGUpdaterIndexTest, WriteCacheCoalescesAndMatchesImmediateWrites) {
       << "single-thread staged drain order is deterministic across cache modes";
 }
 
+TEST_F(QGUpdaterIndexTest, ExactEvictRemovesExactFarthestNeighbor) {
+  const std::string suffix = "_R" + std::to_string(kDeg) + "_MD" + std::to_string(kDim) + ".index";
+  const std::string prefix = (tiny_->dir / "exact_evict").string();
+  for (const std::string &ext :
+       {suffix, suffix + "_rotator", suffix + "_cache_ids", suffix + "_cache_nodes"}) {
+    std::filesystem::copy_file(tiny_->prefix + ext, prefix + ext,
+                               std::filesystem::copy_options::overwrite_existing);
+  }
+  QuantizedGraph qg(kN, kDeg, kDim, kDim);
+  qg.load_disk_index(prefix.c_str(), 0.0F);
+  qg.set_params(64, 1, 4);
+  UpdateParams params;
+  params.ef_insert = 64;
+  params.backlink_mode = UpdateParams::Backlink::kExactEvict;
+  params.max_points = kN + 1;
+  params.write_cache = false;
+  QGUpdater upd(qg, params);
+  const size_t node_len = (32 * kDim + 128 * kDeg + kDeg * kDim) / 8;
+  const size_t npp = std::max<size_t>(1, 4096 / node_len);
+  const size_t page_size = (npp * node_len + kSectorLen - 1) / kSectorLen * kSectorLen;
+  std::vector<std::vector<char>> before(kN);
+  for (PID id = 0; id < kN; ++id) {
+    before[id] = read_node_row(qg, prefix + suffix, id, node_len, page_size, npp);
+  }
+  const auto inserted = make_data(1, kDim, 7781);
+  upd.insert(inserted.data());
+
+  size_t checked = 0;
+  for (PID u = 0; u < kN; ++u) {
+    const auto after = read_node_row(qg, prefix + suffix, u, node_len, page_size, npp);
+    const auto *old_ids = reinterpret_cast<const PID *>(before[u].data() + upd.neighbor_off_bytes());
+    const auto *new_ids = reinterpret_cast<const PID *>(after.data() + upd.neighbor_off_bytes());
+    std::unordered_set<PID> new_set(new_ids, new_ids + kDeg);
+    std::vector<PID> removed;
+    for (size_t j = 0; j < kDeg; ++j) {
+      if (new_set.count(old_ids[j]) == 0) removed.push_back(old_ids[j]);
+    }
+    if (removed.size() != 1 || new_set.count(static_cast<PID>(kN)) == 0) continue;
+    float worst = -1;
+    PID farthest = 0;
+    for (size_t j = 0; j < kDeg; ++j) {
+      const float d = space::l2_sqr(tiny_->data.data() + static_cast<size_t>(u) * kDim,
+                                    tiny_->data.data() + static_cast<size_t>(old_ids[j]) * kDim,
+                                    kDim);
+      if (d > worst) { worst = d; farthest = old_ids[j]; }
+    }
+    EXPECT_EQ(removed[0], farthest) << "target row " << u;
+    ++checked;
+  }
+  EXPECT_EQ(checked, upd.stats().evictions);
+  EXPECT_GT(checked, 0U);
+}
+
+TEST_F(QGUpdaterIndexTest, EvictTelemetryP1MatchesManualReplay) {
+  const std::string suffix = "_R" + std::to_string(kDeg) + "_MD" + std::to_string(kDim) + ".index";
+  const std::string prefix = (tiny_->dir / "evict_tel").string();
+  for (const std::string &ext :
+       {suffix, suffix + "_rotator", suffix + "_cache_ids", suffix + "_cache_nodes"}) {
+    std::filesystem::copy_file(tiny_->prefix + ext, prefix + ext,
+                               std::filesystem::copy_options::overwrite_existing);
+  }
+  QuantizedGraph qg(kN, kDeg, kDim, kDim);
+  qg.load_disk_index(prefix.c_str(), 0.0F);
+  qg.set_params(64, 1, 4);
+  UpdateParams params;
+  params.ef_insert = 64;
+  params.backlink_mode = UpdateParams::Backlink::kEvict;
+  params.evict_telemetry = 1.0;
+  params.max_points = kN + 4;
+  params.write_cache = false;
+  QGUpdater upd(qg, params);
+  const auto inserted = make_data(4, kDim, 99181);
+  for (size_t i = 0; i < 4; ++i) upd.insert(inserted.data() + i * kDim);
+  const UpdateStats s = upd.stats();
+  EXPECT_EQ(s.evict_tel_samples, s.evictions);
+  EXPECT_EQ(std::accumulate(s.evict_tel_regret.begin(), s.evict_tel_regret.end(), uint64_t{0}),
+            s.evict_tel_samples);
+  EXPECT_EQ(s.evict_tel_agree, s.evict_tel_regret[0]);
+  EXPECT_TRUE(std::isfinite(s.evict_tel_relerr_sum));
+}
+
+TEST(QGUpdaterUnit, GroupedRecallArithmetic) {
+  const std::vector<uint64_t> hits{2, 1, 0, 3};
+  const std::vector<uint64_t> totals{2, 2, 4, 4};
+  const std::vector<int> groups{0, 1, 2, 1};
+  const auto recall = grouped_recall(hits, totals, groups);
+  EXPECT_DOUBLE_EQ(recall[0], 1.0);
+  EXPECT_DOUBLE_EQ(recall[1], 4.0 / 6.0);
+  EXPECT_DOUBLE_EQ(recall[2], 0.0);
+  EXPECT_DOUBLE_EQ(grouped_recall({0}, {0}, {0})[1], -1.0);
+}
+
 TEST_F(QGUpdaterIndexTest, GhostSlotDetection) {
   QuantizedGraph qg(kN, kDeg, kDim, kDim);
   qg.load_disk_index(tiny_->prefix.c_str(), 0.0F);

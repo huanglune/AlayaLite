@@ -233,6 +233,10 @@ struct UpdateStats {
   uint64_t degenerate_skips = 0;
   uint64_t full_recomputes = 0;
   uint64_t forced_links = 0;  // inserts whose only backlink came from the force policy
+  uint64_t evict_tel_samples = 0;
+  uint64_t evict_tel_agree = 0;
+  std::array<uint64_t, 4> evict_tel_regret{};  // exact rank: 0, 1, 2, 3+
+  double evict_tel_relerr_sum = 0;
   uint64_t consolidated_rows = 0;
   uint64_t spliced_slots = 0;
   uint64_t ghosted_slots = 0;
@@ -240,6 +244,28 @@ struct UpdateStats {
   uint64_t garden_pump_links = 0;
   uint64_t garden_us = 0;
 };
+
+inline std::array<double, 3> grouped_recall(const std::vector<uint64_t> &query_hits,
+                                            const std::vector<uint64_t> &query_totals,
+                                            const std::vector<int> &groups) {
+  if (query_hits.size() != query_totals.size() || query_hits.size() != groups.size()) {
+    throw std::invalid_argument("grouped_recall: size mismatch");
+  }
+  std::array<uint64_t, 3> hits{};
+  std::array<uint64_t, 3> totals{};
+  for (size_t i = 0; i < groups.size(); ++i) {
+    if (groups[i] < 0 || groups[i] >= 3) {
+      throw std::invalid_argument("grouped_recall: group outside [0,2]");
+    }
+    hits[groups[i]] += query_hits[i];
+    totals[groups[i]] += query_totals[i];
+  }
+  std::array<double, 3> out{};
+  for (size_t g = 0; g < out.size(); ++g) {
+    out[g] = totals[g] == 0 ? -1 : static_cast<double>(hits[g]) / totals[g];
+  }
+  return out;
+}
 
 struct GardenParams {
   double frac = 0.05;
@@ -253,9 +279,10 @@ struct UpdateParams {
   size_t ef_insert = 100;
   float alpha = 1.2F;
   size_t prune_pool_cap = 300;  // candidates fed to RobustPrune
-  enum class Backlink { kNone, kEvict, kAlphaEvict, kFullPrune };
+  enum class Backlink { kNone, kEvict, kExactEvict, kAlphaEvict, kFullPrune };
   Backlink backlink_mode = Backlink::kAlphaEvict;
   size_t alpha_check_max = 16;  // captured neighbors tested per reverse edge
+  double evict_telemetry = 0;   // kEvict decision sampling probability
   size_t max_points = 0;        // page-version table capacity; 0 -> 2*N + 4096
   size_t splice_rerank = 4;     // consolidation: FastScan-recalled candidates reranked exactly
   bool maintain_indegree = false;
@@ -359,6 +386,13 @@ class QGUpdater {
     s.degenerate_skips = stats_.degenerate_skips.load();
     s.full_recomputes = stats_.full_recomputes.load();
     s.forced_links = stats_.forced_links.load();
+    s.evict_tel_samples = stats_.evict_tel_samples.load();
+    s.evict_tel_agree = stats_.evict_tel_agree.load();
+    for (size_t i = 0; i < s.evict_tel_regret.size(); ++i) {
+      s.evict_tel_regret[i] = stats_.evict_tel_regret[i].load();
+    }
+    s.evict_tel_relerr_sum =
+        static_cast<double>(stats_.evict_tel_relerr_nano.load()) / 1e9;
     s.consolidated_rows = stats_.consolidated_rows.load();
     s.spliced_slots = stats_.spliced_slots.load();
     s.ghosted_slots = stats_.ghosted_slots.load();
@@ -716,6 +750,10 @@ class QGUpdater {
     std::atomic<uint64_t> degenerate_skips{0};
     std::atomic<uint64_t> full_recomputes{0};
     std::atomic<uint64_t> forced_links{0};
+    std::atomic<uint64_t> evict_tel_samples{0};
+    std::atomic<uint64_t> evict_tel_agree{0};
+    std::array<std::atomic<uint64_t>, 4> evict_tel_regret{};
+    std::atomic<uint64_t> evict_tel_relerr_nano{0};
     std::atomic<uint64_t> consolidated_rows{0};
     std::atomic<uint64_t> spliced_slots{0};
     std::atomic<uint64_t> ghosted_slots{0};
@@ -1356,6 +1394,10 @@ class QGUpdater {
         }
       }
       bool evicted = false;
+      bool tel_pending = false;
+      bool tel_agree = false;
+      size_t tel_rank = 0;
+      double tel_relerr = 0;
       if (slot == deg_) {
         // Reused per-thread query object: constructing a QGQuery here means an
         // aligned lut_ allocation per evict decision (millions per drain).
@@ -1380,20 +1422,81 @@ class QGUpdater {
                                     reinterpret_cast<const uint8_t *>(row + code_off_bytes()),
                                     fac);
         float worst = -1;
+        size_t estimated_slot = deg_;
         for (size_t j = 0; j < deg_; ++j) {
           if (ids[j] == x_id) {
             return true;  // already linked (shouldn't happen for a fresh id)
           }
           if (appro[j] > worst) {
             worst = appro[j];
-            slot = j;
+            estimated_slot = j;
           }
         }
-        if (!force && est_new >= worst) {
+        slot = estimated_slot;
+
+        const bool exact_mode = params_.backlink_mode == UpdateParams::Backlink::kExactEvict;
+        bool sample = false;
+        if (params_.backlink_mode == UpdateParams::Backlink::kEvict &&
+            params_.evict_telemetry > 0) {
+          thread_local std::mt19937_64 tel_rng(
+              static_cast<uint64_t>(std::random_device{}()) ^
+              static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id())));
+          sample = params_.evict_telemetry >= 1 ||
+                   std::generate_canonical<double, 53>(tel_rng) < params_.evict_telemetry;
+        }
+        std::vector<float> exact;
+        size_t exact_slot = deg_;
+        float exact_worst = -1;
+        if (exact_mode || sample) {
+          exact.resize(deg_);
+          AlignedBuf nb_page(page_size_);
+          for (size_t j = 0; j < deg_; ++j) {
+            read_rmw_page(ids[j], nb_page.data());
+            stats_.patch_page_reads++;
+            const auto *nb_f = reinterpret_cast<const float *>(
+                nb_page.data() + node_offset_in_page(ids[j]));
+            exact[j] = space::l2_sqr(row_f, nb_f, dim_) +
+                       (res_dim_ > 0
+                            ? space::l2_sqr(row_f + dim_, nb_f + dim_, res_dim_)
+                            : 0.0F);
+            if (exact[j] > exact_worst) {
+              exact_worst = exact[j];
+              exact_slot = j;
+            }
+          }
+          if (exact_mode) {
+            slot = exact_slot;
+            worst = exact_worst;
+          }
+        }
+        const float new_distance =
+            exact_mode
+                ? space::l2_sqr(row_f, x_vec, dim_) +
+                      (res_dim_ > 0
+                           ? space::l2_sqr(row_f + dim_, x_vec + dim_, res_dim_)
+                           : 0.0F)
+                : est_new;
+        if (!force && new_distance >= worst) {
           stats_.est_skips++;
           return false;
         }
         evicted = true;
+
+        // Telemetry is committed only for an accepted eviction decision, so
+        // p=1 sample count has the same denominator as evictions.
+        if (sample) {
+          tel_pending = true;
+          tel_agree = estimated_slot == exact_slot;
+          size_t rank = 0;
+          for (size_t j = 0; j < deg_; ++j) {
+            if (exact[j] > exact[estimated_slot]) ++rank;
+          }
+          tel_rank = std::min<size_t>(rank, 3);
+          const double denom = static_cast<double>(exact[estimated_slot]);
+          tel_relerr = denom > 0
+                           ? std::abs(static_cast<double>(appro[estimated_slot]) - denom) / denom
+                           : (appro[estimated_slot] == 0 ? 0.0 : 1.0);
+        }
       }
 
       if (!patch_slot(row, slot, x_id, x_vec, x_res_sqr)) {
@@ -1402,6 +1505,13 @@ class QGUpdater {
       }
       if (evicted) {
         stats_.evictions++;
+        if (tel_pending) {
+          stats_.evict_tel_samples++;
+          if (tel_agree) stats_.evict_tel_agree++;
+          stats_.evict_tel_regret[tel_rank]++;
+          stats_.evict_tel_relerr_nano.fetch_add(
+              static_cast<uint64_t>(std::min(tel_relerr, 1e9) * 1e9));
+        }
       } else {
         stats_.free_slot_fills++;
       }

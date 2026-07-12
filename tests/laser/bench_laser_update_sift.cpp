@@ -31,6 +31,7 @@
 #include <fstream>
 #include <iostream>
 #include <numeric>
+#include <random>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -109,6 +110,51 @@ IntMatrix read_ibin(const std::string &path) {
   return m;
 }
 
+std::vector<int> read_query_groups(const std::string &path, size_t expected) {
+  if (path.empty()) return {};
+  std::ifstream in(path);
+  if (!in) throw std::runtime_error("cannot open " + path);
+  std::vector<int> groups;
+  std::string line;
+  while (std::getline(in, line)) {
+    const auto first = line.find_first_not_of(" \t\r");
+    if (first == std::string::npos || line[first] == '#') continue;
+    std::istringstream row(line);
+    int group = -1;
+    double frac = 0;
+    if (!(row >> group >> frac) || group < 0 || group > 2) {
+      throw std::runtime_error("bad query group row: " + line);
+    }
+    groups.push_back(group);
+  }
+  if (groups.size() != expected) {
+    throw std::runtime_error("query_groups/query count mismatch");
+  }
+  return groups;
+}
+
+double telemetry_p50(const alaya::laser::UpdateStats &s) {
+  if (s.evict_tel_samples == 0) return -1;
+  const uint64_t target = (s.evict_tel_samples + 1) / 2;
+  uint64_t cumulative = 0;
+  for (size_t rank = 0; rank < s.evict_tel_regret.size(); ++rank) {
+    cumulative += s.evict_tel_regret[rank];
+    if (cumulative >= target) return static_cast<double>(rank);
+  }
+  return 3;
+}
+
+void print_telemetry(const alaya::laser::UpdateStats &s) {
+  const double agree = s.evict_tel_samples == 0
+                           ? -1
+                           : static_cast<double>(s.evict_tel_agree) / s.evict_tel_samples;
+  const double relerr = s.evict_tel_samples == 0
+                            ? -1
+                            : s.evict_tel_relerr_sum / s.evict_tel_samples;
+  std::cout << ",tel_agree," << agree << ",tel_regret_p50," << telemetry_p50(s)
+            << ",tel_relerr," << relerr;
+}
+
 void write_fbin(const std::string &path, const float *data, int32_t n, int32_t dim) {
   std::ofstream out(path, std::ios::binary | std::ios::trunc);
   if (!out) {
@@ -123,6 +169,7 @@ void write_fbin(const std::string &path, const float *data, int32_t n, int32_t d
 struct Args {
   std::string mode;
   std::string base, query, gt, prefix;
+  std::string query_groups;
   uint64_t n = 0;
   uint64_t from = 0, count = 0;
   uint64_t live_max = 0;
@@ -141,6 +188,8 @@ struct Args {
   float alpha = 1.2F;
   uint64_t seed = 42;
   std::string arm = "alpha";  // none|evict|alpha|full
+  double evict_telemetry = 0;
+  uint64_t shuffle_seed = 0;
   uint32_t direct = 0;  // 1 = O_DIRECT write fd (P0.1 attribution arm), 0 = buffered (default)
   uint32_t write_cache = 1;  // 0 = immediate per-patch writes (P0.1-era control)
   uint32_t pipeline = 0;     // staged mode only: overlap drain(i) with batch i+1 (2-batch isolation)
@@ -166,6 +215,8 @@ Args parse(int argc, char **argv) {
       a.gt = v;
     else if (k == "--prefix")
       a.prefix = v;
+    else if (k == "--query_groups")
+      a.query_groups = v;
     else if (k == "--n")
       a.n = std::stoull(v);
     else if (k == "--from")
@@ -204,6 +255,10 @@ Args parse(int argc, char **argv) {
       a.prune_cap = std::stoull(v);
     else if (k == "--alpha_check_max")
       a.alpha_check_max = std::stoull(v);
+    else if (k == "--evict_telemetry")
+      a.evict_telemetry = std::stod(v);
+    else if (k == "--shuffle_seed")
+      a.shuffle_seed = std::stoull(v);
     else if (k == "--batch")
       a.batch = std::stoull(v);
     else if (k == "--insert_threads")
@@ -236,7 +291,7 @@ Args parse(int argc, char **argv) {
       a.alpha = std::stof(v);
     else if (k == "--seed")
       a.seed = std::stoull(v);
-    else if (k == "--arm")
+    else if (k == "--arm" || k == "--backlink")
       a.arm = v;
     else if (k == "--efs") {
       a.efs.clear();
@@ -307,10 +362,13 @@ int do_insert(const Args &a) {
   p.alpha = a.alpha;
   p.prune_pool_cap = a.prune_cap;
   p.alpha_check_max = a.alpha_check_max;
+  p.evict_telemetry = a.evict_telemetry;
   if (a.arm == "none")
     p.backlink_mode = alaya::laser::UpdateParams::Backlink::kNone;
   else if (a.arm == "evict")
     p.backlink_mode = alaya::laser::UpdateParams::Backlink::kEvict;
+  else if (a.arm == "exact")
+    p.backlink_mode = alaya::laser::UpdateParams::Backlink::kExactEvict;
   else if (a.arm == "alpha")
     p.backlink_mode = alaya::laser::UpdateParams::Backlink::kAlphaEvict;
   else if (a.arm == "full")
@@ -340,24 +398,31 @@ int do_insert(const Args &a) {
   // filter ids >= snapshot until publish.
   std::future<void> pending;
   uint64_t pending_publish = 0;
+  std::vector<uint64_t> insert_order(a.count);
+  std::iota(insert_order.begin(), insert_order.end(), uint64_t{0});
+  if (a.shuffle_seed != 0) {
+    std::mt19937_64 rng(a.shuffle_seed);
+    std::shuffle(insert_order.begin(), insert_order.end(), rng);
+  }
   for (uint64_t start = 0; start < a.count; start += a.batch) {
     const uint64_t end = std::min(a.count, start + a.batch);
-    const int64_t end_signed = static_cast<int64_t>(end);
+    const int64_t batch_size = static_cast<int64_t>(end - start);
 #pragma omp parallel for num_threads(ins_threads) schedule(dynamic)
-    for (int64_t i = static_cast<int64_t>(start); i < end_signed; ++i) {
+    for (int64_t oi = 0; oi < batch_size; ++oi) {
+      const uint64_t i = insert_order[start + static_cast<size_t>(oi)];
       upd.insert_with_id(base.row(a.from + static_cast<uint64_t>(i)),
                          static_cast<alaya::laser::PID>(a.n + static_cast<uint64_t>(i)));
     }
     if (pending.valid()) {
       pending.get();
-      upd.publish(pending_publish);
+      if (a.shuffle_seed == 0) upd.publish(pending_publish);
     }
     if (a.pipeline != 0) {
       pending = std::async(std::launch::async, [&upd, fl_threads] { upd.flush(fl_threads); });
       pending_publish = a.n + end;
     } else {
       upd.flush(fl_threads);
-      upd.publish(a.n + end);
+      if (a.shuffle_seed == 0) upd.publish(a.n + end);
     }
     if (end / 10000 != start / 10000) {
       auto now = std::chrono::steady_clock::now();
@@ -367,8 +432,9 @@ int do_insert(const Args &a) {
   }
   if (pending.valid()) {
     pending.get();
-    upd.publish(pending_publish);
+    if (a.shuffle_seed == 0) upd.publish(pending_publish);
   }
+  if (a.shuffle_seed != 0) upd.publish(a.n + a.count);
   upd.finalize();
   auto t1 = std::chrono::steady_clock::now();
   const double secs = std::chrono::duration<double>(t1 - t0).count();
@@ -389,6 +455,9 @@ int do_insert(const Args &a) {
             << " alpha_skips=" << s.alpha_skips << " degenerate=" << s.degenerate_skips
             << " full_recomputes=" << s.full_recomputes << " forced_links=" << s.forced_links
             << "\n";
+  std::cout << "round,1,recall,-1";
+  print_telemetry(s);
+  std::cout << "\n";
   return 0;
 }
 
@@ -412,10 +481,14 @@ int do_churn(const Args &a) {
   p.ef_insert = a.ef_insert;
   p.alpha = a.alpha;
   p.prune_pool_cap = a.prune_cap;
+  p.alpha_check_max = a.alpha_check_max;
+  p.evict_telemetry = a.evict_telemetry;
   if (a.arm == "none")
     p.backlink_mode = alaya::laser::UpdateParams::Backlink::kNone;
   else if (a.arm == "evict")
     p.backlink_mode = alaya::laser::UpdateParams::Backlink::kEvict;
+  else if (a.arm == "exact")
+    p.backlink_mode = alaya::laser::UpdateParams::Backlink::kExactEvict;
   else if (a.arm == "alpha")
     p.backlink_mode = alaya::laser::UpdateParams::Backlink::kAlphaEvict;
   else if (a.arm == "full")
@@ -432,6 +505,7 @@ int do_churn(const Args &a) {
   if (a.garden != 0) upd.init_indegree(a.insert_threads);
   std::cout << "[churn] direct_io=" << (upd.direct_io() ? 1 : 0) << "\n";
   std::vector<uint32_t> results(static_cast<size_t>(query.n) * a.topk);
+  const std::vector<int> query_groups = read_query_groups(a.query_groups, query.n);
   const uint32_t ef_eval = a.efs.empty() ? 100 : a.efs[0];
   const int ins_threads = static_cast<int>(std::max<size_t>(1, a.insert_threads));
 
@@ -445,6 +519,8 @@ int do_churn(const Args &a) {
     const double qps = query.n / std::chrono::duration<double>(t1 - t0).count();
     uint64_t hits = 0;
     uint64_t total = 0;
+    std::array<uint64_t, 3> group_hits{};
+    std::array<uint64_t, 3> group_total{};
     for (size_t qi = 0; qi < query.n; ++qi) {
       const uint32_t *truth_row = gt.row(qi);
       std::unordered_set<uint32_t> truth;
@@ -455,10 +531,12 @@ int do_churn(const Args &a) {
         }
       }
       total += truth.size();
+      if (!query_groups.empty()) group_total[query_groups[qi]] += truth.size();
       const uint32_t *res_row = results.data() + qi * a.topk;
       for (uint32_t j = 0; j < a.topk; ++j) {
         if (truth.count(res_row[j]) != 0) {
           ++hits;
+          if (!query_groups.empty()) ++group_hits[query_groups[qi]];
         }
       }
     }
@@ -483,8 +561,17 @@ int do_churn(const Args &a) {
               << ",free_fills," << s.free_slot_fills << ",evictions," << s.evictions
               << ",est_skips," << s.est_skips << ",forced," << s.forced_links
               << ",indeg_p1," << pct(0.01) << ",indeg_p5," << pct(0.05)
-              << ",indeg_p50," << pct(0.50) << "\n"
-              << std::flush;
+              << ",indeg_p50," << pct(0.50);
+    if (!query_groups.empty()) {
+      for (size_t g = 0; g < 3; ++g) {
+        const double value = group_total[g] == 0
+                                 ? -1
+                                 : static_cast<double>(group_hits[g]) / group_total[g];
+        std::cout << ",recall_g" << g << "," << value;
+      }
+    }
+    print_telemetry(s);
+    std::cout << "\n" << std::flush;
   };
 
   std::cout << "[churn] base_n=" << a.n << " rounds=" << a.runs << " count=" << a.count
@@ -523,30 +610,38 @@ int do_churn(const Args &a) {
     const size_t fl_threads = a.flush_threads == 0 ? a.insert_threads : a.flush_threads;
     std::future<void> pending;
     uint64_t pending_publish = 0;
+    std::vector<uint64_t> insert_order(a.count);
+    std::iota(insert_order.begin(), insert_order.end(), uint64_t{0});
+    if (a.shuffle_seed != 0) {
+      std::mt19937_64 rng(a.shuffle_seed + r);
+      std::shuffle(insert_order.begin(), insert_order.end(), rng);
+    }
     for (uint64_t start = 0; start < a.count; start += a.batch) {
       const uint64_t end = std::min(a.count, start + a.batch);
-      const int64_t end_signed = static_cast<int64_t>(end);
+      const int64_t batch_size = static_cast<int64_t>(end - start);
 #pragma omp parallel for num_threads(ins_threads) schedule(dynamic)
-      for (int64_t i = static_cast<int64_t>(start); i < end_signed; ++i) {
+      for (int64_t oi = 0; oi < batch_size; ++oi) {
+        const uint64_t i = insert_order[start + static_cast<size_t>(oi)];
         upd.insert_with_id(base.row(ins_base + static_cast<uint64_t>(i)),
                            static_cast<alaya::laser::PID>(ins_base + static_cast<uint64_t>(i)));
       }
       if (pending.valid()) {
         pending.get();
-        upd.publish(pending_publish);
+        if (a.shuffle_seed == 0) upd.publish(pending_publish);
       }
       if (a.pipeline != 0) {
         pending = std::async(std::launch::async, [&upd, fl_threads] { upd.flush(fl_threads); });
         pending_publish = ins_base + end;
       } else {
         upd.flush(fl_threads);
-        upd.publish(ins_base + end);
+        if (a.shuffle_seed == 0) upd.publish(ins_base + end);
       }
     }
     if (pending.valid()) {
       pending.get();
-      upd.publish(pending_publish);
+      if (a.shuffle_seed == 0) upd.publish(pending_publish);
     }
+    if (a.shuffle_seed != 0) upd.publish(ins_base + a.count);
     auto t1 = std::chrono::steady_clock::now();
     std::cout << "[churn] round " << r + 1
               << " insert_qps=" << a.count / std::chrono::duration<double>(t1 - t0).count()
@@ -568,6 +663,7 @@ int do_eval(const Args &a) {
   const uint32_t dim = query.dim;
   const uint32_t main_dim = a.main_dim == 0 ? dim : a.main_dim;
   const uint64_t live_max = a.live_max == 0 ? a.n : a.live_max;
+  const std::vector<int> query_groups = read_query_groups(a.query_groups, query.n);
 
   std::unordered_set<alaya::laser::PID> dead;
   for (uint64_t i = 0; i < a.tombstone_n; ++i) {
@@ -587,7 +683,9 @@ int do_eval(const Args &a) {
   std::cout << "[eval] n=" << a.n << " live_max=" << live_max << " tombstones=" << dead.size()
             << " queries=" << query.n << " topk=" << a.topk << " threads=" << a.threads
             << " beam=" << a.beam << "\n";
-  std::cout << "ef,recall,qps,mean_us\n";
+  std::cout << "ef,recall,qps,mean_us";
+  if (!query_groups.empty()) std::cout << ",recall_g0,recall_g1,recall_g2";
+  std::cout << "\n";
 
   std::vector<uint32_t> results(static_cast<size_t>(query.n) * a.topk);
   for (uint32_t ef : a.efs) {
@@ -607,6 +705,8 @@ int do_eval(const Args &a) {
     uint64_t total = 0;
     uint64_t new_hits = 0;
     uint64_t new_total = 0;
+    std::array<uint64_t, 3> group_hits{};
+    std::array<uint64_t, 3> group_total{};
     for (size_t qi = 0; qi < query.n; ++qi) {
       const uint32_t *truth_row = gt.row(qi);
       std::unordered_set<uint32_t> truth;
@@ -616,11 +716,13 @@ int do_eval(const Args &a) {
         }
       }
       total += truth.size();
+      if (!query_groups.empty()) group_total[query_groups[qi]] += truth.size();
       const uint32_t *res_row = results.data() + qi * a.topk;
       std::unordered_set<uint32_t> res_set(res_row, res_row + a.topk);
       for (uint32_t t : truth) {
         const bool hit = res_set.count(t) != 0;
         hits += static_cast<uint64_t>(hit);
+        if (!query_groups.empty()) group_hits[query_groups[qi]] += static_cast<uint64_t>(hit);
         if (a.new_id_split != 0 && t >= a.new_id_split) {
           ++new_total;
           new_hits += static_cast<uint64_t>(hit);
@@ -634,6 +736,14 @@ int do_eval(const Args &a) {
       const double new_recall =
           new_total == 0 ? 0.0 : static_cast<double>(new_hits) / static_cast<double>(new_total);
       std::cout << ",new_recall=" << new_recall << ",new_total=" << new_total;
+    }
+    if (!query_groups.empty()) {
+      for (size_t g = 0; g < 3; ++g) {
+        const double value = group_total[g] == 0
+                                 ? -1
+                                 : static_cast<double>(group_hits[g]) / group_total[g];
+        std::cout << "," << value;
+      }
     }
     std::cout << "\n";
   }
