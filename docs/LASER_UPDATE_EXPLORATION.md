@@ -489,3 +489,47 @@ Yi(原版 `~/workspace/alaya-dev/Yi`,SPDK/io_uring 全异步)与其在 AlayaLite
 
 默认值已回翻 buffered(`direct_io=false`);P0.2 进行中(实现已按简报派发 codex,
 DIO flush 模式选型另有并行诊断)。
+
+### 9.2 P0.2 → P0.2b:从批末写回到驻留 buffer pool(2026-07-12)
+
+**第二判决:批末写回两种口味都输,写次数才是敌人。** P0.2 初版(批内脏页缓存、
+批末每唯一页一次写回、flush→publish)写次数 35.8→28.3/插入,但吞吐反降至
+3.4k/s:相位计时显示 flush 21s(buffered+sync_file_range 只有 134k 页/s——
+批末回写与下一批打架)、DIO flush 更慢(70k/s,同步 completion)。inline 基线
+的 287k/s 本质是"写与搜索重叠"的产物,拆成独立相位后怎么写都亏。
+
+**解法 = Yi 的 buffer pool 终局形态(P0.2b)**:缓存跨批驻留
+(`cache_cap_pages` 水位,默认 4GB),回链目标高度偏斜(hub 行),跨批合并把
+物理写压到 **8.6/插入(−4.15×)**,且全部推迟到水位驱逐/consolidate/finalize;
+批内 flush=0。搜索改为**穿透池读**(`read_node_page` overlay,命中 shard 锁内
+memcpy),缓存页变异纳入既有每页 seqlock(改前奇改后偶),批内安全性由快照守卫
+(`cur/nb >= snapshot`)保证;外部进程 reader 的边界仍是 `finalize()+fsync`。
+
+**第三判决:第二个串行点是 glibc 堆伸缩,不是锁也不是设备。** 池化后 drain
+(补丁应用)阶段成为主项且 T32≈T64 不随线程扩展——存在 ~330k patches/s 全局顶
+(v2 inline 的 266k patches/s 是同一个顶,当时被搜索重叠掩盖)。perf 归因:
+每条补丁数次短命对齐分配(Eigen RowMatrix、QGQuery 的 lut/rotate/quantize
+scratch、patch_slot 的 pad/rot/bins)→ glibc memalign 反复 grow/shrink 堆 →
+`mprotect` 压 `mmap_sem`(内核全局)。修复:五处 thread_local scratch +
+`QGQuery::rebind()` 每线程复用 + `EdgePayload` 按 thread_local 引用返回 +
+bench 侧 `mallopt(M_TRIM_THRESHOLD/M_TOP_PAD/M_MMAP_THRESHOLD)`。
+drain 10.9s→4.8s(64T),恢复线程扩展。
+
+**P0 终局数字**(SIFT1M 900k+100k,evict,batch=4096):
+
+| 配置 | inserts/s | 物理写/插入 | 备注 |
+|---|---|---|---|
+| inline 立即写(基线) | 7439 (64T) | 35.8 | 写搜重叠,287k 写/s 顶 |
+| 池化 P0.2b | 7126 (32T) / **8319 (64T)** | **8.6** | 含 finalize 一次性写回;循环净速率 ~10.3k/s |
+| 池化 none 臂 | **20271** (64T) | 1.0 | 搜索侧上限较 buffered 版 +15%(overlay 读) |
+
+质量逐点持平(0.9658@60 / 0.9881@100 / 0.9969@200,new_recall 0.9763@100);
+churn 100% 换血 + consolidation:0.9740(≈v2 0.9748),轮内 QPS 略升。
+单测新增:同页去重断言、缓存开/关文件逐字节一致;laser 全套 11/11。
+
+**下一杠杆**(P0 收尾/P1.5 衔接):drain(4.8s)与下一批搜索(4.9s)目前是
+串行相位——bench 级双批流水(drain(i) 与 batch i+1 搜索重叠,隔离度等效
+batch×2,forced-links 语义有一处批间分裂的小注意点,实测 forced=0 风险可忽略)
+估计可到 ~14k/s;再往上是 P1.5 协程端到端流水线。教训入档:**测并行写路径前
+先划相位计时;"不随线程扩展"优先怀疑全局串行点(本例 mmap_sem),而不是加锁
+粒度。**
