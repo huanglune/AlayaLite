@@ -32,6 +32,10 @@
 
 namespace alaya {
 
+namespace internal::collection {
+class CollectionTestAccess;
+}  // namespace internal::collection
+
 inline constexpr std::string_view kCollectionPublicVersion{"1.1.0"};
 inline constexpr std::string_view kCollectionLegacyRemovalVersion{"1.2.0"};
 
@@ -682,6 +686,8 @@ class Collection {
   }
 
  private:
+  friend class internal::collection::CollectionTestAccess;
+
   inline static constexpr std::uint64_t kActiveSegmentId = 2;
   inline static constexpr std::uint64_t kActiveSegmentGeneration = 1;
   inline static constexpr std::string_view kFacadeNamespace{"collection_facade_v1"};
@@ -1290,8 +1296,6 @@ class Collection {
     if (!status.ok()) {
       return status;
     }
-    fire_seal_failpoint(options, CollectionSealFailPoint::during_export_build);
-
     auto base_manifest = internal::collection::load_manifest_v2_if_present(options_.root);
     if (!base_manifest.ok()) {
       return base_manifest.status();
@@ -1317,6 +1321,11 @@ class Collection {
     publication.collection_features.manifest_v2_writer = true;
     publication.abort_policy =
         internal::collection::ArtifactAbortPolicy::retain_for_restart_cleanup;
+    if (options.fail_point == CollectionSealFailPoint::during_export_build &&
+        options.failpoint_hook) {
+      publication.fail_point =
+          internal::collection::ArtifactTransactionFailPoint::after_staging_write;
+    }
     publication.base_manifest = std::move(base_manifest).value();
     core::BuildContext build_context;
     build_context.growing_reservation = context.build_reservation;
@@ -1332,6 +1341,10 @@ class Collection {
                                                                             build_data.value().rows,
                                                                             publication,
                                                                             build_context);
+    if (options.fail_point == CollectionSealFailPoint::during_export_build &&
+        options.failpoint_hook) {
+      fire_seal_failpoint(options, CollectionSealFailPoint::during_export_build);
+    }
     if (!built.ok()) {
       return built.status();
     }

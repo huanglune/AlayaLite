@@ -17,9 +17,21 @@
 #include <gtest/gtest.h>
 
 #include "alaya/collection.hpp"
+#include "index/collection/sha256.hpp"
 #include "utils/platform.hpp"
 
 namespace alaya {
+namespace internal::collection {
+
+class CollectionTestAccess {
+ public:
+  [[nodiscard]] static auto pin_epoch(const Collection &collection) -> RoutingSnapshotPtr {
+    return collection.implementation_->pin_routing_snapshot();
+  }
+};
+
+}  // namespace internal::collection
+
 namespace {
 
 class TemporaryDirectory {
@@ -312,12 +324,17 @@ TEST(CollectionFacade, FlatCompactPreservesRowsAndGcDeletesOnlyReleasedSources) 
   auto before = collection->search(core::TypedTensorView::contiguous(query.data(), 1, 2), 10);
   ASSERT_TRUE(before.ok()) << before.status().diagnostic();
   std::map<std::string, std::vector<std::byte>> row_bytes;
+  std::map<std::string, std::string> row_sha256;
   for (const auto &record : collection->records().value()) {
     ASSERT_TRUE(record.vector.has_value());
     row_bytes.emplace(id_string(record.logical_id),
                       std::vector<std::byte>(record.vector->bytes().begin(),
                                              record.vector->bytes().end()));
+    row_sha256.emplace(id_string(record.logical_id),
+                       internal::collection::sha256(record.vector->bytes()).hex());
   }
+
+  auto held_epoch = internal::collection::CollectionTestAccess::pin_epoch(*collection);
 
   auto compacted = collection->compact();
   ASSERT_TRUE(compacted.ok()) << compacted.status().diagnostic();
@@ -340,7 +357,17 @@ TEST(CollectionFacade, FlatCompactPreservesRowsAndGcDeletesOnlyReleasedSources) 
     ASSERT_NE(found, row_bytes.end());
     EXPECT_EQ(std::vector<std::byte>(record.vector->bytes().begin(), record.vector->bytes().end()),
               found->second);
+    EXPECT_EQ(internal::collection::sha256(record.vector->bytes()).hex(),
+              row_sha256.at(id_string(record.logical_id)));
   }
+
+  auto deferred = collection->gc();
+  ASSERT_TRUE(deferred.ok()) << deferred.status().diagnostic();
+  EXPECT_EQ(deferred.value().reclaimed, 0U);
+  EXPECT_EQ(deferred.value().deferred, 2U);
+  EXPECT_TRUE(std::filesystem::is_directory(temporary.path() / "segments" / "seg_00000004"));
+  EXPECT_TRUE(std::filesystem::is_directory(temporary.path() / "segments" / "seg_00000006"));
+  held_epoch.reset();
 
   auto reclaimed = collection->gc();
   ASSERT_TRUE(reclaimed.ok()) << reclaimed.status().diagnostic();
@@ -423,9 +450,20 @@ TEST(CollectionFacade, SealFourPointSigkillRecoveryRollsBackOrForward) {
     ASSERT_EQ(::waitpid(child, &child_status, 0), child);
     ASSERT_TRUE(WIFSIGNALED(child_status));
     EXPECT_EQ(WTERMSIG(child_status), SIGKILL);
+    if (failpoint == CollectionSealFailPoint::during_export_build) {
+      const auto staging =
+          root / internal::collection::ArtifactControlPlaneTransaction::kStagingDirectory;
+      ASSERT_TRUE(std::filesystem::is_directory(staging));
+      EXPECT_NE(std::filesystem::directory_iterator(staging),
+                std::filesystem::directory_iterator{});
+    }
 
     auto recovered = Collection::open(root);
     ASSERT_TRUE(recovered.ok()) << recovered.status().diagnostic();
+    if (failpoint == CollectionSealFailPoint::during_export_build) {
+      EXPECT_FALSE(std::filesystem::exists(
+          root / internal::collection::ArtifactControlPlaneTransaction::kStagingDirectory));
+    }
     auto collection = std::move(recovered).value();
     EXPECT_EQ(collection->size(), 3U);
     const std::array<float, 2> successor{3.0F, 0.0F};

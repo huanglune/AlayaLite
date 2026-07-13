@@ -170,7 +170,7 @@ TEST(CollectionFacadeStress, ConcurrentSealSearchAndWritesRouteToSuccessor) {
                           core::StatusDetail::none);
   std::thread sealer([&] {
     CollectionSealOptions seal_options;
-    seal_options.fail_point = CollectionSealFailPoint::during_export_build;
+    seal_options.fail_point = CollectionSealFailPoint::after_successor_switch;
     seal_options.failpoint_hook = [&](CollectionSealFailPoint) {
       successor_online.store(true, std::memory_order_release);
       while (!release_builder.load(std::memory_order_acquire)) {
