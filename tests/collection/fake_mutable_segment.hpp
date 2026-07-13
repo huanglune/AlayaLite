@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -73,8 +74,12 @@ class FakeMutableSegment {
   };
 
   struct Transaction {
-    SegmentMutationPayload payload{};
-    std::array<float, 2> vector{};
+    struct Row {
+      SegmentMutationPayload payload{};
+      std::array<float, 2> vector{};
+    };
+
+    std::vector<Row> rows{};
     bool staged{};
   };
 
@@ -108,32 +113,47 @@ class FakeMutableSegment {
   [[nodiscard]] auto prepare_mutation(const core::OpaqueOperationRequest &request,
                                       core::MutationContext &,
                                       core::MutationToken &token) -> core::Status {
-    if (request.payload == nullptr || request.payload_size < sizeof(SegmentMutationPayload)) {
+    if (request.payload == nullptr) {
       return core::Status::error(core::StatusCode::invalid_argument,
                                  core::OperationStage::mutation_prepare,
                                  core::StatusDetail::malformed_struct,
                                  "fake mutation payload is missing");
     }
-    const auto &payload = *static_cast<const SegmentMutationPayload *>(request.payload);
     Transaction transaction;
-    transaction.payload = payload;
-    if (payload.action == SegmentMutationAction::write) {
-      if (payload.vector.data == nullptr || payload.vector.rows != 1 || payload.vector.dim != 2 ||
-          payload.vector.scalar_type != core::ScalarType::float32) {
-        return core::Status::error(core::StatusCode::invalid_argument,
-                                   core::OperationStage::mutation_prepare,
-                                   core::StatusDetail::malformed_struct,
-                                   "fake write payload tensor is invalid");
+    std::uint64_t transaction_id{};
+    if (request.payload_size == sizeof(SegmentMutationBundlePayload)) {
+      const auto &bundle = *static_cast<const SegmentMutationBundlePayload *>(request.payload);
+      if (!core::is_current_struct(bundle) || bundle.rows.empty()) {
+        return malformed_prepare("fake mutation bundle is invalid");
       }
-      const auto *values = payload.vector.row<float>(0);
-      transaction.vector = {values[0], values[1]};
+      transaction_id = bundle.batch_op_id;
+      transaction.rows.reserve(bundle.rows.size());
+      for (const auto &payload : bundle.rows) {
+        auto row = copy_row(payload);
+        if (!row.ok()) {
+          return row.status();
+        }
+        transaction.rows.push_back(std::move(row).value());
+      }
+    } else if (request.payload_size == sizeof(SegmentMutationPayload)) {
+      const auto &payload = *static_cast<const SegmentMutationPayload *>(request.payload);
+      auto row = copy_row(payload);
+      if (!row.ok()) {
+        return row.status();
+      }
+      transaction_id = payload.op_id;
+      transaction.rows.push_back(std::move(row).value());
+    } else {
+      return malformed_prepare("fake mutation payload size is invalid");
     }
     {
       std::lock_guard lock(mutex_);
-      transactions_.insert_or_assign(payload.op_id, transaction);
-      prepared_op_ids_.push_back(payload.op_id);
+      transactions_.insert_or_assign(transaction_id, transaction);
+      for (const auto &row : transaction.rows) {
+        prepared_op_ids_.push_back(row.payload.op_id);
+      }
     }
-    token.value = payload.op_id;
+    token.value = transaction_id;
     return core::Status::success();
   }
 
@@ -180,16 +200,13 @@ class FakeMutableSegment {
                                  core::StatusDetail::malformed_struct,
                                  "fake mutation was not staged");
     }
-    if (found->second.payload.previous.has_value() &&
-        found->second.payload.previous->segment_id == kSegmentId) {
-      rows_.erase(static_cast<std::uint64_t>(found->second.payload.previous->row_id));
+    if (fail_next_publish_.exchange(false, std::memory_order_acq_rel)) {
+      return core::Status::error(core::StatusCode::internal,
+                                 core::OperationStage::mutation_publish,
+                                 core::StatusDetail::engine_exception,
+                                 "injected fake publish failure");
     }
-    if (found->second.payload.action == SegmentMutationAction::write) {
-      rows_.insert_or_assign(static_cast<std::uint64_t>(found->second.payload.target.row_id),
-                             PublishedRow{found->second.vector,
-                                          found->second.payload.upsert_sequence});
-    }
-    published_op_ids_.push_back(found->second.payload.op_id);
+    apply_rows_locked(found->second.rows);
     transactions_.erase(found);
     active_mutations_.fetch_sub(1, std::memory_order_acq_rel);
     return core::Status::success();
@@ -207,8 +224,50 @@ class FakeMutableSegment {
     return core::Status::success();
   }
 
-  [[nodiscard]] auto replay_mutation(const core::OpaqueOperationRequest &, core::MutationContext &)
+  [[nodiscard]] auto replay_mutation(const core::OpaqueOperationRequest &request,
+                                     core::MutationContext &) -> core::Status {
+    if (request.payload == nullptr) {
+      return malformed_prepare("fake replay payload is missing");
+    }
+    Transaction transaction;
+    std::uint64_t transaction_id{};
+    if (request.payload_size == sizeof(SegmentMutationBundlePayload)) {
+      const auto &bundle = *static_cast<const SegmentMutationBundlePayload *>(request.payload);
+      transaction_id = bundle.batch_op_id;
+      for (const auto &payload : bundle.rows) {
+        auto row = copy_row(payload);
+        if (!row.ok()) {
+          return row.status();
+        }
+        transaction.rows.push_back(std::move(row).value());
+      }
+    } else if (request.payload_size == sizeof(SegmentMutationPayload)) {
+      const auto &payload = *static_cast<const SegmentMutationPayload *>(request.payload);
+      transaction_id = payload.op_id;
+      auto row = copy_row(payload);
+      if (!row.ok()) {
+        return row.status();
+      }
+      transaction.rows.push_back(std::move(row).value());
+    } else {
+      return malformed_prepare("fake replay payload size is invalid");
+    }
+    std::lock_guard lock(mutex_);
+    apply_rows_locked(transaction.rows);
+    const auto found = transactions_.find(transaction_id);
+    if (found != transactions_.end()) {
+      if (found->second.staged) {
+        active_mutations_.fetch_sub(1, std::memory_order_acq_rel);
+      }
+      transactions_.erase(found);
+    }
+    return core::Status::success();
+  }
+
+  [[nodiscard]] auto checkpoint(core::CheckpointContext &, core::CheckpointToken &token)
       -> core::Status {
+    std::lock_guard lock(mutex_);
+    token.value = published_op_ids_.empty() ? 0 : published_op_ids_.back();
     return core::Status::success();
   }
 
@@ -224,6 +283,7 @@ class FakeMutableSegment {
   }
 
   void fail_next_stage() { fail_next_stage_.store(true, std::memory_order_release); }
+  void fail_next_publish() { fail_next_publish_.store(true, std::memory_order_release); }
   void gate_next_stage() { stage_barrier_.enable(); }
   void gate_next_search() { search_barrier_.enable(); }
   [[nodiscard]] auto wait_for_stage() -> bool { return stage_barrier_.wait_until_entered(); }
@@ -240,10 +300,57 @@ class FakeMutableSegment {
     std::lock_guard lock(mutex_);
     return prepared_op_ids_;
   }
+  [[nodiscard]] auto published_op_ids() const -> std::vector<std::uint64_t> {
+    std::lock_guard lock(mutex_);
+    return published_op_ids_;
+  }
 
   static constexpr std::uint64_t kSegmentId = 2;
 
  private:
+  [[nodiscard]] static auto malformed_prepare(std::string diagnostic) -> core::Status {
+    return core::Status::error(core::StatusCode::invalid_argument,
+                               core::OperationStage::mutation_prepare,
+                               core::StatusDetail::malformed_struct,
+                               std::move(diagnostic));
+  }
+
+  [[nodiscard]] static auto copy_row(const SegmentMutationPayload &payload)
+      -> core::Result<Transaction::Row> {
+    if (!core::is_current_struct(payload)) {
+      return malformed_prepare("fake mutation row payload is incompatible");
+    }
+    Transaction::Row row;
+    row.payload = payload;
+    if (payload.action == SegmentMutationAction::write) {
+      if (payload.vector.data == nullptr || payload.vector.rows != 1 || payload.vector.dim != 2 ||
+          payload.vector.scalar_type != core::ScalarType::float32) {
+        return malformed_prepare("fake write payload tensor is invalid");
+      }
+      const auto *values = payload.vector.row<float>(0);
+      row.vector = {values[0], values[1]};
+    }
+    return row;
+  }
+
+  void apply_rows_locked(const std::vector<Transaction::Row> &transaction_rows) {
+    for (const auto &row : transaction_rows) {
+      const auto &payload = row.payload;
+      if (published_op_id_set_.contains(payload.op_id)) {
+        continue;
+      }
+      if (payload.previous.has_value() && payload.previous->segment_id == kSegmentId) {
+        rows_.erase(static_cast<std::uint64_t>(payload.previous->row_id));
+      }
+      if (payload.action == SegmentMutationAction::write) {
+        rows_.insert_or_assign(static_cast<std::uint64_t>(payload.target.row_id),
+                               PublishedRow{row.vector, payload.upsert_sequence});
+      }
+      published_op_ids_.push_back(payload.op_id);
+      published_op_id_set_.insert(payload.op_id);
+    }
+  }
+
   [[nodiscard]] auto execute_search(const core::SearchRequest &request) const -> core::Status {
     search_barrier_.arrive_and_wait();
     std::map<std::uint64_t, PublishedRow> rows;
@@ -301,7 +408,9 @@ class FakeMutableSegment {
   std::map<std::uint64_t, Transaction> transactions_{};
   std::vector<std::uint64_t> prepared_op_ids_{};
   std::vector<std::uint64_t> published_op_ids_{};
+  std::set<std::uint64_t> published_op_id_set_{};
   std::atomic_bool fail_next_stage_{};
+  std::atomic_bool fail_next_publish_{};
   std::atomic_uint64_t abort_count_{};
   std::atomic_uint64_t active_mutations_{};
   std::atomic_uint64_t maximum_active_mutations_{};

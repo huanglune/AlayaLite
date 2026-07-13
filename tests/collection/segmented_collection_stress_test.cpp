@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <thread>
@@ -26,6 +27,7 @@ namespace {
   registration.segment_id = test::FakeMutableSegment::kSegmentId;
   registration.role = SegmentRole::active_mutable;
   registration.segment = std::move(erased).value();
+  registration.atomic_mutation_bundle = true;
   auto opened = SegmentedCollection::open({2, core::Metric::l2, core::ScalarType::float32},
                                           {std::move(registration)});
   EXPECT_TRUE(opened.ok());
@@ -135,6 +137,85 @@ TEST(SegmentedCollectionStress, ConcurrentSearchAndMutationPreserveAdmittedWater
   EXPECT_EQ(producer->maximum_active_mutations(), 1U);
   EXPECT_TRUE(collection->close().ok());
   EXPECT_TRUE(collection->drain().ok());
+}
+
+TEST(SegmentedCollectionStress, DurableCoordinatorSerializesMutationsAndPinsSearchWatermarks) {
+  const auto root =
+      std::filesystem::temp_directory_path() / "alaya-segmented-collection-durable-stress";
+  std::filesystem::remove_all(root);
+  std::shared_ptr<test::FakeMutableSegment> producer = std::make_shared<test::FakeMutableSegment>();
+  auto erased = test::make_fake_mutable_any(producer);
+  ASSERT_TRUE(erased.ok());
+  SegmentRegistration registration;
+  registration.segment_id = test::FakeMutableSegment::kSegmentId;
+  registration.role = SegmentRole::active_mutable;
+  registration.segment = std::move(erased).value();
+  registration.atomic_mutation_bundle = true;
+  CollectionConfig config;
+  config.features.wal_coordinator = true;
+  config.wal.root = root;
+  auto opened = SegmentedCollection::open({2, core::Metric::l2, core::ScalarType::float32},
+                                          {std::move(registration)},
+                                          config);
+  ASSERT_TRUE(opened.ok());
+  auto collection = std::move(opened).value();
+  constexpr std::uint32_t kIterations = 40;
+  std::atomic_bool start{};
+  std::atomic_bool failed{};
+  std::vector<std::thread> threads;
+  for (std::uint32_t writer = 0; writer < 2; ++writer) {
+    threads.emplace_back([&, writer] {
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      for (std::uint32_t iteration = 0; iteration < kIterations; ++iteration) {
+        const std::array<float, 2> vector{static_cast<float>(writer),
+                                          static_cast<float>(iteration)};
+        if (!upsert(collection, "durable-" + std::to_string(writer), vector).ok()) {
+          failed.store(true, std::memory_order_release);
+          return;
+        }
+      }
+    });
+  }
+  for (std::uint32_t reader = 0; reader < 2; ++reader) {
+    threads.emplace_back([&, reader] {
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      std::uint64_t previous{};
+      const std::array<float, 2> query{static_cast<float>(reader), 0.0F};
+      for (std::uint32_t iteration = 0; iteration < kIterations * 2; ++iteration) {
+        core::SearchContext context;
+        CollectionSearchRequest request;
+        request.queries = core::TypedTensorView::contiguous(query.data(), 1, 2);
+        request.options.top_k = 4;
+        request.context = &context;
+        auto result = collection->search(request);
+        if (!result.ok() || result.value().visibility_watermark < previous) {
+          failed.store(true, std::memory_order_release);
+          return;
+        }
+        previous = result.value().visibility_watermark;
+        for (const auto &hit : result.value().queries[0].hits) {
+          if (hit.upsert_sequence > result.value().visibility_watermark) {
+            failed.store(true, std::memory_order_release);
+            return;
+          }
+        }
+      }
+    });
+  }
+  start.store(true, std::memory_order_release);
+  for (auto &thread : threads) {
+    thread.join();
+  }
+  EXPECT_FALSE(failed.load(std::memory_order_acquire));
+  EXPECT_EQ(producer->maximum_active_mutations(), 1U);
+  EXPECT_EQ(collection->stats().visibility_watermark, kIterations * 2U);
+  EXPECT_EQ(collection->stats().durable_watermark, kIterations * 2U);
+  collection.reset();
+  std::filesystem::remove_all(root);
 }
 
 }  // namespace

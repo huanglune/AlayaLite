@@ -171,6 +171,7 @@ class StaticSegment {
   registration.generation = 1;
   registration.role = SegmentRole::active_mutable;
   registration.segment = std::move(erased).value();
+  registration.atomic_mutation_bundle = true;
   return registration;
 }
 

@@ -33,6 +33,18 @@ alaya_add_test(
 )
 
 alaya_cc_target(
+  wal_coordinator_test
+  SRCS wal_coordinator_test.cpp
+  GTEST
+)
+alaya_add_test(
+  NAME wal_coordinator_test
+  TARGET wal_coordinator_test
+  LABELS unit collection persistence wal crash
+  TIMEOUT 120
+)
+
+alaya_cc_target(
   segmented_collection_test
   SRCS segmented_collection_test.cpp
   GTEST
