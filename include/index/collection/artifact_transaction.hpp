@@ -182,6 +182,34 @@ class ArtifactControlPlaneTransaction {
     }
   }
 
+  // Read-only engine path: checksum an already-published native payload and
+  // stage only the manifest-v2 control files. The engine artifacts remain at
+  // their existing paths and are never copied, renamed, or rewritten.
+  [[nodiscard]] auto reference_existing(std::vector<LogicalArtifactSpec> specs) noexcept
+      -> core::Status {
+    if (state_ != State::created) {
+      return invalid_state(core::OperationStage::save,
+                           "artifact transaction can only reference files once");
+    }
+    try {
+      if (!std::filesystem::is_directory(final_payload_)) {
+        return core::Status::error(core::StatusCode::invalid_argument,
+                                   core::OperationStage::save,
+                                   core::StatusDetail::malformed_struct,
+                                   "referenced artifact payload directory does not exist");
+      }
+      auto status = install_specs(std::move(specs), final_payload_);
+      if (!status.ok()) {
+        return status;
+      }
+      reference_existing_payload_ = true;
+      std::filesystem::create_directory(staging_payload_);
+      return core::Status::success();
+    } catch (...) {
+      return core::status_from_exception(core::OperationStage::save);
+    }
+  }
+
   [[nodiscard]] auto prepare(SegmentEntryV2 segment) noexcept -> core::Result<SegmentEntryV2> {
     if (state_ != State::created || bindings_.empty()) {
       return invalid_state(core::OperationStage::save,
@@ -212,7 +240,9 @@ class ArtifactControlPlaneTransaction {
         if (!std::filesystem::exists(binding.absolute_path)) {
           continue;
         }
-        platform::sync_file_or_throw(binding.absolute_path);
+        if (!reference_existing_payload_) {
+          platform::sync_file_or_throw(binding.absolute_path);
+        }
         const auto bytes = std::filesystem::file_size(binding.absolute_path);
         if (bytes > std::numeric_limits<std::uint64_t>::max() - io_bytes) {
           return core::Status::error(core::StatusCode::invalid_argument,
@@ -248,7 +278,7 @@ class ArtifactControlPlaneTransaction {
         return prepared_segment_;
       }
 
-      const auto owned_body = serialize_owned_artifacts(segment);
+      const auto owned_body = serialize_owned_artifacts(segment, reference_existing_payload_);
       const auto owned_path = staging_payload_ / kOwnedArtifactManifestFilename;
       platform::write_all_fsync(owned_path, owned_body.data(), owned_body.size());
       OwnedArtifactV2 owned_manifest;
@@ -268,7 +298,8 @@ class ArtifactControlPlaneTransaction {
 
       const auto ready_body = "version=1\nsegment=" + segment.segment_id +
                               "\ngeneration=" + std::to_string(segment.generation) +
-                              "\nowned_manifest_sha256=" + owned_manifest.digest.hex() + "\n";
+                              "\nowned_manifest_sha256=" + owned_manifest.digest.hex() + "\n" +
+                              (reference_existing_payload_ ? "payload_mode=reference\n" : "");
       const auto ready_path = staging_payload_ / kReadyFilename;
       platform::write_all_fsync(ready_path, ready_body.data(), ready_body.size());
       segment.ready = true;
@@ -308,15 +339,41 @@ class ArtifactControlPlaneTransaction {
     }
     try {
       std::filesystem::create_directories(final_payload_.parent_path());
-      if (std::filesystem::exists(final_payload_)) {
-        return core::Status::error(core::StatusCode::conflict,
-                                   core::OperationStage::save,
-                                   core::StatusDetail::already_exists,
-                                   "artifact publish target already exists");
+      if (reference_existing_payload_) {
+        if (!std::filesystem::is_directory(final_payload_)) {
+          return core::Status::error(core::StatusCode::io_error,
+                                     core::OperationStage::save,
+                                     core::StatusDetail::none,
+                                     "referenced artifact payload disappeared before publish");
+        }
+        if (options_.manifest_v2_writer) {
+          const auto owned_source = staging_payload_ / kOwnedArtifactManifestFilename;
+          const auto ready_source = staging_payload_ / kReadyFilename;
+          const auto owned_target = final_payload_ / kOwnedArtifactManifestFilename;
+          const auto ready_target = final_payload_ / kReadyFilename;
+          if (std::filesystem::exists(owned_target) || std::filesystem::exists(ready_target)) {
+            return core::Status::error(core::StatusCode::conflict,
+                                       core::OperationStage::save,
+                                       core::StatusDetail::already_exists,
+                                       "referenced payload already has manifest-v2 control files");
+          }
+          platform::atomic_replace_no_overwrite(owned_source, owned_target);
+          referenced_owned_manifest_published_ = true;
+          platform::atomic_replace_no_overwrite(ready_source, ready_target);
+          referenced_ready_published_ = true;
+          platform::sync_directory_or_throw(final_payload_);
+        }
+      } else {
+        if (std::filesystem::exists(final_payload_)) {
+          return core::Status::error(core::StatusCode::conflict,
+                                     core::OperationStage::save,
+                                     core::StatusDetail::already_exists,
+                                     "artifact publish target already exists");
+        }
+        platform::atomic_replace_no_overwrite(staging_payload_, final_payload_);
+        payload_published_ = true;
+        platform::sync_directory_or_throw(final_payload_.parent_path());
       }
-      platform::atomic_replace_no_overwrite(staging_payload_, final_payload_);
-      payload_published_ = true;
-      platform::sync_directory_or_throw(final_payload_.parent_path());
       if (options_.fail_point ==
           ArtifactTransactionFailPoint::after_payload_publish_before_manifest) {
         return injected_failure("after payload publish and before manifest publish");
@@ -425,8 +482,19 @@ class ArtifactControlPlaneTransaction {
           if (live_directories.contains(relative)) {
             continue;
           }
-          if (std::filesystem::is_regular_file(entry.path() / kOwnedArtifactManifestFilename) &&
-              std::filesystem::is_regular_file(entry.path() / kReadyFilename)) {
+          const auto owned_path = entry.path() / kOwnedArtifactManifestFilename;
+          const auto ready_path = entry.path() / kReadyFilename;
+          if (std::filesystem::is_regular_file(owned_path)) {
+            const auto owned_body = platform::read_file_prefix(owned_path, 256);
+            if (owned_body.find("payload_mode=reference\n") != std::string::npos) {
+              std::filesystem::remove(owned_path);
+              std::filesystem::remove(ready_path);
+              platform::sync_directory_or_throw(entry.path());
+              continue;
+            }
+          }
+          if (std::filesystem::is_regular_file(owned_path) &&
+              std::filesystem::is_regular_file(ready_path)) {
             std::filesystem::remove_all(entry.path());
           }
         }
@@ -482,7 +550,8 @@ class ArtifactControlPlaneTransaction {
            value.find('\\') == value.npos && value.find('\0') == value.npos;
   }
 
-  [[nodiscard]] auto install_specs(std::vector<LogicalArtifactSpec> specs) -> core::Status {
+  [[nodiscard]] auto install_specs(std::vector<LogicalArtifactSpec> specs,
+                                   const std::filesystem::path &payload_base = {}) -> core::Status {
     if (specs.empty()) {
       return core::Status::error(core::StatusCode::invalid_argument,
                                  core::OperationStage::save,
@@ -506,7 +575,8 @@ class ArtifactControlPlaneTransaction {
                   "logical artifact names/paths must be unique safe relative paths");
       }
       Binding binding;
-      binding.absolute_path = staging_payload_ / spec.relative_path;
+      binding.absolute_path =
+          (payload_base.empty() ? staging_payload_ : payload_base) / spec.relative_path;
       binding.absolute_path_string = binding.absolute_path.string();
       binding.spec = std::move(spec);
       bindings_.push_back(std::move(binding));
@@ -527,12 +597,14 @@ class ArtifactControlPlaneTransaction {
     return core::validate_runtime_control(deadline_, cancellation_, stage);
   }
 
-  [[nodiscard]] static auto serialize_owned_artifacts(const SegmentEntryV2 &segment)
+  [[nodiscard]] static auto serialize_owned_artifacts(const SegmentEntryV2 &segment,
+                                                      bool reference_existing_payload)
       -> std::string {
     std::string body =
         "version=2\nsegment=" + artifact_manifest_v2_detail::encode_string(segment.segment_id) +
-        "\ngeneration=" + std::to_string(segment.generation) +
-        "\nartifacts=" + std::to_string(segment.artifacts.size()) + "\n";
+        "\ngeneration=" + std::to_string(segment.generation) + "\n" +
+        (reference_existing_payload ? std::string("payload_mode=reference\n") : std::string{}) +
+        "artifacts=" + std::to_string(segment.artifacts.size()) + "\n";
     for (std::size_t index = 0; index < segment.artifacts.size(); ++index) {
       const auto &artifact = segment.artifacts[index];
       const auto prefix = "artifact." + std::to_string(index) + ".";
@@ -567,6 +639,15 @@ class ArtifactControlPlaneTransaction {
     std::error_code ec;
     std::filesystem::remove_all(staging_root_, ec);
     std::filesystem::remove(pending_manifest_, ec);
+    if (reference_existing_payload_ && !manifest_published_) {
+      if (referenced_ready_published_) {
+        std::filesystem::remove(final_payload_ / kReadyFilename, ec);
+      }
+      if (referenced_owned_manifest_published_) {
+        std::filesystem::remove(final_payload_ / kOwnedArtifactManifestFilename, ec);
+      }
+      return;
+    }
     if (payload_published_) {
       if (manifest_published_) {
         return;
@@ -589,6 +670,9 @@ class ArtifactControlPlaneTransaction {
   State state_{State::created};
   bool payload_published_{};
   bool manifest_published_{};
+  bool reference_existing_payload_{};
+  bool referenced_owned_manifest_published_{};
+  bool referenced_ready_published_{};
 };
 
 }  // namespace alaya::internal::collection

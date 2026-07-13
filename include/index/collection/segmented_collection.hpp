@@ -800,11 +800,11 @@ class SegmentedCollection {
              hit_index < storage.offsets[index + 1];
              ++hit_index) {
           const auto &hit = storage.hits[static_cast<std::size_t>(hit_index)];
-          if (is_nan_score(hit.score)) {
+          if (hit.score_kind != core::ScoreKind::rank_only && is_nan_score(hit.score)) {
             return core::Status::error(core::StatusCode::internal,
                                        core::OperationStage::search,
                                        core::StatusDetail::invalid_score,
-                                       "segment returned a NaN score");
+                                       "numeric segment returned a NaN score");
           }
           const RowAddress address{entry->segment_id, entry->generation, hit.row_id};
           const auto reverse = snapshot->reverse.find(address);

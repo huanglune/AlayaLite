@@ -57,7 +57,8 @@ struct ManifestReaderOptions {
   bool verify_artifacts{true};
   std::set<std::string> available_features{"manifest_v2",
                                            "disk_flat_segment",
-                                           "disk_vamana_segment"};
+                                           "disk_vamana_segment",
+                                           "disk_laser_segment"};
 };
 
 class CollectionManifestDualReader {
