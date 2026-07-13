@@ -266,3 +266,111 @@ projection.
 |---|---|---|
 | facade and Python binding may be reverted | entry routing may temporarily return to a legacy wrapper | never delete the new reader, coordinator, importer audit, or replay code |
 | internal Segment bodies remain independently revertible because this gate only composes them | no runtime fallback may reopen a PyIndex WAL as a second owner | continue dual-read/import; a switched marker, new WAL, ID map, or manifest rolls forward only |
+
+## Gate 9-B legacy wrapper closeout
+
+Gate 9-B retains the pinned lifecycle from Gate 9-A:
+`V_public="1.1.0"` and `V_remove="1.2.0"`.  Every row below shares one
+process-once entry token across all methods named in its trigger column.  The
+warning is emitted by the outer public wrapper with a literal
+`warnings.warn(..., stacklevel=2)`, so its filename and line number identify
+the caller rather than `_legacy.py` or an implementation module.
+
+| public surface | first-use trigger sharing one token | warning category | exact message | telemetry category |
+|---|---|---|---|---|
+| `alayalite.Index` | constructor or `load`; whichever is first | `AlayaLiteLegacyApiWarning` | `alayalite.Index is a legacy API and will be removed in AlayaLite 1.2.0; use alayalite.Collection instead.` | `index` |
+| `alayalite.DiskCollection` | constructor or `open`; whichever is first | `AlayaLiteLegacyApiWarning` | `alayalite.DiskCollection is a legacy API and will be removed in AlayaLite 1.2.0; use alayalite.Collection instead.` | `disk_collection` |
+| `alayalite.laser.Index` | first `fit`, `from_prefix`, `search`, `batch_search`, or `set_params` call | `AlayaLiteLegacyApiWarning` | `alayalite.laser.Index is a legacy API and will be removed in AlayaLite 1.2.0; use alayalite.Collection instead.` | `laser` |
+| `alayalite.vamana.build_index` | first builder call | `AlayaLiteLegacyApiWarning` | `alayalite.vamana.build_index is a legacy API and will be removed in AlayaLite 1.2.0; use alayalite.Collection instead.` | `vamana` |
+| `Client` index methods | first `list_indices`, `get_index`, `create_index`, `get_or_create_index`, `delete_index`, or `save_index` call | `AlayaLiteLegacyApiWarning` | `alayalite.Client index methods is a legacy API and will be removed in AlayaLite 1.2.0; use collection methods instead.` | `client_index` |
+| `Collection.get_cpp_index()` | first call, independent of the `Index` token | `DeprecationWarning` | `Collection.get_cpp_index() is deprecated and will be removed in AlayaLite 1.2.0; use canonical Collection methods instead. The returned native view is read-only.` | `index` |
+
+Nested implementation calls do not consume or misattribute a second public
+entry.  `Client.create_index` suppresses the nested `Index` boundary after the
+`client_index` warning, and LASER build suppresses the nested Vamana warning
+while retaining the original monkeypatchable public builder seam.  A later
+direct Vamana call still emits its own first-use event.
+
+### Telemetry schema and sink
+
+Each first-use warning atomically creates one schema-v1 record:
+
+| field | value/constraint |
+|---|---|
+| `schema_version` | integer `1` |
+| `event` | `legacy_api_used` |
+| `category` | `index`, `disk_collection`, `laser`, `vamana`, or `client_index` |
+| `caller_file` | warning callsite filename |
+| `caller_line` | warning callsite line number |
+| `removal_version` | `1.2.0` |
+
+The record is retained in process memory and emitted at INFO to the
+`alayalite.legacy` logger with the same structured fields.  It contains no API
+arguments, IDs, vectors, paths passed as data, metadata, documents, or query
+results, and no network sink exists.  The warning/record token is claimed
+under one lock, so concurrent first use still emits once.
+
+### Wrapper routing and compatibility-gate separation
+
+`Index` continues to compute and store through the existing `PyIndex`; the
+outer wrapper does not open another WAL.  `DiskCollection` owns one outer
+Python forwarding object and the same native DiskCollection-v1 instance, so
+all three search conversions and pending semantics remain in their original
+native boundary.  LASER and Vamana forward to their existing implementations.
+Client collection methods remain canonical, while only its index-method set is
+wrapped.  `get_cpp_index()` returns the same cached read-only native view and
+does not gain mutation, RocksDB, or internal-row methods.
+
+| compatibility class | Gate 9-B action | independent retirement rule |
+|---|---|---|
+| API legacy | warning/telemetry wrappers above, removed at `1.2.0` | semver removal after the one-version window |
+| source bridge | native pybind classes, old builders, and model adapters remain | delete only after source consumers migrate |
+| format reader | legacy recovery/import and DiskCollection-v1 readers remain | delete only after inventory, converter, corpus, and reader telemetry gates |
+
+No API-wrapper rollback may reopen a second PyIndex WAL for canonical
+Collection.  Source bridges and format readers are not tied to the API
+removal clock.
+
+### Four-quirk bidirectional golden map
+
+| §7.4 quirk | legacy wrapper assertion | canonical target assertion |
+|---|---|---|
+| memory ID-max padding versus Disk single truncation | `test_index_return_shapes_and_boundaries` locks `uint32` max padding; `test_disk_collection_public_shape_visibility_and_errors` locks list truncation | `test_target_search_truncates_without_id_max_or_any_sentinel` locks paired short hits and valid count |
+| three Disk search shapes and dense sentinels | the Disk golden locks list / `uint64` ndarray / tuple-of-ndarrays, `(N,k)` shapes, `UINT64_MAX` and `NaN` tails, dtypes, and method-specific error text | `test_target_single_and_batch_share_one_short_row_response_schema` locks one flat response schema, offsets, valid counts, paired IDs/distances, and dtypes |
+| WAL owner in PyIndex | the Index golden observes its sole `recovery/wal.bin` after mutation and absence of a canonical WAL | `test_target_cpp_collection_is_the_only_wal_and_scalar_owner` observes only `collection_wal_v1` and no PyIndex WAL/RocksDB owner |
+| Disk pending is unsearchable and excluded from size | the Disk golden locks `add -> size()==0/search==[] -> flush -> size()==3` | `test_target_mutable_add_is_searchable_before_return_and_size_is_live` locks searchable receipts, live size, accepted/pending counts, and bytes |
+
+### §9.11 verification reconciliation
+
+| §9.11 requirement | executable evidence |
+|---|---|
+| Python/C++ parity | `test_collection_canonical.py` direct-native/reopen parity plus the C++ Collection parity tests in the release preset |
+| warning category, stacklevel, once-only, telemetry | `test_legacy_warnings.py` covers all six public surfaces and the structured logger sink |
+| legacy parameters, returns, exceptions | `test_python_api_golden.py`, `test_index_types.py`, the dispatch matrix, and the DiskCollection suites |
+| canonical truncation, response, size/accounting | the four target-half tests in `test_collection_target_golden.py` |
+| algorithm matrix and identity | `test_dispatch_matrix.py`, `test_index_algorithm_identity.py`, and `test_collection_canonical_matrix.py` |
+| wheel/package size | CPython 3.13 Linux wheel is `8,716,176` bytes, `+3,496` from the Gate 9-A `8,712,680`-byte reference; SHA-256 is `4f93d1fe2f40bca3d1f6d5f46b091c52349456347633a8e730bdb7e40a94f88c` |
+| read-only `get_cpp_index()` | existing Collection tests assert `mutable is False` and missing mutation methods; Gate 9-B adds warning callsite/category/once-only assertions |
+
+The final 2026-07-13 execution record is:
+
+| verification lane | result |
+|---|---|
+| release configure/build | `BUILD_PYTHON=ON`, Release build completed |
+| C++ release preset | `117/117` passed |
+| Python default suite | `454 passed, 8 skipped, 51 deselected`; exactly seven passes above the Gate 9-A `447/8` reference |
+| warning/telemetry contract | `7 passed` |
+| legacy algorithm identity | `33 passed, 0 failed` |
+| legacy recovery corpus | `7 passed, 0 failed` |
+| canonical cutover set | `42 passed, 0 failed` |
+| DiskCollection family | `135 passed, 5 skipped` |
+| artifact golden | all 14 families match `artifact-baseline.json` |
+| code generation | generator rerun left the source worktree unchanged |
+| wheel/size map | `build/g9b-wheel/size-map.json` records the `8,716,176`-byte wheel |
+
+### Gate 9-B rollback policy
+
+| code rollback | runtime routing rollback | on-disk policy |
+|---|---|---|
+| the Python wrapper/telemetry and tests are separable commits | an entry may temporarily route to the retained legacy implementation, but canonical Collection must keep its coordinator | retain canonical WAL/importer/read-only-view code and all legacy format readers |
+| no frozen core, graph/disk Segment, or segment-body source changes are part of this gate | warning emission can be disabled only with the whole wrapper rollback, not by opening another owner | switched/imported directories remain roll-forward-only; API removal never implies format-reader removal |
