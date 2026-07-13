@@ -6,6 +6,20 @@ alaya_cc_target(segmented_collection_header_closure SRCS segmented_collection_he
 alaya_cc_target(logical_wal_header_closure SRCS logical_wal_header_closure.cpp)
 alaya_cc_target(mutation_wal_codec_header_closure SRCS mutation_wal_codec_header_closure.cpp)
 alaya_cc_target(collection_checkpoint_header_closure SRCS collection_checkpoint_header_closure.cpp)
+alaya_cc_target(legacy_importer_header_closure SRCS legacy_importer_header_closure.cpp)
+
+alaya_cc_target(
+  legacy_importer_test
+  SRCS legacy_importer_test.cpp
+  GTEST
+  DEFS ALAYA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+)
+alaya_add_test(
+  NAME legacy_importer_test
+  TARGET legacy_importer_test
+  LABELS integration collection persistence migration
+  TIMEOUT 180
+)
 alaya_cc_target(legacy_memory_adapter_header_closure SRCS legacy_memory_adapter_header_closure.cpp)
 alaya_cc_target(legacy_disk_adapter_header_closure SRCS legacy_disk_adapter_header_closure.cpp)
 alaya_cc_target(manifest_v2_header_closure SRCS manifest_v2_header_closure.cpp)
