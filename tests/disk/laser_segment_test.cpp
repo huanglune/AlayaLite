@@ -345,12 +345,75 @@ TEST(LaserSegment, DifferentialRankOnlyManifestGateCollectionRejectionAndPerform
                                                            core::OpenOptions{},
                                                            collection_open_context);
   ASSERT_TRUE(collection_reopened.ok()) << collection_reopened.status().diagnostic();
-  collection_reopened.value().reset();
 
   // A numeric segment plus a rank-only LASER segment with no exact-vector
   // source must take Collection's existing incomparable-domain rejection.
   SearchCall laser_candidates(vectors.data() + 31 * kDim, 1, kTopK, 64);
   ASSERT_TRUE(segment->search(laser_candidates.request).ok());
+
+  // A LASER-only route is valid when Collection is given the exact-vector
+  // seam required to normalize rank-only results. This is deliberately a
+  // separate snapshot from the incomparable mixed request below.
+  auto standalone_any = LaserSegment::into_any(std::move(collection_reopened).value());
+  ASSERT_TRUE(standalone_any.ok()) << standalone_any.status().diagnostic();
+  SegmentRegistration standalone_registration;
+  standalone_registration.segment_id = 3;
+  standalone_registration.role = SegmentRole::sealed;
+  standalone_registration.segment = std::move(standalone_any).value();
+  for (std::size_t index = 0; index < laser_candidates.counts[0]; ++index) {
+    const auto label = static_cast<std::uint64_t>(laser_candidates.hits[index].row_id);
+    standalone_registration.rows.push_back({core::LogicalId::from_legacy_uint64(label),
+                                            core::SegmentRowId(label),
+                                            0,
+                                            VersionState::live,
+                                            {}});
+  }
+  standalone_registration.exact_rerank = [&vectors](const core::TypedTensorView &query,
+                                                     core::SegmentRowId row_id)
+      -> core::Result<float> {
+    const auto label = static_cast<std::uint64_t>(row_id);
+    if (label < 50'000 || (label - 50'000) % 13 != 0 ||
+        (label - 50'000) / 13 >= kCount) {
+      return core::Status::error(core::StatusCode::corruption,
+                                 core::OperationStage::search,
+                                 core::StatusDetail::malformed_struct,
+                                 "LASER label is outside the fixture vector map");
+    }
+    const auto source_row = (label - 50'000) / 13;
+    float distance{};
+    for (std::uint32_t column = 0; column < kDim; ++column) {
+      const auto delta = query.row<float>(0)[column] -
+                         vectors[static_cast<std::size_t>(source_row) * kDim + column];
+      distance += delta * delta;
+    }
+    return distance;
+  };
+  auto standalone =
+      SegmentedCollection::open({kDim, core::Metric::l2, core::ScalarType::float32},
+                                {std::move(standalone_registration)});
+  ASSERT_TRUE(standalone.ok()) << standalone.status().diagnostic();
+  core::SearchContext standalone_context;
+  CollectionSearchRequest standalone_request;
+  standalone_request.queries =
+      core::TypedTensorView::contiguous(vectors.data() + 31 * kDim, 1, kDim);
+  standalone_request.options.top_k = 5;
+  auto standalone_extension =
+      LaserSegment::make_search_extension(laser_candidates.extension_options);
+  standalone_extension.unknown_policy = core::UnknownExtensionPolicy::ignore_safe;
+  standalone_request.options.extensions =
+      std::span<const core::AlgorithmSearchExtension>(&standalone_extension, 1);
+  standalone_request.context = &standalone_context;
+  auto standalone_result = std::move(standalone).value()->search(standalone_request);
+  ASSERT_TRUE(standalone_result.ok()) << standalone_result.status().diagnostic();
+  ASSERT_EQ(standalone_result.value().queries.size(), 1U);
+  ASSERT_TRUE(standalone_result.value().queries[0].status.ok());
+  ASSERT_EQ(standalone_result.value().queries[0].hits.size(), 5U);
+  for (const auto &hit : standalone_result.value().queries[0].hits) {
+    EXPECT_NE(static_cast<std::uint32_t>(hit.result_flags) &
+                  static_cast<std::uint32_t>(core::ResultFlag::exact_reranked),
+              0U);
+  }
+
   std::vector<float> flat_vectors(2 * kDim);
   std::copy_n(vectors.data(), kDim, flat_vectors.data());
   std::copy_n(vectors.data() + kDim, kDim, flat_vectors.data() + kDim);

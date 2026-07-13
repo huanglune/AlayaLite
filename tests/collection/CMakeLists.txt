@@ -54,3 +54,15 @@ alaya_add_test(
   LABELS collection stress tsan
   TIMEOUT 120
 )
+
+alaya_cc_target(
+  heterogeneous_segment_integration_test
+  SRCS heterogeneous_segment_integration_test.cpp
+  GTEST
+)
+alaya_add_test(
+  NAME heterogeneous_segment_integration_test
+  TARGET heterogeneous_segment_integration_test
+  LABELS integration collection disk segment
+  TIMEOUT 180
+)
