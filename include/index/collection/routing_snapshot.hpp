@@ -22,13 +22,15 @@ struct SegmentEntry {
                SegmentRole segment_role,
                core::AnySegment erased_segment,
                ExactRerank rerank,
-               std::uint64_t first_unused_row)
+               std::uint64_t first_unused_row,
+               bool supports_atomic_bundle)
       : segment_id(id),
         generation(segment_generation),
         role(segment_role),
         segment(std::move(erased_segment)),
         exact_rerank(std::move(rerank)),
-        next_row_id(first_unused_row) {}
+        next_row_id(first_unused_row),
+        atomic_mutation_bundle(supports_atomic_bundle) {}
 
   std::uint64_t segment_id{};
   std::uint64_t generation{};
@@ -36,6 +38,7 @@ struct SegmentEntry {
   core::AnySegment segment{};
   ExactRerank exact_rerank{};
   std::atomic_uint64_t next_row_id{};
+  bool atomic_mutation_bundle{};
 
   // Collection uses this lock only when an instance declares a weaker
   // ConcurrencyProfile. It never changes the engine's operation table.
@@ -48,6 +51,7 @@ using ReverseMap = std::map<RowAddress, ReverseEntry>;
 struct RoutingSnapshot {
   std::uint64_t generation{1};
   std::uint64_t visibility_watermark{};
+  std::uint64_t durable_watermark{};
   std::uint64_t metadata_epoch{1};
   std::vector<std::shared_ptr<SegmentEntry>> segments{};
   VersionMap versions{};

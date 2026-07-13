@@ -180,6 +180,10 @@ struct SegmentRegistration {
   std::vector<RegisteredRow> rows{};
   ExactRerank exact_rerank{};
   std::uint64_t next_row_id{};
+  // Collection-internal capability. It does not grow the frozen AnySegment
+  // table: an engine opts into receiving one opaque bundle through the
+  // existing mutation token protocol.
+  bool atomic_mutation_bundle{};
 };
 
 struct CollectionHit {
@@ -234,12 +238,23 @@ struct CollectionRecord {
 
 enum class WriteMode : std::uint8_t { insert_only = 0, upsert = 1, replace = 2 };
 
+enum class WriteDurability : std::uint8_t {
+  searchable = 0,
+  wal_fsync = 1,
+};
+
+struct WriteOptions {
+  WriteDurability durability{WriteDurability::wal_fsync};
+  std::string retry_token{};
+};
+
 struct WriteRequest {
   core::LogicalId logical_id{};
   core::TypedTensorView vector{};
   Metadata metadata{};
   std::string document{};
   WriteMode mode{WriteMode::upsert};
+  WriteOptions options{};
 };
 
 enum class SegmentMutationAction : std::uint8_t { write = 0, erase = 1 };
@@ -258,6 +273,16 @@ struct SegmentMutationPayload {
   SegmentMutationPayload() : header(core::current_struct_header<SegmentMutationPayload>()) {}
 };
 
+struct SegmentMutationBundlePayload {
+  core::VersionedStructHeader header{};
+  std::uint64_t batch_op_id{};
+  std::span<const SegmentMutationPayload> rows{};
+  std::uint64_t reserved[4]{};
+
+  SegmentMutationBundlePayload()
+      : header(core::current_struct_header<SegmentMutationBundlePayload>()) {}
+};
+
 enum class RowMutationStatus : std::uint8_t {
   inserted = 0,
   updated = 1,
@@ -270,14 +295,73 @@ enum class RowMutationStatus : std::uint8_t {
   aborted = 8,
 };
 
-enum class DurabilityState : std::uint8_t { memory_only = 0 };
+enum class DurabilityState : std::uint8_t {
+  memory_only = 0,
+  searchable_not_durable = 1,
+  wal_fsync = 2,
+};
 
 struct MutationReceipt {
+  // op_id remains the row-operation compatibility spelling.
   std::uint64_t op_id{};
+  std::uint64_t batch_op_id{};
+  std::uint64_t row_op_id{};
   std::uint64_t visibility_watermark{};
+  std::uint64_t durable_watermark{};
   bool searchable{};
   DurabilityState durability{DurabilityState::memory_only};
   RowMutationStatus row_status{RowMutationStatus::aborted};
+  std::string retry_token{};
+};
+
+enum class BatchMutationMode : std::uint8_t {
+  per_row_independent = 0,
+  all_or_nothing = 1,
+};
+
+enum class RowMutationAction : std::uint8_t { write = 0, erase = 1 };
+
+struct BatchRowMutation {
+  RowMutationAction action{RowMutationAction::write};
+  core::LogicalId logical_id{};
+  core::TypedTensorView vector{};
+  Metadata metadata{};
+  std::string document{};
+  WriteMode write_mode{WriteMode::upsert};
+  std::string retry_token{};
+};
+
+struct BatchMutationRequest {
+  std::span<const BatchRowMutation> rows{};
+  BatchMutationMode mode{BatchMutationMode::per_row_independent};
+  WriteOptions options{};
+};
+
+struct BatchMutationReceipt {
+  std::uint64_t batch_op_id{};
+  std::uint64_t visibility_watermark{};
+  std::uint64_t durable_watermark{};
+  bool searchable{};
+  DurabilityState durability{DurabilityState::memory_only};
+  std::string retry_token{};
+  std::vector<MutationReceipt> rows{};
+};
+
+enum class MutationFailPoint : std::uint8_t {
+  none = 0,
+  before_prepare = 1,
+  after_prepare = 2,
+  after_stage = 3,
+  after_commit = 4,
+  after_publish = 5,
+  metadata_stage_failure = 6,
+};
+
+struct CheckpointReceipt {
+  std::uint64_t durable_watermark{};
+  std::uint64_t wal_cut{};
+  std::uint64_t metadata_epoch{};
+  std::string checkpoint_name{};
 };
 
 struct CollectionFeatureFlags {
@@ -285,6 +369,7 @@ struct CollectionFeatureFlags {
   bool legacy_memory_adapter{true};
   bool legacy_disk_adapter{true};
   bool experimental_persistence_writer{};
+  bool wal_coordinator{};
   // Roll-forward gate: disabling this bit prevents new manifest-v2
   // publications but never removes the v2 reader.
   bool manifest_v2_writer{};
@@ -295,9 +380,25 @@ struct PersistenceOptions {
   std::string namespace_name{"collection_shell_v1"};
 };
 
+struct WalPersistenceOptions {
+  std::filesystem::path root{};
+  std::string namespace_name{"collection_wal_v1"};
+};
+
+struct CollectionRecoveryOptions {
+  // G7-B may preserve a source op-id range by seeding this lower bound. It is
+  // accepted only as a monotonic floor; WAL/checkpoint/registered versions can
+  // always advance it further.
+  std::uint64_t minimum_next_op_id{1};
+};
+
 struct CollectionConfig {
   CollectionFeatureFlags features{};
   PersistenceOptions persistence{};
+  WalPersistenceOptions wal{};
+  CollectionRecoveryOptions recovery{};
+  MutationFailPoint fail_point{MutationFailPoint::none};
+  std::function<void(MutationFailPoint)> failpoint_hook{};
 };
 
 enum class LifecycleState : std::uint8_t { open = 0, closing = 1, closed = 2 };
@@ -314,6 +415,7 @@ struct CollectionStats {
   core::RowCount tombstone_count{};
   std::uint64_t routing_generation{};
   std::uint64_t visibility_watermark{};
+  std::uint64_t durable_watermark{};
   std::uint64_t metadata_epoch{};
   LifecycleState lifecycle{LifecycleState::open};
 };

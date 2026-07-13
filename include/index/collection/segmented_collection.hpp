@@ -24,6 +24,7 @@
 #include <utility>
 #include <vector>
 
+#include "index/collection/collection_checkpoint.hpp"
 #include "index/collection/experimental_snapshot_writer.hpp"
 
 namespace alaya::internal::collection {
@@ -156,6 +157,12 @@ class SegmentedCollection {
     }
     std::lock_guard mutation_lock(mutation_mutex_);
     auto current = load_snapshot();
+    if (!request.options.retry_token.empty()) {
+      const auto retried = retry_receipts_.find(request.options.retry_token);
+      if (retried != retry_receipts_.end()) {
+        return retried->second;
+      }
+    }
     auto status = validate_logical_id(request.logical_id, core::OperationStage::validation);
     if (!status.ok()) {
       return status;
@@ -201,17 +208,25 @@ class SegmentedCollection {
                          SegmentMutationAction::write,
                          std::move(payload),
                          row_status,
-                         context);
+                         context,
+                         request.options);
   }
 
-  [[nodiscard]] auto erase(const core::LogicalId &logical_id, core::MutationContext &context)
-      -> core::Result<MutationReceipt> {
+  [[nodiscard]] auto erase(const core::LogicalId &logical_id,
+                           core::MutationContext &context,
+                           WriteOptions options = {}) -> core::Result<MutationReceipt> {
     auto admission = admit();
     if (!admission.has_value()) {
       return closed_status(core::OperationStage::admission);
     }
     std::lock_guard mutation_lock(mutation_mutex_);
     auto current = load_snapshot();
+    if (!options.retry_token.empty()) {
+      const auto retried = retry_receipts_.find(options.retry_token);
+      if (retried != retry_receipts_.end()) {
+        return retried->second;
+      }
+    }
     const auto status = validate_logical_id(logical_id, core::OperationStage::validation);
     if (!status.ok()) {
       return status;
@@ -225,7 +240,8 @@ class SegmentedCollection {
                          SegmentMutationAction::erase,
                          found->second.payload,
                          RowMutationStatus::deleted,
-                         context);
+                         context,
+                         options);
   }
 
   [[nodiscard]] auto delete_by_filter(const LogicalFilter &filter, core::MutationContext &context)
@@ -246,8 +262,8 @@ class SegmentedCollection {
     }
 
     // The expansion is deterministic because VersionMap is ordered by canonical
-    // LogicalId bytes. Gate 7 will persist this list in WAL; Gate 4 never
-    // re-evaluates the predicate while applying it.
+    // LogicalId bytes. Each expanded delete is persisted as its own logical
+    // transaction; recovery never re-evaluates the predicate.
     std::vector<MutationReceipt> receipts;
     receipts.reserve(expanded.size());
     for (const auto &logical_id : expanded) {
@@ -261,13 +277,106 @@ class SegmentedCollection {
                                    SegmentMutationAction::erase,
                                    found->second.payload,
                                    RowMutationStatus::deleted,
-                                   context);
+                                   context,
+                                   {});
       if (!receipt.ok()) {
         return receipt.status();
       }
       receipts.push_back(std::move(receipt).value());
     }
     return receipts;
+  }
+
+  [[nodiscard]] auto mutate_batch(const BatchMutationRequest &request,
+                                  core::MutationContext &context)
+      -> core::Result<BatchMutationReceipt> {
+    auto admission = admit();
+    if (!admission.has_value()) {
+      return closed_status(core::OperationStage::admission);
+    }
+    std::lock_guard mutation_lock(mutation_mutex_);
+    if (!request.options.retry_token.empty()) {
+      const auto retried = batch_retry_receipts_.find(request.options.retry_token);
+      if (retried != batch_retry_receipts_.end()) {
+        return retried->second;
+      }
+    }
+    auto current = load_snapshot();
+    if (request.rows.empty()) {
+      BatchMutationReceipt empty;
+      empty.visibility_watermark = current->visibility_watermark;
+      empty.durable_watermark = current->durable_watermark;
+      empty.searchable = true;
+      empty.durability = config_.features.wal_coordinator
+                             ? durability_state(request.options.durability)
+                             : DurabilityState::memory_only;
+      empty.retry_token = request.options.retry_token;
+      auto marker = persist_batch_receipt(empty, request.options.durability);
+      if (!marker.ok()) {
+        return marker;
+      }
+      if (!empty.retry_token.empty()) {
+        batch_retry_receipts_.insert_or_assign(empty.retry_token, empty);
+      }
+      return empty;
+    }
+    if (request.rows.size() > std::numeric_limits<std::uint32_t>::max()) {
+      return core::Status::error(core::StatusCode::invalid_argument,
+                                 core::OperationStage::validation,
+                                 core::StatusDetail::arithmetic_overflow,
+                                 "batch mutation row count exceeds uint32");
+    }
+    const auto batch_op_id = next_op_id_.fetch_add(1, std::memory_order_acq_rel);
+    if (request.mode == BatchMutationMode::all_or_nothing) {
+      return mutate_atomic_batch_locked(std::move(current), request, context, batch_op_id);
+    }
+
+    BatchMutationReceipt batch;
+    batch.batch_op_id = batch_op_id;
+    batch.retry_token = request.options.retry_token;
+    batch.rows.reserve(request.rows.size());
+    for (std::size_t index = 0; index < request.rows.size(); ++index) {
+      auto row_options = request.options;
+      row_options.retry_token = request.rows[index].retry_token;
+      if (row_options.retry_token.empty() && !request.options.retry_token.empty()) {
+        row_options.retry_token = request.options.retry_token + "#" + std::to_string(index);
+      }
+      const auto retried = row_options.retry_token.empty()
+                               ? retry_receipts_.end()
+                               : retry_receipts_.find(row_options.retry_token);
+      if (retried != retry_receipts_.end()) {
+        auto receipt = retried->second;
+        receipt.batch_op_id = batch_op_id;
+        batch.rows.push_back(std::move(receipt));
+        continue;
+      }
+      auto receipt = mutate_batch_row_locked(load_snapshot(),
+                                             request.rows[index],
+                                             context,
+                                             row_options,
+                                             batch_op_id);
+      if (!receipt.ok()) {
+        return receipt.status();
+      }
+      batch.rows.push_back(std::move(receipt).value());
+    }
+    const auto final = load_snapshot();
+    batch.visibility_watermark = final->visibility_watermark;
+    batch.durable_watermark = final->durable_watermark;
+    batch.searchable = std::ranges::any_of(batch.rows, [](const MutationReceipt &row) {
+      return row.searchable;
+    });
+    batch.durability = config_.features.wal_coordinator
+                           ? durability_state(request.options.durability)
+                           : DurabilityState::memory_only;
+    auto marker = persist_batch_receipt(batch, request.options.durability);
+    if (!marker.ok()) {
+      return marker;
+    }
+    if (!batch.retry_token.empty()) {
+      batch_retry_receipts_.insert_or_assign(batch.retry_token, batch);
+    }
+    return batch;
   }
 
   [[nodiscard]] auto retire_segment(std::uint64_t segment_id, std::uint64_t generation)
@@ -311,6 +420,7 @@ class SegmentedCollection {
     if (snapshot != nullptr) {
       result.routing_generation = snapshot->generation;
       result.visibility_watermark = snapshot->visibility_watermark;
+      result.durable_watermark = snapshot->durable_watermark;
       result.metadata_epoch = snapshot->metadata_epoch;
       for (const auto &entry : snapshot->segments) {
         core::SegmentStats segment_stats;
@@ -397,6 +507,71 @@ class SegmentedCollection {
     return ExperimentalSnapshotWriter::write(config_.persistence, *load_snapshot());
   }
 
+  [[nodiscard]] auto checkpoint(core::CheckpointContext &context)
+      -> core::Result<CheckpointReceipt> {
+    std::lock_guard checkpoint_lock(checkpoint_mutex_);
+    auto admission = admit();
+    if (!admission.has_value()) {
+      return closed_status(core::OperationStage::checkpoint);
+    }
+    if (!config_.features.wal_coordinator || wal_ == nullptr) {
+      return core::Status::error(core::StatusCode::not_supported,
+                                 core::OperationStage::checkpoint,
+                                 core::StatusDetail::operation_slot_absent,
+                                 "collection WAL/checkpoint coordinator is disabled");
+    }
+    auto control = core::validate_runtime_control(context.deadline,
+                                                  context.cancellation,
+                                                  core::OperationStage::checkpoint);
+    if (!control.ok()) {
+      return control;
+    }
+    ControlPlaneGate gate(this);
+    control = gate.drain(context.deadline, context.cancellation);
+    if (!control.ok()) {
+      return control;
+    }
+    std::lock_guard mutation_lock(mutation_mutex_);
+    const auto snapshot = load_snapshot();
+    for (const auto &entry : snapshot->segments) {
+      if (entry->role != SegmentRole::active_mutable) {
+        continue;
+      }
+      if (!entry->segment.capabilities().supports(core::OperationCapability::checkpoint)) {
+        return core::Status::error(core::StatusCode::not_supported,
+                                   core::OperationStage::checkpoint,
+                                   core::StatusDetail::operation_slot_absent,
+                                   "active mutable segment lacks full checkpoint capability");
+      }
+      core::CheckpointToken token;
+      auto status = entry->segment.checkpoint(context, token);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    auto stored = CollectionCheckpointStore::write(wal_->directory(),
+                                                   *snapshot,
+                                                   retry_receipts_,
+                                                   batch_retry_receipts_);
+    if (!stored.ok()) {
+      return stored.status();
+    }
+    auto receipt = std::move(stored).value();
+    const auto status = wal_->reset_to_checkpoint(receipt.wal_cut);
+    if (!status.ok()) {
+      return status;
+    }
+    auto durable = std::make_shared<RoutingSnapshot>(*snapshot);
+    durable->durable_watermark = receipt.durable_watermark;
+    publish_snapshot(std::move(durable));
+    return receipt;
+  }
+
+  static void apply_checkpoint_to_manifest(const CheckpointReceipt &checkpoint,
+                                           ArtifactManifestV2 &manifest) {
+    CollectionCheckpointStore::apply_to_manifest(checkpoint, manifest);
+  }
+
   // Internal tests and control-plane code can pin this immutable epoch. The
   // shared reference is the reclamation barrier for every SegmentEntry it owns.
   [[nodiscard]] auto pin_routing_snapshot() const -> RoutingSnapshotPtr { return load_snapshot(); }
@@ -421,22 +596,61 @@ class SegmentedCollection {
     SegmentedCollection *owner_{};
   };
 
+  class ControlPlaneGate {
+   public:
+    explicit ControlPlaneGate(SegmentedCollection *owner) : owner_(owner) {
+      std::lock_guard lock(owner_->lifecycle_mutex_);
+      owner_->control_plane_gate_ = true;
+    }
+    ControlPlaneGate(const ControlPlaneGate &) = delete;
+    auto operator=(const ControlPlaneGate &) -> ControlPlaneGate & = delete;
+    ~ControlPlaneGate() {
+      std::lock_guard lock(owner_->lifecycle_mutex_);
+      owner_->control_plane_gate_ = false;
+      owner_->lifecycle_changed_.notify_all();
+    }
+
+    [[nodiscard]] auto drain(const core::Deadline &deadline,
+                             const core::CancellationToken &cancellation) -> core::Status {
+      std::unique_lock lock(owner_->lifecycle_mutex_);
+      while (owner_->inflight_operations_ != 1) {  // The checkpoint owns the remaining admission.
+        auto control = core::validate_runtime_control(deadline,
+                                                      cancellation,
+                                                      core::OperationStage::checkpoint);
+        if (!control.ok()) {
+          return control;
+        }
+        if (deadline.enabled) {
+          owner_->lifecycle_changed_.wait_for(lock, std::chrono::milliseconds(1));
+        } else {
+          owner_->lifecycle_changed_.wait(lock);
+        }
+      }
+      return core::Status::success();
+    }
+
+   private:
+    SegmentedCollection *owner_{};
+  };
+
   class PendingGuard {
    public:
-    PendingGuard(SegmentedCollection *owner, std::uint64_t bytes) : owner_(owner), bytes_(bytes) {
-      owner_->pending_count_.fetch_add(1, std::memory_order_acq_rel);
+    PendingGuard(SegmentedCollection *owner, std::uint64_t bytes, std::uint64_t rows = 1)
+        : owner_(owner), bytes_(bytes), rows_(rows) {
+      owner_->pending_count_.fetch_add(rows_, std::memory_order_acq_rel);
       owner_->pending_bytes_.fetch_add(bytes_, std::memory_order_acq_rel);
     }
     PendingGuard(const PendingGuard &) = delete;
     auto operator=(const PendingGuard &) -> PendingGuard & = delete;
     ~PendingGuard() {
-      owner_->pending_count_.fetch_sub(1, std::memory_order_acq_rel);
+      owner_->pending_count_.fetch_sub(rows_, std::memory_order_acq_rel);
       owner_->pending_bytes_.fetch_sub(bytes_, std::memory_order_acq_rel);
     }
 
    private:
     SegmentedCollection *owner_{};
     std::uint64_t bytes_{};
+    std::uint64_t rows_{};
   };
 
   class AcceptedGuard {
@@ -586,11 +800,28 @@ class SegmentedCollection {
                                          registration.role,
                                          std::move(registration.segment),
                                          std::move(registration.exact_rerank),
-                                         first_unused));
+                                         first_unused,
+                                         registration.atomic_mutation_bundle));
     }
     recalculate_counts(*snapshot);
     snapshot->visibility_watermark = maximum_sequence;
-    next_op_id_.store(maximum_sequence + 1, std::memory_order_release);
+    snapshot->durable_watermark = 0;
+    if (config_.features.wal_coordinator) {
+      auto opened = CollectionLogicalWal::open(config_.wal.root, config_.wal.namespace_name);
+      if (!opened.ok()) {
+        return opened.status();
+      }
+      wal_ = std::move(opened).value();
+      const auto recovered = recover_durable_state(snapshot);
+      if (!recovered.ok()) {
+        return recovered;
+      }
+    }
+    const auto minimum_next = std::max({maximum_sequence + 1,
+                                        snapshot->visibility_watermark + 1,
+                                        maximum_recovered_op_id_ + 1,
+                                        config_.recovery.minimum_next_op_id});
+    next_op_id_.store(minimum_next, std::memory_order_release);
     accepted_count_.store(snapshot->searchable_live_count, std::memory_order_release);
     publish_snapshot(std::move(snapshot));
     return core::Status::success();
@@ -598,7 +829,7 @@ class SegmentedCollection {
 
   [[nodiscard]] auto admit() -> std::optional<OperationGuard> {
     std::lock_guard lock(lifecycle_mutex_);
-    if (lifecycle_ != LifecycleState::open) {
+    if (lifecycle_ != LifecycleState::open || control_plane_gate_) {
       return std::nullopt;
     }
     ++inflight_operations_;
@@ -608,9 +839,7 @@ class SegmentedCollection {
   void release_admission() {
     std::lock_guard lock(lifecycle_mutex_);
     --inflight_operations_;
-    if (inflight_operations_ == 0) {
-      lifecycle_changed_.notify_all();
-    }
+    lifecycle_changed_.notify_all();
   }
 
   [[nodiscard]] auto search_at_snapshot(const RoutingSnapshotPtr &snapshot,
@@ -926,8 +1155,9 @@ class SegmentedCollection {
                                    SegmentMutationAction action,
                                    RecordPayload payload,
                                    RowMutationStatus row_status,
-                                   core::MutationContext &context)
-      -> core::Result<MutationReceipt> {
+                                   core::MutationContext &context,
+                                   const WriteOptions &options,
+                                   std::uint64_t batch_op_id = 0) -> core::Result<MutationReceipt> {
     auto control = core::validate_runtime_control(context.deadline,
                                                   context.cancellation,
                                                   core::OperationStage::admission);
@@ -942,7 +1172,9 @@ class SegmentedCollection {
                                  "collection has no active mutable segment");
     }
     const auto op_id = next_op_id_.fetch_add(1, std::memory_order_acq_rel);
-    AcceptedGuard accepted(this, row_status);
+    if (batch_op_id == 0) {
+      batch_op_id = op_id;
+    }
     const auto row_value = target->next_row_id.fetch_add(1, std::memory_order_acq_rel);
     if (row_value == std::numeric_limits<std::uint64_t>::max()) {
       return core::Status::error(core::StatusCode::resource_exhausted,
@@ -953,80 +1185,773 @@ class SegmentedCollection {
     const RowAddress address{target->segment_id, target->generation, core::SegmentRowId(row_value)};
     const auto previous = current->versions.find(logical_id);
 
-    SegmentMutationPayload mutation;
-    mutation.action = action;
-    mutation.op_id = op_id;
-    mutation.upsert_sequence = op_id;
-    mutation.target = address;
+    WalMutationTransaction transaction;
+    transaction.batch_op_id = batch_op_id;
+    transaction.batch_mode = BatchMutationMode::per_row_independent;
+    transaction.durability = options.durability;
+    WalMutationRow row;
+    row.op_id = op_id;
+    row.action = action;
+    row.status = row_status;
+    row.logical_id = logical_id;
+    row.target = address;
     if (previous != current->versions.end()) {
-      mutation.previous = previous->second.address;
+      row.previous = previous->second.address;
     }
-    if (action == SegmentMutationAction::write && payload.vector.has_value()) {
-      mutation.vector = payload.vector->view();
+    row.payload = std::move(payload);
+    row.retry_token = options.retry_token;
+    transaction.rows.push_back(std::move(row));
+    auto executed =
+        execute_transaction_locked(std::move(current), target, transaction, context, op_id);
+    if (!executed.ok()) {
+      return executed.status();
     }
-    core::OpaqueOperationRequest opaque;
-    opaque.payload = &mutation;
-    opaque.payload_size = sizeof(mutation);
-    core::MutationContext engine_context = context;
-    engine_context.transaction_token = &mutation;
-    const auto pending_bytes =
-        payload.vector.has_value() ? static_cast<std::uint64_t>(payload.vector->bytes().size()) : 0;
-    PendingGuard pending(this, pending_bytes);
-    core::MutationToken token;
-    bool prepared{};
+    return std::move(executed).value().front();
+  }
 
+  struct ValidatedBatchRow {
+    bool valid{};
+    SegmentMutationAction action{SegmentMutationAction::write};
+    RowMutationStatus status{RowMutationStatus::invalid_argument};
+    RecordPayload payload{};
+    std::optional<RowAddress> previous{};
+  };
+
+  [[nodiscard]] auto validate_batch_row(const RoutingSnapshotPtr &current,
+                                        const BatchRowMutation &row) const -> ValidatedBatchRow {
+    ValidatedBatchRow result;
+    if (!validate_logical_id(row.logical_id, core::OperationStage::validation).ok()) {
+      return result;
+    }
+    const auto found = current->versions.find(row.logical_id);
+    const auto live = found != current->versions.end() && found->second.state == VersionState::live;
+    if (found != current->versions.end()) {
+      result.previous = found->second.address;
+    }
+    if (row.action == RowMutationAction::erase) {
+      result.action = SegmentMutationAction::erase;
+      if (!live) {
+        result.status = RowMutationStatus::not_found;
+        return result;
+      }
+      result.payload = found->second.payload;
+      result.status = RowMutationStatus::deleted;
+      result.valid = true;
+      return result;
+    }
+    auto tensor = core::validate_tensor(row.vector, schema_.dim, core::OperationStage::validation);
+    if (!tensor.ok() || row.vector.rows != 1 || row.vector.scalar_type != schema_.scalar_type) {
+      return result;
+    }
+    if (row.write_mode == WriteMode::insert_only && live) {
+      result.status = RowMutationStatus::already_exists;
+      return result;
+    }
+    if (row.write_mode == WriteMode::replace && !live) {
+      result.status = RowMutationStatus::not_found;
+      return result;
+    }
+    auto owned = OwnedVector::copy_row(row.vector, 0);
+    if (!owned.ok()) {
+      return result;
+    }
+    result.payload.vector = std::move(owned).value();
+    result.payload.metadata = row.metadata;
+    result.payload.document = row.document;
+    result.status = !live                                  ? RowMutationStatus::inserted
+                    : row.write_mode == WriteMode::replace ? RowMutationStatus::replaced
+                                                           : RowMutationStatus::updated;
+    result.valid = true;
+    return result;
+  }
+
+  [[nodiscard]] auto make_non_searchable_receipt(const RoutingSnapshotPtr &current,
+                                                 std::uint64_t batch_op_id,
+                                                 RowMutationStatus status,
+                                                 std::string retry_token) -> MutationReceipt {
+    const auto op_id = next_op_id_.fetch_add(1, std::memory_order_acq_rel);
+    MutationReceipt receipt;
+    receipt.op_id = op_id;
+    receipt.batch_op_id = batch_op_id;
+    receipt.row_op_id = op_id;
+    receipt.visibility_watermark = current->visibility_watermark;
+    receipt.durable_watermark = current->durable_watermark;
+    receipt.searchable = false;
+    receipt.durability = DurabilityState::memory_only;
+    receipt.row_status = status;
+    receipt.retry_token = std::move(retry_token);
+    if (!receipt.retry_token.empty()) {
+      retry_receipts_.insert_or_assign(receipt.retry_token, receipt);
+    }
+    return receipt;
+  }
+
+  [[nodiscard]] auto mutate_batch_row_locked(RoutingSnapshotPtr current,
+                                             const BatchRowMutation &row,
+                                             core::MutationContext &context,
+                                             const WriteOptions &options,
+                                             std::uint64_t batch_op_id)
+      -> core::Result<MutationReceipt> {
+    auto validated = validate_batch_row(current, row);
+    if (!validated.valid) {
+      return make_non_searchable_receipt(current,
+                                         batch_op_id,
+                                         validated.status,
+                                         options.retry_token);
+    }
+    return mutate_locked(std::move(current),
+                         row.logical_id,
+                         validated.action,
+                         std::move(validated.payload),
+                         validated.status,
+                         context,
+                         options,
+                         batch_op_id);
+  }
+
+  [[nodiscard]] auto mutate_atomic_batch_locked(RoutingSnapshotPtr current,
+                                                const BatchMutationRequest &request,
+                                                core::MutationContext &context,
+                                                std::uint64_t batch_op_id)
+      -> core::Result<BatchMutationReceipt> {
+    const auto target = current->find_active_mutable();
+    if (target == nullptr || !target->atomic_mutation_bundle) {
+      return core::Status::error(core::StatusCode::not_supported,
+                                 core::OperationStage::admission,
+                                 core::StatusDetail::operation_slot_absent,
+                                 "active engine does not support an atomic mutation bundle");
+    }
+    std::vector<ValidatedBatchRow> validated;
+    validated.reserve(request.rows.size());
+    std::map<core::LogicalId, std::size_t, LogicalIdLess> first_occurrence;
+    std::optional<std::size_t> failed;
+    RowMutationStatus failed_status{RowMutationStatus::invalid_argument};
+    for (std::size_t index = 0; index < request.rows.size(); ++index) {
+      auto [unused, inserted] = first_occurrence.emplace(request.rows[index].logical_id, index);
+      (void)unused;
+      auto row = validate_batch_row(current, request.rows[index]);
+      if (!inserted) {
+        row.valid = false;
+        row.status = RowMutationStatus::conflict;
+      }
+      if (!row.valid && !failed.has_value()) {
+        failed = index;
+        failed_status = row.status;
+      }
+      validated.push_back(std::move(row));
+    }
+    if (failed.has_value()) {
+      BatchMutationReceipt receipt;
+      receipt.batch_op_id = batch_op_id;
+      receipt.visibility_watermark = current->visibility_watermark;
+      receipt.durable_watermark = current->durable_watermark;
+      receipt.retry_token = request.options.retry_token;
+      receipt.rows.reserve(request.rows.size());
+      for (std::size_t index = 0; index < request.rows.size(); ++index) {
+        auto token = request.rows[index].retry_token;
+        if (token.empty() && !request.options.retry_token.empty()) {
+          token = request.options.retry_token + "#" + std::to_string(index);
+        }
+        receipt.rows.push_back(make_non_searchable_receipt(current,
+                                                           batch_op_id,
+                                                           index == *failed
+                                                               ? failed_status
+                                                               : RowMutationStatus::aborted,
+                                                           std::move(token)));
+      }
+      auto marker = persist_batch_receipt(receipt, request.options.durability);
+      if (!marker.ok()) {
+        return marker;
+      }
+      if (!receipt.retry_token.empty()) {
+        batch_retry_receipts_.insert_or_assign(receipt.retry_token, receipt);
+      }
+      return receipt;
+    }
+
+    WalMutationTransaction transaction;
+    transaction.batch_op_id = batch_op_id;
+    transaction.batch_mode = BatchMutationMode::all_or_nothing;
+    transaction.durability = request.options.durability;
+    transaction.retry_token = request.options.retry_token;
+    transaction.rows.reserve(request.rows.size());
+    for (std::size_t index = 0; index < request.rows.size(); ++index) {
+      const auto row_value = target->next_row_id.fetch_add(1, std::memory_order_acq_rel);
+      if (row_value == std::numeric_limits<std::uint64_t>::max()) {
+        return core::Status::error(core::StatusCode::resource_exhausted,
+                                   core::OperationStage::admission,
+                                   core::StatusDetail::arithmetic_overflow,
+                                   "active segment exhausted its row ID space");
+      }
+      WalMutationRow row;
+      row.op_id = next_op_id_.fetch_add(1, std::memory_order_acq_rel);
+      row.action = validated[index].action;
+      row.status = validated[index].status;
+      row.logical_id = request.rows[index].logical_id;
+      row.target = {target->segment_id, target->generation, core::SegmentRowId(row_value)};
+      row.previous = validated[index].previous;
+      row.payload = std::move(validated[index].payload);
+      row.retry_token = request.rows[index].retry_token;
+      if (row.retry_token.empty() && !request.options.retry_token.empty()) {
+        row.retry_token = request.options.retry_token + "#" + std::to_string(index);
+      }
+      transaction.rows.push_back(std::move(row));
+    }
+    auto executed =
+        execute_transaction_locked(std::move(current), target, transaction, context, batch_op_id);
+    if (!executed.ok()) {
+      if (executed.status().stage() == core::OperationStage::mutation_publish) {
+        return executed.status();
+      }
+      const auto snapshot = load_snapshot();
+      BatchMutationReceipt aborted;
+      aborted.batch_op_id = batch_op_id;
+      aborted.visibility_watermark = snapshot->visibility_watermark;
+      aborted.durable_watermark = snapshot->durable_watermark;
+      aborted.retry_token = request.options.retry_token;
+      for (const auto &row : transaction.rows) {
+        MutationReceipt receipt;
+        receipt.op_id = row.op_id;
+        receipt.batch_op_id = batch_op_id;
+        receipt.row_op_id = row.op_id;
+        receipt.visibility_watermark = snapshot->visibility_watermark;
+        receipt.durable_watermark = snapshot->durable_watermark;
+        receipt.row_status = RowMutationStatus::aborted;
+        receipt.retry_token = row.retry_token;
+        if (!receipt.retry_token.empty()) {
+          retry_receipts_.insert_or_assign(receipt.retry_token, receipt);
+        }
+        aborted.rows.push_back(std::move(receipt));
+      }
+      if (!aborted.retry_token.empty()) {
+        auto marker = persist_batch_receipt(aborted, request.options.durability);
+        if (!marker.ok()) {
+          return marker;
+        }
+        batch_retry_receipts_.insert_or_assign(aborted.retry_token, aborted);
+      }
+      return aborted;
+    }
+    const auto snapshot = load_snapshot();
+    BatchMutationReceipt receipt;
+    receipt.batch_op_id = batch_op_id;
+    receipt.visibility_watermark = snapshot->visibility_watermark;
+    receipt.durable_watermark = snapshot->durable_watermark;
+    receipt.searchable = true;
+    receipt.durability = config_.features.wal_coordinator
+                             ? durability_state(request.options.durability)
+                             : DurabilityState::memory_only;
+    receipt.retry_token = request.options.retry_token;
+    receipt.rows = std::move(executed).value();
+    auto marker = persist_batch_receipt(receipt, request.options.durability);
+    if (!marker.ok()) {
+      return marker;
+    }
+    if (!receipt.retry_token.empty()) {
+      batch_retry_receipts_.insert_or_assign(receipt.retry_token, receipt);
+    }
+    return receipt;
+  }
+
+  [[nodiscard]] static auto durability_state(WriteDurability durability) -> DurabilityState {
+    return durability == WriteDurability::wal_fsync ? DurabilityState::wal_fsync
+                                                    : DurabilityState::searchable_not_durable;
+  }
+
+  [[nodiscard]] auto persist_batch_receipt(const BatchMutationReceipt &receipt,
+                                           WriteDurability durability) -> core::Status {
+    if (wal_ == nullptr || receipt.retry_token.empty()) {
+      return core::Status::success();
+    }
+    try {
+      const auto payload = encode_batch_receipt_marker(receipt);
+      const auto durable = durability == WriteDurability::wal_fsync;
+      return wal_->append(LogicalWalRecordType::publish_marker,
+                          static_cast<std::uint8_t>(0x80U | (durable ? 1U : 0U)),
+                          receipt.batch_op_id,
+                          receipt.batch_op_id,
+                          payload,
+                          durable ? LogicalWalSync::fsync : LogicalWalSync::buffered);
+    } catch (...) {
+      return core::status_from_exception(core::OperationStage::completion);
+    }
+  }
+
+  [[nodiscard]] auto failpoint(MutationFailPoint point) -> bool {
+    if (config_.failpoint_hook) {
+      config_.failpoint_hook(point);
+    }
+    return config_.fail_point == point;
+  }
+
+  [[nodiscard]] static auto injected_failure(MutationFailPoint point) -> core::Status {
+    const auto stage =
+        point == MutationFailPoint::after_commit || point == MutationFailPoint::after_publish
+            ? core::OperationStage::mutation_publish
+        : point == MutationFailPoint::after_stage ||
+                point == MutationFailPoint::metadata_stage_failure
+            ? core::OperationStage::mutation_stage
+            : core::OperationStage::mutation_prepare;
+    return core::Status::error(core::StatusCode::internal,
+                               stage,
+                               core::StatusDetail::engine_exception,
+                               "injected collection mutation failpoint");
+  }
+
+  [[nodiscard]] auto make_engine_payloads(const WalMutationTransaction &transaction)
+      -> std::vector<SegmentMutationPayload> {
+    std::vector<SegmentMutationPayload> payloads;
+    payloads.reserve(transaction.rows.size());
+    for (const auto &row : transaction.rows) {
+      SegmentMutationPayload payload;
+      payload.action = row.action;
+      payload.op_id = row.op_id;
+      payload.upsert_sequence = row.op_id;
+      payload.target = row.target;
+      payload.previous = row.previous;
+      if (row.action == SegmentMutationAction::write && row.payload.vector.has_value()) {
+        payload.vector = row.payload.vector->view();
+      }
+      payloads.push_back(std::move(payload));
+    }
+    return payloads;
+  }
+
+  [[nodiscard]] auto build_dark_snapshot(const RoutingSnapshotPtr &current,
+                                         const WalMutationTransaction &transaction,
+                                         bool durable)
+      -> core::Result<std::shared_ptr<RoutingSnapshot>> {
+    try {
+      auto next = std::make_shared<RoutingSnapshot>(*current);
+      next->generation = current->generation + 1;
+      next->metadata_epoch = current->metadata_epoch + 1;
+      for (const auto &row : transaction.rows) {
+        next->visibility_watermark = std::max(next->visibility_watermark, row.op_id);
+        next->reverse.insert_or_assign(row.target, ReverseEntry{row.logical_id, row.op_id});
+        next->versions.insert_or_assign(row.logical_id,
+                                        VersionEntry{row.target,
+                                                     row.op_id,
+                                                     row.action == SegmentMutationAction::write
+                                                         ? VersionState::live
+                                                         : VersionState::tombstone,
+                                                     row.payload});
+      }
+      if (durable) {
+        next->durable_watermark = next->visibility_watermark;
+      }
+      recalculate_counts(*next);
+      return next;
+    } catch (...) {
+      return core::status_from_exception(core::OperationStage::mutation_stage);
+    }
+  }
+
+  [[nodiscard]] auto execute_transaction_locked(RoutingSnapshotPtr current,
+                                                const std::shared_ptr<SegmentEntry> &target,
+                                                const WalMutationTransaction &transaction,
+                                                core::MutationContext &context,
+                                                std::uint64_t transaction_id)
+      -> core::Result<std::vector<MutationReceipt>> {
+    if (failpoint(MutationFailPoint::before_prepare)) {
+      return injected_failure(MutationFailPoint::before_prepare);
+    }
+    std::vector<std::byte> wal_payload;
+    try {
+      wal_payload = encode_wal_transaction(transaction);
+    } catch (...) {
+      return core::status_from_exception(core::OperationStage::mutation_prepare);
+    }
+    const auto durable =
+        config_.features.wal_coordinator && transaction.durability == WriteDurability::wal_fsync;
+    if (wal_ != nullptr) {
+      auto status = wal_->append(LogicalWalRecordType::prepare,
+                                 durable ? 1U : 0U,
+                                 transaction_id,
+                                 transaction.batch_op_id,
+                                 wal_payload,
+                                 durable ? LogicalWalSync::flush : LogicalWalSync::buffered);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    if (failpoint(MutationFailPoint::after_prepare)) {
+      return injected_failure(MutationFailPoint::after_prepare);
+    }
+
+    auto dark = build_dark_snapshot(current, transaction, durable);
+    if (!dark.ok()) {
+      return dark.status();
+    }
+    auto engine_payloads = make_engine_payloads(transaction);
+    SegmentMutationBundlePayload bundle;
+    bundle.batch_op_id = transaction.batch_op_id;
+    bundle.rows = engine_payloads;
+    core::OpaqueOperationRequest opaque;
+    const auto bundled =
+        transaction.batch_mode == BatchMutationMode::all_or_nothing && transaction.rows.size() > 1;
+    opaque.payload = bundled ? static_cast<const void *>(&bundle)
+                             : static_cast<const void *>(&engine_payloads.front());
+    opaque.payload_size = bundled ? sizeof(bundle) : sizeof(SegmentMutationPayload);
+    core::MutationContext engine_context = context;
+    engine_context.transaction_token = &transaction;
+    std::uint64_t pending_bytes{};
+    for (const auto &row : transaction.rows) {
+      if (row.payload.vector.has_value()) {
+        pending_bytes += row.payload.vector->bytes().size();
+      }
+    }
+    PendingGuard pending(this, pending_bytes, transaction.rows.size());
+    std::vector<std::unique_ptr<AcceptedGuard>> accepted;
+    accepted.reserve(transaction.rows.size());
+    for (const auto &row : transaction.rows) {
+      accepted.push_back(std::make_unique<AcceptedGuard>(this, row.status));
+    }
+    core::MutationToken token;
     const auto capabilities = target->segment.capabilities();
     std::unique_lock<std::shared_mutex> exclusion;
     if (!capabilities.concurrency.search_with_stage ||
         !capabilities.concurrency.search_with_publish) {
       exclusion = std::unique_lock<std::shared_mutex>(target->operation_mutex);
     }
-
     auto status = target->segment.prepare_mutation(opaque, engine_context, token);
     if (!status.ok()) {
       return status;
     }
-    prepared = true;
     status = target->segment.stage_mutation(token, engine_context);
     if (!status.ok()) {
       (void)target->segment.abort_mutation(token, engine_context);
       return status;
     }
-
-    std::shared_ptr<RoutingSnapshot> next;
-    try {
-      next = std::make_shared<RoutingSnapshot>(*current);
-      next->generation = current->generation + 1;
-      next->visibility_watermark = op_id;
-      next->metadata_epoch = current->metadata_epoch + 1;
-      next->reverse.insert_or_assign(address, ReverseEntry{logical_id, op_id});
-      next->versions.insert_or_assign(logical_id,
-                                      VersionEntry{address,
-                                                   op_id,
-                                                   action == SegmentMutationAction::write
-                                                       ? VersionState::live
-                                                       : VersionState::tombstone,
-                                                   std::move(payload)});
-      recalculate_counts(*next);
-    } catch (...) {
-      if (prepared) {
-        (void)target->segment.abort_mutation(token, engine_context);
-      }
-      return core::status_from_exception(core::OperationStage::mutation_stage);
+    if (failpoint(MutationFailPoint::after_stage)) {
+      (void)target->segment.abort_mutation(token, engine_context);
+      return injected_failure(MutationFailPoint::after_stage);
     }
-
+    if (failpoint(MutationFailPoint::metadata_stage_failure)) {
+      (void)target->segment.abort_mutation(token, engine_context);
+      return injected_failure(MutationFailPoint::metadata_stage_failure);
+    }
+    if (wal_ != nullptr) {
+      status = wal_->append(LogicalWalRecordType::commit,
+                            durable ? 1U : 0U,
+                            transaction_id,
+                            transaction.batch_op_id,
+                            {},
+                            durable ? LogicalWalSync::fsync : LogicalWalSync::buffered);
+      if (!status.ok()) {
+        (void)target->segment.abort_mutation(token, engine_context);
+        return status;
+      }
+    }
+    if (failpoint(MutationFailPoint::after_commit)) {
+      return injected_failure(MutationFailPoint::after_commit);
+    }
     status = target->segment.publish_mutation(token, engine_context);
     if (!status.ok()) {
-      (void)target->segment.abort_mutation(token, engine_context);
+      // COMMIT is already authoritative. Recovery must retry publish; aborting
+      // here would incorrectly discard a durable transaction.
       return status;
     }
+    publish_snapshot(std::move(dark).value());
+    for (auto &guard : accepted) {
+      guard->commit();
+    }
+    const auto published = load_snapshot();
+    std::vector<MutationReceipt> receipts;
+    receipts.reserve(transaction.rows.size());
+    for (const auto &row : transaction.rows) {
+      MutationReceipt receipt;
+      receipt.op_id = row.op_id;
+      receipt.batch_op_id = transaction.batch_op_id;
+      receipt.row_op_id = row.op_id;
+      receipt.visibility_watermark = published->visibility_watermark;
+      receipt.durable_watermark = published->durable_watermark;
+      receipt.searchable = true;
+      receipt.durability =
+          wal_ == nullptr ? DurabilityState::memory_only : durability_state(transaction.durability);
+      receipt.row_status = row.status;
+      receipt.retry_token = row.retry_token;
+      if (!receipt.retry_token.empty()) {
+        retry_receipts_.insert_or_assign(receipt.retry_token, receipt);
+      }
+      receipts.push_back(std::move(receipt));
+    }
+    if (wal_ != nullptr) {
+      status = wal_->append(LogicalWalRecordType::publish_marker,
+                            durable ? 1U : 0U,
+                            transaction_id,
+                            transaction.batch_op_id,
+                            {},
+                            durable ? LogicalWalSync::flush : LogicalWalSync::buffered);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    if (failpoint(MutationFailPoint::after_publish)) {
+      return injected_failure(MutationFailPoint::after_publish);
+    }
+    return receipts;
+  }
 
-    // This atomic pointer swap is the Gate 4 visibility linearization point.
-    // There is deliberately no WAL or durability acknowledgement here; Gate 7
-    // inserts COMMIT between dark stage and this publication.
-    publish_snapshot(std::move(next));
-    accepted.commit();
-    return MutationReceipt{op_id, op_id, true, DurabilityState::memory_only, row_status};
+  [[nodiscard]] auto replay_engine_transaction(const WalMutationTransaction &transaction)
+      -> core::Status {
+    if (transaction.rows.empty()) {
+      return core::Status::success();
+    }
+    const auto target =
+        load_or_initializing_snapshot_->find_segment(transaction.rows.front().target.segment_id,
+                                                     transaction.rows.front().target.generation);
+    if (target == nullptr ||
+        !target->segment.capabilities().supports(core::OperationCapability::mutation)) {
+      return core::Status::error(core::StatusCode::corruption,
+                                 core::OperationStage::mutation_replay,
+                                 core::StatusDetail::readonly_instance,
+                                 "committed WAL targets an unavailable mutable segment");
+    }
+    for (const auto &row : transaction.rows) {
+      if (row.target.segment_id != target->segment_id ||
+          row.target.generation != target->generation) {
+        return core::Status::error(core::StatusCode::corruption,
+                                   core::OperationStage::mutation_replay,
+                                   core::StatusDetail::malformed_struct,
+                                   "one WAL transaction targets multiple segment instances");
+      }
+    }
+    auto payloads = make_engine_payloads(transaction);
+    SegmentMutationBundlePayload bundle;
+    bundle.batch_op_id = transaction.batch_op_id;
+    bundle.rows = payloads;
+    const auto bundled =
+        transaction.batch_mode == BatchMutationMode::all_or_nothing && transaction.rows.size() > 1;
+    core::OpaqueOperationRequest opaque;
+    opaque.payload =
+        bundled ? static_cast<const void *>(&bundle) : static_cast<const void *>(&payloads.front());
+    opaque.payload_size = bundled ? sizeof(bundle) : sizeof(SegmentMutationPayload);
+    core::MutationContext context;
+    context.transaction_token = &transaction;
+    return target->segment.replay_mutation(opaque, context);
+  }
+
+  void install_recovered_receipts(const WalMutationTransaction &transaction,
+                                  const RoutingSnapshot &snapshot,
+                                  DurabilityState durability) {
+    BatchMutationReceipt batch;
+    batch.batch_op_id = transaction.batch_op_id;
+    batch.visibility_watermark = snapshot.visibility_watermark;
+    batch.durable_watermark = snapshot.durable_watermark;
+    batch.searchable = true;
+    batch.durability = durability;
+    batch.retry_token = transaction.retry_token;
+    for (const auto &row : transaction.rows) {
+      MutationReceipt receipt;
+      receipt.op_id = row.op_id;
+      receipt.batch_op_id = transaction.batch_op_id;
+      receipt.row_op_id = row.op_id;
+      receipt.visibility_watermark = snapshot.visibility_watermark;
+      receipt.durable_watermark = snapshot.durable_watermark;
+      receipt.searchable = true;
+      receipt.durability = durability;
+      receipt.row_status = row.status;
+      receipt.retry_token = row.retry_token;
+      if (!receipt.retry_token.empty()) {
+        retry_receipts_.insert_or_assign(receipt.retry_token, receipt);
+      }
+      batch.rows.push_back(std::move(receipt));
+    }
+    if (!batch.retry_token.empty()) {
+      batch_retry_receipts_.insert_or_assign(batch.retry_token, std::move(batch));
+    }
+  }
+
+  [[nodiscard]] auto apply_checkpoint_image(std::shared_ptr<RoutingSnapshot> &snapshot,
+                                            CollectionCheckpointImage image) -> core::Status {
+    snapshot->versions.clear();
+    snapshot->reverse.clear();
+    snapshot->generation = image.generation;
+    snapshot->visibility_watermark = image.visibility_watermark;
+    snapshot->durable_watermark = image.durable_watermark;
+    snapshot->metadata_epoch = image.metadata_epoch;
+    for (const auto &row : image.state.rows) {
+      const auto target = snapshot->find_segment(row.target.segment_id, row.target.generation);
+      if (target == nullptr) {
+        return core::Status::error(core::StatusCode::corruption,
+                                   core::OperationStage::open,
+                                   core::StatusDetail::malformed_struct,
+                                   "checkpoint targets an unregistered segment instance");
+      }
+      snapshot->reverse.insert_or_assign(row.target, ReverseEntry{row.logical_id, row.op_id});
+      snapshot->versions.insert_or_assign(row.logical_id,
+                                          VersionEntry{row.target,
+                                                       row.op_id,
+                                                       row.action == SegmentMutationAction::write
+                                                           ? VersionState::live
+                                                           : VersionState::tombstone,
+                                                       row.payload});
+      const auto row_id = static_cast<std::uint64_t>(row.target.row_id);
+      if (row_id != std::numeric_limits<std::uint64_t>::max()) {
+        auto current = target->next_row_id.load(std::memory_order_acquire);
+        while (current <= row_id &&
+               !target->next_row_id.compare_exchange_weak(current,
+                                                          row_id + 1,
+                                                          std::memory_order_acq_rel)) {
+        }
+      }
+      maximum_recovered_op_id_ = std::max(maximum_recovered_op_id_, row.op_id);
+    }
+    recalculate_counts(*snapshot);
+    retry_receipts_ = std::move(image.retry_receipts);
+    batch_retry_receipts_ = std::move(image.batch_retry_receipts);
+    // A fresh fake/engine instance rebuilds its current mutable view through
+    // the idempotent replay seam; a persistent engine treats this as a no-op.
+    load_or_initializing_snapshot_ = snapshot;
+    for (const auto &row : image.state.rows) {
+      const auto target = snapshot->find_segment(row.target.segment_id, row.target.generation);
+      if (target != nullptr && target->role == SegmentRole::active_mutable) {
+        WalMutationTransaction single;
+        single.batch_op_id = row.op_id;
+        single.batch_mode = BatchMutationMode::per_row_independent;
+        single.durability = WriteDurability::wal_fsync;
+        single.rows.push_back(row);
+        const auto status = replay_engine_transaction(single);
+        if (!status.ok()) {
+          return status;
+        }
+      }
+    }
+    return core::Status::success();
+  }
+
+  [[nodiscard]] auto recover_durable_state(std::shared_ptr<RoutingSnapshot> &snapshot)
+      -> core::Status {
+    load_or_initializing_snapshot_ = snapshot;
+    auto checkpoint = CollectionCheckpointStore::load(wal_->directory());
+    if (!checkpoint.ok()) {
+      return checkpoint.status();
+    }
+    std::uint64_t wal_cut{};
+    if (checkpoint.value().has_value()) {
+      wal_cut = checkpoint.value()->wal_cut;
+      auto status = apply_checkpoint_image(snapshot, std::move(*checkpoint.value()));
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    struct Pending {
+      WalMutationTransaction transaction{};
+      std::uint64_t transaction_id{};
+    };
+    struct Committed {
+      WalMutationTransaction transaction{};
+      std::uint64_t transaction_id{};
+      bool durable{};
+      bool publish_marker{};
+    };
+    std::map<std::uint64_t, Pending> pending;
+    std::vector<Committed> committed;
+    std::map<std::uint64_t, std::size_t> committed_index;
+    try {
+      for (const auto &frame : wal_->recovery_scan().frames) {
+        maximum_recovered_op_id_ = std::max(maximum_recovered_op_id_, frame.op_id);
+        if (frame.type == LogicalWalRecordType::checkpoint) {
+          wal_cut = std::max(wal_cut, frame.op_id);
+          continue;
+        }
+        if (frame.type == LogicalWalRecordType::prepare) {
+          auto transaction = decode_wal_transaction(frame.payload);
+          if (transaction.rows.empty()) {
+            return core::Status::error(core::StatusCode::corruption,
+                                       core::OperationStage::mutation_replay,
+                                       core::StatusDetail::malformed_struct,
+                                       "WAL PREPARE contains no mutation rows");
+          }
+          for (const auto &row : transaction.rows) {
+            maximum_recovered_op_id_ = std::max(maximum_recovered_op_id_, row.op_id);
+          }
+          pending.insert_or_assign(frame.op_id, Pending{std::move(transaction), frame.op_id});
+          continue;
+        }
+        if (frame.type == LogicalWalRecordType::commit) {
+          const auto found = pending.find(frame.op_id);
+          if (found == pending.end() || committed_index.contains(frame.op_id)) {
+            continue;
+          }
+          committed_index.emplace(frame.op_id, committed.size());
+          committed.push_back(Committed{std::move(found->second.transaction),
+                                        frame.op_id,
+                                        (frame.flags & 1U) != 0,
+                                        false});
+          pending.erase(found);
+          continue;
+        }
+        if ((frame.flags & 0x80U) != 0U) {
+          auto receipt = decode_batch_receipt_marker(frame.payload);
+          if (receipt.batch_op_id != frame.batch_id || receipt.retry_token.empty()) {
+            return core::Status::error(core::StatusCode::corruption,
+                                       core::OperationStage::mutation_replay,
+                                       core::StatusDetail::malformed_struct,
+                                       "batch receipt WAL marker identity is invalid");
+          }
+          batch_retry_receipts_.insert_or_assign(receipt.retry_token, std::move(receipt));
+          continue;
+        }
+        const auto found = committed_index.find(frame.op_id);
+        if (found != committed_index.end()) {
+          committed[found->second].publish_marker = true;
+        }
+      }
+    } catch (const std::invalid_argument &error) {
+      return core::Status::error(core::StatusCode::corruption,
+                                 core::OperationStage::mutation_replay,
+                                 core::StatusDetail::malformed_struct,
+                                 error.what());
+    } catch (...) {
+      return core::status_from_exception(core::OperationStage::mutation_replay);
+    }
+
+    const auto active = snapshot->find_active_mutable();
+    if (active != nullptr) {
+      core::MutationContext context;
+      for (const auto &[unused, transaction] : pending) {
+        (void)unused;
+        core::MutationToken token;
+        token.value = transaction.transaction_id;
+        (void)active->segment.abort_mutation(token, context);
+      }
+    }
+
+    for (auto &entry : committed) {
+      const auto maximum_row =
+          std::ranges::max(entry.transaction.rows, {}, &WalMutationRow::op_id).op_id;
+      if (maximum_row > wal_cut && maximum_row > snapshot->visibility_watermark) {
+        load_or_initializing_snapshot_ = snapshot;
+        auto status = replay_engine_transaction(entry.transaction);
+        if (!status.ok()) {
+          return status;
+        }
+        auto next = build_dark_snapshot(snapshot, entry.transaction, entry.durable);
+        if (!next.ok()) {
+          return next.status();
+        }
+        snapshot = std::move(next).value();
+        load_or_initializing_snapshot_ = snapshot;
+      }
+      install_recovered_receipts(entry.transaction,
+                                 *snapshot,
+                                 entry.durable ? DurabilityState::wal_fsync
+                                               : DurabilityState::searchable_not_durable);
+      if (!entry.publish_marker) {
+        const auto status = wal_->append(LogicalWalRecordType::publish_marker,
+                                         entry.durable ? 1U : 0U,
+                                         entry.transaction_id,
+                                         entry.transaction.batch_op_id,
+                                         {},
+                                         LogicalWalSync::flush);
+        if (!status.ok()) {
+          return status;
+        }
+      }
+    }
+    load_or_initializing_snapshot_.reset();
+    return core::Status::success();
   }
 
   [[nodiscard]] auto validate_logical_id(const core::LogicalId &logical_id,
@@ -1194,7 +2119,14 @@ class SegmentedCollection {
     }
   }
 
-  [[nodiscard]] static auto closed_status(core::OperationStage stage) -> core::Status {
+  [[nodiscard]] auto closed_status(core::OperationStage stage) const -> core::Status {
+    std::lock_guard lock(lifecycle_mutex_);
+    if (lifecycle_ == LifecycleState::open && control_plane_gate_) {
+      return core::Status::error(core::StatusCode::conflict,
+                                 stage,
+                                 core::StatusDetail::none,
+                                 "collection admission is temporarily gated by checkpoint");
+    }
     return core::Status::error(core::StatusCode::closed,
                                stage,
                                core::StatusDetail::operation_slot_absent,
@@ -1220,12 +2152,19 @@ class SegmentedCollection {
 
   CollectionSchema schema_{};
   CollectionConfig config_{};
+  std::unique_ptr<CollectionLogicalWal> wal_{};
+  std::map<std::string, MutationReceipt, std::less<>> retry_receipts_{};
+  std::map<std::string, BatchMutationReceipt, std::less<>> batch_retry_receipts_{};
+  std::shared_ptr<RoutingSnapshot> load_or_initializing_snapshot_{};
+  std::uint64_t maximum_recovered_op_id_{};
   RoutingSnapshotPtr snapshot_{};
   mutable std::mutex lifecycle_mutex_{};
   std::condition_variable lifecycle_changed_{};
   LifecycleState lifecycle_{LifecycleState::open};
+  bool control_plane_gate_{};
   std::uint64_t inflight_operations_{};
   std::mutex drain_mutex_{};
+  std::mutex checkpoint_mutex_{};
   std::mutex mutation_mutex_{};
   std::atomic_uint64_t next_op_id_{1};
   std::atomic_uint64_t accepted_count_{};
