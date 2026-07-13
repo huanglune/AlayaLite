@@ -36,6 +36,7 @@ alaya_cc_target(
 )
 alaya_cc_target(disk_flat_segment_header_closure SRCS disk_flat_segment_header_closure.cpp)
 alaya_cc_target(disk_vamana_segment_header_closure SRCS disk_vamana_segment_header_closure.cpp)
+alaya_cc_target(laser_segment_header_closure SRCS laser_segment_header_closure.cpp)
 alaya_cc_target(
   disk_vamana_segment_test
   GTEST
@@ -196,6 +197,8 @@ if(ALAYA_ENABLE_LASER)
       test_disk_collection_laser.cpp
       test_laser_adapter_overhead.cpp
       test_laser_searcher_thread_safety.cpp
+      laser_segment_test.cpp
+      laser_segment_stress_test.cpp
   )
   set(ALAYA_LASER_SEGMENT_TEST_TARGETS)
   foreach(laser_segment_test_source IN LISTS ALAYA_LASER_SEGMENT_TEST_CANDIDATES)
@@ -220,6 +223,20 @@ if(ALAYA_ENABLE_LASER)
         NAME ${_laser_segment_test_target}
         TARGET ${_laser_segment_test_target}
         LABELS laser performance
+      )
+    elseif(_laser_segment_test_target STREQUAL "laser_segment_test")
+      alaya_add_test(
+        NAME ${_laser_segment_test_target}
+        TARGET ${_laser_segment_test_target}
+        LABELS laser segment
+        TIMEOUT 180
+      )
+    elseif(_laser_segment_test_target STREQUAL "laser_segment_stress_test")
+      alaya_add_test(
+        NAME ${_laser_segment_test_target}
+        TARGET ${_laser_segment_test_target}
+        LABELS laser segment stress tsan
+        TIMEOUT 180
       )
     else()
       alaya_add_test(
