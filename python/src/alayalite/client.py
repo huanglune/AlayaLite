@@ -52,7 +52,11 @@ class Client:
                     self.__collection_map[name] = Collection.load(self.__url, name)
                     logger.info("Loaded collection %s", name)
                 elif is_index_url(full_url):
-                    self.__index_map[name] = Index.load(self.__url, name)
+                    # Discovery is an implementation detail of Client(url).
+                    # The first public index method emits client_index at the
+                    # user's callsite; do not attribute Index.load to here.
+                    with _suppress_legacy_warning("index"):
+                        self.__index_map[name] = Index.load(self.__url, name)
                     logger.info("Loaded index %s", name)
                 else:
                     logger.warning("Ignoring unknown storage entry at %s", full_url)
