@@ -14,6 +14,7 @@ from typing import List, Optional
 import numpy as np
 
 from ._alayalitepy import PyIndexInterface as _PyIndexInterface
+from ._legacy import legacy_api
 from .common import (
     VectorLike,
     VectorLikeBatch,
@@ -69,6 +70,7 @@ class Index:
     The Index class provides a Python interface for managing and querying vector indices.
     """
 
+    @legacy_api("index", "index", "alayalite.Index", "alayalite.Collection")
     def __init__(self, name: str = "default", params: Optional[IndexParams] = None):
         """
         Initialize a new Index instance.
@@ -286,6 +288,7 @@ class Index:
         return {"type": "index", "index": self.__params.to_json_dict()}
 
     @classmethod
+    @legacy_api("index", "index", "alayalite.Index", "alayalite.Collection")
     def load(cls, url, name):
         """
         Load an existing index from disk.

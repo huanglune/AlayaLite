@@ -31,11 +31,12 @@ from ._alayalitepy import (  # re-exported below as the public status hierarchy
 )
 from ._alayalitepy import _Collection as _NativeCollection
 from ._alayalitepy import _CollectionReadView as _NativeCollectionReadView
+from ._legacy import LEGACY_API_V_REMOVE, legacy_api
 from .common import _assert, normalize_filter_execution_hint, valid_dtype
 from .schema import IndexParams, load_schema, save_schema
 
 V_PUBLIC = "1.1.0"
-V_REMOVE = "1.2.0"
+V_REMOVE = LEGACY_API_V_REMOVE
 STATUS_VERSION = "1"
 
 
@@ -217,11 +218,22 @@ class Collection:
             )
         return self.__native
 
+    @legacy_api(
+        "collection_get_cpp_index",
+        "index",
+        "Collection.get_cpp_index()",
+        "canonical Collection methods",
+        warning_category=DeprecationWarning,
+        message=(
+            f"Collection.get_cpp_index() is deprecated and will be removed in AlayaLite {V_REMOVE}; "
+            "use canonical Collection methods instead. The returned native view is read-only."
+        ),
+    )
     def get_cpp_index(self) -> _NativeCollectionReadView:
         """Return the Gate 9-A read-only native view.
 
         The view deliberately has no mutation, RocksDB, or internal-row API.
-        Its deprecation warning is introduced by Gate 9-B.
+        Gate 9-B deprecates this escape hatch while retaining the read-only view.
         """
         return self._get_cpp_index()
 

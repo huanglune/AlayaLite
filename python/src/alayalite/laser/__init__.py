@@ -22,6 +22,8 @@ from typing import Union
 
 import numpy as np
 
+from alayalite._legacy import _suppress_legacy_warning, legacy_api
+
 try:
     from alayalite._alayalitepy import laser as _raw_laser_mod  # type: ignore[attr-defined]
 except (AttributeError, ImportError):
@@ -211,6 +213,7 @@ class Index:
         self._loaded = bool(loaded)
 
     @classmethod
+    @legacy_api("laser", "laser", "alayalite.laser.Index", "alayalite.Collection")
     def fit(
         cls,
         vectors_or_fbin,
@@ -348,16 +351,17 @@ class Index:
         if not (effective_skip and validate_vamana_index(vamana_path, int(bp.R))):
             from alayalite import vamana as vamana_mod  # pylint: disable=import-outside-toplevel
 
-            vamana_mod.build_index(
-                data_path=raw_fbin_path,
-                output_path=vamana_path,
-                R=int(bp.R),
-                L=int(bp.L),
-                alpha=float(bp.alpha),
-                seed=master_seed,
-                num_threads=resolved_threads,
-                dram_budget_gb=float(dram_budget_gb),
-            )
+            with _suppress_legacy_warning("vamana"):
+                vamana_mod.build_index(
+                    data_path=raw_fbin_path,
+                    output_path=vamana_path,
+                    R=int(bp.R),
+                    L=int(bp.L),
+                    alpha=float(bp.alpha),
+                    seed=master_seed,
+                    num_threads=resolved_threads,
+                    dram_budget_gb=float(dram_budget_gb),
+                )
 
         raw_laser_mod = _require_raw_laser()
         raw = raw_laser_mod.Index(
@@ -403,6 +407,7 @@ class Index:
         return cls(raw=raw, prefix=prefix, params=params, loaded=loaded)
 
     @classmethod
+    @legacy_api("laser", "laser", "alayalite.laser.Index", "alayalite.Collection")
     def from_prefix(cls, prefix: PathLikeStr, dram_budget_gb: float = 1.0) -> Index:
         """Load an existing LASER index from a prefix (without ``_R*_MD*.index``)."""
         base = os.fspath(prefix)
@@ -461,6 +466,7 @@ class Index:
                 "LASER index is not loaded. Use Index.fit(..., auto_load=True) or Index.from_prefix(...)."
             )
 
+    @legacy_api("laser", "laser", "alayalite.laser.Index", "alayalite.Collection")
     def search(self, query: np.ndarray, k: int):
         self._require_loaded()
         q = np.ascontiguousarray(query, dtype=np.float32)
@@ -470,6 +476,7 @@ class Index:
             raise ValueError(f"expected query.shape[0]={self._params.raw_dim}, got query.shape[0]={q.shape[0]}")
         return self._raw.search(q, int(k))
 
+    @legacy_api("laser", "laser", "alayalite.laser.Index", "alayalite.Collection")
     def batch_search(self, queries: np.ndarray, k: int):
         self._require_loaded()
         q = np.ascontiguousarray(queries, dtype=np.float32)
@@ -479,6 +486,7 @@ class Index:
             raise ValueError(f"expected queries.shape[1]={self._params.raw_dim}, got queries.shape[1]={q.shape[1]}")
         return self._raw.batch_search(q, int(k))
 
+    @legacy_api("laser", "laser", "alayalite.laser.Index", "alayalite.Collection")
     def set_params(self, ef_search: int = 200, num_threads: int = 0, beam_width: int = 16) -> None:
         self._require_loaded()
         self._raw.set_params(

@@ -11,6 +11,7 @@ import logging
 import os
 import shutil
 
+from ._legacy import _suppress_legacy_warning, legacy_api
 from .collection import Collection
 from .index import Index
 from .schema import IndexParams, is_collection_url, is_index_url, save_schema
@@ -65,6 +66,7 @@ class Client:
         """
         return list(self.__collection_map.keys())
 
+    @legacy_api("client_index", "client_index", "alayalite.Client index methods", "collection methods")
     def list_indices(self):
         """
         List all index names currently managed by the client.
@@ -86,6 +88,7 @@ class Client:
         """
         return self.__collection_map.get(name)
 
+    @legacy_api("client_index", "client_index", "alayalite.Client index methods", "collection methods")
     def get_index(self, name: str = "default") -> Index:
         """
         Get an index by name.
@@ -140,6 +143,7 @@ class Client:
         self.__collection_map[name] = collection
         return collection
 
+    @legacy_api("client_index", "client_index", "alayalite.Client index methods", "collection methods")
     def create_index(self, name: str = "default", **kwargs) -> Index:
         """
         Create a new index with the given name and parameters.
@@ -158,7 +162,10 @@ class Client:
             raise RuntimeError(f"A collection or index with name '{name}' already exists")
 
         params = IndexParams.from_kwargs(**kwargs)
-        index = Index(name, params)
+        # The public Client index boundary already emitted client_index.  Do
+        # not leak a second Index warning whose callsite would be this wrapper.
+        with _suppress_legacy_warning("index"):
+            index = Index(name, params)
         self.__index_map[name] = index
         return index
 
@@ -178,6 +185,7 @@ class Client:
             collection = self.create_collection(name, **kwargs)
         return collection
 
+    @legacy_api("client_index", "client_index", "alayalite.Client index methods", "collection methods")
     def get_or_create_index(self, name: str, **kwargs) -> Index:
         """
         Retrieve an index if it exists, otherwise create a new one.
@@ -217,6 +225,7 @@ class Client:
                 shutil.rmtree(collection_url)
                 logger.info("Deleted collection '%s' from disk", collection_name)
 
+    @legacy_api("client_index", "client_index", "alayalite.Client index methods", "collection methods")
     def delete_index(self, index_name: str, delete_on_disk: bool = False):
         """
         Delete an index by name.
@@ -270,6 +279,7 @@ class Client:
         self.__collection_map = {}
         self.__index_map = {}
 
+    @legacy_api("client_index", "client_index", "alayalite.Client index methods", "collection methods")
     def save_index(self, index_name: str):
         """
         Save an index to disk.

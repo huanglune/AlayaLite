@@ -11,7 +11,8 @@ to all key components like the Client, Collection, and utility functions.
 
 import warnings
 
-from ._alayalitepy import DiskCollection, MetricType  # noqa: E402
+from ._alayalitepy import MetricType  # noqa: E402
+from ._legacy import AlayaLiteLegacyApiWarning  # noqa: E402
 from .client import Client  # noqa: E402
 from .collection import (  # noqa: E402
     STATUS_VERSION as COLLECTION_STATUS_VERSION,
@@ -37,6 +38,7 @@ from .collection import (
     CollectionResourceExhaustedError,
     CollectionStatusError,
 )
+from .disk_collection import DiskCollection  # noqa: E402
 from .index import Index  # noqa: E402
 from .utils import calc_gt, calc_recall, load_fvecs, load_ivecs  # noqa: E402
 
@@ -63,6 +65,7 @@ __all__ = [
     "COLLECTION_V_PUBLIC",
     "LEGACY_API_V_REMOVE",
     "COLLECTION_STATUS_VERSION",
+    "AlayaLiteLegacyApiWarning",
     "CollectionStatusError",
     "CollectionInvalidArgumentError",
     "CollectionNotSupportedError",

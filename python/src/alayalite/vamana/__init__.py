@@ -18,7 +18,14 @@ outputs — see ``tests/vamana/test_cli_vs_python_parity.py``.
 from __future__ import annotations
 
 from alayalite._alayalitepy import vamana as _vamana_mod  # type: ignore[attr-defined]
+from alayalite._legacy import legacy_api
 
-build_index = _vamana_mod.build_index
+
+@legacy_api("vamana", "vamana", "alayalite.vamana.build_index", "alayalite.Collection")
+def build_index(*args, **kwargs):
+    return _vamana_mod.build_index(*args, **kwargs)
+
+
+build_index.__doc__ = _vamana_mod.build_index.__doc__
 
 __all__ = ["build_index"]
