@@ -179,6 +179,21 @@ def generate(build_dir: Path) -> dict[str, object]:
             [str(disk_flat_segment_generator), str(out / "disk_flat_segment")],
             check=True,
         )
+        disk_vamana_segment_generator = (
+            build_dir / "tests/golden/artifact_disk_vamana_segment_generator"
+        )
+        if not disk_vamana_segment_generator.is_file():
+            raise RuntimeError(
+                "build the artifact_disk_vamana_segment_generator target first: "
+                f"{disk_vamana_segment_generator}"
+            )
+        subprocess.run(
+            [
+                str(disk_vamana_segment_generator),
+                str(out / "disk_vamana_segment"),
+            ],
+            check=True,
+        )
         memory_qg_generator = build_dir / "tests/golden/artifact_memory_qg_generator"
         if not memory_qg_generator.is_file():
             raise RuntimeError(
