@@ -199,6 +199,7 @@ if(ALAYA_ENABLE_LASER)
       test_laser_searcher_thread_safety.cpp
       laser_segment_test.cpp
       laser_segment_stress_test.cpp
+      gate6_rollback_drill_test.cpp
   )
   set(ALAYA_LASER_SEGMENT_TEST_TARGETS)
   foreach(laser_segment_test_source IN LISTS ALAYA_LASER_SEGMENT_TEST_CANDIDATES)

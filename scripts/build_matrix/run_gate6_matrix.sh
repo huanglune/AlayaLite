@@ -11,7 +11,7 @@ jobs="${ALAYA_GATE6_JOBS:-4}"
 python="${ALAYA_GATE6_PYTHON:-${repo_root}/.venv/bin/python}"
 requested_lane="${1:-all}"
 lanes=(native avx2)
-ctest_regex='^(disk_test_(flat_segment|vamana_segment|flat_segment_stress|vamana_segment_stress|segment_factory|collection_factory_dispatch)|test_segment_factory_(vamana|laser)|laser_segment_(test|stress_test)|manifest_v2_test|heterogeneous_segment_integration_test)$'
+ctest_regex='^(disk_test_(flat_segment|vamana_segment|flat_segment_stress|vamana_segment_stress|segment_factory|collection_factory_dispatch)|test_segment_factory_(vamana|laser)|laser_segment_(test|stress_test)|gate6_rollback_drill_test|manifest_v2_test|heterogeneous_segment_integration_test)$'
 
 lane_args() {
   case "$1" in
