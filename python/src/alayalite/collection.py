@@ -153,7 +153,14 @@ class Collection:
     is retained only as a source-compatible choice of collection directory.
     """
 
-    def __init__(self, name: str, index_params: IndexParams = None):
+    def __init__(
+        self,
+        name: str,
+        index_params: IndexParams = None,
+        *,
+        auto_seal_rows: int = 0,
+    ):
+        _assert(int(auto_seal_rows) >= 0, "auto_seal_rows must be greater than or equal to 0")
         self.__index_params = index_params if index_params is not None else IndexParams()
         if not self.__index_params.rocksdb_path:
             self.__index_params.rocksdb_path = _default_rocksdb_path(name)
@@ -162,6 +169,7 @@ class Collection:
         self.__read_view: Optional[_NativeCollectionReadView] = None
         self.__dim: Optional[int] = None
         self.__dtype: Optional[np.dtype] = None
+        self.__auto_seal_rows = int(auto_seal_rows)
 
     def _bind_open_native(self, root: str) -> None:
         self.__root = os.path.abspath(root)
@@ -169,6 +177,7 @@ class Collection:
         native_options = self.__native.options()
         self.__dim = int(native_options["dim"])
         self.__dtype = np.dtype(native_options["dtype"])
+        self.__auto_seal_rows = int(native_options["auto_seal_rows"])
 
     @staticmethod
     def _normalize_item_id(item_id) -> str:
@@ -206,6 +215,7 @@ class Collection:
             params.quantization_type,
             int(build_threads),
             400,
+            self.__auto_seal_rows,
         )
         self.__dim = int(dim)
         self.__dtype = dtype
@@ -655,6 +665,18 @@ class Collection:
     def checkpoint(self) -> dict:
         return self._require_native().checkpoint()
 
+    def seal(self) -> dict:
+        """Rotate to a successor and publish an immutable Flat generation."""
+        return self._require_native().seal()
+
+    def compact(self) -> dict:
+        """Merge all eligible sealed Flat generations into one Flat generation."""
+        return self._require_native().compact()
+
+    def gc(self) -> dict:
+        """Reclaim gc_pending artifacts whose search epochs have released."""
+        return self._require_native().gc()
+
     def reindex(self, ef_construction: int = 400, num_threads: Optional[int] = None):
         """Export, recreate, re-add, atomically swap, and checkpoint the native owner."""
         _assert(int(ef_construction) > 0, "ef_construction must be greater than 0")
@@ -678,6 +700,7 @@ class Collection:
                 options["quantization_type"],
                 int(threads),
                 int(ef_construction),
+                int(options["auto_seal_rows"]),
             )
             if records:
                 ids = [str(record["id"]) for record in records]

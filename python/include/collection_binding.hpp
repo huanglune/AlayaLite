@@ -682,7 +682,8 @@ class PyCollection {
                                    const std::string &index_type,
                                    const std::string &quantization_type,
                                    std::uint32_t build_threads,
-                                   std::uint32_t ef_construction) -> std::shared_ptr<PyCollection> {
+                                   std::uint32_t ef_construction,
+                                   std::uint64_t auto_seal_rows) -> std::shared_ptr<PyCollection> {
     CollectionOptions options;
     options.root = root;
     options.dim = dim;
@@ -692,6 +693,7 @@ class PyCollection {
     options.quantization = quantization(quantization_type);
     options.build_threads = build_threads;
     options.ef_construction = ef_construction;
+    options.auto_seal_rows = auto_seal_rows;
     return std::make_shared<PyCollection>(unwrap(Collection::create(std::move(options))));
   }
 
@@ -844,6 +846,42 @@ class PyCollection {
     return result;
   }
 
+  [[nodiscard]] auto seal() -> py::dict {
+    const auto receipt = unwrap(collection_->seal());
+    py::dict result;
+    result["source_segment_id"] = receipt.source_segment_id;
+    result["successor_segment_id"] = receipt.successor_segment_id;
+    result["sealed_segment_id"] = receipt.sealed_segment_id;
+    result["wal_cut"] = receipt.wal_cut;
+    result["sealed_rows"] = receipt.sealed_rows;
+    result["sealed_bytes"] = receipt.sealed_bytes;
+    result["manifest_generation"] = receipt.manifest_generation;
+    return result;
+  }
+
+  [[nodiscard]] auto compact() -> py::dict {
+    const auto receipt = unwrap(collection_->compact());
+    py::dict result;
+    result["source_segment_ids"] = receipt.source_segment_ids;
+    result["compacted_segment_id"] = receipt.compacted_segment_id;
+    result["compacted_rows"] = receipt.compacted_rows;
+    result["input_bytes"] = receipt.input_bytes;
+    result["output_bytes"] = receipt.output_bytes;
+    result["manifest_generation"] = receipt.manifest_generation;
+    return result;
+  }
+
+  [[nodiscard]] auto gc() -> py::dict {
+    const auto receipt = unwrap(collection_->gc());
+    py::dict result;
+    result["pending"] = receipt.pending;
+    result["reclaimed"] = receipt.reclaimed;
+    result["deferred"] = receipt.deferred;
+    result["reclaimed_bytes"] = receipt.reclaimed_bytes;
+    result["manifest_generation"] = receipt.manifest_generation;
+    return result;
+  }
+
   [[nodiscard]] auto stats() const -> py::dict {
     const auto stats = collection_->stats();
     py::dict result;
@@ -861,6 +899,10 @@ class PyCollection {
     result["visibility_watermark"] = stats.visibility_watermark;
     result["durable_watermark"] = stats.durable_watermark;
     result["metadata_epoch"] = stats.metadata_epoch;
+    result["sealed_segments_count"] = stats.sealed_segments_count;
+    result["gc_pending_count"] = stats.gc_pending_count;
+    result["active_segment_algorithm"] = algorithm_name(stats.active_segment_algorithm);
+    result["compacted_bytes"] = stats.compacted_bytes;
     result["lifecycle"] = static_cast<std::uint8_t>(stats.lifecycle);
     return result;
   }
@@ -879,6 +921,7 @@ class PyCollection {
     result["implementation_key"] = collection_->target_implementation_key();
     result["engine_factory_key"] = collection_->target_engine_factory_key();
     result["active_algorithm"] = algorithm_name(collection_->active_algorithm());
+    result["auto_seal_rows"] = options.auto_seal_rows;
     result["imported_legacy_layout"] = collection_->imported_legacy_layout();
     return result;
   }
@@ -942,7 +985,8 @@ inline void register_collection(py::module_ &module) {
                   py::arg("index_type"),
                   py::arg("quantization_type"),
                   py::arg("build_threads") = 1,
-                  py::arg("ef_construction") = 400)
+                  py::arg("ef_construction") = 400,
+                  py::arg("auto_seal_rows") = 0)
       .def_static("open", &PyCollection::open, py::arg("root"))
       .def("mutate",
            &PyCollection::mutate,
@@ -988,6 +1032,9 @@ inline void register_collection(py::module_ &module) {
       .def("get_by_ids", &PyCollection::get_by_ids, py::arg("ids"))
       .def("records", &PyCollection::records)
       .def("checkpoint", &PyCollection::checkpoint)
+      .def("seal", &PyCollection::seal)
+      .def("compact", &PyCollection::compact)
+      .def("gc", &PyCollection::gc)
       .def("stats", &PyCollection::stats)
       .def("options", &PyCollection::options)
       .def("close", &PyCollection::close);

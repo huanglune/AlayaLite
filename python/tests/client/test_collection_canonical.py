@@ -165,3 +165,45 @@ def test_gate10_filter_policies_overfetch_stats_and_budget_reuse(tmp_path):
     assert reused["ids"].tolist() == ["row-0", "row-1"]
     assert reused["search_stats"]["lease_acquired"] == 1
     assert reused["search_stats"]["lease_released"] == 1
+
+
+def test_gate10_python_seal_compact_gc_and_collection_stats(tmp_path):
+    collection = Collection(
+        "gate10-lifecycle",
+        IndexParams(rocksdb_path=str(tmp_path / "gate10-lifecycle" / "rocksdb")),
+    )
+    collection.add([_item("a", [0, 0]), _item("b", [1, 0])])
+    first = collection.seal()
+    assert first["sealed_rows"] == 2
+    assert first["source_segment_id"] == 2
+    assert first["successor_segment_id"] == 3
+    collection.gc()
+
+    collection.add([_item("c", [2, 0]), _item("d", [3, 0])])
+    second = collection.seal()
+    assert second["sealed_rows"] == 2
+    collection.gc()
+
+    before = collection.search(np.asarray([0.0, 0.0], dtype=np.float32), top_k=10)
+    compacted = collection.compact()
+    assert compacted["source_segment_ids"] == [4, 6]
+    assert compacted["compacted_rows"] == 4
+    after = collection.search(np.asarray([0.0, 0.0], dtype=np.float32), top_k=10)
+    assert after["ids"].tolist() == before["ids"].tolist()
+    np.testing.assert_array_equal(after["distances"], before["distances"])
+
+    reclaimed = collection.gc()
+    assert reclaimed["reclaimed"] == 2
+    stats = collection.stats()
+    assert stats["sealed_segments_count"] == 1
+    assert stats["gc_pending_count"] == 0
+    assert stats["active_segment_algorithm"] == "flat"
+    assert stats["compacted_bytes"] == compacted["input_bytes"]
+
+    automatic = Collection(
+        "gate10-auto-seal",
+        IndexParams(rocksdb_path=str(tmp_path / "gate10-auto-seal" / "rocksdb")),
+        auto_seal_rows=2,
+    )
+    automatic.add([_item("x", [0, 0]), _item("y", [1, 0])])
+    assert automatic.stats()["sealed_segments_count"] == 1

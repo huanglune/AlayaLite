@@ -393,6 +393,21 @@ struct CheckpointReceipt {
   std::string checkpoint_name{};
 };
 
+struct ActiveRotationReceipt {
+  std::uint64_t source_segment_id{};
+  std::uint64_t source_generation{};
+  std::uint64_t successor_segment_id{};
+  std::uint64_t successor_generation{};
+  CheckpointReceipt checkpoint{};
+};
+
+struct SegmentReplacement {
+  core::LogicalId logical_id{};
+  RowAddress source{};
+  RowAddress target{};
+  std::uint64_t upsert_sequence{};
+};
+
 struct CollectionFeatureFlags {
   bool collection_shell{true};
   bool legacy_memory_adapter{true};
@@ -440,6 +455,7 @@ struct CollectionConfig {
 enum class LifecycleState : std::uint8_t { open = 0, closing = 1, closed = 2 };
 
 struct CollectionStats {
+  core::VersionedStructHeader header{};
   core::RowCount size{};
   // Current accepted logical rows: searchable live IDs plus admitted inserts
   // still in dark stage. Historical versions and delete operations are not
@@ -454,6 +470,8 @@ struct CollectionStats {
   std::uint64_t durable_watermark{};
   std::uint64_t metadata_epoch{};
   LifecycleState lifecycle{LifecycleState::open};
+
+  CollectionStats() : header(core::current_struct_header<CollectionStats>()) {}
 };
 
 }  // namespace alaya::internal::collection

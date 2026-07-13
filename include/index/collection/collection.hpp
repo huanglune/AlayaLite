@@ -4,22 +4,28 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "index/collection/detail/canonical_flat_segment.hpp"
+#include "index/collection/detail/collection_flat_target.hpp"
 #include "index/collection/legacy_importer.hpp"
 #include "index/collection/sha256.hpp"
 #include "utils/platform_fs.hpp"
@@ -61,7 +67,50 @@ struct CollectionOptions {
   std::uint32_t build_threads{1};
   std::uint32_t ef_construction{400};
   std::uint64_t max_logical_id_bytes{64U * 1024U};
+  // Zero disables automatic rotation. A positive value rotates after the
+  // active generation reaches this many physical rows.
+  std::uint64_t auto_seal_rows{};
   bool imported_legacy_layout{};
+};
+
+enum class CollectionSealFailPoint : std::uint8_t {
+  none = 0,
+  after_cut_before_successor = 1,
+  after_successor_switch = 2,
+  during_export_build = 3,
+  after_manifest_publish = 4,
+};
+
+struct CollectionSealOptions {
+  CollectionSealFailPoint fail_point{CollectionSealFailPoint::none};
+  std::function<void(CollectionSealFailPoint)> failpoint_hook{};
+};
+
+struct CollectionSealReceipt {
+  std::uint64_t source_segment_id{};
+  std::uint64_t successor_segment_id{};
+  std::uint64_t sealed_segment_id{};
+  std::uint64_t wal_cut{};
+  core::RowCount sealed_rows{};
+  std::uint64_t sealed_bytes{};
+  std::uint64_t manifest_generation{};
+};
+
+struct CollectionCompactReceipt {
+  std::vector<std::uint64_t> source_segment_ids{};
+  std::uint64_t compacted_segment_id{};
+  core::RowCount compacted_rows{};
+  std::uint64_t input_bytes{};
+  std::uint64_t output_bytes{};
+  std::uint64_t manifest_generation{};
+};
+
+struct CollectionGcReceipt {
+  core::RowCount pending{};
+  core::RowCount reclaimed{};
+  core::RowCount deferred{};
+  std::uint64_t reclaimed_bytes{};
+  std::uint64_t manifest_generation{};
 };
 
 struct CollectionItem {
@@ -101,6 +150,7 @@ struct CollectionSearchResponse {
 };
 
 struct CollectionStatistics {
+  core::VersionedStructHeader header{};
   core::RowCount size{};
   core::RowCount accepted_count{};
   core::RowCount pending_count{};
@@ -115,7 +165,13 @@ struct CollectionStatistics {
   std::uint64_t visibility_watermark{};
   std::uint64_t durable_watermark{};
   std::uint64_t metadata_epoch{};
+  core::RowCount sealed_segments_count{};
+  core::RowCount gc_pending_count{};
+  core::AlgorithmId active_segment_algorithm{core::algorithm::flat};
+  std::uint64_t compacted_bytes{};
   internal::collection::LifecycleState lifecycle{internal::collection::LifecycleState::open};
+
+  CollectionStatistics() : header(core::current_struct_header<CollectionStatistics>()) {}
 };
 
 class Collection {
@@ -147,12 +203,18 @@ class Collection {
       if (!status.ok()) {
         return status;
       }
-      auto opened = open_segmented(options);
+      internal::collection::CollectionControlState state;
+      state.auto_seal_rows = options.auto_seal_rows;
+      status = internal::collection::CollectionControlStore::save(options.root, state);
+      if (!status.ok()) {
+        return status;
+      }
+      auto opened = open_segmented(options, state);
       if (!opened.ok()) {
         return opened.status();
       }
       auto result = std::shared_ptr<Collection>(
-          new Collection(std::move(options), std::move(opened).value(), false));
+          new Collection(std::move(options), std::move(opened).value(), false, std::move(state)));
       core::CheckpointContext context;
       context.durability_target = core::DurabilityTarget::full_checkpoint;
       auto checkpoint = result->checkpoint(context);
@@ -179,6 +241,32 @@ class Collection {
         if (!options.ok()) {
           return options.status();
         }
+        if (internal::collection::CollectionControlStore::exists(root)) {
+          auto loaded_state = internal::collection::CollectionControlStore::load(root);
+          if (!loaded_state.ok()) {
+            return loaded_state.status();
+          }
+          auto state = std::move(loaded_state).value();
+          auto status = normalize_control_state_before_open(root, state);
+          if (!status.ok()) {
+            return status;
+          }
+          options.value().auto_seal_rows = state.auto_seal_rows;
+          auto opened = open_segmented(options.value(), state);
+          if (!opened.ok()) {
+            return opened.status();
+          }
+          const auto imported_layout = options.value().imported_legacy_layout;
+          auto result = std::shared_ptr<Collection>(new Collection(std::move(options).value(),
+                                                                   std::move(opened).value(),
+                                                                   imported_layout,
+                                                                   std::move(state)));
+          status = result->recover_control_state();
+          if (!status.ok()) {
+            return status;
+          }
+          return result;
+        }
         if (options.value().imported_legacy_layout) {
           internal::collection::LegacyImportOptions import_options;
           import_options.source_root = root;
@@ -191,16 +279,32 @@ class Collection {
           if (!imported.ok()) {
             return imported.status();
           }
+          internal::collection::CollectionControlState state;
+          state.last_sealed_segment_id = 1;
+          state.last_sealed_generation = 1;
+          auto status = internal::collection::CollectionControlStore::save(root, state);
+          if (!status.ok()) {
+            return status;
+          }
           return std::shared_ptr<Collection>(new Collection(std::move(options).value(),
                                                             std::move(imported).value().collection,
-                                                            true));
+                                                            true,
+                                                            std::move(state)));
         }
-        auto opened = open_segmented(options.value());
+        internal::collection::CollectionControlState state;
+        state.auto_seal_rows = options.value().auto_seal_rows;
+        auto opened = open_segmented(options.value(), state);
         if (!opened.ok()) {
           return opened.status();
         }
-        return std::shared_ptr<Collection>(
-            new Collection(std::move(options).value(), std::move(opened).value(), false));
+        auto status = internal::collection::CollectionControlStore::save(root, state);
+        if (!status.ok()) {
+          return status;
+        }
+        return std::shared_ptr<Collection>(new Collection(std::move(options).value(),
+                                                          std::move(opened).value(),
+                                                          false,
+                                                          std::move(state)));
       }
 
       const auto route = internal::collection::LegacyImporter::resolve_open_route(root, root);
@@ -234,8 +338,17 @@ class Collection {
       if (!status.ok()) {
         return status;
       }
-      return std::shared_ptr<Collection>(
-          new Collection(std::move(options), std::move(imported).value().collection, true));
+      internal::collection::CollectionControlState state;
+      state.last_sealed_segment_id = 1;
+      state.last_sealed_generation = 1;
+      status = internal::collection::CollectionControlStore::save(root, state);
+      if (!status.ok()) {
+        return status;
+      }
+      return std::shared_ptr<Collection>(new Collection(std::move(options),
+                                                        std::move(imported).value().collection,
+                                                        true,
+                                                        std::move(state)));
     } catch (...) {
       return core::status_from_exception(core::OperationStage::open);
     }
@@ -306,7 +419,11 @@ class Collection {
     request.mode = mode;
     request.options = std::move(options);
     core::MutationContext context;
-    return implementation_->mutate_batch(request, context);
+    auto receipt = implementation_->mutate_batch(request, context);
+    if (receipt.ok()) {
+      maybe_auto_seal();
+    }
+    return receipt;
   }
 
   [[nodiscard]] auto add_batch(
@@ -429,13 +546,41 @@ class Collection {
 
   [[nodiscard]] auto checkpoint(core::CheckpointContext &context)
       -> core::Result<CollectionCheckpointReceipt> {
-    return implementation_->checkpoint(context);
+    std::lock_guard lock(control_mutex_);
+    return checkpoint_locked(context);
   }
 
   [[nodiscard]] auto checkpoint() -> core::Result<CollectionCheckpointReceipt> {
     core::CheckpointContext context;
     context.durability_target = core::DurabilityTarget::full_checkpoint;
     return checkpoint(context);
+  }
+
+  [[nodiscard]] auto seal(CollectionSealOptions options = {})
+      -> core::Result<CollectionSealReceipt> {
+    core::SealContext context;
+    return seal(context, std::move(options));
+  }
+
+  [[nodiscard]] auto seal(core::SealContext &context, CollectionSealOptions options = {})
+      -> core::Result<CollectionSealReceipt> {
+    std::lock_guard lock(control_mutex_);
+    return seal_locked(context, options);
+  }
+
+  [[nodiscard]] auto compact() -> core::Result<CollectionCompactReceipt> {
+    core::SealContext context;
+    return compact(context);
+  }
+
+  [[nodiscard]] auto compact(core::SealContext &context) -> core::Result<CollectionCompactReceipt> {
+    std::lock_guard lock(control_mutex_);
+    return compact_locked(context);
+  }
+
+  [[nodiscard]] auto gc() -> core::Result<CollectionGcReceipt> {
+    std::lock_guard lock(control_mutex_);
+    return gc_locked();
   }
 
   [[nodiscard]] auto stats() const -> CollectionStatistics {
@@ -468,6 +613,20 @@ class Collection {
     }
     result.searchable_bytes = result.searchable_vector_bytes;
     result.accepted_bytes = result.accepted_vector_bytes;
+    result.active_segment_algorithm = core::algorithm::flat;
+    {
+      std::lock_guard lock(control_mutex_);
+      result.compacted_bytes = control_state_.compacted_bytes;
+      const auto manifest = internal::collection::load_manifest_v2_if_present(options_.root);
+      if (manifest.ok() && manifest.value().has_value()) {
+        for (const auto &entry : manifest.value()->segments) {
+          if (entry.lifecycle == internal::collection::SegmentLifecycleV2::sealed) {
+            ++result.sealed_segments_count;
+          }
+        }
+        result.gc_pending_count = manifest.value()->gc.pending_segment_ids.size();
+      }
+    }
     return result;
   }
 
@@ -530,10 +689,12 @@ class Collection {
 
   Collection(CollectionOptions options,
              std::shared_ptr<internal::collection::SegmentedCollection> implementation,
-             bool imported)
+             bool imported,
+             internal::collection::CollectionControlState control_state)
       : options_(std::move(options)),
         implementation_(std::move(implementation)),
-        imported_(imported) {}
+        imported_(imported),
+        control_state_(std::move(control_state)) {}
 
   [[nodiscard]] static auto error(core::StatusCode code,
                                   core::OperationStage stage,
@@ -601,31 +762,1057 @@ class Collection {
   }
 
   [[nodiscard]] static auto make_active_registration(
-      const internal::collection::CollectionSchema &schema)
+      const internal::collection::CollectionSchema &schema,
+      std::uint64_t segment_id = kActiveSegmentId,
+      std::uint64_t generation = kActiveSegmentGeneration)
       -> core::Result<internal::collection::SegmentRegistration> {
     return internal::collection::detail::make_canonical_flat_registration(schema,
-                                                                          kActiveSegmentId,
-                                                                          kActiveSegmentGeneration);
+                                                                          segment_id,
+                                                                          generation);
   }
 
-  [[nodiscard]] static auto open_segmented(const CollectionOptions &options)
+  [[nodiscard]] static auto numeric_segment_id(std::string_view segment_id) -> std::uint64_t {
+    if (!segment_id.starts_with("seg_") || segment_id.size() != 12) {
+      throw std::invalid_argument("Gate-10 Flat segment identity is malformed");
+    }
+    return parse_u64(segment_id.substr(4));
+  }
+
+  [[nodiscard]] static auto open_segmented(
+      const CollectionOptions &options,
+      const internal::collection::CollectionControlState &control_state)
       -> core::Result<std::shared_ptr<internal::collection::SegmentedCollection>> {
     internal::collection::CollectionSchema schema{options.dim,
                                                   options.metric,
                                                   options.scalar_type,
                                                   options.max_logical_id_bytes};
-    auto active = make_active_registration(schema);
+    std::vector<internal::collection::SegmentRegistration> registrations;
+    auto manifest = internal::collection::load_manifest_v2_if_present(options.root);
+    if (!manifest.ok()) {
+      return manifest.status();
+    }
+    if (manifest.value().has_value()) {
+      for (const auto &entry : manifest.value()->segments) {
+        if (entry.lifecycle == internal::collection::SegmentLifecycleV2::retired ||
+            entry.lifecycle == internal::collection::SegmentLifecycleV2::gc_pending) {
+          continue;
+        }
+        core::OpenContext context;
+        auto erased = internal::collection::detail::open_collection_flat_entry(options.root,
+                                                                               entry,
+                                                                               options.scalar_type,
+                                                                               context);
+        if (!erased.ok()) {
+          return erased.status();
+        }
+        internal::collection::SegmentRegistration registration;
+        registration.segment_id = numeric_segment_id(entry.segment_id);
+        registration.generation = entry.generation;
+        registration.role = internal::collection::SegmentRole::sealed;
+        registration.segment = std::move(erased).value();
+        registrations.push_back(std::move(registration));
+      }
+    }
+
+    const auto already_registered = [&](std::uint64_t segment_id, std::uint64_t generation) {
+      return std::ranges::any_of(registrations, [&](const auto &registration) {
+        return registration.segment_id == segment_id && registration.generation == generation;
+      });
+    };
+    if (control_state.phase != internal::collection::CollectionControlPhase::idle &&
+        control_state.phase != internal::collection::CollectionControlPhase::cut_pending) {
+      for (const auto &source : control_state.sources) {
+        if (already_registered(source.segment_id, source.generation)) {
+          continue;
+        }
+        auto source_registration =
+            make_active_registration(schema, source.segment_id, source.generation);
+        if (!source_registration.ok()) {
+          return source_registration.status();
+        }
+        source_registration.value().role = internal::collection::SegmentRole::sealed;
+        registrations.push_back(std::move(source_registration).value());
+      }
+    }
+
+    auto active = make_active_registration(schema,
+                                           control_state.active_segment_id,
+                                           control_state.active_generation);
     if (!active.ok()) {
       return active.status();
     }
     internal::collection::CollectionConfig config;
     config.features.wal_coordinator = true;
+    config.features.manifest_v2_writer = true;
     config.wal.root = options.root;
-    std::vector<internal::collection::SegmentRegistration> registrations;
     registrations.push_back(std::move(active).value());
     return internal::collection::SegmentedCollection::open(schema,
                                                            std::move(registrations),
                                                            std::move(config));
+  }
+
+  struct ReplacementBuildData {
+    std::vector<internal::collection::SegmentReplacement> replacements{};
+    std::vector<internal::collection::RegisteredRow> rows{};
+    core::RowCount live_rows{};
+    std::uint64_t snapshot_bytes{};
+  };
+
+  struct PendingGcCandidate {
+    std::string manifest_segment_id{};
+    std::filesystem::path artifact_directory{};
+    std::weak_ptr<internal::collection::SegmentEntry> epoch_reference{};
+  };
+
+  static void fire_seal_failpoint(const CollectionSealOptions &options,
+                                  CollectionSealFailPoint point) {
+    if (options.fail_point == point && options.failpoint_hook) {
+      options.failpoint_hook(point);
+    }
+  }
+
+  [[nodiscard]] static auto address_is_source(
+      const internal::collection::RowAddress &address,
+      std::span<const internal::collection::RowAddress> sources) -> bool {
+    return std::ranges::any_of(sources, [&](const auto &source) {
+      return source.segment_id == address.segment_id && source.generation == address.generation;
+    });
+  }
+
+  [[nodiscard]] static auto collect_replacement_rows(
+      const internal::collection::RoutingSnapshot &snapshot,
+      std::span<const internal::collection::RowAddress> sources,
+      std::uint64_t target_segment_id,
+      std::uint64_t target_generation,
+      bool preserve_source_row_ids) -> core::Result<ReplacementBuildData> {
+    ReplacementBuildData result;
+    std::uint64_t next_row{};
+    for (const auto &[logical_id, version] : snapshot.versions) {
+      if (!address_is_source(version.address, sources)) {
+        continue;
+      }
+      const auto target_row =
+          preserve_source_row_ids ? static_cast<std::uint64_t>(version.address.row_id) : next_row++;
+      internal::collection::RowAddress target{target_segment_id,
+                                              target_generation,
+                                              core::SegmentRowId(target_row)};
+      result.replacements.push_back({logical_id, version.address, target, version.upsert_sequence});
+      result.rows.push_back(
+          {logical_id, target.row_id, version.upsert_sequence, version.state, version.payload});
+      if (version.state == internal::collection::VersionState::live) {
+        ++result.live_rows;
+      }
+      std::uint64_t row_bytes = version.payload.document.size();
+      if (version.payload.vector.has_value() &&
+          !core::checked_add(row_bytes, version.payload.vector->bytes().size(), row_bytes)) {
+        return error(core::StatusCode::resource_exhausted,
+                     core::OperationStage::freeze,
+                     core::StatusDetail::arithmetic_overflow,
+                     "seal snapshot accounting overflowed");
+      }
+      for (const auto &[key, value] : version.payload.metadata) {
+        std::uint64_t scalar_bytes = key.size();
+        std::visit(
+            [&](const auto &item) {
+              using T = std::decay_t<decltype(item)>;
+              if constexpr (std::is_same_v<T, std::string>) {
+                scalar_bytes += item.size();
+              } else {
+                scalar_bytes += sizeof(item);
+              }
+            },
+            value);
+        if (!core::checked_add(row_bytes, scalar_bytes, row_bytes)) {
+          return error(core::StatusCode::resource_exhausted,
+                       core::OperationStage::freeze,
+                       core::StatusDetail::arithmetic_overflow,
+                       "seal metadata accounting overflowed");
+        }
+      }
+      if (!core::checked_add(result.snapshot_bytes, row_bytes, result.snapshot_bytes)) {
+        return error(core::StatusCode::resource_exhausted,
+                     core::OperationStage::freeze,
+                     core::StatusDetail::arithmetic_overflow,
+                     "seal snapshot total accounting overflowed");
+      }
+    }
+    return result;
+  }
+
+  [[nodiscard]] auto checkpoint_locked(core::CheckpointContext &context)
+      -> core::Result<CollectionCheckpointReceipt> {
+    auto receipt = implementation_->checkpoint(context);
+    if (!receipt.ok()) {
+      return receipt.status();
+    }
+    auto manifest = internal::collection::load_manifest_v2_if_present(options_.root);
+    if (!manifest.ok()) {
+      return manifest.status();
+    }
+    if (manifest.value().has_value()) {
+      auto updated = std::move(*manifest.value());
+      internal::collection::SegmentedCollection::apply_checkpoint_to_manifest(receipt.value(),
+                                                                              updated);
+      updated.publication.generation =
+          std::max(updated.publication.generation + 1, control_state_.manifest_generation + 1);
+      updated.publication.parent = std::string(internal::collection::kCollectionManifestFilename);
+      auto status = internal::collection::publish_manifest_v2_atomic(options_.root, updated);
+      if (!status.ok()) {
+        return status;
+      }
+      control_state_.manifest_generation = updated.publication.generation;
+      status = internal::collection::CollectionControlStore::save(options_.root, control_state_);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    return receipt;
+  }
+
+  [[nodiscard]] auto patch_published_target_manifest() -> core::Status {
+    auto loaded = internal::collection::load_manifest_v2_if_present(options_.root);
+    if (!loaded.ok()) {
+      return loaded.status();
+    }
+    if (!loaded.value().has_value()) {
+      return error(core::StatusCode::corruption,
+                   core::OperationStage::save,
+                   core::StatusDetail::malformed_struct,
+                   "Flat target build did not publish manifest v2");
+    }
+    auto manifest = std::move(*loaded.value());
+    const auto target_name =
+        internal::collection::detail::flat_segment_name(control_state_.target_segment_id);
+    const auto target = std::ranges::find_if(manifest.segments, [&](const auto &entry) {
+      return entry.segment_id == target_name &&
+             entry.generation == control_state_.target_generation;
+    });
+    if (target == manifest.segments.end()) {
+      return error(core::StatusCode::corruption,
+                   core::OperationStage::save,
+                   core::StatusDetail::malformed_struct,
+                   "published manifest omits the Flat replacement target");
+    }
+    target->lifecycle = internal::collection::SegmentLifecycleV2::sealed;
+    target->source_retention.clear();
+    for (const auto &source : control_state_.sources) {
+      const auto source_name = internal::collection::detail::flat_segment_name(source.segment_id);
+      target->source_retention.push_back(source_name);
+      const auto source_entry = std::ranges::find_if(manifest.segments, [&](const auto &entry) {
+        return entry.segment_id == source_name && entry.generation == source.generation;
+      });
+      if (source_entry != manifest.segments.end()) {
+        source_entry->lifecycle = internal::collection::SegmentLifecycleV2::gc_pending;
+      }
+      if (std::ranges::find(manifest.gc.pending_segment_ids, source_name) ==
+          manifest.gc.pending_segment_ids.end()) {
+        manifest.gc.pending_segment_ids.push_back(source_name);
+      }
+    }
+    manifest.gc.phase = internal::collection::GcPhaseV2::pending;
+    ++manifest.gc.generation;
+    manifest.gc.retained_sources = {target_name};
+    manifest.publication.generation =
+        std::max(manifest.publication.generation + 1, control_state_.manifest_generation + 1);
+    manifest.publication.parent = std::string(internal::collection::kCollectionManifestFilename);
+    auto status = internal::collection::publish_manifest_v2_atomic(options_.root, manifest);
+    if (!status.ok()) {
+      return status;
+    }
+    control_state_.manifest_generation = manifest.publication.generation;
+    return core::Status::success();
+  }
+
+  [[nodiscard]] static auto normalize_control_state_before_open(
+      const std::filesystem::path &root,
+      internal::collection::CollectionControlState &state) -> core::Status {
+    if (state.phase == internal::collection::CollectionControlPhase::cut_pending) {
+      internal::collection::CollectionControlStore::remove_replacements(root, state.mapping_file);
+      state.operation = internal::collection::CollectionControlOperation::idle;
+      state.phase = internal::collection::CollectionControlPhase::idle;
+      state.sources.clear();
+      state.successor_segment_id = 0;
+      state.successor_generation = 0;
+      state.target_segment_id = 0;
+      state.target_generation = 0;
+      state.wal_cut = 0;
+      state.mapping_file.clear();
+      return internal::collection::CollectionControlStore::save(root, state);
+    }
+
+    auto manifest = internal::collection::load_manifest_v2_if_present(root);
+    if (!manifest.ok()) {
+      return manifest.status();
+    }
+    const auto target_name =
+        state.target_segment_id == 0
+            ? std::string{}
+            : internal::collection::detail::flat_segment_name(state.target_segment_id);
+    const auto target_published =
+        manifest.value().has_value() &&
+        std::ranges::any_of(manifest.value()->segments, [&](const auto &entry) {
+          return entry.segment_id == target_name && entry.generation == state.target_generation;
+        });
+    if (state.phase == internal::collection::CollectionControlPhase::building && target_published) {
+      state.phase = internal::collection::CollectionControlPhase::manifest_published;
+      return internal::collection::CollectionControlStore::save(root, state);
+    }
+    if (state.phase == internal::collection::CollectionControlPhase::manifest_published &&
+        !target_published) {
+      return error(core::StatusCode::corruption,
+                   core::OperationStage::open,
+                   core::StatusDetail::malformed_struct,
+                   "Gate-10 state says manifest-published but the target is absent");
+    }
+    if (state.phase == internal::collection::CollectionControlPhase::building &&
+        !target_published) {
+      auto status = internal::collection::ArtifactControlPlaneTransaction::cleanup_orphans(root);
+      if (!status.ok()) {
+        return status;
+      }
+      internal::collection::CollectionControlStore::remove_replacements(root, state.mapping_file);
+      state.mapping_file.clear();
+      state.phase = state.operation == internal::collection::CollectionControlOperation::seal
+                        ? internal::collection::CollectionControlPhase::successor_active
+                        : internal::collection::CollectionControlPhase::idle;
+      if (state.phase == internal::collection::CollectionControlPhase::idle) {
+        state.operation = internal::collection::CollectionControlOperation::idle;
+        state.pending_compacted_bytes = 0;
+        state.sources.clear();
+        state.target_segment_id = 0;
+        state.target_generation = 0;
+      }
+      return internal::collection::CollectionControlStore::save(root, state);
+    }
+    return core::Status::success();
+  }
+
+  [[nodiscard]] auto recover_control_state() -> core::Status {
+    if (control_state_.phase != internal::collection::CollectionControlPhase::manifest_published) {
+      return core::Status::success();
+    }
+    auto status = patch_published_target_manifest();
+    if (!status.ok()) {
+      return status;
+    }
+    auto replacements =
+        internal::collection::CollectionControlStore::load_replacements(options_.root,
+                                                                        control_state_
+                                                                            .mapping_file);
+    if (!replacements.ok()) {
+      return replacements.status();
+    }
+    auto pinned = implementation_->pin_routing_snapshot();
+    for (const auto &source : control_state_.sources) {
+      if (auto entry = pinned->find_segment(source.segment_id, source.generation)) {
+        const auto source_name = internal::collection::detail::flat_segment_name(source.segment_id);
+        pending_gc_.push_back(
+            {source_name,
+             control_state_.operation == internal::collection::CollectionControlOperation::compact
+                 ? options_.root / "segments" / source_name
+                 : std::filesystem::path{},
+             entry});
+      }
+    }
+    status = implementation_->resume_segment_replacement(control_state_.sources,
+                                                         control_state_.target_segment_id,
+                                                         control_state_.target_generation,
+                                                         replacements.value());
+    if (!status.ok()) {
+      return status;
+    }
+    pinned.reset();
+    core::CheckpointContext checkpoint_context;
+    checkpoint_context.durability_target = core::DurabilityTarget::full_checkpoint;
+    auto checkpoint = checkpoint_locked(checkpoint_context);
+    if (!checkpoint.ok()) {
+      return checkpoint.status();
+    }
+    const auto mapping_file = control_state_.mapping_file;
+    if (control_state_.operation == internal::collection::CollectionControlOperation::compact) {
+      if (!core::checked_add(control_state_.compacted_bytes,
+                             control_state_.pending_compacted_bytes,
+                             control_state_.compacted_bytes)) {
+        control_state_.compacted_bytes = std::numeric_limits<std::uint64_t>::max();
+      }
+    }
+    control_state_.pending_compacted_bytes = 0;
+    control_state_.operation = internal::collection::CollectionControlOperation::idle;
+    control_state_.phase = internal::collection::CollectionControlPhase::idle;
+    control_state_.last_sealed_segment_id = control_state_.target_segment_id;
+    control_state_.last_sealed_generation = control_state_.target_generation;
+    control_state_.sources.clear();
+    control_state_.successor_segment_id = 0;
+    control_state_.successor_generation = 0;
+    control_state_.target_segment_id = 0;
+    control_state_.target_generation = 0;
+    control_state_.wal_cut = 0;
+    control_state_.mapping_file.clear();
+    status = internal::collection::CollectionControlStore::save(options_.root, control_state_);
+    if (!status.ok()) {
+      return status;
+    }
+    internal::collection::CollectionControlStore::remove_replacements(options_.root, mapping_file);
+    return core::Status::success();
+  }
+
+  [[nodiscard]] auto seal_locked(core::SealContext &context, const CollectionSealOptions &options)
+      -> core::Result<CollectionSealReceipt> {
+    auto status = core::validate_runtime_control(context.deadline,
+                                                 context.cancellation,
+                                                 core::OperationStage::freeze);
+    if (!status.ok()) {
+      return status;
+    }
+    status = normalize_control_state_before_open(options_.root, control_state_);
+    if (!status.ok()) {
+      return status;
+    }
+    if (control_state_.phase == internal::collection::CollectionControlPhase::manifest_published) {
+      status = recover_control_state();
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    if (control_state_.phase != internal::collection::CollectionControlPhase::idle &&
+        control_state_.phase != internal::collection::CollectionControlPhase::successor_active) {
+      return error(core::StatusCode::conflict,
+                   core::OperationStage::freeze,
+                   core::StatusDetail::none,
+                   "another Collection control-plane operation is in progress");
+    }
+
+    if (control_state_.phase == internal::collection::CollectionControlPhase::idle) {
+      const auto snapshot = implementation_->pin_routing_snapshot();
+      const auto source = snapshot->find_active_mutable();
+      if (source == nullptr || snapshot->known_rows_for(*source) == 0) {
+        return error(core::StatusCode::not_found,
+                     core::OperationStage::freeze,
+                     core::StatusDetail::none,
+                     "cannot seal an empty active segment");
+      }
+      if (control_state_.next_segment_id > 99'999'998) {
+        return error(core::StatusCode::resource_exhausted,
+                     core::OperationStage::freeze,
+                     core::StatusDetail::arithmetic_overflow,
+                     "Flat segment namespace is exhausted");
+      }
+      control_state_.operation = internal::collection::CollectionControlOperation::seal;
+      control_state_.phase = internal::collection::CollectionControlPhase::cut_pending;
+      control_state_.sources = {internal::collection::RowAddress{source->segment_id,
+                                                                 source->generation,
+                                                                 core::SegmentRowId{}}};
+      control_state_.successor_segment_id = control_state_.next_segment_id++;
+      control_state_.successor_generation = 1;
+      control_state_.target_segment_id = control_state_.next_segment_id++;
+      control_state_.target_generation = 1;
+      control_state_.wal_cut = snapshot->visibility_watermark;
+      control_state_.mapping_file.clear();
+      status = internal::collection::CollectionControlStore::save(options_.root, control_state_);
+      if (!status.ok()) {
+        return status;
+      }
+      fire_seal_failpoint(options, CollectionSealFailPoint::after_cut_before_successor);
+
+      internal::collection::CollectionSchema schema{options_.dim,
+                                                    options_.metric,
+                                                    options_.scalar_type,
+                                                    options_.max_logical_id_bytes};
+      auto successor = make_active_registration(schema,
+                                                control_state_.successor_segment_id,
+                                                control_state_.successor_generation);
+      if (!successor.ok()) {
+        return successor.status();
+      }
+      core::CheckpointContext checkpoint_context;
+      checkpoint_context.deadline = context.deadline;
+      checkpoint_context.cancellation = context.cancellation;
+      checkpoint_context.lane = context.lane;
+      checkpoint_context.dirty_page_io_credits = context.io_credits;
+      checkpoint_context.wal_io_credits = context.io_credits;
+      checkpoint_context.durability_target = core::DurabilityTarget::full_checkpoint;
+      auto rotated =
+          implementation_->rotate_to_successor(std::move(successor).value(),
+                                               checkpoint_context,
+                                               [&](const internal::collection::ActiveRotationReceipt
+                                                       &receipt) {
+                                                 control_state_.active_segment_id =
+                                                     receipt.successor_segment_id;
+                                                 control_state_.active_generation =
+                                                     receipt.successor_generation;
+                                                 control_state_.wal_cut =
+                                                     receipt.checkpoint.wal_cut;
+                                                 control_state_.phase = internal::collection::
+                                                     CollectionControlPhase::successor_active;
+                                                 return internal::collection::
+                                                     CollectionControlStore::save(options_.root,
+                                                                                  control_state_);
+                                               });
+      if (!rotated.ok()) {
+        return rotated.status();
+      }
+      fire_seal_failpoint(options, CollectionSealFailPoint::after_successor_switch);
+    }
+
+    auto pinned = implementation_->pin_routing_snapshot();
+    auto build_data = collect_replacement_rows(*pinned,
+                                               control_state_.sources,
+                                               control_state_.target_segment_id,
+                                               control_state_.target_generation,
+                                               true);
+    if (!build_data.ok()) {
+      return build_data.status();
+    }
+    if (build_data.value().live_rows == 0) {
+      return error(core::StatusCode::not_found,
+                   core::OperationStage::build,
+                   core::StatusDetail::none,
+                   "active seal snapshot contains no live rows");
+    }
+    status = context.snapshot_reservation.ensure(build_data.value().snapshot_bytes,
+                                                 core::OperationStage::freeze,
+                                                 "seal snapshot reservation is too small");
+    if (!status.ok()) {
+      return status;
+    }
+    control_state_.mapping_file =
+        "seal_" + std::to_string(control_state_.target_segment_id) + ".map";
+    status =
+        internal::collection::CollectionControlStore::save_replacements(options_.root,
+                                                                        control_state_.mapping_file,
+                                                                        build_data.value()
+                                                                            .replacements);
+    if (!status.ok()) {
+      return status;
+    }
+    control_state_.phase = internal::collection::CollectionControlPhase::building;
+    status = internal::collection::CollectionControlStore::save(options_.root, control_state_);
+    if (!status.ok()) {
+      return status;
+    }
+    fire_seal_failpoint(options, CollectionSealFailPoint::during_export_build);
+
+    auto base_manifest = internal::collection::load_manifest_v2_if_present(options_.root);
+    if (!base_manifest.ok()) {
+      return base_manifest.status();
+    }
+    disk::DiskFlatPublicationOptions publication;
+    publication.collection_root = options_.root;
+    publication.segment_id =
+        internal::collection::detail::flat_segment_name(control_state_.target_segment_id);
+    publication.segment_generation = control_state_.target_generation;
+    publication.manifest_generation =
+        std::max(control_state_.manifest_generation + 1,
+                 base_manifest.value().has_value()
+                     ? base_manifest.value()->publication.generation + 1
+                     : std::uint64_t{1});
+    publication.publication_parent = std::string(internal::collection::kCollectionManifestFilename);
+    publication.metadata_epoch = pinned->metadata_epoch;
+    publication.metadata_checkpoint =
+        "checkpoint_" + std::to_string(control_state_.wal_cut) + ".bin";
+    publication.wal_cut = control_state_.wal_cut;
+    publication.row_versions = {control_state_.wal_cut == 0 ? std::uint64_t{0} : std::uint64_t{1},
+                                control_state_.wal_cut};
+    publication.id_map_checkpoint = publication.metadata_checkpoint;
+    publication.collection_features.manifest_v2_writer = true;
+    publication.abort_policy =
+        internal::collection::ArtifactAbortPolicy::retain_for_restart_cleanup;
+    publication.base_manifest = std::move(base_manifest).value();
+    core::BuildContext build_context;
+    build_context.growing_reservation = context.build_reservation;
+    build_context.io_credits = context.io_credits;
+    build_context.deadline = context.deadline;
+    build_context.cancellation = context.cancellation;
+    build_context.lane = context.lane;
+    internal::collection::CollectionSchema schema{options_.dim,
+                                                  options_.metric,
+                                                  options_.scalar_type,
+                                                  options_.max_logical_id_bytes};
+    auto built = internal::collection::detail::build_collection_flat_target(schema,
+                                                                            build_data.value().rows,
+                                                                            publication,
+                                                                            build_context);
+    if (!built.ok()) {
+      return built.status();
+    }
+    auto built_target = std::move(built).value();
+    status = patch_published_target_manifest();
+    if (!status.ok()) {
+      return status;
+    }
+    control_state_.phase = internal::collection::CollectionControlPhase::manifest_published;
+    status = internal::collection::CollectionControlStore::save(options_.root, control_state_);
+    if (!status.ok()) {
+      return status;
+    }
+    fire_seal_failpoint(options, CollectionSealFailPoint::after_manifest_publish);
+
+    for (const auto &source : control_state_.sources) {
+      if (auto entry = pinned->find_segment(source.segment_id, source.generation)) {
+        pending_gc_.push_back(
+            {internal::collection::detail::flat_segment_name(source.segment_id), {}, entry});
+      }
+    }
+    internal::collection::SegmentRegistration target;
+    target.segment_id = control_state_.target_segment_id;
+    target.generation = control_state_.target_generation;
+    target.role = internal::collection::SegmentRole::sealed;
+    target.segment = std::move(built_target.segment);
+    target.rows = build_data.value().rows;
+    status = implementation_->install_segment_replacement(control_state_.sources,
+                                                          std::move(target),
+                                                          build_data.value().replacements);
+    if (!status.ok()) {
+      return status;
+    }
+    pinned.reset();
+    core::CheckpointContext checkpoint_context;
+    checkpoint_context.deadline = context.deadline;
+    checkpoint_context.cancellation = context.cancellation;
+    checkpoint_context.lane = context.lane;
+    checkpoint_context.dirty_page_io_credits = context.io_credits;
+    checkpoint_context.wal_io_credits = context.io_credits;
+    checkpoint_context.durability_target = core::DurabilityTarget::full_checkpoint;
+    auto checkpoint = checkpoint_locked(checkpoint_context);
+    if (!checkpoint.ok()) {
+      return checkpoint.status();
+    }
+
+    CollectionSealReceipt receipt;
+    receipt.source_segment_id = control_state_.sources.front().segment_id;
+    receipt.successor_segment_id = control_state_.active_segment_id;
+    receipt.sealed_segment_id = control_state_.target_segment_id;
+    receipt.wal_cut = control_state_.wal_cut;
+    receipt.sealed_rows = build_data.value().live_rows;
+    receipt.sealed_bytes = built_target.artifact_bytes;
+    receipt.manifest_generation = control_state_.manifest_generation;
+    const auto mapping_file = control_state_.mapping_file;
+    control_state_.operation = internal::collection::CollectionControlOperation::idle;
+    control_state_.phase = internal::collection::CollectionControlPhase::idle;
+    control_state_.last_sealed_segment_id = control_state_.target_segment_id;
+    control_state_.last_sealed_generation = control_state_.target_generation;
+    control_state_.sources.clear();
+    control_state_.successor_segment_id = 0;
+    control_state_.successor_generation = 0;
+    control_state_.target_segment_id = 0;
+    control_state_.target_generation = 0;
+    control_state_.wal_cut = 0;
+    control_state_.mapping_file.clear();
+    status = internal::collection::CollectionControlStore::save(options_.root, control_state_);
+    if (!status.ok()) {
+      return status;
+    }
+    internal::collection::CollectionControlStore::remove_replacements(options_.root, mapping_file);
+    return receipt;
+  }
+
+  [[nodiscard]] auto verify_flat_exports(
+      const internal::collection::RoutingSnapshot &snapshot,
+      std::span<const internal::collection::RowAddress> sources) const -> core::Status {
+    for (const auto &source : sources) {
+      const auto entry = snapshot.find_segment(source.segment_id, source.generation);
+      if (entry == nullptr ||
+          !entry->segment.capabilities().supports(core::OperationCapability::export_rows)) {
+        return error(core::StatusCode::not_supported,
+                     core::OperationStage::export_rows,
+                     core::StatusDetail::operation_slot_absent,
+                     "Flat compact source does not expose export_rows");
+      }
+      std::shared_ptr<::alaya::disk::DiskFlatExportState> owner;
+      ::alaya::disk::DiskFlatExportRequest typed;
+      typed.batch_rows = 256;
+      typed.lifetime_owner = &owner;
+      core::OpaqueOperationRequest request;
+      request.payload = &typed;
+      request.payload_size = sizeof(typed);
+      core::ExportCursor cursor;
+      auto status = entry->segment.export_rows(request, cursor);
+      if (!status.ok()) {
+        return status;
+      }
+      if (owner == nullptr || cursor.state != owner.get()) {
+        return error(core::StatusCode::internal,
+                     core::OperationStage::export_rows,
+                     core::StatusDetail::malformed_struct,
+                     "Flat export cursor did not retain its source epoch");
+      }
+      bool done{};
+      while (!done) {
+        ::alaya::disk::DiskFlatExportBatch batch;
+        status = owner->next(batch);
+        if (!status.ok()) {
+          return status;
+        }
+        if (batch.logical_ids.size() != batch.vectors.rows ||
+            batch.vectors.scalar_type != core::ScalarType::float32 ||
+            batch.vectors.dim != options_.dim) {
+          return error(core::StatusCode::corruption,
+                       core::OperationStage::export_rows,
+                       core::StatusDetail::malformed_struct,
+                       "Flat export batch has an inconsistent row schema");
+        }
+        for (std::size_t index = 0; index < batch.logical_ids.size(); ++index) {
+          const internal::collection::RowAddress address{source.segment_id,
+                                                         source.generation,
+                                                         core::SegmentRowId(
+                                                             batch.logical_ids[index])};
+          const auto reverse = snapshot.reverse.find(address);
+          if (reverse == snapshot.reverse.end()) {
+            continue;
+          }
+          const auto version = snapshot.versions.find(reverse->second.logical_id);
+          if (version == snapshot.versions.end() || version->second.address != address ||
+              version->second.state != internal::collection::VersionState::live ||
+              !version->second.payload.vector.has_value() ||
+              options_.metric == core::Metric::cosine) {
+            continue;
+          }
+          std::vector<float> expected;
+          status = internal::collection::detail::vector_as_float(*version->second.payload.vector,
+                                                                 expected);
+          if (!status.ok()) {
+            return status;
+          }
+          if (expected.size() != options_.dim ||
+              std::memcmp(expected.data(),
+                          batch.vectors.row<float>(index),
+                          expected.size() * sizeof(float)) != 0) {
+            return error(core::StatusCode::corruption,
+                         core::OperationStage::export_rows,
+                         core::StatusDetail::malformed_struct,
+                         "Flat compact export row differs from the Collection-owned vector");
+          }
+        }
+        done = batch.done;
+      }
+    }
+    return core::Status::success();
+  }
+
+  [[nodiscard]] auto compact_locked(core::SealContext &context)
+      -> core::Result<CollectionCompactReceipt> {
+    auto status = core::validate_runtime_control(context.deadline,
+                                                 context.cancellation,
+                                                 core::OperationStage::build);
+    if (!status.ok()) {
+      return status;
+    }
+    status = normalize_control_state_before_open(options_.root, control_state_);
+    if (!status.ok()) {
+      return status;
+    }
+    if (control_state_.phase == internal::collection::CollectionControlPhase::manifest_published) {
+      status = recover_control_state();
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    if (control_state_.phase != internal::collection::CollectionControlPhase::idle) {
+      return error(core::StatusCode::conflict,
+                   core::OperationStage::build,
+                   core::StatusDetail::none,
+                   "another Collection control-plane operation is in progress");
+    }
+    auto loaded = internal::collection::load_manifest_v2_if_present(options_.root);
+    if (!loaded.ok()) {
+      return loaded.status();
+    }
+    if (!loaded.value().has_value()) {
+      return error(core::StatusCode::not_found,
+                   core::OperationStage::build,
+                   core::StatusDetail::none,
+                   "Flat compact requires at least two sealed manifest entries");
+    }
+    auto base_manifest = std::move(*loaded.value());
+    std::vector<internal::collection::RowAddress> sources;
+    std::uint64_t input_bytes{};
+    for (const auto &entry : base_manifest.segments) {
+      if (entry.lifecycle != internal::collection::SegmentLifecycleV2::sealed ||
+          entry.algorithm_id != core::algorithm::flat) {
+        continue;
+      }
+      sources.push_back(
+          {numeric_segment_id(entry.segment_id), entry.generation, core::SegmentRowId{}});
+      for (const auto &artifact : entry.artifacts) {
+        if (!core::checked_add(input_bytes, artifact.size_bytes, input_bytes)) {
+          input_bytes = std::numeric_limits<std::uint64_t>::max();
+          break;
+        }
+      }
+    }
+    if (sources.size() < 2) {
+      return error(core::StatusCode::not_found,
+                   core::OperationStage::build,
+                   core::StatusDetail::none,
+                   "Flat compact requires at least two sealed Flat segments");
+    }
+    if (control_state_.next_segment_id > 99'999'999) {
+      return error(core::StatusCode::resource_exhausted,
+                   core::OperationStage::build,
+                   core::StatusDetail::arithmetic_overflow,
+                   "Flat segment namespace is exhausted");
+    }
+    auto pinned = implementation_->pin_routing_snapshot();
+    status = verify_flat_exports(*pinned, sources);
+    if (!status.ok()) {
+      return status;
+    }
+    const auto target_segment_id = control_state_.next_segment_id++;
+    constexpr std::uint64_t kTargetGeneration = 1;
+    auto build_data =
+        collect_replacement_rows(*pinned, sources, target_segment_id, kTargetGeneration, false);
+    if (!build_data.ok()) {
+      return build_data.status();
+    }
+    if (build_data.value().live_rows == 0) {
+      return error(core::StatusCode::not_found,
+                   core::OperationStage::build,
+                   core::StatusDetail::none,
+                   "Flat compact sources contain no live rows");
+    }
+    status = context.snapshot_reservation.ensure(build_data.value().snapshot_bytes,
+                                                 core::OperationStage::build,
+                                                 "compact snapshot reservation is too small");
+    if (!status.ok()) {
+      return status;
+    }
+    control_state_.operation = internal::collection::CollectionControlOperation::compact;
+    control_state_.phase = internal::collection::CollectionControlPhase::building;
+    control_state_.sources = sources;
+    control_state_.target_segment_id = target_segment_id;
+    control_state_.target_generation = kTargetGeneration;
+    control_state_.wal_cut = pinned->visibility_watermark;
+    control_state_.pending_compacted_bytes = input_bytes;
+    control_state_.mapping_file = "compact_" + std::to_string(target_segment_id) + ".map";
+    status =
+        internal::collection::CollectionControlStore::save_replacements(options_.root,
+                                                                        control_state_.mapping_file,
+                                                                        build_data.value()
+                                                                            .replacements);
+    if (!status.ok()) {
+      return status;
+    }
+    status = internal::collection::CollectionControlStore::save(options_.root, control_state_);
+    if (!status.ok()) {
+      return status;
+    }
+
+    ::alaya::disk::DiskFlatPublicationOptions publication;
+    publication.collection_root = options_.root;
+    publication.segment_id = internal::collection::detail::flat_segment_name(target_segment_id);
+    publication.segment_generation = kTargetGeneration;
+    publication.manifest_generation =
+        std::max(base_manifest.publication.generation + 1, control_state_.manifest_generation + 1);
+    publication.publication_parent = std::string(internal::collection::kCollectionManifestFilename);
+    publication.metadata_epoch = pinned->metadata_epoch;
+    publication.metadata_checkpoint =
+        "checkpoint_" + std::to_string(control_state_.wal_cut) + ".bin";
+    publication.wal_cut = control_state_.wal_cut;
+    publication.row_versions = {control_state_.wal_cut == 0 ? std::uint64_t{0} : std::uint64_t{1},
+                                control_state_.wal_cut};
+    publication.id_map_checkpoint = publication.metadata_checkpoint;
+    publication.collection_features.manifest_v2_writer = true;
+    publication.abort_policy =
+        internal::collection::ArtifactAbortPolicy::retain_for_restart_cleanup;
+    publication.base_manifest = std::move(base_manifest);
+    core::BuildContext build_context;
+    build_context.growing_reservation = context.build_reservation;
+    build_context.io_credits = context.io_credits;
+    build_context.deadline = context.deadline;
+    build_context.cancellation = context.cancellation;
+    build_context.lane = context.lane;
+    internal::collection::CollectionSchema schema{options_.dim,
+                                                  options_.metric,
+                                                  options_.scalar_type,
+                                                  options_.max_logical_id_bytes};
+    auto built = internal::collection::detail::build_collection_flat_target(schema,
+                                                                            build_data.value().rows,
+                                                                            publication,
+                                                                            build_context);
+    if (!built.ok()) {
+      return built.status();
+    }
+    auto built_target = std::move(built).value();
+    status = patch_published_target_manifest();
+    if (!status.ok()) {
+      return status;
+    }
+    control_state_.phase = internal::collection::CollectionControlPhase::manifest_published;
+    status = internal::collection::CollectionControlStore::save(options_.root, control_state_);
+    if (!status.ok()) {
+      return status;
+    }
+
+    for (const auto &source : sources) {
+      const auto source_name = internal::collection::detail::flat_segment_name(source.segment_id);
+      if (auto entry = pinned->find_segment(source.segment_id, source.generation)) {
+        pending_gc_.push_back({source_name, options_.root / "segments" / source_name, entry});
+      }
+    }
+    internal::collection::SegmentRegistration target;
+    target.segment_id = target_segment_id;
+    target.generation = kTargetGeneration;
+    target.role = internal::collection::SegmentRole::sealed;
+    target.segment = std::move(built_target.segment);
+    target.rows = build_data.value().rows;
+    status = implementation_->install_segment_replacement(sources,
+                                                          std::move(target),
+                                                          build_data.value().replacements);
+    if (!status.ok()) {
+      return status;
+    }
+    pinned.reset();
+    core::CheckpointContext checkpoint_context;
+    checkpoint_context.deadline = context.deadline;
+    checkpoint_context.cancellation = context.cancellation;
+    checkpoint_context.lane = context.lane;
+    checkpoint_context.dirty_page_io_credits = context.io_credits;
+    checkpoint_context.wal_io_credits = context.io_credits;
+    checkpoint_context.durability_target = core::DurabilityTarget::full_checkpoint;
+    auto checkpoint = checkpoint_locked(checkpoint_context);
+    if (!checkpoint.ok()) {
+      return checkpoint.status();
+    }
+
+    CollectionCompactReceipt receipt;
+    for (const auto &source : sources) {
+      receipt.source_segment_ids.push_back(source.segment_id);
+    }
+    receipt.compacted_segment_id = target_segment_id;
+    receipt.compacted_rows = build_data.value().live_rows;
+    receipt.input_bytes = input_bytes;
+    receipt.output_bytes = built_target.artifact_bytes;
+    receipt.manifest_generation = control_state_.manifest_generation;
+    const auto mapping_file = control_state_.mapping_file;
+    if (!core::checked_add(control_state_.compacted_bytes,
+                           input_bytes,
+                           control_state_.compacted_bytes)) {
+      control_state_.compacted_bytes = std::numeric_limits<std::uint64_t>::max();
+    }
+    control_state_.pending_compacted_bytes = 0;
+    control_state_.operation = internal::collection::CollectionControlOperation::idle;
+    control_state_.phase = internal::collection::CollectionControlPhase::idle;
+    control_state_.last_sealed_segment_id = target_segment_id;
+    control_state_.last_sealed_generation = kTargetGeneration;
+    control_state_.sources.clear();
+    control_state_.target_segment_id = 0;
+    control_state_.target_generation = 0;
+    control_state_.wal_cut = 0;
+    control_state_.mapping_file.clear();
+    status = internal::collection::CollectionControlStore::save(options_.root, control_state_);
+    if (!status.ok()) {
+      return status;
+    }
+    internal::collection::CollectionControlStore::remove_replacements(options_.root, mapping_file);
+    return receipt;
+  }
+
+  [[nodiscard]] auto gc_locked() -> core::Result<CollectionGcReceipt> {
+    auto loaded = internal::collection::load_manifest_v2_if_present(options_.root);
+    if (!loaded.ok()) {
+      return loaded.status();
+    }
+    CollectionGcReceipt receipt;
+    if (!loaded.value().has_value()) {
+      return receipt;
+    }
+    auto manifest = std::move(*loaded.value());
+    receipt.pending = manifest.gc.pending_segment_ids.size();
+    std::vector<std::string> reclaim;
+    const auto retained = control_state_.last_sealed_segment_id == 0
+                              ? std::string{}
+                              : internal::collection::detail::flat_segment_name(
+                                    control_state_.last_sealed_segment_id);
+    for (const auto &segment_id : manifest.gc.pending_segment_ids) {
+      if (segment_id == retained) {
+        ++receipt.deferred;
+        continue;
+      }
+      const auto candidate = std::ranges::find_if(pending_gc_, [&](const auto &item) {
+        return item.manifest_segment_id == segment_id;
+      });
+      if (candidate != pending_gc_.end() && !candidate->epoch_reference.expired()) {
+        ++receipt.deferred;
+        continue;
+      }
+      reclaim.push_back(segment_id);
+    }
+    if (reclaim.empty()) {
+      receipt.manifest_generation = manifest.publication.generation;
+      return receipt;
+    }
+
+    manifest.gc.phase = internal::collection::GcPhaseV2::reclaimable;
+    ++manifest.gc.generation;
+    manifest.publication.generation =
+        std::max(manifest.publication.generation + 1, control_state_.manifest_generation + 1);
+    manifest.publication.parent = std::string(internal::collection::kCollectionManifestFilename);
+    auto status = internal::collection::publish_manifest_v2_atomic(options_.root, manifest);
+    if (!status.ok()) {
+      return status;
+    }
+
+    try {
+      for (const auto &segment_id : reclaim) {
+        const auto entry = std::ranges::find_if(manifest.segments, [&](const auto &item) {
+          return item.segment_id == segment_id;
+        });
+        if (entry != manifest.segments.end()) {
+          if (entry->lifecycle != internal::collection::SegmentLifecycleV2::gc_pending) {
+            return error(core::StatusCode::conflict,
+                         core::OperationStage::save,
+                         core::StatusDetail::none,
+                         "GC refused a segment that is not gc_pending");
+          }
+          for (const auto &artifact : entry->artifacts) {
+            if (!core::checked_add(receipt.reclaimed_bytes,
+                                   artifact.size_bytes,
+                                   receipt.reclaimed_bytes)) {
+              receipt.reclaimed_bytes = std::numeric_limits<std::uint64_t>::max();
+              break;
+            }
+          }
+          std::filesystem::remove_all(options_.root / "segments" / segment_id);
+        }
+        ++receipt.reclaimed;
+      }
+      const auto segments_root = options_.root / "segments";
+      if (std::filesystem::is_directory(segments_root)) {
+        platform::sync_directory_or_throw(segments_root);
+      }
+    } catch (...) {
+      return core::status_from_exception(core::OperationStage::save);
+    }
+
+    std::erase_if(manifest.segments, [&](const auto &entry) {
+      return std::ranges::find(reclaim, entry.segment_id) != reclaim.end();
+    });
+    std::erase_if(manifest.gc.pending_segment_ids, [&](const auto &segment_id) {
+      return std::ranges::find(reclaim, segment_id) != reclaim.end();
+    });
+    manifest.gc.phase = manifest.gc.pending_segment_ids.empty()
+                            ? internal::collection::GcPhaseV2::idle
+                            : internal::collection::GcPhaseV2::pending;
+    ++manifest.gc.generation;
+    manifest.gc.retained_sources =
+        retained.empty() ? std::vector<std::string>{} : std::vector<std::string>{retained};
+    manifest.publication.generation =
+        std::max(manifest.publication.generation + 1, control_state_.manifest_generation + 1);
+    manifest.publication.parent = std::string(internal::collection::kCollectionManifestFilename);
+    status = internal::collection::publish_manifest_v2_atomic(options_.root, manifest);
+    if (!status.ok()) {
+      return status;
+    }
+    control_state_.manifest_generation = manifest.publication.generation;
+    status = internal::collection::CollectionControlStore::save(options_.root, control_state_);
+    if (!status.ok()) {
+      return status;
+    }
+    std::erase_if(pending_gc_, [&](const auto &candidate) {
+      return std::ranges::find(reclaim, candidate.manifest_segment_id) != reclaim.end();
+    });
+    receipt.manifest_generation = manifest.publication.generation;
+    return receipt;
   }
 
   [[nodiscard]] auto write(const CollectionItem &item,
@@ -640,7 +1827,28 @@ class Collection {
     request.mode = mode;
     request.options = std::move(options);
     core::MutationContext context;
-    return implementation_->write(request, context);
+    auto receipt = implementation_->write(request, context);
+    if (receipt.ok()) {
+      maybe_auto_seal();
+    }
+    return receipt;
+  }
+
+  void maybe_auto_seal() noexcept {
+    if (options_.auto_seal_rows == 0) {
+      return;
+    }
+    try {
+      const auto snapshot = implementation_->pin_routing_snapshot();
+      const auto active = snapshot->find_active_mutable();
+      if (active == nullptr || snapshot->known_rows_for(*active) < options_.auto_seal_rows) {
+        return;
+      }
+      (void)seal();
+    } catch (...) {
+      // The committed mutation remains authoritative. Auto-seal is a
+      // best-effort control-plane policy and can be retried explicitly.
+    }
   }
 
   [[nodiscard]] auto execute_search(const core::TypedTensorView &queries,
@@ -806,6 +2014,9 @@ class Collection {
   CollectionOptions options_{};
   std::shared_ptr<internal::collection::SegmentedCollection> implementation_{};
   bool imported_{};
+  mutable std::mutex control_mutex_{};
+  internal::collection::CollectionControlState control_state_{};
+  std::vector<PendingGcCandidate> pending_gc_{};
 };
 
 }  // namespace alaya

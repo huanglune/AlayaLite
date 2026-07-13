@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <shared_mutex>
 #include <span>
 #include <string>
@@ -586,6 +587,158 @@ class SegmentedCollection {
     CollectionCheckpointStore::apply_to_manifest(checkpoint, manifest);
   }
 
+  using RotationDurableCallback = std::function<core::Status(const ActiveRotationReceipt &)>;
+
+  [[nodiscard]] auto rotate_to_successor(SegmentRegistration successor,
+                                         core::CheckpointContext &context,
+                                         RotationDurableCallback durable_switch)
+      -> core::Result<ActiveRotationReceipt> {
+    std::lock_guard checkpoint_lock(checkpoint_mutex_);
+    auto admission = admit();
+    if (!admission.has_value()) {
+      return closed_status(core::OperationStage::freeze);
+    }
+    if (!config_.features.wal_coordinator || wal_ == nullptr) {
+      return core::Status::error(core::StatusCode::not_supported,
+                                 core::OperationStage::freeze,
+                                 core::StatusDetail::operation_slot_absent,
+                                 "successor rotation requires the Collection WAL coordinator");
+    }
+    auto control = core::validate_runtime_control(context.deadline,
+                                                  context.cancellation,
+                                                  core::OperationStage::freeze);
+    if (!control.ok()) {
+      return control;
+    }
+    if (successor.role != SegmentRole::active_mutable || !successor.rows.empty()) {
+      return core::Status::error(core::StatusCode::invalid_argument,
+                                 core::OperationStage::freeze,
+                                 core::StatusDetail::malformed_struct,
+                                 "successor registration must be an empty active mutable segment");
+    }
+    const auto successor_descriptor = successor.segment.descriptor();
+    if (!successor.segment.capabilities().supports(core::OperationCapability::mutation) ||
+        !successor.segment.capabilities().supports(core::OperationCapability::checkpoint) ||
+        successor_descriptor.dim != schema_.dim || successor_descriptor.metric != schema_.metric ||
+        successor_descriptor.stored_scalar_type != schema_.scalar_type ||
+        successor.segment_id == 0 || successor.generation == 0) {
+      return core::Status::
+          error(core::StatusCode::invalid_argument,
+                core::OperationStage::freeze,
+                core::StatusDetail::readonly_instance,
+                "successor does not satisfy the active mutable schema/capabilities");
+    }
+
+    ControlPlaneGate gate(this);
+    control = gate.drain(context.deadline, context.cancellation);
+    if (!control.ok()) {
+      return control;
+    }
+    std::lock_guard mutation_lock(mutation_mutex_);
+    const auto current = load_snapshot();
+    const auto source = current->find_active_mutable();
+    if (source == nullptr) {
+      return core::Status::error(core::StatusCode::conflict,
+                                 core::OperationStage::freeze,
+                                 core::StatusDetail::readonly_instance,
+                                 "successor rotation found no active mutable source");
+    }
+    if (current->find_segment(successor.segment_id, successor.generation) != nullptr) {
+      return core::Status::error(core::StatusCode::conflict,
+                                 core::OperationStage::freeze,
+                                 core::StatusDetail::already_exists,
+                                 "successor segment identity is already routed");
+    }
+
+    core::CheckpointToken source_token;
+    auto status = source->segment.checkpoint(context, source_token);
+    if (!status.ok()) {
+      return status;
+    }
+    core::CheckpointToken successor_token;
+    status = successor.segment.checkpoint(context, successor_token);
+    if (!status.ok()) {
+      return status;
+    }
+
+    auto next = std::make_shared<RoutingSnapshot>(*current);
+    for (auto &entry : next->segments) {
+      if (entry->segment_id == source->segment_id && entry->generation == source->generation) {
+        entry = std::make_shared<SegmentEntry>(source->segment_id,
+                                               source->generation,
+                                               SegmentRole::sealed,
+                                               source->segment,
+                                               source->exact_rerank,
+                                               source->next_row_id.load(std::memory_order_acquire),
+                                               source->atomic_mutation_bundle);
+        break;
+      }
+    }
+    next->segments.push_back(std::make_shared<SegmentEntry>(successor.segment_id,
+                                                            successor.generation,
+                                                            successor.role,
+                                                            std::move(successor.segment),
+                                                            std::move(successor.exact_rerank),
+                                                            successor.next_row_id,
+                                                            successor.atomic_mutation_bundle));
+    next->generation = current->generation + 1;
+
+    auto stored = CollectionCheckpointStore::write(wal_->directory(),
+                                                   *next,
+                                                   retry_receipts_,
+                                                   batch_retry_receipts_);
+    if (!stored.ok()) {
+      return stored.status();
+    }
+    auto receipt = std::move(stored).value();
+    status = wal_->reset_to_checkpoint(receipt.wal_cut);
+    if (!status.ok()) {
+      return status;
+    }
+    next->durable_watermark = receipt.durable_watermark;
+    ActiveRotationReceipt rotation{source->segment_id,
+                                   source->generation,
+                                   successor.segment_id,
+                                   successor.generation,
+                                   receipt};
+    if (durable_switch) {
+      status = durable_switch(rotation);
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    publish_snapshot(std::move(next));
+    return rotation;
+  }
+
+  [[nodiscard]] auto install_segment_replacement(std::span<const RowAddress> sources,
+                                                 SegmentRegistration target,
+                                                 std::span<const SegmentReplacement> replacements)
+      -> core::Status {
+    auto admission = admit();
+    if (!admission.has_value()) {
+      return closed_status(core::OperationStage::save);
+    }
+    std::lock_guard mutation_lock(mutation_mutex_);
+    return install_segment_replacement_locked(sources, std::move(target), replacements, false);
+  }
+
+  [[nodiscard]] auto resume_segment_replacement(std::span<const RowAddress> sources,
+                                                std::uint64_t target_segment_id,
+                                                std::uint64_t target_generation,
+                                                std::span<const SegmentReplacement> replacements)
+      -> core::Status {
+    auto admission = admit();
+    if (!admission.has_value()) {
+      return closed_status(core::OperationStage::open);
+    }
+    std::lock_guard mutation_lock(mutation_mutex_);
+    SegmentRegistration target;
+    target.segment_id = target_segment_id;
+    target.generation = target_generation;
+    return install_segment_replacement_locked(sources, std::move(target), replacements, true);
+  }
+
   // Internal tests and control-plane code can pin this immutable epoch. The
   // shared reference is the reclamation barrier for every SegmentEntry it owns.
   [[nodiscard]] auto pin_routing_snapshot() const -> RoutingSnapshotPtr { return load_snapshot(); }
@@ -772,6 +925,129 @@ class SegmentedCollection {
 
   explicit SegmentedCollection(CollectionSchema schema, CollectionConfig config)
       : schema_(std::move(schema)), config_(std::move(config)) {}
+
+  [[nodiscard]] auto install_segment_replacement_locked(
+      std::span<const RowAddress> sources,
+      SegmentRegistration target,
+      std::span<const SegmentReplacement> replacements,
+      bool target_is_already_routed) -> core::Status {
+    if (sources.empty() || target.segment_id == 0 || target.generation == 0) {
+      return core::Status::error(core::StatusCode::invalid_argument,
+                                 core::OperationStage::save,
+                                 core::StatusDetail::malformed_struct,
+                                 "segment replacement identities are incomplete");
+    }
+    const auto is_source = [&](const RowAddress &address) {
+      return std::ranges::any_of(sources, [&](const RowAddress &source) {
+        return source.segment_id == address.segment_id && source.generation == address.generation;
+      });
+    };
+    const auto current = load_snapshot();
+    for (const auto &source : sources) {
+      if (current->find_segment(source.segment_id, source.generation) == nullptr) {
+        return core::Status::error(core::StatusCode::not_found,
+                                   core::OperationStage::save,
+                                   core::StatusDetail::none,
+                                   "segment replacement source is no longer routed");
+      }
+    }
+
+    std::shared_ptr<SegmentEntry> target_entry;
+    if (target_is_already_routed) {
+      target_entry = current->find_segment(target.segment_id, target.generation);
+      if (target_entry == nullptr) {
+        return core::Status::error(core::StatusCode::corruption,
+                                   core::OperationStage::open,
+                                   core::StatusDetail::malformed_struct,
+                                   "published replacement target is not registered");
+      }
+    } else {
+      if (current->find_segment(target.segment_id, target.generation) != nullptr) {
+        return core::Status::error(core::StatusCode::conflict,
+                                   core::OperationStage::save,
+                                   core::StatusDetail::already_exists,
+                                   "segment replacement target is already routed");
+      }
+      const auto descriptor = target.segment.descriptor();
+      if (!target.segment.capabilities().supports(core::OperationCapability::search) ||
+          descriptor.dim != schema_.dim || descriptor.metric != schema_.metric ||
+          descriptor.stored_scalar_type != schema_.scalar_type) {
+        return core::Status::
+            error(core::StatusCode::invalid_argument,
+                  core::OperationStage::save,
+                  core::StatusDetail::malformed_struct,
+                  "segment replacement target disagrees with the Collection schema");
+      }
+      target_entry = std::make_shared<SegmentEntry>(target.segment_id,
+                                                    target.generation,
+                                                    SegmentRole::sealed,
+                                                    std::move(target.segment),
+                                                    std::move(target.exact_rerank),
+                                                    target.next_row_id,
+                                                    false);
+    }
+
+    std::set<RowAddress> mapped_sources;
+    std::set<RowAddress> mapped_targets;
+    for (const auto &replacement : replacements) {
+      if (!is_source(replacement.source) || replacement.target.segment_id != target.segment_id ||
+          replacement.target.generation != target.generation ||
+          !mapped_sources.insert(replacement.source).second ||
+          !mapped_targets.insert(replacement.target).second) {
+        return core::Status::
+            error(core::StatusCode::invalid_argument,
+                  core::OperationStage::save,
+                  core::StatusDetail::malformed_struct,
+                  "segment replacement map contains an invalid or duplicate address");
+      }
+    }
+    for (const auto &[unused, version] : current->versions) {
+      (void)unused;
+      if (is_source(version.address) && !mapped_sources.contains(version.address)) {
+        return core::Status::
+            error(core::StatusCode::conflict,
+                  core::OperationStage::save,
+                  core::StatusDetail::none,
+                  "segment replacement map does not cover every current source version");
+      }
+    }
+
+    auto next = std::make_shared<RoutingSnapshot>(*current);
+    if (!target_is_already_routed) {
+      next->segments.push_back(target_entry);
+    }
+    for (const auto &replacement : replacements) {
+      next->reverse.insert_or_assign(replacement.target,
+                                     ReverseEntry{replacement.logical_id,
+                                                  replacement.upsert_sequence});
+      const auto found = next->versions.find(replacement.logical_id);
+      if (found != next->versions.end() && found->second.address == replacement.source &&
+          found->second.upsert_sequence == replacement.upsert_sequence) {
+        found->second.address = replacement.target;
+      }
+      const auto row = static_cast<std::uint64_t>(replacement.target.row_id);
+      if (row != std::numeric_limits<std::uint64_t>::max()) {
+        auto first_unused = target_entry->next_row_id.load(std::memory_order_acquire);
+        while (first_unused <= row &&
+               !target_entry->next_row_id.compare_exchange_weak(first_unused,
+                                                                row + 1,
+                                                                std::memory_order_acq_rel)) {
+        }
+      }
+    }
+    std::erase_if(next->reverse, [&](const auto &item) {
+      return is_source(item.first);
+    });
+    std::erase_if(next->segments, [&](const auto &entry) {
+      return std::ranges::any_of(sources, [&](const RowAddress &source) {
+        return source.segment_id == entry->segment_id && source.generation == entry->generation;
+      });
+    });
+    next->generation = current->generation + 1;
+    recalculate_counts(*next);
+    publish_snapshot(std::move(next));
+    return core::Status::success();
+  }
 
   [[nodiscard]] auto initialize(std::vector<SegmentRegistration> registrations) -> core::Status {
     auto snapshot = std::make_shared<RoutingSnapshot>();
@@ -2198,6 +2474,15 @@ class SegmentedCollection {
                                    core::OperationStage::mutation_replay,
                                    core::StatusDetail::malformed_struct,
                                    "one WAL transaction targets multiple segment instances");
+      }
+      const auto row_id = static_cast<std::uint64_t>(row.target.row_id);
+      if (row_id != std::numeric_limits<std::uint64_t>::max()) {
+        auto first_unused = target->next_row_id.load(std::memory_order_acquire);
+        while (first_unused <= row_id &&
+               !target->next_row_id.compare_exchange_weak(first_unused,
+                                                          row_id + 1,
+                                                          std::memory_order_acq_rel)) {
+        }
       }
     }
     if (!target->segment.capabilities().supports(core::OperationCapability::mutation)) {
