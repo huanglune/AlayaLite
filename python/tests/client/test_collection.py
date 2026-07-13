@@ -14,11 +14,9 @@ import shutil
 import tempfile
 import unittest
 import uuid
-from unittest.mock import patch
 
 import numpy as np
 from alayalite import Collection
-from alayalite.index import Index
 from alayalite.schema import IndexParams
 from alayalite.utils import calc_gt, calc_recall, normalize_vectors_for_cosine_metric
 
@@ -117,16 +115,15 @@ class TestCollection(unittest.TestCase):
             self.collection.get_cpp_index()
 
     def test_insert_uses_explicit_build_threads(self):
-        """First-build fit should honor explicit build thread parameters."""
+        """Canonical native creation must receive the requested build thread count."""
         items = [
             (1, "Document 1", np.array([0.1, 0.2, 0.3], dtype=np.float32), {"category": "A"}),
             (2, "Document 2", np.array([0.4, 0.5, 0.6], dtype=np.float32), {"category": "B"}),
         ]
         collection = self._create_collection("test_collection_threads", self._collection_params(build_threads=7))
-        with patch.object(Index, "fit", autospec=True, return_value=None) as mock_fit:
-            collection.insert(items)
+        collection.insert(items)
 
-        self.assertEqual(mock_fit.call_args.kwargs["num_threads"], 7)
+        self.assertEqual(collection.get_cpp_index().options()["build_threads"], 7)
 
     def test_upsert_fit_and_concat(self):
         items = [
@@ -180,31 +177,32 @@ class TestCollection(unittest.TestCase):
         ]
         self.collection.insert(items)
 
-        cpp_index = self.collection.get_cpp_index()
-        scalars = cpp_index.batch_get_scalar_data_by_internal_ids(np.array([0, 1, 99], dtype=np.uint32))
+        # Gate 9-A removes the PyIndex/RocksDB internal-row escape hatch. Pin
+        # the same scalar values by LogicalId through the canonical owner.
+        scalars = self.collection.get_records([1, 2, 99])
 
-        self.assertEqual(len(scalars), 3)
-        self.assertEqual(scalars[0]["item_id"], "1")
+        self.assertEqual(len(scalars), 2)
+        self.assertEqual(scalars[0]["id"], "1")
         self.assertEqual(scalars[1]["metadata"]["category"], "B")
-        self.assertEqual(scalars[2].get("item_id", ""), "")
+        self.assertEqual(scalars[0]["vector"].dtype, np.float32)
 
     def test_cpp_internal_id_bridge_supports_uint64(self):
         params = self._collection_params(id_type=np.uint64)
         collection = self._create_collection("test_collection_uint64_bridge", params)
         collection.insert([("a", "Document A", np.array([0.1, 0.2, 0.3], dtype=np.float32), {"kind": "seed"})])
 
-        cpp_index = collection.get_cpp_index()
-        scalar = cpp_index.get_scalar_data_by_internal_id(np.uint64(0))
-        self.assertEqual(scalar["item_id"], "a")
+        view = collection.get_cpp_index()
+        self.assertFalse(view.mutable)
+        scalar = collection.get_records([np.uint64(0), "a"])[0]
+        self.assertEqual(scalar["id"], "a")
+        self.assertEqual(collection.get_index_params().id_type, np.uint64)
 
-        item_ids = cpp_index.batch_get_item_ids_by_internal_ids(np.array([0], dtype=np.uint64))
-        self.assertEqual(list(item_ids), ["a"])
-
-        vector = cpp_index.get_data_by_id(np.uint64(0))
+        vector = scalar["vector"]
         self.assertEqual(vector.shape[0], 3)
+        self.assertEqual(vector.dtype, np.float32)
 
-        cpp_index.remove(np.uint64(0))
-        self.assertFalse(cpp_index.contains("a"))
+        collection.delete_by_id(["a"])
+        self.assertEqual(collection.get_by_id(["a"])["id"], [])
 
     def test_upsert(self):
         """Test updating an existing item in the collection."""
@@ -322,6 +320,7 @@ class TestCollection(unittest.TestCase):
     def test_rabitq_collection_build_with_scalar_data_keeps_space_accessible(self):
         """RaBitQ collection build should succeed with metadata-backed scalar storage."""
         params = self._collection_params(
+            index_type="qg",
             quantization_type="rabitq",
             metric="l2",
             capacity=10_000,
@@ -338,13 +337,9 @@ class TestCollection(unittest.TestCase):
         labels = np.array(["A", "B", "C"], dtype=object)[ids % 3]
         items = [(str(i), f"Document {i}", vectors[i], {"category": labels[i]}) for i in range(total)]
 
-        try:
-            collection.insert(items)
-        except (RuntimeError, ValueError) as exc:
-            self.skipTest(f"RaBitQ runtime support unavailable in this environment: {exc}")
+        collection.insert(items)
 
-        cpp_index = collection.get_cpp_index()
-        vector = cpp_index.get_data_by_id(0)
+        vector = collection.get_records([0])[0]["vector"]
         self.assertEqual(vector.shape[0], 64)
         self.assertGreater(float(np.linalg.norm(vector)), 0.0)
 
@@ -495,7 +490,7 @@ class TestCollection(unittest.TestCase):
             )
 
     def test_hybrid_query_materialized_view_merges_multiple_partitions(self):
-        """Eligible IN filters should use MV partitions and keep exact global ordering."""
+        """IN filters should keep exact global ordering across metadata values."""
         params = self._collection_params(
             quantization_type="sq8",
             metric="l2",
@@ -512,9 +507,6 @@ class TestCollection(unittest.TestCase):
         ]
         collection.insert(items)
 
-        cpp_index = collection.get_cpp_index()
-        self.assertEqual(cpp_index.get_materialized_view_partition_count(), 3)
-
         result = collection.hybrid_query(
             [[0.55, 0.0, 0.0]],
             limit=3,
@@ -525,7 +517,7 @@ class TestCollection(unittest.TestCase):
         self.assertEqual(result["id"][0], ["c1", "c2", "a2"])
 
     def test_hybrid_query_materialized_view_partition_only_eq_filter(self):
-        """Pure partition-field EQ filters should return partition-local ANN results correctly."""
+        """Pure metadata EQ filters should return the filtered ANN results correctly."""
         params = self._collection_params(
             quantization_type="sq8",
             metric="l2",
@@ -541,9 +533,6 @@ class TestCollection(unittest.TestCase):
         ]
         collection.insert(items)
 
-        cpp_index = collection.get_cpp_index()
-        self.assertEqual(cpp_index.get_materialized_view_partition_count(), 2)
-
         result = collection.hybrid_query(
             [[0.1, 0.0, 0.0]],
             limit=2,
@@ -555,7 +544,7 @@ class TestCollection(unittest.TestCase):
         self.assertEqual(result["id"][0], ["a1", "a2"])
 
     def test_materialized_view_invalidates_after_incremental_insert(self):
-        """Incremental updates should drop stale MV partitions and fall back to runtime hybrid search."""
+        """Incremental updates must be visible to the pinned-snapshot filter projection."""
         params = self._collection_params(
             quantization_type="none",
             metric="l2",
@@ -570,12 +559,9 @@ class TestCollection(unittest.TestCase):
         ]
         collection.insert(items)
 
-        cpp_index = collection.get_cpp_index()
-        self.assertEqual(cpp_index.get_materialized_view_partition_count(), 2)
+        self.assertFalse(collection.get_cpp_index().mutable)
 
         collection.insert([("a3", "Doc A3", np.array([0.05, 0.0, 0.0], dtype=np.float32), {"category": "A"})])
-
-        self.assertEqual(cpp_index.get_materialized_view_partition_count(), 0)
 
         result = collection.hybrid_query(
             [[0.05, 0.0, 0.0]],
@@ -586,8 +572,9 @@ class TestCollection(unittest.TestCase):
         self.assertEqual(result["id"][0][0], "a3")
 
     def test_rabitq_batch_hybrid_query_uses_materialized_view_without_crashing(self):
-        """Batch MV hybrid search should handle RaBitQ partition-local ids larger than 31."""
+        """Explicit-QG batch hybrid search should handle filtered ids larger than 31."""
         params = self._collection_params(
+            index_type="qg",
             quantization_type="rabitq",
             metric="l2",
             capacity=600,
@@ -614,13 +601,7 @@ class TestCollection(unittest.TestCase):
                     {"labels": f"label_{i % 10}", "id": i},
                 )
             )
-        try:
-            collection.insert(items)
-        except (RuntimeError, ValueError) as exc:
-            self.skipTest(f"RaBitQ runtime support unavailable in this environment: {exc}")
-
-        cpp_index = collection.get_cpp_index()
-        self.assertEqual(cpp_index.get_materialized_view_partition_count(), 10)
+        collection.insert(items)
 
         target_ids = [331, 341, 351, 361, 371]
         queries = [items[i][2].tolist() for i in target_ids]
@@ -738,7 +719,10 @@ class TestCollection(unittest.TestCase):
         self.assertEqual(set(result_remaining["id"]), {str(i) for i in remaining_ids})
 
         # Step 3: Reindex to rebuild the graph with only remaining items
-        self.collection.reindex()
+        self.collection.reindex(ef_construction=211, num_threads=3)
+        rebuilt_options = self.collection.get_cpp_index().options()
+        self.assertEqual(rebuilt_options["ef_construction"], 211)
+        self.assertEqual(rebuilt_options["build_threads"], 3)
 
         # --- Recall check after reindex ---
         remaining_vectors = vectors[900:]  # 100 remaining vectors

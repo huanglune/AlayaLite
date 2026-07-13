@@ -3,6 +3,42 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 alaya_cc_target(segmented_collection_header_closure SRCS segmented_collection_header_closure.cpp)
+alaya_cc_target(collection_header_closure SRCS collection_header_closure.cpp)
+
+alaya_cc_target(
+  collection_facade_test
+  SRCS collection_facade_test.cpp
+  GTEST
+)
+alaya_add_test(
+  NAME collection_facade_test
+  TARGET collection_facade_test
+  LABELS unit collection canonical
+  TIMEOUT 60
+)
+alaya_cc_target(
+  collection_facade_importer_test
+  SRCS collection_facade_importer_test.cpp
+  GTEST
+  DEFS ALAYA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+)
+alaya_add_test(
+  NAME collection_facade_importer_test
+  TARGET collection_facade_importer_test
+  LABELS integration collection canonical migration
+  TIMEOUT 180
+)
+alaya_cc_target(
+  collection_facade_stress_test
+  SRCS collection_facade_stress_test.cpp
+  GTEST
+)
+alaya_add_test(
+  NAME collection_facade_stress_test
+  TARGET collection_facade_stress_test
+  LABELS collection canonical stress tsan
+  TIMEOUT 120
+)
 alaya_cc_target(logical_wal_header_closure SRCS logical_wal_header_closure.cpp)
 alaya_cc_target(mutation_wal_codec_header_closure SRCS mutation_wal_codec_header_closure.cpp)
 alaya_cc_target(collection_checkpoint_header_closure SRCS collection_checkpoint_header_closure.cpp)
@@ -56,7 +92,11 @@ alaya_cc_target(
 alaya_add_test(
   NAME wal_coordinator_test
   TARGET wal_coordinator_test
-  LABELS unit collection persistence wal crash
+  LABELS unit
+         collection
+         persistence
+         wal
+         crash
   TIMEOUT 120
 )
 

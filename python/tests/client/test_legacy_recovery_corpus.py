@@ -121,7 +121,10 @@ def _verify_index(index, generation: dict, expected: dict) -> None:
 
 
 def _verify_collection(collection, generation: dict, expected: dict) -> None:
-    assert int(collection.get_cpp_index().get_data_num()) == expected["expected_count"]
+    stats = collection.stats()
+    assert int(stats["size"]) == expected["expected_live_count"]
+    assert int(stats["allocated_count"]) >= int(stats["size"])
+    assert collection.get_cpp_index().options()["imported_legacy_layout"] is True
 
     found = collection.get_by_id(expected["item_lookup_order"])
     expected_items = expected["expected_items"]
@@ -139,12 +142,17 @@ def _verify_collection(collection, generation: dict, expected: dict) -> None:
 
 @pytest.mark.parametrize("case", CORPUS_MANIFEST["cases"], ids=_case_id)
 def test_legacy_reader_recovers_checked_in_corpus(case, tmp_path):
-    """Open/recover each old-format case in a disposable copy and pin its terminal state."""
+    """Recover legacy Index cases and import Collection cases without changing source bytes."""
     source = CORPUS_ROOT / case["name"]
     copied_case = tmp_path / case["name"]
     shutil.copytree(source, copied_case)
     _relocate_schema(copied_case)
     _relocate_scalar_paths(copied_case, case["has_scalar_data"])
+    frozen_source = {
+        path.relative_to(copied_case): (path.stat().st_size, hashlib.sha256(path.read_bytes()).hexdigest())
+        for path in copied_case.rglob("*")
+        if path.is_file()
+    }
 
     generation = _read_json(copied_case / "generation.json")
     expected = _read_json(copied_case / "expected.json")
@@ -154,19 +162,24 @@ def test_legacy_reader_recovers_checked_in_corpus(case, tmp_path):
             index = client.get_index(case["name"])
             assert index is not None
             _verify_index(index, generation, expected)
+
+            recovered_manifest = _manifest_fields(copied_case)
+            assert int(recovered_manifest["applied_through_op_id"]) == expected["expected_applied_through_op_id"]
+            if case["terminal_shape"] in {
+                "committed_wal_tail",
+                "snapshot_plus_committed_wal_tail",
+                "torn_wal_tail",
+            }:
+                assert recovered_manifest["reason"] == "post_recovery"
+            assert not (copied_case / "recovery" / "wal.bin").exists()
         else:
             collection = client.get_collection(case["name"])
             assert collection is not None
             _verify_collection(collection, generation, expected)
-
-        recovered_manifest = _manifest_fields(copied_case)
-        assert int(recovered_manifest["applied_through_op_id"]) == expected["expected_applied_through_op_id"]
-        if case["terminal_shape"] in {
-            "committed_wal_tail",
-            "snapshot_plus_committed_wal_tail",
-            "torn_wal_tail",
-        }:
-            assert recovered_manifest["reason"] == "post_recovery"
-        assert not (copied_case / "recovery" / "wal.bin").exists()
+            assert (copied_case / ".alaya_internal" / "legacy_import_v1" / "ACTIVE").is_file()
+            for relative, (expected_bytes, expected_sha) in frozen_source.items():
+                path = copied_case / relative
+                assert path.stat().st_size == expected_bytes
+                assert hashlib.sha256(path.read_bytes()).hexdigest() == expected_sha
     finally:
         client.reset()

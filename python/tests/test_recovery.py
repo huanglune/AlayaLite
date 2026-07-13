@@ -82,11 +82,17 @@ class TestRecovery(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 91, msg=result.stdout + result.stderr)
 
-        recovery_dir = os.path.join(self.temp_dir, "recovering", "recovery")
+        recovery_dir = os.path.join(
+            self.temp_dir,
+            "recovering",
+            ".alaya_internal",
+            "collection_wal_v1",
+        )
         self.assertTrue(os.path.isfile(os.path.join(self.temp_dir, "recovering", "schema.json")))
         self.assertTrue(os.path.isfile(os.path.join(recovery_dir, "CURRENT")))
-        self.assertTrue(os.path.isdir(os.path.join(recovery_dir, "snapshots")))
-        self.assertTrue(os.path.isfile(os.path.join(recovery_dir, "wal.bin")))
+        self.assertTrue(os.path.isfile(os.path.join(recovery_dir, "checkpoint_0.bin")))
+        self.assertTrue(os.path.isfile(os.path.join(recovery_dir, "logical.wal")))
+        self.assertFalse(os.path.exists(os.path.join(self.temp_dir, "recovering", "recovery", "wal.bin")))
 
         recovered_client = Client(self.temp_dir)
         recovered = recovered_client.get_collection("recovering")
