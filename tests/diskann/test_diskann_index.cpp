@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -254,6 +255,123 @@ TEST_F(DiskANNIndexTest, SearchRejectsNullQueryAndZeroTopK) {
   EXPECT_THROW(idx.search(nullptr, 10, out_l.data(), out_d.data()), std::invalid_argument);
   EXPECT_THROW(idx.search(v.data(), 0, out_l.data(), out_d.data()), std::invalid_argument);
 }
+
+#if defined(__linux__)
+TEST_F(DiskANNIndexTest, ReadonlyPipelinedSearchReturnsIncrementalPerQueryCounts) {
+  const uint64_t n = 400, dim = 32;
+  const uint32_t nq = 8, k = 10;
+  const auto v = make_vectors(n, dim);
+  const auto labels = make_labels(n);
+  const auto queries = make_vectors(nq, dim, /*seed=*/2026);
+  DiskANNBuildParams bp;
+  bp.R = 32;
+  bp.cache_ratio = 0.0;
+  DiskANNIndex::build(dir(), v.data(), labels.data(), n, dim, bp);
+
+  DiskANNIndex idx;
+  DiskANNLoadParams load;
+  load.num_threads = 4;
+  load.beam_width = 4;
+  load.scratch_search_list_size = 96;
+  load.updatable = false;
+  idx.load(dir(), load);
+  const DiskANNSearchParams sp{/*L=*/96,
+                               /*use_pq=*/false,
+                               /*rerank=*/false,
+                               /*rerank_count=*/0,
+                               /*deterministic=*/true};
+  std::vector<uint64_t> direct_labels(nq * k);
+  std::vector<float> direct_distances(nq * k);
+  for (uint32_t query = 0; query < nq; ++query) {
+    ASSERT_EQ(idx.search(queries.data() + query * dim,
+                         k,
+                         direct_labels.data() + query * k,
+                         direct_distances.data() + query * k,
+                         sp),
+              k);
+  }
+
+  std::vector<uint64_t> pipeline_labels(nq * k);
+  std::vector<float> pipeline_distances(nq * k);
+  std::vector<uint32_t> counts(nq, std::numeric_limits<uint32_t>::max());
+  idx.search_pipelined(queries.data(),
+                       nq,
+                       k,
+                       pipeline_labels.data(),
+                       pipeline_distances.data(),
+                       /*num_threads=*/4,
+                       /*pipeline=*/4,
+                       sp,
+                       nullptr,
+                       nullptr,
+                       counts.data());
+  EXPECT_EQ(counts, std::vector<uint32_t>(nq, k));
+  EXPECT_EQ(pipeline_labels, direct_labels);
+  for (std::size_t index = 0; index < pipeline_distances.size(); ++index) {
+    EXPECT_FLOAT_EQ(pipeline_distances[index], direct_distances[index]) << "index=" << index;
+  }
+}
+
+TEST_F(DiskANNIndexTest, ReadonlyPipelinedPqRerankMatchesDirectBitwise) {
+  const uint64_t n = 400, dim = 32;
+  const uint32_t nq = 8, k = 10;
+  const auto v = make_vectors(n, dim);
+  const auto labels = make_labels(n);
+  const auto queries = make_vectors(nq, dim, /*seed=*/2027);
+  DiskANNBuildParams bp;
+  bp.R = 32;
+  bp.cache_ratio = 0.0;
+  bp.pq_n_chunks = 8;
+  DiskANNIndex::build(dir(), v.data(), labels.data(), n, dim, bp);
+
+  DiskANNIndex idx;
+  DiskANNLoadParams load;
+  load.num_threads = 4;
+  load.beam_width = 4;
+  load.scratch_search_list_size = 96;
+  load.updatable = false;
+  idx.load(dir(), load);
+  const DiskANNSearchParams sp{/*L=*/96,
+                               /*use_pq=*/true,
+                               /*rerank=*/true,
+                               /*rerank_count=*/0,
+                               /*deterministic=*/true};
+  std::vector<uint64_t> direct_labels(nq * k);
+  std::vector<float> direct_distances(nq * k);
+  for (uint32_t query = 0; query < nq; ++query) {
+    ASSERT_EQ(idx.search(queries.data() + query * dim,
+                         k,
+                         direct_labels.data() + query * k,
+                         direct_distances.data() + query * k,
+                         sp),
+              k);
+  }
+
+  std::vector<uint64_t> pipeline_labels(nq * k);
+  std::vector<float> pipeline_distances(nq * k);
+  std::vector<uint32_t> counts(nq);
+  const alaya::diskann::BeamSearchCancelProbe probe{nullptr, [](const void *) noexcept {
+                                                      return false;
+                                                    }};
+  idx.search_pipelined(queries.data(),
+                       nq,
+                       k,
+                       pipeline_labels.data(),
+                       pipeline_distances.data(),
+                       /*num_threads=*/4,
+                       /*pipeline=*/4,
+                       sp,
+                       nullptr,
+                       nullptr,
+                       counts.data(),
+                       &probe);
+  EXPECT_EQ(counts, std::vector<uint32_t>(nq, k));
+  EXPECT_EQ(pipeline_labels, direct_labels);
+  for (std::size_t index = 0; index < pipeline_distances.size(); ++index) {
+    EXPECT_FLOAT_EQ(pipeline_distances[index], direct_distances[index]) << "index=" << index;
+  }
+}
+#endif
 
 // ----------------------------- batch --------------------------------------
 
