@@ -153,3 +153,7 @@ and `disk_vamana_legacy/disk_vamana` as the explicit direct-path compatibility
 identity. The independent `disk_vamana_segment` feature defaults on. Turning it
 off makes only the new factory return `not_supported`; it neither falls back
 silently nor changes the existing `DiskCollection` v1 builder/reader path.
+
+LASER uses the same manifest-v2 READY/SHA reader contract but retains its
+imported payload by read-only reference instead of presenting build/save
+slots. See [LASER immutable disk segment](laser-segment.md).

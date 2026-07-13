@@ -55,7 +55,7 @@ v1 bytes must not be silently rewritten.
 | --- | --- |
 | `QgSegment`, `RaBitQSpace`, the detail QG build kernel, in-memory graph search/executor | `MemoryRaBitQFormat` |
 | `include/index/graph/laser/qg/`, LASER builder/searcher | `LaserRaBitQFormat` |
-| `LaserSegmentImporter`, disk LASER segment factory/searcher | `LaserRaBitQFormat` artifacts only |
+| `LaserSegmentImporter`, `LaserSegment`, disk LASER segment factory/searcher | `LaserRaBitQFormat` artifacts only |
 
 Python and manifest dispatch still use the historical string `"QG"` for LASER in several APIs.
 That string is behavior compatibility, not a format discriminator. Dispatch, WAL, segment, or
@@ -65,3 +65,7 @@ factory code must resolve the engine first and must not select a RaBitQ decoder 
 For the legacy memory `Index` mapping from declared HNSW/NSG/Fusion rows to the
 actual QG engine, including honest descriptor/runtime keys and the Gate 9 plan,
 see [Memory QG legacy dispatch contract](memory-qg-legacy-dispatch.md).
+
+The open-only AnySegment contract, rank-only score domain, manifest-v2
+reference publication, and runtime fallback rules are specified in
+[LASER immutable disk segment](laser-segment.md).
