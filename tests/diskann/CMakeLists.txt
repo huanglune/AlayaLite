@@ -62,6 +62,16 @@ alaya_add_test(
 
 if(ALAYA_ENABLE_LASER)
   alaya_cc_target(
+    diskann_segment_header_closure
+    LASER
+    SRCS diskann_segment_header_closure.cpp
+  )
+  alaya_cc_target(
+    diskann_segment_test
+    GTEST LASER
+    SRCS diskann_segment_test.cpp
+  )
+  alaya_cc_target(
     test_diskann_beam_search
     GTEST LASER
     SRCS test_diskann_beam_search.cpp
@@ -96,6 +106,12 @@ if(ALAYA_ENABLE_LASER)
     NAME test_diskann_beam_search
     TARGET test_diskann_beam_search
     LABELS diskann
+  )
+  alaya_add_test(
+    NAME test_diskann_segment
+    TARGET diskann_segment_test
+    LABELS diskann segment
+    TIMEOUT 180
   )
   alaya_add_test(
     NAME test_diskann_index

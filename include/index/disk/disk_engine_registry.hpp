@@ -16,12 +16,15 @@ enum class EngineFeature {
   vamana = disk_vamana_segment,
   disk_laser_segment,
   laser = disk_laser_segment,
+  diskann_segment,
+  diskann = diskann_segment,
 };
 
 struct DiskEngineFeatureFlags {
   bool disk_flat_segment{true};
   bool disk_vamana_segment{true};
   bool disk_laser_segment{true};
+  bool diskann_segment{true};
 
   [[nodiscard]] constexpr auto enabled(EngineFeature feature) const noexcept -> bool {
     switch (feature) {
@@ -33,6 +36,8 @@ struct DiskEngineFeatureFlags {
         return disk_vamana_segment;
       case EngineFeature::disk_laser_segment:
         return disk_laser_segment;
+      case EngineFeature::diskann_segment:
+        return diskann_segment;
     }
     return false;
   }
@@ -78,6 +83,13 @@ inline constexpr FactoryRegistration kDiskLaserRegistration{
     {"disk_laser", "disk_laser_segment", "laser"},
     {"disk_laser", "disk_laser_legacy", "disk_laser"},
     EngineFeature::disk_laser_segment,
+    true,
+};
+
+inline constexpr FactoryRegistration kDiskAnnRegistration{
+    {"diskann", "diskann_segment", "diskann"},
+    {"diskann", "diskann_index", "diskann"},
+    EngineFeature::diskann_segment,
     true,
 };
 
