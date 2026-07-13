@@ -120,3 +120,36 @@ The disk registry records `disk_flat_segment/flat` as the new identity and
 `disk_flat_segment` feature defaults on; turning it off makes the new factory
 return `not_supported` and does not redirect or modify `DiskCollection` v1.
 
+## Disk Vamana immutable segment
+
+`DiskVamanaSegment` composes the retained `VamanaSegmentBuilder` and
+`VamanaSegmentSearcher`; it does not duplicate the graph builder, reader or
+greedy-search kernel. It exposes typed float32 `build`, `open`, approximate
+single/batch `search`, byte-preserving `save`, `stats`, `descriptor() noexcept`
+and `into_any()`. Its descriptor uses core algorithm `vamana` (6), native
+format 1, L2 and disk medium. Its AnySegment capability set is exactly search,
+batch, save and stats. The immutable type has no mutation methods or slots, and
+unlike DiskFlat it deliberately has no export slot.
+
+The first segmented disk-Vamana implementation has an explicit L2 gate.
+`inner_product` and `cosine` builds return `not_supported` before a publication
+transaction or filesystem path is created. Open parses the small native
+manifest first and returns the same `not_supported` gate before vector/ID mmap
+or graph loading. The diagnostic names the rejected metric and says that the
+first version supports L2 only. L2 follows the complete build/open/search/save
+path.
+
+The native artifact format is unchanged: `manifest.txt`, `ids.u64.bin`,
+`vectors.f32.bin` and `graph.index` are the exact files produced by the direct
+v1 builder. Transactional build adopts those files without rewriting them;
+transactional save copies and fsyncs them byte for byte. Direct v1 searchers
+open Segment output, while the Segment opens direct-builder output and
+`DiskCollection` v1 manifests through the dual reader. `ARTIFACTS.v2`, `READY`
+and collection manifest v2 exist only when the independent manifest-v2 writer
+gate is enabled.
+
+The disk registry records `disk_vamana_segment/vamana` as the current identity
+and `disk_vamana_legacy/disk_vamana` as the explicit direct-path compatibility
+identity. The independent `disk_vamana_segment` feature defaults on. Turning it
+off makes only the new factory return `not_supported`; it neither falls back
+silently nor changes the existing `DiskCollection` v1 builder/reader path.

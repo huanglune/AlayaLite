@@ -105,6 +105,7 @@ checking in 33 redundant copies.
 | DiskCollection Flat | yes | direct collection/searcher types | collection + Flat segment |
 | DiskFlat Segment exact oracle | no Python dispatch row | build/open/search/batch/save/export, differential and TSan tests | independent v2-gated golden plus byte equality with native Flat files |
 | DiskCollection Vamana | common facade behavior; engine-specific existing tests | direct collection/Vamana surface | collection + Vamana segment |
+| DiskVamana Segment | no Python dispatch row | build/open/search/batch/save, explicit L2 gate, differential and TSan tests | independent v2-gated golden plus byte equality with native Vamana files |
 | DiskCollection LASER | common facade behavior; engine-specific existing tests | LASER build closure remains in existing CTest | deterministic LASER fixture/sidecars |
 | high-level Collection | yes | `PyIndex` is Python-layer C++, documented as such | memory artifact + recovery inventory |
 
@@ -113,6 +114,7 @@ Regenerate and compare artifacts with:
 ```bash
 cmake --build build/Release --target artifact_diskann_generator \
   artifact_disk_flat_segment_generator \
+  artifact_disk_vamana_segment_generator \
   artifact_memory_qg_generator artifact_memory_vamana_generator
 PYTHONPATH=python/src:build/Release/python \
   python scripts/golden/generate_artifact_baseline.py
