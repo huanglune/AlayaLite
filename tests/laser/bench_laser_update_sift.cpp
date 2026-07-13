@@ -206,7 +206,8 @@ struct Args {
   uint64_t shuffle_seed = 0;
   uint32_t direct = 0;       // 1 = O_DIRECT write fd (P0.1 attribution arm), 0 = buffered (default)
   uint32_t write_cache = 1;  // 0 = immediate per-patch writes (P0.1-era control)
-  size_t cache_cap_pages = 0;  // 0 = retain UpdateParams default
+  size_t cache_cap_pages = 0;              // 0 = retain UpdateParams default
+  size_t maintenance_evict_stride = 4096;  // 0 = phase-boundary-only legacy behavior
   uint32_t pipeline = 0;  // staged mode only: overlap drain(i) with batch i+1 (2-batch isolation)
   uint32_t stage = 0;     // 1 = stage backlinks + barrier drain; 0 = inline patches into pool
   size_t flush_threads = 0;       // threads for the overlapped flush; 0 = insert_threads
@@ -317,6 +318,8 @@ Args parse(int argc, char **argv) {
       a.write_cache = std::stoul(v);
     else if (k == "--cache_cap_pages")
       a.cache_cap_pages = parse_cache_cap_pages(v);
+    else if (k == "--maintenance_evict_stride")
+      a.maintenance_evict_stride = std::stoull(v);
     else if (k == "--pipeline")
       a.pipeline = std::stoul(v);
     else if (k == "--stage")
@@ -485,6 +488,7 @@ int do_insert(const Args &a) {
   p.direct_io = a.direct != 0;
   p.write_cache = a.write_cache != 0;
   p.stage_backlinks = a.stage != 0;
+  p.maintenance_evict_stride = a.maintenance_evict_stride;
   apply_cache_cap_pages(a.cache_cap_pages, p);
   alaya::laser::QGUpdater upd(qg, p);
   const int ins_threads = static_cast<int>(std::max<size_t>(1, a.insert_threads));
@@ -615,12 +619,14 @@ int do_churn(const Args &a) {
   p.stage_backlinks = a.stage != 0;
   p.maintain_indegree = a.garden != 0;
   p.maintain_turnover = a.garden != 0 && a.garden_policy == "turnover";
+  p.maintenance_evict_stride = a.maintenance_evict_stride;
   apply_cache_cap_pages(a.cache_cap_pages, p);
   alaya::laser::QGUpdater upd(qg, p);
   if (a.garden != 0) upd.init_indegree(a.insert_threads);
   if (p.maintain_turnover) upd.init_turnover();
   std::cout << "[churn] direct_io=" << (upd.direct_io() ? 1 : 0)
             << " cache_cap_pages=" << upd.cache_cap_pages()
+            << " maintenance_evict_stride=" << upd.maintenance_evict_stride()
             << " cache_low_pages=" << upd.cache_cap_pages() / 2 << " splice=" << a.splice
             << " evict_margin=" << a.evict_margin << "\n";
   std::vector<uint32_t> results(static_cast<size_t>(query.n) * a.topk);
@@ -709,7 +715,8 @@ int do_churn(const Args &a) {
               << s.free_slot_fills << ",evictions," << s.evictions << ",est_skips," << s.est_skips
               << ",forced," << s.forced_links << ",indeg_p1," << pct(0.01) << ",indeg_p5,"
               << pct(0.05) << ",indeg_p50," << pct(0.50) << ",file_pages," << upd.file_pages()
-              << ",pool_pages," << upd.pool_pages() << ",freed,"
+              << ",pool_pages," << upd.pool_pages() << ",maintenance_peak_pool_pages,"
+              << s.maintenance_peak_pool_pages << ",freed,"
               << s.freed_slots - last_round_stats.freed_slots << ",reused,"
               << s.reused_slots - last_round_stats.reused_slots << ",live_frac,"
               << (upd.allocated_points() == 0
@@ -1190,6 +1197,7 @@ int do_mixed(const Args &a) {
   p.stage_backlinks = a.stage != 0;
   p.maintain_indegree = true;
   p.maintain_turnover = a.garden_policy == "turnover";
+  p.maintenance_evict_stride = a.maintenance_evict_stride;
   apply_cache_cap_pages(a.cache_cap_pages, p);
   alaya::laser::QGUpdater upd(qg, p);
   upd.init_indegree(a.insert_threads);

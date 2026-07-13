@@ -295,6 +295,7 @@ struct UpdateStats {
   uint64_t garden_selected_turnover_rows = 0;
   uint64_t garden_all_turnover_sum = 0;
   uint64_t garden_all_turnover_rows = 0;
+  uint64_t maintenance_peak_pool_pages = 0;
 };
 
 struct TurnoverSummary {
@@ -361,10 +362,13 @@ struct UpdateParams {
                                    // insert threads overlap patch CPU with search IO, and the
                                    // kAlphaEvict capture-pool check works); true: stage per target
                                    // and drain at the batch barrier (phase-separated variant)
-  size_t cache_cap_pages = 1U << 20;  // pool high watermark (pages). Hub rows are patched by
-                                      // many batches; keeping pages resident coalesces those
-                                      // writes across batches (physical writes happen only on
-                                      // watermark eviction, consolidate() and finalize())
+  size_t cache_cap_pages = 1U << 20;       // pool high watermark (pages). Hub rows are patched by
+                                           // many batches; keeping pages resident coalesces those
+                                           // writes across batches (physical writes happen only on
+                                           // watermark eviction, consolidate() and finalize())
+  size_t maintenance_evict_stride = 4096;  // maintenance batch size in pages/rows before a
+                                           // high->low pool check; 0 preserves phase-boundary-only
+                                           // eviction
 };
 
 class QGUpdater {
@@ -486,6 +490,7 @@ class QGUpdater {
   /** Current resident update-pool size and its configured high watermark. */
   [[nodiscard]] size_t pool_pages() const { return write_cache_.total_pages(); }
   [[nodiscard]] size_t cache_cap_pages() const { return params_.cache_cap_pages; }
+  [[nodiscard]] size_t maintenance_evict_stride() const { return params_.maintenance_evict_stride; }
 
   /** @brief Snapshot of the (atomic) counters. */
   [[nodiscard]] UpdateStats stats() const {
@@ -529,6 +534,7 @@ class QGUpdater {
     s.garden_selected_turnover_rows = stats_.garden_selected_turnover_rows.load();
     s.garden_all_turnover_sum = stats_.garden_all_turnover_sum.load();
     s.garden_all_turnover_rows = stats_.garden_all_turnover_rows.load();
+    s.maintenance_peak_pool_pages = stats_.maintenance_peak_pool_pages.load();
     return s;
   }
 
@@ -956,14 +962,55 @@ class QGUpdater {
     const size_t n = committed_.load(std::memory_order_acquire);
     const size_t target = r_target == 0 ? deg_ : std::min(r_target, deg_);
     const int nt = static_cast<int>(std::max<size_t>(1, num_threads));
+    const size_t stride = params_.maintenance_evict_stride;
+    const bool in_pass_evict =
+        stride != 0 && params_.write_cache && params_.cache_cap_pages < file_pages();
+    const size_t rows_per_batch =
+        !in_pass_evict || stride > std::numeric_limits<size_t>::max() / npp_
+            ? n
+            : std::max<size_t>(1, stride * npp_);
+    if (!in_pass_evict) {
 #pragma omp parallel for num_threads(nt) schedule(dynamic, 256)
-    for (int64_t ui = 0; ui < static_cast<int64_t>(n); ++ui) {
-      const PID u = static_cast<PID>(ui);
-      if (is_hidden(u)) {
-        continue;
+      for (int64_t ui = 0; ui < static_cast<int64_t>(n); ++ui) {
+        const PID u = static_cast<PID>(ui);
+        if (is_hidden(u)) {
+          continue;
+        }
+        consolidate_row(u, n, target);
       }
-      consolidate_row(u, n, target);
+    } else {
+      size_t batch_begin = 0;
+      size_t batch_end = 0;
+      while (batch_begin < n) {
+        bool leave_region = false;
+        bool need_evict = false;
+#pragma omp parallel num_threads(nt) shared(batch_begin, batch_end, leave_region, need_evict)
+        {
+          for (;;) {
+#pragma omp single
+            {
+              batch_end = std::min(n, batch_begin + rows_per_batch);
+            }
+#pragma omp for schedule(dynamic, 256)
+            for (int64_t ui = static_cast<int64_t>(batch_begin);
+                 ui < static_cast<int64_t>(batch_end);
+                 ++ui) {
+              const PID u = static_cast<PID>(ui);
+              if (!is_hidden(u)) consolidate_row(u, n, target);
+            }
+#pragma omp single
+            {
+              batch_begin = batch_end;
+              need_evict = note_maintenance_pool_and_test_high();
+              leave_region = need_evict || batch_begin == n;
+            }
+            if (leave_region) break;
+          }
+        }
+        if (need_evict) enforce_maintenance_watermark(num_threads);
+      }
     }
+    if (stride != 0) note_maintenance_pool_and_test_high();
     drain_staged_edges(num_threads);
     flush_dirty(num_threads);
     if (reclaim_slots) {
@@ -977,7 +1024,15 @@ class QGUpdater {
                                     }),
                      eligible.end());
       std::sort(eligible.begin(), eligible.end());
-      for (PID id : eligible) push_free_slot(id);
+      const size_t reclaim_batch =
+          !in_pass_evict || stride > std::numeric_limits<size_t>::max() / npp_
+              ? std::max<size_t>(1, eligible.size())
+              : std::max<size_t>(1, stride * npp_);
+      for (size_t begin = 0; begin < eligible.size(); begin += reclaim_batch) {
+        const size_t end = std::min(eligible.size(), begin + reclaim_batch);
+        for (size_t i = begin; i < end; ++i) push_free_slot(eligible[i]);
+        if (in_pass_evict) enforce_maintenance_watermark(num_threads);
+      }
       flush_dirty(num_threads);
     }
   }
@@ -1030,10 +1085,46 @@ class QGUpdater {
     }
     const size_t target = gp.r_target == 0 ? deg_ : std::min(gp.r_target, deg_);
     const int nt = static_cast<int>(std::max<size_t>(1, num_threads));
+    const size_t stride = params_.maintenance_evict_stride;
+    const bool in_pass_evict =
+        stride != 0 && params_.write_cache && params_.cache_cap_pages < file_pages();
+    const size_t rows_per_batch = in_pass_evict ? stride : std::max<size_t>(1, live.size());
+    if (!in_pass_evict) {
 #pragma omp parallel for num_threads(nt) schedule(dynamic, 1)
-    for (int64_t i = 0; i < static_cast<int64_t>(live.size()); ++i) {
-      garden_row(live[static_cast<size_t>(i)], gp, target);
+      for (int64_t i = 0; i < static_cast<int64_t>(live.size()); ++i) {
+        garden_row(live[static_cast<size_t>(i)], gp, target);
+      }
+    } else {
+      size_t batch_begin = 0;
+      size_t batch_end = 0;
+      while (batch_begin < live.size()) {
+        bool leave_region = false;
+        bool need_evict = false;
+#pragma omp parallel num_threads(nt) shared(batch_begin, batch_end, leave_region, need_evict)
+        {
+          for (;;) {
+#pragma omp single
+            {
+              batch_end = std::min(live.size(), batch_begin + rows_per_batch);
+            }
+#pragma omp for schedule(dynamic, 1)
+            for (int64_t i = static_cast<int64_t>(batch_begin); i < static_cast<int64_t>(batch_end);
+                 ++i) {
+              garden_row(live[static_cast<size_t>(i)], gp, target);
+            }
+#pragma omp single
+            {
+              batch_begin = batch_end;
+              need_evict = note_maintenance_pool_and_test_high();
+              leave_region = need_evict || batch_begin == live.size();
+            }
+            if (leave_region) break;
+          }
+        }
+        if (need_evict) enforce_maintenance_watermark(num_threads);
+      }
     }
+    if (stride != 0) note_maintenance_pool_and_test_high();
     flush_dirty(num_threads);
     stats_.garden_us.fetch_add(
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0)
@@ -1206,6 +1297,7 @@ class QGUpdater {
     std::atomic<uint64_t> garden_selected_turnover_rows{0};
     std::atomic<uint64_t> garden_all_turnover_sum{0};
     std::atomic<uint64_t> garden_all_turnover_rows{0};
+    std::atomic<uint64_t> maintenance_peak_pool_pages{0};
   };
 
   struct CapturedNode {
@@ -1476,21 +1568,35 @@ class QGUpdater {
 
   void rebuild_free_chain(const std::vector<PID> &free_ids) {
     PID head = kPidMax;
-    for (PID id : free_ids) {
-      const std::lock_guard<std::mutex> guard(page_lock(id));
+    const size_t stride = params_.maintenance_evict_stride;
+    const bool in_pass_evict =
+        stride != 0 && params_.write_cache && params_.cache_cap_pages < file_pages();
+    const size_t rows_per_batch =
+        !in_pass_evict || stride > std::numeric_limits<size_t>::max() / npp_
+            ? std::max<size_t>(1, free_ids.size())
+            : std::max<size_t>(1, stride * npp_);
+    for (size_t i = 0; i < free_ids.size(); ++i) {
+      const PID id = free_ids[i];
       const PID next = head;
-      modify_node_page(id, [&](char *page) {
-        char *row = page + node_offset_in_page(id);
-        const uint64_t next64 = next;
-        std::memcpy(row, &next64, sizeof(next64));
-        QGRowTrailer trailer = row_trailer(page, id);
-        trailer.valid_degree = 0;
-        trailer.flags |= kQGRowTombstone | kQGRowFree;
-        set_row_trailer(page, id, trailer);
-        return true;
-      });
+      {
+        const std::lock_guard<std::mutex> guard(page_lock(id));
+        modify_node_page(id, [&](char *page) {
+          char *row = page + node_offset_in_page(id);
+          const uint64_t next64 = next;
+          std::memcpy(row, &next64, sizeof(next64));
+          QGRowTrailer trailer = row_trailer(page, id);
+          trailer.valid_degree = 0;
+          trailer.flags |= kQGRowTombstone | kQGRowFree;
+          set_row_trailer(page, id, trailer);
+          return true;
+        });
+      }
       head = id;
+      if (in_pass_evict && ((i + 1) % rows_per_batch == 0 || i + 1 == free_ids.size())) {
+        enforce_maintenance_watermark(1);
+      }
     }
+    if (stride != 0) note_maintenance_pool_and_test_high();
     free_list_head_.store(head, std::memory_order_release);
     free_count_.store(free_ids.size(), std::memory_order_release);
   }
@@ -2117,6 +2223,27 @@ class QGUpdater {
     // finalize()+fsync only.
     if (!direct_io_ && !dirty.empty()) {
       ::sync_file_range(fd_, 0, 0, SYNC_FILE_RANGE_WRITE);
+    }
+  }
+
+  /** Record a maintenance-batch peak and report whether high was reached. */
+  bool note_maintenance_pool_and_test_high() {
+    const size_t pages = write_cache_.total_pages();
+    uint64_t peak = stats_.maintenance_peak_pool_pages.load(std::memory_order_relaxed);
+    while (peak < pages &&
+           !stats_.maintenance_peak_pool_pages.compare_exchange_weak(peak,
+                                                                     pages,
+                                                                     std::memory_order_relaxed,
+                                                                     std::memory_order_relaxed)) {
+    }
+    return params_.write_cache && pages >= params_.cache_cap_pages;
+  }
+
+  /** Enforce high->low after the maintenance worker team and all latches exit. */
+  void enforce_maintenance_watermark(size_t num_threads) {
+    if (note_maintenance_pool_and_test_high()) {
+      flush_dirty(num_threads);
+      evict_clean(params_.cache_cap_pages / 2);
     }
   }
 

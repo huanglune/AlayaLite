@@ -601,7 +601,87 @@ TEST_F(QGUpdaterIndexTest, BenchCacheCapPagesFlagReachesUpdater) {
 
   QGUpdater upd(qg, params);
   EXPECT_EQ(upd.cache_cap_pages(), 17U);
+  EXPECT_EQ(upd.maintenance_evict_stride(), 4096U);
   EXPECT_EQ(upd.pool_pages(), 0U);
+}
+
+TEST_F(QGUpdaterIndexTest, MaintenanceInPassEvictionBoundsPoolAndPreservesRows) {
+  constexpr size_t kCacheCap = 32;
+  constexpr size_t kStride = 1;
+
+  struct Result {
+    std::vector<uint64_t> page_hashes;
+    size_t pool_pages = 0;
+    uint64_t peak_pool_pages = 0;
+  };
+
+  auto run_consolidate = [&](const std::string &name, size_t stride, size_t cache_cap) {
+    const std::string prefix = (tiny_->dir / name).string();
+    copy_index_artifact(tiny_->v1_prefix, prefix);
+    Result result;
+    {
+      QuantizedGraph qg(kN, kDeg, kDim, kDim);
+      qg.load_disk_index(prefix.c_str(), 0.0F);
+      UpdateParams params;
+      params.cache_cap_pages = cache_cap;
+      params.maintenance_evict_stride = stride;
+      QGUpdater upd(qg, params);
+      for (PID id = 200; id < 232; ++id) upd.tombstone(id);
+      upd.consolidate(1, kDeg - 4, false);
+      result.pool_pages = upd.pool_pages();
+      result.peak_pool_pages = upd.stats().maintenance_peak_pool_pages;
+    }
+    result.page_hashes = index_page_hashes(prefix + index_suffix(), kSectorLen);
+    return result;
+  };
+
+  auto run_garden = [&](const std::string &name, size_t stride, size_t cache_cap) {
+    const std::string prefix = (tiny_->dir / name).string();
+    copy_index_artifact(tiny_->v1_prefix, prefix);
+    Result result;
+    {
+      QuantizedGraph qg(kN, kDeg, kDim, kDim);
+      qg.load_disk_index(prefix.c_str(), 0.0F);
+      UpdateParams params;
+      params.cache_cap_pages = cache_cap;
+      params.maintenance_evict_stride = stride;
+      params.maintain_indegree = true;
+      QGUpdater upd(qg, params);
+      upd.init_indegree(1);
+      GardenParams garden;
+      garden.frac = 0.05;
+      garden.ef_maintenance = 64;
+      garden.pump_budget = 0;
+      garden.r_target = kDeg - 4;
+      garden.policy = GardenParams::Policy::kRandom;
+      upd.garden(1, garden);
+      result.pool_pages = upd.pool_pages();
+      result.peak_pool_pages = upd.stats().maintenance_peak_pool_pages;
+    }
+    result.page_hashes = index_page_hashes(prefix + index_suffix(), kSectorLen);
+    return result;
+  };
+
+  const Result consolidate_old = run_consolidate("maintenance_consolidate_old", 0, kCacheCap);
+  const Result consolidate_new = run_consolidate("maintenance_consolidate_new", kStride, kCacheCap);
+  EXPECT_GT(consolidate_old.pool_pages, kCacheCap);
+  EXPECT_LE(consolidate_new.peak_pool_pages, kCacheCap);
+  EXPECT_LE(consolidate_new.pool_pages, kCacheCap);
+  EXPECT_EQ(consolidate_new.page_hashes, consolidate_old.page_hashes);
+  const Result consolidate_unreachable =
+      run_consolidate("maintenance_consolidate_unreachable", kStride, kN);
+  EXPECT_EQ(consolidate_unreachable.peak_pool_pages, consolidate_unreachable.pool_pages);
+  EXPECT_EQ(consolidate_unreachable.page_hashes, consolidate_old.page_hashes);
+
+  const Result garden_old = run_garden("maintenance_garden_old", 0, kCacheCap);
+  const Result garden_new = run_garden("maintenance_garden_new", kStride, kCacheCap);
+  EXPECT_GT(garden_old.pool_pages, kCacheCap);
+  EXPECT_LE(garden_new.peak_pool_pages, kCacheCap);
+  EXPECT_LE(garden_new.pool_pages, kCacheCap);
+  EXPECT_EQ(garden_new.page_hashes, garden_old.page_hashes);
+  const Result garden_unreachable = run_garden("maintenance_garden_unreachable", kStride, kN);
+  EXPECT_EQ(garden_unreachable.peak_pool_pages, garden_unreachable.pool_pages);
+  EXPECT_EQ(garden_unreachable.page_hashes, garden_old.page_hashes);
 }
 
 TEST_F(QGUpdaterIndexTest, InsertPatchTombstoneEndToEnd) {
