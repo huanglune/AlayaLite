@@ -266,9 +266,13 @@ TEST(ArtifactControlPlaneTransaction, CrashCutsNeverEnterRoutingAndRestartCleans
     EXPECT_FALSE(std::filesystem::exists(temporary.path() / "segments/seg_00000001"));
     transaction.reset();
     EXPECT_TRUE(std::filesystem::exists(temporary.path() / ".alaya_staging"));
+    constexpr std::string_view stale_manifest{"not-routable"};
+    const auto stale_path = temporary.path() / ".collection_manifest.v2.stale";
+    platform::write_all_fsync(stale_path, stale_manifest.data(), stale_manifest.size());
     auto cleanup = ArtifactControlPlaneTransaction::cleanup_orphans(temporary.path());
     EXPECT_TRUE(cleanup.ok()) << cleanup.diagnostic();
     EXPECT_FALSE(std::filesystem::exists(temporary.path() / ".alaya_staging"));
+    EXPECT_FALSE(std::filesystem::exists(stale_path));
   }
 }
 

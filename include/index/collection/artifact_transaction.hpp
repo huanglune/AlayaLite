@@ -334,10 +334,8 @@ class ArtifactControlPlaneTransaction {
           *found = prepared_segment_;
         }
         const auto body = manifest.serialize();
-        const auto pending_manifest =
-            options_.collection_root / (".collection_manifest.v2." + options_.transaction_id);
-        platform::write_all_fsync(pending_manifest, body.data(), body.size());
-        platform::atomic_replace(pending_manifest,
+        platform::write_all_fsync(pending_manifest_, body.data(), body.size());
+        platform::atomic_replace(pending_manifest_,
                                  options_.collection_root / kCollectionManifestFilename);
         manifest_published_ = true;
         state_ = State::published;
@@ -386,6 +384,9 @@ class ArtifactControlPlaneTransaction {
   [[nodiscard]] static auto cleanup_orphans(const std::filesystem::path &collection_root) noexcept
       -> core::Status {
     try {
+      if (!std::filesystem::exists(collection_root)) {
+        return core::Status::success();
+      }
       std::error_code ec;
       std::filesystem::remove_all(collection_root / kStagingDirectory, ec);
       if (ec) {
@@ -394,6 +395,12 @@ class ArtifactControlPlaneTransaction {
                                    core::StatusDetail::none,
                                    "cannot remove interrupted artifact staging directories: " +
                                        ec.message());
+      }
+      for (const auto &entry : std::filesystem::directory_iterator(collection_root)) {
+        const auto filename = entry.path().filename().string();
+        if (entry.is_regular_file() && filename.starts_with(".collection_manifest.v2.")) {
+          std::filesystem::remove(entry.path());
+        }
       }
       std::set<std::filesystem::path> live_directories;
       const auto manifest_path = collection_root / kCollectionManifestFilename;
@@ -466,7 +473,9 @@ class ArtifactControlPlaneTransaction {
         cancellation_(std::move(cancellation)),
         staging_root_(options_.collection_root / kStagingDirectory / options_.transaction_id),
         staging_payload_(staging_root_ / options_.target_relative_directory.filename()),
-        final_payload_(options_.collection_root / options_.target_relative_directory) {}
+        final_payload_(options_.collection_root / options_.target_relative_directory),
+        pending_manifest_(options_.collection_root /
+                          (".collection_manifest.v2." + options_.transaction_id)) {}
 
   [[nodiscard]] static auto safe_component(std::string_view value) -> bool {
     return !value.empty() && value != "." && value != ".." && value.find('/') == value.npos &&
@@ -557,6 +566,7 @@ class ArtifactControlPlaneTransaction {
   void cleanup_owned_paths() noexcept {
     std::error_code ec;
     std::filesystem::remove_all(staging_root_, ec);
+    std::filesystem::remove(pending_manifest_, ec);
     if (payload_published_) {
       if (manifest_published_) {
         return;
@@ -572,6 +582,7 @@ class ArtifactControlPlaneTransaction {
   std::filesystem::path staging_root_{};
   std::filesystem::path staging_payload_{};
   std::filesystem::path final_payload_{};
+  std::filesystem::path pending_manifest_{};
   std::vector<Binding> bindings_{};
   std::vector<core::ArtifactLocation> locations_{};
   SegmentEntryV2 prepared_segment_{};

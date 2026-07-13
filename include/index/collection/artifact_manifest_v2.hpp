@@ -349,6 +349,7 @@ struct ArtifactManifestV2 {
   [[nodiscard]] auto validate() const -> core::Status {
     if (manifest_version != kArtifactManifestV2SchemaVersion || collection.schema_name.empty() ||
         collection.schema_version == 0 || collection.dim == 0 ||
+        core::scalar_type_size(collection.scalar_type) == 0 ||
         collection.logical_id_encoding_version == 0 || publication.generation == 0 ||
         row_versions.minimum > row_versions.maximum) {
       return core::Status::error(core::StatusCode::invalid_argument,
