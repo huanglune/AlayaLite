@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added a default-off, Collection-internal mutable DiskANN Segment bundle with
+  dark WAL staging, COMMIT-before-publish ordering, strict tombstone/version
+  filtering, idempotent applied-op replay, per-row and atomic batch modes, and
+  manifest-v2 checkpoints. A mutation-free roll-forward reader remains able to
+  consume checkpointed state and a committed WAL tail; no DiskANN mutation API
+  is exposed through the canonical SDK or Python surface.
+
 - Added an independently gated readonly `DiskAnnSegment` over the native
   DiskANN file family, with typed sync/native-async search and batch
   translation, resource admission, stats, and an explicit `diskann_index`
