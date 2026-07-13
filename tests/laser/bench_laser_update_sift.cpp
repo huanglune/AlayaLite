@@ -21,8 +21,8 @@
 // directory first when comparing arms.
 
 #include <malloc.h>
-#include <future>
 #include <omp.h>
+#include <future>
 
 #include <algorithm>
 #include <atomic>
@@ -43,17 +43,17 @@
 #include <unordered_set>
 #include <vector>
 
+#include "bench_laser_update_sift_support.hpp"
 #include "index/graph/laser/qg/qg.hpp"
 #include "index/graph/laser/qg/qg_builder.hpp"
 #include "index/graph/laser/qg/qg_updater.hpp"
 #include "index/graph/vamana/vamana_builder.hpp"
 #include "index/graph/vamana/vamana_writer.hpp"
-#include "bench_laser_update_sift_support.hpp"
 
 namespace {
 
-using alaya::laser::bench::MappedFloatMatrix;
 using alaya::laser::bench::apply_cache_cap_pages;
+using alaya::laser::bench::MappedFloatMatrix;
 using alaya::laser::bench::parse_cache_cap_pages;
 
 struct FloatMatrix {
@@ -156,14 +156,12 @@ double telemetry_p50(const alaya::laser::UpdateStats &s) {
 }
 
 void print_telemetry(const alaya::laser::UpdateStats &s) {
-  const double agree = s.evict_tel_samples == 0
-                           ? -1
-                           : static_cast<double>(s.evict_tel_agree) / s.evict_tel_samples;
-  const double relerr = s.evict_tel_samples == 0
-                            ? -1
-                            : s.evict_tel_relerr_sum / s.evict_tel_samples;
-  std::cout << ",tel_agree," << agree << ",tel_regret_p50," << telemetry_p50(s)
-            << ",tel_relerr," << relerr;
+  const double agree =
+      s.evict_tel_samples == 0 ? -1 : static_cast<double>(s.evict_tel_agree) / s.evict_tel_samples;
+  const double relerr =
+      s.evict_tel_samples == 0 ? -1 : s.evict_tel_relerr_sum / s.evict_tel_samples;
+  std::cout << ",tel_agree," << agree << ",tel_regret_p50," << telemetry_p50(s) << ",tel_relerr,"
+            << relerr;
 }
 
 void write_fbin(const std::string &path, const float *data, int32_t n, int32_t dim) {
@@ -206,18 +204,18 @@ struct Args {
   double evict_margin = 0;
   uint32_t splice = 1;
   uint64_t shuffle_seed = 0;
-  uint32_t direct = 0;  // 1 = O_DIRECT write fd (P0.1 attribution arm), 0 = buffered (default)
+  uint32_t direct = 0;       // 1 = O_DIRECT write fd (P0.1 attribution arm), 0 = buffered (default)
   uint32_t write_cache = 1;  // 0 = immediate per-patch writes (P0.1-era control)
   size_t cache_cap_pages = 0;  // 0 = retain UpdateParams default
-  uint32_t pipeline = 0;     // staged mode only: overlap drain(i) with batch i+1 (2-batch isolation)
-  uint32_t stage = 0;        // 1 = stage backlinks + barrier drain; 0 = inline patches into pool
-  size_t flush_threads = 0;  // threads for the overlapped flush; 0 = insert_threads
-  uint32_t query_threads = 16;      // mixed: closed-loop query clients
-  uint32_t mixed_ef = 100;          // mixed: updater pool-search ef
-  double mixed_seconds = 10.0;      // mixed: duration of each insert/query window
-  uint32_t mixed_rate_pct = 100;    // mixed: 0|25|50|100; 100 is unlimited
-  double mixed_full_rate = 0.0;     // token-bucket 100% reference QPS for 25/50
-  std::string csv;                  // mixed: append one row per phase
+  uint32_t pipeline = 0;  // staged mode only: overlap drain(i) with batch i+1 (2-batch isolation)
+  uint32_t stage = 0;     // 1 = stage backlinks + barrier drain; 0 = inline patches into pool
+  size_t flush_threads = 0;       // threads for the overlapped flush; 0 = insert_threads
+  uint32_t query_threads = 16;    // mixed: closed-loop query clients
+  uint32_t mixed_ef = 100;        // mixed: updater pool-search ef
+  double mixed_seconds = 10.0;    // mixed: duration of each insert/query window
+  uint32_t mixed_rate_pct = 100;  // mixed: 0|25|50|100; 100 is unlimited
+  double mixed_full_rate = 0.0;   // token-bucket 100% reference QPS for 25/50
+  std::string csv;                // mixed: append one row per phase
   std::vector<uint32_t> efs = {60, 80, 100, 150, 200, 300};
 };
 
@@ -427,8 +425,7 @@ int do_build(const Args &a) {
     int32_t pca_dim = 0;
     pca_base.read(reinterpret_cast<char *>(&pca_n), sizeof(pca_n));
     pca_base.read(reinterpret_cast<char *>(&pca_dim), sizeof(pca_dim));
-    const uintmax_t expected_size =
-        8 + static_cast<uintmax_t>(base.n) * dim * sizeof(float);
+    const uintmax_t expected_size = 8 + static_cast<uintmax_t>(base.n) * dim * sizeof(float);
     if (!pca_base || pca_n != static_cast<int32_t>(base.n) ||
         pca_dim != static_cast<int32_t>(dim) ||
         std::filesystem::file_size(pca_base_path) != expected_size) {
@@ -617,13 +614,15 @@ int do_churn(const Args &a) {
   p.write_cache = a.write_cache != 0;
   p.stage_backlinks = a.stage != 0;
   p.maintain_indegree = a.garden != 0;
+  p.maintain_turnover = a.garden != 0 && a.garden_policy == "turnover";
   apply_cache_cap_pages(a.cache_cap_pages, p);
   alaya::laser::QGUpdater upd(qg, p);
   if (a.garden != 0) upd.init_indegree(a.insert_threads);
+  if (p.maintain_turnover) upd.init_turnover();
   std::cout << "[churn] direct_io=" << (upd.direct_io() ? 1 : 0)
             << " cache_cap_pages=" << upd.cache_cap_pages()
-            << " cache_low_pages=" << upd.cache_cap_pages() / 2
-            << " splice=" << a.splice << " evict_margin=" << a.evict_margin << "\n";
+            << " cache_low_pages=" << upd.cache_cap_pages() / 2 << " splice=" << a.splice
+            << " evict_margin=" << a.evict_margin << "\n";
   std::vector<uint32_t> results(static_cast<size_t>(query.n) * a.topk);
   const std::vector<int> query_groups = read_query_groups(a.query_groups, query.n);
   const uint32_t ef_eval = a.efs.empty() ? 100 : a.efs[0];
@@ -725,12 +724,17 @@ int do_churn(const Args &a) {
     }
     print_telemetry(s);
     std::cout << "\n" << std::flush;
+    if (p.maintain_turnover) {
+      const auto turnover = upd.turnover_summary();
+      std::cout << "turnover," << round << ",sum," << turnover.sum << ",p50," << turnover.p50
+                << ",p99," << turnover.p99 << ",rows," << turnover.rows << "\n"
+                << std::flush;
+    }
     const std::array<const char *, 4> age_names = {"base", "fresh", "mid", "old"};
     std::cout << "round_age," << round;
     for (size_t bucket = 0; bucket < age_names.size(); ++bucket) {
-      const double value = age_total[bucket] == 0
-                               ? -1
-                               : static_cast<double>(age_hits[bucket]) / age_total[bucket];
+      const double value =
+          age_total[bucket] == 0 ? -1 : static_cast<double>(age_hits[bucket]) / age_total[bucket];
       std::cout << "," << age_names[bucket] << "," << value << "," << age_total[bucket];
     }
     std::cout << "\n" << std::flush;
@@ -742,8 +746,7 @@ int do_churn(const Args &a) {
       auto ef_t0 = std::chrono::steady_clock::now();
       qg.batch_search(query.data.data(), a.topk, results.data(), query.n);
       auto ef_t1 = std::chrono::steady_clock::now();
-      const double ef_qps =
-          query.n / std::chrono::duration<double>(ef_t1 - ef_t0).count();
+      const double ef_qps = query.n / std::chrono::duration<double>(ef_t1 - ef_t0).count();
       uint64_t ef_hits = 0;
       uint64_t ef_total = 0;
       std::array<uint64_t, 3> ef_group_hits{};
@@ -755,8 +758,7 @@ int do_churn(const Args &a) {
           const uint32_t source = truth_row[j];
           if (source < source_to_pid.size()) {
             const alaya::laser::PID pid = source_to_pid[source];
-            if (pid != alaya::laser::kPidMax &&
-                upd.deleted().find(pid) == upd.deleted().end()) {
+            if (pid != alaya::laser::kPidMax && upd.deleted().find(pid) == upd.deleted().end()) {
               truth.insert(pid);
             }
           }
@@ -772,9 +774,8 @@ int do_churn(const Args &a) {
         }
       }
       std::cout << "round_ef," << round << "," << ef << ",recall,"
-                << (ef_total == 0
-                        ? 0.0
-                        : static_cast<double>(ef_hits) / static_cast<double>(ef_total))
+                << (ef_total == 0 ? 0.0
+                                  : static_cast<double>(ef_hits) / static_cast<double>(ef_total))
                 << ",qps," << ef_qps;
       if (!query_groups.empty()) {
         for (size_t g = 0; g < 3; ++g) {
@@ -822,6 +823,8 @@ int do_churn(const Args &a) {
         gp.policy = alaya::laser::GardenParams::Policy::kLowIndegree;
       else if (a.garden_policy == "random")
         gp.policy = alaya::laser::GardenParams::Policy::kRandom;
+      else if (a.garden_policy == "turnover")
+        gp.policy = alaya::laser::GardenParams::Policy::kTurnover;
       else
         throw std::runtime_error("bad --garden_policy " + a.garden_policy);
       upd.garden(a.insert_threads, gp);
@@ -888,6 +891,22 @@ int do_churn(const Args &a) {
               << " garden_s=" << std::chrono::duration<double>(tg1 - tg0).count()
               << " gardened_rows=" << garden_after.gardened_rows - garden_before.gardened_rows
               << "\n";
+    if (p.maintain_turnover) {
+      const uint64_t selected_sum =
+          garden_after.garden_selected_turnover_sum - garden_before.garden_selected_turnover_sum;
+      const uint64_t selected_rows =
+          garden_after.garden_selected_turnover_rows - garden_before.garden_selected_turnover_rows;
+      const uint64_t all_sum =
+          garden_after.garden_all_turnover_sum - garden_before.garden_all_turnover_sum;
+      const uint64_t all_rows =
+          garden_after.garden_all_turnover_rows - garden_before.garden_all_turnover_rows;
+      const double selected_avg =
+          selected_rows == 0 ? 0.0 : static_cast<double>(selected_sum) / selected_rows;
+      const double all_avg = all_rows == 0 ? 0.0 : static_cast<double>(all_sum) / all_rows;
+      std::cout << "turnover_garden," << r + 1 << ",selected_avg," << selected_avg << ",all_avg,"
+                << all_avg << ",selected_sum," << selected_sum << ",selected_rows," << selected_rows
+                << ",all_sum," << all_sum << ",all_rows," << all_rows << "\n";
+    }
     if ((r + 1) % a.checkpoint_every == 0) {
       upd.checkpoint();
     } else {
@@ -912,8 +931,8 @@ class TokenBucket {
     for (;;) {
       std::unique_lock<std::mutex> lock(mutex_);
       const auto now = std::chrono::steady_clock::now();
-      tokens_ = std::min(capacity_,
-                         tokens_ + std::chrono::duration<double>(now - last_).count() * rate_);
+      tokens_ =
+          std::min(capacity_, tokens_ + std::chrono::duration<double>(now - last_).count() * rate_);
       last_ = now;
       if (tokens_ >= 1.0) {
         tokens_ -= 1.0;
@@ -961,8 +980,8 @@ struct MixedPhaseMetrics {
 double percentile_us(std::vector<uint64_t> &latencies, double percentile) {
   if (latencies.empty()) return 0;
   std::sort(latencies.begin(), latencies.end());
-  const size_t rank = static_cast<size_t>(
-      std::ceil(percentile * static_cast<double>(latencies.size())));
+  const size_t rank =
+      static_cast<size_t>(std::ceil(percentile * static_cast<double>(latencies.size())));
   const size_t index = std::min(latencies.size() - 1, std::max<size_t>(1, rank) - 1);
   return static_cast<double>(latencies[index]) / 1000.0;
 }
@@ -980,8 +999,7 @@ std::pair<uint64_t, uint64_t> evaluate_boundary_recall(
 #pragma omp parallel for num_threads(threads) schedule(dynamic, 16) reduction(+ : hits, total)
   for (int64_t raw_qi = 0; raw_qi < static_cast<int64_t>(query.n); ++raw_qi) {
     const size_t qi = static_cast<size_t>(raw_qi);
-    const std::vector<alaya::laser::PID> result =
-        upd.search(query.row(qi), a.topk, a.mixed_ef);
+    const std::vector<alaya::laser::PID> result = upd.search(query.row(qi), a.topk, a.mixed_ef);
     std::vector<alaya::laser::PID> truth;
     truth.reserve(a.topk);
     for (uint32_t j = 0; j < gt.dim && truth.size() < a.topk; ++j) {
@@ -1000,15 +1018,14 @@ std::pair<uint64_t, uint64_t> evaluate_boundary_recall(
   return {hits, total};
 }
 
-MixedPhaseMetrics measure_mixed_phase(
-    const std::string &phase,
-    bool maintenance,
-    alaya::laser::QGUpdater &upd,
-    const FloatMatrix &query,
-    const IntMatrix &gt,
-    const Args &a,
-    const std::unordered_set<alaya::laser::PID> &eval_dead,
-    const std::function<uint64_t()> &work) {
+MixedPhaseMetrics measure_mixed_phase(const std::string &phase,
+                                      bool maintenance,
+                                      alaya::laser::QGUpdater &upd,
+                                      const FloatMatrix &query,
+                                      const IntMatrix &gt,
+                                      const Args &a,
+                                      const std::unordered_set<alaya::laser::PID> &eval_dead,
+                                      const std::function<uint64_t()> &work) {
   std::atomic<bool> start{false};
   std::atomic<bool> stop{false};
   std::atomic<uint32_t> ready{0};
@@ -1024,8 +1041,7 @@ MixedPhaseMetrics measure_mixed_phase(
         auto &local = worker[tid];
         local.latency_ns.reserve(4096);
         while (!stop.load(std::memory_order_acquire)) {
-          const size_t qi =
-              (static_cast<size_t>(tid) + iteration * a.query_threads) % query.n;
+          const size_t qi = (static_cast<size_t>(tid) + iteration * a.query_threads) % query.n;
           ++iteration;
           const auto t0 = std::chrono::steady_clock::now();
           const std::vector<alaya::laser::PID> result =
@@ -1092,8 +1108,7 @@ MixedPhaseMetrics measure_mixed_phase(
   out.p50_us = percentile_us(latencies, 0.50);
   out.p99_us = percentile_us(latencies, 0.99);
   out.seqlock_calls = after.query_seqlock_read_calls - before.query_seqlock_read_calls;
-  out.seqlock_retries =
-      after.query_seqlock_read_retries - before.query_seqlock_read_retries;
+  out.seqlock_retries = after.query_seqlock_read_retries - before.query_seqlock_read_retries;
   out.query_page_reads = after.query_page_reads - before.query_page_reads;
   return out;
 }
@@ -1109,8 +1124,7 @@ void write_mixed_csv(const Args &a, const std::vector<MixedPhaseMetrics> &phases
   bool need_header = true;
   if (!a.csv.empty()) {
     std::error_code ec;
-    need_header =
-        !std::filesystem::exists(a.csv, ec) || std::filesystem::file_size(a.csv, ec) == 0;
+    need_header = !std::filesystem::exists(a.csv, ec) || std::filesystem::file_size(a.csv, ec) == 0;
     file.open(a.csv, std::ios::app);
     if (!file) throw std::runtime_error("cannot append mixed csv " + a.csv);
     out = &file;
@@ -1124,8 +1138,8 @@ void write_mixed_csv(const Args &a, const std::vector<MixedPhaseMetrics> &phases
                   static_cast<double>(phase.seqlock_calls + phase.seqlock_retries);
     *out << phase.phase << ',' << a.mixed_rate_pct << ',' << a.query_threads << ','
          << a.insert_threads << ',' << phase.eval_watermark << ',' << phase.query_count << ','
-         << phase.query_qps << ',' << phase.p50_us << ',' << phase.p99_us << ','
-         << phase.recall << ',' << phase.inserted << ',' << phase.insert_qps << ','
+         << phase.query_qps << ',' << phase.p50_us << ',' << phase.p99_us << ',' << phase.recall
+         << ',' << phase.inserted << ',' << phase.insert_qps << ','
          << (phase.maintenance ? phase.p50_us : -1.0) << ','
          << (phase.maintenance ? phase.p99_us : -1.0) << ',' << phase.seqlock_calls << ','
          << phase.seqlock_retries << ',' << retry_rate << ',' << phase.query_page_reads << ','
@@ -1175,9 +1189,11 @@ int do_mixed(const Args &a) {
   p.write_cache = a.write_cache != 0;
   p.stage_backlinks = a.stage != 0;
   p.maintain_indegree = true;
+  p.maintain_turnover = a.garden_policy == "turnover";
   apply_cache_cap_pages(a.cache_cap_pages, p);
   alaya::laser::QGUpdater upd(qg, p);
   upd.init_indegree(a.insert_threads);
+  if (p.maintain_turnover) upd.init_turnover();
 
   const double target_rate = a.mixed_rate_pct == 25 || a.mixed_rate_pct == 50
                                  ? a.mixed_full_rate * static_cast<double>(a.mixed_rate_pct) / 100.0
@@ -1265,6 +1281,8 @@ int do_mixed(const Args &a) {
     gp.policy = alaya::laser::GardenParams::Policy::kLowIndegree;
   else if (a.garden_policy == "random")
     gp.policy = alaya::laser::GardenParams::Policy::kRandom;
+  else if (a.garden_policy == "turnover")
+    gp.policy = alaya::laser::GardenParams::Policy::kTurnover;
   else
     throw std::runtime_error("bad --garden_policy " + a.garden_policy);
   phases.push_back(measure_mixed_phase("garden", true, upd, query, gt, a, dead, [&]() -> uint64_t {
