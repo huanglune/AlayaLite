@@ -249,6 +249,11 @@ enum class MetricPreprocessing : std::uint8_t {
 };
 
 enum class FilterPolicy : std::uint8_t { automatic = 0, strict = 1, allow_partial = 2 };
+enum class FilterExecution : std::uint8_t {
+  prefilter = 0,
+  traversal = 1,
+  postfilter = 2,
+};
 enum class RerankPolicy : std::uint8_t { automatic = 0, disabled = 1, exact_required = 2 };
 enum class PartialResultPolicy : std::uint8_t { discard = 0, retain = 1 };
 enum class UnknownExtensionPolicy : std::uint8_t { ignore_safe = 0, reject = 1 };

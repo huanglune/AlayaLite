@@ -54,6 +54,7 @@ def test_target_single_and_batch_share_one_short_row_response_schema(tmp_path):
             "completeness",
             "visibility_watermark",
             "metadata_epoch",
+            "search_stats",
         }
     )
     assert batch["ids"].tolist() == ["a", "b", "b", "a"]

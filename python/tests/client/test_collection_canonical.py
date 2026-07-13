@@ -5,7 +5,11 @@
 
 import numpy as np
 import pytest
-from alayalite import Collection, CollectionInvalidArgumentError
+from alayalite import (
+    Collection,
+    CollectionInvalidArgumentError,
+    CollectionResourceExhaustedError,
+)
 from alayalite._alayalitepy import _Collection
 from alayalite.schema import IndexParams
 
@@ -96,3 +100,68 @@ def test_native_status_maps_to_versioned_python_exception(tmp_path):
     assert error.status_version == "1"
     assert error.status_code != 0
     assert error.partial is False
+
+
+def test_gate10_filter_policies_overfetch_stats_and_budget_reuse(tmp_path):
+    collection = Collection(
+        "gate10-filter",
+        IndexParams(rocksdb_path=str(tmp_path / "gate10-filter" / "rocksdb")),
+    )
+    collection.add(
+        [
+            _item(
+                f"row-{row}",
+                [row, 0],
+                metadata={"selected": row >= 4, "all": True},
+            )
+            for row in range(8)
+        ]
+    )
+    query = np.asarray([0.0, 0.0], dtype=np.float32)
+
+    for expression, expected in (
+        ({"missing": True}, []),
+        ({"selected": True}, ["row-4", "row-5"]),
+        ({"all": True}, ["row-0", "row-1"]),
+    ):
+        strict = collection.search(
+            query,
+            top_k=2,
+            metadata_filter=expression,
+            filter_policy="strict",
+        )
+        assert strict["ids"].tolist() == expected
+        assert strict["search_stats"]["filter_execution"] == "prefilter"
+
+    traversed = collection.search(
+        query,
+        top_k=2,
+        metadata_filter={"selected": True},
+        filter_policy="auto",
+        filter_selectivity=0.5,
+    )
+    assert traversed["ids"].tolist() == ["row-4", "row-5"]
+    assert traversed["search_stats"]["filter_execution"] == "traversal"
+    assert traversed["search_stats"]["overfetch_rounds"] == 2
+    assert traversed["search_stats"]["filter_examined"] > 0
+    assert traversed["search_stats"]["filter_passed"] > 0
+    assert traversed["search_stats"]["lease_acquired"] == 1
+    assert traversed["search_stats"]["lease_released"] == 1
+
+    postfiltered = collection.search(
+        query,
+        top_k=2,
+        metadata_filter={"all": True},
+        filter_policy="auto",
+        filter_selectivity=1.0,
+    )
+    assert postfiltered["search_stats"]["filter_execution"] == "postfilter"
+
+    with pytest.raises(CollectionResourceExhaustedError) as denied:
+        collection.search(query, top_k=2, scratch_budget_bytes=1)
+    assert denied.value.partial is False
+
+    reused = collection.search(query, top_k=2)
+    assert reused["ids"].tolist() == ["row-0", "row-1"]
+    assert reused["search_stats"]["lease_acquired"] == 1
+    assert reused["search_stats"]["lease_released"] == 1

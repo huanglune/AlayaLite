@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -35,6 +36,15 @@ class SegmentedCollection {
   auto operator=(const SegmentedCollection &) -> SegmentedCollection & = delete;
   SegmentedCollection(SegmentedCollection &&) = delete;
   auto operator=(SegmentedCollection &&) -> SegmentedCollection & = delete;
+
+  ~SegmentedCollection() {
+#ifndef NDEBUG
+    assert(outstanding_search_leases_.load(std::memory_order_acquire) == 0 &&
+           "SegmentedCollection destroyed with an unreleased search lease");
+    assert(leased_search_bytes_.load(std::memory_order_acquire) == 0 &&
+           "SegmentedCollection destroyed with accounted scratch bytes still leased");
+#endif
+  }
 
   [[nodiscard]] static auto open(CollectionSchema schema,
                                  std::vector<SegmentRegistration> registrations,
@@ -580,6 +590,10 @@ class SegmentedCollection {
   // shared reference is the reclamation barrier for every SegmentEntry it owns.
   [[nodiscard]] auto pin_routing_snapshot() const -> RoutingSnapshotPtr { return load_snapshot(); }
 
+  [[nodiscard]] auto outstanding_search_leases() const noexcept -> std::uint64_t {
+    return outstanding_search_leases_.load(std::memory_order_acquire);
+  }
+
  private:
   class OperationGuard {
    public:
@@ -684,6 +698,48 @@ class SegmentedCollection {
     SegmentedCollection *owner_{};
     RowMutationStatus status_{RowMutationStatus::aborted};
     bool committed_{};
+  };
+
+  class SearchLeaseGuard {
+   public:
+    SearchLeaseGuard(SegmentedCollection *owner, std::uint64_t bytes, CollectionSearchStats *stats)
+        : owner_(owner), bytes_(bytes), stats_(stats) {
+      owner_->outstanding_search_leases_.fetch_add(1, std::memory_order_acq_rel);
+      const auto leased =
+          owner_->leased_search_bytes_.fetch_add(bytes_, std::memory_order_acq_rel) + bytes_;
+      if (stats_ != nullptr) {
+        ++stats_->lease_acquired;
+        stats_->lease_peak_bytes = std::max(stats_->lease_peak_bytes, leased);
+      }
+    }
+
+    SearchLeaseGuard(const SearchLeaseGuard &) = delete;
+    auto operator=(const SearchLeaseGuard &) -> SearchLeaseGuard & = delete;
+
+    ~SearchLeaseGuard() { release(); }
+
+    void release() noexcept {
+      if (owner_ == nullptr) {
+        return;
+      }
+      [[maybe_unused]] const auto previous_bytes =
+          owner_->leased_search_bytes_.fetch_sub(bytes_, std::memory_order_acq_rel);
+      [[maybe_unused]] const auto previous_leases =
+          owner_->outstanding_search_leases_.fetch_sub(1, std::memory_order_acq_rel);
+#ifndef NDEBUG
+      assert(previous_bytes >= bytes_ && "search byte lease accounting underflow");
+      assert(previous_leases != 0 && "search lease accounting underflow");
+#endif
+      if (stats_ != nullptr) {
+        ++stats_->lease_released;
+      }
+      owner_ = nullptr;
+    }
+
+   private:
+    SegmentedCollection *owner_{};
+    std::uint64_t bytes_{};
+    CollectionSearchStats *stats_{};
   };
 
   struct SegmentSearchStorage {
@@ -847,15 +903,138 @@ class SegmentedCollection {
     lifecycle_changed_.notify_all();
   }
 
+  struct SearchBudgetPlan {
+    std::uint64_t scratch_bytes{};
+    std::uint64_t io_requests{};
+    std::uint64_t io_bytes{};
+  };
+
+  [[nodiscard]] static auto search_budget_denied(std::string diagnostic) -> core::Status {
+    return core::Status::error(core::StatusCode::resource_exhausted,
+                               core::OperationStage::admission,
+                               core::StatusDetail::budget_denied,
+                               std::move(diagnostic),
+                               core::Retryability::retryable_with_backoff);
+  }
+
+  [[nodiscard]] auto preflight_search_budget(const RoutingSnapshot &snapshot,
+                                             const CollectionSearchRequest &request)
+      -> core::Result<SearchBudgetPlan> {
+    SearchBudgetPlan plan;
+    const auto candidate_rows =
+        std::max<core::RowCount>(snapshot.searchable_live_count, request.options.top_k);
+    std::uint64_t candidates{};
+    std::uint64_t candidate_bytes{};
+    std::uint64_t query_bytes{};
+    if (!core::checked_multiply(request.queries.rows, candidate_rows, candidates) ||
+        !core::checked_multiply(candidates, sizeof(CollectionHit), candidate_bytes) ||
+        !core::checked_multiply(request.queries.rows, request.queries.row_stride, query_bytes) ||
+        !core::checked_add(candidate_bytes, query_bytes, plan.scratch_bytes)) {
+      return search_budget_denied("collection search scratch accounting overflowed");
+    }
+
+    const auto rounds = static_cast<std::uint64_t>(request.maximum_overfetch_rounds) + 1;
+    for (const auto &entry : snapshot.segments) {
+      if (entry->segment.descriptor().medium != core::Medium::disk) {
+        continue;
+      }
+      const auto known_rows = snapshot.known_rows_for(*entry);
+      std::uint64_t requests{};
+      std::uint64_t bytes{};
+      std::uint64_t row_bytes{};
+      if (!core::checked_multiply(request.queries.rows, rounds, requests) ||
+          !core::checked_multiply(entry->segment.descriptor().dim, sizeof(float), row_bytes) ||
+          !core::checked_multiply(known_rows, row_bytes, bytes) ||
+          !core::checked_multiply(bytes, request.queries.rows, bytes) ||
+          !core::checked_multiply(bytes, rounds, bytes) ||
+          !core::checked_add(plan.io_requests, requests, plan.io_requests) ||
+          !core::checked_add(plan.io_bytes, bytes, plan.io_bytes)) {
+        return search_budget_denied("collection search I/O accounting overflowed");
+      }
+    }
+
+    if (!request.context->query_scratch_lease.permits(plan.scratch_bytes)) {
+      return search_budget_denied("collection search scratch lease is too small");
+    }
+    const auto &credits = request.context->io_credits;
+    if ((credits.available_requests != core::kUnlimitedResource &&
+         credits.available_requests < plan.io_requests) ||
+        (credits.available_bytes != core::kUnlimitedResource &&
+         credits.available_bytes < plan.io_bytes)) {
+      return search_budget_denied("collection search I/O credits are too small");
+    }
+    return plan;
+  }
+
+  [[nodiscard]] static auto estimate_filter_selectivity(const RoutingSnapshot &snapshot,
+                                                        const LogicalFilter &filter,
+                                                        CollectionSearchStats *stats) -> double {
+    if (const auto provided = filter.selectivity_estimate(); provided.has_value()) {
+      return *provided;
+    }
+    constexpr std::uint64_t kSampleRows = 256;
+    std::uint64_t examined{};
+    std::uint64_t passed{};
+    for (const auto &[logical_id, version] : snapshot.versions) {
+      if (examined == kSampleRows) {
+        break;
+      }
+      if (version.state != VersionState::live ||
+          version.upsert_sequence > snapshot.visibility_watermark) {
+        continue;
+      }
+      ++examined;
+      const auto matches =
+          filter.matches(logical_id, version.payload.metadata, version.payload.document);
+      passed += matches ? 1U : 0U;
+    }
+    if (stats != nullptr) {
+      stats->filter_examined += examined;
+      stats->filter_passed += passed;
+    }
+    return examined == 0 ? 0.0 : static_cast<double>(passed) / static_cast<double>(examined);
+  }
+
+  [[nodiscard]] static auto select_filter_execution(const RoutingSnapshot &snapshot,
+                                                    const CollectionSearchRequest &request,
+                                                    bool prefer_exact)
+      -> core::Result<core::FilterExecution> {
+    if (!request.filter.active()) {
+      return core::FilterExecution::postfilter;
+    }
+    if (prefer_exact || request.options.filter_policy == core::FilterPolicy::strict) {
+      return core::FilterExecution::prefilter;
+    }
+    const auto selectivity = estimate_filter_selectivity(snapshot, request.filter, request.stats);
+    if (selectivity < 0.0 || selectivity > 1.0) {
+      return core::Status::error(core::StatusCode::invalid_argument,
+                                 core::OperationStage::validation,
+                                 core::StatusDetail::malformed_struct,
+                                 "filter selectivity estimate must be in [0, 1]");
+    }
+    if (selectivity <= 0.15) {
+      return core::FilterExecution::prefilter;
+    }
+    if (selectivity <= 0.60) {
+      return core::FilterExecution::traversal;
+    }
+    return core::FilterExecution::postfilter;
+  }
+
   [[nodiscard]] auto search_at_snapshot(const RoutingSnapshotPtr &snapshot,
                                         const CollectionSearchRequest &request,
                                         bool prefer_exact) -> core::Result<CollectionSearchResult> {
     if (snapshot == nullptr || request.context == nullptr ||
-        !core::is_current_struct(*request.context) || !core::is_current_struct(request.options)) {
+        !core::is_current_struct(*request.context) || !core::is_current_struct(request.options) ||
+        (request.stats != nullptr && !core::is_current_struct(*request.stats))) {
       return core::Status::error(core::StatusCode::invalid_argument,
                                  core::OperationStage::validation,
                                  core::StatusDetail::malformed_struct,
                                  "collection search request is incomplete or incompatible");
+    }
+    if (request.stats != nullptr) {
+      *request.stats = CollectionSearchStats{};
+      request.stats->filter_active = request.filter.active();
     }
     auto status =
         core::validate_tensor(request.queries, schema_.dim, core::OperationStage::validation);
@@ -887,23 +1066,44 @@ class SegmentedCollection {
       return result;
     }
 
-    if (prefer_exact || request.filter.active()) {
-      const auto all_vectors_owned =
-          std::all_of(snapshot->versions.begin(), snapshot->versions.end(), [](const auto &item) {
-            return item.second.state != VersionState::live ||
-                   item.second.payload.vector.has_value();
-          });
-      if (all_vectors_owned) {
-        return exact_search(snapshot, request);
-      }
+    auto selected = select_filter_execution(*snapshot, request, prefer_exact);
+    if (!selected.ok()) {
+      return selected.status();
+    }
+    auto execution = std::move(selected).value();
+    const auto all_vectors_owned =
+        std::all_of(snapshot->versions.begin(), snapshot->versions.end(), [](const auto &item) {
+          return item.second.state != VersionState::live || item.second.payload.vector.has_value();
+        });
+    if (execution == core::FilterExecution::prefilter && !all_vectors_owned) {
       if (request.options.filter_policy == core::FilterPolicy::strict) {
+        return search_budget_denied("strict filtered search requires exact fallback vectors");
+      }
+      if (prefer_exact) {
         return core::Status::error(core::StatusCode::not_supported,
                                    core::OperationStage::search,
                                    core::StatusDetail::operation_slot_absent,
-                                   "strict filtered search requires vectors for exact fallback");
+                                   "exact hybrid search requires readable live vectors");
       }
+      execution = core::FilterExecution::traversal;
     }
-    return fanout_search(snapshot, request);
+    if (request.stats != nullptr) {
+      request.stats->filter_execution = execution;
+    }
+
+    auto budget = preflight_search_budget(*snapshot, request);
+    if (!budget.ok()) {
+      return budget.status();
+    }
+    if (request.stats != nullptr) {
+      request.stats->budget_consumed = budget.value().scratch_bytes;
+    }
+    SearchLeaseGuard lease(this, budget.value().scratch_bytes, request.stats);
+
+    if (execution == core::FilterExecution::prefilter) {
+      return exact_search(snapshot, request);
+    }
+    return fanout_search(snapshot, request, execution);
   }
 
   [[nodiscard]] auto exact_search(const RoutingSnapshotPtr &snapshot,
@@ -923,17 +1123,24 @@ class SegmentedCollection {
       auto &query_result = result.queries[static_cast<std::size_t>(query_index)];
       for (const auto &[logical_id, version] : snapshot->versions) {
         if (version.state != VersionState::live ||
-            version.upsert_sequence > snapshot->visibility_watermark ||
-            !request.filter.matches(logical_id,
-                                    version.payload.metadata,
-                                    version.payload.document)) {
+            version.upsert_sequence > snapshot->visibility_watermark) {
           continue;
         }
+        if (request.filter.active()) {
+          if (request.stats != nullptr) {
+            ++request.stats->filter_examined;
+          }
+          if (!request.filter.matches(logical_id,
+                                      version.payload.metadata,
+                                      version.payload.document)) {
+            continue;
+          }
+          if (request.stats != nullptr) {
+            ++request.stats->filter_passed;
+          }
+        }
         if (!version.payload.vector.has_value()) {
-          return core::Status::error(core::StatusCode::not_supported,
-                                     core::OperationStage::search,
-                                     core::StatusDetail::operation_slot_absent,
-                                     "exact fallback cannot read a live row vector");
+          return search_budget_denied("exact fallback cannot read a live row vector");
         }
         auto score = exact_distance(query_row(request.queries, query_index),
                                     *version.payload.vector,
@@ -941,18 +1148,28 @@ class SegmentedCollection {
         if (!score.ok()) {
           return score.status();
         }
+        if (is_nan_score(score.value())) {
+          if (request.stats != nullptr) {
+            ++request.stats->nan_discarded;
+          }
+          continue;
+        }
+        auto flags = core::ResultFlag::exact_reranked | core::ResultFlag::version_checked;
+        if (request.filter.active()) {
+          flags = flags | core::ResultFlag::filtered;
+        }
         query_result.hits.push_back(CollectionHit{logical_id,
                                                   std::move(score).value(),
                                                   core::ScoreKind::distance,
                                                   schema_.metric,
-                                                  core::ResultFlag::exact_reranked |
-                                                      core::ResultFlag::filtered |
-                                                      core::ResultFlag::version_checked,
+                                                  flags,
                                                   version.upsert_sequence,
                                                   version.address});
         if (request.context->stats != nullptr) {
-          ++request.context->stats->filter_candidates;
           ++request.context->stats->rerank_count;
+          if (request.filter.active()) {
+            ++request.context->stats->filter_candidates;
+          }
         }
       }
       sort_hits(query_result.hits);
@@ -968,152 +1185,252 @@ class SegmentedCollection {
   }
 
   [[nodiscard]] auto fanout_search(const RoutingSnapshotPtr &snapshot,
-                                   const CollectionSearchRequest &request)
+                                   const CollectionSearchRequest &request,
+                                   core::FilterExecution execution)
       -> core::Result<CollectionSearchResult> {
-    std::vector<std::vector<Candidate>> candidates(static_cast<std::size_t>(request.queries.rows));
-    std::vector<bool> exhaustive(static_cast<std::size_t>(request.queries.rows), true);
-    std::vector<core::Status> per_query_status(static_cast<std::size_t>(request.queries.rows),
-                                               core::Status::success());
-
+    auto request_limit = request.options.top_k;
+    core::RowCount maximum_known_rows{};
     for (const auto &entry : snapshot->segments) {
-      const auto known_rows = snapshot->known_rows_for(*entry);
-      if (known_rows == 0) {
-        continue;
-      }
-      const auto candidate_limit = std::max<core::RowCount>(request.options.top_k, known_rows);
-      std::uint64_t sink_count{};
-      if (!core::checked_multiply(request.queries.rows, candidate_limit, sink_count) ||
-          sink_count > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-        return core::Status::error(core::StatusCode::invalid_argument,
-                                   core::OperationStage::search,
-                                   core::StatusDetail::arithmetic_overflow,
-                                   "collection fanout sink size is not representable");
-      }
-      SegmentSearchStorage storage(request.queries.rows, candidate_limit);
-      core::SearchRequest segment_request;
-      segment_request.queries = request.queries;
-      segment_request.options = request.options;
-      segment_request.options.top_k = candidate_limit;
-      // Gate 4 owns the exact post-filter seam. Engine capability negotiation
-      // and physical pushdown remain Gate 10, so the frozen view stays `none`.
-      segment_request.filter = core::SegmentFilterView{};
-      segment_request.context = request.context;
-      segment_request.response = &storage.response;
-      segment_request.lifetime_pin = std::const_pointer_cast<RoutingSnapshot>(snapshot);
+      maximum_known_rows = std::max(maximum_known_rows, snapshot->known_rows_for(*entry));
+    }
 
-      const auto capabilities = entry->segment.capabilities();
-      core::Status segment_status;
-      if (capabilities.concurrency.reentrant_search) {
-        std::shared_lock operation_lock(entry->operation_mutex);
-        segment_status = entry->segment.search(std::move(segment_request));
-      } else {
-        std::unique_lock operation_lock(entry->operation_mutex);
-        segment_status = entry->segment.search(std::move(segment_request));
-      }
-      if (!segment_status.ok()) {
-        return segment_status;
-      }
-      auto response_status =
-          validate_segment_response(storage.response, request.queries.rows, candidate_limit);
-      if (!response_status.ok()) {
-        return response_status;
-      }
+    for (std::uint32_t round = 0;; ++round) {
+      std::vector<std::vector<Candidate>> candidates(
+          static_cast<std::size_t>(request.queries.rows));
+      std::vector<bool> exhaustive(static_cast<std::size_t>(request.queries.rows), true);
+      std::vector<core::Status> per_query_status(static_cast<std::size_t>(request.queries.rows),
+                                                 core::Status::success());
 
-      for (core::RowCount query_index = 0; query_index < request.queries.rows; ++query_index) {
-        const auto index = static_cast<std::size_t>(query_index);
-        if (!storage.statuses[index].ok()) {
-          per_query_status[index] = storage.statuses[index];
-          exhaustive[index] = false;
+      for (const auto &entry : snapshot->segments) {
+        const auto known_rows = snapshot->known_rows_for(*entry);
+        if (known_rows == 0) {
           continue;
         }
-        exhaustive[index] =
-            exhaustive[index] &&
-            (storage.completeness[index] == core::SearchCompleteness::eligible_exhausted ||
-             storage.counts[index] >= known_rows);
-        for (core::RowCount hit_index = storage.offsets[index];
-             hit_index < storage.offsets[index + 1];
-             ++hit_index) {
-          const auto &hit = storage.hits[static_cast<std::size_t>(hit_index)];
-          if (hit.score_kind != core::ScoreKind::rank_only && is_nan_score(hit.score)) {
-            return core::Status::error(core::StatusCode::internal,
-                                       core::OperationStage::search,
-                                       core::StatusDetail::invalid_score,
-                                       "numeric segment returned a NaN score");
+        const auto candidate_limit = std::min<core::RowCount>(known_rows, request_limit);
+        std::uint64_t sink_count{};
+        if (candidate_limit == 0 ||
+            !core::checked_multiply(request.queries.rows, candidate_limit, sink_count) ||
+            sink_count > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+          return core::Status::error(core::StatusCode::invalid_argument,
+                                     core::OperationStage::search,
+                                     core::StatusDetail::arithmetic_overflow,
+                                     "collection fanout sink size is not representable");
+        }
+        SegmentSearchStorage storage(request.queries.rows, candidate_limit);
+        core::SearchRequest segment_request;
+        segment_request.queries = request.queries;
+        segment_request.options = request.options;
+        segment_request.options.top_k = candidate_limit;
+        if (execution == core::FilterExecution::traversal && request.filter.active()) {
+          segment_request.filter.kind = core::SegmentFilterKind::predicate;
+          segment_request.filter.exact = false;
+          segment_request.filter.metadata_epoch = snapshot->metadata_epoch;
+          segment_request.filter.payload = std::addressof(request.filter);
+          segment_request.filter.payload_size = sizeof(LogicalFilter);
+          segment_request.filter.selectivity_hint =
+              request.filter.selectivity_estimate().value_or(1.0);
+        }
+        segment_request.context = request.context;
+        segment_request.response = &storage.response;
+        segment_request.lifetime_pin = std::const_pointer_cast<RoutingSnapshot>(snapshot);
+
+        const auto capabilities = entry->segment.capabilities();
+        if (request.stats != nullptr && entry->segment.descriptor().medium == core::Medium::disk) {
+          std::uint64_t requests{};
+          std::uint64_t bytes{};
+          std::uint64_t row_bytes{};
+          const auto accounted =
+              core::checked_multiply(request.queries.rows, std::uint64_t{1}, requests) &&
+              core::checked_multiply(entry->segment.descriptor().dim, sizeof(float), row_bytes) &&
+              core::checked_multiply(known_rows, row_bytes, bytes) &&
+              core::checked_multiply(bytes, request.queries.rows, bytes) &&
+              core::checked_add(request.stats->io_requests_consumed,
+                                requests,
+                                request.stats->io_requests_consumed) &&
+              core::checked_add(request.stats->io_bytes_consumed,
+                                bytes,
+                                request.stats->io_bytes_consumed) &&
+              core::checked_add(request.stats->budget_consumed,
+                                bytes,
+                                request.stats->budget_consumed);
+          if (!accounted) {
+            return search_budget_denied("collection search runtime accounting overflowed");
           }
-          const RowAddress address{entry->segment_id, entry->generation, hit.row_id};
-          const auto reverse = snapshot->reverse.find(address);
-          if (reverse == snapshot->reverse.end() ||
-              reverse->second.upsert_sequence > snapshot->visibility_watermark) {
-            continue;  // dark or newer than the admitted watermark
+        }
+        core::Status segment_status;
+        if (capabilities.concurrency.reentrant_search) {
+          std::shared_lock operation_lock(entry->operation_mutex);
+          segment_status = entry->segment.search(std::move(segment_request));
+        } else {
+          std::unique_lock operation_lock(entry->operation_mutex);
+          segment_status = entry->segment.search(std::move(segment_request));
+        }
+        if (!segment_status.ok()) {
+          if (request.options.filter_policy != core::FilterPolicy::allow_partial) {
+            return segment_status;
           }
-          const auto version = snapshot->versions.find(reverse->second.logical_id);
-          if (version == snapshot->versions.end() || version->second.state != VersionState::live ||
-              version->second.upsert_sequence != reverse->second.upsert_sequence ||
-              version->second.address != address ||
-              version->second.upsert_sequence > snapshot->visibility_watermark ||
-              !request.filter.matches(version->first,
-                                      version->second.payload.metadata,
-                                      version->second.payload.document)) {
+          std::fill(exhaustive.begin(), exhaustive.end(), false);
+          continue;
+        }
+        auto response_status =
+            validate_segment_response(storage.response, request.queries.rows, candidate_limit);
+        if (!response_status.ok()) {
+          return response_status;
+        }
+
+        for (core::RowCount query_index = 0; query_index < request.queries.rows; ++query_index) {
+          const auto index = static_cast<std::size_t>(query_index);
+          if (!storage.statuses[index].ok()) {
+            if (request.options.filter_policy == core::FilterPolicy::allow_partial) {
+              exhaustive[index] = false;
+            } else {
+              per_query_status[index] = storage.statuses[index];
+              exhaustive[index] = false;
+            }
             continue;
           }
-          auto flags = hit.result_flags | core::ResultFlag::version_checked;
-          if (request.filter.active()) {
-            flags = flags | core::ResultFlag::filtered;
+          exhaustive[index] =
+              exhaustive[index] &&
+              (storage.completeness[index] == core::SearchCompleteness::eligible_exhausted ||
+               storage.counts[index] >= known_rows);
+          for (core::RowCount hit_index = storage.offsets[index];
+               hit_index < storage.offsets[index + 1];
+               ++hit_index) {
+            const auto &hit = storage.hits[static_cast<std::size_t>(hit_index)];
+            if (hit.score_kind != core::ScoreKind::rank_only && is_nan_score(hit.score)) {
+              if (request.stats != nullptr) {
+                ++request.stats->nan_discarded;
+              }
+              continue;
+            }
+            const RowAddress address{entry->segment_id, entry->generation, hit.row_id};
+            const auto reverse = snapshot->reverse.find(address);
+            if (reverse == snapshot->reverse.end() ||
+                reverse->second.upsert_sequence > snapshot->visibility_watermark) {
+              continue;
+            }
+            const auto version = snapshot->versions.find(reverse->second.logical_id);
+            if (version == snapshot->versions.end() ||
+                version->second.state != VersionState::live ||
+                version->second.upsert_sequence != reverse->second.upsert_sequence ||
+                version->second.address != address ||
+                version->second.upsert_sequence > snapshot->visibility_watermark) {
+              continue;
+            }
+            if (execution == core::FilterExecution::traversal && request.filter.active()) {
+              if (request.stats != nullptr) {
+                ++request.stats->filter_examined;
+              }
+              if (!request.filter.matches(version->first,
+                                          version->second.payload.metadata,
+                                          version->second.payload.document)) {
+                continue;
+              }
+              if (request.stats != nullptr) {
+                ++request.stats->filter_passed;
+              }
+            }
+            auto flags = hit.result_flags | core::ResultFlag::version_checked;
+            if (request.filter.active()) {
+              flags = flags | core::ResultFlag::filtered;
+            }
+            candidates[index].push_back(Candidate{CollectionHit{version->first,
+                                                                hit.score,
+                                                                hit.score_kind,
+                                                                hit.comparable_metric,
+                                                                flags,
+                                                                version->second.upsert_sequence,
+                                                                address},
+                                                  entry,
+                                                  &version->second.payload});
           }
-          candidates[index].push_back(Candidate{CollectionHit{version->first,
-                                                              hit.score,
-                                                              hit.score_kind,
-                                                              hit.comparable_metric,
-                                                              flags,
-                                                              version->second.upsert_sequence,
-                                                              address},
-                                                entry,
-                                                &version->second.payload});
         }
       }
-    }
 
-    CollectionSearchResult result;
-    result.visibility_watermark = snapshot->visibility_watermark;
-    result.metadata_epoch = snapshot->metadata_epoch;
-    result.queries.resize(static_cast<std::size_t>(request.queries.rows));
-    for (core::RowCount query_index = 0; query_index < request.queries.rows; ++query_index) {
-      const auto index = static_cast<std::size_t>(query_index);
-      auto &query_result = result.queries[index];
-      if (!per_query_status[index].ok()) {
-        query_result.status = per_query_status[index];
-        query_result.completeness = core::SearchCompleteness::failed;
-        continue;
+      CollectionSearchResult result;
+      result.visibility_watermark = snapshot->visibility_watermark;
+      result.metadata_epoch = snapshot->metadata_epoch;
+      result.queries.resize(static_cast<std::size_t>(request.queries.rows));
+      bool needs_more{};
+      for (core::RowCount query_index = 0; query_index < request.queries.rows; ++query_index) {
+        const auto index = static_cast<std::size_t>(query_index);
+        auto &query_result = result.queries[index];
+        if (!per_query_status[index].ok()) {
+          query_result.status = per_query_status[index];
+          query_result.completeness = core::SearchCompleteness::failed;
+          continue;
+        }
+        auto normalized = normalize_scores(candidates[index],
+                                           query_row(request.queries, query_index),
+                                           request.context,
+                                           request.stats);
+        if (!normalized.ok()) {
+          return normalized.status();
+        }
+        query_result.hits = std::move(normalized).value();
+        sort_hits(query_result.hits);
+        query_result.hits.erase(std::unique(query_result.hits.begin(),
+                                            query_result.hits.end(),
+                                            [](const CollectionHit &lhs, const CollectionHit &rhs) {
+                                              return lhs.logical_id == rhs.logical_id;
+                                            }),
+                                query_result.hits.end());
+
+        if (execution == core::FilterExecution::postfilter && request.filter.active()) {
+          std::vector<CollectionHit> filtered;
+          filtered.reserve(query_result.hits.size());
+          for (auto &hit : query_result.hits) {
+            const auto version = snapshot->versions.find(hit.logical_id);
+            if (request.stats != nullptr) {
+              ++request.stats->filter_examined;
+            }
+            if (version == snapshot->versions.end() ||
+                !request.filter.matches(hit.logical_id,
+                                        version->second.payload.metadata,
+                                        version->second.payload.document)) {
+              continue;
+            }
+            if (request.stats != nullptr) {
+              ++request.stats->filter_passed;
+            }
+            filtered.push_back(std::move(hit));
+          }
+          query_result.hits = std::move(filtered);
+        }
+        if (query_result.hits.size() > request.options.top_k) {
+          query_result.hits.resize(static_cast<std::size_t>(request.options.top_k));
+        }
+        query_result.status = core::Status::success();
+        query_result.completeness =
+            query_result.hits.size() == request.options.top_k ? core::SearchCompleteness::complete_k
+            : exhaustive[index] ? core::SearchCompleteness::eligible_exhausted
+                                : core::SearchCompleteness::strategy_incomplete;
+        needs_more =
+            needs_more || (query_result.hits.size() < request.options.top_k && !exhaustive[index]);
       }
-      auto normalized = normalize_scores(candidates[index],
-                                         query_row(request.queries, query_index),
-                                         request.context);
-      if (!normalized.ok()) {
-        return normalized.status();
+
+      if (!needs_more || round >= request.maximum_overfetch_rounds ||
+          request_limit >= maximum_known_rows) {
+        return result;
       }
-      query_result.hits = std::move(normalized).value();
-      sort_hits(query_result.hits);
-      query_result.hits.erase(std::unique(query_result.hits.begin(),
-                                          query_result.hits.end(),
-                                          [](const CollectionHit &lhs, const CollectionHit &rhs) {
-                                            return lhs.logical_id == rhs.logical_id;
-                                          }),
-                              query_result.hits.end());
-      if (query_result.hits.size() > request.options.top_k) {
-        query_result.hits.resize(static_cast<std::size_t>(request.options.top_k));
+      const auto doubled = request_limit > std::numeric_limits<core::RowCount>::max() / 2
+                               ? std::numeric_limits<core::RowCount>::max()
+                               : request_limit * 2;
+      const auto next_limit = std::min(maximum_known_rows, doubled);
+      if (next_limit <= request_limit) {
+        return result;
       }
-      query_result.status = core::Status::success();
-      query_result.completeness =
-          query_result.hits.size() == request.options.top_k ? core::SearchCompleteness::complete_k
-          : exhaustive[index] ? core::SearchCompleteness::eligible_exhausted
-                              : core::SearchCompleteness::strategy_incomplete;
+      request_limit = next_limit;
+      if (request.stats != nullptr) {
+        ++request.stats->overfetch_rounds;
+      }
     }
-    return result;
   }
 
   [[nodiscard]] auto normalize_scores(const std::vector<Candidate> &candidates,
                                       const core::TypedTensorView &query,
-                                      core::SearchContext *context)
+                                      core::SearchContext *context,
+                                      CollectionSearchStats *stats)
       -> core::Result<std::vector<CollectionHit>> {
     std::vector<CollectionHit> result;
     result.reserve(candidates.size());
@@ -1135,6 +1452,12 @@ class SegmentedCollection {
           return reranked.status();
         }
         hit.score = std::move(reranked).value();
+        if (is_nan_score(hit.score)) {
+          if (stats != nullptr) {
+            ++stats->nan_discarded;
+          }
+          continue;
+        }
         hit.score_kind = core::ScoreKind::distance;
         hit.comparable_metric = schema_.metric;
         hit.result_flags = hit.result_flags | core::ResultFlag::exact_reranked;
@@ -2254,12 +2577,6 @@ class SegmentedCollection {
         score = exact_distance_typed<std::uint8_t>(query, vector, metric);
         break;
     }
-    if (is_nan_score(score)) {
-      return core::Status::error(core::StatusCode::internal,
-                                 core::OperationStage::search,
-                                 core::StatusDetail::invalid_score,
-                                 "exact rerank produced a NaN score");
-    }
     return score;
   }
 
@@ -2350,6 +2667,8 @@ class SegmentedCollection {
   std::atomic_uint64_t accepted_count_{};
   std::atomic_uint64_t pending_count_{};
   std::atomic_uint64_t pending_bytes_{};
+  std::atomic_uint64_t outstanding_search_leases_{};
+  std::atomic_uint64_t leased_search_bytes_{};
 };
 
 }  // namespace alaya::internal::collection

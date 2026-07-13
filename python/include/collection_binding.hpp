@@ -8,17 +8,21 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>  // NOLINT(build/c++17)
+#include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -307,6 +311,172 @@ inline void register_exceptions(py::module_ &module) {
   return result;
 }
 
+[[nodiscard]] inline auto scalar_number(const CollectionScalarValue &value)
+    -> std::optional<long double> {
+  return std::visit(
+      [](const auto &item) -> std::optional<long double> {
+        using T = std::decay_t<decltype(item)>;
+        if constexpr (std::is_same_v<T, bool> || std::is_same_v<T, std::int64_t> ||
+                      std::is_same_v<T, double>) {
+          return static_cast<long double>(item);
+        }
+        return std::nullopt;
+      },
+      value);
+}
+
+[[nodiscard]] inline auto scalar_equal(const CollectionScalarValue &lhs,
+                                       const CollectionScalarValue &rhs) -> bool {
+  const auto left_number = scalar_number(lhs);
+  const auto right_number = scalar_number(rhs);
+  if (left_number.has_value() && right_number.has_value()) {
+    return *left_number == *right_number;
+  }
+  return lhs == rhs;
+}
+
+[[nodiscard]] inline auto scalar_less(const CollectionScalarValue &lhs,
+                                      const CollectionScalarValue &rhs) -> bool {
+  const auto left_number = scalar_number(lhs);
+  const auto right_number = scalar_number(rhs);
+  if (left_number.has_value() && right_number.has_value()) {
+    return *left_number < *right_number;
+  }
+  if (const auto *left = std::get_if<std::string>(&lhs)) {
+    if (const auto *right = std::get_if<std::string>(&rhs)) {
+      return *left < *right;
+    }
+  }
+  return false;
+}
+
+using MetadataPredicate = std::function<bool(const CollectionMetadata &)>;
+
+[[nodiscard]] inline auto compile_metadata_filter(const py::handle &object) -> MetadataPredicate {
+  if (!py::isinstance<py::dict>(object)) {
+    throw py::type_error("metadata_filter must be a dict");
+  }
+  const auto dictionary = py::reinterpret_borrow<py::dict>(object);
+  std::vector<MetadataPredicate> clauses;
+  clauses.reserve(dictionary.size());
+  for (const auto &[raw_key, raw_expected] : dictionary) {
+    const auto key = py::cast<std::string>(raw_key);
+    if (key == "$and" || key == "$or") {
+      if (!py::isinstance<py::sequence>(raw_expected) || py::isinstance<py::str>(raw_expected)) {
+        throw py::type_error(key + " expects a list of filter expressions");
+      }
+      std::vector<MetadataPredicate> children;
+      for (const auto &child : py::reinterpret_borrow<py::sequence>(raw_expected)) {
+        children.push_back(compile_metadata_filter(child));
+      }
+      clauses.push_back(
+          [children = std::move(children), any = key == "$or"](const CollectionMetadata &metadata) {
+            if (any) {
+              return std::ranges::any_of(children, [&](const auto &child) {
+                return child(metadata);
+              });
+            }
+            return std::ranges::all_of(children, [&](const auto &child) {
+              return child(metadata);
+            });
+          });
+      continue;
+    }
+
+    if (!py::isinstance<py::dict>(raw_expected)) {
+      auto expected = metadata_value(raw_expected);
+      clauses.push_back([key, expected = std::move(expected)](const CollectionMetadata &metadata) {
+        const auto found = metadata.find(key);
+        return found != metadata.end() && scalar_equal(found->second, expected);
+      });
+      continue;
+    }
+
+    const auto operations = py::reinterpret_borrow<py::dict>(raw_expected);
+    for (const auto &[raw_operation, raw_operand] : operations) {
+      const auto operation = py::cast<std::string>(raw_operation);
+      if (operation == "$in") {
+        if (!py::isinstance<py::sequence>(raw_operand) || py::isinstance<py::str>(raw_operand)) {
+          throw py::type_error("$in expects a list-like operand");
+        }
+        std::vector<CollectionScalarValue> values;
+        for (const auto &value : py::reinterpret_borrow<py::sequence>(raw_operand)) {
+          values.push_back(metadata_value(value));
+        }
+        clauses.push_back([key, values = std::move(values)](const CollectionMetadata &metadata) {
+          const auto found = metadata.find(key);
+          return found != metadata.end() && std::ranges::any_of(values, [&](const auto &value) {
+                   return scalar_equal(found->second, value);
+                 });
+        });
+        continue;
+      }
+      if (operation != "$eq" && operation != "$gt" && operation != "$ge" && operation != "$lt" &&
+          operation != "$le") {
+        throw py::value_error("Unsupported operator: " + operation);
+      }
+      auto operand = metadata_value(raw_operand);
+      clauses.push_back(
+          [key, operation, operand = std::move(operand)](const CollectionMetadata &metadata) {
+            const auto found = metadata.find(key);
+            if (found == metadata.end()) {
+              return false;
+            }
+            if (operation == "$eq") {
+              return scalar_equal(found->second, operand);
+            }
+            if (operation == "$gt") {
+              return scalar_less(operand, found->second);
+            }
+            if (operation == "$ge") {
+              return !scalar_less(found->second, operand);
+            }
+            if (operation == "$lt") {
+              return scalar_less(found->second, operand);
+            }
+            return !scalar_less(operand, found->second);
+          });
+    }
+  }
+  return [clauses = std::move(clauses)](const CollectionMetadata &metadata) {
+    return std::ranges::all_of(clauses, [&](const auto &clause) {
+      return clause(metadata);
+    });
+  };
+}
+
+[[nodiscard]] inline auto collection_filter(const py::object &expression,
+                                            const py::object &selectivity) -> CollectionFilter {
+  if (expression.is_none()) {
+    return {};
+  }
+  auto predicate = compile_metadata_filter(expression);
+  std::optional<double> estimate;
+  if (!selectivity.is_none()) {
+    estimate = py::cast<double>(selectivity);
+  }
+  return CollectionFilter(
+      [predicate = std::move(predicate)](const core::LogicalId &,
+                                         const CollectionMetadata &metadata,
+                                         std::string_view) {
+        return predicate(metadata);
+      },
+      estimate);
+}
+
+[[nodiscard]] inline auto filter_policy(std::string_view value) -> core::FilterPolicy {
+  if (value == "auto") {
+    return core::FilterPolicy::automatic;
+  }
+  if (value == "strict") {
+    return core::FilterPolicy::strict;
+  }
+  if (value == "allow_partial") {
+    return core::FilterPolicy::allow_partial;
+  }
+  throw py::value_error("filter_policy must be auto, strict, or allow_partial");
+}
+
 [[nodiscard]] inline auto logical_id(std::string_view value) -> core::LogicalId {
   return core::LogicalId::from_utf8(value);
 }
@@ -413,6 +583,37 @@ template <class T>
   return result;
 }
 
+[[nodiscard]] inline auto filter_execution_name(core::FilterExecution execution)
+    -> std::string_view {
+  switch (execution) {
+    case core::FilterExecution::prefilter:
+      return "prefilter";
+    case core::FilterExecution::traversal:
+      return "traversal";
+    case core::FilterExecution::postfilter:
+      return "postfilter";
+  }
+  return "postfilter";
+}
+
+[[nodiscard]] inline auto search_stats_to_dict(const CollectionSearchStatistics &stats)
+    -> py::dict {
+  py::dict result;
+  result["filter_active"] = stats.filter_active;
+  result["filter_execution"] = filter_execution_name(stats.filter_execution);
+  result["filter_examined"] = stats.filter_examined;
+  result["filter_passed"] = stats.filter_passed;
+  result["nan_discarded"] = stats.nan_discarded;
+  result["overfetch_rounds"] = stats.overfetch_rounds;
+  result["budget_consumed"] = stats.budget_consumed;
+  result["lease_acquired"] = stats.lease_acquired;
+  result["lease_released"] = stats.lease_released;
+  result["lease_peak_bytes"] = stats.lease_peak_bytes;
+  result["io_requests_consumed"] = stats.io_requests_consumed;
+  result["io_bytes_consumed"] = stats.io_bytes_consumed;
+  return result;
+}
+
 [[nodiscard]] inline auto search_response_to_dict(const CollectionSearchResponse &response)
     -> py::dict {
   py::list id_list;
@@ -440,6 +641,7 @@ template <class T>
   result["completeness"] = copy_array(completeness);
   result["visibility_watermark"] = response.visibility_watermark;
   result["metadata_epoch"] = response.metadata_epoch;
+  result["search_stats"] = search_stats_to_dict(response.search_stats);
   return result;
 }
 
@@ -559,23 +761,53 @@ class PyCollection {
                                          write_options(durability, retry_token))));
   }
 
-  [[nodiscard]] auto search(const py::array &queries, std::uint64_t top_k) -> py::dict {
+  [[nodiscard]] auto search(const py::array &queries,
+                            std::uint64_t top_k,
+                            const py::object &metadata_filter,
+                            const std::string &policy,
+                            const py::object &selectivity,
+                            std::uint64_t scratch_budget_bytes,
+                            std::uint64_t io_budget_requests,
+                            std::uint64_t io_budget_bytes) -> py::dict {
     const auto view = tensor_view(queries, collection_->options().dim, false);
     if (view.scalar_type != collection_->options().scalar_type) {
       throw py::type_error("canonical Collection query dtype must match the collection dtype");
     }
+    core::SearchOptions options(top_k);
+    options.filter_policy = filter_policy(policy);
+    core::SearchContext context;
+    context.query_scratch_lease.available_bytes = scratch_budget_bytes;
+    context.io_credits.available_requests = io_budget_requests;
+    context.io_credits.available_bytes = io_budget_bytes;
+    const auto filter = collection_filter(metadata_filter, selectivity);
     if (queries.ndim() == 1) {
-      return search_response_to_dict(unwrap(collection_->search(view, top_k)));
+      return search_response_to_dict(unwrap(collection_->search(view, options, context, filter)));
     }
-    return search_response_to_dict(unwrap(collection_->batch_search(view, top_k)));
+    return search_response_to_dict(
+        unwrap(collection_->batch_search(view, options, context, filter)));
   }
 
-  [[nodiscard]] auto batch_search(const py::array &queries, std::uint64_t top_k) -> py::dict {
+  [[nodiscard]] auto batch_search(const py::array &queries,
+                                  std::uint64_t top_k,
+                                  const py::object &metadata_filter,
+                                  const std::string &policy,
+                                  const py::object &selectivity,
+                                  std::uint64_t scratch_budget_bytes,
+                                  std::uint64_t io_budget_requests,
+                                  std::uint64_t io_budget_bytes) -> py::dict {
     const auto view = tensor_view(queries, collection_->options().dim);
     if (view.scalar_type != collection_->options().scalar_type) {
       throw py::type_error("canonical Collection query dtype must match the collection dtype");
     }
-    return search_response_to_dict(unwrap(collection_->batch_search(view, top_k)));
+    core::SearchOptions options(top_k);
+    options.filter_policy = filter_policy(policy);
+    core::SearchContext context;
+    context.query_scratch_lease.available_bytes = scratch_budget_bytes;
+    context.io_credits.available_requests = io_budget_requests;
+    context.io_credits.available_bytes = io_budget_bytes;
+    const auto filter = collection_filter(metadata_filter, selectivity);
+    return search_response_to_dict(
+        unwrap(collection_->batch_search(view, options, context, filter)));
   }
 
   [[nodiscard]] auto get_by_id(const std::string &id) -> py::object {
@@ -671,10 +903,24 @@ class PyCollectionReadView {
   [[nodiscard]] auto get_by_ids(const py::list &ids) -> py::list { return owner_->get_by_ids(ids); }
   [[nodiscard]] auto records() -> py::list { return owner_->records(); }
   [[nodiscard]] auto search(const py::array &queries, std::uint64_t top_k) -> py::dict {
-    return owner_->search(queries, top_k);
+    return owner_->search(queries,
+                          top_k,
+                          py::none(),
+                          "auto",
+                          py::none(),
+                          core::kUnlimitedResource,
+                          core::kUnlimitedResource,
+                          core::kUnlimitedResource);
   }
   [[nodiscard]] auto batch_search(const py::array &queries, std::uint64_t top_k) -> py::dict {
-    return owner_->batch_search(queries, top_k);
+    return owner_->batch_search(queries,
+                                top_k,
+                                py::none(),
+                                "auto",
+                                py::none(),
+                                core::kUnlimitedResource,
+                                core::kUnlimitedResource,
+                                core::kUnlimitedResource);
   }
   [[nodiscard]] auto stats() const -> py::dict { return owner_->stats(); }
   [[nodiscard]] auto options() const -> py::dict { return owner_->options(); }
@@ -716,8 +962,28 @@ inline void register_collection(py::module_ &module) {
            py::arg("mode") = "per_row_independent",
            py::arg("durability") = "wal_fsync",
            py::arg("retry_token") = "")
-      .def("search", &PyCollection::search, py::arg("query"), py::arg("top_k"))
-      .def("batch_search", &PyCollection::batch_search, py::arg("queries"), py::arg("top_k"))
+      .def("search",
+           &PyCollection::search,
+           py::arg("query"),
+           py::arg("top_k"),
+           py::kw_only(),
+           py::arg("metadata_filter") = py::none(),
+           py::arg("filter_policy") = "auto",
+           py::arg("filter_selectivity") = py::none(),
+           py::arg("scratch_budget_bytes") = core::kUnlimitedResource,
+           py::arg("io_budget_requests") = core::kUnlimitedResource,
+           py::arg("io_budget_bytes") = core::kUnlimitedResource)
+      .def("batch_search",
+           &PyCollection::batch_search,
+           py::arg("queries"),
+           py::arg("top_k"),
+           py::kw_only(),
+           py::arg("metadata_filter") = py::none(),
+           py::arg("filter_policy") = "auto",
+           py::arg("filter_selectivity") = py::none(),
+           py::arg("scratch_budget_bytes") = core::kUnlimitedResource,
+           py::arg("io_budget_requests") = core::kUnlimitedResource,
+           py::arg("io_budget_bytes") = core::kUnlimitedResource)
       .def("get_by_id", &PyCollection::get_by_id, py::arg("id"))
       .def("get_by_ids", &PyCollection::get_by_ids, py::arg("ids"))
       .def("records", &PyCollection::records)

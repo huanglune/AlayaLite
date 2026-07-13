@@ -483,7 +483,7 @@ TEST(SegmentedCollection, MutationMutationIsSerializedAndOpIdsAreMonotonic) {
   EXPECT_EQ(collection->stats().size, kWrites);
 }
 
-TEST(SegmentedCollection, RejectsIncomparableScoreDomainsAndNaN) {
+TEST(SegmentedCollection, RejectsIncomparableScoreDomainsAndDiscardsNaN) {
   auto distance = std::make_shared<StaticSegment>(StaticSegment::Rows{{0, {0.0F, 0.0F}}},
                                                   core::ScoreKind::distance);
   auto similarity = std::make_shared<StaticSegment>(StaticSegment::Rows{{0, {1.0F, 1.0F}}},
@@ -528,10 +528,159 @@ TEST(SegmentedCollection, RejectsIncomparableScoreDomainsAndNaN) {
   opened = SegmentedCollection::open({2, core::Metric::l2, core::ScalarType::float32},
                                      {std::move(nan_registration)});
   ASSERT_TRUE(opened.ok());
-  auto invalid =
-      std::move(opened).value()->search(make_search_request(query.data(), 1, 1, context));
-  EXPECT_FALSE(invalid.ok());
-  EXPECT_EQ(invalid.status().detail(), core::StatusDetail::invalid_score);
+  const auto nan_collection = std::move(opened).value();
+  CollectionSearchStats nan_stats;
+  auto nan_request = make_search_request(query.data(), 1, 1, context);
+  nan_request.stats = &nan_stats;
+  auto discarded = nan_collection->search(nan_request);
+  ASSERT_TRUE(discarded.ok()) << discarded.status().diagnostic();
+  EXPECT_TRUE(discarded.value().queries[0].hits.empty());
+  EXPECT_EQ(discarded.value().queries[0].completeness,
+            core::SearchCompleteness::eligible_exhausted);
+  EXPECT_EQ(nan_stats.nan_discarded, 1U);
+  EXPECT_EQ(nan_collection->outstanding_search_leases(), 0U);
+}
+
+TEST(SegmentedCollection, FilterPoliciesSelectAllExecutionsAndBoundedOverfetch) {
+  StaticSegment::Rows physical;
+  SegmentRegistration registration;
+  registration.segment_id = 41;
+  registration.role = SegmentRole::sealed;
+  for (std::uint64_t row = 0; row < 8; ++row) {
+    const std::array<float, 2> vector{static_cast<float>(row), 0.0F};
+    physical.emplace(row, vector);
+    registration.rows.push_back({core::LogicalId::from_utf8("row-" + std::to_string(row)),
+                                 core::SegmentRowId(row),
+                                 row + 1,
+                                 VersionState::live,
+                                 owned_payload(vector, {{"selected", row >= 4}, {"all", true}})});
+  }
+  registration.segment = readonly_any(std::make_shared<StaticSegment>(std::move(physical)));
+  auto opened = SegmentedCollection::open({2, core::Metric::l2, core::ScalarType::float32},
+                                          {std::move(registration)});
+  ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
+  const auto collection = std::move(opened).value();
+  const std::array<float, 2> query{};
+  core::SearchContext context;
+
+  CollectionSearchStats low_stats;
+  auto low = make_search_request(query.data(),
+                                 1,
+                                 2,
+                                 context,
+                                 LogicalFilter::metadata_equals("selected", true));
+  low.filter = LogicalFilter(
+      [](const core::LogicalId &, const Metadata &metadata, std::string_view) {
+        return std::get<bool>(metadata.at("selected"));
+      },
+      0.05);
+  low.stats = &low_stats;
+  auto prefiltered = collection->search(low);
+  ASSERT_TRUE(prefiltered.ok()) << prefiltered.status().diagnostic();
+  EXPECT_EQ(low_stats.filter_execution, core::FilterExecution::prefilter);
+  EXPECT_EQ(prefiltered.value().queries[0].hits.size(), 2U);
+  EXPECT_EQ(low_stats.overfetch_rounds, 0U);
+
+  CollectionSearchStats medium_stats;
+  auto medium = low;
+  medium.filter = LogicalFilter(
+      [](const core::LogicalId &, const Metadata &metadata, std::string_view) {
+        return std::get<bool>(metadata.at("selected"));
+      },
+      0.50);
+  medium.stats = &medium_stats;
+  auto traversed = collection->search(medium);
+  ASSERT_TRUE(traversed.ok()) << traversed.status().diagnostic();
+  EXPECT_EQ(medium_stats.filter_execution, core::FilterExecution::traversal);
+  EXPECT_EQ(medium_stats.overfetch_rounds, 2U);
+  ASSERT_EQ(traversed.value().queries[0].hits.size(), 2U);
+  EXPECT_EQ(traversed.value().queries[0].hits[0].logical_id, core::LogicalId::from_utf8("row-4"));
+  EXPECT_GT(medium_stats.filter_examined, medium_stats.filter_passed);
+
+  CollectionSearchStats high_stats;
+  auto high = low;
+  high.filter = LogicalFilter(
+      [](const core::LogicalId &, const Metadata &metadata, std::string_view) {
+        return std::get<bool>(metadata.at("all"));
+      },
+      1.0);
+  high.stats = &high_stats;
+  auto postfiltered = collection->search(high);
+  ASSERT_TRUE(postfiltered.ok()) << postfiltered.status().diagnostic();
+  EXPECT_EQ(high_stats.filter_execution, core::FilterExecution::postfilter);
+  EXPECT_EQ(postfiltered.value().queries[0].hits.size(), 2U);
+  EXPECT_EQ(high_stats.overfetch_rounds, 0U);
+
+  CollectionSearchStats partial_stats;
+  auto partial = medium;
+  partial.options.filter_policy = core::FilterPolicy::allow_partial;
+  partial.maximum_overfetch_rounds = 0;
+  partial.stats = &partial_stats;
+  auto best_effort = collection->search(partial);
+  ASSERT_TRUE(best_effort.ok()) << best_effort.status().diagnostic();
+  EXPECT_TRUE(best_effort.value().queries[0].hits.empty());
+  EXPECT_EQ(best_effort.value().queries[0].completeness,
+            core::SearchCompleteness::strategy_incomplete);
+}
+
+TEST(SegmentedCollection, StrictMissingVectorAndBudgetDenialHaveZeroEffectAndReleaseLease) {
+  auto producer =
+      std::make_shared<StaticSegment>(StaticSegment::Rows{{0, {0.0F, 0.0F}}, {1, {1.0F, 0.0F}}});
+  SegmentRegistration registration;
+  registration.segment_id = 42;
+  registration.role = SegmentRole::sealed;
+  registration.segment = readonly_any(producer);
+  registration.rows = {
+      {core::LogicalId::from_utf8("with-vector"),
+       core::SegmentRowId(0),
+       1,
+       VersionState::live,
+       owned_payload({0.0F, 0.0F}, {{"keep", true}})},
+      {core::LogicalId::from_utf8("missing-vector"),
+       core::SegmentRowId(1),
+       2,
+       VersionState::live,
+       RecordPayload{std::nullopt, {{"keep", true}}, {}}},
+  };
+  auto opened = SegmentedCollection::open({2, core::Metric::l2, core::ScalarType::float32},
+                                          {std::move(registration)});
+  ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
+  const auto collection = std::move(opened).value();
+  const std::array<float, 2> query{};
+  core::SearchContext context;
+  CollectionSearchStats stats;
+  auto request = make_search_request(query.data(),
+                                     1,
+                                     2,
+                                     context,
+                                     LogicalFilter::metadata_equals("keep", true));
+  request.options.filter_policy = core::FilterPolicy::strict;
+  request.stats = &stats;
+  auto missing = collection->search(request);
+  ASSERT_FALSE(missing.ok());
+  EXPECT_EQ(missing.status().code(), core::StatusCode::resource_exhausted);
+  EXPECT_EQ(missing.status().detail(), core::StatusDetail::budget_denied);
+  EXPECT_EQ(collection->outstanding_search_leases(), 0U);
+
+  // Best effort does not require the missing exact fallback vector. Denial is
+  // preflighted before any segment writes a result, and the same context is
+  // immediately reusable once its budget is restored.
+  request.options.filter_policy = core::FilterPolicy::allow_partial;
+  request.filter = LogicalFilter{};
+  context.query_scratch_lease.available_bytes = 1;
+  auto denied = collection->search(request);
+  ASSERT_FALSE(denied.ok());
+  EXPECT_EQ(denied.status().code(), core::StatusCode::resource_exhausted);
+  EXPECT_EQ(collection->outstanding_search_leases(), 0U);
+
+  context.query_scratch_lease.available_bytes = core::kUnlimitedResource;
+  auto retried = collection->search(request);
+  ASSERT_TRUE(retried.ok()) << retried.status().diagnostic();
+  EXPECT_EQ(retried.value().queries[0].hits.size(), 2U);
+  EXPECT_EQ(stats.lease_acquired, 1U);
+  EXPECT_EQ(stats.lease_released, 1U);
+  EXPECT_GT(stats.budget_consumed, 0U);
+  EXPECT_EQ(collection->outstanding_search_leases(), 0U);
 }
 
 TEST(SegmentedCollection, CrossSegmentHnswUpsertDeleteSuppressesOldVersions) {

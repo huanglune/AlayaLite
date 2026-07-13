@@ -48,6 +48,8 @@ using CollectionDurabilityState = internal::collection::DurabilityState;
 using CollectionCheckpointReceipt = internal::collection::CheckpointReceipt;
 using CollectionProjection = internal::collection::Projection;
 using CollectionRecord = internal::collection::CollectionRecord;
+using CollectionFilter = internal::collection::LogicalFilter;
+using CollectionSearchStatistics = internal::collection::CollectionSearchStats;
 
 struct CollectionOptions {
   std::filesystem::path root{};
@@ -95,6 +97,7 @@ struct CollectionSearchResponse {
   std::vector<core::RowCount> valid_counts{};
   std::vector<core::Status> statuses{};
   std::vector<core::SearchCompleteness> completeness{};
+  CollectionSearchStatistics search_stats{};
 };
 
 struct CollectionStatistics {
@@ -344,13 +347,21 @@ class Collection {
                             const core::SearchOptions &options,
                             core::SearchContext &context)
       -> core::Result<CollectionSearchResponse> {
+    return search(query, options, context, CollectionFilter{});
+  }
+
+  [[nodiscard]] auto search(const core::TypedTensorView &query,
+                            const core::SearchOptions &options,
+                            core::SearchContext &context,
+                            const CollectionFilter &filter)
+      -> core::Result<CollectionSearchResponse> {
     if (query.rows != 1) {
       return error(core::StatusCode::invalid_argument,
                    core::OperationStage::validation,
                    core::StatusDetail::malformed_struct,
                    "canonical Collection single search requires exactly one query row");
     }
-    return execute_search(query, options, context);
+    return execute_search(query, options, context, filter);
   }
 
   [[nodiscard]] auto search(const core::TypedTensorView &query, std::uint64_t top_k)
@@ -360,11 +371,30 @@ class Collection {
     return search(query, options, context);
   }
 
+  [[nodiscard]] auto search(const core::TypedTensorView &query,
+                            std::uint64_t top_k,
+                            const CollectionFilter &filter,
+                            core::FilterPolicy policy = core::FilterPolicy::automatic)
+      -> core::Result<CollectionSearchResponse> {
+    core::SearchOptions options(top_k);
+    options.filter_policy = policy;
+    core::SearchContext context;
+    return search(query, options, context, filter);
+  }
+
   [[nodiscard]] auto batch_search(const core::TypedTensorView &queries,
                                   const core::SearchOptions &options,
                                   core::SearchContext &context)
       -> core::Result<CollectionSearchResponse> {
-    return execute_search(queries, options, context);
+    return batch_search(queries, options, context, CollectionFilter{});
+  }
+
+  [[nodiscard]] auto batch_search(const core::TypedTensorView &queries,
+                                  const core::SearchOptions &options,
+                                  core::SearchContext &context,
+                                  const CollectionFilter &filter)
+      -> core::Result<CollectionSearchResponse> {
+    return execute_search(queries, options, context, filter);
   }
 
   [[nodiscard]] auto batch_search(const core::TypedTensorView &queries, std::uint64_t top_k)
@@ -372,6 +402,17 @@ class Collection {
     core::SearchOptions options(top_k);
     core::SearchContext context;
     return batch_search(queries, options, context);
+  }
+
+  [[nodiscard]] auto batch_search(const core::TypedTensorView &queries,
+                                  std::uint64_t top_k,
+                                  const CollectionFilter &filter,
+                                  core::FilterPolicy policy = core::FilterPolicy::automatic)
+      -> core::Result<CollectionSearchResponse> {
+    core::SearchOptions options(top_k);
+    options.filter_policy = policy;
+    core::SearchContext context;
+    return batch_search(queries, options, context, filter);
   }
 
   [[nodiscard]] auto get_by_id(const core::LogicalId &logical_id,
@@ -604,17 +645,22 @@ class Collection {
 
   [[nodiscard]] auto execute_search(const core::TypedTensorView &queries,
                                     const core::SearchOptions &options,
-                                    core::SearchContext &context)
+                                    core::SearchContext &context,
+                                    const CollectionFilter &filter)
       -> core::Result<CollectionSearchResponse> {
+    CollectionSearchStatistics search_stats;
     internal::collection::CollectionSearchRequest request;
     request.queries = queries;
     request.options = options;
+    request.filter = filter;
     request.context = std::addressof(context);
+    request.stats = std::addressof(search_stats);
     auto result = implementation_->search(request);
     if (!result.ok()) {
       return result.status();
     }
     CollectionSearchResponse response;
+    response.search_stats = search_stats;
     response.visibility_watermark = result.value().visibility_watermark;
     response.metadata_epoch = result.value().metadata_epoch;
     response.offsets.reserve(result.value().queries.size() + 1);

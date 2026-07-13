@@ -527,17 +527,61 @@ class Collection:
         _assert(expected_dim == self.__dim, "Vector dimension must match the index dimension.")
         return np.ascontiguousarray(array)
 
-    def search(self, query, top_k: int = 10) -> dict:
-        """Canonical single-query response using the batch logical schema."""
+    def search(
+        self,
+        query,
+        top_k: int = 10,
+        *,
+        metadata_filter=None,
+        filter_policy: str = "auto",
+        filter_selectivity: Optional[float] = None,
+        scratch_budget_bytes: Optional[int] = None,
+        io_budget_requests: Optional[int] = None,
+        io_budget_bytes: Optional[int] = None,
+    ) -> dict:
+        """Canonical single-query response with native Gate-10 filtering/accounting."""
         _assert(top_k >= 0, "top_k must be greater than or equal to 0")
         array = self._canonical_queries(query, batch=False, compatibility_cast=False)
-        return self.__native.search(array, int(top_k))
+        expression = None if metadata_filter is None else self._filter_expression(metadata_filter)
+        unlimited = (1 << 64) - 1
+        return self.__native.search(
+            array,
+            int(top_k),
+            metadata_filter=expression,
+            filter_policy=filter_policy,
+            filter_selectivity=filter_selectivity,
+            scratch_budget_bytes=unlimited if scratch_budget_bytes is None else int(scratch_budget_bytes),
+            io_budget_requests=unlimited if io_budget_requests is None else int(io_budget_requests),
+            io_budget_bytes=unlimited if io_budget_bytes is None else int(io_budget_bytes),
+        )
 
-    def batch_search(self, queries, top_k: int = 10) -> dict:
-        """Canonical flat NumPy response with offsets and valid counts."""
+    def batch_search(
+        self,
+        queries,
+        top_k: int = 10,
+        *,
+        metadata_filter=None,
+        filter_policy: str = "auto",
+        filter_selectivity: Optional[float] = None,
+        scratch_budget_bytes: Optional[int] = None,
+        io_budget_requests: Optional[int] = None,
+        io_budget_bytes: Optional[int] = None,
+    ) -> dict:
+        """Canonical flat response with native Gate-10 filtering/accounting."""
         _assert(top_k >= 0, "top_k must be greater than or equal to 0")
         array = self._canonical_queries(queries, batch=True, compatibility_cast=False)
-        return self.__native.batch_search(array, int(top_k))
+        expression = None if metadata_filter is None else self._filter_expression(metadata_filter)
+        unlimited = (1 << 64) - 1
+        return self.__native.batch_search(
+            array,
+            int(top_k),
+            metadata_filter=expression,
+            filter_policy=filter_policy,
+            filter_selectivity=filter_selectivity,
+            scratch_budget_bytes=unlimited if scratch_budget_bytes is None else int(scratch_budget_bytes),
+            io_budget_requests=unlimited if io_budget_requests is None else int(io_budget_requests),
+            io_budget_bytes=unlimited if io_budget_bytes is None else int(io_budget_bytes),
+        )
 
     @staticmethod
     def _response_rows(response: dict):
@@ -583,27 +627,22 @@ class Collection:
         num_threads: int = 1,
         filter_execution_hint: Optional[str] = None,
     ) -> dict:
-        """Pinned-snapshot post-filter projection; Gate 10 pushdown is not used."""
+        """Compatibility projection over strict native Gate-10 filtering."""
         self._require_native()
         _assert(ef_search >= limit, "ef_search must be >= limit")
         _assert(num_threads > 0, "num_threads must be greater than 0")
         normalize_filter_execution_hint(filter_execution_hint)
         expression = self._filter_expression(metadata_filter)
         queries = self._canonical_queries(vectors, batch=True, compatibility_cast=True)
-        records = self.__native.records()
-        by_id = {str(record["id"]): record for record in records}
-        response = self.__native.batch_search(queries, len(records))
+        response = self.__native.batch_search(
+            queries,
+            int(limit),
+            metadata_filter=expression,
+            filter_policy="strict",
+        )
         rows = []
         for begin, end in self._response_rows(response):
-            selected = []
-            for value in response["ids"][begin:end].tolist():
-                item_id = str(value)
-                record = by_id.get(item_id)
-                if record is not None and _matches_filter(record["metadata"], expression):
-                    selected.append(item_id)
-                    if len(selected) == limit:
-                        break
-            rows.append(selected)
+            rows.append([str(value) for value in response["ids"][begin:end].tolist()])
         return {"id": rows}
 
     def stats(self) -> dict:

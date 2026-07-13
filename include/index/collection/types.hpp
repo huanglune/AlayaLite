@@ -44,7 +44,8 @@ class LogicalFilter {
       std::function<bool(const core::LogicalId &, const Metadata &, std::string_view)>;
 
   LogicalFilter() = default;
-  explicit LogicalFilter(Predicate predicate) : predicate_(std::move(predicate)) {}
+  explicit LogicalFilter(Predicate predicate, std::optional<double> selectivity_estimate = {})
+      : predicate_(std::move(predicate)), selectivity_estimate_(selectivity_estimate) {}
 
   [[nodiscard]] static auto metadata_equals(std::string key, ScalarValue value) -> LogicalFilter {
     return LogicalFilter([key = std::move(key), value = std::move(value)](const core::LogicalId &,
@@ -57,6 +58,10 @@ class LogicalFilter {
 
   [[nodiscard]] auto active() const noexcept -> bool { return static_cast<bool>(predicate_); }
 
+  [[nodiscard]] auto selectivity_estimate() const noexcept -> std::optional<double> {
+    return selectivity_estimate_;
+  }
+
   [[nodiscard]] auto matches(const core::LogicalId &id,
                              const Metadata &metadata,
                              std::string_view document) const -> bool {
@@ -65,6 +70,7 @@ class LogicalFilter {
 
  private:
   Predicate predicate_{};
+  std::optional<double> selectivity_estimate_{};
 };
 
 struct CollectionSchema {
@@ -208,11 +214,34 @@ struct CollectionSearchResult {
   std::vector<CollectionQueryResult> queries{};
 };
 
+struct CollectionSearchStats {
+  core::VersionedStructHeader header{};
+  core::FilterExecution filter_execution{core::FilterExecution::postfilter};
+  bool filter_active{};
+  std::uint8_t reserved_bytes[6]{};
+  std::uint64_t filter_examined{};
+  std::uint64_t filter_passed{};
+  std::uint64_t nan_discarded{};
+  // Number of segment re-queries after the first round.
+  std::uint64_t overfetch_rounds{};
+  std::uint64_t budget_consumed{};
+  std::uint64_t lease_acquired{};
+  std::uint64_t lease_released{};
+  std::uint64_t lease_peak_bytes{};
+  std::uint64_t io_requests_consumed{};
+  std::uint64_t io_bytes_consumed{};
+  std::uint64_t reserved[4]{};
+
+  CollectionSearchStats() : header(core::current_struct_header<CollectionSearchStats>()) {}
+};
+
 struct CollectionSearchRequest {
   core::TypedTensorView queries{};
   core::SearchOptions options{};
   LogicalFilter filter{};
   core::SearchContext *context{};
+  CollectionSearchStats *stats{};
+  std::uint32_t maximum_overfetch_rounds{4};
 };
 
 enum class Projection : std::uint8_t {
