@@ -326,6 +326,10 @@ class SegmentedCollection {
                                  core::StatusDetail::arithmetic_overflow,
                                  "batch mutation row count exceeds uint32");
     }
+    auto batch_resources = preflight_batch_resources(request, context);
+    if (!batch_resources.ok()) {
+      return batch_resources;
+    }
     const auto batch_op_id = next_op_id_.fetch_add(1, std::memory_order_acq_rel);
     if (request.mode == BatchMutationMode::all_or_nothing) {
       return mutate_atomic_batch_locked(std::move(current), request, context, batch_op_id);
@@ -1218,6 +1222,105 @@ class SegmentedCollection {
     std::optional<RowAddress> previous{};
   };
 
+  [[nodiscard]] auto preflight_batch_resources(const BatchMutationRequest &request,
+                                               core::MutationContext &context) const
+      -> core::Status {
+    if (!core::is_current_struct(context)) {
+      return core::Status::error(core::StatusCode::invalid_argument,
+                                 core::OperationStage::admission,
+                                 core::StatusDetail::malformed_struct,
+                                 "batch mutation context is incompatible");
+    }
+    auto control = core::validate_runtime_control(context.deadline,
+                                                  context.cancellation,
+                                                  core::OperationStage::admission);
+    if (!control.ok()) {
+      return control;
+    }
+    std::uint64_t bytes{};
+    if (!core::checked_multiply(request.rows.size(), sizeof(SegmentMutationPayload), bytes)) {
+      return core::Status::error(core::StatusCode::resource_exhausted,
+                                 core::OperationStage::admission,
+                                 core::StatusDetail::arithmetic_overflow,
+                                 "batch mutation reservation overflows uint64");
+    }
+    for (const auto &row : request.rows) {
+      std::uint64_t row_bytes = row.logical_id.canonical_bytes().size() + row.document.size();
+      if (row.action == RowMutationAction::write && row.vector.rows == 1 &&
+          row.vector.dim == schema_.dim && row.vector.scalar_type == schema_.scalar_type) {
+        std::uint64_t vector_bytes{};
+        if (!core::checked_multiply(row.vector.dim,
+                                    core::scalar_type_size(row.vector.scalar_type),
+                                    vector_bytes) ||
+            !core::checked_add(row_bytes, vector_bytes, row_bytes)) {
+          return core::Status::error(core::StatusCode::resource_exhausted,
+                                     core::OperationStage::admission,
+                                     core::StatusDetail::arithmetic_overflow,
+                                     "batch mutation vector bytes overflow uint64");
+        }
+      }
+      for (const auto &[key, value] : row.metadata) {
+        std::uint64_t metadata_bytes = key.size() + sizeof(value);
+        if (const auto *text = std::get_if<std::string>(&value); text != nullptr) {
+          metadata_bytes += text->size();
+        }
+        if (!core::checked_add(row_bytes, metadata_bytes, row_bytes)) {
+          return core::Status::error(core::StatusCode::resource_exhausted,
+                                     core::OperationStage::admission,
+                                     core::StatusDetail::arithmetic_overflow,
+                                     "batch mutation metadata bytes overflow uint64");
+        }
+      }
+      if (!core::checked_add(bytes, row_bytes, bytes)) {
+        return core::Status::error(core::StatusCode::resource_exhausted,
+                                   core::OperationStage::admission,
+                                   core::StatusDetail::arithmetic_overflow,
+                                   "batch mutation bytes overflow uint64");
+      }
+    }
+    auto resource =
+        context.pending_reservation.ensure(bytes,
+                                           core::OperationStage::admission,
+                                           "batch pending-mutation reservation is too small");
+    if (!resource.ok()) {
+      return resource;
+    }
+    resource = context.stage_reservation.ensure(bytes,
+                                                core::OperationStage::admission,
+                                                "batch mutation-stage reservation is too small");
+    if (!resource.ok()) {
+      return resource;
+    }
+    if (wal_ != nullptr) {
+      std::uint64_t wal_records{};
+      std::uint64_t framing{};
+      std::uint64_t wal_bytes{};
+      if (!core::checked_multiply(request.rows.size(), 3, wal_records) ||
+          !core::checked_add(wal_records, 1, wal_records) ||
+          !core::checked_multiply(wal_records,
+                                  logical_wal_detail::kHeaderBytes +
+                                      logical_wal_detail::kTrailerBytes,
+                                  framing) ||
+          !core::checked_add(bytes, framing, wal_bytes)) {
+        return core::Status::error(core::StatusCode::resource_exhausted,
+                                   core::OperationStage::admission,
+                                   core::StatusDetail::arithmetic_overflow,
+                                   "batch mutation WAL accounting overflows uint64");
+      }
+      if ((context.wal_io_credits.available_requests != core::kUnlimitedResource &&
+           context.wal_io_credits.available_requests < wal_records) ||
+          (context.wal_io_credits.available_bytes != core::kUnlimitedResource &&
+           context.wal_io_credits.available_bytes < wal_bytes)) {
+        return core::Status::error(core::StatusCode::resource_exhausted,
+                                   core::OperationStage::admission,
+                                   core::StatusDetail::budget_denied,
+                                   "batch mutation WAL I/O credits are too small",
+                                   core::Retryability::retryable_with_backoff);
+      }
+    }
+    return core::Status::success();
+  }
+
   [[nodiscard]] auto validate_batch_row(const RoutingSnapshotPtr &current,
                                         const BatchRowMutation &row) const -> ValidatedBatchRow {
     ValidatedBatchRow result;
@@ -1556,11 +1659,75 @@ class SegmentedCollection {
     if (failpoint(MutationFailPoint::before_prepare)) {
       return injected_failure(MutationFailPoint::before_prepare);
     }
+    if (!core::is_current_struct(context)) {
+      return core::Status::error(core::StatusCode::invalid_argument,
+                                 core::OperationStage::mutation_prepare,
+                                 core::StatusDetail::malformed_struct,
+                                 "collection mutation context is incompatible");
+    }
+    std::uint64_t pending_bytes{};
+    for (const auto &row : transaction.rows) {
+      if (row.payload.vector.has_value()) {
+        if (!core::checked_add(pending_bytes, row.payload.vector->bytes().size(), pending_bytes)) {
+          return core::Status::error(core::StatusCode::resource_exhausted,
+                                     core::OperationStage::mutation_prepare,
+                                     core::StatusDetail::arithmetic_overflow,
+                                     "collection mutation pending bytes overflow uint64");
+        }
+      }
+    }
+    std::uint64_t row_overhead{};
+    std::uint64_t reservation_bytes{};
+    if (!core::checked_multiply(transaction.rows.size(),
+                                sizeof(SegmentMutationPayload),
+                                row_overhead) ||
+        !core::checked_add(pending_bytes, row_overhead, reservation_bytes)) {
+      return core::Status::error(core::StatusCode::resource_exhausted,
+                                 core::OperationStage::mutation_prepare,
+                                 core::StatusDetail::arithmetic_overflow,
+                                 "collection mutation stage bytes overflow uint64");
+    }
+    auto resource =
+        context.pending_reservation.ensure(reservation_bytes,
+                                           core::OperationStage::mutation_prepare,
+                                           "collection pending-mutation reservation is too small");
+    if (!resource.ok()) {
+      return resource;
+    }
+    resource =
+        context.stage_reservation.ensure(reservation_bytes,
+                                         core::OperationStage::mutation_prepare,
+                                         "collection mutation-stage reservation is too small");
+    if (!resource.ok()) {
+      return resource;
+    }
     std::vector<std::byte> wal_payload;
     try {
       wal_payload = encode_wal_transaction(transaction);
     } catch (...) {
       return core::status_from_exception(core::OperationStage::mutation_prepare);
+    }
+    if (wal_ != nullptr) {
+      constexpr std::uint64_t kWalRecords = 3;
+      constexpr std::uint64_t kWalFramingBytes =
+          kWalRecords * (logical_wal_detail::kHeaderBytes + logical_wal_detail::kTrailerBytes);
+      std::uint64_t wal_bytes{};
+      if (!core::checked_add(wal_payload.size(), kWalFramingBytes, wal_bytes)) {
+        return core::Status::error(core::StatusCode::resource_exhausted,
+                                   core::OperationStage::mutation_prepare,
+                                   core::StatusDetail::arithmetic_overflow,
+                                   "collection mutation WAL bytes overflow uint64");
+      }
+      if ((context.wal_io_credits.available_requests != core::kUnlimitedResource &&
+           context.wal_io_credits.available_requests < kWalRecords) ||
+          (context.wal_io_credits.available_bytes != core::kUnlimitedResource &&
+           context.wal_io_credits.available_bytes < wal_bytes)) {
+        return core::Status::error(core::StatusCode::resource_exhausted,
+                                   core::OperationStage::mutation_prepare,
+                                   core::StatusDetail::budget_denied,
+                                   "collection mutation WAL I/O credits are too small",
+                                   core::Retryability::retryable_with_backoff);
+      }
     }
     const auto durable =
         config_.features.wal_coordinator && transaction.durability == WriteDurability::wal_fsync;
@@ -1595,12 +1762,6 @@ class SegmentedCollection {
     opaque.payload_size = bundled ? sizeof(bundle) : sizeof(SegmentMutationPayload);
     core::MutationContext engine_context = context;
     engine_context.transaction_token = &transaction;
-    std::uint64_t pending_bytes{};
-    for (const auto &row : transaction.rows) {
-      if (row.payload.vector.has_value()) {
-        pending_bytes += row.payload.vector->bytes().size();
-      }
-    }
     PendingGuard pending(this, pending_bytes, transaction.rows.size());
     std::vector<std::unique_ptr<AcceptedGuard>> accepted;
     accepted.reserve(transaction.rows.size());
@@ -1701,12 +1862,11 @@ class SegmentedCollection {
     const auto target =
         load_or_initializing_snapshot_->find_segment(transaction.rows.front().target.segment_id,
                                                      transaction.rows.front().target.generation);
-    if (target == nullptr ||
-        !target->segment.capabilities().supports(core::OperationCapability::mutation)) {
+    if (target == nullptr) {
       return core::Status::error(core::StatusCode::corruption,
                                  core::OperationStage::mutation_replay,
                                  core::StatusDetail::readonly_instance,
-                                 "committed WAL targets an unavailable mutable segment");
+                                 "committed WAL targets an unavailable segment");
     }
     for (const auto &row : transaction.rows) {
       if (row.target.segment_id != target->segment_id ||
@@ -1716,6 +1876,21 @@ class SegmentedCollection {
                                    core::StatusDetail::malformed_struct,
                                    "one WAL transaction targets multiple segment instances");
       }
+    }
+    if (!target->segment.capabilities().supports(core::OperationCapability::mutation)) {
+      core::SegmentStats stats;
+      const auto maximum_row = std::ranges::max(transaction.rows, {}, &WalMutationRow::op_id).op_id;
+      if (target->segment.stats(stats).ok() && stats.snapshot_version >= maximum_row) {
+        // A roll-forward reader may have consumed the physical WAL tail into
+        // its private working generation before erasing mutation slots. The
+        // Collection still rebuilds its logical snapshot from this WAL, but
+        // does not need a writer slot to repeat already-applied physical work.
+        return core::Status::success();
+      }
+      return core::Status::error(core::StatusCode::corruption,
+                                 core::OperationStage::mutation_replay,
+                                 core::StatusDetail::readonly_instance,
+                                 "committed WAL targets a reader below its applied watermark");
     }
     auto payloads = make_engine_payloads(transaction);
     SegmentMutationBundlePayload bundle;
