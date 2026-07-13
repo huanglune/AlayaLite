@@ -370,6 +370,9 @@ struct CollectionFeatureFlags {
   bool legacy_disk_adapter{true};
   bool experimental_persistence_writer{};
   bool wal_coordinator{};
+  // Independent Gate 7-B writer gate. Disabling it prevents discovery or
+  // continuation of a legacy import; already switched data remains readable.
+  bool legacy_importer{};
   // Roll-forward gate: disabling this bit prevents new manifest-v2
   // publications but never removes the v2 reader.
   bool manifest_v2_writer{};
@@ -390,6 +393,10 @@ struct CollectionRecoveryOptions {
   // accepted only as a monotonic floor; WAL/checkpoint/registered versions can
   // always advance it further.
   std::uint64_t minimum_next_op_id{1};
+  // A legacy checkpoint can cover a committed delete without retaining the
+  // deleted external ID. The importer uses this floor to preserve that
+  // committed visibility cut without inventing a logical row/version.
+  std::uint64_t minimum_visibility_watermark{};
 };
 
 struct CollectionConfig {

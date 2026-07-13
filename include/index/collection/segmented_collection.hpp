@@ -804,7 +804,8 @@ class SegmentedCollection {
                                          registration.atomic_mutation_bundle));
     }
     recalculate_counts(*snapshot);
-    snapshot->visibility_watermark = maximum_sequence;
+    snapshot->visibility_watermark =
+        std::max(maximum_sequence, config_.recovery.minimum_visibility_watermark);
     snapshot->durable_watermark = 0;
     if (config_.features.wal_coordinator) {
       auto opened = CollectionLogicalWal::open(config_.wal.root, config_.wal.namespace_name);
