@@ -574,16 +574,18 @@ class DiskANNIndex {
    *        threads bound CPU, @p pipeline bounds in-flight queries, and
    *        throughput follows Little's law instead of 8/latency.
    *
-   * Per-query semantics match search() with rerank off (the async beams sit in
-   * the sync schedulers' recall-equivalence class). Rerank is rejected, as in
-   * pq_beam_search_async — in the trace-bench protocol it is a no-op anyway
-   * (every retset entry is expanded during traversal, so rerank re-reads 0
-   * nodes). Requires an updatable load with update_io=uring for the shared
-   * reactor. Each in-flight slot owns a private ThreadData (visited bits +
+   * Per-query semantics match search() (the async beams sit in the sync
+   * schedulers' recall-equivalence class). PQ rerank uses the exact distances
+   * collected while every retained entry is expanded, so it submits no extra
+   * rerank reads. A readonly load is sufficient because PageReader owns the
+   * page pipeline; updatable loads may additionally share their page cache.
+   * Each in-flight slot owns a private ThreadData (visited bits +
    * scratch), so @p pipeline trades memory for I/O overlap; the search()/
    * update ThreadData pools are not touched.
    *
-   * @p per_query_stats / @p per_query_us: optional arrays of @p n_queries.
+   * @p per_query_stats / @p per_query_us / @p per_query_counts: optional arrays
+   * of @p n_queries. Counts are an additive output; absent pointers preserve
+   * every existing caller's sentinel-padded row semantics.
    */
   void search_pipelined(const float *queries,
                         uint32_t n_queries,
@@ -594,7 +596,9 @@ class DiskANNIndex {
                         uint32_t pipeline,
                         const DiskANNSearchParams &params = {},
                         SearchStats *per_query_stats = nullptr,
-                        double *per_query_us = nullptr) const {
+                        double *per_query_us = nullptr,
+                        uint32_t *per_query_counts = nullptr,
+                        const BeamSearchCancelProbe *cancel_probe = nullptr) const {
     if (!loaded_) {
       throw std::runtime_error("DiskANNIndex::search_pipelined: index not loaded");
     }
@@ -607,10 +611,13 @@ class DiskANNIndex {
     if (out_labels == nullptr || out_distances == nullptr) {
       throw std::invalid_argument("DiskANNIndex::search_pipelined: null output buffers");
     }
-    if (params.rerank) {
+    if (params.rerank && cancel_probe == nullptr) {
       throw std::invalid_argument("DiskANNIndex::search_pipelined: rerank is not supported");
     }
-    if (!update_reactor_ || !reader_) {
+    if (!reader_) {
+      throw std::runtime_error("DiskANNIndex::search_pipelined: PageReader is unavailable");
+    }
+    if (updatable_ && !update_reactor_) {
       throw std::runtime_error(
           "DiskANNIndex::search_pipelined: requires an updatable load with "
           "update_io=uring (shared reactor)");
@@ -628,6 +635,9 @@ class DiskANNIndex {
     // is expanded), then cut the exact-sorted list to top_k below. Requesting
     // only top_k would pre-cut by PQ order — measurably worse recall.
     const uint32_t ask = std::max<uint32_t>(top_k, params.search_list_size);
+    if (per_query_counts != nullptr) {
+      std::fill_n(per_query_counts, n_queries, uint32_t{0});
+    }
 
     // One private ThreadData per in-flight coroutine, cached across calls: a
     // slot holds its td for the whole run, so no gate is needed, and reuse
@@ -674,7 +684,13 @@ class DiskANNIndex {
           sp.search_list_size = params.search_list_size;
           sp.beam_width = beam_width_;
           sp.use_pq = use_pq;
-          sp.rerank = false;
+          sp.rerank = params.rerank;
+          sp.rerank_count = params.rerank_count;
+          if (sp.rerank && sp.rerank_count == 0) {
+            sp.rerank_count = top_k > std::numeric_limits<uint32_t>::max() / 3
+                                  ? std::numeric_limits<uint32_t>::max()
+                                  : top_k * 3;
+          }
           sp.deterministic = params.deterministic;
 
           SearchStats *stats = per_query_stats != nullptr ? &per_query_stats[qi] : nullptr;
@@ -690,9 +706,10 @@ class DiskANNIndex {
                                                     sp,
                                                     *td,
                                                     stats,
-                                                    *update_reactor_,
+                                                    update_reactor_.get(),
                                                     pool,
-                                                    fd);
+                                                    fd,
+                                                    cancel_probe);
           } else {
             results = co_await disk_greedy_search_async(ctx,
                                                         query,
@@ -700,9 +717,10 @@ class DiskANNIndex {
                                                         sp,
                                                         *td,
                                                         stats,
-                                                        *update_reactor_,
+                                                        update_reactor_.get(),
                                                         pool,
-                                                        fd);
+                                                        fd,
+                                                        cancel_probe);
           }
 
           uint64_t *labels_row = out_labels + static_cast<uint64_t>(qi) * top_k;
@@ -720,10 +738,16 @@ class DiskANNIndex {
             labels_row[i] = kNoLabel;
             dist_row[i] = std::numeric_limits<float>::max();
           }
+          if (per_query_counts != nullptr) {
+            per_query_counts[qi] = count;
+          }
           if (per_query_us != nullptr) {
             per_query_us[qi] =
                 std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0)
                     .count();
+          }
+          if (cancel_probe != nullptr && cancel_probe->requested()) {
+            break;
           }
         } catch (...) {
           {

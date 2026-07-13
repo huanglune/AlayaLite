@@ -52,6 +52,20 @@
 
 namespace alaya::diskann {
 
+// Optional, non-owning cancellation hook for the coroutine beam. The owner
+// must keep state alive until the coroutine returns. A null probe preserves
+// the historical path and avoids an indirect call at wave boundaries.
+struct BeamSearchCancelProbe {
+  using IsCancelled = bool (*)(const void *) noexcept;
+
+  const void *state{};
+  IsCancelled is_cancelled{};
+
+  [[nodiscard]] auto requested() const noexcept -> bool {
+    return is_cancelled != nullptr && is_cancelled(state);
+  }
+};
+
 namespace beam_async_detail {
 inline void check_wave(const std::vector<storage::io::ReadResult> &results,
                        uint64_t page_size) {
@@ -84,9 +98,10 @@ inline auto disk_greedy_search_async(const SearchContext &ctx,
                                      const SearchParams &params,
                                      ThreadData &td,
                                      SearchStats *stats,
-                                     alaya::UringReactor &reactor,
+                                     alaya::UringReactor *reactor,
                                      coro::thread_pool &pool,
-                                     int fd)
+                                     int fd,
+                                     const BeamSearchCancelProbe *cancel_probe = nullptr)
     -> coro::task<std::vector<std::pair<uint32_t, float>>> {
   (void)reactor;
   (void)fd;
@@ -176,6 +191,9 @@ inline auto disk_greedy_search_async(const SearchContext &ctx,
       }
     }
   }
+  if (cancel_probe != nullptr && cancel_probe->requested()) {
+    co_return std::vector<std::pair<uint32_t, float>>{};
+  }
 
   std::vector<uint32_t> todo;
   std::vector<uint32_t> miss_ids;
@@ -239,6 +257,9 @@ inline auto disk_greedy_search_async(const SearchContext &ctx,
         absorb(miss_ids[j], buf + geom.offset_to_node(miss_ids[j]));
       }
     }
+    if (cancel_probe != nullptr && cancel_probe->requested()) {
+      break;
+    }
   }
 
   std::vector<std::pair<uint32_t, float>> out;
@@ -253,9 +274,36 @@ inline auto disk_greedy_search_async(const SearchContext &ctx,
   co_return out;
 }
 
-/// Coroutine PQ beam search (no-rerank only — the update search never
-/// reranks; rerank would need blocking reads through the td's AIO context,
-/// which gate ThreadData objects deliberately do not register). Each beam step reads
+// Retain the original reactor-reference overload for every existing caller.
+// PageReader owns the actual reads; the pointer overload lets readonly callers
+// avoid manufacturing an unused reactor.
+inline auto disk_greedy_search_async(const SearchContext &ctx,
+                                     const float *query,
+                                     uint32_t top_k,
+                                     const SearchParams &params,
+                                     ThreadData &td,
+                                     SearchStats *stats,
+                                     alaya::UringReactor &reactor,
+                                     coro::thread_pool &pool,
+                                     int fd,
+                                     const BeamSearchCancelProbe *cancel_probe = nullptr)
+    -> coro::task<std::vector<std::pair<uint32_t, float>>> {
+  return disk_greedy_search_async(ctx,
+                                  query,
+                                  top_k,
+                                  params,
+                                  td,
+                                  stats,
+                                  &reactor,
+                                  pool,
+                                  fd,
+                                  cancel_probe);
+}
+
+/// Coroutine PQ beam search. Existing null-probe callers retain the historical
+/// no-rerank-only contract. A probed readonly operation may exact-rerank the
+/// retained entries already expanded by traversal, without submitting a new
+/// blocking read through the td's AIO context. Each beam step reads
 /// its cache misses as one reactor wave; cache hits are processed inline while
 /// popping, exactly like the sync pipelined variant's fill_pipe, so this sits
 /// in the same recall-equivalence class as both sync schedulers (and is
@@ -273,10 +321,12 @@ inline auto pq_beam_search_async(const SearchContext &ctx,
                                  const SearchParams &params,
                                  ThreadData &td,
                                  SearchStats *stats,
-                                 alaya::UringReactor &reactor,
+                                 alaya::UringReactor *reactor,
                                  coro::thread_pool &pool,
-                                 int fd) -> coro::task<std::vector<std::pair<uint32_t, float>>> {
-  if (params.rerank) {
+                                 int fd,
+                                 const BeamSearchCancelProbe *cancel_probe = nullptr)
+    -> coro::task<std::vector<std::pair<uint32_t, float>>> {
+  if (params.rerank && cancel_probe == nullptr) {
     throw std::invalid_argument("pq_beam_search_async: rerank is not supported");
   }
   (void)reactor;
@@ -376,21 +426,42 @@ inline auto pq_beam_search_async(const SearchContext &ctx,
         process_node(miss_ids[j], buf + geom.offset_to_node(miss_ids[j]));
       }
     }
+    if (cancel_probe != nullptr && cancel_probe->requested()) {
+      break;
+    }
   }
 
-  // Result extraction: PQ no-rerank (exact where known during traversal).
+  // Result extraction: a completed traversal has exact distances for every
+  // retained node. A cancelled traversal retains only the already-expanded
+  // exact candidates when rerank was requested; no new page wave is submitted.
   std::vector<std::pair<uint32_t, float>> out;
   auto is_live = [&](uint32_t id) {
     return ctx.tombstone == nullptr || !ctx.tombstone->is_deleted(id);
   };
-  out.reserve(std::min<size_t>(retset.size(), static_cast<size_t>(top_k)));
-  for (size_t i = 0; i < retset.size() && out.size() < top_k; ++i) {
-    const uint32_t id = retset[i].id;
-    if (!is_live(id)) {
-      continue;
+  if (params.rerank) {
+    const size_t want =
+        params.rerank_count > 0 ? params.rerank_count : static_cast<size_t>(top_k) * 3;
+    out.reserve(std::min<size_t>(retset.size(), want));
+    for (size_t i = 0; i < retset.size() && out.size() < want; ++i) {
+      const uint32_t id = retset[i].id;
+      if (!is_live(id)) {
+        continue;
+      }
+      const float exact = td.exact_dist(id);
+      if (!ThreadData::is_missing_exact(exact)) {
+        out.emplace_back(id, exact);
+      }
     }
-    const float exact = td.exact_dist(id);
-    out.emplace_back(id, !ThreadData::is_missing_exact(exact) ? exact : retset[i].distance);
+  } else {
+    out.reserve(std::min<size_t>(retset.size(), static_cast<size_t>(top_k)));
+    for (size_t i = 0; i < retset.size() && out.size() < top_k; ++i) {
+      const uint32_t id = retset[i].id;
+      if (!is_live(id)) {
+        continue;
+      }
+      const float exact = td.exact_dist(id);
+      out.emplace_back(id, !ThreadData::is_missing_exact(exact) ? exact : retset[i].distance);
+    }
   }
   std::sort(out.begin(), out.end(), [](const auto &a, const auto &b) {
     return a.second < b.second || (a.second == b.second && a.first < b.first);
@@ -399,6 +470,29 @@ inline auto pq_beam_search_async(const SearchContext &ctx,
     out.resize(top_k);
   }
   co_return out;
+}
+
+inline auto pq_beam_search_async(const SearchContext &ctx,
+                                 const float *query,
+                                 uint32_t top_k,
+                                 const SearchParams &params,
+                                 ThreadData &td,
+                                 SearchStats *stats,
+                                 alaya::UringReactor &reactor,
+                                 coro::thread_pool &pool,
+                                 int fd,
+                                 const BeamSearchCancelProbe *cancel_probe = nullptr)
+    -> coro::task<std::vector<std::pair<uint32_t, float>>> {
+  return pq_beam_search_async(ctx,
+                              query,
+                              top_k,
+                              params,
+                              td,
+                              stats,
+                              &reactor,
+                              pool,
+                              fd,
+                              cancel_probe);
 }
 
 }  // namespace alaya::diskann
