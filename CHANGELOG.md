@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added an independently gated readonly `DiskAnnSegment` over the native
+  DiskANN file family, with typed synchronous search/batch translation,
+  resource admission, stats, and an explicit `diskann_index` direct-path
+  identity. Native contract-v3 async remains disabled until the retained beam
+  coroutine gains a cooperative-cancel safe point; the readonly adapter does
+  not advertise mutation or checkpoint capabilities.
+
 - Added the independently gated, non-destructive legacy PyIndex importer. It
   directly decodes schema/CURRENT/raw snapshots/read-only RocksDB checkpoints
   and complete-COMMIT WAL prefixes into a sealed DiskFlat exact-oracle segment,
