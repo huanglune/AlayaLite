@@ -35,6 +35,17 @@ alaya_cc_target(
   SRCS disk_flat_segment_test.cpp
 )
 alaya_cc_target(disk_flat_segment_header_closure SRCS disk_flat_segment_header_closure.cpp)
+alaya_cc_target(disk_vamana_segment_header_closure SRCS disk_vamana_segment_header_closure.cpp)
+alaya_cc_target(
+  disk_vamana_segment_test
+  GTEST
+  SRCS disk_vamana_segment_test.cpp
+)
+alaya_cc_target(
+  disk_vamana_segment_stress_test
+  GTEST
+  SRCS disk_vamana_segment_stress_test.cpp
+)
 alaya_cc_target(
   disk_flat_segment_stress_test
   GTEST
@@ -102,6 +113,13 @@ alaya_add_test(NAME disk_test_mmap_file TARGET mmap_file_test)
 alaya_add_test(NAME disk_test_flat_builder TARGET disk_flat_builder_test)
 alaya_add_test(NAME disk_test_flat_searcher TARGET disk_flat_searcher_test)
 alaya_add_test(NAME disk_test_flat_segment TARGET disk_flat_segment_test LABELS disk segment)
+alaya_add_test(NAME disk_test_vamana_segment TARGET disk_vamana_segment_test LABELS disk segment)
+alaya_add_test(
+  NAME disk_test_vamana_segment_stress
+  TARGET disk_vamana_segment_stress_test
+  LABELS disk segment stress tsan
+  TIMEOUT 120
+)
 alaya_add_test(
   NAME disk_test_flat_segment_stress
   TARGET disk_flat_segment_stress_test
