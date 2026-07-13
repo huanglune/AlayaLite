@@ -3,10 +3,8 @@
 
 import numpy as np
 import pytest
-
 from alayalite import Collection, DiskCollection, Index, MetricType
 from alayalite.schema import IndexParams
-
 
 VECTORS = np.array([[0, 0], [1, 0], [0, 2]], dtype=np.float32)
 
@@ -27,6 +25,10 @@ def test_index_return_shapes_and_boundaries(tmp_path):
     with pytest.raises(ValueError, match="queries must not be empty"):
         index.batch_search(VECTORS[:0], 2)
     assert index.insert(np.array([3, 0], dtype=np.float32)) == 3
+    # The wrapper retains the one legacy PyIndex recovery owner and does not
+    # open a second canonical WAL beside it.
+    assert (tmp_path / "recovery" / "wal.bin").is_file()
+    assert not (tmp_path / ".alaya_internal" / "collection_wal_v1").exists()
 
     with pytest.raises(ValueError, match="query must be a 1D array"):
         index.search(np.zeros((1, 2), dtype=np.float32), 1)
@@ -75,18 +77,28 @@ def test_disk_collection_public_shape_visibility_and_errors(tmp_path):
     col.flush()
     assert col.size() == 3
     assert col.search(query, k=99) == [(10, 0.0), (11, 1.0), (12, 4.0)]
-    labels = col.batch_search(VECTORS[:2], k=2)
+    labels = col.batch_search(VECTORS[:2], k=5)
     assert isinstance(labels, np.ndarray) and labels.dtype == np.uint64
-    assert labels.tolist() == [[10, 11], [11, 10]]
-    labels_with_distance, distances = col.batch_search_with_distance(VECTORS[:2], k=2)
+    assert labels.shape == (2, 5)
+    assert labels[:, :3].tolist() == [[10, 11, 12], [11, 10, 12]]
+    assert np.all(labels[:, 3:] == np.iinfo(np.uint64).max)
+    labels_with_distance, distances = col.batch_search_with_distance(VECTORS[:2], k=5)
     assert labels_with_distance.tolist() == labels.tolist()
     assert isinstance(distances, np.ndarray) and distances.dtype == np.float32
-    assert distances.tolist() == [[0.0, 1.0], [0.0, 1.0]]
+    assert distances.shape == (2, 5)
+    assert distances[:, :3].tolist() == [[0.0, 1.0, 4.0], [0.0, 1.0, 5.0]]
+    assert np.isnan(distances[:, 3:]).all()
 
     with pytest.raises(ValueError, match="DiskCollection.search: k must be > 0"):
         col.search(query, k=0)
     with pytest.raises(ValueError, match="ef must be > 0"):
         col.search(query, k=1, ef=0)
+    with pytest.raises(ValueError) as batch_error:
+        col.batch_search(VECTORS[:1], k=0)
+    assert str(batch_error.value) == "DiskCollection.batch_search: k must be > 0 (got 0)"
+    with pytest.raises(ValueError) as distance_error:
+        col.batch_search_with_distance(VECTORS[:1], k=0)
+    assert str(distance_error.value) == "DiskCollection.batch_search_with_distance: k must be > 0 (got 0)"
     with pytest.raises(ValueError, match="duplicate"):
         col.add(VECTORS[:2], np.array([20, 20], dtype=np.uint64))
         col.flush()
