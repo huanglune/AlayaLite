@@ -1579,3 +1579,35 @@ garden lowdeg +0.75pp 保护、驱逐压力是新节点质量来源(FO 反向定
 - 年龄谱(round_age)是维护机制评审的标准判别读数(E9-E11 三轮定罪全靠它);
 - 预注册裁决标准("old ≥ 对照+1pp 才算成立")防止把噪声当机制;
 - 负结果三连(滞回/随机重写/turnover 靶向)都带反向定理,负结果≠零信息。
+
+## 26. E8 判决:deep10m RAM-cap 曲面——页缓存侧 20× out-of-core 成立,匿名墙=maintenance 趟内驻留 2.2× 索引(2026-07-12,g03,14 cells)
+
+Cell:deep10m(10M×96d 全主维 pd128,索引 41GB),g03 本地 build+v2 迁移一次、
+每 cell 字节克隆,基线配方(ins200/garden f.20)3 轮 churn,--efs 100,200,
+冻结 bench d791…(W1+W2)。产物 data/laser-update/ramcap-deep10m/。
+14 cells:7 PASS / 7 OOM。
+
+### 26.1 双面判决
+
+**页缓存侧(核心正结论):92GiB/131k 池 vs 不限/同池——ef100 recall −0.014pp、
+插入吞吐保 97.8%、全程吞吐保 76.9%,refault 35.68M、PSI 18.84s。**匿名占
+~90GiB 后,41GB 索引实际运行在 ~2GiB 有效页缓存上 = **I/O 路径 20× 超订仍
+质量无损**;128→92GiB 区间 refault/PSI 平滑退化,无质量悬崖——"堵缓存玩具"
+的核心证据成立。
+
+**匿名墙(量化的工程债):最小可行 92GiB,88GiB round1 insert OOM。**根因=
+maintenance 匿名峰值 ~89.8GiB(≈2.2× 索引),不是索引页缓存。机制:池水位
+enforcement 只在相位边界(T8 §17.5 已知边界),consolidate/garden 单趟触遍
+全索引 ⇒ 趟内池无界膨胀到 O(index)。500k 时 6.27GiB 无害,10M 放大成墙。
+
+### 26.2 修复路径(E13,排队)
+
+**趟内水位驱逐**:consolidate/garden 循环内池超 high 即 evict(而非趟尾)。
+预期把匿名地板从 2.2× 索引压到 池 cap+O(batch) ⇒ 8-16GiB cell 对 41GB 索引
+可行,out-of-core 叙事全线诚实。E12(嵌入战役)释放构建树后实施+g03 复扫
+8/16/32GiB 档。
+
+### 26.3 执行账
+
+g03 本地 build+迁移+克隆;v1 build 与 v2 pristine 保留在 g03 供复扫;结果收回
+NFS。全程无源码/仓库改动。
