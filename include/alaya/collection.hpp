@@ -1,0 +1,7 @@
+// SPDX-FileCopyrightText: 2026 AlayaDB.AI
+//
+// SPDX-License-Identifier: AGPL-3.0-only
+
+#pragma once
+
+#include "index/collection/collection.hpp"

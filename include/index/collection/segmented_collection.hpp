@@ -2297,7 +2297,11 @@ class SegmentedCollection {
 
   [[nodiscard]] auto closed_status(core::OperationStage stage) const -> core::Status {
     std::lock_guard lock(lifecycle_mutex_);
-    if (lifecycle_ == LifecycleState::open && control_plane_gate_) {
+    // Admission can observe the checkpoint gate and then reach this mapper
+    // after the gate has already reopened.  The lifecycle is the stable fact:
+    // an open collection rejected by admit() was temporarily gated and must
+    // remain retryable rather than being misreported as permanently closed.
+    if (lifecycle_ == LifecycleState::open) {
       return core::Status::error(core::StatusCode::conflict,
                                  stage,
                                  core::StatusDetail::none,

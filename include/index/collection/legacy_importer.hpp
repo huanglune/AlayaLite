@@ -14,8 +14,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <filesystem>
+#include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -62,10 +63,18 @@ enum class LegacyOpenRoute : std::uint8_t {
 };
 
 struct LegacyImportOptions {
+  using ActiveRegistrationFactory =
+      std::function<core::Result<SegmentRegistration>(const CollectionSchema &)>;
+
   std::filesystem::path source_root{};
   std::filesystem::path target_root{};
   CollectionFeatureFlags features{};
   LegacyImporterFailPoint fail_point{LegacyImporterFailPoint::none};
+  // Optional Gate 9 facade composition seam.  The importer still owns and
+  // validates the sealed legacy target; a canonical facade may append its
+  // independently constructed active mutable registration without routing
+  // the source through a legacy reader.
+  ActiveRegistrationFactory active_registration_factory{};
 };
 
 struct LegacyImportAudit {
@@ -1246,7 +1255,9 @@ inline void cleanup_incomplete(const fs::path &target_root) {
   }
 }
 
-[[nodiscard]] inline auto open_imported(const fs::path &target_root)
+[[nodiscard]] inline auto open_imported(
+    const fs::path &target_root,
+    const LegacyImportOptions::ActiveRegistrationFactory &active_registration_factory = {})
     -> core::Result<LegacyImportResult> {
   if (!valid_marker(target_root)) {
     return failure(core::OperationStage::open,
@@ -1278,10 +1289,18 @@ inline void cleanup_incomplete(const fs::path &target_root) {
     config.wal.root = target_root;
     config.recovery.minimum_next_op_id = audit.minimum_next_op_id;
     config.recovery.minimum_visibility_watermark = audit.maximum_committed_op_id;
+    CollectionSchema schema{audit.dim, core::Metric::l2, audit.source_scalar_type};
+    std::vector<SegmentRegistration> registrations;
+    registrations.push_back(std::move(registration));
+    if (active_registration_factory) {
+      auto active = active_registration_factory(schema);
+      if (!active.ok()) {
+        return active.status();
+      }
+      registrations.push_back(std::move(active).value());
+    }
     auto collection =
-        SegmentedCollection::open({audit.dim, core::Metric::l2, audit.source_scalar_type},
-                                  {std::move(registration)},
-                                  std::move(config));
+        SegmentedCollection::open(schema, std::move(registrations), std::move(config));
     if (!collection.ok()) {
       return collection.status();
     }
@@ -1311,7 +1330,7 @@ class LegacyImporter {
                              "legacy importer target root is empty");
     }
     if (detail::valid_marker(options.target_root)) {
-      return detail::open_imported(options.target_root);
+      return detail::open_imported(options.target_root, options.active_registration_factory);
     }
     if (!options.features.legacy_importer) {
       return detail::failure(core::OperationStage::save,
@@ -1409,10 +1428,18 @@ class LegacyImporter {
       config.wal.root = options.target_root;
       config.recovery.minimum_next_op_id = minimum_next_op_id;
       config.recovery.minimum_visibility_watermark = maximum_committed;
+      CollectionSchema collection_schema{schema.dim, core::Metric::l2, schema.scalar_type};
+      std::vector<SegmentRegistration> registrations;
+      registrations.push_back(std::move(registration));
+      if (options.active_registration_factory) {
+        auto active = options.active_registration_factory(collection_schema);
+        if (!active.ok()) {
+          return active.status();
+        }
+        registrations.push_back(std::move(active).value());
+      }
       auto collection =
-          SegmentedCollection::open({schema.dim, core::Metric::l2, schema.scalar_type},
-                                    {std::move(registration)},
-                                    std::move(config));
+          SegmentedCollection::open(collection_schema, std::move(registrations), std::move(config));
       if (!collection.ok()) {
         return collection.status();
       }
