@@ -25,6 +25,7 @@
 #include "index/collection/manifest_dual_reader.hpp"
 #include "index/collection/types.hpp"
 #include "index/disk/disk_engine_registry.hpp"
+#include "index/disk/laser_segment_searcher.hpp"
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/segment_manifest.hpp"
 
