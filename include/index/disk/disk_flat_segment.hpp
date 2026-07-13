@@ -864,10 +864,12 @@ class DiskFlatSegment {
                                                           request.context->cancellation,
                                                           core::OperationStage::search);
       if (!control.ok()) {
-        response.offsets[row + 1] = cursor;
-        response.valid_counts[row] = 0;
-        response.statuses[row] = control;
-        response.completeness[row] = core::SearchCompleteness::failed;
+        for (core::RowCount remaining = row; remaining < request.queries.rows; ++remaining) {
+          response.offsets[remaining + 1] = cursor;
+          response.valid_counts[remaining] = 0;
+          response.statuses[remaining] = control;
+          response.completeness[remaining] = core::SearchCompleteness::failed;
+        }
         return request.queries.rows == 1 ? control : core::Status::success();
       }
       try {
