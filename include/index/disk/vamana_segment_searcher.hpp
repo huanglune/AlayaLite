@@ -231,6 +231,8 @@ class VamanaSegmentSearcher : public SegmentSearcher {
   auto dim() const -> uint32_t override { return static_cast<uint32_t>(manifest_.dim); }
   auto type() const -> DiskIndexType override { return DiskIndexType::Vamana; }
 
+  [[nodiscard]] auto manifest() const noexcept -> const SegmentManifest & { return manifest_; }
+
  private:
   static constexpr uint64_t kMaxDim = static_cast<uint64_t>(UINT32_MAX);
   static constexpr uint64_t kMaxCount = static_cast<uint64_t>(UINT32_MAX);

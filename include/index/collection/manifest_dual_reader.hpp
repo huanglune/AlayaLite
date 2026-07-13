@@ -55,7 +55,9 @@ struct UnifiedManifestView {
 struct ManifestReaderOptions {
   std::uint32_t reader_version{kArtifactManifestV2SchemaVersion};
   bool verify_artifacts{true};
-  std::set<std::string> available_features{"manifest_v2", "disk_flat_segment"};
+  std::set<std::string> available_features{"manifest_v2",
+                                           "disk_flat_segment",
+                                           "disk_vamana_segment"};
 };
 
 class CollectionManifestDualReader {
