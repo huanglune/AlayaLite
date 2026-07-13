@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import struct
 import subprocess
@@ -64,7 +65,26 @@ def _vectors(rows: int, dim: int) -> np.ndarray:
     return rng.standard_normal((rows, dim)).astype(np.float32)
 
 
-def _generate_python_artifacts(out: Path) -> None:
+def _load_build_tree_extension(build_dir: Path) -> None:
+    extension = _build_tree_extension(build_dir)
+    if extension is None:
+        raise RuntimeError(
+            f"expected exactly one build-tree extension under {build_dir / 'python'}"
+        )
+    module_name = "alayalite._alayalitepy"
+    spec = importlib.util.spec_from_file_location(module_name, extension)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load build-tree extension: {extension}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+
+
+def _generate_python_artifacts(out: Path, build_dir: Path) -> None:
+    # Always exercise the binary from --build-dir. Without this preload, a
+    # developer venv can silently satisfy the relative import with an older
+    # installed extension and make cross-lane golden comparisons meaningless.
+    _load_build_tree_extension(build_dir)
     from alayalite import DiskCollection, Index, MetricType
     from alayalite.schema import IndexParams
 
@@ -164,7 +184,7 @@ def _generate_laser_fixture(out: Path, build_dir: Path) -> bool:
 def generate(build_dir: Path) -> dict[str, object]:
     with tempfile.TemporaryDirectory(prefix="alaya-artifact-golden-") as temp:
         out = Path(temp)
-        _generate_python_artifacts(out)
+        _generate_python_artifacts(out, build_dir)
         diskann_generator = build_dir / "tests/golden/artifact_diskann_generator"
         if not diskann_generator.is_file():
             raise RuntimeError(f"build the artifact_diskann_generator target first: {diskann_generator}")

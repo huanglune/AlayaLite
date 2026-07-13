@@ -17,3 +17,15 @@ Cross-platform feasibility is covered without introducing a new toolchain: the e
 builds Linux aarch64, macOS arm64/x86_64, and Windows x64. LASER remains unsupported on Linux ARM and defaults off.
 MSVC and ARM cannot be executed by this local script unless it is run natively with those toolchains; add native CI
 rows invoking `core-only` when compile-only feedback faster than wheel builds is needed.
+
+Gate 6 has a stricter two-lane release and artifact check:
+
+```sh
+scripts/build_matrix/run_gate6_matrix.sh
+```
+
+It builds isolated host-native (`-march=native`) and fixed x86 AVX2+FMA lanes, runs the disk-segment CTest subset,
+and generates all 14 golden families twice per lane. Same-lane output must be byte-stable. The Flat and DiskFlat
+Segment families must also match across lanes and the checked baseline. DiskCollection Vamana and DiskVamana
+Segment drift is reported rather than hidden because the retained k-means/BLAS path can depend on ISA; both
+same-lane stability and search tests remain mandatory. Logs and inventories are written below `build/gate6-matrix`.
