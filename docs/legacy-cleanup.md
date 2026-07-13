@@ -36,7 +36,11 @@ converter: it validates a source fingerprint, emits a canonical checkpoint,
 and records an audit/activation marker without rewriting the source artifact.
 
 Memory RaBitQ and LASER are mathematically related but never share a reader.
-Their reciprocal rejection tests live in the independent Gate 11 format test.
+The independent `rabitq_format_separation_test` wraps a real memory-QG file in
+a complete LASER segment and verifies LASER open rejects its header; it also
+feeds the checked-in LASER fixture index to memory `QgSegment::open` and
+verifies the RaBitQ v1 header gate rejects it before allocation or rotator
+construction.
 
 ## Utils and lint scope
 

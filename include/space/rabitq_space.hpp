@@ -620,6 +620,17 @@ class RaBitQSpace {
     reader.read(reinterpret_cast<char *>(&type_), sizeof(type_));
     reader.read(reinterpret_cast<char *>(&ep_), sizeof(ep_));
 
+    const bool metric_valid = metric_ == MetricType::L2 || metric_ == MetricType::IP ||
+                              metric_ == MetricType::COS;
+    const bool rotator_valid = type_ == RotatorType::MatrixRotator ||
+                               type_ == RotatorType::FhtKacRotator ||
+                               type_ == RotatorType::FhtRotator;
+    if (!reader || !metric_valid || !rotator_valid || dim_ == 0 || item_cnt_ > capacity_ ||
+        (item_cnt_ != 0 && ep_ >= item_cnt_)) {
+      throw std::invalid_argument(
+          "RaBitQSpace: incompatible v1 header; artifact is not memory RaBitQ format");
+    }
+
     if constexpr (has_scalar_data) {
       load_scalar_config(reader);
       scalar_storage_ = std::make_unique<RocksDBStorage<IDType>>(config_);
