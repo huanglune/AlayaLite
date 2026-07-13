@@ -95,7 +95,6 @@ inline void pack_codes(size_t padded_dim,
   ::alaya::simd::fastscan::pack_codes_bytes<false>(padded_dim, quantization_code, num, blocks);
 }
 
-// NOLINTBEGIN
 //  use fast scan to accumulate one block, dim % 16 == 0
 inline void accumulate(const uint8_t *ALAYA_RESTRICT codes,
                        const uint8_t *ALAYA_RESTRICT lp_table,
@@ -218,7 +217,6 @@ inline void accumulate(const uint8_t *ALAYA_RESTRICT codes,
   detail::accumulate_scalar(codes, lp_table, result, dim);
 #endif
 }
-// NOLINTEND
 
 template <typename T>
 inline void estimate_distances(const uint16_t *ALAYA_RESTRICT nth_segments,

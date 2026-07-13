@@ -15,7 +15,6 @@
 #include "utils/scalar_data.hpp"
 
 namespace alaya {
-// NOLINTBEGIN
 /// Comparison operators for filter conditions
 enum class FilterOp : uint8_t {
   EQ,          ///< Equal (==)
@@ -314,5 +313,4 @@ struct MetadataFilter {
     return *this;
   }
 };
-// NOLINTEND
 }  // namespace alaya

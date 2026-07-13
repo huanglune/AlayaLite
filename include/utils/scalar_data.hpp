@@ -18,7 +18,6 @@
 namespace alaya {
 struct EmptyScalarData {};
 
-// NOLINTBEGIN
 /// Supported metadata value types
 using MetadataValue = std::variant<int64_t, double, std::string, bool>;
 using MetadataMap = std::unordered_map<std::string, MetadataValue>;
@@ -436,5 +435,4 @@ struct ScalarData {
     }
   }
 };
-// NOLINTEND
 }  // namespace alaya

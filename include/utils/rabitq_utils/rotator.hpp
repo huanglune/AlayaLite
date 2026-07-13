@@ -31,7 +31,6 @@
 #include "utils/math.hpp"
 
 namespace alaya {
-// NOLINTBEGIN
 enum class RotatorType : uint8_t { MatrixRotator, FhtKacRotator, FhtRotator };
 
 // abstract rotator
@@ -400,5 +399,4 @@ std::unique_ptr<Rotator<T>> choose_rotator(size_t dim,
   ALAYA_UNREACHABLE;
   // throw std::invalid_argument("Invalid rotator type in choose_rotator()\n");
 }
-// NOLINTEND
 }  // namespace alaya

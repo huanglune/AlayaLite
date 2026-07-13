@@ -26,7 +26,6 @@
 #include "utils/memory.hpp"
 
 namespace alaya {
-// NOLINTBEGIN
 
 /**
  * @brief hash set to record visited vertices
@@ -116,5 +115,4 @@ class HashBasedBooleanSet {
     }
   }
 };
-// NOLINTEND
 }  // namespace alaya

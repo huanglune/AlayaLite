@@ -12,13 +12,11 @@
 
 namespace alaya::disk {
 
-// NOLINTBEGIN
 enum class DiskIndexType {
   Flat,
   Vamana,
   Laser,
 };
-// NOLINTEND
 
 struct DiskSearchOptions {
   uint32_t top_k = 10;

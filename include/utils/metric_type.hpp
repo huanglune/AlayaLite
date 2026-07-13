@@ -10,14 +10,12 @@
 
 namespace alaya {
 
-// NOLINTBEGIN
 enum class MetricType {
   L2,
   IP,
   COS,
   NONE,
 };
-// NOLINTEND
 
 struct MetricMap {
   static constexpr std::array<std::tuple<std::string_view, MetricType>, 3> kStaticMap = {

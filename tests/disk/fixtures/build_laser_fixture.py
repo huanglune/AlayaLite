@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import struct
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -71,7 +72,7 @@ def _stage_build_tree_package(extension: Path, stage_root: Path) -> Path:
     return staged_extension
 
 
-def _load_build_tree_modules(extension: Path, stage_root: Path) -> tuple[object, object]:
+def _load_build_tree_extension(extension: Path, stage_root: Path) -> None:
     extension = extension.resolve(strict=True)
     if extension.suffix != ".so":
         _die(f"--extension must name a build-tree .so: {extension}")
@@ -96,7 +97,6 @@ def _load_build_tree_modules(extension: Path, stage_root: Path) -> tuple[object,
     if loaded != extension or Path(staged_extension).resolve(strict=True) != extension:
         _die(f"extension provenance mismatch: requested={extension}, loaded={loaded}")
     print(f"[laser-fixture] loaded build-tree extension: {loaded}")
-    return _alayalitepy.laser.Index, _alayalitepy.vamana
 
 
 def _die(message: str) -> None:
@@ -297,7 +297,7 @@ def _ensure_medoids(
 
 
 def _ensure_vamana_graph(
-    vamana_module: object,
+    native_builder: Path,
     pca_base_path: Path,
     graph_path: Path,
     degree: int,
@@ -312,15 +312,20 @@ def _ensure_vamana_graph(
         return
     print(f"[laser-fixture] building Vamana graph: {graph_path}")
     graph_path.parent.mkdir(parents=True, exist_ok=True)
-    vamana_module.build_index(
-        data_path=str(pca_base_path),
-        output_path=str(graph_path),
-        R=degree,
-        L=build_l,
-        alpha=alpha,
-        seed=seed,
-        num_threads=build_threads,
-        dram_budget_gb=dram_budget_gb,
+    subprocess.run(
+        [
+            str(native_builder),
+            "vamana",
+            str(pca_base_path),
+            str(graph_path),
+            str(degree),
+            str(build_l),
+            str(alpha),
+            str(seed),
+            str(build_threads),
+            str(dram_budget_gb),
+        ],
+        check=True,
     )
     if not _valid_vamana_index(graph_path, degree):
         _die(f"Vamana graph did not validate after generation: {graph_path}")
@@ -346,7 +351,7 @@ def _laser_required_valid(paths: dict[str, Path], count: int, main_dim: int) -> 
 
 
 def _ensure_laser_artifacts(
-    raw_index_cls: object,
+    native_builder: Path,
     vamana_graph_path: Path,
     output_dir: Path,
     prefix: str,
@@ -364,21 +369,21 @@ def _ensure_laser_artifacts(
         return
 
     print(f"[laser-fixture] building native LASER artifacts with prefix={prefix}")
-    index = raw_index_cls(
-        index_type="QG",
-        metric="l2",
-        num_elements=count,
-        main_dimension=main_dim,
-        dimension=dim,
-        degree_bound=degree,
-        rotator_seed=seed,
-        rotator_dump_path="",
-    )
-    index.build_index(
-        str(vamana_graph_path),
-        str(output_dir / prefix),
-        EF=ef_indexing,
-        num_thread=build_threads,
+    subprocess.run(
+        [
+            str(native_builder),
+            "laser",
+            str(vamana_graph_path),
+            str(output_dir / prefix),
+            str(count),
+            str(dim),
+            str(main_dim),
+            str(degree),
+            str(seed),
+            str(ef_indexing),
+            str(build_threads),
+        ],
+        check=True,
     )
     if not _laser_required_valid(required, count, main_dim):
         missing = [name for name, path in required.items() if not _nonempty(path)]
@@ -395,6 +400,12 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         required=True,
         help="Exact build-tree _alayalitepy shared object to load.",
+    )
+    parser.add_argument(
+        "--native-builder",
+        type=Path,
+        required=True,
+        help="Exact build-tree laser_fixture_builder executable to use.",
     )
     parser.add_argument(
         "--force", action="store_true", help="Regenerate even when provenance matches."
@@ -427,13 +438,19 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _provenance(args: argparse.Namespace, extension: Path, main_dim: int) -> dict[str, object]:
+def _provenance(
+    args: argparse.Namespace, extension: Path, native_builder: Path, main_dim: int
+) -> dict[str, object]:
     return {
         "schema_version": 1,
         "generator_sha256": _sha256(Path(__file__).resolve()),
         "extension": {
             "filename": extension.name,
             "sha256": _sha256(extension),
+        },
+        "native_builder": {
+            "filename": native_builder.name,
+            "sha256": _sha256(native_builder),
         },
         "parameters": {
             "prefix": args.prefix,
@@ -511,13 +528,16 @@ def main() -> int:
 
     output_dir = args.output_dir.resolve()
     extension = args.extension.resolve(strict=True)
+    native_builder = args.native_builder.resolve(strict=True)
+    if not native_builder.is_file():
+        _die(f"--native-builder must name a regular file: {native_builder}")
     main_dim = args.main_dim or args.dim
     if main_dim != args.dim:
         _die("v1 fixture generation requires --main-dim to equal --dim")
 
-    expected_stamp = _provenance(args, extension, main_dim)
+    expected_stamp = _provenance(args, extension, native_builder, main_dim)
     python_stage = tempfile.TemporaryDirectory(prefix="alaya-laser-python-stage-")
-    raw_index_cls, vamana_module = _load_build_tree_modules(extension, Path(python_stage.name))
+    _load_build_tree_extension(extension, Path(python_stage.name))
     if (
         not args.force
         and _stamp_matches(output_dir, expected_stamp)
@@ -558,7 +578,7 @@ def main() -> int:
         args.optional_sidecars,
     )
     _ensure_vamana_graph(
-        vamana_module,
+        native_builder,
         pca_base_path,
         vamana_graph_path,
         args.R,
@@ -569,7 +589,7 @@ def main() -> int:
         args.dram_budget_gb,
     )
     _ensure_laser_artifacts(
-        raw_index_cls,
+        native_builder,
         vamana_graph_path,
         generated_dir,
         prefix,

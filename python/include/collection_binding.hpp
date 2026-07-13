@@ -936,43 +936,6 @@ class PyCollection {
   std::shared_ptr<Collection> collection_{};
 };
 
-class PyCollectionReadView {
- public:
-  explicit PyCollectionReadView(std::shared_ptr<PyCollection> owner) : owner_(std::move(owner)) {}
-
-  [[nodiscard]] auto get_by_id(const std::string &id) -> py::object {
-    return owner_->get_by_id(id);
-  }
-  [[nodiscard]] auto get_by_ids(const py::list &ids) -> py::list { return owner_->get_by_ids(ids); }
-  [[nodiscard]] auto records() -> py::list { return owner_->records(); }
-  [[nodiscard]] auto search(const py::array &queries, std::uint64_t top_k) -> py::dict {
-    return owner_->search(queries,
-                          top_k,
-                          py::none(),
-                          "auto",
-                          py::none(),
-                          core::kUnlimitedResource,
-                          core::kUnlimitedResource,
-                          core::kUnlimitedResource);
-  }
-  [[nodiscard]] auto batch_search(const py::array &queries, std::uint64_t top_k) -> py::dict {
-    return owner_->batch_search(queries,
-                                top_k,
-                                py::none(),
-                                "auto",
-                                py::none(),
-                                core::kUnlimitedResource,
-                                core::kUnlimitedResource,
-                                core::kUnlimitedResource);
-  }
-  [[nodiscard]] auto stats() const -> py::dict { return owner_->stats(); }
-  [[nodiscard]] auto options() const -> py::dict { return owner_->options(); }
-  [[nodiscard]] auto mutable_access() const noexcept -> bool { return false; }
-
- private:
-  std::shared_ptr<PyCollection> owner_{};
-};
-
 inline void register_collection(py::module_ &module) {
   register_exceptions(module);
   py::class_<PyCollection, std::shared_ptr<PyCollection>>(module, "_Collection")
@@ -1039,20 +1002,6 @@ inline void register_collection(py::module_ &module) {
       .def("options", &PyCollection::options)
       .def("close", &PyCollection::close);
 
-  py::class_<PyCollectionReadView, std::shared_ptr<PyCollectionReadView>>(module,
-                                                                          "_CollectionReadView")
-      .def(py::init<std::shared_ptr<PyCollection>>(), py::arg("collection"))
-      .def("get_by_id", &PyCollectionReadView::get_by_id, py::arg("id"))
-      .def("get_by_ids", &PyCollectionReadView::get_by_ids, py::arg("ids"))
-      .def("records", &PyCollectionReadView::records)
-      .def("search", &PyCollectionReadView::search, py::arg("query"), py::arg("top_k"))
-      .def("batch_search",
-           &PyCollectionReadView::batch_search,
-           py::arg("queries"),
-           py::arg("top_k"))
-      .def("stats", &PyCollectionReadView::stats)
-      .def("options", &PyCollectionReadView::options)
-      .def_property_readonly("mutable", &PyCollectionReadView::mutable_access);
 }
 
 }  // namespace alaya::python::collection_binding

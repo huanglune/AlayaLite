@@ -140,6 +140,7 @@ alaya_add_test(NAME test_disk_collection_vamana TARGET test_disk_collection_vama
 alaya_add_test(NAME test_vamana_adapter_overhead TARGET test_vamana_adapter_overhead)
 
 if(ALAYA_ENABLE_LASER)
+  alaya_cc_target(laser_fixture_builder LASER SRCS fixtures/laser_fixture_builder.cpp)
   set(ALAYA_LASER_SEGMENT_FIXTURE_PREFIX dsqg_seg_00000001)
   set(ALAYA_LASER_SEGMENT_FIXTURE_DIR ${CMAKE_CURRENT_BINARY_DIR}/fixtures/laser_segment)
   set(ALAYA_LASER_SEGMENT_FIXTURE_INPUT
@@ -179,8 +180,9 @@ if(ALAYA_ENABLE_LASER)
         ${CMAKE_COMMAND} -E env ${ALAYA_LASER_SEGMENT_FIXTURE_ENV} ${Python_EXECUTABLE}
         ${CMAKE_SOURCE_DIR}/tests/disk/fixtures/build_laser_fixture.py --output-dir ${ALAYA_LASER_SEGMENT_FIXTURE_DIR}
         --extension $<TARGET_FILE:_alayalitepy>
+        --native-builder $<TARGET_FILE:laser_fixture_builder>
         --prefix ${ALAYA_LASER_SEGMENT_FIXTURE_PREFIX} --count 2048 --dim 128 --R 64 --seed 42 --optional-sidecars
-      DEPENDS ${CMAKE_SOURCE_DIR}/tests/disk/fixtures/build_laser_fixture.py _alayalitepy
+      DEPENDS ${CMAKE_SOURCE_DIR}/tests/disk/fixtures/build_laser_fixture.py _alayalitepy laser_fixture_builder
       COMMENT "Generating deterministic LASER disk fixture"
       VERBATIM
     )

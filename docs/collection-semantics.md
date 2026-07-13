@@ -1,9 +1,10 @@
 # Collection / index semantics baseline
 
-This document freezes the observable state of the public index APIs before the
-index/segment abstraction migration.  It is a description of the current tree,
-not the target contract.  A check mark means that the operation is exposed by
-the named public object; “adapter” means that another object supplies it.
+This document freezes the historical observable state of the public index APIs
+before the index/segment abstraction migration. Those Python APIs were removed
+in AlayaLite 1.2.0; the table is retained only as migration evidence and is not
+a description of the current public surface. Current users enter through
+`Collection`; “adapter” below describes the pre-removal implementation.
 
 ## Capability matrix
 
@@ -32,7 +33,7 @@ do not go through that dispatch table.
 
 ### Memory `Index` and high-level `Collection`
 
-`python/include/index.hpp::PyIndex<Runtime, Space>` owns the Segment or legacy
+The removed `PyIndex<Runtime, Space>` implementation owned the Segment or legacy
 runtime, vector/quant spaces, jobs, scalar RocksDB storage, and (when a
 recovery root can be derived) `RecoveryManager`. Recovery is therefore
 attached to the Python adapter, not to a C++ Collection abstraction.

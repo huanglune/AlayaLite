@@ -1,5 +1,9 @@
 # AlayaLite Python Interfaces
 
+> AlayaLite 1.2.0 exposes canonical `Collection`. The `Index`,
+> `DiskCollection`, LASER builder, and Vamana builder examples below describe
+> the removed pre-1.2 API and are retained only as migration history.
+
 This page introduces the Python interfaces in AlayaLite, which include two layers:
 
 **Collection**: Manages raw data and its relationship with indexes. Users can build their knowledge base by integrating our *Collection* into other tools like [Open WebUI](https://github.com/open-webui/open-webui) and [LangChain](https://github.com/langchain-ai/langchain), or building their own RAG application following [our tutorial](https://github.com/AlayaDB-AI/AlayaLite/blob/main/examples/rag/README.md).

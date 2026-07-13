@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.util
 import json
 import struct
 import subprocess
@@ -65,75 +64,19 @@ def _vectors(rows: int, dim: int) -> np.ndarray:
     return rng.standard_normal((rows, dim)).astype(np.float32)
 
 
-def _load_build_tree_extension(build_dir: Path) -> None:
-    extension = _build_tree_extension(build_dir)
-    if extension is None:
-        raise RuntimeError(
-            f"expected exactly one build-tree extension under {build_dir / 'python'}"
-        )
-    module_name = "alayalite._alayalitepy"
-    spec = importlib.util.spec_from_file_location(module_name, extension)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load build-tree extension: {extension}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-
-
-def _generate_python_artifacts(out: Path, build_dir: Path) -> None:
-    # Always exercise the binary from --build-dir. Without this preload, a
-    # developer venv can silently satisfy the relative import with an older
-    # installed extension and make cross-lane golden comparisons meaningless.
-    _load_build_tree_extension(build_dir)
-    from alayalite import DiskCollection, Index, MetricType
-    from alayalite.schema import IndexParams
-
-    vectors = _vectors(64, 8)
-    for quantization in ("none", "sq8"):
-        memory = out / f"memory_hnsw_{quantization}"
-        index = Index("golden", IndexParams(capacity=80, max_nbrs=8,
-                                             quantization_type=quantization))
-        index.fit(vectors, ef_construction=32, num_threads=1)
-        index.save(memory)
-        index.close()
-
-    # NSG's retained NN-Descent kernel requires more than 64 rows. Keep the
-    # pre-existing HNSW corpus untouched and add deterministic per-engine
-    # families with their own fixed shape.
-    graph_vectors = _vectors(80, 8)
-    for engine in ("nsg", "fusion"):
-        for quantization in ("none", "sq8"):
-            memory = out / f"memory_{engine}_{quantization}"
-            index = Index(
-                "golden",
-                IndexParams(
-                    index_type=engine,
-                    capacity=96,
-                    max_nbrs=8,
-                    quantization_type=quantization,
-                ),
-            )
-            index.fit(graph_vectors, ef_construction=32, num_threads=1)
-            index.save(memory)
-            index.close()
-
-    ids = np.arange(1000, 1064, dtype=np.uint64)
-    for engine in ("disk_flat", "disk_vamana"):
-        target = out / engine
-        kwargs = {}
-        if engine == "disk_vamana":
-            kwargs = {
-                "vamana_R": 8,
-                "vamana_L": 24,
-                "vamana_alpha": 1.2,
-                "vamana_seed": 424242,
-                "vamana_num_threads": 1,
-            }
-        collection = DiskCollection(path=str(target), dim=8, metric=MetricType.L2,
-                                    index_type=engine, **kwargs)
-        collection.add(vectors, ids)
-        collection.flush()
-        del collection
+def _generate_retained_v1_artifacts(out: Path, build_dir: Path) -> None:
+    generator = build_dir / "tests/golden/artifact_legacy_v1_generator"
+    if not generator.is_file():
+        raise RuntimeError(f"build the artifact_legacy_v1_generator target first: {generator}")
+    vectors_path = out / ".retained-v1-vectors.fbin"
+    vectors = _vectors(80, 8)
+    with vectors_path.open("wb") as stream:
+        np.array(vectors.shape, dtype=np.int32).tofile(stream)
+        vectors.tofile(stream)
+    try:
+        subprocess.run([str(generator), str(out), str(vectors_path)], check=True)
+    finally:
+        vectors_path.unlink(missing_ok=True)
 
 
 def _build_tree_extension(build_dir: Path) -> Path | None:
@@ -153,6 +96,13 @@ def _generate_laser_fixture(out: Path, build_dir: Path) -> bool:
         )
         return False
     target = out / "laser_fixture"
+    native_builder = build_dir / "tests/disk/laser_fixture_builder"
+    if not native_builder.is_file():
+        print(
+            f"LASER fixture omitted: build the native fixture builder first: {native_builder}",
+            file=sys.stderr,
+        )
+        return False
     command = [
         sys.executable,
         str(ROOT / "tests/disk/fixtures/build_laser_fixture.py"),
@@ -160,6 +110,8 @@ def _generate_laser_fixture(out: Path, build_dir: Path) -> bool:
         str(target),
         "--extension",
         str(extension),
+        "--native-builder",
+        str(native_builder),
         "--force",
         "--prefix",
         "dsqg_seg_00000001",
@@ -184,7 +136,7 @@ def _generate_laser_fixture(out: Path, build_dir: Path) -> bool:
 def generate(build_dir: Path) -> dict[str, object]:
     with tempfile.TemporaryDirectory(prefix="alaya-artifact-golden-") as temp:
         out = Path(temp)
-        _generate_python_artifacts(out, build_dir)
+        _generate_retained_v1_artifacts(out, build_dir)
         diskann_generator = build_dir / "tests/golden/artifact_diskann_generator"
         if not diskann_generator.is_file():
             raise RuntimeError(f"build the artifact_diskann_generator target first: {diskann_generator}")

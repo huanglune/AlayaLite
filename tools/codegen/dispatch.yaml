@@ -10,46 +10,13 @@
 # reason about matrix diffs without reconstructing a Cartesian product.
 implementation_registry:
   hnsw_segment:
-    {engine_factory_key: hnsw, artifact_identity: hnsw,
-     runtime_template: 'HnswSegment<{search_space}, {build_space}>'}
+    {engine_factory_key: hnsw, artifact_identity: hnsw}
   nsg_segment:
-    {engine_factory_key: nsg, artifact_identity: nsg,
-     runtime_template: 'NsgSegment<{search_space}, {build_space}>'}
+    {engine_factory_key: nsg, artifact_identity: nsg}
   fusion_segment:
-    {engine_factory_key: fusion, artifact_identity: fusion,
-     runtime_template: 'FusionSegment<{search_space}, {build_space}>'}
+    {engine_factory_key: fusion, artifact_identity: fusion}
   qg_segment:
-    {engine_factory_key: qg, artifact_identity: qg,
-     runtime_template: 'QgSegment<{search_space}>'}
-  legacy_qg_model:
-    {engine_factory_key: qg, artifact_identity: qg,
-     runtime_template: '{declared_runtime}'}
-
-# A migrated Gate 5 engine keeps its legacy factory identity here.  The
-# generated factory consults the matching independent feature bit before using
-# the new implementation.  HNSW predates Gate 5 and is source-revert-only: its
-# removed public builder is intentionally not resurrected as a runtime path.
-engine_factories       :
-  hnsw:
-    feature_flag: none
-    legacy_implementation_key: hnsw_segment
-    legacy_engine_factory_key: hnsw
-    rollback: source_revert
-  nsg:
-    feature_flag: nsg_segment
-    legacy_implementation_key: hnsw_segment
-    legacy_engine_factory_key: hnsw
-    rollback: feature_flag
-  fusion:
-    feature_flag: fusion_segment
-    legacy_implementation_key: hnsw_segment
-    legacy_engine_factory_key: hnsw
-    rollback: feature_flag
-  qg:
-    feature_flag: qg_segment
-    legacy_implementation_key: legacy_qg_model
-    legacy_engine_factory_key: qg
-    rollback: feature_flag
+    {engine_factory_key: qg, artifact_identity: qg}
 
 combinations           :
 - {data: float, id: uint32_t, quant: NONE, index: HNSW, implementation_key: hnsw_segment, engine_factory_key: hnsw}
@@ -85,26 +52,3 @@ combinations           :
 - {data: uint8_t, id: uint64_t, quant: NONE, index: HNSW, implementation_key: hnsw_segment, engine_factory_key: hnsw}
 - {data: uint8_t, id: uint64_t, quant: NONE, index: NSG, implementation_key: nsg_segment, engine_factory_key: nsg}
 - {data: uint8_t, id: uint64_t, quant: NONE, index: FUSION, implementation_key: fusion_segment, engine_factory_key: fusion}
-
-search_spaces          :
-  NONE: RawSpace<{data},{distance},{id},SequentialStorage<{data},{id}>,{scalar}>
-  SQ8: SQ8Space<{data},{distance},{id},SequentialStorage<uint8_t,{id}>,{scalar}>
-  SQ4: SQ4Space<{data},{distance},{id},SequentialStorage<uint8_t,{id}>,{scalar}>
-  RABITQ: RaBitQSpace<{data},{distance},{id},{scalar}>
-
-build_spaces           :
-  NONE: RawSpace<{data},{distance},{id},SequentialStorage<{data},{id}>,{scalar}>
-  SQ8: RawSpace<{data},{distance},{id},SequentialStorage<{data},{id}>,{build_scalar}>
-  SQ4: RawSpace<{data},{distance},{id},SequentialStorage<{data},{id}>,{build_scalar}>
-  RABITQ: RaBitQSpace<{data},{distance},{id},{scalar}>
-
-builders               :
-  HNSW: HnswSegment<{space}>
-  NSG: detail::NsgBuilderKernel<{space}>
-  FUSION: detail::FusionBuilderKernel<{space},detail::HnswBuilderKernel<{space}>,detail::NsgBuilderKernel<{space}>>
-
-distance_type          : float
-build_scalar_type      : EmptyScalarData
-search_scalar_types    :
-  with_scalar: ScalarData
-  without_scalar: EmptyScalarData

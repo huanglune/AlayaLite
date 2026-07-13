@@ -15,9 +15,7 @@ from typing import Literal, Optional, Type, Union
 import numpy as np
 from numpy import typing as npt
 
-from ._alayalitepy import IndexType as _IndexType
 from ._alayalitepy import MetricType as _MetricType
-from ._alayalitepy import QuantizationType as _QuantizationType
 from .utils import normalize_vectors_for_cosine_metric
 
 # TypeAlias is only available in Python 3.10+
@@ -39,8 +37,8 @@ DistanceMetric: TypeAlias = Literal["euclidean", "l2", "ip", "cosine", "cos"]
 """ Type alias for one of {"euclidean", "l2", "ip", "cosine", "cos"} """
 QuantizationType: TypeAlias = Literal[None, "none", "sq8", "sq4", "rabitq"]
 """ Type alias for one of {None, "none", "sq8", "sq4"} """
-IndexType: TypeAlias = Literal["hnsw", "nsg", "fusion"]
-""" Type alias for one of {"hnsw", "nsg" ,"fusion"} """
+IndexType: TypeAlias = Literal["flat", "hnsw", "nsg", "fusion", "qg"]
+"""Canonical Collection algorithm spelling."""
 VectorLike: TypeAlias = npt.NDArray[VectorDType]  # type: ignore
 """ Type alias for something that can be treated as a vector """
 VectorLikeBatch: TypeAlias = npt.NDArray[VectorDType]  # type: ignore
@@ -49,7 +47,7 @@ VectorLikeBatch: TypeAlias = npt.NDArray[VectorDType]  # type: ignore
 _VALID_IDTYPES = [np.uint64, np.uint32]
 _VALID_DTYPES = [np.dtype(np.float32), np.dtype(np.int8), np.dtype(np.uint8)]
 _VALID_METRIC_TYPES = ["euclidean", "l2", "ip", "cosine", "cos"]
-_VALID_INDEX_TYPES = ["hnsw", "nsg", "fusion"]
+_VALID_INDEX_TYPES = ["flat", "hnsw", "nsg", "fusion", "qg"]
 _VALID_SQ_TYPES = [None, "none", "sq8", "sq4", "rabitq"]
 
 __all__ = [
@@ -156,19 +154,19 @@ def assert_valid_quantization_type(quantization_type: str) -> None:
     )
 
 
-def valid_quantization_type(quantization_type: str) -> _QuantizationType:
+def valid_quantization_type(quantization_type: str) -> str:
     assert_valid_quantization_type(quantization_type)
 
     if quantization_type is None:
-        return _QuantizationType.NONE
+        return "none"
     elif quantization_type.lower() == "none":
-        return _QuantizationType.NONE
+        return "none"
     elif quantization_type.lower() == "sq8":
-        return _QuantizationType.SQ8
+        return "sq8"
     elif quantization_type.lower() == "sq4":
-        return _QuantizationType.SQ4
+        return "sq4"
     elif quantization_type.lower() == "rabitq":
-        return _QuantizationType.RABITQ
+        return "rabitq"
 
 
 def assert_valid_index_type(index: str) -> None:
@@ -178,15 +176,10 @@ def assert_valid_index_type(index: str) -> None:
     )
 
 
-def valid_index_type(index: str) -> _IndexType:
+def valid_index_type(index: str) -> str:
     assert_valid_index_type(index)
 
-    if index.lower() == "hnsw":
-        return _IndexType.HNSW
-    elif index.lower() == "nsg":
-        return _IndexType.NSG
-    elif index.lower() == "fusion":
-        return _IndexType.FUSION
+    return index.lower()
 
 
 def valid_max_nbrs(max_nbrs: np.uint32) -> np.uint32:

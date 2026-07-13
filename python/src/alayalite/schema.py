@@ -14,7 +14,6 @@ from typing import Optional
 
 import numpy as np
 
-from ._alayalitepy import IndexParams as _IndexParams
 from .common import (
     IDType,
     VectorDType,
@@ -24,10 +23,7 @@ from .common import (
     valid_capacity_type,
     valid_dtype,
     valid_id_type,
-    valid_index_type,
     valid_max_nbrs,
-    valid_metric_type,
-    valid_quantization_type,
     valid_thread_count,
 )
 
@@ -79,32 +75,6 @@ class IndexParams:
         if self.max_nbrs is None:
             self.max_nbrs = 32
 
-    def to_cpp_params(self):
-        native_index_type = valid_index_type(self.index_type)
-        native_data_type = valid_dtype(self.data_type)
-        native_id_type = valid_id_type(self.id_type)
-        native_metric_type = valid_metric_type(self.metric)
-        native_quantization_type = valid_quantization_type(self.quantization_type)
-        capacity = valid_capacity_type(self.capacity)
-        max_nbrs = valid_max_nbrs(self.max_nbrs)
-        build_threads = valid_thread_count(self.build_threads)
-        materialized_view_build_threads = valid_thread_count(self.materialized_view_build_threads)
-
-        return _IndexParams(
-            index_type_=native_index_type,
-            data_type_=native_data_type,
-            id_type_=native_id_type,
-            quantization_type_=native_quantization_type,
-            metric_=native_metric_type,
-            capacity_=capacity,
-            max_nbrs_=max_nbrs,
-            build_threads_=build_threads or 0,
-            materialized_view_build_threads_=materialized_view_build_threads or 0,
-            rocksdb_path_=self.rocksdb_path if self.rocksdb_path else "",
-            has_scalar_data_=self.has_scalar_data,
-            indexed_fields_=self.indexed_fields if self.indexed_fields else [],
-        )
-
     def to_json_dict(self) -> dict:
         return {
             "index_type": self.index_type,
@@ -155,11 +125,7 @@ class IndexParams:
 
         if kwargs.get("index_type") is not None:
             ind_type = kwargs.get("index_type")
-            # ``qg`` is the explicit canonical Collection spelling required
-            # for RaBitQ.  Legacy Index validation intentionally continues to
-            # reject it when ``to_cpp_params`` is used on that path.
-            if str(ind_type).lower() != "qg":
-                assert_valid_index_type(ind_type)
+            assert_valid_index_type(ind_type)
             index_type = ind_type
         if kwargs.get("data_type") is not None:
             data_type = valid_dtype(kwargs.get("data_type"))

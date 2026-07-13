@@ -1,8 +1,13 @@
 # AlayaLite Client User Guide
 
+> AlayaLite 1.2.0 removed `Index`, `DiskCollection`, the Client index methods,
+> and the LASER/Vamana Python builders. Sections below that demonstrate those
+> names are retained as pre-1.2 migration reference only. New code must use
+> canonical `Collection`; see `docs/legacy-cleanup.md` for the reader policy.
+
 This guide is based on [`python/src/alayalite/client.py`](https://github.com/AlayaDB-AI/AlayaLite/blob/main/python/src/alayalite/client.py), the main Python entry point for managing AlayaLite objects.
 
-`Client` manages two kinds of objects:
+`Client` now manages canonical collections. Before 1.2 it managed two kinds of objects:
 
 - `Index`: stores vectors only. Use it for pure ANN search, algorithm experiments, and benchmark-style workflows.
 - `Collection`: stores `id + document + embedding + metadata`. Use it for RAG, knowledge bases, metadata filtering, and hybrid search.

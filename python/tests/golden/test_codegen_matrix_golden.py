@@ -52,13 +52,12 @@ def test_dispatch_yaml_is_the_frozen_33_row_allowlist():
         ("qg_segment", "qg"): 3,
     }
 
-    engine_factories = config["engine_factories"]
-    assert engine_factories["hnsw"]["rollback"] == "source_revert"
-    assert engine_factories["hnsw"]["feature_flag"] == "none"
-    assert {engine_factories[key]["feature_flag"] for key in ("nsg", "fusion", "qg")} == {
-        "nsg_segment",
-        "fusion_segment",
-        "qg_segment",
+    assert set(config) == {"implementation_registry", "combinations"}
+    assert config["implementation_registry"] == {
+        "hnsw_segment": {"engine_factory_key": "hnsw", "artifact_identity": "hnsw"},
+        "nsg_segment": {"engine_factory_key": "nsg", "artifact_identity": "nsg"},
+        "fusion_segment": {"engine_factory_key": "fusion", "artifact_identity": "fusion"},
+        "qg_segment": {"engine_factory_key": "qg", "artifact_identity": "qg"},
     }
 
     generated = (ROOT / "python/tests/client/_dispatch_matrix_params.py").read_text(encoding="utf-8")
