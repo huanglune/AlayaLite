@@ -157,3 +157,6 @@ silently nor changes the existing `DiskCollection` v1 builder/reader path.
 LASER uses the same manifest-v2 READY/SHA reader contract but retains its
 imported payload by read-only reference instead of presenting build/save
 slots. See [LASER immutable disk segment](laser-segment.md).
+
+The consolidated engine table, rollback results, release-note material and
+design §9.8 checklist are in [Gate 6 disk-segment final state](gate6-disk-segments.md).

@@ -126,3 +126,6 @@ is regenerated with `python scripts/size_map/generate_size_map.py`; pass
 golden before/after compatibility-wrapper changes, require old artifact open
 and hash/field review for serializer changes, compile this header surface, and
 compare the same-toolchain size map for added/removed template instances.
+
+Gate 6's final three-engine capability/rollback table and validation ledger are
+maintained in [Gate 6 disk-segment final state](gate6-disk-segments.md).
