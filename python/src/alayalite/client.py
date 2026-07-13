@@ -2,112 +2,73 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""
-This module provides the main Client class for interacting with the AlayaLite database,
-managing indices and collections.
+"""Canonical Collection manager.
+
+The ``Client`` index-method family was removed in AlayaLite 1.2.0. Legacy
+PyIndex layouts discovered below a client URL are imported non-destructively
+through ``Collection.open`` and appear in the collection map.
 """
 
 import logging
 import os
 import shutil
 
-from ._legacy import _suppress_legacy_warning, legacy_api
+from ._legacy import raise_removed_legacy_api
 from .collection import Collection
-from .index import Index
 from .schema import IndexParams, is_collection_url, is_index_url, save_schema
 
 __all__ = ["Client"]
 
 logger = logging.getLogger(__name__)
 
+_REMOVED_INDEX_METHODS = frozenset(
+    {
+        "list_indices",
+        "get_index",
+        "create_index",
+        "get_or_create_index",
+        "delete_index",
+        "save_index",
+    }
+)
+
 
 class Client:
-    """
-    Client manages collections and indices. This class provides methods for
-    creating, retrieving, saving, and deleting collections and indices from disk.
-    """
+    """Manage canonical ``Collection`` instances under an optional root URL."""
 
     def __init__(self, url=None):
-        """
-        Initialize the Client. Optionally, provide a URL to load data from disk.
-        If no URL is provided, the client cannot save or load any data.
-
-        Args:
-            url (str, optional): The directory path from which to load data. Defaults to None.
-        """
         self.__collection_map = {}
-        self.__index_map = {}
         self.__url = None
-        if url is not None:
-            self.__url = os.path.abspath(url)
-            if not os.path.exists(self.__url):
-                os.makedirs(self.__url)
+        if url is None:
+            return
 
-            logger.info("Loading AlayaLite data from %s", self.__url)
-            all_names = [f for f in os.listdir(self.__url) if os.path.isdir(os.path.join(self.__url, f))]
-            logger.debug("Discovered entries under client url: %s", all_names)
-            for name in all_names:
-                full_url = os.path.join(self.__url, name)
-                if is_collection_url(full_url):
-                    self.__collection_map[name] = Collection.load(self.__url, name)
-                    logger.info("Loaded collection %s", name)
-                elif is_index_url(full_url):
-                    # Discovery is an implementation detail of Client(url).
-                    # The first public index method emits client_index at the
-                    # user's callsite; do not attribute Index.load to here.
-                    with _suppress_legacy_warning("index"):
-                        self.__index_map[name] = Index.load(self.__url, name)
-                    logger.info("Loaded index %s", name)
-                else:
-                    logger.warning("Ignoring unknown storage entry at %s", full_url)
+        self.__url = os.path.abspath(url)
+        os.makedirs(self.__url, exist_ok=True)
+        logger.info("Loading AlayaLite data from %s", self.__url)
+        all_names = [
+            entry
+            for entry in os.listdir(self.__url)
+            if os.path.isdir(os.path.join(self.__url, entry))
+        ]
+        logger.debug("Discovered entries under client url: %s", all_names)
+        for name in all_names:
+            full_url = os.path.join(self.__url, name)
+            if is_collection_url(full_url) or is_index_url(full_url):
+                self.__collection_map[name] = Collection.load(self.__url, name)
+                logger.info("Loaded collection %s", name)
+            else:
+                logger.warning("Ignoring unknown storage entry at %s", full_url)
+
+    def __getattr__(self, name: str):
+        if name in _REMOVED_INDEX_METHODS:
+            raise_removed_legacy_api("Client index methods")
+        raise AttributeError(f"{type(self).__name__!s} has no attribute {name!r}")
 
     def list_collections(self):
-        """
-        List all collection names currently managed by the client.
-
-        Returns:
-            list: A list of collection names.
-        """
         return list(self.__collection_map.keys())
 
-    @legacy_api("client_index", "client_index", "alayalite.Client index methods", "collection methods")
-    def list_indices(self):
-        """
-        List all index names currently managed by the client.
-
-        Returns:
-            list: A list of index names.
-        """
-        return list(self.__index_map.keys())
-
     def get_collection(self, name: str = "default") -> Collection:
-        """
-        Get a collection by name. If the collection does not exist, returns None.
-
-        Args:
-            name (str, optional): The name of the collection to retrieve. Defaults to "default".
-
-        Returns:
-            Collection or None: The collection if found, else None.
-        """
         return self.__collection_map.get(name)
-
-    @legacy_api("client_index", "client_index", "alayalite.Client index methods", "collection methods")
-    def get_index(self, name: str = "default") -> Index:
-        """
-        Get an index by name.
-
-        Args:
-            name (str, optional): The name of the index to retrieve. Defaults to "default".
-
-        Returns:
-            _PyIndexInterface (cpp class): The index if found, else None
-        """
-        if name in self.__index_map:
-            return self.__index_map[name]
-        else:
-            logger.info("Index %s does not exist", name)
-            return None
 
     @staticmethod
     def _close_collection(collection: Collection) -> None:
@@ -116,29 +77,9 @@ class Client:
         except (AttributeError, RuntimeError):
             pass
 
-    @staticmethod
-    def _close_index(index: Index) -> None:
-        try:
-            index.close()
-        except (AttributeError, RuntimeError):
-            pass
-
     def create_collection(self, name: str = "default", **kwargs) -> Collection:
-        """
-        Create a new collection with the given name.
-
-        Args:
-            name (str): The name of the collection to create.
-            **_kwargs: Additional parameters (currently unused).
-
-        Returns:
-            Collection: The created collection.
-
-        Raises:
-            RuntimeError: If a collection or index with the same name already exists.
-        """
-        if name in self.__collection_map or name in self.__index_map:
-            raise RuntimeError(f"A collection or index with name '{name}' already exists")
+        if name in self.__collection_map:
+            raise RuntimeError(f"A collection with name '{name}' already exists")
 
         index_params = IndexParams.from_kwargs(**kwargs)
         if not index_params.rocksdb_path and self.__url is not None:
@@ -147,76 +88,13 @@ class Client:
         self.__collection_map[name] = collection
         return collection
 
-    @legacy_api("client_index", "client_index", "alayalite.Client index methods", "collection methods")
-    def create_index(self, name: str = "default", **kwargs) -> Index:
-        """
-        Create a new index with the given name and parameters.
-
-        Args:
-            name (str): The name of the index to create.
-            **kwargs: Additional parameters for index creation.
-
-        Returns:
-            Index: The created index.
-
-        Raises:
-            RuntimeError: If a collection or index with the same name already exists.
-        """
-        if name in self.__collection_map or name in self.__index_map:
-            raise RuntimeError(f"A collection or index with name '{name}' already exists")
-
-        params = IndexParams.from_kwargs(**kwargs)
-        # The public Client index boundary already emitted client_index.  Do
-        # not leak a second Index warning whose callsite would be this wrapper.
-        with _suppress_legacy_warning("index"):
-            index = Index(name, params)
-        self.__index_map[name] = index
-        return index
-
     def get_or_create_collection(self, name: str, **kwargs) -> Collection:
-        """
-        Retrieve a collection if it exists, otherwise create a new one.
-
-        Args:
-            name (str): The name of the collection to retrieve or create.
-            **kwargs: Parameters for collection creation if it doesn't exist.
-
-        Returns:
-            Collection: The existing or newly created collection.
-        """
         collection = self.get_collection(name)
         if collection is None:
             collection = self.create_collection(name, **kwargs)
         return collection
 
-    @legacy_api("client_index", "client_index", "alayalite.Client index methods", "collection methods")
-    def get_or_create_index(self, name: str, **kwargs) -> Index:
-        """
-        Retrieve an index if it exists, otherwise create a new one.
-
-        Args:
-            name (str): The name of the index to retrieve or create.
-            **kwargs: Parameters for index creation if it doesn't exist.
-
-        Returns:
-            Index: The existing or newly created index.
-        """
-        index = self.get_index(name)
-        if index is None:
-            index = self.create_index(name, **kwargs)
-        return index
-
     def delete_collection(self, collection_name: str, delete_on_disk: bool = False):
-        """
-        Delete a collection by name.
-
-        Args:
-            collection_name (str): The name of the collection to delete.
-            delete_on_disk (bool, optional): Whether to delete it from disk. Defaults to False.
-
-        Raises:
-            RuntimeError: If the collection does not exist or client URL is not set for disk ops.
-        """
         if collection_name not in self.__collection_map:
             raise RuntimeError(f"Collection '{collection_name}' does not exist")
         if delete_on_disk and self.__url is None:
@@ -229,45 +107,13 @@ class Client:
                 shutil.rmtree(collection_url)
                 logger.info("Deleted collection '%s' from disk", collection_name)
 
-    @legacy_api("client_index", "client_index", "alayalite.Client index methods", "collection methods")
-    def delete_index(self, index_name: str, delete_on_disk: bool = False):
-        """
-        Delete an index by name.
-
-        Args:
-            index_name (str): The name of the index to delete.
-            delete_on_disk (bool, optional): Whether to delete it from disk. Defaults to False.
-
-        Raises:
-            RuntimeError: If the index does not exist or client URL is not set for disk ops.
-        """
-        if index_name not in self.__index_map:
-            raise RuntimeError(f"Index '{index_name}' does not exist")
+    def reset(self, delete_on_disk: bool = False):
         if delete_on_disk and self.__url is None:
             raise RuntimeError("Client is not initialized with a url for disk operations")
-        index = self.__index_map.pop(index_name)
-        self._close_index(index)
-        if delete_on_disk:
-            index_url = os.path.join(self.__url, index_name)
-            if os.path.exists(index_url):
-                shutil.rmtree(index_url)
-                logger.info("Deleted index '%s' from disk", index_name)
-
-    def reset(self, delete_on_disk: bool = False):
-        """
-        Reset the client
-        """
-        if delete_on_disk:
-            if self.__url is None:
-                raise RuntimeError("Client is not initialized with a url for disk operations")
 
         collection_items = list(self.__collection_map.items())
-        index_items = list(self.__index_map.items())
-
         for _, collection in collection_items:
             self._close_collection(collection)
-        for _, index in index_items:
-            self._close_index(index)
 
         if delete_on_disk:
             for collection_name, _ in collection_items:
@@ -275,46 +121,9 @@ class Client:
                 if os.path.exists(collection_url):
                     shutil.rmtree(collection_url)
 
-            for index_name, _ in index_items:
-                index_url = os.path.join(self.__url, index_name)
-                if os.path.exists(index_url):
-                    shutil.rmtree(index_url)
-
         self.__collection_map = {}
-        self.__index_map = {}
-
-    @legacy_api("client_index", "client_index", "alayalite.Client index methods", "collection methods")
-    def save_index(self, index_name: str):
-        """
-        Save an index to disk.
-
-        Args:
-            index_name (str): The name of the index to save.
-
-        Raises:
-            RuntimeError: If client URL is not set or the index does not exist.
-        """
-        if self.__url is None:
-            raise RuntimeError("Client is not initialized with a url")
-        if index_name not in self.__index_map:
-            raise RuntimeError(f"Index '{index_name}' does not exist")
-
-        index_url = os.path.join(self.__url, index_name)
-        schema_map = self.__index_map[index_name].save(index_url)
-        index_schema_url = os.path.join(index_url, "schema.json")
-        save_schema(index_schema_url, schema_map)
-        logger.info("Saved index '%s'", index_name)
 
     def save_collection(self, collection_name: str):
-        """
-        Save a collection to disk.
-
-        Args:
-            collection_name (str): The name of the collection to save.
-
-        Raises:
-            RuntimeError: If client URL is not set or the collection does not exist.
-        """
         if self.__url is None:
             raise RuntimeError("Client is not initialized with a url")
         if collection_name not in self.__collection_map:

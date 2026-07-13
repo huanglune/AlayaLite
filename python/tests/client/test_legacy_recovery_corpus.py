@@ -26,17 +26,6 @@ def _read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _manifest_fields(case_dir: Path) -> dict[str, str]:
-    snapshot_id = (case_dir / "recovery" / "CURRENT").read_text(encoding="utf-8").strip()
-    manifest_path = case_dir / "recovery" / "snapshots" / snapshot_id / "manifest.txt"
-    fields = {}
-    for line in manifest_path.read_text(encoding="utf-8").splitlines():
-        key, separator, value = line.partition("=")
-        if separator:
-            fields[key] = value
-    return fields
-
-
 def _case_id(case: dict) -> str:
     return case["name"]
 
@@ -111,38 +100,37 @@ def _relocate_scalar_paths(case_dir: Path, has_scalar_data: bool) -> None:
     _replace_length_prefixed_path(case_dir / "raw.data", ROCKSDB_PLACEHOLDER, new_path)
 
 
-def _verify_index(index, generation: dict, expected: dict) -> None:
-    assert int(index.get_cpp_index().get_data_num()) == expected["expected_count"]
-    dtype = np.dtype(generation["data_type"])
-    for query in expected["queries"]:
-        vector = np.asarray(query["vector"], dtype=dtype)
-        actual = index.search(vector, topk=query["topk"], ef_search=64)
-        assert [int(value) for value in actual] == query["expected_internal_ids"]
-
-
-def _verify_collection(collection, generation: dict, expected: dict) -> None:
+def _verify_collection(collection, generation: dict, expected: dict, case: dict) -> None:
     stats = collection.stats()
-    assert int(stats["size"]) == expected["expected_live_count"]
+    expected_live_count = expected.get("expected_live_count")
+    if expected_live_count is None:
+        removed_rows = sum("remove(" in operation for operation in case["operations"])
+        expected_live_count = expected["expected_count"] - removed_rows
+    assert int(stats["size"]) == expected_live_count
     assert int(stats["allocated_count"]) >= int(stats["size"])
-    assert collection.get_cpp_index().options()["imported_legacy_layout"] is True
+    assert collection.options()["imported_legacy_layout"] is True
 
-    found = collection.get_by_id(expected["item_lookup_order"])
-    expected_items = expected["expected_items"]
-    assert found["id"] == [item["id"] for item in expected_items]
-    assert found["document"] == [item["document"] for item in expected_items]
-    assert found["metadata"] == [item["metadata"] for item in expected_items]
-    assert len(found["id"]) == expected["expected_live_count"]
+    if "item_lookup_order" in expected:
+        found = collection.get_by_id(expected["item_lookup_order"])
+        expected_items = expected["expected_items"]
+        assert found["id"] == [item["id"] for item in expected_items]
+        assert found["document"] == [item["document"] for item in expected_items]
+        assert found["metadata"] == [item["metadata"] for item in expected_items]
+        assert len(found["id"]) == expected_live_count
 
     dtype = np.dtype(generation["data_type"])
     for query in expected["queries"]:
         vector = np.asarray([query["vector"]], dtype=dtype)
-        actual = collection.batch_query(vector, limit=query["topk"], ef_search=64)
-        assert actual["id"][0] == query["expected_item_ids"]
+        actual = collection.batch_search(vector, top_k=query["topk"])
+        expected_ids = query.get("expected_item_ids")
+        if expected_ids is None:
+            expected_ids = [str(value) for value in query["expected_internal_ids"]]
+        assert [str(value) for value in actual["ids"].tolist()] == expected_ids
 
 
 @pytest.mark.parametrize("case", CORPUS_MANIFEST["cases"], ids=_case_id)
 def test_legacy_reader_recovers_checked_in_corpus(case, tmp_path):
-    """Recover legacy Index cases and import Collection cases without changing source bytes."""
+    """Import every legacy layout through canonical Collection without changing source bytes."""
     source = CORPUS_ROOT / case["name"]
     copied_case = tmp_path / case["name"]
     shutil.copytree(source, copied_case)
@@ -158,28 +146,13 @@ def test_legacy_reader_recovers_checked_in_corpus(case, tmp_path):
     expected = _read_json(copied_case / "expected.json")
     client = Client(tmp_path)
     try:
-        if case["kind"] == "index":
-            index = client.get_index(case["name"])
-            assert index is not None
-            _verify_index(index, generation, expected)
-
-            recovered_manifest = _manifest_fields(copied_case)
-            assert int(recovered_manifest["applied_through_op_id"]) == expected["expected_applied_through_op_id"]
-            if case["terminal_shape"] in {
-                "committed_wal_tail",
-                "snapshot_plus_committed_wal_tail",
-                "torn_wal_tail",
-            }:
-                assert recovered_manifest["reason"] == "post_recovery"
-            assert not (copied_case / "recovery" / "wal.bin").exists()
-        else:
-            collection = client.get_collection(case["name"])
-            assert collection is not None
-            _verify_collection(collection, generation, expected)
-            assert (copied_case / ".alaya_internal" / "legacy_import_v1" / "ACTIVE").is_file()
-            for relative, (expected_bytes, expected_sha) in frozen_source.items():
-                path = copied_case / relative
-                assert path.stat().st_size == expected_bytes
-                assert hashlib.sha256(path.read_bytes()).hexdigest() == expected_sha
+        collection = client.get_collection(case["name"])
+        assert collection is not None
+        _verify_collection(collection, generation, expected, case)
+        assert (copied_case / ".alaya_internal" / "legacy_import_v1" / "ACTIVE").is_file()
+        for relative, (expected_bytes, expected_sha) in frozen_source.items():
+            path = copied_case / relative
+            assert path.stat().st_size == expected_bytes
+            assert hashlib.sha256(path.read_bytes()).hexdigest() == expected_sha
     finally:
         client.reset()

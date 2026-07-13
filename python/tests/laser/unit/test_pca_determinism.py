@@ -6,8 +6,6 @@
 
 from __future__ import annotations
 
-import argparse
-import importlib.util
 from pathlib import Path
 
 import numpy as np
@@ -102,54 +100,3 @@ def test_fit_incremental_pca_rejects_too_few_samples_for_components() -> None:
 
     with pytest.raises(ValueError, match="at least n_components"):
         fit_incremental_pca(sample_vectors, n_components=256)
-
-
-def test_force_single_thread_requires_all_alignment_seeds(tmp_path: Path) -> None:
-    repo_root = Path(__file__).resolve().parents[4]
-    spec = importlib.util.spec_from_file_location(
-        "laser_example_main",
-        repo_root / "examples" / "laser" / "main.py",
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    cfg = tmp_path / "missing_pca_seed.toml"
-    cfg.write_text(
-        """
-medoid_seed = 42
-rotator_seed = 42
-force_single_thread = true
-build_threads = 1
-
-[dataset]
-name = "test"
-metric = "l2"
-degree = 64
-main_dimension = 16
-
-[paths]
-base = "/tmp/base.fbin"
-query = "/tmp/query.fbin"
-gt = "/tmp/gt.ibin"
-output = "/tmp/out"
-""".lstrip(),
-        encoding="utf-8",
-    )
-    args = argparse.Namespace(
-        topk=None,
-        threads=None,
-        beam_width=None,
-        dram_budget=None,
-        efs=None,
-        ep_num=None,
-        degree=None,
-        main_dim=None,
-        build_threads=None,
-        ef_indexing=None,
-        warmup=None,
-        runs=None,
-    )
-
-    with pytest.raises(ValueError, match="pca_seed"):
-        module.load_config(cfg, args)

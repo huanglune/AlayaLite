@@ -12,7 +12,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "alayalite"
-version = "1.1.0"
+version = "1.2.0"
 authors = [{ name = "AlayaDB.AI", email = "dev@alayadb.ai" }]
 
 description = "AlayaLite Python extension module"
@@ -43,13 +43,8 @@ dependencies = [
 # Runtime extras for `pip install alayalite[<extra>]`. dependency-groups below
 # (PEP 735) are uv-only and do NOT install for pip / pip-tools consumers.
 [project.optional-dependencies]
-# Minimum set the LASER fit/search Python path imports at runtime:
-#   - scikit-learn  -> alayalite.laser._pca (IncrementalPCA)
-#   - faiss-cpu     -> alayalite.laser._medoid (kmeans)
-#   - tqdm          -> alayalite.laser._pca (progress bar)
-# Dev-only extras (matplotlib, psutil, tomli for examples/laser CLI) stay in
-# the `laser` dependency-group below; this extra only covers what `import
-# alayalite.laser` and `Index.fit(...)` need.
+# Offline LASER artifact-maintenance helpers retained for format tooling.
+# The public ``alayalite.laser.Index`` API was removed in 1.2.0.
 laser = [
     "scikit-learn>=1.3",
     "faiss-cpu>=1.7",
@@ -144,7 +139,7 @@ skip = ["*-musllinux*", "*-manylinux_i686"]
 # package cache warm across the per-python-version builds and across CI runs.
 container-engine = "docker; create_args: -v ~/.conan2:/root/.conan2"
 test-requires = ["pytest", "pytest-asyncio", "pyyaml"]
-test-command = "python -c \"import platform, sys, alayalite; from alayalite import laser, vamana; is_linux_x86 = sys.platform.startswith('linux') and platform.machine() in {'x86_64', 'AMD64'}; is_windows_x86 = sys.platform == 'win32' and platform.machine() in {'x86_64', 'AMD64'}; laser_expected = is_linux_x86 or is_windows_x86; assert not (laser_expected and laser.RawIndex is None), 'LASER should be available on this lane'; simd = laser.selected_simd() if is_linux_x86 else 'not-tested'; print(alayalite.__version__); print(f'laser_simd={simd}', flush=True); assert (not is_linux_x86) or simd in {'avx512', 'avx2'}\""
+test-command = "python -c \"import alayalite; assert 'Index' not in alayalite.__all__; assert 'DiskCollection' not in alayalite.__all__; assert alayalite.__version__ == '1.2.0'; print(alayalite.__version__)\""
 
 [tool.cibuildwheel.linux]
 manylinux-x86_64-image = "manylinux_2_28"

@@ -179,25 +179,12 @@ class TestRaBitQBruteForceLarge(unittest.TestCase):
 
         print(f"  Running hybrid query (bf={use_bf}, ef_search={ef_search})...")
         start = time.perf_counter()
-        if use_bf:
-            cpp_index = collection.get_cpp_index()
-            filter_obj = collection.build_filter({"label": "target_label"})
-            _, item_ids = cpp_index.hybrid_search(
-                np.asarray(query, dtype=np.float32)[0],
-                TOP_K_LARGE,
-                ef_search,
-                filter_obj,
-                True,
-                "",
-            )
-            result = {"id": [list(item_ids)]}
-        else:
-            result = collection.hybrid_query(
-                query,
-                limit=TOP_K_LARGE,
-                metadata_filter={"label": "target_label"},
-                ef_search=ef_search,
-            )
+        result = collection.hybrid_query(
+            query,
+            limit=TOP_K_LARGE,
+            metadata_filter={"label": "target_label"},
+            ef_search=ef_search,
+        )
         elapsed = time.perf_counter() - start
 
         self.assertEqual(len(result["id"]), 1)
@@ -248,17 +235,12 @@ class TestRaBitQBruteForceLarge(unittest.TestCase):
         # Search 2: Brute-force
         print(f"  Running hybrid_query (bf=True, ef_search={ef_search})...")
         start = time.perf_counter()
-        cpp_index = collection.get_cpp_index()
-        filter_obj = collection.build_filter({"label": "target_label"})
-        _, item_ids = cpp_index.hybrid_search(
-            np.asarray(query, dtype=np.float32)[0],
-            TOP_K_LARGE,
-            ef_search,
-            filter_obj,
-            True,
-            "",
+        result = collection.hybrid_query(
+            query,
+            limit=TOP_K_LARGE,
+            metadata_filter={"label": "target_label"},
+            ef_search=ef_search,
         )
-        result = {"id": [list(item_ids)]}
         time_bf = time.perf_counter() - start
 
         self.assertEqual(len(result["id"]), 1)

@@ -33,13 +33,6 @@ def test_conftest_ignores_bench_tests_on_windows(monkeypatch) -> None:
     assert namespace["collect_ignore_glob"] == ["*.py"]
 
 
-def test_disk_engine_synth_schema_pins_metric_argument() -> None:
-    text = _read_bench_file("test_disk_engine_synth_schema.py")
-
-    assert '"--metric"' in text
-    assert '"L2"' in text
-
-
 def test_distance_order_cases_include_query_vectors_in_parametrize() -> None:
     text = _read_bench_file("test_datasets.py")
 

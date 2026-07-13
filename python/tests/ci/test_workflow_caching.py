@@ -204,12 +204,12 @@ def test_cibuildwheel_builds_portable_package_targets() -> None:
     assert "-DBUILD_TOOLS=OFF" in cmake_args
 
 
-def test_cibuildwheel_logs_laser_simd_selection_on_linux_x86() -> None:
+def test_cibuildwheel_smoke_checks_the_1_2_public_surface() -> None:
     pyproject_text = PYPROJECT.read_text(encoding="utf-8")
 
-    assert "laser.selected_simd()" in pyproject_text
-    assert "laser_simd=" in pyproject_text
-    assert "is_linux_x86" in pyproject_text
+    assert "'Index' not in alayalite.__all__" in pyproject_text
+    assert "'DiskCollection' not in alayalite.__all__" in pyproject_text
+    assert "alayalite.__version__ == '1.2.0'" in pyproject_text
 
 
 def test_ccache_keys_are_versioned_for_portable_isa_reset() -> None:

@@ -1,31 +1,15 @@
-# SPDX-FileCopyrightText: 2025 AlayaDB.AI
+# SPDX-FileCopyrightText: 2026 AlayaDB.AI
 #
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""AlayaLite Vamana graph builder.
+"""Import tombstone for the Vamana builder removed in AlayaLite 1.2.0."""
 
-The binding is compiled into ``alayalite._alayalitepy.vamana`` as a
-submodule. The module exposes a single function, ``build_index``, that
-writes a DiskANN-format ``.index`` file from a ``.fbin`` dataset.
+from alayalite._legacy import raise_removed_legacy_api
 
-The CLI ``build_vamana_index`` (under ``tools/build_vamana_index/``) and
-this Python binding share one dispatch library
-(``include/index/graph/vamana/build_dispatch.hpp``). Given identical
-parameters and ``num_threads=1``, both produce byte-for-byte identical
-outputs — see ``tests/vamana/test_cli_vs_python_parity.py``.
-"""
-
-from __future__ import annotations
-
-from alayalite._alayalitepy import vamana as _vamana_mod  # type: ignore[attr-defined]
-from alayalite._legacy import legacy_api
+__all__: list[str] = []
 
 
-@legacy_api("vamana", "vamana", "alayalite.vamana.build_index", "alayalite.Collection")
-def build_index(*args, **kwargs):
-    return _vamana_mod.build_index(*args, **kwargs)
-
-
-build_index.__doc__ = _vamana_mod.build_index.__doc__
-
-__all__ = ["build_index"]
+def __getattr__(name: str):
+    if name == "build_index":
+        raise_removed_legacy_api("vamana.build_index")
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

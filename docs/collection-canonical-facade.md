@@ -374,3 +374,20 @@ The final 2026-07-13 execution record is:
 |---|---|---|
 | the Python wrapper/telemetry and tests are separable commits | an entry may temporarily route to the retained legacy implementation, but canonical Collection must keep its coordinator | retain canonical WAL/importer/read-only-view code and all legacy format readers |
 | no frozen core, graph/disk Segment, or segment-body source changes are part of this gate | warning emission can be disabled only with the whole wrapper rollback, not by opening another owner | switched/imported directories remain roll-forward-only; API removal never implies format-reader removal |
+
+## Gate 11 API removal at 1.2.0
+
+AlayaLite 1.2.0 removes the one-release compatibility window. `Index`,
+`DiskCollection`, `alayalite.laser.Index`/`RawIndex`,
+`alayalite.vamana.build_index`, the six `Client` index methods, and the
+`Collection.get_cpp_index()`/`get_index()` escape hatches are no longer in a
+public `__all__` or class dictionary. A direct access through an old import
+spelling raises `AlayaLiteLegacyApiWarning` with a stable “removed in 1.2.0”
+message instead of executing the retired path.
+
+This API removal does not retire a persisted-format reader. All six checked-in
+legacy recovery cases—including the four historical `type=index` layouts—now
+open as canonical `Collection` objects through `LegacyImporter`. The importer
+continues to fingerprint and preserve every source byte. DiskCollection-v1,
+old memory snapshot, LASER, manifest, WAL, and RocksDB checkpoint decoding are
+tracked independently under the Gate-11 reader inventory.

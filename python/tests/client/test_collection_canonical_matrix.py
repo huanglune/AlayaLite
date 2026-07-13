@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 AlayaDB.AI
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""Canonical Collection identity coverage over the frozen 33-row legacy matrix."""
+"""Canonical Collection identity coverage over the frozen 33-row matrix."""
 
 import numpy as np
 import pytest
@@ -41,7 +41,7 @@ def test_canonical_legal_33_matrix_subset_preserves_declared_identity(case, iden
     vector = np.arange(4, dtype=data_type)
     collection.add([("row", "document", vector, {"axis": np.dtype(id_type).name})])
 
-    options = collection.get_cpp_index().options()
+    options = collection.options()
     assert options["index_type"] == index_type
     assert options["implementation_key"] == implementation_key
     assert options["engine_factory_key"] == engine_factory_key == declared_artifact_identity
@@ -51,7 +51,7 @@ def test_canonical_legal_33_matrix_subset_preserves_declared_identity(case, iden
     collection.close()
 
     reopened = Collection.load(tmp_path, root.name)
-    reopened_options = reopened.get_cpp_index().options()
+    reopened_options = reopened.options()
     assert reopened_options["implementation_key"] == implementation_key
     assert reopened_options["engine_factory_key"] == engine_factory_key
     assert reopened.get_records(["row"])[0]["vector"].dtype == np.dtype(data_type)
@@ -96,5 +96,5 @@ def test_canonical_explicit_qg_identity_is_legal(id_type, tmp_path):
     )
     collection.add([("qg", "document", np.zeros(4, dtype=np.float32), {})])
 
-    assert collection.get_cpp_index().options()["implementation_key"] == "qg_segment"
-    assert collection.get_cpp_index().options()["engine_factory_key"] == "qg"
+    assert collection.options()["implementation_key"] == "qg_segment"
+    assert collection.options()["engine_factory_key"] == "qg"

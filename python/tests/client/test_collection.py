@@ -109,10 +109,10 @@ class TestCollection(unittest.TestCase):
         result = self.collection.get_by_id(["ok"])
         self.assertEqual(result["document"], ["Document OK"])
 
-    def test_get_cpp_index_before_first_insert_has_actionable_error(self):
-        """Accessing the native index before first insert should explain how to initialize it."""
+    def test_options_before_first_insert_has_actionable_error(self):
+        """Canonical options require the first insert to initialize native state."""
         with self.assertRaisesRegex(RuntimeError, "Call insert\\(\\) with the first batch of data first"):
-            self.collection.get_cpp_index()
+            self.collection.options()
 
     def test_insert_uses_explicit_build_threads(self):
         """Canonical native creation must receive the requested build thread count."""
@@ -123,7 +123,7 @@ class TestCollection(unittest.TestCase):
         collection = self._create_collection("test_collection_threads", self._collection_params(build_threads=7))
         collection.insert(items)
 
-        self.assertEqual(collection.get_cpp_index().options()["build_threads"], 7)
+        self.assertEqual(collection.options()["build_threads"], 7)
 
     def test_upsert_fit_and_concat(self):
         items = [
@@ -191,8 +191,6 @@ class TestCollection(unittest.TestCase):
         collection = self._create_collection("test_collection_uint64_bridge", params)
         collection.insert([("a", "Document A", np.array([0.1, 0.2, 0.3], dtype=np.float32), {"kind": "seed"})])
 
-        view = collection.get_cpp_index()
-        self.assertFalse(view.mutable)
         scalar = collection.get_records([np.uint64(0), "a"])[0]
         self.assertEqual(scalar["id"], "a")
         self.assertEqual(collection.get_index_params().id_type, np.uint64)
@@ -559,8 +557,6 @@ class TestCollection(unittest.TestCase):
         ]
         collection.insert(items)
 
-        self.assertFalse(collection.get_cpp_index().mutable)
-
         collection.insert([("a3", "Doc A3", np.array([0.05, 0.0, 0.0], dtype=np.float32), {"category": "A"})])
 
         result = collection.hybrid_query(
@@ -720,7 +716,7 @@ class TestCollection(unittest.TestCase):
 
         # Step 3: Reindex to rebuild the graph with only remaining items
         self.collection.reindex(ef_construction=211, num_threads=3)
-        rebuilt_options = self.collection.get_cpp_index().options()
+        rebuilt_options = self.collection.options()
         self.assertEqual(rebuilt_options["ef_construction"], 211)
         self.assertEqual(rebuilt_options["build_threads"], 3)
 

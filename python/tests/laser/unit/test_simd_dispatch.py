@@ -7,14 +7,12 @@
 from __future__ import annotations
 
 import pytest
-from _laser_support import DISK_LASER_SUPPORTED, LASER_SIMD  # noqa: E402
+from alayalite import laser
 
 
-@pytest.mark.skipif(not DISK_LASER_SUPPORTED, reason="disk_laser is not supported on this build/platform")
 def test_laser_selected_simd_allows_avx2_fallback() -> None:
-    from alayalite import laser  # pylint: disable=import-outside-toplevel
-
     selected = laser.selected_simd()
+    if selected == "unavailable":
+        pytest.skip("LASER kernels are unavailable on this platform")
     print(f"laser_simd={selected}")
     assert selected in {"avx512", "avx2", "generic"}
-    assert selected == LASER_SIMD
