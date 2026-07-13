@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include "alaya/collection.hpp"
+#include "index/collection/logical_wal.hpp"
 #include "index/collection/sha256.hpp"
 #include "utils/platform.hpp"
 
@@ -281,6 +282,17 @@ TEST(CollectionFacade, SealRotatesToSuccessorPublishesFlatAndReopens) {
   EXPECT_EQ(target->algorithm_id, core::algorithm::flat);
   EXPECT_EQ(target->lifecycle, internal::collection::SegmentLifecycleV2::sealed);
   EXPECT_EQ(target->wal_cut, sealed.value().wal_cut);
+  EXPECT_EQ(manifest.gc.retained_sources, (std::vector<std::string>{"seg_00000004"}));
+
+  const auto wal_scan = internal::collection::CollectionLogicalWal::scan_file(
+      temporary.path() / ".alaya_internal" /
+      std::string(internal::collection::kCollectionWalNamespace) /
+      std::string(internal::collection::kCollectionWalFilename));
+  ASSERT_TRUE(wal_scan.ok()) << wal_scan.status().diagnostic();
+  ASSERT_EQ(wal_scan.value().frames.size(), 1U);
+  EXPECT_EQ(wal_scan.value().frames[0].type,
+            internal::collection::LogicalWalRecordType::checkpoint);
+  EXPECT_EQ(wal_scan.value().frames[0].op_id, sealed.value().wal_cut);
 
   const std::array<float, 2> successor_vector{10.0F, 0.0F};
   ASSERT_TRUE(collection->add(item("successor", successor_vector)).ok());
@@ -346,6 +358,11 @@ TEST(CollectionFacade, FlatCompactPreservesRowsAndGcDeletesOnlyReleasedSources) 
   EXPECT_TRUE(std::filesystem::is_directory(temporary.path() / "segments" / "seg_00000004"));
   EXPECT_TRUE(std::filesystem::is_directory(temporary.path() / "segments" / "seg_00000006"));
   EXPECT_TRUE(std::filesystem::is_directory(temporary.path() / "segments" / "seg_00000007"));
+  const auto compact_manifest =
+      internal::collection::ArtifactManifestV2::load(temporary.path() / "collection_manifest.txt");
+  EXPECT_EQ(compact_manifest.gc.pending_segment_ids,
+            (std::vector<std::string>{"seg_00000004", "seg_00000006"}));
+  EXPECT_EQ(compact_manifest.gc.retained_sources, (std::vector<std::string>{"seg_00000007"}));
 
   auto after = collection->search(core::TypedTensorView::contiguous(query.data(), 1, 2), 10);
   ASSERT_TRUE(after.ok()) << after.status().diagnostic();
