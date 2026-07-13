@@ -246,6 +246,13 @@ TEST(DiskFlatSegment, DescriptorCapabilitiesAndDisabledFactoryAreExplicit) {
   EXPECT_TRUE(capabilities.supports(core::OperationCapability::export_rows));
   EXPECT_TRUE(capabilities.supports(core::OperationCapability::stats));
   EXPECT_FALSE(capabilities.supports(core::OperationCapability::mutation));
+  core::OpaqueOperationRequest mutation_request;
+  core::MutationContext mutation_context;
+  core::MutationToken mutation_token;
+  const auto mutation_status =
+      any.prepare_mutation(mutation_request, mutation_context, mutation_token);
+  EXPECT_EQ(mutation_status.code(), core::StatusCode::not_supported);
+  EXPECT_EQ(mutation_status.detail(), core::StatusDetail::operation_slot_absent);
 
   internal::disk::DiskEngineFeatureFlags disabled;
   disabled.disk_flat_segment = false;
@@ -258,6 +265,13 @@ TEST(DiskFlatSegment, DescriptorCapabilitiesAndDisabledFactoryAreExplicit) {
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.status().code(), core::StatusCode::not_supported);
   EXPECT_FALSE(std::filesystem::exists(options.collection_root));
+  core::OpenContext disabled_open_context;
+  auto rejected_open = DiskFlatSegmentFactory::open(core::ArtifactView{},
+                                                    core::OpenOptions{},
+                                                    disabled_open_context,
+                                                    disabled);
+  ASSERT_FALSE(rejected_open.ok());
+  EXPECT_EQ(rejected_open.status().code(), core::StatusCode::not_supported);
   EXPECT_EQ(DiskFlatSegmentFactory::registration.current.implementation_key, "disk_flat_segment");
   EXPECT_EQ(DiskFlatSegmentFactory::registration.current.engine_factory_key, "flat");
   EXPECT_EQ(DiskFlatSegmentFactory::registration.legacy.implementation_key, "disk_flat_legacy");
