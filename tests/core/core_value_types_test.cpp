@@ -14,8 +14,6 @@
 #include <gtest/gtest.h>
 
 #include "core/any_segment.hpp"
-#include "core/compat.hpp"
-#include "index/compat.hpp"
 
 namespace {
 
@@ -246,43 +244,6 @@ TEST(CoreV3Response, RejectsRowsTimesTopKOverflowBeforeTouchingSink) {
                                         OperationStage::validation);
   EXPECT_EQ(status.code(), StatusCode::invalid_argument);
   EXPECT_EQ(status.detail(), StatusDetail::arithmetic_overflow);
-}
-
-TEST(CoreCompat, CoreClosureKeepsStableIdsAndUpperLayerConvertsLegacyValues) {
-  EXPECT_EQ(algorithm::hnsw, 2U);
-  const alaya::disk::DiskSearchOptions legacy{7, 81, 5, false};
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-  auto adapter = alaya::index_compat::from_disk_search_options(legacy, algorithm::laser);
-  const auto roundtrip =
-      alaya::index_compat::to_disk_search_options(adapter.options(), algorithm::laser);
-  const alaya::disk::DiskSearchHit legacy_hit{std::numeric_limits<std::uint64_t>::max(), -2.5F};
-  const auto hit = alaya::index_compat::from_disk_search_hit(legacy_hit, Metric::l2);
-  const auto roundtrip_hit = alaya::index_compat::to_disk_search_hit(hit);
-#pragma GCC diagnostic pop
-
-  EXPECT_EQ(adapter.options().top_k, 7U);
-  EXPECT_EQ(roundtrip.ef, legacy.ef);
-  EXPECT_EQ(roundtrip.beam_width, legacy.beam_width);
-  EXPECT_EQ(roundtrip.exact_rerank, legacy.exact_rerank);
-  EXPECT_EQ(static_cast<std::uint64_t>(hit.row_id), legacy_hit.label);
-  EXPECT_FLOAT_EQ(hit.score, legacy_hit.distance);
-  EXPECT_EQ(roundtrip_hit.label, legacy_hit.label);
-}
-
-TEST(CoreCompat, ConvertsEveryValidLegacyMetricAndRejectsNone) {
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-  EXPECT_EQ(alaya::index_compat::from_metric_type(alaya::MetricType::L2), Metric::l2);
-  EXPECT_EQ(alaya::index_compat::from_metric_type(alaya::MetricType::IP), Metric::inner_product);
-  EXPECT_EQ(alaya::index_compat::from_metric_type(alaya::MetricType::COS), Metric::cosine);
-  EXPECT_EQ(alaya::index_compat::to_metric_type(Metric::l2), alaya::MetricType::L2);
-  EXPECT_EQ(alaya::index_compat::from_index_type(alaya::IndexType::HNSW), algorithm::hnsw);
-  EXPECT_EQ(alaya::index_compat::from_disk_index_type(alaya::disk::DiskIndexType::Laser),
-            algorithm::laser);
-  EXPECT_THROW((void)alaya::index_compat::from_metric_type(alaya::MetricType::NONE),
-               std::invalid_argument);
-#pragma GCC diagnostic pop
 }
 
 }  // namespace

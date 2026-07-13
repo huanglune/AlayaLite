@@ -23,7 +23,7 @@
 #include <tuple>
 #include <utility>
 #include <vector>
-#include "index/disk/disk_collection.hpp"
+#include "index/disk/detail/disk_collection_v1.hpp"
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/types.hpp"
 #include "utils/metric_type.hpp"

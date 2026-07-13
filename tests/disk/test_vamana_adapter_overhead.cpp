@@ -16,7 +16,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-#include "index/disk/disk_collection.hpp"
+#include "index/disk/detail/disk_collection_v1.hpp"
 #include "index/disk/types.hpp"
 #include "index/graph/vamana/vamana_greedy_search.hpp"
 #include "index/graph/vamana/vamana_reader.hpp"

@@ -11,8 +11,7 @@
 #include <utility>
 
 #include "index/collection/types.hpp"
-#include "index/compat.hpp"
-#include "index/disk/disk_collection.hpp"
+#include "index/disk/detail/disk_collection_v1.hpp"
 
 namespace alaya::internal::collection {
 
@@ -77,18 +76,6 @@ class LegacyDiskCollectionAdapter {
     disk::DiskSearchOptions options;
     options.top_k = static_cast<std::uint32_t>(request.options.top_k);
     options.exact_rerank = request.options.rerank_policy != core::RerankPolicy::disabled;
-    for (const auto &extension : request.options.extensions) {
-      if (extension.algorithm_id != descriptor_.algorithm_id || extension.payload == nullptr ||
-          extension.payload_size < sizeof(index_compat::LegacyDiskSearchExtension)) {
-        continue;
-      }
-      const auto &payload =
-          *static_cast<const index_compat::LegacyDiskSearchExtension *>(extension.payload);
-      options.ef = payload.effort;
-      options.beam_width = payload.beam_width;
-      break;
-    }
-
     auto &response = *request.response;
     response.query_count = request.queries.rows;
     response.score_kind = rank_only_ ? core::ScoreKind::rank_only : core::ScoreKind::distance;

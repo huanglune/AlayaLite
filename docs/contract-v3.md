@@ -32,9 +32,9 @@ with `table_size` and `table_version`.
 | §3.8 | `core/any_segment.hpp`, context types | admission status, optional close/drain slots, operation state pinned through exactly-once completion |
 
 Stable algorithm IDs live in `core/algorithm_registry.hpp`, which has no
-domain dependencies. Legacy disk/index/metric conversions live one layer up in
-`index/compat.hpp`; `core/compat.hpp` is only a source forwarding bridge for
-old algorithm constant names.
+domain dependencies. Gate 11 removed the temporary `core/compat.hpp` and
+`index/compat.hpp` source bridges after their consumers reached the canonical
+types.
 
 ## Input and output invariants
 

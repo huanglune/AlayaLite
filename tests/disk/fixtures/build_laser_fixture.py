@@ -88,8 +88,7 @@ def _load_build_tree_modules(extension: Path, stage_root: Path) -> tuple[object,
         if not type(finder).__module__.startswith("_editable_")
     ]
     try:
-        from alayalite import _alayalitepy, vamana  # pylint: disable=import-outside-toplevel
-        from alayalite.laser import RawIndex  # pylint: disable=import-outside-toplevel
+        from alayalite import _alayalitepy  # pylint: disable=import-outside-toplevel
     except ImportError as exc:
         _die(f"could not import the explicitly selected build-tree extension {extension}: {exc}")
 
@@ -97,7 +96,7 @@ def _load_build_tree_modules(extension: Path, stage_root: Path) -> tuple[object,
     if loaded != extension or Path(staged_extension).resolve(strict=True) != extension:
         _die(f"extension provenance mismatch: requested={extension}, loaded={loaded}")
     print(f"[laser-fixture] loaded build-tree extension: {loaded}")
-    return RawIndex, vamana
+    return _alayalitepy.laser.Index, _alayalitepy.vamana
 
 
 def _die(message: str) -> None:

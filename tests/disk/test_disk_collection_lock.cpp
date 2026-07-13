@@ -24,7 +24,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include "index/disk/disk_collection.hpp"
+#include "index/disk/detail/disk_collection_v1.hpp"
 #include "utils/metric_type.hpp"
 
 namespace alaya::disk {

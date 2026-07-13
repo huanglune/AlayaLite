@@ -62,7 +62,6 @@ SPDX-License-Identifier = "Apache-2.0"
 
 [[annotations]]
 path = [
-  "include/utils/rabitq_utils/search_utils/epoch_visited.hpp",
   "include/utils/rabitq_utils/search_utils/visited_pool.hpp",
   "include/index/graph/laser/qg/qg_builder.hpp",
   "include/index/graph/laser/qg/qg.hpp",

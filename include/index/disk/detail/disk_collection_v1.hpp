@@ -4,6 +4,10 @@
 
 #pragma once
 
+// Internal retained reader for the DiskCollection-v1 layout. The former
+// public source bridge was removed in Gate 11; canonical open/import paths and
+// format-regression tests may include this detail header only.
+
 #include <algorithm>
 #include <atomic>
 #include <cerrno>

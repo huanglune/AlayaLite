@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-#include "index/disk/disk_collection.hpp"
+#include "index/disk/detail/disk_collection_v1.hpp"
 
 #include <gtest/gtest.h>
 #include <unistd.h>
