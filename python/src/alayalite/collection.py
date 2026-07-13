@@ -2,97 +2,535 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""
-This module defines the Collection class, which manages documents,
-their embeddings, and the associated vector index.
-"""
+"""Canonical Collection facade backed by the native C++ coordinator."""
+
+from __future__ import annotations
 
 import os
 import shutil
-from typing import List, Optional, Union
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, List, Optional, Union
 
 import numpy as np
 
-from ._alayalitepy import LogicOp as _LogicOp
-from ._alayalitepy import MetadataFilter as _MetadataFilter
-from ._alayalitepy import PyIndexInterface as _PyIndexInterface
-from .common import _assert, _validate_query_vectors, normalize_filter_execution_hint, valid_dtype
-from .index import Index
+from ._alayalitepy import (  # re-exported below as the public status hierarchy
+    CollectionCancelledError,
+    CollectionClosedError,
+    CollectionConflictError,
+    CollectionCorruptionError,
+    CollectionDeadlineExceededError,
+    CollectionInternalError,
+    CollectionInvalidArgumentError,
+    CollectionIoError,
+    CollectionNotFoundError,
+    CollectionNotSupportedError,
+    CollectionResourceExhaustedError,
+    CollectionStatusError,
+)
+from ._alayalitepy import _Collection as _NativeCollection
+from ._alayalitepy import _CollectionReadView as _NativeCollectionReadView
+from .common import _assert, normalize_filter_execution_hint, valid_dtype
 from .schema import IndexParams, load_schema, save_schema
-from .utils import normalize_vectors_for_cosine_metric
+
+V_PUBLIC = "1.1.0"
+V_REMOVE = "1.2.0"
+STATUS_VERSION = "1"
+
+
+__all__ = [
+    "Collection",
+    "CollectionStatusError",
+    "CollectionInvalidArgumentError",
+    "CollectionNotSupportedError",
+    "CollectionConflictError",
+    "CollectionNotFoundError",
+    "CollectionResourceExhaustedError",
+    "CollectionDeadlineExceededError",
+    "CollectionCancelledError",
+    "CollectionIoError",
+    "CollectionCorruptionError",
+    "CollectionClosedError",
+    "CollectionInternalError",
+    "V_PUBLIC",
+    "V_REMOVE",
+    "STATUS_VERSION",
+]
 
 
 def _default_rocksdb_path(collection_name: str, base_dir: Optional[str] = None) -> str:
+    """Retain the historical configuration spelling as a storage-root hint."""
     if base_dir is not None:
         return os.path.join(base_dir, collection_name, "rocksdb")
-
     rocksdb_base = os.environ.get("ALAYALITE_ROCKSDB_DIR", "./RocksDB")
     return os.path.join(rocksdb_base, collection_name)
 
 
-# pylint: disable=unused-private-member
-class Collection:
-    """
-    Collection class to manage a collection of documents and their embeddings.
+def _canonical_root(rocksdb_path: str) -> str:
+    """Translate the old config field without opening a RocksDB owner."""
+    path = Path(rocksdb_path).expanduser()
+    if path.name == "rocksdb":
+        path = path.parent
+    return os.path.abspath(os.fspath(path))
 
-    Data storage is handled by the underlying C++ Index, supporting:
-    - Vectors: stored in the vector space
-    - Scalar data (item_id, document, metadata): stored in RocksDB via the Space layer
+
+@dataclass(frozen=True)
+class _CompiledMetadataFilter:
+    expression: dict
+
+
+def _validate_filter_expression(expression) -> None:
+    if not isinstance(expression, dict):
+        raise TypeError("metadata_filter must be a dict")
+    for key, value in expression.items():
+        if key in ("$and", "$or"):
+            if not isinstance(value, (list, tuple)):
+                raise TypeError(f"{key} expects a list of filter expressions")
+            for child in value:
+                _validate_filter_expression(child)
+            continue
+        if isinstance(value, dict):
+            for operator, operand in value.items():
+                if operator not in ("$eq", "$gt", "$ge", "$lt", "$le", "$in"):
+                    raise ValueError(f"Unsupported operator: {operator}")
+                if operator == "$in" and not isinstance(operand, (list, tuple, set, frozenset)):
+                    raise TypeError("$in expects a list-like operand")
+
+
+def _matches_filter(metadata: dict, expression: dict) -> bool:
+    for key, expected in expression.items():
+        if key == "$and":
+            if not all(_matches_filter(metadata, child) for child in expected):
+                return False
+            continue
+        if key == "$or":
+            if not any(_matches_filter(metadata, child) for child in expected):
+                return False
+            continue
+
+        actual = metadata.get(key)
+        if not isinstance(expected, dict):
+            if actual != expected:
+                return False
+            continue
+        for operator, operand in expected.items():
+            if operator == "$eq" and actual != operand:
+                return False
+            if operator == "$gt" and not (actual is not None and actual > operand):
+                return False
+            if operator == "$ge" and not (actual is not None and actual >= operand):
+                return False
+            if operator == "$lt" and not (actual is not None and actual < operand):
+                return False
+            if operator == "$le" and not (actual is not None and actual <= operand):
+                return False
+            if operator == "$in" and actual not in operand:
+                return False
+    return True
+
+
+def _row_status_name(value: int) -> str:
+    return (
+        "inserted",
+        "updated",
+        "replaced",
+        "deleted",
+        "already_exists",
+        "not_found",
+        "conflict",
+        "invalid_argument",
+        "aborted",
+    )[int(value)]
+
+
+class Collection:
+    """The canonical Python facade over :class:`alaya::Collection`.
+
+    Vectors, LogicalIds, documents, metadata, versions, tombstones, WAL and
+    checkpoints all have one native owner.  The former ``rocksdb_path`` field
+    is retained only as a source-compatible choice of collection directory.
     """
 
     def __init__(self, name: str, index_params: IndexParams = None):
-        """
-        Initializes the collection.
-
-        Args:
-            name (str): The name of the collection.
-            index_params (IndexParams): Configuration parameters for the index.
-        """
-        self.__name = name
         self.__index_params = index_params if index_params is not None else IndexParams()
         if not self.__index_params.rocksdb_path:
             self.__index_params.rocksdb_path = _default_rocksdb_path(name)
-        self.__index_py: Optional[Index] = None
-        self.__cpp_index: Optional[_PyIndexInterface] = None
+        self.__root = _canonical_root(self.__index_params.rocksdb_path)
+        self.__native: Optional[_NativeCollection] = None
+        self.__read_view: Optional[_NativeCollectionReadView] = None
+        self.__dim: Optional[int] = None
+        self.__dtype: Optional[np.dtype] = None
 
-    def get_cpp_index(self) -> _PyIndexInterface:
-        """
-        Get the underlying native index.
-        """
-        return self._get_cpp_index()
+    def _bind_open_native(self, root: str) -> None:
+        self.__root = os.path.abspath(root)
+        self.__native = _NativeCollection.open(self.__root)
+        native_options = self.__native.options()
+        self.__dim = int(native_options["dim"])
+        self.__dtype = np.dtype(native_options["dtype"])
 
-    def build_filter(self, filter_dict: Optional[Union[dict, _MetadataFilter]]) -> _MetadataFilter:
-        """
-        Compile a Python metadata filter into the native representation.
-        """
-        return self._build_filter(filter_dict)
+    @staticmethod
+    def _normalize_item_id(item_id) -> str:
+        if isinstance(item_id, bytes):
+            return item_id.decode("utf-8")
+        return str(item_id)
 
-    def _get_cpp_index(self) -> _PyIndexInterface:
-        """Get the C++ index, raising error if not initialized."""
-        if self.__index_py is None:
+    def _resolved_params(self) -> IndexParams:
+        self.__index_params.fill_none_values()
+        self.__index_params.data_type = valid_dtype(self.__index_params.data_type)
+        self.__index_params.metric = str(self.__index_params.metric).lower()
+        self.__index_params.quantization_type = str(self.__index_params.quantization_type).lower()
+        self.__index_params.index_type = str(self.__index_params.index_type).lower()
+        if self.__index_params.index_type not in ("hnsw", "nsg", "fusion", "qg", "flat"):
+            raise ValueError("canonical Collection index_type must be flat, hnsw, nsg, fusion, or qg")
+        if self.__index_params.quantization_type not in ("none", "sq4", "sq8", "rabitq"):
+            raise ValueError("canonical Collection quantization_type is unsupported")
+        return self.__index_params
+
+    def _create_native(self, dim: int, dtype) -> _NativeCollection:
+        if self.__index_params.data_type is None:
+            self.__index_params.data_type = valid_dtype(dtype)
+        params = self._resolved_params()
+        dtype = valid_dtype(dtype)
+        if params.data_type != dtype:
+            raise ValueError(f"Data type mismatch: {params.data_type} vs {dtype}")
+        build_threads = params.build_threads if params.build_threads is not None else 1
+        _assert(build_threads > 0, "index_params.build_threads must be greater than 0")
+        native = _NativeCollection.create(
+            self.__root,
+            int(dim),
+            params.metric,
+            dtype,
+            params.index_type,
+            params.quantization_type,
+            int(build_threads),
+            400,
+        )
+        self.__dim = int(dim)
+        self.__dtype = dtype
+        return native
+
+    def _require_native(self) -> _NativeCollection:
+        if self.__native is None:
             raise RuntimeError(
                 "Collection index is not initialized yet. Call insert() with the first batch of data first."
             )
-        if self.__cpp_index is None:
-            self.__cpp_index = self.__index_py.get_cpp_index()
-        if self.__cpp_index is None:
-            raise RuntimeError(
-                "Collection index backend is unavailable. Call insert() with the first batch of data first."
-            )
-        return self.__cpp_index
+        return self.__native
 
-    def _maybe_persist_schema_for_recovery(self) -> None:
-        if not self.__index_params.rocksdb_path or self.__index_py is None:
+    def get_cpp_index(self) -> _NativeCollectionReadView:
+        """Return the Gate 9-A read-only native view.
+
+        The view deliberately has no mutation, RocksDB, or internal-row API.
+        Its deprecation warning is introduced by Gate 9-B.
+        """
+        return self._get_cpp_index()
+
+    def _get_cpp_index(self) -> _NativeCollectionReadView:
+        native = self._require_native()
+        if self.__read_view is None:
+            self.__read_view = _NativeCollectionReadView(native)
+        return self.__read_view
+
+    def build_filter(self, filter_dict: Optional[Union[dict, _CompiledMetadataFilter]]):
+        """Compile the compatibility metadata DSL for pinned-snapshot filtering."""
+        if isinstance(filter_dict, _CompiledMetadataFilter):
+            return filter_dict
+        expression = {} if filter_dict is None else filter_dict
+        _validate_filter_expression(expression)
+        return _CompiledMetadataFilter(expression)
+
+    @staticmethod
+    def _filter_expression(metadata_filter) -> dict:
+        if isinstance(metadata_filter, _CompiledMetadataFilter):
+            return metadata_filter.expression
+        expression = {} if metadata_filter is None else metadata_filter
+        _validate_filter_expression(expression)
+        return expression
+
+    def _prepare_items(self, items: Iterable[tuple]):
+        materialized = list(items)
+        if not materialized:
+            return materialized, [], [], np.empty((0, self.__dim or 0), dtype=self.__dtype or np.float32), []
+        ids = []
+        documents = []
+        metadata = []
+        vectors = []
+        for entry in materialized:
+            if len(entry) != 4:
+                raise ValueError("Collection items must be (item_id, document, embedding, metadata) tuples")
+            item_id, document, embedding, scalar = entry
+            ids.append(self._normalize_item_id(item_id))
+            documents.append(str(document))
+            metadata.append({} if scalar is None else dict(scalar))
+            vectors.append(np.asarray(embedding))
+        array = np.asarray(vectors)
+        _assert(array.ndim == 2, "vectors must be a 2D array")
+        dtype = valid_dtype(array.dtype)
+        array = np.ascontiguousarray(array, dtype=dtype)
+        if self.__dim is not None:
+            _assert(array.shape[1] == self.__dim, "Vector dimension must match the index dimension.")
+        if self.__dtype is not None and dtype != self.__dtype:
+            raise ValueError(f"Data type mismatch: {self.__dtype} vs {dtype}")
+        return materialized, ids, documents, array, metadata
+
+    @staticmethod
+    def _first_duplicate(ids: List[str]) -> Optional[str]:
+        seen = set()
+        for item_id in ids:
+            if item_id in seen:
+                return item_id
+            seen.add(item_id)
+        return None
+
+    def _persist_discovery_schema(self) -> None:
+        if self.__native is None:
             return
-
-        collection_dir = os.path.dirname(self.__index_params.rocksdb_path)
-        if not collection_dir:
+        schema_path = os.path.join(self.__root, "schema.json")
+        if self.__native.options()["imported_legacy_layout"] and os.path.exists(schema_path):
             return
-
         save_schema(
-            os.path.join(collection_dir, "schema.json"),
-            {"type": "collection", "index": self.__index_params.to_json_dict()},
+            schema_path,
+            {
+                "type": "collection",
+                "format": "canonical_collection_v1",
+                "public_version": V_PUBLIC,
+                "index": self.__index_params.to_json_dict(),
+            },
         )
+
+    def insert(self, items: List[tuple]):
+        """Insert rows in ``insert_only`` mode and return the native batch receipt."""
+        materialized, ids, documents, vectors, metadata = self._prepare_items(items)
+        if not materialized:
+            return None
+        duplicate = self._first_duplicate(ids)
+        if duplicate is not None:
+            raise RuntimeError(f"Duplicate item_id: {duplicate}")
+
+        created_here = self.__native is None
+        if not created_here:
+            existing = self.__native.get_by_ids(ids)
+            for item_id, record in zip(ids, existing):
+                if record is not None:
+                    raise RuntimeError(f"Duplicate item_id: {item_id}")
+
+        root_existed = os.path.exists(self.__root)
+        try:
+            if self.__native is None:
+                self.__native = self._create_native(vectors.shape[1], vectors.dtype)
+            receipt = self.__native.mutate(ids, documents, vectors, metadata, "add")
+            for item_id, row in zip(ids, receipt["rows"]):
+                if _row_status_name(row["row_status"]) != "inserted":
+                    raise RuntimeError(f"Duplicate item_id: {item_id}")
+            self._persist_discovery_schema()
+            return receipt
+        except Exception:
+            if created_here:
+                try:
+                    if self.__native is not None:
+                        self.__native.close()
+                finally:
+                    self.__native = None
+                    self.__read_view = None
+                    self.__dim = None
+                    self.__dtype = None
+                    if not root_existed and os.path.exists(self.__root):
+                        shutil.rmtree(self.__root)
+            raise
+
+    def mutate_batch(
+        self,
+        items,
+        *,
+        action: str = "upsert",
+        mode: str = "per_row_independent",
+        durability: str = "wal_fsync",
+        retry_token: str = "",
+    ):
+        """Apply a canonical add/upsert batch with explicit §4.4 semantics."""
+        if action not in ("add", "upsert", "replace"):
+            raise ValueError("canonical Collection mutation action must be add, upsert, or replace")
+        if mode not in ("per_row_independent", "all_or_nothing"):
+            raise ValueError("canonical Collection batch mode must be per_row_independent or all_or_nothing")
+        if durability not in ("wal_fsync", "searchable"):
+            raise ValueError("canonical Collection durability must be wal_fsync or searchable")
+        materialized, ids, documents, vectors, metadata = self._prepare_items(items)
+        if not materialized:
+            return None
+        created_here = self.__native is None
+        root_existed = os.path.exists(self.__root)
+        try:
+            if self.__native is None:
+                self.__native = self._create_native(vectors.shape[1], vectors.dtype)
+            receipt = self.__native.mutate(
+                ids,
+                documents,
+                vectors,
+                metadata,
+                action,
+                mode=mode,
+                durability=durability,
+                retry_token=str(retry_token),
+            )
+            self._persist_discovery_schema()
+            return receipt
+        except Exception:
+            if created_here:
+                try:
+                    if self.__native is not None:
+                        self.__native.close()
+                finally:
+                    self.__native = None
+                    self.__read_view = None
+                    self.__dim = None
+                    self.__dtype = None
+                    if not root_existed and os.path.exists(self.__root):
+                        shutil.rmtree(self.__root)
+            raise
+
+    def add(
+        self,
+        items,
+        *,
+        mode: str = "per_row_independent",
+        durability: str = "wal_fsync",
+        retry_token: str = "",
+    ):
+        """Canonical insert-only batch returning stable per-row receipts."""
+        return self.mutate_batch(
+            items,
+            action="add",
+            mode=mode,
+            durability=durability,
+            retry_token=retry_token,
+        )
+
+    def upsert(
+        self,
+        items: List[tuple],
+        *,
+        mode: str = "per_row_independent",
+        durability: str = "wal_fsync",
+        retry_token: str = "",
+    ):
+        """Insert or update rows through the Collection version owner."""
+        return self.mutate_batch(
+            items,
+            action="upsert",
+            mode=mode,
+            durability=durability,
+            retry_token=retry_token,
+        )
+
+    def remove(
+        self,
+        ids,
+        *,
+        mode: str = "per_row_independent",
+        durability: str = "wal_fsync",
+        retry_token: str = "",
+    ):
+        """Canonical LogicalId remove batch with stable missing-row statuses."""
+        if mode not in ("per_row_independent", "all_or_nothing"):
+            raise ValueError("canonical Collection batch mode must be per_row_independent or all_or_nothing")
+        if durability not in ("wal_fsync", "searchable"):
+            raise ValueError("canonical Collection durability must be wal_fsync or searchable")
+        if not ids or self.__native is None:
+            return None
+        normalized = [self._normalize_item_id(item_id) for item_id in ids]
+        return self.__native.remove(
+            normalized,
+            mode=mode,
+            durability=durability,
+            retry_token=str(retry_token),
+        )
+
+    def delete_by_id(self, ids: List[str]):
+        """Remove LogicalIds; missing rows retain stable ``not_found`` receipts."""
+        return self.remove(ids)
+
+    def get_by_id(self, ids: List[str]) -> dict:
+        """Project item ID, document, and metadata for live LogicalIds."""
+        results = {"id": [], "document": [], "metadata": []}
+        if not ids or self.__native is None:
+            return results
+        normalized = [self._normalize_item_id(item_id) for item_id in ids]
+        for record in self.__native.get_by_ids(normalized):
+            if record is None:
+                continue
+            results["id"].append(str(record["id"]))
+            results["document"].append(record["document"])
+            results["metadata"].append(record["metadata"])
+        return results
+
+    def get_records(self, ids: List[str]) -> list:
+        """Return canonical record projections, including vectors and versions."""
+        if self.__native is None:
+            return []
+        normalized = [self._normalize_item_id(item_id) for item_id in ids]
+        return [record for record in self.__native.get_by_ids(normalized) if record is not None]
+
+    def filter_query(self, metadata_filter, limit: int = 100) -> dict:
+        """Filter one pinned native record snapshot without Gate 10 pushdown."""
+        self._require_native()
+        _assert(limit > 0, "limit must be greater than 0")
+        expression = self._filter_expression(metadata_filter)
+        result = {"id": [], "document": [], "metadata": [], "internal_id": []}
+        for record in self.__native.records():
+            if not _matches_filter(record["metadata"], expression):
+                continue
+            result["id"].append(str(record["id"]))
+            result["document"].append(record["document"])
+            result["metadata"].append(record["metadata"])
+            result["internal_id"].append(record["upsert_sequence"])
+            if len(result["id"]) == limit:
+                break
+        return result
+
+    def delete_by_filter(self, metadata_filter: dict, batch_size: int = 1000) -> int:
+        """Expand a pinned filter deterministically, then remove through the coordinator."""
+        self._require_native()
+        _assert(batch_size > 0, "batch_size must be greater than 0")
+        expression = self._filter_expression(metadata_filter)
+        ids = [
+            str(record["id"]) for record in self.__native.records() if _matches_filter(record["metadata"], expression)
+        ]
+        deleted = 0
+        for offset in range(0, len(ids), batch_size):
+            receipt = self.__native.remove(ids[offset : offset + batch_size])
+            deleted += sum(_row_status_name(row["row_status"]) == "deleted" for row in receipt["rows"])
+        return deleted
+
+    def _canonical_queries(self, vectors, *, batch: bool, compatibility_cast: bool) -> np.ndarray:
+        native = self._require_native()
+        del native
+        array = np.asarray(vectors, dtype=self.__dtype if compatibility_cast else None)
+        if batch:
+            _assert(array.ndim == 2, "queries must be a 2D array")
+        else:
+            _assert(array.ndim == 1, "query must be a 1D array")
+        if array.dtype != self.__dtype:
+            raise TypeError(f"query dtype must match collection dtype {self.__dtype}")
+        expected_dim = array.shape[1] if batch else array.shape[0]
+        _assert(expected_dim == self.__dim, "Vector dimension must match the index dimension.")
+        return np.ascontiguousarray(array)
+
+    def search(self, query, top_k: int = 10) -> dict:
+        """Canonical single-query response using the batch logical schema."""
+        _assert(top_k >= 0, "top_k must be greater than or equal to 0")
+        array = self._canonical_queries(query, batch=False, compatibility_cast=False)
+        return self.__native.search(array, int(top_k))
+
+    def batch_search(self, queries, top_k: int = 10) -> dict:
+        """Canonical flat NumPy response with offsets and valid counts."""
+        _assert(top_k >= 0, "top_k must be greater than or equal to 0")
+        array = self._canonical_queries(queries, batch=True, compatibility_cast=False)
+        return self.__native.batch_search(array, int(top_k))
+
+    @staticmethod
+    def _response_rows(response: dict):
+        for begin, end in zip(response["offsets"][:-1], response["offsets"][1:]):
+            yield int(begin), int(end)
 
     def batch_query(
         self,
@@ -101,478 +539,205 @@ class Collection:
         ef_search: int = 100,
         num_threads: int = 1,
     ) -> dict:
-        """
-        Queries the index using a batch of vectors.
-
-        Returns:
-            dict with keys: id, document, metadata, distance
-        """
-        _assert(self.__index_py is not None, "Index is not initialized yet")
+        """Compatibility projection over canonical ``batch_search``."""
+        self._require_native()
         _assert(num_threads > 0, "num_threads must be greater than 0")
         _assert(ef_search >= limit, "ef_search must be greater than or equal to limit")
-
-        vectors_arr, _ = _validate_query_vectors(vectors, self.__index_py.get_dim(), metric=self.__index_params.metric)
-
-        # Query validation already normalizes cosine queries before they reach the native index.
-        ids_arr, dists_arr = self.__index_py.batch_search_with_distance(
-            vectors_arr,
-            limit,
-            ef_search,
-            num_threads,
-        )
-
-        cpp_index = self._get_cpp_index()
-        flat_scalars = cpp_index.batch_get_scalar_data_by_internal_ids(ids_arr.reshape(-1))
-        scalar_offset = 0
-        ret = {"id": [], "document": [], "metadata": [], "distance": []}
-        for ids_row, dists_row in zip(ids_arr, dists_arr):
-            row_ids = []
-            row_docs = []
-            row_metas = []
-            row_dists = [float(d) for d in dists_row]
-
-            for _ in ids_row:
-                scalar = flat_scalars[scalar_offset]
-                scalar_offset += 1
-                row_ids.append(scalar.get("item_id", ""))
-                row_docs.append(scalar.get("document", ""))
-                row_metas.append(scalar.get("metadata", {}))
-
-            ret["id"].append(row_ids)
-            ret["document"].append(row_docs)
-            ret["metadata"].append(row_metas)
-            ret["distance"].append(row_dists)
-
-        return ret
+        _assert(limit >= 0, "limit must be greater than or equal to 0")
+        queries = self._canonical_queries(vectors, batch=True, compatibility_cast=True)
+        response = self.__native.batch_search(queries, int(limit))
+        unique_ids = [str(value) for value in response["ids"].tolist()]
+        records = {
+            str(record["id"]): record
+            for record in self.__native.get_by_ids(list(dict.fromkeys(unique_ids)))
+            if record is not None
+        }
+        result = {"id": [], "document": [], "metadata": [], "distance": []}
+        for begin, end in self._response_rows(response):
+            row_ids = [str(value) for value in response["ids"][begin:end].tolist()]
+            result["id"].append(row_ids)
+            result["document"].append([records[item_id]["document"] for item_id in row_ids])
+            result["metadata"].append([records[item_id]["metadata"] for item_id in row_ids])
+            result["distance"].append([float(value) for value in response["distances"][begin:end]])
+        return result
 
     def hybrid_query(
         self,
         vectors: List[List[float]],
         limit: int,
         *,
-        metadata_filter: Optional[Union[dict, _MetadataFilter]] = None,
+        metadata_filter=None,
         ef_search: int = 100,
         num_threads: int = 1,
         filter_execution_hint: Optional[str] = None,
     ) -> dict:
-        """
-        Queries the index using vectors with metadata filtering.
-
-        Args:
-            vectors: Query vectors.
-            limit: Result size per query.
-            metadata_filter: Metadata predicate.
-            ef_search: ANN ef parameter.
-            num_threads: Thread count for batch query.
-            filter_execution_hint: Optional hybrid-search execution hint.
-                Supported values: ``None``/``"auto"``, ``"disable"``,
-                ``"bitset_prefilter"``, ``"iterative_filter"``.
-
-        Returns:
-            dict with a single key ``id`` containing item-id rows for each query.
-        """
-        _assert(self.__index_py is not None, "Index is not initialized yet")
+        """Pinned-snapshot post-filter projection; Gate 10 pushdown is not used."""
+        self._require_native()
         _assert(ef_search >= limit, "ef_search must be >= limit")
         _assert(num_threads > 0, "num_threads must be greater than 0")
+        normalize_filter_execution_hint(filter_execution_hint)
+        expression = self._filter_expression(metadata_filter)
+        queries = self._canonical_queries(vectors, batch=True, compatibility_cast=True)
+        records = self.__native.records()
+        by_id = {str(record["id"]): record for record in records}
+        response = self.__native.batch_search(queries, len(records))
+        rows = []
+        for begin, end in self._response_rows(response):
+            selected = []
+            for value in response["ids"][begin:end].tolist():
+                item_id = str(value)
+                record = by_id.get(item_id)
+                if record is not None and _matches_filter(record["metadata"], expression):
+                    selected.append(item_id)
+                    if len(selected) == limit:
+                        break
+            rows.append(selected)
+        return {"id": rows}
 
-        cpp_index = self._get_cpp_index()
-        filter_obj = self._build_filter(metadata_filter)
-        filter_hint = normalize_filter_execution_hint(filter_execution_hint)
-        vectors_arr, is_single_query = _validate_query_vectors(
-            vectors,
-            self.__index_py.get_dim(),
-            metric=self.__index_params.metric,
-        )
+    def stats(self) -> dict:
+        """Return searchable, accepted, pending, and byte accounting."""
+        return self._require_native().stats()
 
-        if is_single_query:
-            _, item_ids = cpp_index.hybrid_search(
-                vectors_arr[0],
-                limit,
-                ef_search,
-                filter_obj,
-                bf=False,
-                filter_execution_hint=filter_hint,
-            )
-            return {"id": [list(item_ids)]}
-        else:
-            _, item_ids = cpp_index.batch_hybrid_search(
-                vectors_arr,
-                limit,
-                ef_search,
-                filter_obj,
-                num_threads,
-                bf=False,
-                filter_execution_hint=filter_hint,
-            )
-            return {"id": [list(row) for row in item_ids]}
+    def size(self) -> int:
+        return int(self.stats()["size"])
 
-    def filter_query(self, metadata_filter: Union[dict, _MetadataFilter], limit: int = 100) -> dict:
-        """
-        Filters records based on metadata conditions (without vector search).
-
-        Args:
-            metadata_filter: Filter conditions dict, e.g.:
-                {"category": "tech"}  # simple equality
-                {"score": {"$gt": 80}}  # comparison operator
-                {"$and": [{"a": 1}, {"b": 2}]}  # logical combination
-            limit: Maximum number of results to return
-
-        Returns:
-            dict with keys: id, document, metadata, internal_id
-        """
-        _assert(self.__index_py is not None, "Index is not initialized yet")
-        _assert(limit > 0, "limit must be greater than 0")
-
-        cpp_index = self._get_cpp_index()
-        filter_obj = self._build_filter(metadata_filter)
-
-        ids, scalar_list = cpp_index.filter_query(filter_obj, limit)
-
-        return {
-            "id": [s.get("item_id", "") for s in scalar_list],
-            "document": [s.get("document", "") for s in scalar_list],
-            "metadata": [s.get("metadata", {}) for s in scalar_list],
-            "internal_id": list(ids),
-        }
-
-    def insert(self, items: List[tuple]):
-        """
-        Inserts multiple documents and their embeddings into the collection.
-
-        Args:
-            items: List of tuples (item_id, document, embedding, metadata)
-        """
-        if not items:
-            return
-
-        if self.__index_py is None:
-            # First insert - initialize index with batch fit
-            _, _, first_embedding, _ = items[0]
-            dt = valid_dtype(np.asarray(first_embedding).dtype)
-            self.__index_params.data_type = dt
-
-            self.__index_params.fill_none_values()
-
-            # Collection always requires scalar data storage
-            self.__index_params.has_scalar_data = True
-
-            index = Index(self.__name, self.__index_params)
-
-            # Prepare batch data
-            vectors = np.array([item[2] for item in items], dtype=dt)
-            item_ids = [item[0] for item in items]
-            documents = [item[1] for item in items]
-            metadata_list = [item[3] for item in items]
-
-            # Fit with scalar data
-            build_threads = self.__index_params.build_threads
-            if build_threads is None:
-                build_threads = 1
-            else:
-                _assert(build_threads > 0, "index_params.build_threads must be greater than 0")
-            index.fit(
-                vectors,
-                ef_construction=400,
-                num_threads=build_threads,
-                item_ids=item_ids,
-                documents=documents,
-                metadata_list=metadata_list,
-            )
-            self.__index_py = index
-            self.__cpp_index = self.__index_py.get_cpp_index()
-            self._maybe_persist_schema_for_recovery()
-        else:
-            # Incremental insert with scalar data
-            cpp_index = self._get_cpp_index()
-            for item_id, document, embedding, metadata in items:
-                vec = np.array(embedding, dtype=self.__index_py.get_dtype())
-                vec = normalize_vectors_for_cosine_metric(vec, self.__index_params.metric)
-                cpp_index.insert(
-                    vec,
-                    100,  # ef
-                    item_id,
-                    document,
-                    metadata or {},
-                )
-
-    def upsert(self, items: List[tuple]):
-        """
-        Inserts new items or updates existing ones.
-        """
-        if not items:
-            return
-
-        if self.__index_py is None:
-            self.insert(items)
-            return
-
-        cpp_index = self._get_cpp_index()
-        for item_id, document, embedding, metadata in items:
-            vec = np.array(embedding, dtype=self.__index_py.get_dtype())
-            vec = normalize_vectors_for_cosine_metric(vec, self.__index_params.metric)
-            cpp_index.upsert(
-                vec,
-                100,  # ef
-                item_id,
-                document,
-                metadata or {},
-            )
-
-    def delete_by_id(self, ids: List[str]):
-        """
-        Deletes documents from the collection by their item IDs.
-        """
-        if not ids or self.__cpp_index is None:
-            return
-
-        for item_id in ids:
-            try:
-                self.__cpp_index.remove_by_item_id(item_id)
-            except RuntimeError:
-                pass  # item_id not found, skip
-
-    def get_by_id(self, ids: List[str]) -> dict:
-        """
-        Gets documents from the collection by their item IDs.
-        """
-        results = {"id": [], "document": [], "metadata": []}
-
-        if not ids or self.__cpp_index is None:
-            return results
-
-        for item_id in ids:
-            try:
-                scalar = self.__cpp_index.get_scalar_data_by_item_id(item_id)
-                results["id"].append(scalar.get("item_id", ""))
-                results["document"].append(scalar.get("document", ""))
-                results["metadata"].append(scalar.get("metadata", {}))
-            except RuntimeError:
-                pass  # item_id not found, skip
-
-        return results
-
-    def delete_by_filter(self, metadata_filter: dict, batch_size: int = 1000) -> int:
-        """
-        Deletes items from the collection based on a metadata filter.
-
-        Args:
-            metadata_filter: Filter conditions dict, e.g.:
-                {"category": "tech"}  # simple equality
-                {"score": {"$lt": 50}}  # comparison operator
-                {"$or": [{"status": "expired"}, {"status": "deleted"}]}
-            batch_size: Number of items to fetch and delete per batch
-
-        Returns:
-            Number of items deleted
-        """
-        _assert(self.__index_py is not None, "Index is not initialized yet")
-
-        total_deleted = 0
-        batch_count = batch_size
-
-        while batch_count == batch_size:
-            results = self.filter_query(metadata_filter, limit=batch_size)
-            item_ids = results.get("id", [])
-            batch_count = len(item_ids)
-            self.delete_by_id(item_ids)
-            total_deleted += batch_count
-
-        return total_deleted
+    def checkpoint(self) -> dict:
+        return self._require_native().checkpoint()
 
     def reindex(self, ef_construction: int = 400, num_threads: Optional[int] = None):
-        """
-        Rebuilds the index while preserving all data.
-
-        This method extracts all vectors and scalar data from the current index,
-        then rebuilds the graph structure with new construction parameters.
-
-        Args:
-            ef_construction: Construction parameter for HNSW algorithm
-            num_threads: Number of threads for index building
-        """
-        _assert(self.__index_py is not None, "Index is not initialized yet")
-        assert self.__index_py is not None  # for type checker
-
-        cpp_index = self._get_cpp_index()
-        data_num = cpp_index.get_data_num()
-        dtype = self.__index_py.get_dtype()
-
-        if data_num == 0:
-            return
-
-        # Collect all vectors and scalar data
-        vectors = []
-        item_ids = []
-        documents = []
-        metadata_list = []
-
-        for i in range(data_num):
+        """Export, recreate, re-add, atomically swap, and checkpoint the native owner."""
+        _assert(int(ef_construction) > 0, "ef_construction must be greater than 0")
+        native = self._require_native()
+        native.checkpoint()
+        records = native.records()
+        options = native.options()
+        threads = options["build_threads"] if num_threads is None else num_threads
+        _assert(int(threads) > 0, "num_threads must be greater than 0")
+        root = Path(self.__root)
+        replacement_root = root.parent / f".{root.name}.reindex-{uuid.uuid4().hex}"
+        backup_root = root.parent / f".{root.name}.backup-{uuid.uuid4().hex}"
+        replacement = None
+        try:
+            replacement = _NativeCollection.create(
+                os.fspath(replacement_root),
+                int(options["dim"]),
+                options["metric"],
+                options["dtype"],
+                options["index_type"],
+                options["quantization_type"],
+                int(threads),
+                int(ef_construction),
+            )
+            if records:
+                ids = [str(record["id"]) for record in records]
+                documents = [record["document"] for record in records]
+                metadata = [record["metadata"] for record in records]
+                vectors = np.ascontiguousarray(np.stack([record["vector"] for record in records]))
+                replacement.mutate(ids, documents, vectors, metadata, "add", mode="all_or_nothing")
+            replacement.checkpoint()
+            replacement.close()
+            replacement = None
+            native.close()
+            self.__native = None
+            self.__read_view = None
             try:
-                scalar = cpp_index.get_scalar_data_by_internal_id(i)
-                item_id = scalar.get("item_id", "")
-                # Skip deleted entries (empty item_id means deleted)
-                if not item_id:
-                    continue
-
-                vec = cpp_index.get_data_by_id(i)
-                vectors.append(vec)
-                item_ids.append(item_id)
-                documents.append(scalar.get("document", ""))
-                metadata_list.append(scalar.get("metadata", {}))
-            except RuntimeError:
-                # Skip deleted or invalid entries
-                continue
-
-        if not vectors:
-            return
-
-        # Convert to numpy array
-        vectors = np.array(vectors, dtype=dtype)
-
-        # Close old RocksDB connection and remove directory before creating new index
-        self.close()
-
-        # Remove old RocksDB directory to allow recreating
-        if self.__index_params.rocksdb_path and os.path.exists(self.__index_params.rocksdb_path):
-            shutil.rmtree(self.__index_params.rocksdb_path)
-
-        # Create new index with same parameters
-        self.__index_py = Index(self.__name, self.__index_params)
-        if num_threads is None:
-            rebuild_threads = self.__index_params.build_threads
-            if rebuild_threads is None:
-                rebuild_threads = 1
-            else:
-                _assert(rebuild_threads > 0, "index_params.build_threads must be greater than 0")
-        else:
-            _assert(num_threads > 0, "num_threads must be greater than 0")
-            rebuild_threads = num_threads
-        self.__index_py.fit(
-            vectors,
-            ef_construction=ef_construction,
-            num_threads=rebuild_threads,
-            item_ids=item_ids,
-            documents=documents,
-            metadata_list=metadata_list,
-        )
-        self.__cpp_index = self.__index_py.get_cpp_index()
-
-    def _build_filter(self, filter_dict: Optional[Union[dict, _MetadataFilter]]) -> _MetadataFilter:
-        """
-        Convert Python dict to C++ MetadataFilter.
-        """
-        mf = _MetadataFilter()
-        if filter_dict is None:
-            return mf
-        if isinstance(filter_dict, _MetadataFilter):
-            return filter_dict
-
-        for key, value in filter_dict.items():
-            if key == "$and":
-                for sub_dict in value:
-                    sub_filter = self._build_filter(sub_dict)
-                    mf.add_sub_filter(sub_filter)
-            elif key == "$or":
-                mf.logic_op = _LogicOp.OR
-                for sub_dict in value:
-                    sub_filter = self._build_filter(sub_dict)
-                    mf.add_sub_filter(sub_filter)
-            elif isinstance(value, dict):
-                for op, op_value in value.items():
-                    # TODO(review - filter DSL parity): expose `$ne`, `$not_in`, and `$contains`
-                    # here so the Python dict DSL stays in sync with every C++ `FilterOp`.
-                    if op == "$eq":
-                        mf.add_eq(key, op_value)
-                    elif op == "$gt":
-                        mf.add_gt(key, op_value)
-                    elif op == "$ge":
-                        mf.add_ge(key, op_value)
-                    elif op == "$lt":
-                        mf.add_lt(key, op_value)
-                    elif op == "$le":
-                        mf.add_le(key, op_value)
-                    elif op == "$in":
-                        mf.add_in(key, op_value)
-                    else:
-                        raise ValueError(f"Unsupported operator: {op}")
-            else:
-                mf.add_eq(key, value)
-
-        return mf
+                os.replace(root, backup_root)
+            except Exception:
+                self.__native = _NativeCollection.open(os.fspath(root))
+                raise
+            try:
+                os.replace(replacement_root, root)
+            except Exception:
+                os.replace(backup_root, root)
+                self.__native = _NativeCollection.open(os.fspath(root))
+                raise
+            try:
+                self.__native = _NativeCollection.open(os.fspath(root))
+                self.__read_view = None
+            except Exception:
+                failed_root = root.parent / f".{root.name}.failed-{uuid.uuid4().hex}"
+                os.replace(root, failed_root)
+                os.replace(backup_root, root)
+                try:
+                    self.__native = _NativeCollection.open(os.fspath(root))
+                finally:
+                    shutil.rmtree(failed_root)
+                raise
+            shutil.rmtree(backup_root)
+            self._persist_discovery_schema()
+            return self.__native.checkpoint()
+        finally:
+            if replacement is not None:
+                try:
+                    replacement.close()
+                except RuntimeError:
+                    pass
+            if replacement_root.exists():
+                shutil.rmtree(replacement_root)
 
     def save(self, url):
-        """
-        Saves the collection to disk.
-        """
-        if not os.path.exists(url):
-            os.makedirs(url)
-
-        schema_map = self.__index_py.save(url)
-        schema_map["type"] = "collection"
-        return schema_map
+        """Checkpoint and export the canonical directory without writing a legacy layout."""
+        native = self._require_native()
+        native.checkpoint()
+        destination = Path(url).absolute()
+        source = Path(self.__root).absolute()
+        if destination != source:
+            staging = destination.parent / f".{destination.name}.canonical-{uuid.uuid4().hex}"
+            if staging.exists():
+                shutil.rmtree(staging)
+            shutil.copytree(source, staging)
+            if destination.exists():
+                if any(destination.iterdir()):
+                    shutil.rmtree(staging)
+                    raise RuntimeError(f"Collection save target is not empty: {destination}")
+                destination.rmdir()
+            os.replace(staging, destination)
+        schema = {
+            "type": "collection",
+            "format": "canonical_collection_v1",
+            "public_version": V_PUBLIC,
+            "index": self.__index_params.to_json_dict(),
+        }
+        return schema
 
     @classmethod
     def load(cls, url, name):
-        """
-        Loads a collection from disk.
-        """
+        """Open canonical data or invoke the native non-destructive legacy importer."""
         collection_url = os.path.join(url, name)
         if not os.path.exists(collection_url):
             raise RuntimeError(f"Collection {name} does not exist")
-
         schema_url = os.path.join(collection_url, "schema.json")
         schema_map = load_schema(schema_url)
-
         if schema_map.get("type") != "collection":
             raise RuntimeError(f"{name} is not a collection")
-
-        # Restore index params from schema (needed by reindex(), etc.)
         index_params = IndexParams.from_str_dict(schema_map["index"])
         if not index_params.rocksdb_path:
             index_params.rocksdb_path = _default_rocksdb_path(name, url)
-
         instance = cls(name, index_params)
-        instance.__index_py = Index.load(url, name)
-        instance.__cpp_index = instance.__index_py.get_cpp_index()
+        instance._bind_open_native(collection_url)
         return instance
 
     def set_metric(self, metric: str):
-        """
-        Sets the metric for the collection's index.
-        """
-        if self.__index_py is not None:
+        if self.__native is not None:
             raise RuntimeError("Cannot change metric after index is created")
-
         self.__index_params.metric = metric
 
     def get_index_params(self):
-        """
-        Retrieve the configuration parameters of the index in the collection.
-        """
         return self.__index_params
 
-    def get_index(self) -> Optional[Index]:
-        """
-        Get the underlying Index instance.
-        """
-        return self.__index_py
+    def get_index(self):
+        """Return the same read-only native view; no legacy Index owner exists."""
+        if self.__native is None:
+            return None
+        return self._get_cpp_index()
 
     def close(self):
-        """
-        Explicitly close and release RocksDB resources.
-        """
-        cpp_index = self.__cpp_index
-        if cpp_index is None and self.__index_py is not None:
-            cpp_index = self.__index_py.get_cpp_index()
-        if cpp_index is not None:
-            cpp_index.close_db()
-            self.__cpp_index = None
-        self.__index_py = None
+        if self.__native is not None:
+            self.__native.close()
+            self.__native = None
+            self.__read_view = None
 
     def __del__(self):
-        """
-        Destructor
-        """
         try:
             self.close()
         except (RuntimeError, AttributeError):

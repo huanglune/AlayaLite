@@ -31,6 +31,7 @@
 #include "utils/metric_type.hpp"
 
 #include "client.hpp"
+#include "collection_binding.hpp"
 #include "disk_collection.hpp"
 #include "index.hpp"
 
@@ -323,6 +324,11 @@ PYBIND11_MODULE(_alayalitepy, m) {
           py::arg("bf") = false,
           py::arg("filter_execution_hint") = std::string())
       .def("close_db", &alaya::BasePyIndex::close_db, "Close and release RocksDB resources");
+
+  // Gate 9-A canonical Collection facade.  This is intentionally distinct from
+  // PyIndexInterface: the native Collection owns its single WAL, metadata and
+  // mutation coordinator, while Python exposes only a separate read-only view.
+  alaya::python::collection_binding::register_collection(m);
 
   // alayalite.DiskCollection — disk-resident segmented collection (v1: Flat).
   alaya::disk::pybindings::register_disk_collection(m);

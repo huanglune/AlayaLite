@@ -13,7 +13,30 @@ import warnings
 
 from ._alayalitepy import DiskCollection, MetricType  # noqa: E402
 from .client import Client  # noqa: E402
-from .collection import Collection  # noqa: E402
+from .collection import (  # noqa: E402
+    STATUS_VERSION as COLLECTION_STATUS_VERSION,
+)
+from .collection import (  # noqa: E402
+    V_PUBLIC as COLLECTION_V_PUBLIC,
+)
+from .collection import (  # noqa: E402
+    V_REMOVE as LEGACY_API_V_REMOVE,
+)
+from .collection import (
+    Collection,
+    CollectionCancelledError,
+    CollectionClosedError,
+    CollectionConflictError,
+    CollectionCorruptionError,
+    CollectionDeadlineExceededError,
+    CollectionInternalError,
+    CollectionInvalidArgumentError,
+    CollectionIoError,
+    CollectionNotFoundError,
+    CollectionNotSupportedError,
+    CollectionResourceExhaustedError,
+    CollectionStatusError,
+)
 from .index import Index  # noqa: E402
 from .utils import calc_gt, calc_recall, load_fvecs, load_ivecs  # noqa: E402
 
@@ -37,6 +60,21 @@ __all__ = [
     "Collection",
     "DiskCollection",
     "MetricType",
+    "COLLECTION_V_PUBLIC",
+    "LEGACY_API_V_REMOVE",
+    "COLLECTION_STATUS_VERSION",
+    "CollectionStatusError",
+    "CollectionInvalidArgumentError",
+    "CollectionNotSupportedError",
+    "CollectionConflictError",
+    "CollectionNotFoundError",
+    "CollectionResourceExhaustedError",
+    "CollectionDeadlineExceededError",
+    "CollectionCancelledError",
+    "CollectionIoError",
+    "CollectionCorruptionError",
+    "CollectionClosedError",
+    "CollectionInternalError",
     # utils
     "load_fvecs",
     "load_ivecs",

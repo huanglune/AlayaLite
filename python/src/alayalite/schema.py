@@ -155,7 +155,11 @@ class IndexParams:
 
         if kwargs.get("index_type") is not None:
             ind_type = kwargs.get("index_type")
-            assert_valid_index_type(ind_type)
+            # ``qg`` is the explicit canonical Collection spelling required
+            # for RaBitQ.  Legacy Index validation intentionally continues to
+            # reject it when ``to_cpp_params`` is used on that path.
+            if str(ind_type).lower() != "qg":
+                assert_valid_index_type(ind_type)
             index_type = ind_type
         if kwargs.get("data_type") is not None:
             data_type = valid_dtype(kwargs.get("data_type"))
