@@ -1652,3 +1652,66 @@ NFS。全程无源码/仓库改动。
 通过。gte 静态 GT 77 查询过滤存活 <10,全部单查询暴力重算(口径红线执行)。
 **配方定稿:ins400+garden lowdeg f.20=质量旗舰;ins200=吞吐档;不再堆插入
 剂量**(E12 自报,采纳)。
+
+## 28. E13 判决:maintenance 趟内水位驱逐——匿名墙拆除,41GB 索引 4GiB RAM 无损跑通(2026-07-13,冻结 bench a465888a,源码 6810f44)
+
+§26 遗留:池水位只在相位边界 enforce,consolidate/garden 单趟触遍全索引 ⇒
+趟内池膨胀 O(index)(deep10m 匿名峰 ~89.8GiB ≈ 2.2× 索引),RAM-cap 地板卡在
+92GiB。E13 в consolidate/garden/rebuild_free_chain 的**页批次之间**加
+high→low 驱逐:每 `maintenance_evict_stride`(默认 4096,0=旧语义)页,工作
+队整体退出并行区与页 latch,`flush_dirty()`(复用 P3a seqlock 写回)+
+`evict_clean(cap/2)`。守卫 `cache_cap_pages < file_pages()`:只在 out-of-core
+域生效,in-core 保持原单趟快路零开销。
+
+### 28.1 g03 deep10m 六格矩阵:全 PASS,地板 92GiB → ≤4GiB(≥23×)
+
+41GB 索引、3×50k churn(consolidate+garden 全开)、E8 同配方同母本:
+
+| cell | r3 ef100 | Δ vs E8 不限 | 峰值 RssAnon | run_s | 读放大 | insert qps |
+|---|---:|---:|---:|---:|---:|---:|
+| 32GiB/131k | 0.97530 | +0.005pp | 2.96GiB | 1,264 | 1.35TiB | 1,680 |
+| 16GiB/131k | 0.97495 | −0.030pp | 2.95GiB | 2,292 | 2.73TiB | 1,309 |
+| 8GiB/131k | 0.97499 | −0.026pp | 2.95GiB | 2,679 | 3.04TiB | 1,199 |
+| 8GiB/65k | 0.97523 | −0.002pp | 2.58GiB | 2,666 | 3.01TiB | 1,195 |
+| 6GiB/65k | 0.97564 | +0.039pp | 2.58GiB | 2,922 | 3.13TiB | 1,212 |
+| **4GiB/65k** | **0.97518** | **−0.007pp** | **2.58GiB** | 3,149 | 3.33TiB | 1,148 |
+
+E8 同六格全部 round1 OOM。判决:(a) **匿名峰与 MemoryMax 完全解耦**(池峰 =
+cap + ~40k/22k 页软超冲,与插入路径同语义);(b) **recall 无损**(带宽
+−0.030~+0.039pp,65k 池反而略优);(c) **退化平滑无悬崖**:32→4GiB 端到端
+2.49×、refault 337M→866M、PSI some 237→427s——瓶颈已从"匿名 OOM 悬崖"转为
+"refault/读放大成本曲线"(后续优化点:低水位策略/维护访问局部性,不属 E13
+功能边界)。头版:**41GB deep10m 在 4GiB cgroup 内完成三轮 churn,r3 ef100
+0.97518,差不限 RAM 对照 −0.007pp。**
+
+### 28.2 本机不变性:位次效应实证 + 去偏后入门
+
+500k SIFT(in-pass 生效)+ GIST pd512 B′(A/A:两臂同走快路)paired,n=4:
+- 正序(control 先跑)SIFT Δr3 三次同号 −0.062/−0.063/−0.043pp,均值
+  −0.056pp,**边缘超 ±0.05pp 门 0.006pp**;
+- GIST **A/A 对照也三次同号 −0.040/−0.010/−0.060pp** ⇒ 位次效应假设;
+- **倒序平衡实验**(inpass 先跑):SIFT Δ 收窄至 −0.015pp,GIST A/A 翻正
+  +0.12pp——先跑者占优坐实(0.02~0.12pp,方向随臂序翻转);
+- 裁决:位次去偏 SIFT 真效应 **−0.036pp**、n=4 合并 −0.046pp,均入门;GIST
+  A/A 四次合并 +0.003pp≈0 证无路径外偏差;叠加 deep10m 端到端 ≤0.04pp,判
+  **不变性 PASS**(原始正序均值越界如实入档,归因位次效应,证据
+  `e13-inpass/local/adjudication.csv`)。
+方法论沉淀:**固定臂序的 paired A/B 有 ~0.02-0.1pp 位次偏差,精确到 0.05pp
+的门必须倒序平衡或随机化臂序**(E12 的 tail-shuffle 误差棒建议同源)。
+
+SIFT 峰值 RssAnon −77.7%(6.24→1.39GiB);维护时长 consolidate +39.6%/garden
++24.1%(SIFT,池压到 65536 时)。**默认值裁决:默认开(4096),明示偏离预注册
+"<5% 才默认开"规则**——守卫把代价严格限制在"不开则匿名 OOM"的 out-of-core
+域,in-core 零开销,安全优先,逃生口 stride=0。
+
+### 28.3 机械与事故
+
+单测:consolidate/garden 新旧路径终态**页哈希逐页一致** + 全程 pool_pages ≤
+cap(旧路径实证超 cap)+ cap≥file_pages 快路等价;Release laser ctest 14/14、
+TSan(setarch -R)4/4 双方独立跑绿;重编 bench md5 与冻结件一致(可复现)。
+事故两则:(a) codex 会话两次死于上游模型容量错误(39.9 万/102.6 万 token),
+第二程死前工作已全部落盘,orchestrator 接管收尾;(b) 首跑 g03 矩阵在编排会话
+死亡后,残留 ssh stdout 管道被 TCP 收尸 ⇒ 后续 tee 与 cap6g/cap4g inner 全
+SIGPIPE(141)——克隆/已跑 cell 无损,setsid 全脱管重跑一次通过。教训入库:
+**远端长任务的驱动脚本必须自带 setsid+/dev/null stdin+文件重定向,不得依赖
+launcher 的继承管道**(后台七坑新增变体)。
