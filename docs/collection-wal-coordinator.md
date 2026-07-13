@@ -182,6 +182,10 @@ own artifact transaction remains responsible for its atomic publication.
 
 ## Gate 7-B importer seam
 
+The concrete state machine, non-destructive source reader, marker/audit
+formats, independent gate, and corpus evidence are specified in the
+[legacy PyIndex importer contract](legacy-importer.md).
+
 An importer must write only this new namespace. It preserves source ordering
 without fabricating a second WAL as follows:
 
@@ -189,8 +193,12 @@ without fabricating a second WAL as follows:
 2. Set `CollectionRecoveryOptions::minimum_next_op_id` to one past the maximum
    source op id (or the next reserved source id). Collection takes the maximum
    of this floor, registered rows, checkpoint state, and all WAL frames.
-3. Open the WAL-enabled Collection and call full `checkpoint`.
-4. Apply the returned cut to manifest v2 with
+3. If a committed snapshot cut has no surviving logical row (for example a
+   scalar delete whose RocksDB checkpoint no longer retains the external ID),
+   set `minimum_visibility_watermark` to that committed cut. This preserves the
+   cut without fabricating a row or advancing to an uncommitted reserved ID.
+4. Open the WAL-enabled Collection and call full `checkpoint`.
+5. Apply the returned cut to manifest v2 with
    `apply_checkpoint_to_manifest`, then publish that manifest through the
    existing artifact transaction.
 

@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added the independently gated, non-destructive legacy PyIndex importer. It
+  directly decodes schema/CURRENT/raw snapshots/read-only RocksDB checkpoints
+  and complete-COMMIT WAL prefixes into a sealed DiskFlat exact-oracle segment,
+  Collection checkpoint/version graph, manifest v2, retained audit, and atomic
+  roll-forward marker. The six pinned dtype/ID/scalar corpus variants now cover
+  byte-exact terminal state, torn tails, idempotent restart, and every importer
+  crash cut without modifying the legacy source.
+
 - Added immutable C++ `VamanaMemSegment` with typed build/open/search/batch,
   byte-compatible Vamana graph + `.fbin` persistence, fixed-seed deterministic
   golden coverage, and a standalone feature-gated factory. NN-Descent is now
