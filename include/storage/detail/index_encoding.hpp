@@ -10,7 +10,7 @@
 #include <cstring>
 #include <string>
 
-#include "scalar_data.hpp"
+#include "utils/scalar_data.hpp"
 
 /**
  * @brief Utilities for encoding metadata values to sortable strings for indexing.

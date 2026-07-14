@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-#include "utils/index_encoding.hpp"
+#include "storage/detail/index_encoding.hpp"
 #include <gtest/gtest.h>
 #include <array>
 #include <limits>

@@ -34,7 +34,7 @@
 #include <vector>
 
 #include "core/log.hpp"
-#include "utils/index_encoding.hpp"
+#include "storage/detail/index_encoding.hpp"
 #include "utils/scalar_data.hpp"
 
 namespace alaya {
