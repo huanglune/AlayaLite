@@ -30,9 +30,7 @@
 #include "utils/rabitq_utils/rotator.hpp"
 
 namespace alaya {
-template <typename DataType = float,
-          typename DistanceType = float,
-          typename IDType = uint32_t>
+template <typename DataType = float, typename DistanceType = float, typename IDType = uint32_t>
 class RaBitQSpace {
  private:
   IDType capacity_{0};

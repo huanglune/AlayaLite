@@ -38,6 +38,7 @@ using RawSpaceType = RawSpace<>;
 using GraphType = Graph<>;
 using SQ8SpaceType = SQ8Space<>;
 
+
 auto test_data_dir() -> std::filesystem::path {
   return std::filesystem::current_path().parent_path() / "data";
 }
