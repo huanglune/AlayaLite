@@ -22,11 +22,7 @@ alaya_cc_target(
   GTEST
   SRCS dataset_utils_test.cpp
 )
-alaya_cc_target(
-  index_encoding_test
-  GTEST
-  SRCS index_encoding_test.cpp
-)
+
 alaya_cc_target(
   rotator_utils_test
   GTEST
@@ -63,11 +59,7 @@ alaya_add_test(
   TARGET dataset_utils_test
   LABELS utils
 )
-alaya_add_test(
-  NAME utils_test_index_encoding
-  TARGET index_encoding_test
-  LABELS utils
-)
+
 alaya_add_test(
   NAME utils_test_rotator_utils
   TARGET rotator_utils_test

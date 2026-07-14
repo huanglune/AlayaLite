@@ -12,11 +12,7 @@ alaya_cc_target(
   GTEST
   SRCS static_storage_test.cpp
 )
-alaya_cc_target(
-  rocksdb_storage_test
-  GTEST
-  SRCS rocksdb_storage_test.cpp
-)
+
 alaya_cc_target(
   page_reader_contract_test
   GTEST
@@ -37,11 +33,7 @@ alaya_add_test(
   TARGET static_storage_test
   LABELS storage
 )
-alaya_add_test(
-  NAME storage_test_rocksdb_storage
-  TARGET rocksdb_storage_test
-  LABELS storage
-)
+
 alaya_add_test(
   NAME storage_test_page_reader_contract
   TARGET page_reader_contract_test

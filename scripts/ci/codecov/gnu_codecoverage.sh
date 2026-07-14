@@ -45,13 +45,11 @@ COVERAGE_TARGETS=(
   rabitq_space_test
   storage_test
   static_storage_test
-  rocksdb_storage_test
   uring_reactor_test
   query_utils_test
   log_test
   evaluate_test
   dataset_utils_test
-  index_encoding_test
   rotator_utils_test
   lut_utils_test
   math_test

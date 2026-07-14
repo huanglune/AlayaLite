@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-only
 
-# Disk collection tests: flat + Vamana engines unconditionally, LASER engine when ALAYA_ENABLE_LASER.
+# Disk segment tests: flat + Vamana engines unconditionally, LASER engine when ALAYA_ENABLE_LASER.
 
 alaya_cc_target(
   disk_types_test
@@ -53,24 +53,9 @@ alaya_cc_target(
   SRCS disk_flat_segment_stress_test.cpp
 )
 alaya_cc_target(
-  disk_collection_test
-  GTEST
-  SRCS disk_collection_test.cpp
-)
-alaya_cc_target(
-  test_disk_collection_lock
-  GTEST
-  SRCS test_disk_collection_lock.cpp
-)
-alaya_cc_target(
   segment_factory_test
   GTEST
   SRCS segment_factory_test.cpp
-)
-alaya_cc_target(
-  disk_collection_factory_dispatch_test
-  GTEST
-  SRCS disk_collection_factory_dispatch_test.cpp
 )
 alaya_cc_target(
   test_vamana_reader
@@ -96,16 +81,6 @@ alaya_cc_target(
   test_segment_factory_vamana
   GTEST
   SRCS test_segment_factory_vamana.cpp
-)
-alaya_cc_target(
-  test_disk_collection_vamana
-  GTEST
-  SRCS test_disk_collection_vamana.cpp
-)
-alaya_cc_target(
-  test_vamana_adapter_overhead
-  GTEST
-  SRCS test_vamana_adapter_overhead.cpp
 )
 
 alaya_add_test(NAME disk_test_types TARGET disk_types_test)
@@ -135,17 +110,12 @@ alaya_add_test(
   LABELS disk segment stress tsan
   TIMEOUT 120
 )
-alaya_add_test(NAME disk_test_collection TARGET disk_collection_test)
-alaya_add_test(NAME test_disk_collection_lock TARGET test_disk_collection_lock)
 alaya_add_test(NAME disk_test_segment_factory TARGET segment_factory_test)
-alaya_add_test(NAME disk_test_collection_factory_dispatch TARGET disk_collection_factory_dispatch_test)
 alaya_add_test(NAME test_vamana_reader TARGET test_vamana_reader)
 alaya_add_test(NAME test_vamana_greedy_search TARGET test_vamana_greedy_search)
 alaya_add_test(NAME test_vamana_segment_builder TARGET test_vamana_segment_builder)
 alaya_add_test(NAME test_vamana_segment_searcher TARGET test_vamana_segment_searcher)
 alaya_add_test(NAME test_segment_factory_vamana TARGET test_segment_factory_vamana)
-alaya_add_test(NAME test_disk_collection_vamana TARGET test_disk_collection_vamana)
-alaya_add_test(NAME test_vamana_adapter_overhead TARGET test_vamana_adapter_overhead)
 
 if(ALAYA_ENABLE_LASER)
   alaya_cc_target(
@@ -179,10 +149,6 @@ if(ALAYA_ENABLE_LASER)
 
   set(ALAYA_LASER_SEGMENT_FIXTURE_AVAILABLE OFF)
   if(BUILD_PYTHON)
-    # The fixture generator imports the freshly built _alayalitepy from the build tree, so it depends on the module
-    # TARGET: CMake orders it after the module link and re-runs it when the module changes. Never invoke a nested `cmake
-    # --build` from inside a build rule here — two build systems compiling the same objects concurrently corrupt
-    # PCH/object files (observed as cc1plus ICEs) and .ninja_deps.
     add_custom_command(
       OUTPUT ${ALAYA_LASER_SEGMENT_FIXTURE_OUTPUTS}
       BYPRODUCTS ${ALAYA_LASER_SEGMENT_FIXTURE_DIR}/${ALAYA_LASER_SEGMENT_FIXTURE_PREFIX}_pca_base.fbin
@@ -207,8 +173,6 @@ if(ALAYA_ENABLE_LASER)
       test_laser_segment_importer.cpp
       test_laser_segment_searcher.cpp
       test_segment_factory_laser.cpp
-      test_disk_collection_laser.cpp
-      test_laser_adapter_overhead.cpp
       test_laser_searcher_thread_safety.cpp
       laser_segment_test.cpp
       laser_segment_stress_test.cpp
@@ -233,13 +197,7 @@ if(ALAYA_ENABLE_LASER)
                                               ALAYA_LASER_FIXTURE_PREFIX="${ALAYA_LASER_SEGMENT_FIXTURE_PREFIX}"
       )
     endif()
-    if(_laser_segment_test_target STREQUAL "test_laser_adapter_overhead")
-      alaya_add_test(
-        NAME ${_laser_segment_test_target}
-        TARGET ${_laser_segment_test_target}
-        LABELS laser performance
-      )
-    elseif(_laser_segment_test_target STREQUAL "laser_segment_test")
+    if(_laser_segment_test_target STREQUAL "laser_segment_test")
       alaya_add_test(
         NAME ${_laser_segment_test_target}
         TARGET ${_laser_segment_test_target}
@@ -265,30 +223,9 @@ if(ALAYA_ENABLE_LASER)
   if(ALAYA_LASER_SEGMENT_TEST_TARGETS)
     add_custom_target(test_laser_segment DEPENDS ${ALAYA_LASER_SEGMENT_TEST_TARGETS})
   endif()
-
-  # The hybrid Flat/Vamana/Laser batch_search test only needs the fixture, the alaya_laser link, and
-  # ALAYA_ENABLE_LASER=1 for its Laser-engine branch; the Flat/Vamana branches run everywhere.
-  alaya_cc_target(
-    test_disk_collection_batch_search
-    GTEST LASER
-    SRCS test_disk_collection_batch_search.cpp
-  )
-  if(ALAYA_LASER_SEGMENT_FIXTURE_AVAILABLE)
-    add_dependencies(test_disk_collection_batch_search laser_segment_fixture)
-    target_compile_definitions(
-      test_disk_collection_batch_search PRIVATE ALAYA_LASER_FIXTURE_DIR="${ALAYA_LASER_SEGMENT_FIXTURE_DIR}"
-                                                ALAYA_LASER_FIXTURE_PREFIX="${ALAYA_LASER_SEGMENT_FIXTURE_PREFIX}"
-    )
-  endif()
 else()
-  alaya_cc_target(
-    test_disk_collection_batch_search
-    GTEST
-    SRCS test_disk_collection_batch_search.cpp
-  )
-
   set(ALAYA_LASER_NEGATIVE_TEST_CANDIDATES test_laser_segment_importer.cpp test_laser_segment_searcher.cpp
-                                           test_segment_factory_laser.cpp test_disk_collection_laser.cpp
+                                           test_segment_factory_laser.cpp
   )
   set(ALAYA_LASER_NEGATIVE_TEST_TARGETS)
   foreach(laser_negative_test_source IN LISTS ALAYA_LASER_NEGATIVE_TEST_CANDIDATES)
@@ -309,5 +246,3 @@ else()
     add_custom_target(test_laser_segment_negative DEPENDS ${ALAYA_LASER_NEGATIVE_TEST_TARGETS})
   endif()
 endif()
-
-alaya_add_test(NAME test_disk_collection_batch_search TARGET test_disk_collection_batch_search)

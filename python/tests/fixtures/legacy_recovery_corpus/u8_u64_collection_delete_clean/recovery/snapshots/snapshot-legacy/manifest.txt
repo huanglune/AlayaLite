@@ -1,9 +1,0 @@
-format_version=1
-snapshot_id=snapshot-legacy
-reason=manual_save
-applied_through_op_id=1
-created_unix_ms=0
-graph_file=graph.snapshot
-data_file=data.snapshot
-quant_file=
-rocksdb_dir=rocksdb

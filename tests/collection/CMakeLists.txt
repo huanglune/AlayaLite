@@ -16,18 +16,7 @@ alaya_add_test(
   LABELS unit collection canonical
   TIMEOUT 60
 )
-alaya_cc_target(
-  collection_facade_importer_test
-  SRCS collection_facade_importer_test.cpp
-  GTEST
-  DEFS ALAYA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-)
-alaya_add_test(
-  NAME collection_facade_importer_test
-  TARGET collection_facade_importer_test
-  LABELS integration collection canonical migration
-  TIMEOUT 180
-)
+
 alaya_cc_target(
   collection_facade_stress_test
   SRCS collection_facade_stress_test.cpp
@@ -44,20 +33,7 @@ alaya_cc_target(mutation_wal_codec_header_closure SRCS mutation_wal_codec_header
 alaya_cc_target(collection_checkpoint_header_closure SRCS collection_checkpoint_header_closure.cpp)
 alaya_cc_target(filter_seal_gc_header_closure SRCS filter_seal_gc_header_closure.cpp)
 alaya_cc_target(collection_flat_target_header_closure SRCS collection_flat_target_header_closure.cpp)
-alaya_cc_target(legacy_importer_header_closure SRCS legacy_importer_header_closure.cpp)
 
-alaya_cc_target(
-  legacy_importer_test
-  SRCS legacy_importer_test.cpp
-  GTEST
-  DEFS ALAYA_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-)
-alaya_add_test(
-  NAME legacy_importer_test
-  TARGET legacy_importer_test
-  LABELS integration collection persistence migration
-  TIMEOUT 180
-)
 alaya_cc_target(manifest_v2_header_closure SRCS manifest_v2_header_closure.cpp)
 
 alaya_cc_target(
