@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-#include "storage/detail/rocksdb_storage.hpp"
+#include "storage/rocksdb_storage.hpp"
 #include "utils/metadata_filter.hpp"
 #include "utils/query_utils.hpp"
 #include "utils/scalar_data.hpp"

@@ -133,7 +133,7 @@ class HnswSegmentTest : public ::testing::Test {
         data_[row * kDim + col] = static_cast<float>((row * 17 + col * 5) % 101) / 101.0F;
       }
     }
-    space_ = std::make_shared<Space>(kCapacity, kDim, MetricType::L2);
+    space_ = std::make_shared<Space>(kCapacity, kDim, core::Metric::l2);
     space_->fit(data_.data(), kRows);
     core::BuildContext context;
     segment_ = Segment::build({core::TypedTensorView::contiguous(data_.data(), kRows, kDim),
@@ -279,7 +279,7 @@ TEST_F(HnswSegmentTest, OpenReadsLegacyRawArtifacts) {
 }
 
 TEST_F(HnswSegmentTest, OpenReadsLegacySq8GraphDataQuantFamily) {
-  auto sq8 = std::make_shared<SQ8Space<>>(kCapacity, kDim, MetricType::L2);
+  auto sq8 = std::make_shared<SQ8Space<>>(kCapacity, kDim, core::Metric::l2);
   sq8->fit(data_.data(), kRows);
 
   detail::HnswBuilderKernel<Space> legacy_builder(space_, 8, 32);
@@ -330,7 +330,7 @@ void verify_native_byte_query() {
       data[row * dim + col] = static_cast<T>(row + col);
     }
   }
-  auto space = std::make_shared<TypedSpace>(rows, dim, MetricType::L2);
+  auto space = std::make_shared<TypedSpace>(rows, dim, core::Metric::l2);
   space->fit(data.data(), rows);
   core::BuildContext context;
   auto segment =

@@ -12,8 +12,8 @@
 #include <string>
 #include <type_traits>
 #include "core/log.hpp"
-#include "core/metric_type.hpp"
 #include "core/platform.hpp"
+#include "core/value_types.hpp"
 #include "simd/distance_ip.hpp"
 #include "simd/distance_l2.hpp"
 #include "space/quant/sq8.hpp"
@@ -50,7 +50,7 @@ class SQ8Space {
 
   SQ8Space() = default;
 
-  SQ8Space(IDType capacity, size_t dim, MetricType metric)
+  SQ8Space(IDType capacity, size_t dim, core::Metric metric)
       : capacity_(capacity), dim_(dim), metric_(metric), quantizer_(dim) {
     data_size_ = dim_ * sizeof(uint8_t);
     data_storage_.init(data_size_, capacity);
@@ -66,11 +66,11 @@ class SQ8Space {
 
   void set_metric_function() {
     switch (metric_) {
-      case MetricType::L2:
+      case core::Metric::l2:
         distance_calu_func_ = simd::l2_sqr_sq8<DataType, DistanceType>;
         break;
-      case MetricType::COS:
-      case MetricType::IP:
+      case core::Metric::cosine:
+      case core::Metric::inner_product:
         distance_calu_func_ = simd::ip_sqr_sq8<DataType, DistanceType>;
         break;
       default:
@@ -116,9 +116,10 @@ class SQ8Space {
   auto get_dim() const -> uint32_t { return dim_; }
 
   auto metric() const -> core::Metric {
-    return metric_ == MetricType::L2
+    return metric_ == core::Metric::l2
                ? core::Metric::l2
-               : (metric_ == MetricType::IP ? core::Metric::inner_product : core::Metric::cosine);
+               : (metric_ == core::Metric::inner_product ? core::Metric::inner_product
+                                                         : core::Metric::cosine);
   }
 
   auto get_quantizer() const -> SQ8Quantizer<DataType> { return quantizer_; }
@@ -219,7 +220,7 @@ class SQ8Space {
  private:
   IDType capacity_{0};
   uint32_t dim_{0};
-  MetricType metric_{MetricType::L2};
+  core::Metric metric_{core::Metric::l2};
 
   DistanceFunction distance_calu_func_;
   uint32_t data_size_{0};

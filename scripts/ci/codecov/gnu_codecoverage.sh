@@ -50,7 +50,6 @@ COVERAGE_TARGETS=(
   query_utils_test
   log_test
   evaluate_test
-  metric_type_test
   data_utils_test
   dataset_utils_test
   index_encoding_test

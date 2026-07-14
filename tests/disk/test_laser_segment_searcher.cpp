@@ -28,7 +28,7 @@
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 
 #ifndef ALAYA_LASER_FIXTURE_DIR
   #define ALAYA_LASER_FIXTURE_DIR ""
@@ -170,7 +170,7 @@ class LaserSegmentSearcherTest : public ::testing::Test {
     std::filesystem::remove_all(tmp_root_, ec);
   }
 
-  static auto base_manifest(MetricType metric = MetricType::L2) -> SegmentManifest {
+  static auto base_manifest(core::Metric metric = core::Metric::l2) -> SegmentManifest {
     SegmentManifest manifest;
     manifest.segment_id = "seg_00000001";
     manifest.index_type = DiskIndexType::Laser;
@@ -211,7 +211,7 @@ class LaserSegmentSearcherTest : public ::testing::Test {
   auto import_fixture_segment(const std::vector<uint64_t> &ids,
                               const std::filesystem::path &src_dir = fixture_dir()) const
       -> SegmentManifest {
-    LaserSegmentImporter importer(kFixtureDim, MetricType::L2, {});
+    LaserSegmentImporter importer(kFixtureDim, core::Metric::l2, {});
     return importer.import_from(src_dir, ids.data(), ids.size(), seg_dir_);
   }
 
@@ -419,7 +419,7 @@ TEST_F(LaserSegmentSearcherTest, search_does_not_reopen_files) {
   const auto body = source.substr(start, end - start);
 
   for (const auto *forbidden :
-       {"SegmentManifest::load", "MMapFile", "::open", "mmap", "load_disk_index", "kMetricMap"}) {
+       {"SegmentManifest::load", "MMapFile", "::open", "mmap", "load_disk_index"}) {
     EXPECT_EQ(body.find(forbidden), std::string::npos) << forbidden << " found in search()";
   }
 }
@@ -466,7 +466,7 @@ TEST_F(LaserSegmentSearcherTest, works_without_optional_medoids_or_pca) {
 }
 
 TEST_F(LaserSegmentSearcherTest, cos_metric_rejected) {
-  write_manifest(base_manifest(MetricType::COS));
+  write_manifest(base_manifest(core::Metric::cosine));
 
   expect_runtime_message_contains(
       [&] {

@@ -150,12 +150,12 @@ TEST(CollectionManifestDualReader, MapsV1ToExplicitDefaultedEquivalentView) {
   std::filesystem::create_directories(segments);
   constexpr std::array<float, 4> vectors{0.0F, 1.0F, 2.0F, 3.0F};
   constexpr std::array<std::uint64_t, 2> labels{100, 101};
-  disk::DiskFlatBuilder builder(2, MetricType::L2);
+  disk::DiskFlatBuilder builder(2, core::Metric::l2);
   builder.add_batch(vectors.data(), labels.data(), labels.size());
   (void)builder.finish(segments / "seg_00000001");
   disk::CollectionManifest legacy;
   legacy.dim = 2;
-  legacy.metric = MetricType::L2;
+  legacy.metric = core::Metric::l2;
   legacy.index_type = disk::DiskIndexType::Flat;
   legacy.next_segment_id = 2;
   legacy.segment_ids = {"seg_00000001"};

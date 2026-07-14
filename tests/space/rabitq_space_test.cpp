@@ -46,7 +46,7 @@ class RaBitQSpaceTest : public ::testing::Test {
 
 TEST_F(RaBitQSpaceTest, ConstructionAndFit) {
   const uint32_t item_cnt = 3;
-  space_ = std::make_shared<SpaceType>(capacity_, dim_, MetricType::L2);
+  space_ = std::make_shared<SpaceType>(capacity_, dim_, core::Metric::l2);
   auto data = make_test_data(item_cnt);
   space_->fit(data.data(), item_cnt);
 
@@ -64,7 +64,7 @@ TEST_F(RaBitQSpaceTest, ConstructionAndFit) {
 
 TEST_F(RaBitQSpaceTest, DistanceComputation) {
   const uint32_t item_cnt = 2;
-  space_ = std::make_shared<SpaceType>(capacity_, dim_, MetricType::L2);
+  space_ = std::make_shared<SpaceType>(capacity_, dim_, core::Metric::l2);
 
   std::vector<float> data(2 * dim_, 0.0f);
   std::fill(data.begin() + dim_, data.end(), 1.0f);
@@ -77,7 +77,7 @@ TEST_F(RaBitQSpaceTest, DistanceComputation) {
 
 TEST_F(RaBitQSpaceTest, SaveAndLoad) {
   const uint32_t item_cnt = 2;
-  space_ = std::make_shared<SpaceType>(capacity_, dim_, MetricType::L2);
+  space_ = std::make_shared<SpaceType>(capacity_, dim_, core::Metric::l2);
   space_->set_ep(1);
 
   auto data = make_test_data(item_cnt);
@@ -108,13 +108,13 @@ TEST_F(RaBitQSpaceTest, SaveAndLoad) {
 }
 
 TEST_F(RaBitQSpaceTest, InvalidMetric3) {
-  EXPECT_THROW(space_ = std::make_shared<SpaceType>(capacity_, dim_, MetricType::NONE),
+  EXPECT_THROW(space_ = std::make_shared<SpaceType>(capacity_, dim_, core::Metric::l2),
                std::runtime_error);
 }
 
 TEST_F(RaBitQSpaceTest, ItemCntOverflow) {
   const uint32_t item_cnt = 11;
-  space_ = std::make_shared<SpaceType>(capacity_, dim_, MetricType::L2);
+  space_ = std::make_shared<SpaceType>(capacity_, dim_, core::Metric::l2);
 
   std::vector<float> data(item_cnt * dim_, 0.0f);
 
@@ -123,7 +123,7 @@ TEST_F(RaBitQSpaceTest, ItemCntOverflow) {
 
 TEST_F(RaBitQSpaceTest, SaveNonExistentPath) {
   const uint32_t item_cnt = 2;
-  space_ = std::make_shared<SpaceType>(capacity_, dim_, MetricType::L2);
+  space_ = std::make_shared<SpaceType>(capacity_, dim_, core::Metric::l2);
   space_->set_ep(1);
 
   auto data = make_test_data(item_cnt);
@@ -135,7 +135,7 @@ TEST_F(RaBitQSpaceTest, SaveNonExistentPath) {
 }
 
 TEST_F(RaBitQSpaceTest, LoadNonExistentPath) {
-  space_ = std::make_shared<SpaceType>(capacity_, dim_, MetricType::L2);
+  space_ = std::make_shared<SpaceType>(capacity_, dim_, core::Metric::l2);
 
   std::string_view invalid_path = "/nonexistent_dir/invalid_file.bin";
 

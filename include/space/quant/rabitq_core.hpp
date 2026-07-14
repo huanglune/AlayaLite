@@ -25,7 +25,7 @@
 #include <cstdint>
 #include <limits>
 
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 #include "utils/rabitq_utils/defines.hpp"
 
 namespace alaya {
@@ -42,7 +42,7 @@ struct RaBitQCore {
                                     const DataType *centroid,
                                     size_t dim,
                                     int *sign_bits,
-                                    const MetricType metric) -> RaBitQCoreFactors<DataType> {
+                                    const core::Metric metric) -> RaBitQCoreFactors<DataType> {
     kernels::linalg::ConstRowMajorArrayMap<DataType> data_arr(data, 1, dim);
     kernels::linalg::ConstRowMajorArrayMap<DataType> cent_arr(centroid, 1, dim);
     kernels::linalg::RowMajorArray<DataType> residual_arr = data_arr - cent_arr;
@@ -62,7 +62,7 @@ struct RaBitQCore {
       residual_dot_half_signed = std::numeric_limits<DataType>::infinity();
     }
 
-    if (metric == MetricType::L2) {
+    if (metric == core::Metric::l2) {
       return {
           residual_l2_sqr +
               (2 * residual_l2_sqr * centroid_dot_half_signed / residual_dot_half_signed),

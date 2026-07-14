@@ -39,7 +39,7 @@ struct DatasetSpec {
   std::filesystem::path query_file_;
   std::filesystem::path gt_file_;
   std::filesystem::path index_file_;
-  alaya::MetricType metric_;
+  alaya::core::Metric metric_;
 };
 
 struct QueryOnlyDataset {
@@ -97,7 +97,7 @@ auto parse_mode(std::string_view mode, const std::filesystem::path &repo_root) -
         .query_file_ = data_dir / "deep1M_query.fvecs",
         .gt_file_ = data_dir / "deep1M_groundtruth.ivecs",
         .index_file_ = data_dir / "deep1M_rabitq.qg",
-        .metric_ = alaya::MetricType::L2,
+        .metric_ = alaya::core::Metric::l2,
     };
   }
 
@@ -109,7 +109,7 @@ auto parse_mode(std::string_view mode, const std::filesystem::path &repo_root) -
         .query_file_ = data_dir / "query.fvecs",
         .gt_file_ = data_dir / "groundtruth.ivecs",
         .index_file_ = data_dir / "t2i1m_rabitq.qg",
-        .metric_ = alaya::MetricType::IP,
+        .metric_ = alaya::core::Metric::inner_product,
     };
   }
 

@@ -24,7 +24,7 @@ namespace {
 
 auto make_one_dim_space(const std::vector<float> &values) -> std::shared_ptr<RawSpace<>> {
   auto space =
-      std::make_shared<RawSpace<>>(static_cast<uint32_t>(values.size()), 1, MetricType::L2);
+      std::make_shared<RawSpace<>>(static_cast<uint32_t>(values.size()), 1, core::Metric::l2);
   space->fit(values.data(), static_cast<uint32_t>(values.size()));
   return space;
 }
@@ -37,7 +37,7 @@ class NSGTest : public ::testing::Test {
     std::filesystem::path data_dir = std::filesystem::current_path().parent_path() / "data";
     ds_ = load_dataset(sift_micro(data_dir));
 
-    space_ = std::make_shared<RawSpace<>>(ds_.data_num_, ds_.dim_, MetricType::L2);
+    space_ = std::make_shared<RawSpace<>>(ds_.data_num_, ds_.dim_, core::Metric::l2);
     space_->fit(ds_.data_.data(), ds_.data_num_);
     nsg_ = std::make_unique<detail::NsgBuilderKernel<RawSpace<>>>(space_);
   }
@@ -150,7 +150,7 @@ TEST_F(NSGSearchTest, SimpleSearchTest) {
 
   std::filesystem::path index_file = fmt::format("{}_M{}.{}", ds_.name_, kM, index_type);
   std::shared_ptr<alaya::RawSpace<>> space =
-      std::make_shared<alaya::RawSpace<>>(ds_.data_num_, ds_.dim_, MetricType::L2);
+      std::make_shared<alaya::RawSpace<>>(ds_.data_num_, ds_.dim_, core::Metric::l2);
   space->fit(ds_.data_.data(), ds_.data_num_);
 
   auto load_graph = std::make_shared<alaya::Graph<>>(ds_.data_num_, kM);

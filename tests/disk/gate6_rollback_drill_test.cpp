@@ -121,7 +121,7 @@ class TemporaryDirectory {
 void import_laser(const std::filesystem::path &segment_directory,
                   const std::vector<std::uint64_t> &labels,
                   const std::filesystem::path &source_directory = fixture_directory()) {
-  LaserSegmentImporter importer(kDim, MetricType::L2, {});
+  LaserSegmentImporter importer(kDim, core::Metric::l2, {});
   (void)importer.import_from(
       source_directory, labels.data(), labels.size(), segment_directory);
 }

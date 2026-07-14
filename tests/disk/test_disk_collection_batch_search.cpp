@@ -21,7 +21,7 @@
 
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/types.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 
 #ifndef ALAYA_LASER_FIXTURE_DIR
   #define ALAYA_LASER_FIXTURE_DIR ""
@@ -146,7 +146,7 @@ class BatchFlatTest : public BatchSearchTestBase {
   // colliding on the writer lock.
   auto build_two_segment_collection(uint64_t per_segment = 500) -> std::filesystem::path {
     const auto path = tmp_root_ / "coll";
-    DiskCollection col(path, kDim, MetricType::L2, DiskIndexType::Flat);
+    DiskCollection col(path, kDim, core::Metric::l2, DiskIndexType::Flat);
     auto v1 = make_vectors(per_segment, kDim, 1);
     auto l1 = sequential_labels(per_segment, 0);
     col.add_batch(v1.data(), l1.data(), per_segment);
@@ -186,7 +186,7 @@ TEST_F(BatchFlatTest, PaddingSentinels) {
   // Build a collection with exactly 3 vectors; request top_k = 10 so trailing
   // [3, 10) slots remain at the caller-pre-filled sentinels.
   const auto path = tmp_root_ / "coll";
-  DiskCollection col(path, kDim, MetricType::L2, DiskIndexType::Flat);
+  DiskCollection col(path, kDim, core::Metric::l2, DiskIndexType::Flat);
   const auto vectors = make_vectors(3, kDim, 11);
   const auto ids = sequential_labels(3, 100);
   col.add_batch(vectors.data(), ids.data(), 3);
@@ -252,7 +252,7 @@ TEST_F(BatchFlatTest, EmptyCollectionAllSentinels) {
   // Fresh collection with zero segments: spec contract 7 keeps every output
   // slot at the caller-pre-filled sentinel.
   const auto path = tmp_root_ / "coll";
-  DiskCollection col(path, kDim, MetricType::L2, DiskIndexType::Flat);
+  DiskCollection col(path, kDim, core::Metric::l2, DiskIndexType::Flat);
 
   const auto opts = default_opts();
   constexpr uint64_t kN = 4;
@@ -366,7 +366,7 @@ class BatchVamanaTest : public BatchSearchTestBase {
     const auto path = tmp_root_ / "coll";
     DiskCollection col(path,
                        kDim,
-                       MetricType::L2,
+                       core::Metric::l2,
                        DiskIndexType::Vamana,
                        DiskCollection::kDefaultMaxPendingBytes,
                        vamana_params());
@@ -469,7 +469,7 @@ TEST_F(BatchVamanaTest, EmptyCollectionAllSentinels) {
   const auto path = tmp_root_ / "coll";
   DiskCollection col(path,
                      kDim,
-                     MetricType::L2,
+                     core::Metric::l2,
                      DiskIndexType::Vamana,
                      DiskCollection::kDefaultMaxPendingBytes,
                      vamana_params());
@@ -652,7 +652,7 @@ class BatchLaserTest : public BatchSearchTestBase {
   // writer lock so callers don't reopen).
   auto build_one_segment_collection() -> DiskCollection {
     const auto path = tmp_root_ / "coll";
-    DiskCollection col(path, kLaserFixtureDim, MetricType::L2, DiskIndexType::Laser);
+    DiskCollection col(path, kLaserFixtureDim, core::Metric::l2, DiskIndexType::Laser);
     auto labels = sequential_labels(kLaserFixtureCount, 0);
     col.import_laser_segment(fixture_dir(), labels.data(), labels.size());
     return col;
@@ -756,7 +756,7 @@ TEST_F(BatchLaserTest, EmptyQueriesNoop) {
 TEST_F(BatchLaserTest, EmptyCollectionAllSentinels) {
   // Construct a Laser collection but skip import: segments_.empty() is true.
   const auto path = tmp_root_ / "coll";
-  DiskCollection col(path, kLaserFixtureDim, MetricType::L2, DiskIndexType::Laser);
+  DiskCollection col(path, kLaserFixtureDim, core::Metric::l2, DiskIndexType::Laser);
   const auto opts = default_opts();
   constexpr uint64_t kN = 4;
   const auto queries = make_vectors(kN, kLaserFixtureDim, 1);

@@ -5,7 +5,7 @@
 #include "index/disk/laser_segment_importer.hpp"
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/segment_manifest.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 
 #include <gtest/gtest.h>
 #include <unistd.h>
@@ -145,13 +145,13 @@ TEST_F(LaserSegmentImporterTest, laser_segment_importer_writes_expected_manifest
   const auto target = seg_dir();
   populate_artifacts(target.filename().string());
 
-  LaserSegmentImporter importer(kDim, MetricType::L2, {});
+  LaserSegmentImporter importer(kDim, core::Metric::l2, {});
   const auto manifest = importer.import_from(src_dir_, ids.data(), ids.size(), target);
 
   EXPECT_EQ(manifest.version, kManifestVersion);
   EXPECT_EQ(manifest.segment_id, "seg_00000001");
   EXPECT_EQ(manifest.index_type, DiskIndexType::Laser);
-  EXPECT_EQ(manifest.metric, MetricType::L2);
+  EXPECT_EQ(manifest.metric, core::Metric::l2);
   EXPECT_EQ(manifest.dim, kDim);
   EXPECT_EQ(manifest.count, ids.size());
   EXPECT_EQ(manifest.ids_file, "ids.u64.bin");
@@ -177,7 +177,7 @@ TEST_F(LaserSegmentImporterTest, minimum_required_artifacts) {
   const auto target = seg_dir();
   populate_artifacts(target.filename().string(), kCount, false);
 
-  LaserSegmentImporter importer(kDim, MetricType::L2, {});
+  LaserSegmentImporter importer(kDim, core::Metric::l2, {});
   importer.import_from(src_dir_, ids.data(), ids.size(), target);
 
   const auto manifest = SegmentManifest::load(target / "manifest.txt");
@@ -195,7 +195,7 @@ TEST_F(LaserSegmentImporterTest, refuses_existing_seg_dir) {
   std::filesystem::create_directories(target);
   write_bytes(target / "marker.txt", "keep");
 
-  LaserSegmentImporter importer(kDim, MetricType::L2, {});
+  LaserSegmentImporter importer(kDim, core::Metric::l2, {});
   EXPECT_THROW((void)importer.import_from(src_dir_, labels().data(), kCount, target),
                std::runtime_error);
   EXPECT_TRUE(std::filesystem::exists(target / "marker.txt"));
@@ -209,7 +209,7 @@ TEST_F(LaserSegmentImporterTest, rejects_missing_required_artifact) {
   const auto missing = src_dir_ / (index_filename(target.filename().string(), {}) + "_rotator");
   std::filesystem::remove(missing);
 
-  LaserSegmentImporter importer(kDim, MetricType::L2, {});
+  LaserSegmentImporter importer(kDim, core::Metric::l2, {});
   try {
     (void)importer.import_from(src_dir_, ids.data(), ids.size(), target);
     FAIL() << "expected missing artifact rejection";
@@ -226,7 +226,7 @@ TEST_F(LaserSegmentImporterTest, rejects_count_mismatch) {
   const auto target = seg_dir();
   const auto index_path = populate_artifacts(target.filename().string(), kCount + 1);
 
-  LaserSegmentImporter importer(kDim, MetricType::L2, {});
+  LaserSegmentImporter importer(kDim, core::Metric::l2, {});
   try {
     (void)importer.import_from(src_dir_, ids.data(), ids.size(), target);
     FAIL() << "expected count mismatch rejection";
@@ -241,7 +241,7 @@ TEST_F(LaserSegmentImporterTest, rejects_count_mismatch) {
 
 TEST_F(LaserSegmentImporterTest, rejects_ip_metric) {
   const auto target = seg_dir();
-  LaserSegmentImporter importer(kDim, MetricType::IP, {});
+  LaserSegmentImporter importer(kDim, core::Metric::inner_product, {});
   try {
     (void)importer.import_from(src_dir_, labels().data(), kCount, target);
     FAIL() << "expected IP metric rejection";
@@ -256,7 +256,7 @@ TEST_F(LaserSegmentImporterTest, rejects_ip_metric) {
 
 TEST_F(LaserSegmentImporterTest, rejects_cos_metric) {
   const auto target = seg_dir();
-  LaserSegmentImporter importer(kDim, MetricType::COS, {});
+  LaserSegmentImporter importer(kDim, core::Metric::cosine, {});
   try {
     (void)importer.import_from(src_dir_, labels().data(), kCount, target);
     FAIL() << "expected COS metric rejection";
@@ -270,7 +270,7 @@ TEST_F(LaserSegmentImporterTest, rejects_cos_metric) {
 
 TEST(LaserSegmentImporterConstructorTest, rejects_dim_below_floor) {
   try {
-    LaserSegmentImporter importer(64, MetricType::L2, {});
+    LaserSegmentImporter importer(64, core::Metric::l2, {});
     (void)importer;
     FAIL() << "expected dim floor rejection";
   } catch (const std::runtime_error &e) {
@@ -282,7 +282,7 @@ TEST(LaserSegmentImporterConstructorTest, rejects_dim_below_floor) {
 
 TEST(LaserSegmentImporterConstructorTest, rejects_dim_not_power_of_two) {
   try {
-    LaserSegmentImporter importer(300, MetricType::L2, {});
+    LaserSegmentImporter importer(300, core::Metric::l2, {});
     (void)importer;
     FAIL() << "expected power-of-two rejection";
   } catch (const std::runtime_error &e) {
@@ -304,7 +304,7 @@ TEST_F(LaserSegmentImporterTest, manifest_records_x_laser_extras) {
   const auto target = seg_dir();
   populate_artifacts(target.filename().string(), kCount, true, params);
 
-  LaserSegmentImporter importer(kDim, MetricType::L2, params);
+  LaserSegmentImporter importer(kDim, core::Metric::l2, params);
   importer.import_from(src_dir_, ids.data(), ids.size(), target);
 
   const auto manifest = SegmentManifest::load(target / "manifest.txt");
@@ -339,7 +339,7 @@ TEST_F(LaserSegmentImporterTest, native_artifact_byte_identical_to_source) {
   const auto target = seg_dir();
   populate_artifacts(target.filename().string());
 
-  LaserSegmentImporter importer(kDim, MetricType::L2, {});
+  LaserSegmentImporter importer(kDim, core::Metric::l2, {});
   importer.import_from(src_dir_, ids.data(), ids.size(), target);
 
   const auto manifest = SegmentManifest::load(target / "manifest.txt");
@@ -359,7 +359,7 @@ TEST_F(LaserSegmentImporterTest, native_artifact_byte_identical_to_source) {
 
 TEST(LaserSegmentImporterUnsupportedBuildTest, stub_throws_dual_substring_message) {
   try {
-    LaserSegmentImporter importer(128, MetricType::L2, {});
+    LaserSegmentImporter importer(128, core::Metric::l2, {});
     (void)importer;
     FAIL() << "expected unsupported Laser importer";
   } catch (const std::runtime_error &e) {

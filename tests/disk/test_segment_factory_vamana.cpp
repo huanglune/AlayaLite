@@ -15,7 +15,7 @@
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 
 namespace alaya::disk {
 namespace {
@@ -53,7 +53,7 @@ class SegmentFactoryVamanaTest : public ::testing::Test {
     return out;
   }
 
-  static auto manifest(DiskIndexType type, uint64_t dim, MetricType metric = MetricType::L2)
+  static auto manifest(DiskIndexType type, uint64_t dim, core::Metric metric = core::Metric::l2)
       -> CollectionManifest {
     CollectionManifest m;
     m.version = kManifestVersion;
@@ -184,7 +184,7 @@ TEST_F(SegmentFactoryVamanaTest, vamana_ip_throws_through_engine) {
 
   try {
     (void)create_segment_from_pending(seg_dir,
-                                      manifest(DiskIndexType::Vamana, kDim, MetricType::IP),
+                                      manifest(DiskIndexType::Vamana, kDim, core::Metric::inner_product),
                                       vectors.data(), ids.data(), ids.size());
     FAIL() << "expected Vamana IP rejection";
   } catch (const std::runtime_error &e) {

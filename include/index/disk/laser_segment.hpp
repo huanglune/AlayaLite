@@ -469,7 +469,7 @@ class LaserSegment {
     if (native.index_type != DiskIndexType::Laser) {
       return unavailable(stage, "LaserSegment received a non-LASER native manifest");
     }
-    if (native.metric != MetricType::L2) {
+    if (native.metric != core::Metric::l2) {
       return unavailable(stage, "LaserSegment first version supports L2 only");
     }
     if (native.version != kFormatVersion || native.dim == 0 || native.count == 0 ||

@@ -46,9 +46,9 @@
 #endif
 
 #include "core/log.hpp"
-#include "core/metric_type.hpp"
 #include "core/platform.hpp"
 #include "core/platform_fs.hpp"
+#include "core/value_types.hpp"
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
@@ -627,7 +627,7 @@ inline auto validate_vamana_params(const VamanaSegmentBuildParams &params,
 inline auto validate_vamana_manifest_config(const CollectionManifest &manifest,
                                             const VamanaSegmentBuildParams &params,
                                             const std::string &context) -> void {
-  if (manifest.metric != MetricType::L2) {
+  if (manifest.metric != core::Metric::l2) {
     throw std::runtime_error(context + ": metric must be L2 for disk_vamana");
   }
   validate_vamana_params(params, context);
@@ -681,14 +681,15 @@ class DiskCollection {
   // Public constructor: create-only.
   DiskCollection(const std::filesystem::path &path,
                  uint32_t dim,
-                 MetricType metric,
+                 core::Metric metric,
                  DiskIndexType index_type,
                  size_t max_pending_bytes = kDefaultMaxPendingBytes,
                  VamanaSegmentBuildParams vamana_params = VamanaSegmentBuildParams{}) {
     if (dim == 0) {
       throw std::invalid_argument("DiskCollection: dim must be > 0");
     }
-    if (metric != MetricType::L2 && metric != MetricType::IP && metric != MetricType::COS) {
+    if (metric != core::Metric::l2 && metric != core::Metric::inner_product &&
+        metric != core::Metric::cosine) {
       throw std::invalid_argument(
           "DiskCollection: metric must be one of L2, IP, COS (got NONE or unknown)");
     }

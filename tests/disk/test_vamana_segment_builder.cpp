@@ -18,7 +18,7 @@
 #include "index/disk/types.hpp"
 #include "index/disk/vamana_segment_builder.hpp"
 #include "index/graph/vamana/vamana_reader.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 
 namespace alaya::disk {
 namespace {
@@ -94,12 +94,12 @@ TEST_F(VamanaSegmentBuilderTest, vamana_segment_builder_writes_expected_files) {
   auto ids = labels(kN, 5000);
   const auto seg_dir = seg_parent_ / "seg_00000001";
 
-  VamanaSegmentBuilder builder(kDim, MetricType::L2, default_params());
+  VamanaSegmentBuilder builder(kDim, core::Metric::l2, default_params());
   builder.add_batch(vectors.data(), ids.data(), kN);
   auto manifest = builder.finish(seg_dir);
 
   EXPECT_EQ(manifest.index_type, DiskIndexType::Vamana);
-  EXPECT_EQ(manifest.metric, MetricType::L2);
+  EXPECT_EQ(manifest.metric, core::Metric::l2);
   EXPECT_EQ(manifest.dim, kDim);
   EXPECT_EQ(manifest.count, kN);
   EXPECT_EQ(manifest.ids_file, "ids.u64.bin");
@@ -136,7 +136,7 @@ TEST_F(VamanaSegmentBuilderTest, add_batch_no_pointer_retention) {
   auto ids = labels(kN, 9000);
   const auto seg_dir = seg_parent_ / "seg_00000002";
 
-  VamanaSegmentBuilder builder(kDim, MetricType::L2, default_params());
+  VamanaSegmentBuilder builder(kDim, core::Metric::l2, default_params());
   builder.add_batch(vectors.data(), ids.data(), kN);
   std::fill(vectors.begin(), vectors.end(), 0.0F);
   builder.finish(seg_dir);
@@ -157,7 +157,7 @@ TEST_F(VamanaSegmentBuilderTest, finish_refuses_existing_seg_dir) {
     marker << "keep";
   }
 
-  VamanaSegmentBuilder builder(kDim, MetricType::L2, default_params());
+  VamanaSegmentBuilder builder(kDim, core::Metric::l2, default_params());
   builder.add_batch(vectors.data(), ids.data(), ids.size());
   EXPECT_THROW(builder.finish(seg_dir), std::runtime_error);
   EXPECT_TRUE(std::filesystem::exists(seg_dir / "marker.txt"));
@@ -169,7 +169,7 @@ TEST_F(VamanaSegmentBuilderTest, finish_rejects_ip_metric) {
   auto ids = labels(32);
   const auto seg_dir = seg_parent_ / "seg_00000004";
 
-  VamanaSegmentBuilder builder(kDim, MetricType::IP, default_params());
+  VamanaSegmentBuilder builder(kDim, core::Metric::inner_product, default_params());
   builder.add_batch(vectors.data(), ids.data(), ids.size());
   try {
     (void)builder.finish(seg_dir);
@@ -188,7 +188,7 @@ TEST_F(VamanaSegmentBuilderTest, finish_rejects_cos_metric) {
   auto ids = labels(32);
   const auto seg_dir = seg_parent_ / "seg_00000005";
 
-  VamanaSegmentBuilder builder(kDim, MetricType::COS, default_params());
+  VamanaSegmentBuilder builder(kDim, core::Metric::cosine, default_params());
   builder.add_batch(vectors.data(), ids.data(), ids.size());
   try {
     (void)builder.finish(seg_dir);
@@ -215,7 +215,7 @@ TEST_F(VamanaSegmentBuilderTest, manifest_records_build_params) {
   params.seed = 7;
   params.num_threads = 1;
 
-  VamanaSegmentBuilder builder(kDim, MetricType::L2, params);
+  VamanaSegmentBuilder builder(kDim, core::Metric::l2, params);
   builder.add_batch(vectors.data(), ids.data(), kN);
   builder.finish(seg_dir);
 

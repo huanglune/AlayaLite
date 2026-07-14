@@ -10,7 +10,7 @@
 #endif
 
 #include "collection_binding.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 
 namespace py = pybind11;
 
@@ -30,10 +30,10 @@ PYBIND11_MODULE(_alayalitepy, module) {
   module.attr("__version__") = "dev";
 #endif
 
-  py::enum_<alaya::MetricType>(module, "MetricType")
-      .value("L2", alaya::MetricType::L2)
-      .value("IP", alaya::MetricType::IP)
-      .value("COS", alaya::MetricType::COS)
+  py::enum_<alaya::core::Metric>(module, "MetricType")
+      .value("L2", alaya::core::Metric::l2)
+      .value("IP", alaya::core::Metric::inner_product)
+      .value("COS", alaya::core::Metric::cosine)
       .export_values();
 
   alaya::python::collection_binding::register_collection(module);

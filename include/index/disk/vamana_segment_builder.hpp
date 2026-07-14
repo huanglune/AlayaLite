@@ -20,9 +20,9 @@
 // rename_no_replace, TmpDirGuard, is_finite_f32 / is_nan_f32 / is_neg_f32).
 // disk_flat_builder.hpp is a red-line file — included read-only here.
 #include "core/log.hpp"
-#include "core/metric_type.hpp"
 #include "core/platform.hpp"
 #include "core/platform_fs.hpp"
+#include "core/value_types.hpp"
 #include "index/disk/disk_flat_builder.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
@@ -54,7 +54,7 @@ struct VamanaSegmentBuildParams {
 // `finish` is single-shot; subsequent calls throw.
 class VamanaSegmentBuilder {
  public:
-  VamanaSegmentBuilder(uint32_t dim, MetricType metric, VamanaSegmentBuildParams params)
+  VamanaSegmentBuilder(uint32_t dim, core::Metric metric, VamanaSegmentBuildParams params)
       : dim_(dim), metric_(metric), params_(params) {
     if (dim == 0) {
       throw std::invalid_argument("VamanaSegmentBuilder: dim must be > 0");
@@ -229,11 +229,12 @@ class VamanaSegmentBuilder {
 
  private:
   auto ensure_metric_supported() const -> void {
-    if (metric_ == MetricType::L2) {
+    if (metric_ == core::Metric::l2) {
       return;
     }
-    const std::string m =
-        (metric_ == MetricType::IP) ? "ip" : ((metric_ == MetricType::COS) ? "cos" : "unknown");
+    const std::string m = (metric_ == core::Metric::inner_product)
+                              ? "ip"
+                              : ((metric_ == core::Metric::cosine) ? "cos" : "unknown");
     throw std::runtime_error("VamanaSegmentBuilder: metric '" + m +
                              "' not implemented in v1 (vamana adapter v1 supports L2 only)");
   }
@@ -243,7 +244,7 @@ class VamanaSegmentBuilder {
   }
 
   uint32_t dim_;
-  MetricType metric_;
+  core::Metric metric_;
   VamanaSegmentBuildParams params_;
   bool closed_ = false;
   std::vector<float> pending_vectors_;

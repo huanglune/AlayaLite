@@ -5,7 +5,7 @@
 #include "space/raw_space.hpp"
 #include <gtest/gtest.h>
 #include <cmath>
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 namespace alaya {
 
 using IDType = uint32_t;
@@ -15,7 +15,7 @@ using DistanceType = float;
 class RawSpaceTest : public ::testing::Test {
  protected:
   RawSpaceTest() {
-    space_ = std::make_unique<RawSpace<DataType, DistanceType, IDType>>(100, 3, MetricType::L2);
+    space_ = std::make_unique<RawSpace<DataType, DistanceType, IDType>>(100, 3, core::Metric::l2);
   }
 
   std::unique_ptr<RawSpace<DataType, DistanceType, IDType>> space_;
@@ -68,7 +68,7 @@ TEST_F(RawSpaceTest, TestDistanceUInt8) {
   std::vector<uint8_t> data1 = {183, 0, 0};
   std::vector<uint8_t> data2 = {107, 2, 3};
 
-  RawSpace<uint8_t> space(100, 3, MetricType::L2);
+  RawSpace<uint8_t> space(100, 3, core::Metric::l2);
 
   space.insert(data1.data());
   space.insert(data2.data());
@@ -84,7 +84,7 @@ TEST_F(RawSpaceTest, TestDistanceInnerProductMetric) {
   std::vector<float> data1 = {1.0F, 2.0F, 3.0F};
   std::vector<float> data2 = {4.0F, 5.0F, 6.0F};
 
-  RawSpace<DataType, DistanceType, IDType> space(100, 3, MetricType::IP);
+  RawSpace<DataType, DistanceType, IDType> space(100, 3, core::Metric::inner_product);
   space.insert(data1.data());
   space.insert(data2.data());
 
@@ -98,7 +98,7 @@ TEST_F(RawSpaceTest, TestDistanceCosineMetricUsesInnerProductPath) {
   std::vector<float> data1 = {1.0F, 0.0F, 2.0F};
   std::vector<float> data2 = {0.5F, 3.0F, 4.0F};
 
-  RawSpace<DataType, DistanceType, IDType> space(100, 3, MetricType::COS);
+  RawSpace<DataType, DistanceType, IDType> space(100, 3, core::Metric::cosine);
   space.insert(data1.data());
   space.insert(data2.data());
 

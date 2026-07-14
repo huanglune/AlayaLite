@@ -20,7 +20,7 @@
 #include "index/disk/disk_flat_builder.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 
 namespace alaya::disk {
 
@@ -82,14 +82,14 @@ TEST_F(DiskFlatBuilderTest, RoundtripL2) {
   auto vectors = make_random_vectors(kN, kDim);
   auto labels = sequential_labels(kN);
 
-  DiskFlatBuilder b(kDim, MetricType::L2);
+  DiskFlatBuilder b(kDim, core::Metric::l2);
   b.add_batch(vectors.data(), labels.data(), kN);
   auto seg_dir = seg_parent_ / "seg_00000001";
   auto manifest = b.finish(seg_dir);
 
   EXPECT_EQ(manifest.dim, kDim);
   EXPECT_EQ(manifest.count, kN);
-  EXPECT_EQ(manifest.metric, MetricType::L2);
+  EXPECT_EQ(manifest.metric, core::Metric::l2);
   EXPECT_EQ(manifest.index_type, DiskIndexType::Flat);
   EXPECT_EQ(manifest.segment_id, "seg_00000001");
 
@@ -101,7 +101,7 @@ TEST_F(DiskFlatBuilderTest, RoundtripL2) {
   EXPECT_EQ(loaded.segment_id, "seg_00000001");
   EXPECT_EQ(loaded.dim, kDim);
   EXPECT_EQ(loaded.count, kN);
-  EXPECT_EQ(loaded.metric, MetricType::L2);
+  EXPECT_EQ(loaded.metric, core::Metric::l2);
 
   EXPECT_EQ(std::filesystem::file_size(seg_dir / "ids.u64.bin"), kN * sizeof(uint64_t));
   EXPECT_EQ(std::filesystem::file_size(seg_dir / "vectors.f32.bin"),
@@ -115,11 +115,11 @@ TEST_F(DiskFlatBuilderTest, RoundtripL2) {
 }
 
 TEST_F(DiskFlatBuilderTest, ConstructionRejectsMetricNone) {
-  EXPECT_THROW(DiskFlatBuilder(16, MetricType::NONE), std::invalid_argument);
+  EXPECT_THROW(DiskFlatBuilder(16, core::Metric::l2), std::invalid_argument);
 }
 
 TEST_F(DiskFlatBuilderTest, ConstructionRejectsDimZero) {
-  EXPECT_THROW(DiskFlatBuilder(0, MetricType::L2), std::invalid_argument);
+  EXPECT_THROW(DiskFlatBuilder(0, core::Metric::l2), std::invalid_argument);
 }
 
 TEST_F(DiskFlatBuilderTest, CallerBufferNotMutatedBuildL2) {
@@ -130,7 +130,7 @@ TEST_F(DiskFlatBuilderTest, CallerBufferNotMutatedBuildL2) {
   const auto vec_hash_before = fnv1a64(vectors.data(), vectors.size() * sizeof(float));
   const auto lab_hash_before = fnv1a64(labels.data(), labels.size() * sizeof(uint64_t));
 
-  DiskFlatBuilder b(kDim, MetricType::L2);
+  DiskFlatBuilder b(kDim, core::Metric::l2);
   b.add_batch(vectors.data(), labels.data(), kN);
   b.finish(seg_parent_ / "seg_00000001");
 
@@ -146,7 +146,7 @@ TEST_F(DiskFlatBuilderTest, CallerBufferNotMutatedBuildIp) {
   const auto vec_hash_before = fnv1a64(vectors.data(), vectors.size() * sizeof(float));
   const auto lab_hash_before = fnv1a64(labels.data(), labels.size() * sizeof(uint64_t));
 
-  DiskFlatBuilder b(kDim, MetricType::IP);
+  DiskFlatBuilder b(kDim, core::Metric::inner_product);
   b.add_batch(vectors.data(), labels.data(), kN);
   b.finish(seg_parent_ / "seg_00000002");
 
@@ -162,7 +162,7 @@ TEST_F(DiskFlatBuilderTest, CallerBufferNotMutatedBuildCos) {
   const auto vec_hash_before = fnv1a64(vectors.data(), vectors.size() * sizeof(float));
   const auto lab_hash_before = fnv1a64(labels.data(), labels.size() * sizeof(uint64_t));
 
-  DiskFlatBuilder b(kDim, MetricType::COS);
+  DiskFlatBuilder b(kDim, core::Metric::cosine);
   b.add_batch(vectors.data(), labels.data(), kN);
   auto manifest = b.finish(seg_parent_ / "seg_00000003");
 
@@ -195,7 +195,7 @@ TEST_F(DiskFlatBuilderTest, ZeroVectorThrowsBuildCos) {
     vectors[7 * kDim + c] = 0.0F;
   }
 
-  DiskFlatBuilder b(kDim, MetricType::COS);
+  DiskFlatBuilder b(kDim, core::Metric::cosine);
   b.add_batch(vectors.data(), labels.data(), kN);
   try {
     (void)b.finish(seg_parent_ / "seg_00000001");
@@ -213,7 +213,7 @@ TEST_F(DiskFlatBuilderTest, ZeroVectorL2Succeeds) {
   std::vector<float> vectors(kN * kDim, 0.0F);
   auto labels = sequential_labels(kN);
 
-  DiskFlatBuilder b(kDim, MetricType::L2);
+  DiskFlatBuilder b(kDim, core::Metric::l2);
   b.add_batch(vectors.data(), labels.data(), kN);
   EXPECT_NO_THROW(b.finish(seg_parent_ / "seg_00000001"));
 }
@@ -224,7 +224,7 @@ TEST_F(DiskFlatBuilderTest, SubnormalMagnitudeCosSucceeds) {
   std::vector<float> vectors(kN * kDim, 1e-30F);
   auto labels = sequential_labels(kN);
 
-  DiskFlatBuilder b(kDim, MetricType::COS);
+  DiskFlatBuilder b(kDim, core::Metric::cosine);
   b.add_batch(vectors.data(), labels.data(), kN);
   ASSERT_NO_THROW(b.finish(seg_parent_ / "seg_00000001"));
 
@@ -241,7 +241,7 @@ TEST_F(DiskFlatBuilderTest, SubnormalMagnitudeCosSucceeds) {
 }
 
 class NonFiniteParam : public DiskFlatBuilderTest,
-                      public ::testing::WithParamInterface<MetricType> {};
+                      public ::testing::WithParamInterface<core::Metric> {};
 
 TEST_P(NonFiniteParam, NaNComponentThrows) {
   constexpr uint32_t kDim = 4;
@@ -291,10 +291,10 @@ TEST_P(NonFiniteParam, NegInfComponentThrows) {
 }
 
 INSTANTIATE_TEST_SUITE_P(AllMetrics, NonFiniteParam,
-                         ::testing::Values(MetricType::L2, MetricType::IP, MetricType::COS));
+                         ::testing::Values(core::Metric::l2, core::Metric::inner_product, core::Metric::cosine));
 
 TEST_F(DiskFlatBuilderTest, NZeroAddBatchIsNoop) {
-  DiskFlatBuilder b(8, MetricType::L2);
+  DiskFlatBuilder b(8, core::Metric::l2);
   EXPECT_NO_THROW(b.add_batch(nullptr, nullptr, 0));
   EXPECT_NO_THROW(b.add_batch(reinterpret_cast<const float *>(0xDEADBEEF),
                               reinterpret_cast<const uint64_t *>(0xCAFE), 0));
@@ -308,7 +308,7 @@ TEST_F(DiskFlatBuilderTest, NZeroAddBatchIsNoop) {
 }
 
 TEST_F(DiskFlatBuilderTest, ZeroBatchesThenFinishThrows) {
-  DiskFlatBuilder b(8, MetricType::L2);
+  DiskFlatBuilder b(8, core::Metric::l2);
   EXPECT_THROW(b.finish(seg_parent_ / "seg_00000001"), std::runtime_error);
 
   // No tmp dir was even created (we throw before mkdir).
@@ -319,7 +319,7 @@ TEST_F(DiskFlatBuilderTest, ZeroBatchesThenFinishThrows) {
 }
 
 TEST_F(DiskFlatBuilderTest, ReuseAfterFinishThrows) {
-  DiskFlatBuilder b(4, MetricType::L2);
+  DiskFlatBuilder b(4, core::Metric::l2);
   std::vector<float> v(4, 1.0F);
   std::vector<uint64_t> l{1};
   b.add_batch(v.data(), l.data(), 1);
@@ -333,7 +333,7 @@ TEST_F(DiskFlatBuilderTest, ExistingSegmentDirRefused) {
   auto seg_dir = seg_parent_ / "seg_00000001";
   std::filesystem::create_directories(seg_dir);
 
-  DiskFlatBuilder b(4, MetricType::L2);
+  DiskFlatBuilder b(4, core::Metric::l2);
   std::vector<float> v(4, 1.0F);
   std::vector<uint64_t> l{1};
   b.add_batch(v.data(), l.data(), 1);
@@ -370,7 +370,7 @@ TEST_F(DiskFlatBuilderTest, MidWriteFailureCleansTmp) {
   new_lim.rlim_max = old_lim.rlim_max;
   ASSERT_EQ(::setrlimit(RLIMIT_FSIZE, &new_lim), 0);
 
-  DiskFlatBuilder b(kDim, MetricType::L2);
+  DiskFlatBuilder b(kDim, core::Metric::l2);
   bool threw = false;
   try {
     b.add_batch(vectors.data(), labels.data(), kN);

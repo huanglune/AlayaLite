@@ -43,7 +43,7 @@ struct LaserSegmentImportParams {
 
 class LaserSegmentImporter {
  public:
-  LaserSegmentImporter(uint32_t dim, MetricType metric, LaserSegmentImportParams params);
+  LaserSegmentImporter(uint32_t dim, core::Metric metric, LaserSegmentImportParams params);
 
   auto import_from(const std::filesystem::path &src_dir,
                    const uint64_t *labels,
@@ -52,7 +52,7 @@ class LaserSegmentImporter {
 
  private:
   uint32_t dim_;
-  MetricType metric_;
+  core::Metric metric_;
   LaserSegmentImportParams params_;
 };
 
@@ -66,14 +66,14 @@ struct Artifact {
 
 inline auto is_power_of_two(uint32_t v) -> bool { return v != 0 && (v & (v - 1U)) == 0; }
 
-inline auto metric_name(MetricType metric) -> std::string {
-  if (metric == MetricType::IP) {
+inline auto metric_name(core::Metric metric) -> std::string {
+  if (metric == core::Metric::inner_product) {
     return "ip";
   }
-  if (metric == MetricType::COS) {
+  if (metric == core::Metric::cosine) {
     return "cos";
   }
-  if (metric == MetricType::L2) {
+  if (metric == core::Metric::l2) {
     return "l2";
   }
   return "unknown";
@@ -203,7 +203,7 @@ inline auto make_tmp_dir(const std::filesystem::path &parent, const std::string 
 }  // namespace laser_importer_detail
 
 inline LaserSegmentImporter::LaserSegmentImporter(uint32_t dim,
-                                                  MetricType metric,
+                                                  core::Metric metric,
                                                   LaserSegmentImportParams params)
     : dim_(dim), metric_(metric), params_(params) {
   if (dim == 0) {
@@ -239,7 +239,7 @@ inline auto LaserSegmentImporter::import_from(const std::filesystem::path &src_d
   }
   laser_importer_detail::reject_existing_segment_dir(seg_dir);
 
-  if (metric_ != MetricType::L2) {
+  if (metric_ != core::Metric::l2) {
     const auto m = laser_importer_detail::metric_name(metric_);
     throw std::runtime_error("LaserSegmentImporter: metric '" + m +
                              "' not implemented in v1 (laser adapter v1 supports L2 only)");
@@ -316,7 +316,7 @@ inline auto LaserSegmentImporter::import_from(const std::filesystem::path &src_d
   manifest.version = kManifestVersion;
   manifest.segment_id = seg_basename;
   manifest.index_type = DiskIndexType::Laser;
-  manifest.metric = MetricType::L2;
+  manifest.metric = core::Metric::l2;
   manifest.dim = dim_;
   manifest.count = n;
   manifest.ids_file = "ids.u64.bin";
@@ -369,7 +369,7 @@ struct LaserSegmentImportParams {
 class LaserSegmentImporter {
  public:
   [[noreturn]] LaserSegmentImporter(uint32_t /*dim*/,
-                                    MetricType /*metric*/,
+                                    core::Metric /*metric*/,
                                     LaserSegmentImportParams /*params*/) {
     throw std::runtime_error("LaserSegmentImporter: engine 'disk_laser' not implemented in v1");
   }

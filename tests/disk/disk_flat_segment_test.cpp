@@ -201,7 +201,7 @@ TEST(DiskFlatSegment, DifferentialBytesSearchExportAndLegacyBidirectionalOpen) {
   EXPECT_EQ(segment_reopened.value()->descriptor().algorithm_id, core::algorithm::flat);
   CollectionManifest legacy_collection;
   legacy_collection.dim = FixtureRows::kDim;
-  legacy_collection.metric = MetricType::L2;
+  legacy_collection.metric = core::Metric::l2;
   legacy_collection.index_type = DiskIndexType::Flat;
   legacy_collection.next_segment_id = 2;
   legacy_collection.segment_ids = {"seg_00000001"};

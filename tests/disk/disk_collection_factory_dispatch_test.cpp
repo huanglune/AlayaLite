@@ -19,7 +19,7 @@
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 
 namespace alaya::disk {
 
@@ -80,7 +80,7 @@ class DiskCollectionFactoryDispatchTest : public ::testing::Test {
 
 TEST_F(DiskCollectionFactoryDispatchTest, disk_collection_constructor_uses_factory_for_flat) {
   const auto coll = tmp_root_ / "coll";
-  EXPECT_NO_THROW(DiskCollection(coll, 16, MetricType::L2, DiskIndexType::Flat));
+  EXPECT_NO_THROW(DiskCollection(coll, 16, core::Metric::l2, DiskIndexType::Flat));
   EXPECT_TRUE(std::filesystem::exists(coll / "collection_manifest.txt"));
   EXPECT_TRUE(std::filesystem::is_directory(coll / "segments"));
 }
@@ -93,7 +93,7 @@ TEST_F(DiskCollectionFactoryDispatchTest, disk_collection_open_uses_factory_for_
   auto labels = sequential_labels(kN, 100);
   std::vector<DiskSearchHit> baseline;
   {
-    DiskCollection col(coll, kDim, MetricType::L2, DiskIndexType::Flat);
+    DiskCollection col(coll, kDim, core::Metric::l2, DiskIndexType::Flat);
     col.add_batch(vectors.data(), labels.data(), kN);
     col.flush();
     auto query = make_random_vectors(1, kDim, 99);
@@ -122,7 +122,7 @@ TEST_F(DiskCollectionFactoryDispatchTest, disk_collection_flush_uses_factory_for
   auto vectors = make_random_vectors(kN, kDim, 1);
   auto labels = sequential_labels(kN, 100);
   {
-    DiskCollection col(coll, kDim, MetricType::L2, DiskIndexType::Flat);
+    DiskCollection col(coll, kDim, core::Metric::l2, DiskIndexType::Flat);
     col.add_batch(vectors.data(), labels.data(), kN);
     col.flush();
   }
@@ -160,7 +160,7 @@ TEST_F(DiskCollectionFactoryDispatchTest,
   // DiskCollection's mutator path entirely.
   const auto seg1_dir = coll / "segments" / "seg_00000001";
   {
-    DiskFlatBuilder b(kDim, MetricType::L2);
+    DiskFlatBuilder b(kDim, core::Metric::l2);
     std::vector<float> v(kDim, 1.0F);
     std::vector<uint64_t> l{42};
     b.add_batch(v.data(), l.data(), 1);
@@ -206,7 +206,7 @@ TEST_F(DiskCollectionFactoryDispatchTest,
   const auto seg2_dir = coll / "segments" / "seg_00000002";
   // Build seg_00000001: labels {10, 20, 30}.
   {
-    DiskFlatBuilder b(kDim, MetricType::L2);
+    DiskFlatBuilder b(kDim, core::Metric::l2);
     auto v = make_random_vectors(3, kDim, 1);
     std::vector<uint64_t> l{10, 20, 30};
     b.add_batch(v.data(), l.data(), 3);
@@ -214,7 +214,7 @@ TEST_F(DiskCollectionFactoryDispatchTest,
   }
   // Build seg_00000002: labels {40, 50, 60}.
   {
-    DiskFlatBuilder b(kDim, MetricType::L2);
+    DiskFlatBuilder b(kDim, core::Metric::l2);
     auto v = make_random_vectors(3, kDim, 2);
     std::vector<uint64_t> l{40, 50, 60};
     b.add_batch(v.data(), l.data(), 3);
@@ -255,7 +255,7 @@ TEST_F(DiskCollectionFactoryDispatchTest,
 
 TEST_F(DiskCollectionFactoryDispatchTest, disk_collection_constructor_accepts_disk_vamana) {
   const auto coll = tmp_root_ / "coll_v";
-  EXPECT_NO_THROW(DiskCollection(coll, 8, MetricType::L2, DiskIndexType::Vamana));
+  EXPECT_NO_THROW(DiskCollection(coll, 8, core::Metric::l2, DiskIndexType::Vamana));
   auto manifest = CollectionManifest::load(coll / "collection_manifest.txt");
   EXPECT_EQ(manifest.index_type, DiskIndexType::Vamana);
 }
@@ -263,7 +263,7 @@ TEST_F(DiskCollectionFactoryDispatchTest, disk_collection_constructor_accepts_di
 TEST_F(DiskCollectionFactoryDispatchTest, disk_collection_constructor_rejects_disk_laser) {
   const auto coll = tmp_root_ / "coll_l";
   try {
-    (void)DiskCollection(coll, 8, MetricType::L2, DiskIndexType::Laser);
+    (void)DiskCollection(coll, 8, core::Metric::l2, DiskIndexType::Laser);
     FAIL() << "expected throw on Laser";
   } catch (const std::runtime_error &e) {
     const std::string msg = e.what();
@@ -304,7 +304,7 @@ namespace {
 // Helper: build a 1-segment collection containing label 1 so subsequent
 // flushes will trigger the cross-segment inventory path.
 void seed_one_segment_collection(const std::filesystem::path &coll, uint32_t dim) {
-  DiskCollection col(coll, dim, MetricType::L2, DiskIndexType::Flat);
+  DiskCollection col(coll, dim, core::Metric::l2, DiskIndexType::Flat);
   std::vector<float> v(dim, 1.0F);
   std::vector<uint64_t> l{1};
   col.add_batch(v.data(), l.data(), 1);
@@ -353,7 +353,7 @@ TEST_F(DiskCollectionFactoryDispatchTest, flush_throws_on_truncated_ids_file) {
   // Seed with two ids so the inventory size check has something to compare
   // against (count=2 → expected 16 bytes).
   {
-    DiskCollection col(coll, kDim, MetricType::L2, DiskIndexType::Flat);
+    DiskCollection col(coll, kDim, core::Metric::l2, DiskIndexType::Flat);
     std::vector<float> v(kDim * 2, 1.0F);
     std::vector<uint64_t> l{1, 2};
     col.add_batch(v.data(), l.data(), 2);
@@ -455,7 +455,7 @@ TEST_F(DiskCollectionFactoryDispatchTest, flat_search_inner_loop_does_not_open_f
   constexpr uint64_t kN = 64;
   const auto seg_dir = tmp_root_ / "seg_00000001";
   {
-    DiskFlatBuilder b(kDim, MetricType::L2);
+    DiskFlatBuilder b(kDim, core::Metric::l2);
     auto v = make_random_vectors(kN, kDim, 1);
     auto l = sequential_labels(kN, 0);
     b.add_batch(v.data(), l.data(), kN);
@@ -484,7 +484,7 @@ TEST_F(DiskCollectionFactoryDispatchTest, flat_search_inner_loop_does_not_remap)
   constexpr uint64_t kN = 64;
   const auto seg_dir = tmp_root_ / "seg_00000001";
   {
-    DiskFlatBuilder b(kDim, MetricType::L2);
+    DiskFlatBuilder b(kDim, core::Metric::l2);
     auto v = make_random_vectors(kN, kDim, 1);
     auto l = sequential_labels(kN, 0);
     b.add_batch(v.data(), l.data(), kN);

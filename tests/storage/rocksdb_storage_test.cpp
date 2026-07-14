@@ -9,7 +9,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "storage/detail/rocksdb_storage.hpp"
+#include "storage/rocksdb_storage.hpp"
 #include "utils/scalar_data.hpp"
 
 namespace alaya {

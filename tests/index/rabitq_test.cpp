@@ -46,7 +46,7 @@ TEST_F(RaBitQSiftSmallTest, SiftSmallQGTest) {  // for code coverage
 
   if (!std::filesystem::exists(index_file)) {
     std::shared_ptr<alaya::RaBitQSpace<>> space =
-        std::make_shared<alaya::RaBitQSpace<>>(ds_.data_num_, ds_.dim_, MetricType::L2);
+        std::make_shared<alaya::RaBitQSpace<>>(ds_.data_num_, ds_.dim_, core::Metric::l2);
     space->fit(ds_.data_.data(), ds_.data_num_);
     LOG_INFO("Successfully fit data into space");
 
@@ -62,7 +62,7 @@ TEST_F(RaBitQSiftSmallTest, SiftSmallQGTest) {  // for code coverage
   auto search_job = std::make_unique<alaya::GraphSearchJob<RaBitQSpace<>>>(load_space, nullptr);
 
   // std::shared_ptr<alaya::RaBitQSpace<>> space =
-  //     std::make_shared<alaya::RaBitQSpace<>>(ds_.data_num_, ds_.dim_, MetricType::L2);
+  //     std::make_shared<alaya::RaBitQSpace<>>(ds_.data_num_, ds_.dim_, core::Metric::l2);
   // space->fit(ds_.data_.data(), ds_.data_num_);
   // LOG_INFO("Successfully fit data into space");
 
@@ -126,7 +126,7 @@ TEST_F(RaBitQSiftSmallTest, InvalidParameterTest) {
 
   if (!std::filesystem::exists(index_file)) {
     std::shared_ptr<alaya::RaBitQSpace<>> space =
-        std::make_shared<alaya::RaBitQSpace<>>(ds_.data_num_, ds_.dim_, MetricType::L2);
+        std::make_shared<alaya::RaBitQSpace<>>(ds_.data_num_, ds_.dim_, core::Metric::l2);
     space->fit(ds_.data_.data(), ds_.data_num_);
 
     auto qg = alaya::detail::QgBuilderKernel<RaBitQSpace<>>(space);

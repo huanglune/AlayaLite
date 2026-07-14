@@ -77,7 +77,7 @@ struct Rows {
 }
 
 [[nodiscard]] auto build_hnsw(const Rows &rows) -> std::unique_ptr<Hnsw> {
-  auto space = std::make_shared<RawSpace<>>(kRowsPerSegment + 8, kDim, MetricType::L2);
+  auto space = std::make_shared<RawSpace<>>(kRowsPerSegment + 8, kDim, core::Metric::l2);
   space->fit(rows.vectors.data(), kRowsPerSegment);
   core::BuildContext context;
   return Hnsw::build({core::TypedTensorView::contiguous(rows.vectors.data(),

@@ -44,7 +44,7 @@ static_assert(offsetof(disk_laser_qg::Factor, factor_vq) == 2 * sizeof(float));
 
 TEST(QGNamingContract, MemoryV1FactorArraysKeepSerializedOrder) {
   constexpr size_t kDim = 64;
-  MemorySpace space(/*capacity=*/1, kDim, MetricType::L2);
+  MemorySpace space(/*capacity=*/1, kDim, core::Metric::l2);
   std::vector<float> data(kDim, 0.0F);
   space.fit(data.data(), /*item_cnt=*/1);
 

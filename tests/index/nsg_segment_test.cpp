@@ -135,7 +135,7 @@ class NsgSegmentTest : public ::testing::Test {
             static_cast<float>((row * 17 + col * 5 + (row % 7) * col) % 101) / 101.0F;
       }
     }
-    space_ = std::make_shared<Space>(kCapacity, kDim, MetricType::L2);
+    space_ = std::make_shared<Space>(kCapacity, kDim, core::Metric::l2);
     space_->fit(data_.data(), kRows);
     core::BuildContext context;
     segment_ = Segment::build({core::TypedTensorView::contiguous(data_.data(), kRows, kDim),
@@ -290,7 +290,7 @@ TEST_F(NsgSegmentTest, OpenReadsLegacyArtifactsAndRoundTripsBytes) {
 }
 
 TEST_F(NsgSegmentTest, QuantizedArtifactFamilyRoundTripsWithoutCodecChanges) {
-  auto sq8 = std::make_shared<SQ8Space<>>(kCapacity, kDim, MetricType::L2);
+  auto sq8 = std::make_shared<SQ8Space<>>(kCapacity, kDim, core::Metric::l2);
   sq8->fit(data_.data(), kRows);
   core::BuildContext build_context;
   auto quantized =

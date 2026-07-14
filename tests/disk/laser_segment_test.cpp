@@ -130,7 +130,7 @@ class TemporaryDirectory {
 
 void import_fixture(const std::filesystem::path &segment_directory,
                     const std::vector<std::uint64_t> &labels) {
-  LaserSegmentImporter importer(kDim, MetricType::L2, {});
+  LaserSegmentImporter importer(kDim, core::Metric::l2, {});
   (void)importer.import_from(fixture_directory(), labels.data(), labels.size(), segment_directory);
 }
 
@@ -208,7 +208,7 @@ TEST(LaserSegment, DifferentialRankOnlyManifestGateCollectionRejectionAndPerform
 
   CollectionManifest legacy_collection;
   legacy_collection.dim = kDim;
-  legacy_collection.metric = MetricType::L2;
+  legacy_collection.metric = core::Metric::l2;
   legacy_collection.index_type = DiskIndexType::Laser;
   legacy_collection.next_segment_id = 2;
   legacy_collection.segment_ids = {"seg_00000001"};

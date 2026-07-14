@@ -33,7 +33,7 @@ class NnDescentTest : public ::testing::Test {
     std::filesystem::path data_dir = std::filesystem::current_path().parent_path() / "data";
     ds_ = load_dataset(sift_micro(data_dir));
 
-    space_ = std::make_shared<RawSpace<>>(ds_.data_num_, ds_.dim_, MetricType::L2);
+    space_ = std::make_shared<RawSpace<>>(ds_.data_num_, ds_.dim_, core::Metric::l2);
     space_->fit(ds_.data_.data(), ds_.data_num_);
     nn_descent_ = std::make_unique<NndescentImpl<RawSpace<>>>(space_, topk_);
   }
@@ -76,7 +76,7 @@ TEST_F(NnDescentSearchTest, SimpleSearchTest) {
 
   std::filesystem::path index_file = fmt::format("{}_M{}.{}", ds_.name_, kM, index_type);
   std::shared_ptr<alaya::RawSpace<>> space =
-      std::make_shared<alaya::RawSpace<>>(ds_.data_num_, ds_.dim_, MetricType::L2);
+      std::make_shared<alaya::RawSpace<>>(ds_.data_num_, ds_.dim_, core::Metric::l2);
   space->fit(ds_.data_.data(), ds_.data_num_);
 
   auto load_graph = std::make_shared<alaya::Graph<>>(ds_.data_num_, kM);

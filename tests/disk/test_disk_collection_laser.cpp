@@ -23,7 +23,7 @@
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 
 #ifndef ALAYA_LASER_FIXTURE_DIR
   #define ALAYA_LASER_FIXTURE_DIR ""
@@ -256,7 +256,7 @@ class DiskCollectionLaserTest : public ::testing::Test {
 
 TEST_F(DiskCollectionLaserTest, import_on_non_laser_collection_throws) {
   const auto coll = tmp_root_ / "coll";
-  DiskCollection col(coll, 128, MetricType::L2, DiskIndexType::Flat);
+  DiskCollection col(coll, 128, core::Metric::l2, DiskIndexType::Flat);
   std::vector<uint64_t> labels{42};
 
   try {
@@ -275,7 +275,7 @@ TEST_F(DiskCollectionLaserTest, import_on_non_laser_collection_throws) {
 TEST_F(DiskCollectionLaserTest, laser_unsupported_when_disabled) {
   const auto coll = tmp_root_ / "coll";
   try {
-    (void)DiskCollection(coll, 128, MetricType::L2, DiskIndexType::Laser);
+    (void)DiskCollection(coll, 128, core::Metric::l2, DiskIndexType::Laser);
     FAIL() << "expected disk_laser constructor rejection";
   } catch (const std::runtime_error &e) {
     const std::string msg = e.what();
@@ -297,7 +297,7 @@ TEST_F(DiskCollectionLaserTest, laser_unsupported_when_disabled) {
 
 TEST_F(DiskCollectionLaserTest, constructor_accepts_laser_when_enabled) {
   const auto coll = tmp_root_ / "coll";
-  DiskCollection col(coll, 128, MetricType::L2, DiskIndexType::Laser);
+  DiskCollection col(coll, 128, core::Metric::l2, DiskIndexType::Laser);
   auto manifest = CollectionManifest::load(coll / "collection_manifest.txt");
   EXPECT_EQ(manifest.index_type, DiskIndexType::Laser);
   EXPECT_EQ(col.size(), 0u);
@@ -305,7 +305,7 @@ TEST_F(DiskCollectionLaserTest, constructor_accepts_laser_when_enabled) {
 
 TEST_F(DiskCollectionLaserTest, add_batch_rejects_laser) {
   const auto coll = tmp_root_ / "coll";
-  DiskCollection col(coll, 128, MetricType::L2, DiskIndexType::Laser);
+  DiskCollection col(coll, 128, core::Metric::l2, DiskIndexType::Laser);
   std::vector<float> vectors(128, 0.0F);
   std::vector<uint64_t> labels{7};
 
@@ -325,7 +325,7 @@ TEST_F(DiskCollectionLaserTest, add_batch_rejects_laser) {
 
 TEST_F(DiskCollectionLaserTest, add_batch_rejects_laser_even_when_n_is_zero) {
   const auto coll = tmp_root_ / "coll";
-  DiskCollection col(coll, 128, MetricType::L2, DiskIndexType::Laser);
+  DiskCollection col(coll, 128, core::Metric::l2, DiskIndexType::Laser);
 
   try {
     col.add_batch(nullptr, nullptr, 0);
@@ -342,7 +342,7 @@ TEST_F(DiskCollectionLaserTest, add_batch_rejects_laser_even_when_n_is_zero) {
 
 TEST_F(DiskCollectionLaserTest, flush_on_empty_laser_is_noop) {
   const auto coll = tmp_root_ / "coll";
-  DiskCollection col(coll, 128, MetricType::L2, DiskIndexType::Laser);
+  DiskCollection col(coll, 128, core::Metric::l2, DiskIndexType::Laser);
   const auto before = CollectionManifest::load(coll / "collection_manifest.txt");
 
   EXPECT_NO_THROW(col.flush());
@@ -362,7 +362,7 @@ TEST_F(DiskCollectionLaserTest, import_laser_segment_writes_segment) {
   auto labels = identity_labels();
 
   {
-    DiskCollection col(coll, kLaserFixtureDim, MetricType::L2, DiskIndexType::Laser);
+    DiskCollection col(coll, kLaserFixtureDim, core::Metric::l2, DiskIndexType::Laser);
     col.import_laser_segment(fixture_dir(), labels.data(), labels.size());
     EXPECT_EQ(col.size(), kLaserFixtureCount);
   }
@@ -403,7 +403,7 @@ TEST_F(DiskCollectionLaserTest, multi_laser_segment_search) {
   auto labels2 = transformed_labels(kLaserFixtureCount, 2, 0);
 
   {
-    DiskCollection col(coll, kLaserFixtureDim, MetricType::L2, DiskIndexType::Laser);
+    DiskCollection col(coll, kLaserFixtureDim, core::Metric::l2, DiskIndexType::Laser);
     col.import_laser_segment(fixture_dir(), labels1.data(), labels1.size());
 
     const auto first_segment_hits = col.search(query_row(vectors, 0), search_options());
@@ -459,7 +459,7 @@ TEST_F(DiskCollectionLaserTest, duplicate_label_across_laser_segments_throws) {
   auto labels2 = identity_labels(kLaserFixtureCount, 100000);
   labels2[17] = 42;
 
-  DiskCollection col(coll, kLaserFixtureDim, MetricType::L2, DiskIndexType::Laser);
+  DiskCollection col(coll, kLaserFixtureDim, core::Metric::l2, DiskIndexType::Laser);
   col.import_laser_segment(fixture_dir(), labels1.data(), labels1.size());
   EXPECT_EQ(col.size(), kLaserFixtureCount);
 
@@ -487,7 +487,7 @@ TEST_F(DiskCollectionLaserTest, open_classifies_laser_orphans) {
   auto labels = identity_labels();
 
   {
-    DiskCollection col(coll, kLaserFixtureDim, MetricType::L2, DiskIndexType::Laser);
+    DiskCollection col(coll, kLaserFixtureDim, core::Metric::l2, DiskIndexType::Laser);
     col.import_laser_segment(fixture_dir(), labels.data(), labels.size());
     EXPECT_EQ(col.size(), kLaserFixtureCount);
   }
@@ -527,7 +527,7 @@ TEST_F(DiskCollectionLaserTest, orphan_classification_tolerates_empty_vectors_fi
   SegmentManifest sm;
   sm.segment_id = "seg_00000001";
   sm.index_type = DiskIndexType::Laser;
-  sm.metric = MetricType::L2;
+  sm.metric = core::Metric::l2;
   sm.dim = 128;
   sm.count = 1;
   sm.ids_file = "ids.u64.bin";

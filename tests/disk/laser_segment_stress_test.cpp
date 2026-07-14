@@ -80,7 +80,7 @@ TEST(LaserSegmentStress, ConcurrentSearchOnlyIsReentrant) {
   std::filesystem::create_directories(root / "segments");
   std::vector<std::uint64_t> labels(kCount);
   std::iota(labels.begin(), labels.end(), std::uint64_t{0});
-  LaserSegmentImporter importer(kDim, MetricType::L2, {});
+  LaserSegmentImporter importer(kDim, core::Metric::l2, {});
   (void)importer.import_from(fixture, labels.data(), labels.size(), root / "segments/seg_00000001");
 
   const auto vector_path = fixture / (std::string(ALAYA_LASER_FIXTURE_PREFIX) + "_input.fbin");

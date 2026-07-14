@@ -208,7 +208,7 @@ TEST(DiskVamanaSegment, DifferentialBytesSearchAndBidirectionalOpenAreExact) {
 
   CollectionManifest legacy_collection;
   legacy_collection.dim = FixtureRows::kDim;
-  legacy_collection.metric = MetricType::L2;
+  legacy_collection.metric = core::Metric::l2;
   legacy_collection.index_type = DiskIndexType::Vamana;
   legacy_collection.next_segment_id = 2;
   legacy_collection.segment_ids = {"seg_00000001"};
@@ -322,8 +322,8 @@ TEST(DiskVamanaSegment, NonL2BuildAndOpenReturnTheFirstVersionGate) {
                                                FixtureRows::params(),
                                                legacy_dir);
   ASSERT_TRUE(legacy.ok()) << legacy.status().diagnostic();
-  for (const auto [metric, name] : {std::pair{MetricType::IP, std::string_view("inner_product")},
-                                    std::pair{MetricType::COS, std::string_view("cosine")}}) {
+  for (const auto [metric, name] : {std::pair{core::Metric::inner_product, std::string_view("inner_product")},
+                                    std::pair{core::Metric::cosine, std::string_view("cosine")}}) {
     auto manifest = SegmentManifest::load(legacy_dir / "manifest.txt");
     manifest.metric = metric;
     manifest.save(legacy_dir / "manifest.txt");

@@ -137,7 +137,7 @@ class FusionSegmentTest : public ::testing::Test {
             static_cast<float>((row * 19 + col * 7 + (row % 5) * col) % 103) / 103.0F;
       }
     }
-    space_ = std::make_shared<Space>(kCapacity, kDim, MetricType::L2);
+    space_ = std::make_shared<Space>(kCapacity, kDim, core::Metric::l2);
     space_->fit(data_.data(), kRows);
     core::BuildContext context;
     segment_ = Segment::build({core::TypedTensorView::contiguous(data_.data(), kRows, kDim),
@@ -271,7 +271,7 @@ TEST_F(FusionSegmentTest, LegacyAndQuantizedArtifactsOpenAndRoundTripByteForByte
   SearchCall raw_call(data_.data(), 1, kDim, 4, 24);
   ASSERT_TRUE(reopened->search(raw_call.request).ok());
 
-  auto sq8 = std::make_shared<SQ8Space<>>(kCapacity, kDim, MetricType::L2);
+  auto sq8 = std::make_shared<SQ8Space<>>(kCapacity, kDim, core::Metric::l2);
   sq8->fit(data_.data(), kRows);
   core::BuildContext build_context;
   auto quantized =
@@ -314,7 +314,7 @@ TEST(FusionSegmentWideIdTest, OpensLegacyUint64OverlayHeaderAndSearches) {
       data[row * dim + col] = static_cast<float>((row * 23 + col * 3) % 109) / 109.0F;
     }
   }
-  auto space = std::make_shared<WideSpace>(capacity, dim, MetricType::L2);
+  auto space = std::make_shared<WideSpace>(capacity, dim, core::Metric::l2);
   space->fit(data.data(), rows);
   using WideKernel = detail::FusionBuilderKernel<WideSpace,
                                                  detail::HnswBuilderKernel<WideSpace>,

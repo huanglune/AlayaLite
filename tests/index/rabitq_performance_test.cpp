@@ -46,7 +46,7 @@ TEST_F(RaBitQDeep1MTest, Deep1MQGTest) {
 
   if (!std::filesystem::exists(index_file)) {
     std::shared_ptr<alaya::RaBitQSpace<>> space =
-        std::make_shared<alaya::RaBitQSpace<>>(ds_.data_num_, ds_.dim_, MetricType::L2);
+        std::make_shared<alaya::RaBitQSpace<>>(ds_.data_num_, ds_.dim_, core::Metric::l2);
     space->fit(ds_.data_.data(), ds_.data_num_);
     LOG_INFO("Successfully fit data into space, data_num={}, dim={}", ds_.data_num_, ds_.dim_);
 
@@ -136,7 +136,7 @@ TEST_F(RaBitQT2I1MTest, DISABLED_T2I1MQGTest) {
 
   if (!std::filesystem::exists(index_file)) {
     std::shared_ptr<alaya::RaBitQSpace<>> space =
-        std::make_shared<alaya::RaBitQSpace<>>(ds_.data_num_, ds_.dim_, MetricType::IP);
+        std::make_shared<alaya::RaBitQSpace<>>(ds_.data_num_, ds_.dim_, core::Metric::inner_product);
     space->fit(ds_.data_.data(), ds_.data_num_);
     LOG_INFO("Successfully fit data into space, data_num={}, dim={}", ds_.data_num_, ds_.dim_);
 

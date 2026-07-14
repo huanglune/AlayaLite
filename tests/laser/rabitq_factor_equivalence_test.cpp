@@ -16,7 +16,7 @@
 
 #include "index/graph/laser/quantization/rabitq.hpp"
 #include "space/quant/rabitq.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 
 namespace alaya {
 namespace {
@@ -92,7 +92,7 @@ TEST(RaBitQFactorEquivalence, L2FactorsCodesAndEstimatorsAgree) {
                                     memory_codes.data(),
                                     f_add.data(),
                                     f_rescale.data(),
-                                    MetricType::L2);
+                                    core::Metric::l2);
 
     laser::RowMatrix<float> laser_data(kNumPoints, static_cast<int64_t>(dim));
     laser::RowMatrix<float> laser_centroid(1, static_cast<int64_t>(dim));
@@ -184,7 +184,7 @@ TEST(RaBitQFactorEquivalence, ZeroResidualHasDifferentNonFinitePolicy) {
                                   memory_codes.data(),
                                   f_add.data(),
                                   f_rescale.data(),
-                                  MetricType::L2);
+                                  core::Metric::l2);
 
   laser::RowMatrix<float> laser_data(kNumPoints, dim);
   laser::RowMatrix<float> laser_centroid(1, dim);

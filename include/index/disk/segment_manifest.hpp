@@ -16,8 +16,8 @@
 #include <string_view>
 #include <vector>
 #include "core/log.hpp"
-#include "core/metric_type.hpp"
 #include "core/platform_fs.hpp"
+#include "core/value_types.hpp"
 #include "index/disk/types.hpp"
 
 namespace alaya::disk {
@@ -98,14 +98,8 @@ inline auto is_valid_segment_id(std::string_view sv) -> bool {
   return true;
 }
 
-inline auto metric_to_string(MetricType m) -> std::string_view {
-  for (const auto &[k, v] : MetricMap::kStaticMap) {
-    if (v == m) {
-      return k;
-    }
-  }
-  throw std::invalid_argument(
-      "metric value cannot be serialized to manifest (NONE or unknown enum)");
+inline auto metric_to_string(core::Metric m) -> std::string_view {
+  return core::metric_to_string(m);
 }
 
 struct KvPair {
@@ -198,7 +192,7 @@ struct SegmentManifest {
   uint64_t version{kManifestVersion};
   std::string segment_id;
   DiskIndexType index_type{DiskIndexType::Flat};
-  MetricType metric{MetricType::L2};
+  core::Metric metric{core::Metric::l2};
   uint64_t dim{0};
   uint64_t count{0};
   std::string ids_file{"ids.u64.bin"};
@@ -292,11 +286,12 @@ struct SegmentManifest {
 
     m.index_type = index_type_from_string(kv["index_type"]);
 
-    m.metric = kMetricMap[kv["metric"]];
-    if (m.metric == MetricType::NONE) {
-      throw std::invalid_argument("manifest metric is unknown or NONE: '" + kv["metric"] +
+    auto parsed_metric = core::metric_from_string(kv["metric"]);
+    if (!parsed_metric.has_value()) {
+      throw std::invalid_argument("manifest metric is unknown: '" + kv["metric"] +
                                   "' (must be one of L2, IP, COS)");
     }
+    m.metric = *parsed_metric;
 
     m.dim = detail::parse_uint64(kv["dim"], "dim");
     if (m.dim == 0) {
@@ -341,7 +336,7 @@ struct SegmentManifest {
 struct CollectionManifest {
   uint64_t version{kManifestVersion};
   uint64_t dim{0};
-  MetricType metric{MetricType::L2};
+  core::Metric metric{core::Metric::l2};
   DiskIndexType index_type{DiskIndexType::Flat};
   uint64_t next_segment_id{1};
   std::vector<std::string> segment_ids;
@@ -445,11 +440,12 @@ struct CollectionManifest {
     if (m.dim == 0) {
       throw std::invalid_argument("collection manifest dim must be > 0");
     }
-    m.metric = kMetricMap[scalars["metric"]];
-    if (m.metric == MetricType::NONE) {
-      throw std::invalid_argument("collection manifest metric is unknown or NONE: '" +
-                                  scalars["metric"] + "' (must be one of L2, IP, COS)");
+    auto parsed_coll_metric = core::metric_from_string(scalars["metric"]);
+    if (!parsed_coll_metric.has_value()) {
+      throw std::invalid_argument("collection manifest metric is unknown: '" + scalars["metric"] +
+                                  "' (must be one of L2, IP, COS)");
     }
+    m.metric = *parsed_coll_metric;
     m.index_type = index_type_from_string(scalars["index_type"]);
     m.next_segment_id = detail::parse_uint64(scalars["next_segment_id"], "next_segment_id");
 

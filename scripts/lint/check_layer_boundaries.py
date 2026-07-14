@@ -36,7 +36,6 @@ RULES: list[tuple[str, list[str], str]] = [
     (
         "include/space/",
         [
-            "storage/detail/rocksdb_storage",
             "storage/rocksdb_storage",
             "index/collection/",
             "index/disk/",

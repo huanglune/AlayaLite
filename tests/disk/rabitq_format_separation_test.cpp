@@ -16,7 +16,7 @@
 #include "index/disk/laser_segment.hpp"
 #include "index/graph/qg/qg_segment.hpp"
 #include "space/rabitq_space.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 #include "core/platform.hpp"
 
 #ifndef ALAYA_LASER_FIXTURE_DIR
@@ -73,7 +73,7 @@ auto make_vectors() -> std::vector<float> {
 
 void build_memory_qg(const std::filesystem::path &artifact) {
   const auto vectors = make_vectors();
-  auto space = std::make_shared<MemorySpace>(kCapacity, kDim, MetricType::L2);
+  auto space = std::make_shared<MemorySpace>(kCapacity, kDim, core::Metric::l2);
   space->fit(vectors.data(), kRows);
   core::BuildContext build_context;
   QgBuildOptions build_options;
@@ -127,7 +127,7 @@ void wrap_memory_qg_as_laser_segment(const std::filesystem::path &memory_artifac
   SegmentManifest manifest;
   manifest.segment_id = "seg_00000001";
   manifest.index_type = DiskIndexType::Laser;
-  manifest.metric = MetricType::L2;
+  manifest.metric = core::Metric::l2;
   manifest.dim = kDim;
   manifest.count = kRows;
   manifest.ids_file = "ids.u64.bin";

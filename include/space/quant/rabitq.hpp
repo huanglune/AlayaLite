@@ -25,7 +25,7 @@
 #include <fstream>
 
 #include "core/log.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 #include "space/quant/rabitq_core.hpp"
 #include "utils/rabitq_utils/defines.hpp"
 #include "utils/rabitq_utils/fastscan.hpp"
@@ -72,14 +72,14 @@ struct RaBitQQuantizer {
                       int *binary_code,
                       DataType &f_add,
                       DataType &f_rescale,
-                      const MetricType metric) {
+                      const core::Metric metric) {
     const auto factors =
         RaBitQCore::memory_factors(data, centroid, padded_dim_, binary_code, metric);
     f_add = factors.base;
     // The legacy memory scan consumes <s/2,q>. L2 historically stores twice the canonical
     // <s,q> scale; IP/COS already store the canonical scale and must remain byte-compatible.
     f_rescale =
-        metric == MetricType::L2 ? 2 * factors.signed_query_scale : factors.signed_query_scale;
+        metric == core::Metric::l2 ? 2 * factors.signed_query_scale : factors.signed_query_scale;
   }
 
  public:
@@ -103,7 +103,7 @@ struct RaBitQQuantizer {
                       uint8_t *bin_code,
                       DataType *f_add,
                       DataType *f_rescale,
-                      const MetricType metric) -> void {
+                      const core::Metric metric) -> void {
     // for compacted quantization code storage
     std::vector<uint8_t> compact_codes(num * padded_dim_ / 8);  // 1 bit/dim
 

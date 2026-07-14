@@ -15,8 +15,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include "core/metric_type.hpp"
 #include "core/platform.hpp"
+#include "core/value_types.hpp"
 #include "index/disk/disk_flat_builder.hpp"  // bit-pattern helpers in alaya::disk::detail
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
@@ -139,7 +139,7 @@ class DiskFlatSegmentSearcher : public SegmentSearcher {
     const float *effective_query = query;
     detail::AlignedFloatBuffer normalized_query;
 
-    if (manifest_.metric == MetricType::COS) {
+    if (manifest_.metric == core::Metric::cosine) {
       double sum_sq = 0.0;
       for (uint32_t c = 0; c < d; ++c) {
         const double v = static_cast<double>(query[c]);
@@ -166,7 +166,7 @@ class DiskFlatSegmentSearcher : public SegmentSearcher {
     // a function pointer via get_l2_sqr_func() on every call; lifting the
     // pointer out of the loop removes one indirection per row.
     using KernelFn = float (*)(const float *__restrict, const float *__restrict, size_t);
-    const KernelFn kernel = (manifest_.metric == MetricType::L2)
+    const KernelFn kernel = (manifest_.metric == core::Metric::l2)
                                 ? static_cast<KernelFn>(simd::get_l2_sqr_func())
                                 : static_cast<KernelFn>(simd::get_ip_sqr_func());
 

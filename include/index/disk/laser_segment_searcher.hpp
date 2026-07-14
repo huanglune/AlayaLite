@@ -24,9 +24,9 @@
   #include <unistd.h>
 #endif
 
-#include "core/metric_type.hpp"
 #include "core/platform.hpp"
 #include "core/platform_fs.hpp"
+#include "core/value_types.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
 #include "storage/mmap_file.hpp"
@@ -43,16 +43,14 @@ namespace alaya::disk {
 
 namespace detail {
 
-inline auto laser_metric_name(MetricType metric) -> std::string {
+inline auto laser_metric_name(core::Metric metric) -> std::string {
   switch (metric) {
-    case MetricType::L2:
+    case core::Metric::l2:
       return "l2";
-    case MetricType::IP:
+    case core::Metric::inner_product:
       return "ip";
-    case MetricType::COS:
+    case core::Metric::cosine:
       return "cos";
-    case MetricType::NONE:
-      return "none";
   }
   return "unknown";
 }
@@ -196,7 +194,7 @@ class LaserSegmentSearcher : public SegmentSearcher {
                                std::to_string(manifest_.count) + ") in segment " +
                                seg_dir.string());
     }
-    if (manifest_.metric != MetricType::L2) {
+    if (manifest_.metric != core::Metric::l2) {
       throw std::runtime_error("LaserSegmentSearcher: metric '" +
                                detail::laser_metric_name(manifest_.metric) +
                                "' not implemented in v1 (disk_laser adapter v1 supports L2 only) "

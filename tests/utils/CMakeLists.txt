@@ -18,11 +18,6 @@ alaya_cc_target(
   SRCS evaluate_test.cpp
 )
 alaya_cc_target(
-  metric_type_test
-  GTEST
-  SRCS metric_type_test.cpp
-)
-alaya_cc_target(
   data_utils_test
   GTEST
   SRCS data_utils_test.cpp
@@ -71,11 +66,6 @@ alaya_add_test(
 alaya_add_test(
   NAME utils_test_evaluate
   TARGET evaluate_test
-  LABELS utils
-)
-alaya_add_test(
-  NAME utils_test_metric_type
-  TARGET metric_type_test
   LABELS utils
 )
 alaya_add_test(

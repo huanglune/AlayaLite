@@ -16,7 +16,7 @@
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 
 namespace alaya::disk {
 namespace {
@@ -57,7 +57,7 @@ class DiskCollectionVamanaTest : public ::testing::Test {
 
 TEST_F(DiskCollectionVamanaTest, constructor_accepts_vamana) {
   const auto path = tmp_root_ / "coll";
-  DiskCollection col(path, 128, MetricType::L2, DiskIndexType::Vamana);
+  DiskCollection col(path, 128, core::Metric::l2, DiskIndexType::Vamana);
   auto manifest = CollectionManifest::load(path / "collection_manifest.txt");
   EXPECT_EQ(manifest.index_type, DiskIndexType::Vamana);
   EXPECT_EQ(manifest.dim, 128u);
@@ -72,7 +72,7 @@ TEST_F(DiskCollectionVamanaTest, flush_writes_vamana_segment) {
   auto ids = labels(kN, 1000);
 
   {
-    DiskCollection col(path, kDim, MetricType::L2, DiskIndexType::Vamana);
+    DiskCollection col(path, kDim, core::Metric::l2, DiskIndexType::Vamana);
     col.add_batch(vectors.data(), ids.data(), kN);
     col.flush();
     EXPECT_EQ(col.size(), kN);
@@ -102,7 +102,7 @@ TEST_F(DiskCollectionVamanaTest, multi_vamana_segment_search) {
   opts.top_k = 10;
   opts.ef = 64;
   {
-    DiskCollection col(path, kDim, MetricType::L2, DiskIndexType::Vamana);
+    DiskCollection col(path, kDim, core::Metric::l2, DiskIndexType::Vamana);
 
     auto v1 = make_vectors(256, kDim, 2);
     auto l1 = labels(256, 0);
@@ -133,7 +133,7 @@ TEST_F(DiskCollectionVamanaTest, multi_vamana_segment_search) {
 TEST_F(DiskCollectionVamanaTest, duplicate_label_across_vamana_segments_throws) {
   constexpr uint32_t kDim = 8;
   const auto path = tmp_root_ / "coll";
-  DiskCollection col(path, kDim, MetricType::L2, DiskIndexType::Vamana);
+  DiskCollection col(path, kDim, core::Metric::l2, DiskIndexType::Vamana);
   auto v1 = make_vectors(64, kDim, 4);
   auto l1 = labels(64, 10);
   col.add_batch(v1.data(), l1.data(), l1.size());
@@ -155,7 +155,7 @@ TEST_F(DiskCollectionVamanaTest, singleton_flush_rejected_before_publish) {
   params.num_threads = 1;
   DiskCollection col(path,
                      kDim,
-                     MetricType::L2,
+                     core::Metric::l2,
                      DiskIndexType::Vamana,
                      DiskCollection::kDefaultMaxPendingBytes,
                      params);
@@ -200,7 +200,7 @@ TEST_F(DiskCollectionVamanaTest, open_rejects_unsupported_vamana_metric) {
 TEST_F(DiskCollectionVamanaTest, max_pending_bytes_survives_reopen) {
   constexpr uint32_t kDim = 4;
   const auto path = tmp_root_ / "coll";
-  { DiskCollection col(path, kDim, MetricType::L2, DiskIndexType::Vamana, 100); }
+  { DiskCollection col(path, kDim, core::Metric::l2, DiskIndexType::Vamana, 100); }
 
   auto reopened = DiskCollection::open(path);
   std::vector<float> vectors(3 * kDim, 0.0F);
@@ -214,7 +214,7 @@ TEST_F(DiskCollectionVamanaTest, open_classifies_vamana_orphans) {
   auto vectors = make_vectors(64, kDim, 6);
   auto ids = labels(64);
   {
-    DiskCollection col(path, kDim, MetricType::L2, DiskIndexType::Vamana);
+    DiskCollection col(path, kDim, core::Metric::l2, DiskIndexType::Vamana);
     col.add_batch(vectors.data(), ids.data(), ids.size());
     col.flush();
   }
@@ -242,7 +242,7 @@ TEST_F(DiskCollectionVamanaTest, open_classifies_vamana_orphans) {
 TEST_F(DiskCollectionVamanaTest, laser_still_rejected) {
   const auto path = tmp_root_ / "coll";
   try {
-    DiskCollection col(path, 128, MetricType::L2, DiskIndexType::Laser);
+    DiskCollection col(path, 128, core::Metric::l2, DiskIndexType::Laser);
     (void)col;
     FAIL() << "expected Laser rejection";
   } catch (const std::runtime_error &e) {
@@ -255,7 +255,7 @@ TEST_F(DiskCollectionVamanaTest, laser_still_rejected) {
 TEST_F(DiskCollectionVamanaTest, vamana_ip_flush_rejected_by_engine) {
   constexpr uint32_t kDim = 8;
   const auto path = tmp_root_ / "coll";
-  DiskCollection col(path, kDim, MetricType::IP, DiskIndexType::Vamana);
+  DiskCollection col(path, kDim, core::Metric::inner_product, DiskIndexType::Vamana);
   auto vectors = make_vectors(32, kDim, 8);
   auto ids = labels(32);
   col.add_batch(vectors.data(), ids.data(), ids.size());

@@ -15,8 +15,8 @@
 #include <string>
 #include <vector>
 
-#include "core/metric_type.hpp"
 #include "core/platform.hpp"
+#include "core/value_types.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
 #include "index/graph/vamana/vamana_greedy_search.hpp"
@@ -87,10 +87,10 @@ class VamanaSegmentSearcher : public SegmentSearcher {
     // Step 2 — v1 metric scope. IP / COS surface here with the dual-substring
     // contract before any mmap so an unsupported-metric manifest produces no
     // observable side effects (matching the spec's pre-IO promise).
-    if (manifest_.metric != MetricType::L2) {
-      const std::string m = (manifest_.metric == MetricType::IP)    ? "ip"
-                            : (manifest_.metric == MetricType::COS) ? "cos"
-                                                                    : "unknown";
+    if (manifest_.metric != core::Metric::l2) {
+      const std::string m = (manifest_.metric == core::Metric::inner_product) ? "ip"
+                            : (manifest_.metric == core::Metric::cosine)      ? "cos"
+                                                                              : "unknown";
       throw std::runtime_error("VamanaSegmentSearcher: metric '" + m +
                                "' not implemented in v1 (vamana adapter v1 supports L2 only) in "
                                "segment " +

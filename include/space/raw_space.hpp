@@ -13,8 +13,8 @@
 #include <string_view>
 #include "../utils/prefetch.hpp"
 #include "core/log.hpp"
-#include "core/metric_type.hpp"
 #include "core/platform.hpp"
+#include "core/value_types.hpp"
 #include "simd/distance_ip.hpp"
 #include "simd/distance_l2.hpp"
 #include "space_concepts.hpp"
@@ -48,7 +48,7 @@ class RawSpace {
 
   IDType capacity_{0};
   uint32_t dim_{0};
-  MetricType metric_{MetricType::L2};
+  core::Metric metric_{core::Metric::l2};
   uint32_t data_size_{0};
   IDType item_cnt_{0};
   IDType delete_cnt_{0};
@@ -57,7 +57,7 @@ class RawSpace {
  public:
   RawSpace() = default;
 
-  RawSpace(IDType capacity, size_t dim, MetricType metric)
+  RawSpace(IDType capacity, size_t dim, core::Metric metric)
       : capacity_(capacity), dim_(dim), metric_(metric) {
     data_size_ = dim * sizeof(DataType);
     distance_calu_func_ = simd::l2_sqr<DataType, DistanceType>;
@@ -65,7 +65,7 @@ class RawSpace {
     data_storage_.init(data_size_, capacity);
 
     if constexpr (!(std::is_same_v<DataType, float> || std::is_same_v<DataType, double>)) {
-      if (metric_ == MetricType::COS) {
+      if (metric_ == core::Metric::cosine) {
         LOG_ERROR("COS metric only support float or double");
         exit(-1);
       }
@@ -81,11 +81,11 @@ class RawSpace {
 
   void set_metric_function() {
     switch (metric_) {
-      case MetricType::L2:
+      case core::Metric::l2:
         distance_calu_func_ = simd::l2_sqr<DataType, DistanceType>;
         break;
-      case MetricType::IP:
-      case MetricType::COS:
+      case core::Metric::inner_product:
+      case core::Metric::cosine:
         distance_calu_func_ = simd::ip_sqr<DataType, DistanceType>;
         break;
       default:
@@ -136,9 +136,10 @@ class RawSpace {
   auto get_dim() const -> uint32_t { return dim_; }
 
   auto metric() const -> core::Metric {
-    return metric_ == MetricType::L2
+    return metric_ == core::Metric::l2
                ? core::Metric::l2
-               : (metric_ == MetricType::IP ? core::Metric::inner_product : core::Metric::cosine);
+               : (metric_ == core::Metric::inner_product ? core::Metric::inner_product
+                                                         : core::Metric::cosine);
   }
 
   auto load(std::string_view filename) -> void {

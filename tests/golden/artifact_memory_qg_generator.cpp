@@ -15,7 +15,7 @@
 
 #include "index/neighbor.hpp"
 #include "space/rabitq_space.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 #include "utils/rabitq_utils/rotator.hpp"
 
 namespace {
@@ -51,7 +51,7 @@ void install_fixed_graph(const std::shared_ptr<Space> &space) {
 }
 
 void overwrite_rotator_with_seed(std::string_view artifact_path) {
-  constexpr std::streamoff kRotatorOffset = sizeof(alaya::MetricType) + sizeof(std::uint32_t) +
+  constexpr std::streamoff kRotatorOffset = sizeof(alaya::core::Metric) + sizeof(std::uint32_t) +
                                             sizeof(std::uint32_t) + sizeof(std::uint32_t) +
                                             sizeof(alaya::RotatorType) + sizeof(std::uint32_t);
   constexpr std::size_t kFlipBytes = 4 * kDim / 8;
@@ -90,7 +90,7 @@ auto main(int argc, char **argv) -> int {
   // RaBitQ's retained default constructor intentionally uses random_device.
   // Write one valid space, replace only its serialized FhtKac flip bytes with
   // a fixed seed, reload that v1 artifact, then refill every persisted byte.
-  auto seed_space = std::make_shared<Space>(kRows, kDim, alaya::MetricType::L2);
+  auto seed_space = std::make_shared<Space>(kRows, kDim, alaya::core::Metric::l2);
   seed_space->fit(data.data(), kRows);
   install_fixed_graph(seed_space);
   seed_space->save(seed_artifact.string());

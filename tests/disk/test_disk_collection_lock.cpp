@@ -25,7 +25,7 @@
 #include <string>
 #include <vector>
 #include "index/disk/detail/disk_collection_v1.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 
 namespace alaya::disk {
 namespace {
@@ -130,7 +130,7 @@ auto make_labels(uint64_t n, uint64_t base = 1000) -> std::vector<uint64_t> {
 }
 
 void build_flat_collection(const std::filesystem::path &path, uint32_t dim = 4, uint64_t n = 2) {
-  DiskCollection col(path, dim, MetricType::L2, DiskIndexType::Flat);
+  DiskCollection col(path, dim, core::Metric::l2, DiskIndexType::Flat);
   auto vectors = make_vectors(n, dim);
   auto labels = make_labels(n);
   col.add_batch(vectors.data(), labels.data(), n);
@@ -182,7 +182,7 @@ class DiskCollectionLockTest : public ::testing::Test {
 
 TEST_F(DiskCollectionLockTest, lock_acquire_writes_lock_file_in_collection_root) {
   const auto path = tmp_root_ / "coll";
-  DiskCollection col(path, 8, MetricType::L2, DiskIndexType::Flat);
+  DiskCollection col(path, 8, core::Metric::l2, DiskIndexType::Flat);
 
   const auto lock_path = lock_path_for(path);
   struct ::stat st {};
@@ -195,7 +195,7 @@ TEST_F(DiskCollectionLockTest, lock_acquire_writes_lock_file_in_collection_root)
 
 TEST_F(DiskCollectionLockTest, lock_held_for_lifetime_of_instance) {
   const auto path = tmp_root_ / "coll";
-  auto col = std::make_unique<DiskCollection>(path, 8, MetricType::L2, DiskIndexType::Flat);
+  auto col = std::make_unique<DiskCollection>(path, 8, core::Metric::l2, DiskIndexType::Flat);
 
   auto attempt = try_lock_file(lock_path_for(path));
   EXPECT_FALSE(attempt.acquired);
@@ -209,7 +209,7 @@ TEST_F(DiskCollectionLockTest, lock_held_for_lifetime_of_instance) {
 TEST_F(DiskCollectionLockTest, lock_released_on_destructor) {
   const auto path = tmp_root_ / "coll";
   {
-    auto col = std::make_unique<DiskCollection>(path, 8, MetricType::L2, DiskIndexType::Flat);
+    auto col = std::make_unique<DiskCollection>(path, 8, core::Metric::l2, DiskIndexType::Flat);
     ASSERT_NE(col, nullptr);
   }
 
@@ -219,7 +219,7 @@ TEST_F(DiskCollectionLockTest, lock_released_on_destructor) {
 
 TEST_F(DiskCollectionLockTest, lock_blocks_second_open_in_same_process) {
   const auto path = tmp_root_ / "coll";
-  DiskCollection col(path, 8, MetricType::L2, DiskIndexType::Flat);
+  DiskCollection col(path, 8, core::Metric::l2, DiskIndexType::Flat);
 
   try {
     (void)DiskCollection::open(path);
@@ -233,10 +233,10 @@ TEST_F(DiskCollectionLockTest, lock_blocks_second_open_in_same_process) {
 
 TEST_F(DiskCollectionLockTest, lock_blocks_second_constructor_path) {
   const auto path = tmp_root_ / "coll";
-  DiskCollection col(path, 8, MetricType::L2, DiskIndexType::Flat);
+  DiskCollection col(path, 8, core::Metric::l2, DiskIndexType::Flat);
 
   try {
-    DiskCollection second(path, 8, MetricType::L2, DiskIndexType::Flat);
+    DiskCollection second(path, 8, core::Metric::l2, DiskIndexType::Flat);
     (void)second;
     FAIL() << "expected create-only constructor to reject an existing collection path";
   } catch (const std::runtime_error &e) {
@@ -354,7 +354,7 @@ TEST_F(DiskCollectionLockTest, lock_acquire_runs_before_orphan_scan) {
 
 TEST_F(DiskCollectionLockTest, lock_acquire_message_contains_pid_when_available) {
   const auto path = tmp_root_ / "coll";
-  DiskCollection col(path, 8, MetricType::L2, DiskIndexType::Flat);
+  DiskCollection col(path, 8, core::Metric::l2, DiskIndexType::Flat);
 
   try {
     (void)DiskCollection::open(path);
@@ -373,7 +373,7 @@ TEST_F(DiskCollectionLockTest, lock_blocks_second_process) {
     GTEST_SKIP() << "cannot locate current test binary for exec-based child check";
   }
   const auto path = tmp_root_ / "coll";
-  DiskCollection col(path, 8, MetricType::L2, DiskIndexType::Flat);
+  DiskCollection col(path, 8, core::Metric::l2, DiskIndexType::Flat);
   ::setenv("ALAYA_LOCK_TEST_PATH", path.c_str(), 1);
 
   const pid_t pid = ::fork();
@@ -402,7 +402,7 @@ TEST_F(DiskCollectionLockTest, lock_released_when_holder_killed_with_sigkill) {
   ASSERT_GE(pid, 0) << std::strerror(errno);
   if (pid == 0) {
     ::close(pipe_fds[0]);
-    DiskCollection col(path, 8, MetricType::L2, DiskIndexType::Flat);
+    DiskCollection col(path, 8, core::Metric::l2, DiskIndexType::Flat);
     const char ready = '1';
     (void)::write(pipe_fds[1], &ready, 1);
     for (;;) {
@@ -430,7 +430,7 @@ TEST_F(DiskCollectionLockTest, lock_released_on_clean_exit) {
   const pid_t pid = ::fork();
   ASSERT_GE(pid, 0) << std::strerror(errno);
   if (pid == 0) {
-    DiskCollection col(path, 8, MetricType::L2, DiskIndexType::Flat);
+    DiskCollection col(path, 8, core::Metric::l2, DiskIndexType::Flat);
     ::_exit(0);
   }
 
@@ -598,12 +598,12 @@ TEST_F(DiskCollectionLockTest, ctor_rollback_on_lock_acquire_failure_removes_pat
   // analog: the EEXIST error contract, which is the shared mechanism.
   const auto path = tmp_root_ / "coll";
   // First ctor wins, holds .lock.
-  DiskCollection col1(path, 4, MetricType::L2, DiskIndexType::Flat);
+  DiskCollection col1(path, 4, core::Metric::l2, DiskIndexType::Flat);
   // Second ctor: `exists(path)` is now true, so the existing TOCTOU-style
   // throw fires first; the message must still surface the literal phrase
   // expected by spec scenario (substring "target path already exists").
   try {
-    DiskCollection col2(path, 4, MetricType::L2, DiskIndexType::Flat);
+    DiskCollection col2(path, 4, core::Metric::l2, DiskIndexType::Flat);
     (void)col2;
     FAIL() << "expected second ctor to fail";
   } catch (const std::runtime_error &e) {
@@ -620,7 +620,7 @@ TEST_F(DiskCollectionLockTest, ctor_creates_lock_before_segments_dir) {
   // the lock file mode is 0600 (created by `_for_create`'s open call,
   // not by a stale leftover).
   const auto path = tmp_root_ / "coll";
-  DiskCollection col(path, 4, MetricType::L2, DiskIndexType::Flat);
+  DiskCollection col(path, 4, core::Metric::l2, DiskIndexType::Flat);
   EXPECT_TRUE(std::filesystem::is_regular_file(lock_path_for(path)));
   EXPECT_TRUE(std::filesystem::is_directory(path / "segments"));
   struct ::stat st {};
@@ -745,7 +745,7 @@ TEST_F(DiskCollectionLockTest, two_concurrent_ctors_race_via_fork) {
     (void)::read(parent_to_child[0], &ready_byte, 1);
     int child_status = 0;
     try {
-      DiskCollection col(path, 4, MetricType::L2, DiskIndexType::Flat);
+      DiskCollection col(path, 4, core::Metric::l2, DiskIndexType::Flat);
       child_status = 1;
     } catch (const std::runtime_error &e) {
       const std::string msg = e.what();
@@ -768,7 +768,7 @@ TEST_F(DiskCollectionLockTest, two_concurrent_ctors_race_via_fork) {
   bool parent_ok = false;
   std::string parent_err;
   try {
-    DiskCollection col(path, 4, MetricType::L2, DiskIndexType::Flat);
+    DiskCollection col(path, 4, core::Metric::l2, DiskIndexType::Flat);
     parent_ok = true;
   } catch (const std::runtime_error &e) {
     parent_err = e.what();
@@ -845,7 +845,7 @@ TEST_F(DiskCollectionLockTest, ctor_and_concurrent_open_no_partial_disk_state) {
   bool ctor_ok = false;
   std::string ctor_err;
   try {
-    DiskCollection col(path, 4, MetricType::L2, DiskIndexType::Flat);
+    DiskCollection col(path, 4, core::Metric::l2, DiskIndexType::Flat);
     ctor_ok = true;
   } catch (const std::runtime_error &e) {
     ctor_err = e.what();

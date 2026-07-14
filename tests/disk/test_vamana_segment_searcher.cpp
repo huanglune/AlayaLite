@@ -21,7 +21,7 @@
 #include "index/disk/vamana_segment_builder.hpp"
 #include "index/disk/vamana_segment_searcher.hpp"
 #include "simd/distance_l2.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 
 namespace alaya::disk {
 namespace {
@@ -74,7 +74,7 @@ class VamanaSegmentSearcherTest : public ::testing::Test {
     vectors_ = make_vectors(n, dim, seed);
     labels_ = labels(n, label_base);
     const auto seg_dir = seg_parent_ / "seg_00000001";
-    VamanaSegmentBuilder builder(dim, MetricType::L2, params());
+    VamanaSegmentBuilder builder(dim, core::Metric::l2, params());
     builder.add_batch(vectors_.data(), labels_.data(), n);
     builder.finish(seg_dir);
     return seg_dir;
@@ -189,7 +189,7 @@ TEST_F(VamanaSegmentSearcherTest, external_label_mapping) {
     labels_[i] = 1000 + 1000 * i;
   }
   {
-    VamanaSegmentBuilder builder(kDim, MetricType::L2, params());
+    VamanaSegmentBuilder builder(kDim, core::Metric::l2, params());
     const auto seg2 = seg_parent_ / "seg_00000002";
     builder.add_batch(vectors_.data(), labels_.data(), labels_.size());
     builder.finish(seg2);
@@ -316,7 +316,7 @@ TEST_F(VamanaSegmentSearcherTest, manifest_count_disagrees_with_graph_throws) {
 TEST_F(VamanaSegmentSearcherTest, cos_metric_rejected) {
   const auto seg_dir = build_segment(128, 8, 11);
   auto manifest = SegmentManifest::load(seg_dir / "manifest.txt");
-  manifest.metric = MetricType::COS;
+  manifest.metric = core::Metric::cosine;
   manifest.save(seg_dir / "manifest.txt");
   expect_runtime_message_contains([&] { VamanaSegmentSearcher searcher(seg_dir); },
                                   {"cos", "not implemented in v1"});

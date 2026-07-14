@@ -17,9 +17,9 @@
 #include <utility>
 #include <vector>
 #include "core/log.hpp"
-#include "core/metric_type.hpp"
 #include "core/platform.hpp"
 #include "core/platform_fs.hpp"
+#include "core/value_types.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
 
@@ -107,11 +107,12 @@ class TmpDirGuard {
 
 class DiskFlatBuilder {
  public:
-  DiskFlatBuilder(uint32_t dim, MetricType metric) : dim_(dim), metric_(metric) {
+  DiskFlatBuilder(uint32_t dim, core::Metric metric) : dim_(dim), metric_(metric) {
     if (dim == 0) {
       throw std::invalid_argument("DiskFlatBuilder: dim must be > 0");
     }
-    if (metric != MetricType::L2 && metric != MetricType::IP && metric != MetricType::COS) {
+    if (metric != core::Metric::l2 && metric != core::Metric::inner_product &&
+        metric != core::Metric::cosine) {
       throw std::invalid_argument(
           "DiskFlatBuilder: metric must be one of L2, IP, COS (got NONE or unknown)");
     }
@@ -207,7 +208,7 @@ class DiskFlatBuilder {
                             labels_.data(),
                             labels_.size() * sizeof(uint64_t));
 
-    if (metric_ == MetricType::COS) {
+    if (metric_ == core::Metric::cosine) {
       std::vector<float> normalized(vectors_.size());
       const uint64_t count = labels_.size();
       for (uint64_t r = 0; r < count; ++r) {
@@ -278,7 +279,7 @@ class DiskFlatBuilder {
 
  private:
   uint32_t dim_;
-  MetricType metric_;
+  core::Metric metric_;
   bool closed_ = false;
   std::vector<float> vectors_;
   std::vector<uint64_t> labels_;

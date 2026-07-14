@@ -22,7 +22,7 @@
 #include "index/disk/laser_segment_searcher.hpp"
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/types.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 
 #ifndef ALAYA_LASER_FIXTURE_DIR
   #define ALAYA_LASER_FIXTURE_DIR ""
@@ -167,7 +167,7 @@ class LaserSegmentSearcherConcurrentSearchTest : public ::testing::Test {
   }
 
   void import_fixture() const {
-    LaserSegmentImporter importer(kFixtureDim, MetricType::L2, {});
+    LaserSegmentImporter importer(kFixtureDim, core::Metric::l2, {});
     auto ids = labels_consecutive();
     (void)importer.import_from(fixture_dir(), ids.data(), ids.size(), seg_dir_);
   }

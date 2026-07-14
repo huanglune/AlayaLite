@@ -69,7 +69,7 @@ class ManifestTest : public ::testing::Test {
 }  // namespace
 
 TEST_F(ManifestTest, SegmentManifestRoundtripAllMetrics) {
-  for (auto metric : {MetricType::L2, MetricType::IP, MetricType::COS}) {
+  for (auto metric : {core::Metric::l2, core::Metric::inner_product, core::Metric::cosine}) {
     SegmentManifest m;
     m.version = 1;
     m.segment_id = "seg_00000007";
@@ -298,7 +298,7 @@ TEST_F(ManifestTest, SegmentManifestAllowsEmptyVectorsFileForLaserSegments) {
   m.version = 1;
   m.segment_id = "seg_00000007";
   m.index_type = DiskIndexType::Laser;
-  m.metric = MetricType::L2;
+  m.metric = core::Metric::l2;
   m.dim = 128;
   m.count = 1000;
   m.ids_file = "ids.u64.bin";
@@ -383,7 +383,7 @@ TEST_F(ManifestTest, SegmentManifestFormatQuirks) {
     auto path = write_text("crlf.txt", m);
     auto loaded = SegmentManifest::load(path);
     EXPECT_EQ(loaded.dim, 128u);
-    EXPECT_EQ(loaded.metric, MetricType::L2);
+    EXPECT_EQ(loaded.metric, core::Metric::l2);
   }
   // Leading and trailing whitespace + comments + blank lines
   {
@@ -404,7 +404,7 @@ TEST_F(ManifestTest, SegmentManifestFormatQuirks) {
     auto loaded = SegmentManifest::load(path);
     EXPECT_EQ(loaded.dim, 128u);
     EXPECT_EQ(loaded.segment_id, "seg_00000007");
-    EXPECT_EQ(loaded.metric, MetricType::L2);
+    EXPECT_EQ(loaded.metric, core::Metric::l2);
   }
 }
 
@@ -412,7 +412,7 @@ TEST_F(ManifestTest, CollectionManifestRoundtripRepeatedSegmentForm) {
   CollectionManifest c;
   c.version = 1;
   c.dim = 128;
-  c.metric = MetricType::COS;
+  c.metric = core::Metric::cosine;
   c.index_type = DiskIndexType::Flat;
   c.next_segment_id = 4;
   c.segment_ids = {"seg_00000001", "seg_00000002", "seg_00000003"};
@@ -421,7 +421,7 @@ TEST_F(ManifestTest, CollectionManifestRoundtripRepeatedSegmentForm) {
   c.save(path);
   auto loaded = CollectionManifest::load(path);
   EXPECT_EQ(loaded.dim, 128u);
-  EXPECT_EQ(loaded.metric, MetricType::COS);
+  EXPECT_EQ(loaded.metric, core::Metric::cosine);
   EXPECT_EQ(loaded.index_type, DiskIndexType::Flat);
   EXPECT_EQ(loaded.next_segment_id, 4u);
   ASSERT_EQ(loaded.segment_ids.size(), 3u);

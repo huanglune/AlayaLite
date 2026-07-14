@@ -19,7 +19,7 @@
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 
 namespace alaya::disk {
 
@@ -62,7 +62,7 @@ class SegmentFactoryTest : public ::testing::Test {
   }
 
   static auto make_collection_manifest(DiskIndexType engine, uint64_t dim,
-                                       MetricType metric = MetricType::L2)
+                                       core::Metric metric = core::Metric::l2)
       -> CollectionManifest {
     CollectionManifest m;
     m.version = kManifestVersion;
@@ -86,7 +86,7 @@ TEST_F(SegmentFactoryTest, segment_factory_opens_flat_segment) {
   auto vectors = make_random_vectors(kN, kDim, 1);
   auto labels = sequential_labels(kN, 100);
   {
-    DiskFlatBuilder b(kDim, MetricType::L2);
+    DiskFlatBuilder b(kDim, core::Metric::l2);
     b.add_batch(vectors.data(), labels.data(), kN);
     b.finish(seg_dir);
   }

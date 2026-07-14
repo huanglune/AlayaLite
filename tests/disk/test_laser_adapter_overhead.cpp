@@ -24,7 +24,7 @@
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/types.hpp"
 #include "index/graph/laser/qg/qg.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 
 #ifndef ALAYA_LASER_FIXTURE_DIR
   #define ALAYA_LASER_FIXTURE_DIR ""
@@ -274,7 +274,7 @@ auto run_adapter_per_query(const Fixture &fixture, const std::vector<float> &que
                       ("alaya_laser_adapter_overhead_" + std::to_string(::getpid()));
     std::filesystem::remove_all(root);
 
-    Collection collection(root, kDim, MetricType::L2, DiskIndexType::Laser);
+    Collection collection(root, kDim, core::Metric::l2, DiskIndexType::Laser);
     auto labels_in = identity_labels();
     collection.import_laser_segment(fixture.dir, labels_in.data(), labels_in.size());
 

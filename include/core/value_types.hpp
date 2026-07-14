@@ -12,6 +12,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -241,6 +242,27 @@ struct TypedTensorView {
 }
 
 enum class Metric : std::uint8_t { l2 = 0, inner_product = 1, cosine = 2 };
+
+[[nodiscard]] constexpr auto metric_from_string(std::string_view s) noexcept
+    -> std::optional<Metric> {
+  if (s == "L2" || s == "l2") return Metric::l2;
+  if (s == "IP" || s == "ip") return Metric::inner_product;
+  if (s == "COS" || s == "cos" || s == "cosine") return Metric::cosine;
+  return std::nullopt;
+}
+
+[[nodiscard]] constexpr auto metric_to_string(Metric m) noexcept -> std::string_view {
+  switch (m) {
+    case Metric::l2:
+      return "L2";
+    case Metric::inner_product:
+      return "IP";
+    case Metric::cosine:
+      return "COS";
+  }
+  return "unknown";
+}
+
 enum class Medium : std::uint8_t { memory = 0, disk = 1 };
 enum class MetricPreprocessing : std::uint8_t {
   none = 0,

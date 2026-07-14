@@ -15,7 +15,7 @@
 #include <vector>
 
 #include "core/log.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 #include "index/neighbor.hpp"
 #include "simd/distance_ip.hpp"
 #include "simd/distance_l2.hpp"
@@ -35,7 +35,7 @@ class RaBitQSpace {
  private:
   IDType capacity_{0};
   uint32_t dim_{0};
-  MetricType metric_{MetricType::L2};
+  core::Metric metric_{core::Metric::l2};
   RotatorType type_;
   IDType item_cnt_{0};
 
@@ -85,7 +85,7 @@ class RaBitQSpace {
   RaBitQSpace(const RaBitQSpace &other) = delete;
   RaBitQSpace(IDType capacity,
               size_t dim,
-              MetricType metric,
+              core::Metric metric,
               RotatorType type = RotatorType::FhtKacRotator)
       : capacity_(capacity), dim_(dim), metric_(metric), type_(type) {
     if constexpr (!std::is_same_v<DataType, float> || !std::is_same_v<DistanceType, float>) {
@@ -110,11 +110,11 @@ class RaBitQSpace {
 
   void set_metric_function() {
     switch (metric_) {
-      case MetricType::L2:
+      case core::Metric::l2:
         distance_cal_func_ = simd::get_l2_sqr_func();
         break;
-      case MetricType::COS:
-      case MetricType::IP:
+      case core::Metric::cosine:
+      case core::Metric::inner_product:
         distance_cal_func_ = simd::get_ip_sqr_func();
         break;
       default:
@@ -244,9 +244,10 @@ class RaBitQSpace {
   auto get_dim() const -> uint32_t { return dim_; }
 
   auto metric() const -> core::Metric {
-    return metric_ == MetricType::L2
+    return metric_ == core::Metric::l2
                ? core::Metric::l2
-               : (metric_ == MetricType::IP ? core::Metric::inner_product : core::Metric::cosine);
+               : (metric_ == core::Metric::inner_product ? core::Metric::inner_product
+                                                         : core::Metric::cosine);
   }
 
   auto get_dist_func() const -> DistanceFunction { return distance_cal_func_; }
@@ -397,8 +398,9 @@ class RaBitQSpace {
     reader.read(reinterpret_cast<char *>(&type_), sizeof(type_));
     reader.read(reinterpret_cast<char *>(&ep_), sizeof(ep_));
 
-    const bool metric_valid =
-        metric_ == MetricType::L2 || metric_ == MetricType::IP || metric_ == MetricType::COS;
+    const bool metric_valid = metric_ == core::Metric::l2 ||
+                              metric_ == core::Metric::inner_product ||
+                              metric_ == core::Metric::cosine;
     const bool rotator_valid = type_ == RotatorType::MatrixRotator ||
                                type_ == RotatorType::FhtKacRotator ||
                                type_ == RotatorType::FhtRotator;

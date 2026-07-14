@@ -128,7 +128,7 @@ class DiskVamanaSegment {
     auto transaction = std::move(begun).value();
 
     try {
-      VamanaSegmentBuilder builder(input.vectors.dim, MetricType::L2, build_params);
+      VamanaSegmentBuilder builder(input.vectors.dim, core::Metric::l2, build_params);
       if (input.vectors.row_stride ==
           static_cast<std::uint64_t>(input.vectors.dim) * sizeof(float)) {
         builder.add_batch(input.vectors.row<float>(0),
@@ -221,7 +221,7 @@ class DiskVamanaSegment {
                                    core::StatusDetail::operation_slot_absent,
                                    "DiskVamana open received a non-Vamana native manifest");
       }
-      if (native.metric != MetricType::L2) {
+      if (native.metric != core::Metric::l2) {
         return l2_gate_status(core::OperationStage::open, native.metric);
       }
 
@@ -312,7 +312,7 @@ class DiskVamanaSegment {
       -> core::Result<std::unique_ptr<DiskVamanaSegment>> {
     try {
       const auto native = SegmentManifest::load(segment_directory / "manifest.txt");
-      if (native.metric != MetricType::L2) {
+      if (native.metric != core::Metric::l2) {
         return l2_gate_status(core::OperationStage::open, native.metric);
       }
       const auto graph_it = native.x_extras.find("x_graph_file");
@@ -608,21 +608,11 @@ class DiskVamanaSegment {
             {std::string(kGraphArtifactName), "graph.index", true, {}}};
   }
 
-  [[nodiscard]] static auto metric_name(MetricType metric) -> std::string_view {
-    switch (metric) {
-      case MetricType::L2:
-        return "l2";
-      case MetricType::IP:
-        return "inner_product";
-      case MetricType::COS:
-        return "cosine";
-      case MetricType::NONE:
-        return "none";
-    }
-    return "unknown";
+  [[nodiscard]] static auto metric_name(core::Metric metric) -> std::string_view {
+    return core::metric_to_string(metric);
   }
 
-  [[nodiscard]] static auto l2_gate_status(core::OperationStage stage, MetricType metric)
+  [[nodiscard]] static auto l2_gate_status(core::OperationStage stage, core::Metric metric)
       -> core::Status {
     return core::Status::error(core::StatusCode::not_supported,
                                stage,
@@ -631,16 +621,8 @@ class DiskVamanaSegment {
                                    std::string(metric_name(metric)) + "' is not supported");
   }
 
-  [[nodiscard]] static auto legacy_metric(core::Metric metric) noexcept -> MetricType {
-    switch (metric) {
-      case core::Metric::l2:
-        return MetricType::L2;
-      case core::Metric::inner_product:
-        return MetricType::IP;
-      case core::Metric::cosine:
-        return MetricType::COS;
-    }
-    return MetricType::NONE;
+  [[nodiscard]] static auto legacy_metric(core::Metric metric) noexcept -> core::Metric {
+    return metric;
   }
 
   [[nodiscard]] static auto require_io_credits(const core::IoCredits &credits,
@@ -1094,7 +1076,7 @@ class DiskVamanaLegacyFactory {
                                    core::StatusDetail::malformed_struct,
                                    "legacy DiskVamana factory input is invalid");
       }
-      VamanaSegmentBuilder builder(input.vectors.dim, MetricType::L2, build_params);
+      VamanaSegmentBuilder builder(input.vectors.dim, core::Metric::l2, build_params);
       for (core::RowCount row = 0; row < input.vectors.rows; ++row) {
         builder.add_batch(input.vectors.row<float>(row), input.logical_ids.data() + row, 1);
       }
@@ -1109,7 +1091,7 @@ class DiskVamanaLegacyFactory {
       -> core::Result<std::unique_ptr<VamanaSegmentSearcher>> {
     try {
       const auto native = SegmentManifest::load(segment_directory / "manifest.txt");
-      if (native.metric != MetricType::L2) {
+      if (native.metric != core::Metric::l2) {
         return DiskVamanaSegment::l2_gate_status(core::OperationStage::open, native.metric);
       }
       return std::make_unique<VamanaSegmentSearcher>(segment_directory);

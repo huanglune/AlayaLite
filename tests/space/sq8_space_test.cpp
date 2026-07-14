@@ -18,7 +18,7 @@ class SQ8SpaceTest : public ::testing::Test {
   void SetUp() override {
     dim_ = 4;
     capacity_ = 10;
-    metric_ = MetricType::L2;
+    metric_ = core::Metric::l2;
     space_ = std::make_shared<SQ8Space<>>(capacity_, dim_, metric_);
     file_name_ = "test_sq8_space.bin";
     if (std::filesystem::exists(file_name_)) {
@@ -36,7 +36,7 @@ class SQ8SpaceTest : public ::testing::Test {
   std::string file_name_;
   size_t dim_;
   uint32_t capacity_;
-  MetricType metric_;
+  core::Metric metric_;
 };
 
 TEST_F(SQ8SpaceTest, Initialization) {

@@ -692,7 +692,7 @@ TEST(SegmentedCollection, CrossSegmentHnswUpsertDeleteSuppressesOldVersions) {
     data[row * 2] = static_cast<float>(row);
     data[row * 2 + 1] = static_cast<float>(row);
   }
-  auto space = std::make_shared<Space>(16, 2, MetricType::L2);
+  auto space = std::make_shared<Space>(16, 2, core::Metric::l2);
   space->fit(data.data(), kRows);
   core::BuildContext build_context;
   auto hnsw =

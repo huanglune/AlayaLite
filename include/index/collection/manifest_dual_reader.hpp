@@ -18,7 +18,6 @@
 #include <vector>
 
 #include "core/algorithm_registry.hpp"
-#include "core/metric_type.hpp"
 #include "core/platform_fs.hpp"
 #include "core/status.hpp"
 #include "core/value_types.hpp"
@@ -111,18 +110,8 @@ class CollectionManifestDualReader {
   }
 
  private:
-  [[nodiscard]] static auto core_metric(MetricType metric) -> core::Metric {
-    switch (metric) {
-      case MetricType::L2:
-        return core::Metric::l2;
-      case MetricType::IP:
-        return core::Metric::inner_product;
-      case MetricType::COS:
-        return core::Metric::cosine;
-      case MetricType::NONE:
-        break;
-    }
-    throw std::invalid_argument("v1 collection contains MetricType::NONE");
+  [[nodiscard]] static auto core_metric(core::Metric metric) noexcept -> core::Metric {
+    return metric;
   }
 
   [[nodiscard]] static auto algorithm_id(disk::DiskIndexType type) noexcept -> core::AlgorithmId {

@@ -19,7 +19,7 @@
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 
 #ifndef ALAYA_LASER_FIXTURE_DIR
   #define ALAYA_LASER_FIXTURE_DIR ""
@@ -61,7 +61,7 @@ class SegmentFactoryLaserTest : public ::testing::Test {
     std::filesystem::remove_all(tmp_root_, ec);
   }
 
-  static auto manifest(DiskIndexType type, uint64_t dim, MetricType metric = MetricType::L2)
+  static auto manifest(DiskIndexType type, uint64_t dim, core::Metric metric = core::Metric::l2)
       -> CollectionManifest {
     CollectionManifest m;
     m.version = kManifestVersion;

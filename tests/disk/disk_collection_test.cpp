@@ -19,7 +19,7 @@
 #include <vector>
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 
 namespace alaya::disk {
 
@@ -68,7 +68,7 @@ TEST_F(DiskCollectionTest, SaveLoadL2) {
   auto coll_path = tmp_root_ / "coll";
 
   {
-    DiskCollection col(coll_path, kDim, MetricType::L2, DiskIndexType::Flat);
+    DiskCollection col(coll_path, kDim, core::Metric::l2, DiskIndexType::Flat);
     auto vectors = make_random_vectors(kN, kDim, 1);
     auto labels = sequential_labels(kN);
     col.add_batch(vectors.data(), labels.data(), kN);
@@ -95,7 +95,7 @@ TEST_F(DiskCollectionTest, MultiSegmentSearch) {
   constexpr uint32_t kDim = 16;
   auto coll_path = tmp_root_ / "coll";
 
-  DiskCollection col(coll_path, kDim, MetricType::L2, DiskIndexType::Flat);
+  DiskCollection col(coll_path, kDim, core::Metric::l2, DiskIndexType::Flat);
 
   auto v1 = make_random_vectors(500, kDim, 1);
   auto l1 = sequential_labels(500, 0);
@@ -156,7 +156,7 @@ TEST_F(DiskCollectionTest, MultiSegmentGlobalTieBreak) {
   opts.top_k = 2;
   std::vector<DiskSearchHit> hits;
   {
-    DiskCollection col(coll_path, kDim, MetricType::L2, DiskIndexType::Flat);
+    DiskCollection col(coll_path, kDim, core::Metric::l2, DiskIndexType::Flat);
 
     // Segment 1 has label=200 with v_same.
     std::vector<float> seg1;
@@ -192,7 +192,7 @@ TEST_F(DiskCollectionTest, MultiSegmentGlobalTieBreak) {
 TEST_F(DiskCollectionTest, DuplicateLabelWithinBatchThrows) {
   constexpr uint32_t kDim = 4;
   auto coll_path = tmp_root_ / "coll";
-  DiskCollection col(coll_path, kDim, MetricType::L2, DiskIndexType::Flat);
+  DiskCollection col(coll_path, kDim, core::Metric::l2, DiskIndexType::Flat);
   auto vectors = make_random_vectors(5, kDim);
   std::vector<uint64_t> labels{1, 2, 3, 1, 5};  // dup label 1
   col.add_batch(vectors.data(), labels.data(), 5);
@@ -205,7 +205,7 @@ TEST_F(DiskCollectionTest, DuplicateLabelWithinBatchThrows) {
 TEST_F(DiskCollectionTest, DuplicateLabelAcrossSegmentsThrows) {
   constexpr uint32_t kDim = 4;
   auto coll_path = tmp_root_ / "coll";
-  DiskCollection col(coll_path, kDim, MetricType::L2, DiskIndexType::Flat);
+  DiskCollection col(coll_path, kDim, core::Metric::l2, DiskIndexType::Flat);
 
   auto v1 = make_random_vectors(3, kDim, 1);
   std::vector<uint64_t> l1{10, 20, 30};
@@ -225,7 +225,7 @@ TEST_F(DiskCollectionTest, OrphanSegmentIgnoredWithClassification) {
   constexpr uint32_t kDim = 4;
   auto coll_path = tmp_root_ / "coll";
   {
-    DiskCollection col(coll_path, kDim, MetricType::L2, DiskIndexType::Flat);
+    DiskCollection col(coll_path, kDim, core::Metric::l2, DiskIndexType::Flat);
     auto v = make_random_vectors(2, kDim);
     std::vector<uint64_t> l{1, 2};
     col.add_batch(v.data(), l.data(), 2);
@@ -256,7 +256,7 @@ TEST_F(DiskCollectionTest, OrphanSegmentIdNoCollision) {
   constexpr uint32_t kDim = 4;
   auto coll_path = tmp_root_ / "coll";
   {
-    DiskCollection col(coll_path, kDim, MetricType::L2, DiskIndexType::Flat);
+    DiskCollection col(coll_path, kDim, core::Metric::l2, DiskIndexType::Flat);
     auto v = make_random_vectors(2, kDim);
     std::vector<uint64_t> l{1, 2};
     col.add_batch(v.data(), l.data(), 2);
@@ -280,7 +280,7 @@ TEST_F(DiskCollectionTest, OrphanSegmentIdNoCollision) {
 TEST_F(DiskCollectionTest, ConstructorExistingPathThrows) {
   auto coll_path = tmp_root_ / "coll";
   std::filesystem::create_directories(coll_path);
-  EXPECT_THROW(DiskCollection(coll_path, 8, MetricType::L2, DiskIndexType::Flat),
+  EXPECT_THROW(DiskCollection(coll_path, 8, core::Metric::l2, DiskIndexType::Flat),
                std::runtime_error);
 }
 
@@ -291,7 +291,7 @@ TEST_F(DiskCollectionTest, OpenMissingPathThrows) {
 TEST_F(DiskCollectionTest, PendingBufferOverflowRetryable) {
   constexpr uint32_t kDim = 4;
   auto coll_path = tmp_root_ / "coll";
-  DiskCollection col(coll_path, kDim, MetricType::L2, DiskIndexType::Flat);
+  DiskCollection col(coll_path, kDim, core::Metric::l2, DiskIndexType::Flat);
 
   // Force the pending buffer to be small via a synthetic batch that's
   // already large enough that another batch overflows the default 512 MiB.
@@ -331,7 +331,7 @@ TEST_F(DiskCollectionTest, PendingBufferSingleBatchTooLarge) {
   constexpr uint32_t kDim = 128;
   constexpr uint64_t kN = 600000;
   auto coll_path = tmp_root_ / "coll";
-  DiskCollection col(coll_path, kDim, MetricType::L2, DiskIndexType::Flat);
+  DiskCollection col(coll_path, kDim, core::Metric::l2, DiskIndexType::Flat);
 
   std::vector<float> vectors(kN * kDim, 0.5F);
   std::vector<uint64_t> labels(kN);
@@ -352,7 +352,7 @@ TEST_F(DiskCollectionTest, PendingBufferSingleBatchTooLarge) {
 TEST_F(DiskCollectionTest, SearchBeforeAnyFlushReturnsEmpty) {
   constexpr uint32_t kDim = 4;
   auto coll_path = tmp_root_ / "coll";
-  DiskCollection col(coll_path, kDim, MetricType::L2, DiskIndexType::Flat);
+  DiskCollection col(coll_path, kDim, core::Metric::l2, DiskIndexType::Flat);
   std::vector<float> q(kDim, 0.5F);
   DiskSearchOptions opts;
   opts.top_k = 5;
@@ -370,7 +370,7 @@ TEST_F(DiskCollectionTest, SearchBeforeAnyFlushReturnsEmpty) {
 TEST_F(DiskCollectionTest, SizeExcludesPending) {
   constexpr uint32_t kDim = 4;
   auto coll_path = tmp_root_ / "coll";
-  DiskCollection col(coll_path, kDim, MetricType::L2, DiskIndexType::Flat);
+  DiskCollection col(coll_path, kDim, core::Metric::l2, DiskIndexType::Flat);
   EXPECT_EQ(col.size(), 0u);
 
   std::vector<float> v(kDim * 5, 1.0F);
@@ -384,7 +384,7 @@ TEST_F(DiskCollectionTest, SizeExcludesPending) {
 
 TEST_F(DiskCollectionTest, VamanaIndexTypeAcceptedInCxx) {
   auto coll_path = tmp_root_ / "coll_v";
-  EXPECT_NO_THROW(DiskCollection(coll_path, 8, MetricType::L2, DiskIndexType::Vamana));
+  EXPECT_NO_THROW(DiskCollection(coll_path, 8, core::Metric::l2, DiskIndexType::Vamana));
   auto manifest = CollectionManifest::load(coll_path / "collection_manifest.txt");
   EXPECT_EQ(manifest.index_type, DiskIndexType::Vamana);
 }
@@ -411,7 +411,7 @@ TEST_F(DiskCollectionTest, SymlinkSegmentRejected) {
   constexpr uint32_t kDim = 4;
   auto coll_path = tmp_root_ / "coll";
   {
-    DiskCollection col(coll_path, kDim, MetricType::L2, DiskIndexType::Flat);
+    DiskCollection col(coll_path, kDim, core::Metric::l2, DiskIndexType::Flat);
     auto v = make_random_vectors(2, kDim);
     std::vector<uint64_t> l{1, 2};
     col.add_batch(v.data(), l.data(), 2);

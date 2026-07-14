@@ -372,7 +372,7 @@ class DiskFlatSegment {
     descriptor.metric = core_metric(searcher_->manifest().metric);
     descriptor.stored_scalar_type = core::ScalarType::float32;
     descriptor.medium = core::Medium::disk;
-    descriptor.preprocessing = searcher_->manifest().metric == MetricType::COS
+    descriptor.preprocessing = searcher_->manifest().metric == core::Metric::cosine
                                    ? core::MetricPreprocessing::l2_normalized
                                    : core::MetricPreprocessing::none;
     descriptor.engine_factory_id = core::algorithm::flat;
@@ -580,30 +580,20 @@ class DiskFlatSegment {
             {std::string(kVectorsArtifactName), "vectors.f32.bin", true, {}}};
   }
 
-  [[nodiscard]] static auto legacy_metric(core::Metric metric) -> MetricType {
+  [[nodiscard]] static auto legacy_metric(core::Metric metric) -> core::Metric {
     switch (metric) {
       case core::Metric::l2:
-        return MetricType::L2;
+        return core::Metric::l2;
       case core::Metric::inner_product:
-        return MetricType::IP;
+        return core::Metric::inner_product;
       case core::Metric::cosine:
-        return MetricType::COS;
+        return core::Metric::cosine;
     }
     throw std::invalid_argument("DiskFlat received an unknown core metric");
   }
 
-  [[nodiscard]] static auto core_metric(MetricType metric) noexcept -> core::Metric {
-    switch (metric) {
-      case MetricType::L2:
-        return core::Metric::l2;
-      case MetricType::IP:
-        return core::Metric::inner_product;
-      case MetricType::COS:
-        return core::Metric::cosine;
-      case MetricType::NONE:
-        return core::Metric::l2;
-    }
-    return core::Metric::l2;
+  [[nodiscard]] static auto core_metric(core::Metric metric) noexcept -> core::Metric {
+    return metric;
   }
 
   [[nodiscard]] static auto require_io_credits(const core::IoCredits &credits,
@@ -802,7 +792,7 @@ class DiskFlatSegment {
                                  core::StatusDetail::arithmetic_overflow,
                                  "DiskFlat scratch size overflows uint64");
     }
-    if (searcher_->manifest().metric == MetricType::COS) {
+    if (searcher_->manifest().metric == core::Metric::cosine) {
       std::uint64_t normalized_bytes{};
       if (!core::checked_multiply(searcher_->dim(), sizeof(float), normalized_bytes) ||
           !core::checked_add(scratch, normalized_bytes, scratch)) {

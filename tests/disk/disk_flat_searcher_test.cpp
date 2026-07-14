@@ -21,7 +21,7 @@
 #include "index/disk/disk_flat_searcher.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 
 namespace alaya::disk {
 
@@ -74,7 +74,7 @@ class DiskFlatSearcherTest : public ::testing::Test {
   }
 
   // Builds a segment via DiskFlatBuilder and returns its directory.
-  auto build_segment(MetricType metric, const std::vector<float> &vectors,
+  auto build_segment(core::Metric metric, const std::vector<float> &vectors,
                      const std::vector<uint64_t> &labels, uint32_t dim,
                      const std::string &seg_name) const -> std::filesystem::path {
     auto seg_dir = seg_parent_ / seg_name;
@@ -160,7 +160,7 @@ TEST_F(DiskFlatSearcherTest, L2MatchesBruteforce) {
   constexpr uint64_t kN = 1000;
   auto vectors = make_random_vectors(kN, kDim, 1);
   auto labels = sequential_labels(kN);
-  auto seg_dir = build_segment(MetricType::L2, vectors, labels, kDim, "seg_00000001");
+  auto seg_dir = build_segment(core::Metric::l2, vectors, labels, kDim, "seg_00000001");
 
   DiskFlatSegmentSearcher s(seg_dir);
   ASSERT_EQ(s.size(), kN);
@@ -185,7 +185,7 @@ TEST_F(DiskFlatSearcherTest, IpMatchesBruteforce) {
   constexpr uint64_t kN = 1000;
   auto vectors = make_random_vectors(kN, kDim, 2);
   auto labels = sequential_labels(kN);
-  auto seg_dir = build_segment(MetricType::IP, vectors, labels, kDim, "seg_00000001");
+  auto seg_dir = build_segment(core::Metric::inner_product, vectors, labels, kDim, "seg_00000001");
 
   DiskFlatSegmentSearcher s(seg_dir);
   auto query = make_random_vectors(1, kDim, 8);
@@ -205,7 +205,7 @@ TEST_F(DiskFlatSearcherTest, CosMatchesBruteforce) {
   constexpr uint64_t kN = 1000;
   auto vectors = make_random_vectors(kN, kDim, 3);
   auto labels = sequential_labels(kN);
-  auto seg_dir = build_segment(MetricType::COS, vectors, labels, kDim, "seg_00000001");
+  auto seg_dir = build_segment(core::Metric::cosine, vectors, labels, kDim, "seg_00000001");
 
   DiskFlatSegmentSearcher s(seg_dir);
   auto query = make_random_vectors(1, kDim, 9);
@@ -225,7 +225,7 @@ TEST_F(DiskFlatSearcherTest, L2ExactMatch) {
   constexpr uint64_t kN = 50;
   auto vectors = make_random_vectors(kN, kDim, 11);
   auto labels = sequential_labels(kN);
-  auto seg_dir = build_segment(MetricType::L2, vectors, labels, kDim, "seg_00000001");
+  auto seg_dir = build_segment(core::Metric::l2, vectors, labels, kDim, "seg_00000001");
 
   DiskFlatSegmentSearcher s(seg_dir);
   std::vector<float> query(vectors.begin() + 7 * kDim, vectors.begin() + 8 * kDim);
@@ -242,7 +242,7 @@ TEST_F(DiskFlatSearcherTest, IpExactMatch) {
   constexpr uint64_t kN = 50;
   auto vectors = make_random_vectors(kN, kDim, 12);
   auto labels = sequential_labels(kN);
-  auto seg_dir = build_segment(MetricType::IP, vectors, labels, kDim, "seg_00000001");
+  auto seg_dir = build_segment(core::Metric::inner_product, vectors, labels, kDim, "seg_00000001");
 
   DiskFlatSegmentSearcher s(seg_dir);
   std::vector<float> query(vectors.begin() + 13 * kDim, vectors.begin() + 14 * kDim);
@@ -262,7 +262,7 @@ TEST_F(DiskFlatSearcherTest, CallerBufferNotMutatedSearchL2) {
   constexpr uint32_t kDim = 8;
   auto vectors = make_random_vectors(20, kDim, 21);
   auto labels = sequential_labels(20);
-  auto seg_dir = build_segment(MetricType::L2, vectors, labels, kDim, "seg_00000001");
+  auto seg_dir = build_segment(core::Metric::l2, vectors, labels, kDim, "seg_00000001");
 
   DiskFlatSegmentSearcher s(seg_dir);
   auto query = make_random_vectors(1, kDim, 99);
@@ -278,7 +278,7 @@ TEST_F(DiskFlatSearcherTest, CallerBufferNotMutatedSearchIp) {
   constexpr uint32_t kDim = 8;
   auto vectors = make_random_vectors(20, kDim, 22);
   auto labels = sequential_labels(20);
-  auto seg_dir = build_segment(MetricType::IP, vectors, labels, kDim, "seg_00000001");
+  auto seg_dir = build_segment(core::Metric::inner_product, vectors, labels, kDim, "seg_00000001");
 
   DiskFlatSegmentSearcher s(seg_dir);
   auto query = make_random_vectors(1, kDim, 100);
@@ -293,7 +293,7 @@ TEST_F(DiskFlatSearcherTest, CallerBufferNotMutatedSearchCos) {
   constexpr uint32_t kDim = 8;
   auto vectors = make_random_vectors(20, kDim, 23);
   auto labels = sequential_labels(20);
-  auto seg_dir = build_segment(MetricType::COS, vectors, labels, kDim, "seg_00000001");
+  auto seg_dir = build_segment(core::Metric::cosine, vectors, labels, kDim, "seg_00000001");
 
   DiskFlatSegmentSearcher s(seg_dir);
   auto query = make_random_vectors(1, kDim, 101);
@@ -308,7 +308,7 @@ TEST_F(DiskFlatSearcherTest, ZeroQueryThrowsSearchCos) {
   constexpr uint32_t kDim = 8;
   auto vectors = make_random_vectors(10, kDim, 31);
   auto labels = sequential_labels(10);
-  auto seg_dir = build_segment(MetricType::COS, vectors, labels, kDim, "seg_00000001");
+  auto seg_dir = build_segment(core::Metric::cosine, vectors, labels, kDim, "seg_00000001");
 
   DiskFlatSegmentSearcher s(seg_dir);
   std::vector<float> query(kDim, 0.0F);
@@ -321,7 +321,7 @@ TEST_F(DiskFlatSearcherTest, ZeroQueryL2Succeeds) {
   constexpr uint32_t kDim = 8;
   auto vectors = make_random_vectors(10, kDim, 32);
   auto labels = sequential_labels(10);
-  auto seg_dir = build_segment(MetricType::L2, vectors, labels, kDim, "seg_00000001");
+  auto seg_dir = build_segment(core::Metric::l2, vectors, labels, kDim, "seg_00000001");
 
   DiskFlatSegmentSearcher s(seg_dir);
   std::vector<float> query(kDim, 0.0F);
@@ -334,7 +334,7 @@ TEST_F(DiskFlatSearcherTest, ZeroQueryL2Succeeds) {
 }
 
 class NonFiniteQueryParam : public DiskFlatSearcherTest,
-                             public ::testing::WithParamInterface<MetricType> {};
+                             public ::testing::WithParamInterface<core::Metric> {};
 
 TEST_P(NonFiniteQueryParam, NaNQueryThrows) {
   constexpr uint32_t kDim = 8;
@@ -372,13 +372,13 @@ TEST_P(NonFiniteQueryParam, PosInfQueryThrows) {
 }
 
 INSTANTIATE_TEST_SUITE_P(AllMetrics, NonFiniteQueryParam,
-                         ::testing::Values(MetricType::L2, MetricType::IP, MetricType::COS));
+                         ::testing::Values(core::Metric::l2, core::Metric::inner_product, core::Metric::cosine));
 
 TEST_F(DiskFlatSearcherTest, TopKZeroThrows) {
   constexpr uint32_t kDim = 4;
   auto vectors = make_random_vectors(10, kDim, 51);
   auto labels = sequential_labels(10);
-  auto seg_dir = build_segment(MetricType::L2, vectors, labels, kDim, "seg_00000001");
+  auto seg_dir = build_segment(core::Metric::l2, vectors, labels, kDim, "seg_00000001");
 
   DiskFlatSegmentSearcher s(seg_dir);
   auto query = make_random_vectors(1, kDim, 200);
@@ -392,7 +392,7 @@ TEST_F(DiskFlatSearcherTest, TopKExceedsCountCaps) {
   constexpr uint64_t kN = 10;
   auto vectors = make_random_vectors(kN, kDim, 52);
   auto labels = sequential_labels(kN);
-  auto seg_dir = build_segment(MetricType::L2, vectors, labels, kDim, "seg_00000001");
+  auto seg_dir = build_segment(core::Metric::l2, vectors, labels, kDim, "seg_00000001");
 
   DiskFlatSegmentSearcher s(seg_dir);
   auto query = make_random_vectors(1, kDim, 201);
@@ -406,7 +406,7 @@ TEST_F(DiskFlatSearcherTest, FileSizeMismatchThrowsVectors) {
   constexpr uint32_t kDim = 8;
   auto vectors = make_random_vectors(10, kDim, 61);
   auto labels = sequential_labels(10);
-  auto seg_dir = build_segment(MetricType::L2, vectors, labels, kDim, "seg_00000001");
+  auto seg_dir = build_segment(core::Metric::l2, vectors, labels, kDim, "seg_00000001");
 
   // Truncate vectors.f32.bin by 1 byte.
   auto vec_path = seg_dir / "vectors.f32.bin";
@@ -419,7 +419,7 @@ TEST_F(DiskFlatSearcherTest, FileSizeMismatchThrowsIds) {
   constexpr uint32_t kDim = 8;
   auto vectors = make_random_vectors(10, kDim, 62);
   auto labels = sequential_labels(10);
-  auto seg_dir = build_segment(MetricType::L2, vectors, labels, kDim, "seg_00000001");
+  auto seg_dir = build_segment(core::Metric::l2, vectors, labels, kDim, "seg_00000001");
 
   auto ids_path = seg_dir / "ids.u64.bin";
   const auto orig_size = std::filesystem::file_size(ids_path);

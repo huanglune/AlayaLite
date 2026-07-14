@@ -44,7 +44,7 @@ struct MemoryFixture {
     fixture.data[row * 2] = static_cast<float>(row);
     fixture.data[row * 2 + 1] = static_cast<float>(row % 5);
   }
-  fixture.space = std::make_shared<Space>(rows + 8, 2, MetricType::L2);
+  fixture.space = std::make_shared<Space>(rows + 8, 2, core::Metric::l2);
   fixture.space->fit(fixture.data.data(), rows);
   core::BuildContext context;
   fixture.segment = Segment::build({core::TypedTensorView::contiguous(fixture.data.data(), rows, 2),
@@ -171,7 +171,7 @@ TEST(LegacyDiskAdapter, MatchesDirectDiskCollectionAndNeverExposesMutation) {
       std::filesystem::temp_directory_path() / "alaya-legacy-disk-collection-adapter-test";
   std::filesystem::remove_all(root);
   auto disk_collection =
-      std::make_shared<disk::DiskCollection>(root, 2, MetricType::L2, disk::DiskIndexType::Flat);
+      std::make_shared<disk::DiskCollection>(root, 2, core::Metric::l2, disk::DiskIndexType::Flat);
   const std::array<float, 8> vectors{0.0F, 0.0F, 2.0F, 2.0F, 5.0F, 5.0F, 9.0F, 9.0F};
   const std::array<std::uint64_t, 4> labels{100, 200, 300, 400};
   disk_collection->add_batch(vectors.data(), labels.data(), labels.size());
@@ -236,7 +236,7 @@ TEST(LegacyAdapters, MemoryAndDiskSlotsMixWithHnswProducerInOneSnapshot) {
   ASSERT_TRUE(hnsw_erased.ok());
 
   auto disk_collection =
-      std::make_shared<disk::DiskCollection>(root, 2, MetricType::L2, disk::DiskIndexType::Flat);
+      std::make_shared<disk::DiskCollection>(root, 2, core::Metric::l2, disk::DiskIndexType::Flat);
   const std::array<float, 4> disk_vectors{50.0F, 50.0F, 60.0F, 60.0F};
   const std::array<std::uint64_t, 2> disk_labels{500, 600};
   disk_collection->add_batch(disk_vectors.data(), disk_labels.data(), disk_labels.size());

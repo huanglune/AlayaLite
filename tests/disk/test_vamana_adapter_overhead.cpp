@@ -21,7 +21,7 @@
 #include "index/graph/vamana/vamana_greedy_search.hpp"
 #include "index/graph/vamana/vamana_reader.hpp"
 #include "simd/distance_l2.hpp"
-#include "core/metric_type.hpp"
+#include "core/value_types.hpp"
 
 namespace alaya::disk {
 namespace {
@@ -103,7 +103,7 @@ TEST(VamanaAdapterOverheadTest, direct_greedy_vs_disk_collection_adapter) {
                          qbuf.begin() + static_cast<size_t>(q + 1) * kDim);
   }
 
-  DiskCollection collection(coll_path, kDim, MetricType::L2, DiskIndexType::Vamana);
+  DiskCollection collection(coll_path, kDim, core::Metric::l2, DiskIndexType::Vamana);
   collection.add_batch(vectors.data(), ids.data(), ids.size());
   collection.flush();
 

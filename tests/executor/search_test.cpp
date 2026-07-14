@@ -72,27 +72,27 @@ auto max_thread_num() -> uint32_t { return configured_thread_limit(); }
 
 
 auto make_raw_space(const Dataset &ds) -> std::shared_ptr<RawSpaceType> {
-  auto space = std::make_shared<RawSpaceType>(ds.data_num_, ds.dim_, MetricType::L2);
+  auto space = std::make_shared<RawSpaceType>(ds.data_num_, ds.dim_, core::Metric::l2);
   space->fit(ds.data_.data(), ds.data_num_);
   return space;
 }
 
 auto make_sq8_space(const Dataset &ds) -> std::shared_ptr<SQ8SpaceType> {
-  auto space = std::make_shared<SQ8SpaceType>(ds.data_num_, ds.dim_, MetricType::L2);
+  auto space = std::make_shared<SQ8SpaceType>(ds.data_num_, ds.dim_, core::Metric::l2);
   space->fit(ds.data_.data(), ds.data_num_);
   return space;
 }
 
 auto make_one_dim_raw_space(const std::vector<float> &values) -> std::shared_ptr<RawSpaceType> {
   auto space =
-      std::make_shared<RawSpaceType>(static_cast<uint32_t>(values.size()), 1, MetricType::L2);
+      std::make_shared<RawSpaceType>(static_cast<uint32_t>(values.size()), 1, core::Metric::l2);
   space->fit(values.data(), static_cast<uint32_t>(values.size()));
   return space;
 }
 
 auto make_one_dim_sq8_space(const std::vector<float> &values) -> std::shared_ptr<SQ8SpaceType> {
   auto space =
-      std::make_shared<SQ8SpaceType>(static_cast<uint32_t>(values.size()), 1, MetricType::L2);
+      std::make_shared<SQ8SpaceType>(static_cast<uint32_t>(values.size()), 1, core::Metric::l2);
   space->fit(values.data(), static_cast<uint32_t>(values.size()));
   return space;
 }

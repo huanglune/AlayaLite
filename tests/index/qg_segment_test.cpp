@@ -132,7 +132,7 @@ class QgSegmentTest : public ::testing::Test {
                                   static_cast<float>(row % 11) * 0.01F;
       }
     }
-    space_ = std::make_shared<Space>(kCapacity, kDim, MetricType::L2);
+    space_ = std::make_shared<Space>(kCapacity, kDim, core::Metric::l2);
     space_->fit(data_.data(), kRows);
     core::BuildContext context;
     segment_ =

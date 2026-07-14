@@ -64,14 +64,14 @@ void build_memory_artifact(const std::filesystem::path &root,
                            std::uint32_t capacity,
                            const BuildOptions &options) {
   std::filesystem::create_directories(root);
-  auto build_space = std::make_shared<RawSpace>(capacity, dim, alaya::MetricType::L2);
+  auto build_space = std::make_shared<RawSpace>(capacity, dim, alaya::core::Metric::l2);
   build_space->fit(vectors, rows);
 
   std::shared_ptr<SearchSpace> search_space;
   if constexpr (std::is_same_v<SearchSpace, RawSpace>) {
     search_space = build_space;
   } else {
-    search_space = std::make_shared<SearchSpace>(capacity, dim, alaya::MetricType::L2);
+    search_space = std::make_shared<SearchSpace>(capacity, dim, alaya::core::Metric::l2);
     search_space->fit(vectors, rows);
   }
 
@@ -141,7 +141,7 @@ void build_disk_artifacts(const std::filesystem::path &output, const Fbin &input
   {
     alaya::disk::DiskCollection collection(output / "disk_flat",
                                            input.dim,
-                                           alaya::MetricType::L2,
+                                           alaya::core::Metric::l2,
                                            alaya::disk::DiskIndexType::Flat);
     collection.add_batch(input.values.data(), labels.data(), kRows);
     collection.flush();
@@ -155,7 +155,7 @@ void build_disk_artifacts(const std::filesystem::path &output, const Fbin &input
     options.num_threads = 1;
     alaya::disk::DiskCollection collection(output / "disk_vamana",
                                            input.dim,
-                                           alaya::MetricType::L2,
+                                           alaya::core::Metric::l2,
                                            alaya::disk::DiskIndexType::Vamana,
                                            alaya::disk::DiskCollection::kDefaultMaxPendingBytes,
                                            options);
