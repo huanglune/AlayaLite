@@ -97,4 +97,5 @@ alaya_add_test(
   NAME index_test_rabitq_performance
   TARGET rabitq_performance_test
   LABELS performance
+  TIMEOUT 1800
 )
