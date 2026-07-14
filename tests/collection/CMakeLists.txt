@@ -58,8 +58,6 @@ alaya_add_test(
   LABELS integration collection persistence migration
   TIMEOUT 180
 )
-alaya_cc_target(legacy_memory_adapter_header_closure SRCS legacy_memory_adapter_header_closure.cpp)
-alaya_cc_target(legacy_disk_adapter_header_closure SRCS legacy_disk_adapter_header_closure.cpp)
 alaya_cc_target(manifest_v2_header_closure SRCS manifest_v2_header_closure.cpp)
 
 alaya_cc_target(
@@ -110,18 +108,6 @@ alaya_cc_target(
 alaya_add_test(
   NAME segmented_collection_test
   TARGET segmented_collection_test
-  LABELS unit collection
-  TIMEOUT 60
-)
-
-alaya_cc_target(
-  legacy_adapter_test
-  SRCS legacy_adapter_test.cpp
-  GTEST
-)
-alaya_add_test(
-  NAME legacy_adapter_test
-  TARGET legacy_adapter_test
   LABELS unit collection
   TIMEOUT 60
 )

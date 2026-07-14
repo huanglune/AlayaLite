@@ -410,8 +410,6 @@ struct SegmentReplacement {
 
 struct CollectionFeatureFlags {
   bool collection_shell{true};
-  bool legacy_memory_adapter{true};
-  bool legacy_disk_adapter{true};
   bool experimental_persistence_writer{};
   bool wal_coordinator{};
   // Independent Gate 7-B writer gate. Disabling it prevents discovery or
