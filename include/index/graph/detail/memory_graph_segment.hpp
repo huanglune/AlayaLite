@@ -19,7 +19,7 @@
 
 #include "core/algorithm_registry.hpp"
 #include "core/any_segment.hpp"
-#include "executor/jobs/graph_search_job.hpp"
+#include "index/graph/detail/search_runtime/graph_search_job.hpp"
 #include "space/space_concepts.hpp"
 
 namespace alaya::detail {

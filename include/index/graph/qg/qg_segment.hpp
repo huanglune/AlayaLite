@@ -19,7 +19,7 @@
 
 #include "core/algorithm_registry.hpp"
 #include "core/any_segment.hpp"
-#include "executor/jobs/graph_search_job.hpp"
+#include "index/graph/detail/search_runtime/graph_search_job.hpp"
 #include "index/graph/qg/detail/qg_builder_kernel.hpp"
 #include "index/graph/qg/detail/qg_graph.hpp"
 #include "space/rabitq_space.hpp"
