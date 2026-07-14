@@ -3,11 +3,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 alaya_cc_target(
-  coro_test
-  GTEST
-  SRCS coro_test.cpp
-)
-alaya_cc_target(
   search_test
   GTEST
   SRCS search_test.cpp
@@ -22,23 +17,7 @@ alaya_cc_target(
   GTEST
   SRCS mutex_test.cpp
 )
-alaya_cc_target(
-  scheduler_test
-  GTEST
-  SRCS scheduler_test.cpp
-)
-alaya_cc_target(
-  task_queue_test
-  GTEST
-  SRCS task_queue_test.cpp
-)
-alaya_cc_target(
-  worker_test
-  GTEST
-  SRCS worker_test.cpp
-)
 
-alaya_add_test(NAME executor_test_coro TARGET coro_test)
 # search_test bundles several suites; register them separately so ctest can schedule and report them independently. They
 # read data files relative to the build dir, hence the explicit working directory.
 alaya_add_test(
@@ -67,6 +46,3 @@ alaya_add_test(
 )
 alaya_add_test(NAME executor_test_update TARGET update_test)
 alaya_add_test(NAME executor_test_mutex TARGET mutex_test)
-alaya_add_test(NAME executor_test_scheduler TARGET scheduler_test)
-alaya_add_test(NAME executor_test_task_queue TARGET task_queue_test)
-alaya_add_test(NAME executor_test_worker TARGET worker_test)

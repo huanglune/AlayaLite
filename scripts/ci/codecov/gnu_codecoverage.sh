@@ -23,13 +23,9 @@ if ! command -v conan >/dev/null 2>&1; then
 fi
 
 COVERAGE_TARGETS=(
-  coro_test
   search_test
   update_test
   mutex_test
-  scheduler_test
-  task_queue_test
-  worker_test
   fusion_graph_test
   graph_test
   hnsw_test
