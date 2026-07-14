@@ -922,7 +922,6 @@ class PyCollection {
     result["engine_factory_key"] = collection_->target_engine_factory_key();
     result["active_algorithm"] = algorithm_name(collection_->active_algorithm());
     result["auto_seal_rows"] = options.auto_seal_rows;
-    result["imported_legacy_layout"] = collection_->imported_legacy_layout();
     return result;
   }
 

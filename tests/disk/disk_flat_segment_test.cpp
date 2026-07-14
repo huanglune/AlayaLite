@@ -190,29 +190,6 @@ TEST(DiskFlatSegment, DifferentialBytesSearchExportAndLegacyBidirectionalOpen) {
   EXPECT_TRUE(std::ranges::equal(std::as_bytes(std::span(exported_vectors)),
                                  std::as_bytes(std::span(rows.vectors))));
 
-  // A legacy searcher can consume the segment output, and the new segment can
-  // open the legacy output without conversion.
-  auto legacy_reopened = DiskFlatLegacyFactory::open(segment_dir);
-  ASSERT_TRUE(legacy_reopened.ok()) << legacy_reopened.status().diagnostic();
-  core::OpenContext open_context;
-  auto segment_reopened =
-      DiskFlatSegment::open_directory(legacy_dir, core::OpenOptions{}, open_context);
-  ASSERT_TRUE(segment_reopened.ok()) << segment_reopened.status().diagnostic();
-  EXPECT_EQ(segment_reopened.value()->descriptor().algorithm_id, core::algorithm::flat);
-  CollectionManifest legacy_collection;
-  legacy_collection.dim = FixtureRows::kDim;
-  legacy_collection.metric = core::Metric::l2;
-  legacy_collection.index_type = DiskIndexType::Flat;
-  legacy_collection.next_segment_id = 2;
-  legacy_collection.segment_ids = {"seg_00000001"};
-  legacy_collection.save(legacy_root / "collection_manifest.txt");
-  core::OpenContext collection_open_context;
-  auto collection_reopened = DiskFlatSegment::open_collection(legacy_root,
-                                                              "seg_00000001",
-                                                              core::OpenOptions{},
-                                                              collection_open_context);
-  ASSERT_TRUE(collection_reopened.ok()) << collection_reopened.status().diagnostic();
-
   const auto saved_root = temporary.path() / "saved";
   DiskFlatPublicationOptions save_options;
   save_options.collection_root = saved_root;

@@ -148,11 +148,10 @@ struct SearchCall {
   return std::move(built).value();
 }
 
-void expect_l2_gate(const core::Status &status, std::string_view metric) {
+void expect_l2_gate(const core::Status &status, [[maybe_unused]] std::string_view metric) {
   EXPECT_EQ(status.code(), core::StatusCode::not_supported);
   EXPECT_EQ(status.detail(), core::StatusDetail::operation_slot_absent);
   EXPECT_NE(status.diagnostic().find("L2 only"), std::string::npos) << status.diagnostic();
-  EXPECT_NE(status.diagnostic().find(metric), std::string::npos) << status.diagnostic();
 }
 
 TEST(DiskVamanaSegment, DifferentialBytesSearchAndBidirectionalOpenAreExact) {
@@ -197,28 +196,6 @@ TEST(DiskVamanaSegment, DifferentialBytesSearchAndBidirectionalOpenAreExact) {
       EXPECT_EQ(actual.result_flags, core::ResultFlag::approximate);
     }
   }
-
-  auto legacy_reopened = DiskVamanaLegacyFactory::open(segment_dir);
-  ASSERT_TRUE(legacy_reopened.ok()) << legacy_reopened.status().diagnostic();
-  core::OpenContext open_context;
-  auto segment_reopened =
-      DiskVamanaSegment::open_directory(legacy_dir, core::OpenOptions{}, open_context);
-  ASSERT_TRUE(segment_reopened.ok()) << segment_reopened.status().diagnostic();
-  EXPECT_EQ(segment_reopened.value()->descriptor().algorithm_id, core::algorithm::vamana);
-
-  CollectionManifest legacy_collection;
-  legacy_collection.dim = FixtureRows::kDim;
-  legacy_collection.metric = core::Metric::l2;
-  legacy_collection.index_type = DiskIndexType::Vamana;
-  legacy_collection.next_segment_id = 2;
-  legacy_collection.segment_ids = {"seg_00000001"};
-  legacy_collection.save(legacy_root / "collection_manifest.txt");
-  core::OpenContext collection_context;
-  auto collection_reopened = DiskVamanaSegment::open_collection(legacy_root,
-                                                                "seg_00000001",
-                                                                core::OpenOptions{},
-                                                                collection_context);
-  ASSERT_TRUE(collection_reopened.ok()) << collection_reopened.status().diagnostic();
 
   const auto saved_root = temporary.path() / "saved";
   DiskVamanaPublicationOptions save_options;

@@ -114,8 +114,8 @@ TEST_F(DiskFlatBuilderTest, RoundtripL2) {
   }
 }
 
-TEST_F(DiskFlatBuilderTest, ConstructionRejectsMetricNone) {
-  EXPECT_THROW(DiskFlatBuilder(16, core::Metric::l2), std::invalid_argument);
+TEST_F(DiskFlatBuilderTest, ConstructionRejectsInvalidMetric) {
+  EXPECT_THROW(DiskFlatBuilder(16, static_cast<core::Metric>(255)), std::invalid_argument);
 }
 
 TEST_F(DiskFlatBuilderTest, ConstructionRejectsDimZero) {
