@@ -154,11 +154,6 @@ class RawSpace {
     reader.read(reinterpret_cast<char *>(&delete_cnt_), sizeof(delete_cnt_));
     reader.read(reinterpret_cast<char *>(&capacity_), sizeof(capacity_));
 
-    // Skip legacy scalar config section if present in v1 artifacts.
-    // The v1 format wrote RocksDB config here; we consume those bytes to
-    // keep the read cursor aligned but do not use the values (scalar data
-    // is owned by Collection since Gate 9).
-
     data_storage_.load(reader);
     LOG_INFO("RawSpace is loaded from {}", filename);
   }

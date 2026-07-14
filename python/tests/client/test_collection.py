@@ -42,8 +42,8 @@ class TestCollection(unittest.TestCase):
             shutil.rmtree(self.temp_dir)
 
     def _collection_params(self, **kwargs) -> IndexParams:
-        rocksdb_path = kwargs.pop("rocksdb_path", os.path.join(self.temp_dir, "RocksDB", uuid.uuid4().hex))
-        return IndexParams(rocksdb_path=rocksdb_path, **kwargs)
+        storage_path = kwargs.pop("storage_path", os.path.join(self.temp_dir, "Storage", uuid.uuid4().hex))
+        return IndexParams(storage_path=storage_path, **kwargs)
 
     def _track_collection(self, collection: Collection) -> Collection:
         self._collections.append(collection)
@@ -177,7 +177,7 @@ class TestCollection(unittest.TestCase):
         ]
         self.collection.insert(items)
 
-        # Gate 9-A removes the PyIndex/RocksDB internal-row escape hatch. Pin
+        # Gate 9-A removes the PyIndex internal-row escape hatch. Pin
         # the same scalar values by LogicalId through the canonical owner.
         scalars = self.collection.get_records([1, 2, 99])
 
@@ -653,12 +653,12 @@ class TestCollection(unittest.TestCase):
         normalized = normalize_vectors_for_cosine_metric(query, "cosine")
         self.assertAlmostEqual(float(normalized[0][0]), 1.0, places=6)
 
-    def test_load_preserves_explicit_rocksdb_path_from_schema(self):
+    def test_load_preserves_explicit_storage_path_from_schema(self):
         client_dir = os.path.join(self.temp_dir, "client")
         os.makedirs(client_dir, exist_ok=True)
 
-        rocksdb_path = os.path.join(client_dir, "custom-rocksdb")
-        params = self._collection_params(rocksdb_path=rocksdb_path)
+        storage_path = os.path.join(client_dir, "custom-storage")
+        params = self._collection_params(storage_path=storage_path)
         collection = self._create_collection("persisted", params)
         collection.insert([("a", "Document A", np.array([1.0, 0.0, 0.0], dtype=np.float32), {})])
         save_dir = os.path.join(client_dir, "persisted")
@@ -669,7 +669,7 @@ class TestCollection(unittest.TestCase):
 
         loaded = self._track_collection(Collection.load(client_dir, "persisted"))
 
-        self.assertEqual(loaded.get_index_params().rocksdb_path, rocksdb_path)
+        self.assertEqual(loaded.get_index_params().storage_path, storage_path)
 
     def test_reindex_large_scale(self):
         """Large-scale reindex test with recall evaluation.

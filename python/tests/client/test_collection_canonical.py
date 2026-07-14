@@ -20,7 +20,7 @@ def _item(item_id, vector, document="", metadata=None):
 
 def test_python_binding_reopens_cxx_owner_and_matches_direct_parity_sequence(tmp_path):
     root = tmp_path / "parity"
-    collection = Collection("parity", IndexParams(rocksdb_path=str(root / "rocksdb")))
+    collection = Collection("parity", IndexParams(storage_path=str(root / "storage")))
     collection.add([_item("a", [0, 0], "A", {"revision": 1}), _item("b", [2, 0], "B")])
     collection.close()
 
@@ -61,7 +61,7 @@ def test_python_binding_reopens_cxx_owner_and_matches_direct_parity_sequence(tmp
 
 
 def test_canonical_batch_mutation_supports_independent_and_all_or_nothing(tmp_path):
-    collection = Collection("batch", IndexParams(rocksdb_path=str(tmp_path / "batch" / "rocksdb")))
+    collection = Collection("batch", IndexParams(storage_path=str(tmp_path / "batch" / "storage")))
     collection.add([_item("existing", [0, 0])])
 
     independent = collection.add(
@@ -88,7 +88,7 @@ def test_native_status_maps_to_versioned_python_exception(tmp_path):
         IndexParams(
             index_type="hnsw",
             quantization_type="rabitq",
-            rocksdb_path=str(tmp_path / "bad-qg" / "rocksdb"),
+            storage_path=str(tmp_path / "bad-qg" / "storage"),
         ),
     )
 
@@ -105,7 +105,7 @@ def test_native_status_maps_to_versioned_python_exception(tmp_path):
 def test_gate10_filter_policies_overfetch_stats_and_budget_reuse(tmp_path):
     collection = Collection(
         "gate10-filter",
-        IndexParams(rocksdb_path=str(tmp_path / "gate10-filter" / "rocksdb")),
+        IndexParams(storage_path=str(tmp_path / "gate10-filter" / "storage")),
     )
     collection.add(
         [
@@ -170,7 +170,7 @@ def test_gate10_filter_policies_overfetch_stats_and_budget_reuse(tmp_path):
 def test_gate10_python_seal_compact_gc_and_collection_stats(tmp_path):
     collection = Collection(
         "gate10-lifecycle",
-        IndexParams(rocksdb_path=str(tmp_path / "gate10-lifecycle" / "rocksdb")),
+        IndexParams(storage_path=str(tmp_path / "gate10-lifecycle" / "storage")),
     )
     collection.add([_item("a", [0, 0]), _item("b", [1, 0])])
     first = collection.seal()
@@ -202,7 +202,7 @@ def test_gate10_python_seal_compact_gc_and_collection_stats(tmp_path):
 
     automatic = Collection(
         "gate10-auto-seal",
-        IndexParams(rocksdb_path=str(tmp_path / "gate10-auto-seal" / "rocksdb")),
+        IndexParams(storage_path=str(tmp_path / "gate10-auto-seal" / "storage")),
         auto_seal_rows=2,
     )
     automatic.add([_item("x", [0, 0]), _item("y", [1, 0])])

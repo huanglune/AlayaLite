@@ -59,18 +59,18 @@ __all__ = [
 ]
 
 
-def _default_rocksdb_path(collection_name: str, base_dir: Optional[str] = None) -> str:
+def _default_storage_path(collection_name: str, base_dir: Optional[str] = None) -> str:
     """Retain the historical configuration spelling as a storage-root hint."""
     if base_dir is not None:
-        return os.path.join(base_dir, collection_name, "rocksdb")
-    rocksdb_base = os.environ.get("ALAYALITE_ROCKSDB_DIR", "./RocksDB")
-    return os.path.join(rocksdb_base, collection_name)
+        return os.path.join(base_dir, collection_name, "storage")
+    storage_base = os.environ.get("ALAYALITE_STORAGE_DIR", "./Storage")
+    return os.path.join(storage_base, collection_name)
 
 
-def _canonical_root(rocksdb_path: str) -> str:
-    """Translate the old config field without opening a RocksDB owner."""
-    path = Path(rocksdb_path).expanduser()
-    if path.name == "rocksdb":
+def _storage_root(storage_path: str) -> str:
+    """Resolve storage root from the configuration path."""
+    path = Path(storage_path).expanduser()
+    if path.name == "storage":
         path = path.parent
     return os.path.abspath(os.fspath(path))
 
@@ -148,8 +148,8 @@ class Collection:
     """The canonical Python facade over :class:`alaya::Collection`.
 
     Vectors, LogicalIds, documents, metadata, versions, tombstones, WAL and
-    checkpoints all have one native owner.  The former ``rocksdb_path`` field
-    is retained only as a source-compatible choice of collection directory.
+    checkpoints all have one native owner.  ``storage_path`` in IndexParams
+    specifies the collection storage directory.
     """
 
     def __init__(
@@ -161,9 +161,9 @@ class Collection:
     ):
         _assert(int(auto_seal_rows) >= 0, "auto_seal_rows must be greater than or equal to 0")
         self.__index_params = index_params if index_params is not None else IndexParams()
-        if not self.__index_params.rocksdb_path:
-            self.__index_params.rocksdb_path = _default_rocksdb_path(name)
-        self.__root = _canonical_root(self.__index_params.rocksdb_path)
+        if not self.__index_params.storage_path:
+            self.__index_params.storage_path = _default_storage_path(name)
+        self.__root = _storage_root(self.__index_params.storage_path)
         self.__native: Optional[_NativeCollection] = None
         self.__dim: Optional[int] = None
         self.__dtype: Optional[np.dtype] = None
@@ -763,8 +763,8 @@ class Collection:
         if schema_map.get("type") not in {"collection", "index"}:
             raise RuntimeError(f"{name} is not a supported collection artifact")
         index_params = IndexParams.from_str_dict(schema_map["index"])
-        if not index_params.rocksdb_path:
-            index_params.rocksdb_path = _default_rocksdb_path(name, url)
+        if not index_params.storage_path:
+            index_params.storage_path = _default_storage_path(name, url)
         instance = cls(name, index_params)
         instance._bind_open_native(collection_url)
         return instance

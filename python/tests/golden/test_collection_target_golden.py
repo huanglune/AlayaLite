@@ -17,7 +17,7 @@ ITEMS = [
 
 
 def _collection(tmp_path: Path, name: str) -> Collection:
-    return Collection(name, IndexParams(rocksdb_path=str(tmp_path / name / "rocksdb")))
+    return Collection(name, IndexParams(storage_path=str(tmp_path / name / "storage")))
 
 
 def test_target_search_truncates_without_id_max_or_any_sentinel(tmp_path):
@@ -70,14 +70,14 @@ def test_target_single_and_batch_share_one_short_row_response_schema(tmp_path):
 
 def test_target_cpp_collection_is_the_only_wal_and_scalar_owner(tmp_path):
     root = tmp_path / "owner"
-    collection = Collection("owner", IndexParams(rocksdb_path=str(root / "rocksdb")))
+    collection = Collection("owner", IndexParams(storage_path=str(root / "storage")))
     collection.insert(ITEMS)
     collection.checkpoint()
 
     assert (root / ".alaya_internal" / "collection_wal_v1" / "logical.wal").is_file()
     assert (root / ".alaya_internal" / "collection_wal_v1" / "CURRENT").is_file()
     assert not (root / "recovery" / "wal.bin").exists()
-    assert not (root / "rocksdb").exists()
+    assert not (root / "storage").exists()
     assert collection.get_by_id(["a"]) == {
         "id": ["a"],
         "document": ["A"],

@@ -64,7 +64,7 @@ class TestHybridSearch(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
-        os.environ["ALAYALITE_ROCKSDB_DIR"] = os.path.join(self.temp_dir, "RocksDB")
+        os.environ["ALAYALITE_STORAGE_DIR"] = os.path.join(self.temp_dir, "Storage")
 
     def tearDown(self):
         if os.path.exists(self.temp_dir):
@@ -157,7 +157,7 @@ class TestRaBitQBruteForceLarge(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
-        os.environ["ALAYALITE_ROCKSDB_DIR"] = os.path.join(self.temp_dir, "RocksDB")
+        os.environ["ALAYALITE_STORAGE_DIR"] = os.path.join(self.temp_dir, "Storage")
 
     def tearDown(self):
         if os.path.exists(self.temp_dir):

@@ -10,7 +10,7 @@ VECTORS = np.array([[0, 0], [1, 0], [0, 2]], dtype=np.float32)
 
 
 def test_collection_structures_duplicates_and_empty_operations(tmp_path):
-    params = IndexParams(rocksdb_path=str(tmp_path / "rocks"))
+    params = IndexParams(storage_path=str(tmp_path / "rocks"))
     collection = Collection("golden", params)
     assert collection.insert([]) is None
     assert collection.get_by_id(["missing"]) == {"id": [], "document": [], "metadata": []}

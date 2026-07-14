@@ -35,7 +35,7 @@ def test_canonical_legal_33_matrix_subset_preserves_declared_identity(case, iden
             id_type=id_type,
             quantization_type=quantization,
             metric="l2",
-            rocksdb_path=str(root / "rocksdb"),
+            storage_path=str(root / "storage"),
         ),
     )
     vector = np.arange(4, dtype=data_type)
@@ -69,7 +69,7 @@ def test_canonical_rabitq_legacy_spellings_require_explicit_qg(case, tmp_path):
             id_type=id_type,
             quantization_type=quantization,
             metric="l2",
-            rocksdb_path=str(tmp_path / _case_id(case) / "rocksdb"),
+            storage_path=str(tmp_path / _case_id(case) / "storage"),
         ),
     )
 
@@ -91,7 +91,7 @@ def test_canonical_explicit_qg_identity_is_legal(id_type, tmp_path):
             id_type=id_type,
             quantization_type="rabitq",
             metric="l2",
-            rocksdb_path=str(root / "rocksdb"),
+            storage_path=str(root / "storage"),
         ),
     )
     collection.add([("qg", "document", np.zeros(4, dtype=np.float32), {})])

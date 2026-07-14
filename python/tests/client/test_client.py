@@ -28,17 +28,17 @@ class _FakeClosable:
 class TestClient(unittest.TestCase):  # pylint: disable=missing-class-docstring
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp()
-        self._original_rocksdb_dir = os.environ.get("ALAYALITE_ROCKSDB_DIR")
-        os.environ["ALAYALITE_ROCKSDB_DIR"] = os.path.join(self.tmp_dir, "RocksDB")
+        self._original_storage_dir = os.environ.get("ALAYALITE_STORAGE_DIR")
+        os.environ["ALAYALITE_STORAGE_DIR"] = os.path.join(self.tmp_dir, "Storage")
         self.client = Client()
 
     def tearDown(self):
         del self.client
         gc.collect()
-        if self._original_rocksdb_dir is None:
-            os.environ.pop("ALAYALITE_ROCKSDB_DIR", None)
+        if self._original_storage_dir is None:
+            os.environ.pop("ALAYALITE_STORAGE_DIR", None)
         else:
-            os.environ["ALAYALITE_ROCKSDB_DIR"] = self._original_rocksdb_dir
+            os.environ["ALAYALITE_STORAGE_DIR"] = self._original_storage_dir
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def test_create_get_and_duplicate_collection(self):

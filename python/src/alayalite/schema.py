@@ -43,7 +43,7 @@ class IndexParams:
     max_nbrs: int = None
     build_threads: Optional[int] = None
     materialized_view_build_threads: Optional[int] = None
-    rocksdb_path: str = ""  # Path for RocksDB storage (for scalar data)
+    storage_path: str = ""  # Collection storage directory
     has_scalar_data: bool = False  # Whether to enable scalar data storage
     indexed_fields: list = None  # Fields to create secondary indexes for (for fast filtering)
 
@@ -86,7 +86,7 @@ class IndexParams:
             "max_nbrs": self.max_nbrs,
             "build_threads": self.build_threads,
             "materialized_view_build_threads": self.materialized_view_build_threads,
-            "rocksdb_path": self.rocksdb_path,
+            "storage_path": self.storage_path,
             "has_scalar_data": self.has_scalar_data,
             "indexed_fields": self.indexed_fields if self.indexed_fields else [],
         }
@@ -104,7 +104,7 @@ class IndexParams:
             max_nbrs=data["max_nbrs"],
             build_threads=data.get("build_threads") or None,
             materialized_view_build_threads=data.get("materialized_view_build_threads") or None,
-            rocksdb_path=data.get("rocksdb_path", ""),
+            storage_path=data.get("storage_path", ""),
             has_scalar_data=data.get("has_scalar_data", False),  # Default to False for backward compatibility
             indexed_fields=data.get("indexed_fields", []),  # Default to empty list for backward compatibility
         )
@@ -120,7 +120,7 @@ class IndexParams:
         max_nbrs = None
         build_threads = None
         materialized_view_build_threads = None
-        rocksdb_path = ""
+        storage_path = ""
         indexed_fields = None
 
         if kwargs.get("index_type") is not None:
@@ -147,8 +147,8 @@ class IndexParams:
             build_threads = valid_thread_count(kwargs.get("build_threads"))
         if kwargs.get("materialized_view_build_threads") is not None:
             materialized_view_build_threads = valid_thread_count(kwargs.get("materialized_view_build_threads"))
-        if kwargs.get("rocksdb_path") is not None:
-            rocksdb_path = str(kwargs.get("rocksdb_path"))
+        if kwargs.get("storage_path") is not None:
+            storage_path = str(kwargs.get("storage_path"))
         if kwargs.get("indexed_fields") is not None:
             indexed_fields = list(kwargs.get("indexed_fields"))
         return cls(
@@ -161,7 +161,7 @@ class IndexParams:
             max_nbrs=max_nbrs,
             build_threads=build_threads,
             materialized_view_build_threads=materialized_view_build_threads,
-            rocksdb_path=rocksdb_path,
+            storage_path=storage_path,
             indexed_fields=indexed_fields,
         )
 

@@ -21,22 +21,22 @@ class TestRecovery(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
-        self.rocksdb_root = os.path.join(self.temp_dir, "RocksDB")
-        self._original_rocksdb_dir = os.environ.get("ALAYALITE_ROCKSDB_DIR")
-        os.environ["ALAYALITE_ROCKSDB_DIR"] = self.rocksdb_root
+        self.storage_root = os.path.join(self.temp_dir, "Storage")
+        self._original_storage_dir = os.environ.get("ALAYALITE_STORAGE_DIR")
+        os.environ["ALAYALITE_STORAGE_DIR"] = self.storage_root
 
     def tearDown(self):
         gc.collect()
-        if self._original_rocksdb_dir is None:
-            os.environ.pop("ALAYALITE_ROCKSDB_DIR", None)
+        if self._original_storage_dir is None:
+            os.environ.pop("ALAYALITE_STORAGE_DIR", None)
         else:
-            os.environ["ALAYALITE_ROCKSDB_DIR"] = self._original_rocksdb_dir
+            os.environ["ALAYALITE_STORAGE_DIR"] = self._original_storage_dir
         if os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir)
 
     def _run_crashing_child(self, body: str, exit_code: int = 91) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
-        env["ALAYALITE_ROCKSDB_DIR"] = self.rocksdb_root
+        env["ALAYALITE_STORAGE_DIR"] = self.storage_root
 
         script = "\n".join(
             [
@@ -44,7 +44,7 @@ class TestRecovery(unittest.TestCase):
                 "import numpy as np",
                 "from alayalite import Client",
                 "",
-                f'os.environ["ALAYALITE_ROCKSDB_DIR"] = {self.rocksdb_root!r}',
+                f'os.environ["ALAYALITE_STORAGE_DIR"] = {self.storage_root!r}',
                 f"client = Client({self.temp_dir!r})",
                 "",
                 textwrap.dedent(body).strip(),

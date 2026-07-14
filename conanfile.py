@@ -39,9 +39,6 @@ class AlayaLiteConan(ConanFile):
         self.requires("pybind11/2.13.6")
         self.requires("spdlog/1.14.0")
         self.requires("eigen/3.4.0")
-        self.requires("lz4/1.9.4")
-        self.requires("zstd/1.5.6")
-        self.requires("rocksdb/10.5.1")
         # io_uring and coroutine scheduler support are Linux-only in CMake.
         if self.settings.os == "Linux":
             self.requires("libcoro/0.14.1")
@@ -65,10 +62,6 @@ class AlayaLiteConan(ConanFile):
 
         # Use header-only spdlog to avoid ABI compatibility issues on Windows
         self.options["spdlog"].header_only = True
-
-        # Enable compression libraries for RocksDB
-        self.options["rocksdb"].with_lz4 = True
-        self.options["rocksdb"].with_zstd = True
 
         # The project uses libcoro task/mutex primitives, not its networking/TLS
         # layer. ConanCenter's libcoro networking option pulls in epoll-only

@@ -78,8 +78,8 @@ class Client:
             raise RuntimeError(f"A collection with name '{name}' already exists")
 
         index_params = IndexParams.from_kwargs(**kwargs)
-        if not index_params.rocksdb_path and self.__url is not None:
-            index_params.rocksdb_path = os.path.join(self.__url, name, "rocksdb")
+        if not index_params.storage_path and self.__url is not None:
+            index_params.storage_path = os.path.join(self.__url, name, "storage")
         collection = Collection(name, index_params)
         self.__collection_map[name] = collection
         return collection

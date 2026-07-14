@@ -27,8 +27,6 @@ find_package(concurrentqueue REQUIRED)
 find_package(spdlog REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(OpenMP QUIET)
-find_package(RocksDB REQUIRED)
-
 if(BUILD_PYTHON)
   # Reuse the interpreter alaya_preflight() resolved (FindPython / Python_* family) instead of letting pybind11 run its
   # own discovery, so the module, the fixtures, and Conan all agree on one Python.
@@ -36,7 +34,7 @@ if(BUILD_PYTHON)
   find_package(pybind11 REQUIRED)
 endif()
 
-set(THIRD_PARTY_LIBS spdlog::spdlog_header_only concurrentqueue::concurrentqueue Eigen3::Eigen RocksDB::rocksdb)
+set(THIRD_PARTY_LIBS spdlog::spdlog_header_only concurrentqueue::concurrentqueue Eigen3::Eigen)
 
 if(TARGET OpenMP::OpenMP_CXX)
   list(APPEND THIRD_PARTY_LIBS OpenMP::OpenMP_CXX)
