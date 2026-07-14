@@ -50,6 +50,7 @@
 #include "coro/when_all.hpp"
 #include "index/graph/diskann/beam_search.hpp"
 #include "index/graph/diskann/beam_search_async.hpp"
+#include "index/graph/diskann/detail/coro_gate.hpp"
 #include "index/graph/diskann/disk_layout.hpp"
 #include "index/graph/diskann/disk_page_io.hpp"
 #include "index/graph/diskann/disk_update_context.hpp"
@@ -64,7 +65,6 @@
 #include "simd/distance_l2.hpp"
 #include "storage/io/page_reader_factory.hpp"
 #include "storage/io/uring_reactor.hpp"
-#include "index/graph/diskann/detail/coro_gate.hpp"
 
 namespace alaya::diskann {
 

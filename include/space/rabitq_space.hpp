@@ -20,14 +20,14 @@
 #include "simd/distance_ip.hpp"
 #include "simd/distance_l2.hpp"
 #include "space/quant/rabitq.hpp"
+#include "space/quant/rabitq/fastscan.hpp"
+#include "space/quant/rabitq/lut.hpp"
+#include "space/quant/rabitq/rotator.hpp"
 #include "space/space_concepts.hpp"
 #include "storage/container/static_storage.hpp"
 #include "utils/math.hpp"
 #include "utils/openmp.hpp"
 #include "utils/prefetch.hpp"
-#include "space/quant/rabitq/fastscan.hpp"
-#include "space/quant/rabitq/lut.hpp"
-#include "space/quant/rabitq/rotator.hpp"
 
 namespace alaya {
 template <typename DataType = float, typename DistanceType = float, typename IDType = uint32_t>

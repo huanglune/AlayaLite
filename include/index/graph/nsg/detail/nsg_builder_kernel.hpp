@@ -15,13 +15,13 @@
 #include <utility>
 #include <vector>
 #include "core/log.hpp"
-#include "index/graph/graph.hpp"
-#include "index/graph/knng/detail/nndescent_kernel.hpp"
-#include "index/neighbor.hpp"
 #include "index/graph/detail/random.hpp"
 #include "index/graph/detail/thread_config.hpp"
 #include "index/graph/detail/thread_pool.hpp"
 #include "index/graph/detail/timer.hpp"
+#include "index/graph/graph.hpp"
+#include "index/graph/knng/detail/nndescent_kernel.hpp"
+#include "index/neighbor.hpp"
 
 namespace alaya::detail {
 

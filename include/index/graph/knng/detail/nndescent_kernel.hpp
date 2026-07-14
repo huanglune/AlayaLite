@@ -11,13 +11,13 @@
 #include <random>
 #include <vector>
 #include "core/log.hpp"
-#include "index/graph/graph.hpp"
-#include "index/neighbor.hpp"
-#include "space/space_concepts.hpp"
 #include "index/graph/detail/random.hpp"
 #include "index/graph/detail/thread_config.hpp"
 #include "index/graph/detail/thread_pool.hpp"
 #include "index/graph/detail/timer.hpp"
+#include "index/graph/graph.hpp"
+#include "index/neighbor.hpp"
+#include "space/space_concepts.hpp"
 
 namespace alaya {
 

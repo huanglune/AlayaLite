@@ -17,9 +17,9 @@
 #include <vector>
 
 #include "core/log.hpp"
+#include "index/graph/detail/timer.hpp"
 #include "index/graph/vamana/robust_prune.hpp"
 #include "simd/distance_l2.hpp"
-#include "index/graph/detail/timer.hpp"
 
 namespace alaya::vamana {
 
