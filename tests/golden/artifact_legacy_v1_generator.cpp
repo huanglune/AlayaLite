@@ -25,8 +25,7 @@ namespace {
 using RawSpace = alaya::RawSpace<float,
                                  float,
                                  std::uint32_t,
-                                 alaya::SequentialStorage<float, std::uint32_t>,
-                                 alaya::EmptyScalarData>;
+                                 alaya::SequentialStorage<float, std::uint32_t>>;
 using Sq8Space = alaya::SQ8Space<float,
                                  float,
                                  std::uint32_t,

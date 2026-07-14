@@ -8,13 +8,11 @@
 #include <type_traits>
 
 #include "storage/sequential_storage.hpp"
-#include "utils/scalar_data.hpp"
 
 using GoldenSpace = alaya::RawSpace<float,
                                     float,
                                     uint32_t,
-                                    alaya::SequentialStorage<float, uint32_t>,
-                                    alaya::EmptyScalarData>;
+                                    alaya::SequentialStorage<float, uint32_t>>;
 static_assert(std::is_class_v<GoldenSpace>);
 static_assert(alaya::DistanceSpace<GoldenSpace>);
 static_assert(alaya::Quantizer<GoldenSpace>);

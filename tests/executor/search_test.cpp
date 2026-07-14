@@ -23,8 +23,6 @@
 #include "utils/evaluate.hpp"
 #include "utils/locks.hpp"
 #include "utils/log.hpp"
-#include "utils/metadata_filter.hpp"
-#include "utils/scalar_data.hpp"
 #include "utils/thread_config.hpp"
 #include "utils/timer.hpp"
 
@@ -39,10 +37,6 @@ constexpr uint32_t kSparseTailCount = 50;
 using RawSpaceType = RawSpace<>;
 using GraphType = Graph<>;
 using SQ8SpaceType = SQ8Space<>;
-using RawSpaceWithScalarType =
-    RawSpace<float, float, uint32_t, SequentialStorage<float, uint32_t>, ScalarData>;
-using SQ8SpaceWithScalar =
-    SQ8Space<float, float, uint32_t, SequentialStorage<uint8_t, uint32_t>, ScalarData>;
 
 auto test_data_dir() -> std::filesystem::path {
   return std::filesystem::current_path().parent_path() / "data";
@@ -75,18 +69,6 @@ struct ScopedTempDbDir {
 
 auto max_thread_num() -> uint32_t { return configured_thread_limit(); }
 
-auto make_test_metadata(uint32_t item_cnt) -> std::vector<ScalarData> {
-  std::vector<ScalarData> metadata(item_cnt);
-  for (uint32_t i = 0; i < item_cnt; ++i) {
-    MetadataMap meta;
-    meta["id"] = static_cast<int64_t>(i);
-    meta["category"] = static_cast<int64_t>(i % 5);
-    meta["score"] = static_cast<double>(i) * 10.0;
-    meta["name"] = std::string("item_") + std::to_string(i);
-    metadata[i] = ScalarData("id_" + std::to_string(i), "doc_" + std::to_string(i), meta);
-  }
-  return metadata;
-}
 
 auto make_raw_space(const Dataset &ds) -> std::shared_ptr<RawSpaceType> {
   auto space = std::make_shared<RawSpaceType>(ds.data_num_, ds.dim_, MetricType::L2);
@@ -114,31 +96,6 @@ auto make_one_dim_sq8_space(const std::vector<float> &values) -> std::shared_ptr
   return space;
 }
 
-auto make_one_dim_scalar_space(const std::vector<float> &values,
-                               const std::filesystem::path &db_path,
-                               const std::vector<std::string> &indexed_fields)
-    -> std::shared_ptr<RawSpaceWithScalarType> {
-  RocksDBConfig config;
-  config.db_path_ = db_path.string();
-  config.indexed_fields_ = indexed_fields;
-
-  auto space = std::make_shared<RawSpaceWithScalarType>(static_cast<uint32_t>(values.size()),
-                                                        1,
-                                                        MetricType::L2,
-                                                        config);
-
-  std::vector<ScalarData> metadata;
-  metadata.reserve(values.size());
-  for (size_t i = 0; i < values.size(); ++i) {
-    MetadataMap meta;
-    meta["id"] = static_cast<int64_t>(i);
-    meta["group"] = static_cast<int64_t>(i >= 3 ? 1 : 0);
-    metadata.emplace_back("id_" + std::to_string(i), "doc_" + std::to_string(i), std::move(meta));
-  }
-
-  space->fit(values.data(), static_cast<uint32_t>(values.size()), metadata.data());
-  return space;
-}
 
 auto make_graph_from_edges(const std::vector<std::vector<uint32_t>> &adjacency)
     -> std::shared_ptr<GraphType> {
@@ -427,44 +384,6 @@ TEST(GraphSearchJobUnitTest, UnderfilledRerankMarksMissingIdsInvalid) {
   EXPECT_EQ(ids[0], 0U);
   EXPECT_EQ(ids[1], 1U);
   EXPECT_EQ(ids[2], std::numeric_limits<uint32_t>::max());
-}
-TEST(RaBitQGraphSearchJobTest, AllowsNullBuildSpaceForScalarMetadataVariant) {
-  using SearchSpaceType = RaBitQSpace<float, float, uint32_t, ScalarData>;
-  using BuildSpaceType = RaBitQSpace<float, float, uint32_t, EmptyScalarData>;
-  using SearchJobType = GraphSearchJob<SearchSpaceType, BuildSpaceType>;
-
-  auto db_path = test_cache_dir() / "rabitq_graph_search_job_rocksdb";
-  remove_path_if_exists(db_path);
-  {
-    RocksDBConfig config;
-    config.db_path_ = db_path.string();
-
-    constexpr uint32_t kDim = 64;
-    constexpr uint32_t kCount = 4;
-    auto search_space = std::make_shared<SearchSpaceType>(kCount, kDim, MetricType::L2, config);
-
-    std::vector<float> vectors(kCount * kDim, 0.0f);
-    for (uint32_t i = 0; i < kCount; ++i) {
-      vectors[i * kDim + i] = 1.0f;
-    }
-
-    std::vector<ScalarData> metadata;
-    metadata.reserve(kCount);
-    for (uint32_t i = 0; i < kCount; ++i) {
-      MetadataMap meta;
-      meta["category"] = static_cast<int64_t>(i % 2);
-      metadata.emplace_back("id_" + std::to_string(i), "doc_" + std::to_string(i), std::move(meta));
-    }
-
-    search_space->fit(vectors.data(), kCount, metadata.data());
-
-    EXPECT_NO_THROW((void)std::make_unique<SearchJobType>(search_space, nullptr));
-
-    auto search_job = std::make_unique<SearchJobType>(search_space, nullptr);
-    EXPECT_NE(search_job, nullptr);
-    search_space->close_db();
-  }
-  remove_path_if_exists(db_path);
 }
 
 }  // namespace
