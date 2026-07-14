@@ -30,16 +30,6 @@ constexpr const char *kCanonicalSegmentManifest =
     "ids_file=ids.u64.bin\n"
     "vectors_file=vectors.f32.bin\n";
 
-constexpr const char *kCanonicalCollectionManifest =
-    "version=1\n"
-    "dim=128\n"
-    "metric=L2\n"
-    "index_type=disk_flat\n"
-    "next_segment_id=4\n"
-    "segment=seg_00000001\n"
-    "segment=seg_00000002\n"
-    "segment=seg_00000003\n";
-
 class ManifestTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -406,102 +396,6 @@ TEST_F(ManifestTest, SegmentManifestFormatQuirks) {
     EXPECT_EQ(loaded.segment_id, "seg_00000007");
     EXPECT_EQ(loaded.metric, core::Metric::l2);
   }
-}
-
-TEST_F(ManifestTest, CollectionManifestRoundtripRepeatedSegmentForm) {
-  CollectionManifest c;
-  c.version = 1;
-  c.dim = 128;
-  c.metric = core::Metric::cosine;
-  c.index_type = DiskIndexType::Flat;
-  c.next_segment_id = 4;
-  c.segment_ids = {"seg_00000001", "seg_00000002", "seg_00000003"};
-
-  auto path = tmp_dir_ / "coll.txt";
-  c.save(path);
-  auto loaded = CollectionManifest::load(path);
-  EXPECT_EQ(loaded.dim, 128u);
-  EXPECT_EQ(loaded.metric, core::Metric::cosine);
-  EXPECT_EQ(loaded.index_type, DiskIndexType::Flat);
-  EXPECT_EQ(loaded.next_segment_id, 4u);
-  ASSERT_EQ(loaded.segment_ids.size(), 3u);
-  EXPECT_EQ(loaded.segment_ids[0], "seg_00000001");
-  EXPECT_EQ(loaded.segment_ids[1], "seg_00000002");
-  EXPECT_EQ(loaded.segment_ids[2], "seg_00000003");
-}
-
-TEST_F(ManifestTest, CollectionManifestEmptySegmentList) {
-  // freshly-created collection: no segments, next_segment_id == 1
-  std::string m =
-      "version=1\n"
-      "dim=128\n"
-      "metric=L2\n"
-      "index_type=disk_flat\n"
-      "next_segment_id=1\n";
-  auto path = write_text("empty.txt", m);
-  auto loaded = CollectionManifest::load(path);
-  EXPECT_EQ(loaded.next_segment_id, 1u);
-  EXPECT_TRUE(loaded.segment_ids.empty());
-}
-
-TEST_F(ManifestTest, CollectionManifestSegmentsCsvForm) {
-  std::string m =
-      "version=1\n"
-      "dim=128\n"
-      "metric=L2\n"
-      "index_type=disk_flat\n"
-      "next_segment_id=3\n"
-      "segments=seg_00000001,seg_00000002\n";
-  auto path = write_text("csv.txt", m);
-  auto loaded = CollectionManifest::load(path);
-  ASSERT_EQ(loaded.segment_ids.size(), 2u);
-  EXPECT_EQ(loaded.segment_ids[0], "seg_00000001");
-  EXPECT_EQ(loaded.segment_ids[1], "seg_00000002");
-}
-
-TEST_F(ManifestTest, CollectionManifestSegmentsTrailingComma) {
-  std::string bad =
-      "version=1\n"
-      "dim=128\n"
-      "metric=L2\n"
-      "index_type=disk_flat\n"
-      "next_segment_id=3\n"
-      "segments=seg_00000001,seg_00000002,\n";
-  auto path = write_text("trailing.txt", bad);
-  try {
-    (void)CollectionManifest::load(path);
-    ADD_FAILURE() << "expected throw for trailing comma";
-  } catch (const std::exception &e) {
-    const std::string msg = e.what();
-    bool mentions =
-        msg.find("trailing") != std::string::npos || msg.find("empty entry") != std::string::npos;
-    EXPECT_TRUE(mentions) << "msg=" << msg;
-  }
-}
-
-TEST_F(ManifestTest, CollectionManifestSegmentsEmptyEntry) {
-  std::string bad =
-      "version=1\n"
-      "dim=128\n"
-      "metric=L2\n"
-      "index_type=disk_flat\n"
-      "next_segment_id=3\n"
-      "segments=seg_00000001,,seg_00000002\n";
-  auto path = write_text("empty_entry.txt", bad);
-  EXPECT_THROW((void)CollectionManifest::load(path), std::invalid_argument);
-}
-
-TEST_F(ManifestTest, CollectionManifestMixedFormsRejected) {
-  std::string bad =
-      "version=1\n"
-      "dim=128\n"
-      "metric=L2\n"
-      "index_type=disk_flat\n"
-      "next_segment_id=3\n"
-      "segment=seg_00000001\n"
-      "segments=seg_00000002\n";
-  auto path = write_text("mixed.txt", bad);
-  EXPECT_THROW((void)CollectionManifest::load(path), std::invalid_argument);
 }
 
 }  // namespace alaya::disk

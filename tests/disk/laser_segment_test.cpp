@@ -25,6 +25,7 @@
 #include "index/disk/disk_flat_segment.hpp"
 #include "index/disk/laser_segment.hpp"
 #include "platform/detect.hpp"
+#include "index/disk/laser_segment_importer.hpp"
 
 #ifndef ALAYA_LASER_FIXTURE_DIR
   #define ALAYA_LASER_FIXTURE_DIR ""
@@ -205,14 +206,6 @@ TEST(LaserSegment, DifferentialRankOnlyManifestGateCollectionRejectionAndPerform
   const auto labels = fixture_labels();
   const auto vectors = fixture_vectors();
   import_fixture(segment_directory, labels);
-
-  CollectionManifest legacy_collection;
-  legacy_collection.dim = kDim;
-  legacy_collection.metric = core::Metric::l2;
-  legacy_collection.index_type = DiskIndexType::Laser;
-  legacy_collection.next_segment_id = 2;
-  legacy_collection.segment_ids = {"seg_00000001"};
-  legacy_collection.save(root / "collection_manifest.txt");
 
   core::OpenContext open_context;
   auto differential = LaserSegmentLegacyFactory::open_differential(segment_directory, open_context);

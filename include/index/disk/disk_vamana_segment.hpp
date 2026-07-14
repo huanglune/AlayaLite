@@ -1052,9 +1052,6 @@ class DiskVamanaSegmentFactory {
   }
 };
 
-// Explicit legacy target for differential checks and source rollback. The new
-// feature bit never redirects here; DiskCollection v1 continues to use its
-// pre-existing create_segment_from_pending/load_segment_from_manifest route.
 class DiskVamanaLegacyFactory {
  public:
   static constexpr auto registration = internal::disk::kDiskVamanaRegistration;

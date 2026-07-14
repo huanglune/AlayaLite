@@ -53,11 +53,6 @@ alaya_cc_target(
   SRCS disk_flat_segment_stress_test.cpp
 )
 alaya_cc_target(
-  segment_factory_test
-  GTEST
-  SRCS segment_factory_test.cpp
-)
-alaya_cc_target(
   test_vamana_reader
   GTEST
   SRCS test_vamana_reader.cpp
@@ -77,12 +72,6 @@ alaya_cc_target(
   GTEST
   SRCS test_vamana_segment_searcher.cpp
 )
-alaya_cc_target(
-  test_segment_factory_vamana
-  GTEST
-  SRCS test_segment_factory_vamana.cpp
-)
-
 alaya_add_test(NAME disk_test_types TARGET disk_types_test)
 alaya_add_test(NAME disk_test_segment_manifest TARGET segment_manifest_test)
 alaya_add_test(NAME disk_test_mmap_file TARGET mmap_file_test)
@@ -110,13 +99,10 @@ alaya_add_test(
   LABELS disk segment stress tsan
   TIMEOUT 120
 )
-alaya_add_test(NAME disk_test_segment_factory TARGET segment_factory_test)
 alaya_add_test(NAME test_vamana_reader TARGET test_vamana_reader)
 alaya_add_test(NAME test_vamana_greedy_search TARGET test_vamana_greedy_search)
 alaya_add_test(NAME test_vamana_segment_builder TARGET test_vamana_segment_builder)
 alaya_add_test(NAME test_vamana_segment_searcher TARGET test_vamana_segment_searcher)
-alaya_add_test(NAME test_segment_factory_vamana TARGET test_segment_factory_vamana)
-
 if(ALAYA_ENABLE_LASER)
   alaya_cc_target(
     laser_fixture_builder

@@ -22,6 +22,7 @@
 #include "index/disk/disk_vamana_segment.hpp"
 #include "index/disk/laser_segment.hpp"
 #include "platform/detect.hpp"
+#include "index/disk/laser_segment_importer.hpp"
 
 #ifndef ALAYA_LASER_FIXTURE_DIR
   #define ALAYA_LASER_FIXTURE_DIR ""
