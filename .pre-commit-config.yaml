@@ -158,6 +158,18 @@ repos:
     exclude: ^(docs/|build/)
 
 #===========================================================================
+#                            LAYER BOUNDARY LINT HOOK
+#===========================================================================
+- repo: local
+  hooks:
+  - id: layer-boundaries
+    name: Check include layer boundaries
+    entry: python scripts/lint/check_layer_boundaries.py
+    language: python
+    always_run: true
+    pass_filenames: false
+
+#===========================================================================
 #                            REUSE LICENSE COMPLIANCE HOOK
 #===========================================================================
 - repo: https://codeberg.org/fsfe/reuse-tool
