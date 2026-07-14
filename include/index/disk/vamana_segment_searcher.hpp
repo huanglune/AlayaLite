@@ -15,13 +15,13 @@
 #include <string>
 #include <vector>
 
+#include "core/metric_type.hpp"
+#include "core/platform.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
 #include "index/graph/vamana/vamana_greedy_search.hpp"
 #include "index/graph/vamana/vamana_reader.hpp"
 #include "storage/mmap_file.hpp"
-#include "utils/metric_type.hpp"
-#include "utils/platform.hpp"
 
 namespace alaya::disk {
 

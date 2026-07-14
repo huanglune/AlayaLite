@@ -26,13 +26,13 @@
 #include <string_view>
 #include <vector>
 
+#include "core/log.hpp"
 #include "index/graph/vamana/budget_estimator.hpp"
 #include "index/graph/vamana/kmeans_partition.hpp"
 #include "index/graph/vamana/shard_assigner.hpp"
 #include "index/graph/vamana/shard_merger.hpp"
 #include "index/graph/vamana/vamana_builder.hpp"
 #include "index/graph/vamana/vamana_writer.hpp"
-#include "utils/log.hpp"
 #include "utils/timer.hpp"
 
 namespace alaya::vamana {

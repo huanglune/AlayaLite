@@ -15,9 +15,9 @@
 
 #include <cstddef>
 
+#include "core/platform.hpp"
 #include "simd/distance_l2.hpp"
 #include "simd/laser_dispatch.hpp"
-#include "utils/platform.hpp"
 
 namespace alaya::laser::space {
 

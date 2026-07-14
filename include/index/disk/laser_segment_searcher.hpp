@@ -24,12 +24,12 @@
   #include <unistd.h>
 #endif
 
+#include "core/metric_type.hpp"
+#include "core/platform.hpp"
+#include "core/platform_fs.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
 #include "storage/mmap_file.hpp"
-#include "utils/metric_type.hpp"
-#include "utils/platform.hpp"
-#include "utils/platform_fs.hpp"
 
 #if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER != 0
   #include "index/graph/laser/qg/qg.hpp"

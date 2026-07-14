@@ -17,8 +17,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "core/platform.hpp"
 #include "simd/laser_dispatch.hpp"
-#include "utils/platform.hpp"
 
 namespace alaya::laser::scalar {
 

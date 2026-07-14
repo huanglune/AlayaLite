@@ -10,8 +10,8 @@
 #include <span>
 #include <string_view>
 
+#include "core/platform.hpp"
 #include "utils/macros.hpp"
-#include "utils/platform.hpp"
 
 #ifdef ALAYA_OS_LINUX
   #include <unistd.h>

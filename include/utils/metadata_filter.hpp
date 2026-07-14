@@ -11,7 +11,7 @@
 #include <variant>
 #include <vector>
 
-#include "utils/log.hpp"
+#include "core/log.hpp"
 #include "utils/scalar_data.hpp"
 
 namespace alaya {

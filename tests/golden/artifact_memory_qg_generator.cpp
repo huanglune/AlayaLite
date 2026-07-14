@@ -15,7 +15,7 @@
 
 #include "index/neighbor.hpp"
 #include "space/rabitq_space.hpp"
-#include "utils/metric_type.hpp"
+#include "core/metric_type.hpp"
 #include "utils/rabitq_utils/rotator.hpp"
 
 namespace {

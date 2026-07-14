@@ -8,9 +8,7 @@ file(GLOB core_headers "${ALAYA_SOURCE_DIR}/include/core/*.hpp")
 foreach(header IN LISTS core_headers)
   file(STRINGS "${header}" include_lines REGEX "^#[ \t]*include")
   foreach(line IN LISTS include_lines)
-    if(line MATCHES
-       "[<\"](index/|space/|storage/|storage_io/|metadata/|recovery/|sdk/|python/|utils/metric_type\\.hpp)"
-    )
+    if(line MATCHES "[<\"](index/|space/|storage/|storage_io/|metadata/|recovery/|sdk/|python/)")
       message(FATAL_ERROR "core reverse dependency in ${header}: ${line}")
     endif()
   endforeach()

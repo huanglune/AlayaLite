@@ -14,9 +14,9 @@
 #include <utility>
 #include <vector>
 
+#include "core/log.hpp"
 #include "index/graph/graph.hpp"
 #include "space/rabitq_space.hpp"
-#include "utils/log.hpp"
 #include "utils/prefetch.hpp"
 #include "utils/query_utils.hpp"
 #include "utils/rabitq_utils/search_utils/buffer.hpp"

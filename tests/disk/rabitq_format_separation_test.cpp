@@ -16,8 +16,8 @@
 #include "index/disk/laser_segment.hpp"
 #include "index/graph/qg/qg_segment.hpp"
 #include "space/rabitq_space.hpp"
-#include "utils/metric_type.hpp"
-#include "utils/platform.hpp"
+#include "core/metric_type.hpp"
+#include "core/platform.hpp"
 
 #ifndef ALAYA_LASER_FIXTURE_DIR
   #define ALAYA_LASER_FIXTURE_DIR ""

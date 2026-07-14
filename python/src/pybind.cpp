@@ -10,7 +10,7 @@
 #endif
 
 #include "collection_binding.hpp"
-#include "utils/metric_type.hpp"
+#include "core/metric_type.hpp"
 
 namespace py = pybind11;
 

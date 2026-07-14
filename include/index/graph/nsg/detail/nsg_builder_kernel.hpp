@@ -14,10 +14,10 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include "core/log.hpp"
 #include "index/graph/graph.hpp"
 #include "index/graph/knng/detail/nndescent_kernel.hpp"
 #include "index/neighbor.hpp"
-#include "utils/log.hpp"
 #include "utils/random.hpp"
 #include "utils/thread_config.hpp"
 #include "utils/thread_pool.hpp"

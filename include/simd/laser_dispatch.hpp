@@ -12,10 +12,10 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "core/log.hpp"
+#include "core/platform.hpp"
 #include "simd/cpu_features.hpp"
 #include "simd/fastscan.hpp"
-#include "utils/log.hpp"
-#include "utils/platform.hpp"
 
 namespace alaya::laser::simd {
 namespace detail {}

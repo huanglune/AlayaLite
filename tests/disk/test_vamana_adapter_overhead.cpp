@@ -21,7 +21,7 @@
 #include "index/graph/vamana/vamana_greedy_search.hpp"
 #include "index/graph/vamana/vamana_reader.hpp"
 #include "simd/distance_l2.hpp"
-#include "utils/metric_type.hpp"
+#include "core/metric_type.hpp"
 
 namespace alaya::disk {
 namespace {

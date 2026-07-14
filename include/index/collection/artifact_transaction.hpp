@@ -18,12 +18,12 @@
 #include <utility>
 #include <vector>
 
+#include "core/log.hpp"
+#include "core/platform.hpp"
+#include "core/platform_fs.hpp"
 #include "core/resource_contexts.hpp"
 #include "core/value_types.hpp"
 #include "index/collection/artifact_manifest_v2.hpp"
-#include "utils/log.hpp"
-#include "utils/platform.hpp"
-#include "utils/platform_fs.hpp"
 
 namespace alaya::internal::collection {
 

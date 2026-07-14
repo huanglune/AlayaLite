@@ -23,12 +23,12 @@
 
 #include "core/algorithm_registry.hpp"
 #include "core/any_segment.hpp"
+#include "core/platform_fs.hpp"
 #include "index/graph/vamana/vamana_builder.hpp"
 #include "index/graph/vamana/vamana_greedy_search.hpp"
 #include "index/graph/vamana/vamana_reader.hpp"
 #include "index/graph/vamana/vamana_writer.hpp"
 #include "index/memory_engine_registry.hpp"
-#include "utils/platform_fs.hpp"
 
 namespace alaya {
 

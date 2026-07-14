@@ -5,7 +5,7 @@
 #include "space/raw_space.hpp"
 #include <gtest/gtest.h>
 #include <cmath>
-#include "utils/metric_type.hpp"
+#include "core/metric_type.hpp"
 namespace alaya {
 
 using IDType = uint32_t;

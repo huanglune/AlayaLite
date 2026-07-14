@@ -16,8 +16,8 @@
 
 #pragma once
 
+#include "core/platform.hpp"
 #include "kernels/linalg/types.hpp"
-#include "utils/platform.hpp"
 
 #define LOWBIT(x) ((x) & (-(x)))
 

@@ -17,8 +17,8 @@
   #include <utility>
   #include <vector>
 
+  #include "core/platform_fs.hpp"
   #include "index/disk/disk_flat_builder.hpp"
-  #include "utils/platform_fs.hpp"
 #endif
 
 #include <filesystem>

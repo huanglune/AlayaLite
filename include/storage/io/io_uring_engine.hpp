@@ -4,10 +4,10 @@
 
 #pragma once
 
+#include "core/log.hpp"
+#include "core/platform.hpp"
 #include "storage/io/io_engine.hpp"
-#include "utils/log.hpp"
 #include "utils/macros.hpp"
-#include "utils/platform.hpp"
 
 #ifdef ALAYA_OS_LINUX
 

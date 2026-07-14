@@ -19,15 +19,15 @@
 // from disk_flat_builder.hpp's `detail` namespace (write_all_fsync, fsync_dir,
 // rename_no_replace, TmpDirGuard, is_finite_f32 / is_nan_f32 / is_neg_f32).
 // disk_flat_builder.hpp is a red-line file — included read-only here.
+#include "core/log.hpp"
+#include "core/metric_type.hpp"
+#include "core/platform.hpp"
+#include "core/platform_fs.hpp"
 #include "index/disk/disk_flat_builder.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
 #include "index/graph/vamana/vamana_builder.hpp"
 #include "index/graph/vamana/vamana_writer.hpp"
-#include "utils/log.hpp"
-#include "utils/metric_type.hpp"
-#include "utils/platform.hpp"
-#include "utils/platform_fs.hpp"
 
 namespace alaya::disk {
 

@@ -16,7 +16,7 @@
 
 #include "index/graph/laser/quantization/rabitq.hpp"
 #include "space/quant/rabitq.hpp"
-#include "utils/metric_type.hpp"
+#include "core/metric_type.hpp"
 
 namespace alaya {
 namespace {

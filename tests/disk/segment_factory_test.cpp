@@ -19,7 +19,7 @@
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
-#include "utils/metric_type.hpp"
+#include "core/metric_type.hpp"
 
 namespace alaya::disk {
 

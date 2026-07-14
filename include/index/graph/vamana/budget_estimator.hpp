@@ -10,8 +10,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include "core/log.hpp"
 #include "index/graph/vamana/kmeans_partition.hpp"
-#include "utils/log.hpp"
 
 namespace alaya::vamana {
 

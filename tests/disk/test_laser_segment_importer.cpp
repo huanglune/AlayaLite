@@ -5,7 +5,7 @@
 #include "index/disk/laser_segment_importer.hpp"
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/segment_manifest.hpp"
-#include "utils/metric_type.hpp"
+#include "core/metric_type.hpp"
 
 #include <gtest/gtest.h>
 #include <unistd.h>

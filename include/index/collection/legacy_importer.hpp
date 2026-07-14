@@ -32,10 +32,10 @@
 #include <variant>
 #include <vector>
 
+#include "core/platform_fs.hpp"
 #include "index/collection/segmented_collection.hpp"
 #include "index/disk/disk_flat_segment.hpp"
 #include "utils/binary_io.hpp"
-#include "utils/platform_fs.hpp"
 #include "utils/scalar_data.hpp"
 
 namespace alaya::internal::collection {

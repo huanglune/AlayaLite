@@ -21,7 +21,7 @@
 #include "index/disk/vamana_segment_builder.hpp"
 #include "index/disk/vamana_segment_searcher.hpp"
 #include "simd/distance_l2.hpp"
-#include "utils/metric_type.hpp"
+#include "core/metric_type.hpp"
 
 namespace alaya::disk {
 namespace {

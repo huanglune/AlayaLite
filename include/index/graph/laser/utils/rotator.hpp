@@ -43,10 +43,10 @@
 #include <stdexcept>
 #include <string>
 
+#include "core/platform.hpp"
 #include "index/graph/laser/utils/array.hpp"
 #include "index/graph/laser/utils/memory.hpp"
 #include "simd/laser_dispatch.hpp"
-#include "utils/platform.hpp"
 #include "utils/rabitq_utils/rotator.hpp"
 
 #if defined(ALAYA_ARCH_X86) && (defined(__GNUC__) || defined(__clang__))

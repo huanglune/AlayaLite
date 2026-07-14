@@ -17,7 +17,7 @@
  * regardless of the build directory location.
  *
  * Examples:
- *   /tmp/build-xxx/alayalite/include/utils/log.hpp -> include/utils/log.hpp
+ *   /tmp/build-xxx/alayalite/include/core/log.hpp -> include/core/log.hpp
  *   /home/user/project/src/main.cpp -> src/main.cpp
  */
 inline auto extract_relative_path(const char *full_path) -> const char * {

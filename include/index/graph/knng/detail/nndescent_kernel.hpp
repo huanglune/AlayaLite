@@ -10,10 +10,10 @@
 #include <mutex>
 #include <random>
 #include <vector>
+#include "core/log.hpp"
 #include "index/graph/graph.hpp"
 #include "index/neighbor.hpp"
 #include "space/space_concepts.hpp"
-#include "utils/log.hpp"
 #include "utils/random.hpp"
 #include "utils/thread_config.hpp"
 #include "utils/thread_pool.hpp"

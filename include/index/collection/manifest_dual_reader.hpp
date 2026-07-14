@@ -18,13 +18,13 @@
 #include <vector>
 
 #include "core/algorithm_registry.hpp"
+#include "core/metric_type.hpp"
+#include "core/platform_fs.hpp"
 #include "core/status.hpp"
 #include "core/value_types.hpp"
 #include "index/collection/artifact_manifest_v2.hpp"
 #include "index/collection/artifact_transaction.hpp"
 #include "index/disk/segment_manifest.hpp"
-#include "utils/metric_type.hpp"
-#include "utils/platform_fs.hpp"
 
 namespace alaya::internal::collection {
 

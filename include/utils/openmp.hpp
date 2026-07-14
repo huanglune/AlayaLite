@@ -10,7 +10,7 @@
   #include <omp.h>
 #endif
 
-#include "utils/log.hpp"
+#include "core/log.hpp"
 
 #ifdef _OPENMP
   #define ALAYA_OMP_PARALLEL_FOR_DYNAMIC _Pragma("omp parallel for schedule(dynamic)")

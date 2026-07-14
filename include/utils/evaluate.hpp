@@ -9,8 +9,8 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include "core/log.hpp"
 #include "simd/distance_l2.hpp"
-#include "utils/log.hpp"
 namespace alaya {
 
 template <typename DataType = float, typename DistanceType = float, typename IDType = uint32_t>

@@ -16,12 +16,12 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "core/log.hpp"
+#include "core/metric_type.hpp"
+#include "core/platform.hpp"
+#include "core/platform_fs.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
-#include "utils/log.hpp"
-#include "utils/metric_type.hpp"
-#include "utils/platform.hpp"
-#include "utils/platform_fs.hpp"
 
 namespace alaya::disk {
 

@@ -20,9 +20,9 @@
 #include <vector>
 
 #include "core/algorithm_registry.hpp"
+#include "core/platform_fs.hpp"
 #include "core/value_types.hpp"
 #include "index/collection/sha256.hpp"
-#include "utils/platform_fs.hpp"
 
 namespace alaya::internal::collection {
 

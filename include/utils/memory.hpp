@@ -8,8 +8,8 @@
 #include <limits>
 #include <new>
 #include <type_traits>
+#include "core/platform.hpp"
 #include "utils/math.hpp"
-#include "utils/platform.hpp"
 
 namespace alaya {
 

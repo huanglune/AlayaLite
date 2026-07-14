@@ -16,8 +16,8 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include "../../../core/log.hpp"
 #include "../../../space/space_concepts.hpp"
-#include "../../../utils/log.hpp"
 #include "visited_list_pool.hpp"
 
 namespace alaya {

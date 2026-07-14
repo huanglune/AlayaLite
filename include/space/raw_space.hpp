@@ -12,15 +12,15 @@
 #include <string>
 #include <string_view>
 #include "../utils/prefetch.hpp"
+#include "core/log.hpp"
+#include "core/metric_type.hpp"
+#include "core/platform.hpp"
 #include "simd/distance_ip.hpp"
 #include "simd/distance_l2.hpp"
 #include "space_concepts.hpp"
 #include "storage/sequential_storage.hpp"
 #include "utils/data_utils.hpp"
-#include "utils/log.hpp"
 #include "utils/math.hpp"
-#include "utils/metric_type.hpp"
-#include "utils/platform.hpp"
 #include "utils/prefetch.hpp"
 
 namespace alaya {

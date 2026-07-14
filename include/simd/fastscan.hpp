@@ -9,7 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "utils/platform.hpp"
+#include "core/platform.hpp"
 
 namespace alaya::simd::fastscan {
 

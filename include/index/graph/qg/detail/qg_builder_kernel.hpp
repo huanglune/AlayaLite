@@ -17,10 +17,10 @@
 #include <unordered_set>
 #include <vector>
 
+#include "core/log.hpp"
 #include "index/neighbor.hpp"
 #include "space/rabitq_space.hpp"
 #include "space/space_concepts.hpp"
-#include "utils/log.hpp"
 #include "utils/openmp.hpp"
 #include "utils/rabitq_utils/search_utils/buffer.hpp"
 #include "utils/rabitq_utils/search_utils/hashset.hpp"

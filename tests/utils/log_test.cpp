@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-#include "utils/log.hpp"
+#include "core/log.hpp"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <spdlog/sinks/ostream_sink.h>
@@ -14,8 +14,8 @@
 #include <sstream>
 #include <string>
 #include "utils/openmp.hpp"
-#include "utils/platform.hpp"
-#include "utils/platform_fs.hpp"
+#include "core/platform.hpp"
+#include "core/platform_fs.hpp"
 
 namespace alaya {
 
@@ -91,9 +91,9 @@ TEST(LogTest, Show) {
 }
 
 TEST(LogTest, ExtractRelativePathHandlesSourceMarkersAndFallbacks) {
-  EXPECT_STREQ(extract_relative_path("/repo/include/utils/log.hpp"), "include/utils/log.hpp");
-  EXPECT_STREQ(extract_relative_path("C:\\repo\\include\\utils\\log.hpp"),
-               "include\\utils\\log.hpp");
+  EXPECT_STREQ(extract_relative_path("/repo/include/core/log.hpp"), "include/core/log.hpp");
+  EXPECT_STREQ(extract_relative_path("C:\\repo\\include\\core\\log.hpp"),
+               "include\\core\\log.hpp");
   EXPECT_STREQ(extract_relative_path("/repo/src/module.cpp"), "src/module.cpp");
   EXPECT_STREQ(extract_relative_path("C:\\repo\\src\\module.cpp"), "src\\module.cpp");
   EXPECT_STREQ(extract_relative_path("/repo/tests/utils/log_test.cpp"), "tests/utils/log_test.cpp");

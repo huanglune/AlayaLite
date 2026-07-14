@@ -18,7 +18,7 @@
 #include "space/rabitq_space.hpp"
 #include "utils/dataset_utils.hpp"
 #include "utils/evaluate.hpp"
-#include "utils/log.hpp"
+#include "core/log.hpp"
 #include "utils/timer.hpp"
 
 namespace alaya {

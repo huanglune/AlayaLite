@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "utils/platform.hpp"
+#include "core/platform.hpp"
 
 #include <array>
 #include <cassert>
@@ -27,8 +27,8 @@
 #include <stdexcept>
 #include <type_traits>
 
+#include "core/log.hpp"
 #include "simd/fastscan.hpp"
-#include "utils/log.hpp"
 #include "utils/rabitq_utils/defines.hpp"
 
 namespace alaya::fastscan {

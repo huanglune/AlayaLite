@@ -24,7 +24,7 @@
 #include "index/collection/sha256.hpp"
 #include "index/disk/disk_flat_segment.hpp"
 #include "index/disk/laser_segment.hpp"
-#include "utils/platform.hpp"
+#include "core/platform.hpp"
 
 #ifndef ALAYA_LASER_FIXTURE_DIR
   #define ALAYA_LASER_FIXTURE_DIR ""

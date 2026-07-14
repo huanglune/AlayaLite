@@ -17,7 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "utils/platform.hpp"
+#include "core/platform.hpp"
 
 namespace alaya::laser::space {
 

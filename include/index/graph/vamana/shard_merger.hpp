@@ -17,7 +17,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "utils/log.hpp"
+#include "core/log.hpp"
 #include "utils/timer.hpp"
 
 namespace alaya::vamana {

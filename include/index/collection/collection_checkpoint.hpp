@@ -18,10 +18,10 @@
 #include <utility>
 #include <vector>
 
+#include "core/platform_fs.hpp"
 #include "index/collection/artifact_manifest_v2.hpp"
 #include "index/collection/mutation_wal_codec.hpp"
 #include "index/collection/routing_snapshot.hpp"
-#include "utils/platform_fs.hpp"
 
 namespace alaya::internal::collection {
 

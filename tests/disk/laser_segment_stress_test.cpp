@@ -17,7 +17,7 @@
 #include <gtest/gtest.h>
 
 #include "index/disk/laser_segment.hpp"
-#include "utils/platform.hpp"
+#include "core/platform.hpp"
 
 #ifndef ALAYA_LASER_FIXTURE_DIR
   #define ALAYA_LASER_FIXTURE_DIR ""

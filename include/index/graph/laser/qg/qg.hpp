@@ -41,6 +41,7 @@
 #else
   #include "index/graph/laser/utils/page_reader_adapter.hpp"
 #endif
+#include "core/platform.hpp"
 #include "index/graph/laser/utils/array.hpp"
 #include "index/graph/laser/utils/buffer.hpp"
 #include "index/graph/laser/utils/concurrent_queue.hpp"
@@ -49,7 +50,6 @@
 #include "index/graph/laser/utils/pca_transform.hpp"
 #include "index/graph/laser/utils/rotator.hpp"
 #include "third_party/ngt/hashset.hpp"
-#include "utils/platform.hpp"
 
 namespace alaya::laser {
 /**

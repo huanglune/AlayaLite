@@ -14,8 +14,8 @@
 #include <string>
 #include <vector>
 
+#include "core/log.hpp"
 #include "index/graph/vamana/kmeans_partition.hpp"
-#include "utils/log.hpp"
 #include "utils/timer.hpp"
 
 namespace alaya::vamana {

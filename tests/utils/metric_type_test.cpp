@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-#include "utils/metric_type.hpp"
+#include "core/metric_type.hpp"
 #include <gtest/gtest.h>
 #include <string_view>
 

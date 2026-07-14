@@ -14,7 +14,7 @@
 #include "index/collection/manifest_dual_reader.hpp"
 #include "index/collection/types.hpp"
 #include "index/disk/disk_flat_builder.hpp"
-#include "utils/platform_fs.hpp"
+#include "core/platform_fs.hpp"
 
 namespace alaya::internal::collection {
 namespace {

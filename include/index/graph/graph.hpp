@@ -14,7 +14,7 @@
 #include <string_view>
 #include <type_traits>
 #include <vector>
-#include "../../utils/log.hpp"
+#include "../../core/log.hpp"
 #include "overlay_graph.hpp"
 #include "storage/sequential_storage.hpp"
 namespace alaya {

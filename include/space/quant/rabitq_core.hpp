@@ -25,7 +25,7 @@
 #include <cstdint>
 #include <limits>
 
-#include "utils/metric_type.hpp"
+#include "core/metric_type.hpp"
 #include "utils/rabitq_utils/defines.hpp"
 
 namespace alaya {

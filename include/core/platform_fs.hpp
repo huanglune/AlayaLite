@@ -38,7 +38,7 @@
   #endif
 #endif
 
-#include "utils/log.hpp"
+#include "core/log.hpp"
 
 namespace alaya::platform {
 

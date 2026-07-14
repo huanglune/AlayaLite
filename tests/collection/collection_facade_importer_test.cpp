@@ -12,7 +12,7 @@
 
 #include "alaya/collection.hpp"
 #include "index/collection/sha256.hpp"
-#include "utils/platform.hpp"
+#include "core/platform.hpp"
 
 namespace alaya {
 namespace {

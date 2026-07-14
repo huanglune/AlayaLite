@@ -21,13 +21,13 @@
 
 #include "core/algorithm_registry.hpp"
 #include "core/any_segment.hpp"
+#include "core/platform_fs.hpp"
 #include "index/collection/artifact_transaction.hpp"
 #include "index/collection/manifest_dual_reader.hpp"
 #include "index/collection/types.hpp"
 #include "index/disk/disk_engine_registry.hpp"
 #include "index/disk/disk_flat_builder.hpp"
 #include "index/disk/disk_flat_searcher.hpp"
-#include "utils/platform_fs.hpp"
 
 namespace alaya::disk {
 

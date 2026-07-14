@@ -24,9 +24,9 @@
 #include <cstdint>
 #include <fstream>
 
+#include "core/log.hpp"
+#include "core/metric_type.hpp"
 #include "space/quant/rabitq_core.hpp"
-#include "utils/log.hpp"
-#include "utils/metric_type.hpp"
 #include "utils/rabitq_utils/defines.hpp"
 #include "utils/rabitq_utils/fastscan.hpp"
 

@@ -17,7 +17,7 @@
 #include <vector>
 #include "kernels/linalg/types.hpp"
 
-#include "utils/log.hpp"
+#include "core/log.hpp"
 
 namespace alaya::vamana {
 

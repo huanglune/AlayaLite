@@ -22,7 +22,7 @@
 #include "utils/dataset_utils.hpp"
 #include "utils/evaluate.hpp"
 #include "utils/locks.hpp"
-#include "utils/log.hpp"
+#include "core/log.hpp"
 #include "utils/thread_config.hpp"
 #include "utils/timer.hpp"
 

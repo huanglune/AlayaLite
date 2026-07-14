@@ -25,9 +25,9 @@
 #include <memory>
 #include <random>
 
+#include "core/log.hpp"
 #include "defines.hpp"
 #include "simd/fht.hpp"
-#include "utils/log.hpp"
 #include "utils/math.hpp"
 
 namespace alaya {
