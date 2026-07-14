@@ -2,11 +2,8 @@
 # supplies its own transitive prerequisites.
 alaya_cc_target(
   abstraction_public_header_golden
-  SRCS ../build_matrix/public_graph_header.cpp
-       ../build_matrix/public_space_header.cpp
-       ../build_matrix/public_disk_header.cpp
-       ../build_matrix/public_diskann_header.cpp
-       ../build_matrix/public_recovery_header.cpp
+  SRCS ../build_matrix/public_graph_header.cpp ../build_matrix/public_space_header.cpp
+       ../build_matrix/public_disk_header.cpp ../build_matrix/public_diskann_header.cpp
 )
 
 alaya_cc_target(artifact_diskann_generator SRCS artifact_diskann_generator.cpp)
