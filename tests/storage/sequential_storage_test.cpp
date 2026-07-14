@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-#include "storage/sequential_storage.hpp"
+#include "storage/container/sequential_storage.hpp"
 #include <gtest/gtest.h>
 #include <cstdint>
 #include <cstring>  // for memset

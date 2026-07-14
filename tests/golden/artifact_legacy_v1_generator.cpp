@@ -19,6 +19,7 @@
 #include "index/graph/nsg/nsg_segment.hpp"
 #include "space/raw_space.hpp"
 #include "space/sq8_space.hpp"
+#include "storage/container/sequential_storage.hpp"
 
 namespace {
 

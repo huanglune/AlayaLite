@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <type_traits>
 
-#include "storage/sequential_storage.hpp"
+#include "storage/container/sequential_storage.hpp"
 
 using GoldenSpace = alaya::RawSpace<float,
                                     float,

@@ -19,7 +19,7 @@
 #include "simd/distance_ip.hpp"
 #include "simd/distance_l2.hpp"
 #include "space_concepts.hpp"
-#include "storage/sequential_storage.hpp"
+#include "storage/container/sequential_storage.hpp"
 #include "utils/math.hpp"
 #include "utils/prefetch.hpp"
 #include "utils/scalar_data.hpp"

@@ -21,7 +21,7 @@
 #include "simd/distance_l2.hpp"
 #include "space/quant/rabitq.hpp"
 #include "space/space_concepts.hpp"
-#include "storage/static_storage.hpp"
+#include "storage/container/static_storage.hpp"
 #include "utils/math.hpp"
 #include "utils/openmp.hpp"
 #include "utils/prefetch.hpp"

@@ -16,7 +16,7 @@
 #include <vector>
 #include "../../core/log.hpp"
 #include "overlay_graph.hpp"
-#include "storage/sequential_storage.hpp"
+#include "storage/container/sequential_storage.hpp"
 namespace alaya {
 
 constexpr static int kEmptyId = -1;  ///< The id of empty node.
