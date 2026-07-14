@@ -144,39 +144,6 @@ TEST(ArtifactManifestV2, DeterministicRoundTripReconstructsEveryField) {
   EXPECT_TRUE(decoded.validate().ok());
 }
 
-TEST(CollectionManifestDualReader, MapsV1ToExplicitDefaultedEquivalentView) {
-  TemporaryDirectory temporary;
-  const auto segments = temporary.path() / "segments";
-  std::filesystem::create_directories(segments);
-  constexpr std::array<float, 4> vectors{0.0F, 1.0F, 2.0F, 3.0F};
-  constexpr std::array<std::uint64_t, 2> labels{100, 101};
-  disk::DiskFlatBuilder builder(2, core::Metric::l2);
-  builder.add_batch(vectors.data(), labels.data(), labels.size());
-  (void)builder.finish(segments / "seg_00000001");
-  disk::CollectionManifest legacy;
-  legacy.dim = 2;
-  legacy.metric = core::Metric::l2;
-  legacy.index_type = disk::DiskIndexType::Flat;
-  legacy.next_segment_id = 2;
-  legacy.segment_ids = {"seg_00000001"};
-  legacy.x_extras.emplace("x_preserved", "yes");
-  legacy.save(temporary.path() / kCollectionManifestFilename);
-
-  auto opened = CollectionManifestDualReader::open(temporary.path());
-  ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
-  const auto &view = opened.value();
-  EXPECT_EQ(view.source_version, ManifestSourceVersion::disk_collection_v1);
-  EXPECT_EQ(view.manifest.collection.dim, 2);
-  EXPECT_EQ(view.manifest.collection.logical_id_encoding, LogicalIdEncodingV2::legacy_u64_le);
-  EXPECT_EQ(view.manifest.next_segment_id_hint, 2);
-  ASSERT_EQ(view.manifest.segments.size(), 1);
-  EXPECT_EQ(view.manifest.segments[0].algorithm_id, core::algorithm::flat);
-  EXPECT_EQ(view.manifest.extensions.at("x_preserved"), "yes");
-  EXPECT_TRUE(view.field_was_defaulted("collection.metadata_epoch"));
-  EXPECT_TRUE(view.field_was_defaulted("segments[0].artifacts[0].sha256_ready"));
-  EXPECT_EQ(view.manifest.segments[0].artifacts[0].checksum_algorithm, ChecksumAlgorithmV2::none);
-}
-
 TEST(ArtifactControlPlaneTransaction, DefaultGatePublishesNoV2ControlFiles) {
   EXPECT_FALSE(CollectionFeatureFlags{}.manifest_v2_writer);
   TemporaryDirectory temporary;
@@ -300,8 +267,6 @@ TEST(ArtifactControlPlaneTransaction, V2RollForwardReaderVerifiesReadyAndRejects
   // runtime-disable/roll-forward contract.
   auto opened = CollectionManifestDualReader::open(temporary.path());
   ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
-  EXPECT_EQ(opened.value().source_version, ManifestSourceVersion::artifact_manifest_v2);
-  EXPECT_TRUE(opened.value().explicit_defaults.empty());
   ASSERT_EQ(opened.value().manifest.segments.size(), 1);
   EXPECT_EQ(opened.value().manifest.segments[0], prepared.value());
 

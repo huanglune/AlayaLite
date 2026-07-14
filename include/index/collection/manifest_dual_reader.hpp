@@ -4,50 +4,28 @@
 
 #pragma once
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <limits>
-#include <map>
-#include <memory>
 #include <set>
 #include <string>
 #include <string_view>
-#include <utility>
 #include <vector>
 
-#include "core/algorithm_registry.hpp"
 #include "core/status.hpp"
 #include "core/value_types.hpp"
 #include "index/collection/artifact_manifest_v2.hpp"
 #include "index/collection/artifact_transaction.hpp"
-#include "index/disk/segment_manifest.hpp"
 #include "platform/fs.hpp"
 
 namespace alaya::internal::collection {
 
-enum class ManifestSourceVersion : std::uint8_t {
-  disk_collection_v1 = 1,
-  artifact_manifest_v2 = 2,
-};
-
-struct ExplicitManifestDefault {
-  std::string field_path{};
-  std::string reason{};
-
-  auto operator<=>(const ExplicitManifestDefault &) const = default;
-};
-
 struct UnifiedManifestView {
-  ManifestSourceVersion source_version{ManifestSourceVersion::disk_collection_v1};
   ArtifactManifestV2 manifest{};
-  std::vector<ExplicitManifestDefault> explicit_defaults{};
 
-  [[nodiscard]] auto field_was_defaulted(std::string_view field_path) const noexcept -> bool {
-    return std::ranges::any_of(explicit_defaults, [&](const ExplicitManifestDefault &entry) {
-      return entry.field_path == field_path;
-    });
+  [[nodiscard]] auto field_was_defaulted(
+      [[maybe_unused]] std::string_view field_path) const noexcept -> bool {
+    return false;
   }
 };
 
@@ -71,17 +49,13 @@ class CollectionManifestDualReader {
       const auto body = platform::read_regular_file_bounded(path, kMaximumManifestBytes);
       const auto end = body.find('\n');
       const auto first_line = std::string_view(body).substr(0, end);
-      if (first_line == "version=1") {
-        return map_v1(collection_root, disk::CollectionManifest::load(path));
-      }
       if (first_line != "version=2") {
         return core::Status::error(core::StatusCode::corruption,
                                    core::OperationStage::open,
                                    core::StatusDetail::malformed_struct,
-                                   "collection manifest version is neither v1 nor v2");
+                                   "collection manifest version is not v2");
       }
       UnifiedManifestView view;
-      view.source_version = ManifestSourceVersion::artifact_manifest_v2;
       view.manifest = ArtifactManifestV2::deserialize(body);
       auto compatible = validate_reader_compatibility(view.manifest, options);
       if (!compatible.ok()) {
@@ -110,150 +84,6 @@ class CollectionManifestDualReader {
   }
 
  private:
-  [[nodiscard]] static auto core_metric(core::Metric metric) noexcept -> core::Metric {
-    return metric;
-  }
-
-  [[nodiscard]] static auto algorithm_id(disk::DiskIndexType type) noexcept -> core::AlgorithmId {
-    switch (type) {
-      case disk::DiskIndexType::Flat:
-        return core::algorithm::flat;
-      case disk::DiskIndexType::Vamana:
-        return core::algorithm::vamana;
-      case disk::DiskIndexType::Laser:
-        return core::algorithm::laser;
-    }
-    return 0;
-  }
-
-  [[nodiscard]] static auto factory_key(disk::DiskIndexType type) -> std::string {
-    switch (type) {
-      case disk::DiskIndexType::Flat:
-        return "flat";
-      case disk::DiskIndexType::Vamana:
-        return "vamana";
-      case disk::DiskIndexType::Laser:
-        return "laser";
-    }
-    return {};
-  }
-
-  static void mark_default(UnifiedManifestView &view,
-                           std::string field,
-                           std::string reason = "field is absent from DiskCollection manifest v1") {
-    view.explicit_defaults.push_back({std::move(field), std::move(reason)});
-  }
-
-  static void add_v1_artifact(SegmentEntryV2 &entry,
-                              std::string logical_name,
-                              std::filesystem::path relative_path,
-                              const std::filesystem::path &collection_root,
-                              bool required = true) {
-    OwnedArtifactV2 artifact;
-    artifact.logical_name = std::move(logical_name);
-    artifact.relative_path = relative_path.generic_string();
-    artifact.required = required;
-    std::error_code ec;
-    const auto absolute = collection_root / relative_path;
-    if (std::filesystem::is_regular_file(absolute, ec) && !ec) {
-      artifact.size_bytes = static_cast<std::uint64_t>(std::filesystem::file_size(absolute));
-    }
-    artifact.checksum_algorithm = ChecksumAlgorithmV2::none;
-    artifact.ready = false;
-    artifact.reader_compatibility.minimum_reader_version = 1;
-    artifact.reader_compatibility.maximum_reader_version = kArtifactManifestV2SchemaVersion;
-    entry.artifacts.push_back(std::move(artifact));
-  }
-
-  [[nodiscard]] static auto map_v1(const std::filesystem::path &collection_root,
-                                   const disk::CollectionManifest &legacy) -> UnifiedManifestView {
-    UnifiedManifestView view;
-    view.source_version = ManifestSourceVersion::disk_collection_v1;
-    auto &mapped = view.manifest;
-    if (legacy.dim > std::numeric_limits<std::uint32_t>::max()) {
-      throw std::invalid_argument("v1 collection dimension exceeds the v2 uint32 contract");
-    }
-    mapped.manifest_version = kArtifactManifestV2SchemaVersion;
-    mapped.collection.schema_name = "disk_collection_v1";
-    mapped.collection.schema_version = 1;
-    mapped.collection.dim = static_cast<std::uint32_t>(legacy.dim);
-    mapped.collection.metric = core_metric(legacy.metric);
-    mapped.collection.scalar_type = core::ScalarType::float32;
-    mapped.collection.logical_id_encoding = LogicalIdEncodingV2::legacy_u64_le;
-    mapped.collection.logical_id_encoding_version = 1;
-    mapped.next_segment_id_hint = legacy.next_segment_id;
-    mapped.extensions = legacy.x_extras;
-    mapped.publication.generation = 0;
-
-    mark_default(view, "collection.metadata_checkpoint");
-    mark_default(view, "collection.metadata_epoch");
-    mark_default(view, "publication.generation");
-    mark_default(view, "publication.parent");
-    mark_default(view, "wal_cut");
-    mark_default(view, "row_versions");
-    mark_default(view, "id_map_checkpoint");
-    mark_default(view, "gc");
-
-    for (std::size_t index = 0; index < legacy.segment_ids.size(); ++index) {
-      const auto &segment_id = legacy.segment_ids[index];
-      const auto segment_relative = std::filesystem::path("segments") / segment_id;
-      const auto legacy_segment =
-          disk::SegmentManifest::load(collection_root / segment_relative / "manifest.txt");
-      SegmentEntryV2 entry;
-      entry.segment_id = legacy_segment.segment_id;
-      entry.generation = 1;
-      entry.role = SegmentRoleV2::searchable;
-      entry.algorithm_id = algorithm_id(legacy_segment.index_type);
-      entry.format_version = static_cast<std::uint32_t>(legacy_segment.version);
-      entry.factory_key = factory_key(legacy_segment.index_type);
-      entry.capabilities.operations =
-          core::capability_bit(core::OperationCapability::search) |
-          core::capability_bit(core::OperationCapability::batch_search) |
-          core::capability_bit(core::OperationCapability::save) |
-          core::capability_bit(core::OperationCapability::stats);
-      entry.capabilities.cooperative_cancel = false;
-      entry.capabilities.explicit_drain = false;
-      entry.lifecycle = SegmentLifecycleV2::sealed;
-      entry.reader_compatibility.minimum_reader_version = 1;
-      entry.reader_compatibility.maximum_reader_version = kArtifactManifestV2SchemaVersion;
-      entry.extensions = legacy_segment.x_extras;
-      add_v1_artifact(entry, "manifest", segment_relative / "manifest.txt", collection_root);
-      add_v1_artifact(entry, "ids", segment_relative / legacy_segment.ids_file, collection_root);
-      if (!legacy_segment.vectors_file.empty()) {
-        add_v1_artifact(entry,
-                        "vectors",
-                        segment_relative / legacy_segment.vectors_file,
-                        collection_root);
-      }
-      std::set<std::string> recorded_paths;
-      for (const auto &artifact : entry.artifacts) {
-        recorded_paths.insert(artifact.relative_path);
-      }
-      for (const auto &[key, value] : legacy_segment.x_extras) {
-        if (!key.ends_with("_file") || !disk::detail::is_valid_basename(value)) {
-          continue;
-        }
-        const auto relative = segment_relative / value;
-        if (recorded_paths.insert(relative.generic_string()).second) {
-          add_v1_artifact(entry, key, relative, collection_root, false);
-        }
-      }
-      const auto prefix = "segments[" + std::to_string(index) + "].";
-      mark_default(view, prefix + "capabilities", "derived from the v1 engine contract");
-      mark_default(view, prefix + "wal_cut");
-      mark_default(view, prefix + "row_versions");
-      mark_default(view, prefix + "id_map_checkpoint");
-      mark_default(view, prefix + "ready");
-      mark_default(view, prefix + "reader_compatibility");
-      mark_default(view, prefix + "source_retention");
-      for (std::size_t artifact = 0; artifact < entry.artifacts.size(); ++artifact) {
-        mark_default(view, prefix + "artifacts[" + std::to_string(artifact) + "].sha256_ready");
-      }
-      mapped.segments.push_back(std::move(entry));
-    }
-    return view;
-  }
-
   [[nodiscard]] static auto compatibility_supported(const ReaderCompatibilityV2 &compatibility,
                                                     const ManifestReaderOptions &options,
                                                     std::string_view subject) -> core::Status {

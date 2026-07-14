@@ -310,8 +310,6 @@ TEST(Gate6RollbackDrill, V2ThreeEngineRollForwardSurvivesWriterDisableAndRejects
 
   auto three_engine = internal::collection::CollectionManifestDualReader::open(root);
   ASSERT_TRUE(three_engine.ok()) << three_engine.status().diagnostic();
-  ASSERT_EQ(three_engine.value().source_version,
-            internal::collection::ManifestSourceVersion::artifact_manifest_v2);
   ASSERT_EQ(three_engine.value().manifest.segments.size(), 3U);
   std::set<core::AlgorithmId> algorithms;
   for (const auto &entry : three_engine.value().manifest.segments) {
