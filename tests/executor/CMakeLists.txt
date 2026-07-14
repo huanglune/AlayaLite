@@ -8,18 +8,11 @@ alaya_cc_target(
   SRCS search_test.cpp
 )
 alaya_cc_target(
-  update_test
-  GTEST
-  SRCS update_test.cpp
-)
-alaya_cc_target(
   mutex_test
   GTEST
   SRCS mutex_test.cpp
 )
 
-# search_test bundles several suites; register them separately so ctest can schedule and report them independently. They
-# read data files relative to the build dir, hence the explicit working directory.
 alaya_add_test(
   NAME executor_test_search_graph
   TARGET search_test
@@ -27,9 +20,9 @@ alaya_add_test(
   WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )
 alaya_add_test(
-  NAME executor_test_search_hybrid
+  NAME executor_test_search_unit
   TARGET search_test
-  FILTER HybridSearchTest.*
+  FILTER GraphSearchJobUnitTest.*
   WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )
 alaya_add_test(
@@ -38,11 +31,4 @@ alaya_add_test(
   FILTER RaBitQGraphSearchJobTest.*
   WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )
-alaya_add_test(
-  NAME executor_test_search_rabitq_hybrid
-  TARGET search_test
-  FILTER RaBitQHybridSearchTest.*
-  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-)
-alaya_add_test(NAME executor_test_update TARGET update_test)
 alaya_add_test(NAME executor_test_mutex TARGET mutex_test)

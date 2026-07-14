@@ -7,7 +7,7 @@
 
 namespace alaya::detail {
 
-// Internal bridge for generic GraphSearchJob/GraphUpdateJob consumers that are
+// Internal bridge for generic GraphSearchJob consumers that are
 // migrated in later abstraction steps.  It deliberately lives outside the
 // public HnswSegment header: no user-facing builder/Graph pairing remains.
 template <typename SearchSpaceType, typename BuildSpaceType>

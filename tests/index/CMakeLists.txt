@@ -58,12 +58,6 @@ alaya_cc_target(
   SRCS rabitq_performance_test.cpp
 )
 alaya_cc_target(rabitq_benchmark SRCS rabitq_benchmark.cpp)
-# Built for CI coverage but not registered with ctest; run manually when profiling quantization hybrids.
-alaya_cc_target(
-  hybrid_quantization_performance_test
-  GTEST
-  SRCS hybrid_quantization_performance_test.cpp
-)
 
 alaya_add_test(NAME index_test_fusion_graph TARGET fusion_graph_test)
 alaya_add_test(NAME index_test_fusion_segment TARGET fusion_segment_test)

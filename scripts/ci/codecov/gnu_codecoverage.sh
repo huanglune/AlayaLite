@@ -24,7 +24,6 @@ fi
 
 COVERAGE_TARGETS=(
   search_test
-  update_test
   mutex_test
   fusion_graph_test
   graph_test
