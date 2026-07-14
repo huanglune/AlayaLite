@@ -19,7 +19,6 @@
 #include "simd/distance_l2.hpp"
 #include "space_concepts.hpp"
 #include "storage/container/sequential_storage.hpp"
-#include "utils/data_utils.hpp"
 #include "utils/math.hpp"
 #include "utils/prefetch.hpp"
 

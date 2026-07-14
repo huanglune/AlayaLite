@@ -56,7 +56,6 @@
 #include "coro/thread_pool.hpp"
 #include "platform/detect.hpp"
 #include "storage/io/types.hpp"
-#include "utils/macros.hpp"
 
 #ifdef ALAYA_OS_LINUX
   #include <liburing.h>
@@ -117,7 +116,10 @@ class UringReactor {
     io_uring_queue_exit(&ring_);
   }
 
-  ALAYA_NON_COPYABLE_NON_MOVABLE(UringReactor);
+  UringReactor(const UringReactor &) = delete;
+  auto operator=(const UringReactor &) -> UringReactor & = delete;
+  UringReactor(UringReactor &&) = delete;
+  auto operator=(UringReactor &&) -> UringReactor & = delete;
 
   /// True when the kernel supports what the reactor needs (io_uring with READ).
   static auto is_available() -> bool {

@@ -18,11 +18,6 @@ alaya_cc_target(
   SRCS evaluate_test.cpp
 )
 alaya_cc_target(
-  data_utils_test
-  GTEST
-  SRCS data_utils_test.cpp
-)
-alaya_cc_target(
   dataset_utils_test
   GTEST
   SRCS dataset_utils_test.cpp
@@ -31,11 +26,6 @@ alaya_cc_target(
   index_encoding_test
   GTEST
   SRCS index_encoding_test.cpp
-)
-alaya_cc_target(
-  metadata_filter_test
-  GTEST
-  SRCS metadata_filter_test.cpp
 )
 alaya_cc_target(
   rotator_utils_test
@@ -69,11 +59,6 @@ alaya_add_test(
   LABELS utils
 )
 alaya_add_test(
-  NAME utils_test_data_utils
-  TARGET data_utils_test
-  LABELS utils
-)
-alaya_add_test(
   NAME utils_test_dataset_utils
   TARGET dataset_utils_test
   LABELS utils
@@ -81,11 +66,6 @@ alaya_add_test(
 alaya_add_test(
   NAME utils_test_index_encoding
   TARGET index_encoding_test
-  LABELS utils
-)
-alaya_add_test(
-  NAME utils_test_metadata_filter
-  TARGET metadata_filter_test
   LABELS utils
 )
 alaya_add_test(

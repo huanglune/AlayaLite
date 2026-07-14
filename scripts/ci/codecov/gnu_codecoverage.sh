@@ -50,10 +50,8 @@ COVERAGE_TARGETS=(
   query_utils_test
   log_test
   evaluate_test
-  data_utils_test
   dataset_utils_test
   index_encoding_test
-  metadata_filter_test
   rotator_utils_test
   lut_utils_test
   math_test
