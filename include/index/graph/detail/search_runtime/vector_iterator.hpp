@@ -15,11 +15,11 @@
 #include <vector>
 
 #include "core/log.hpp"
+#include "index/graph/detail/search_runtime/buffer.hpp"
+#include "index/graph/detail/search_runtime/query_utils.hpp"
 #include "index/graph/graph.hpp"
 #include "space/rabitq_space.hpp"
 #include "utils/prefetch.hpp"
-#include "index/graph/detail/search_runtime/query_utils.hpp"
-#include "index/graph/detail/search_runtime/buffer.hpp"
 
 namespace alaya {
 

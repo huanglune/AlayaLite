@@ -51,6 +51,7 @@ function(alaya_cc_target target_name)
   else()
     target_link_libraries(${target_name} PRIVATE AlayaLite alaya_build_flags ${ARG_LIBS})
   endif()
+  target_include_directories(${target_name} PRIVATE ${CMAKE_SOURCE_DIR}/tests/include)
 
   if(ARG_GTEST)
     target_link_libraries(${target_name} PRIVATE GTest::gtest GTest::gtest_main)

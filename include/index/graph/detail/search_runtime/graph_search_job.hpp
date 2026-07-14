@@ -25,16 +25,16 @@
 #include <vector>
 
 #include "core/log.hpp"
+#include "index/graph/detail/search_runtime/buffer.hpp"
+#include "index/graph/detail/search_runtime/query_utils.hpp"
 #include "index/graph/detail/search_runtime/search_info.hpp"
 #include "index/graph/detail/search_runtime/vector_iterator.hpp"
+#include "index/graph/detail/search_runtime/visited_pool.hpp"
 #include "index/graph/graph.hpp"
 #include "job_context.hpp"
 #include "space/rabitq_space.hpp"
 #include "space/space_concepts.hpp"
 #include "utils/prefetch.hpp"
-#include "index/graph/detail/search_runtime/query_utils.hpp"
-#include "index/graph/detail/search_runtime/buffer.hpp"
-#include "index/graph/detail/search_runtime/visited_pool.hpp"
 
 #if defined(__linux__)
   #include "coro/task.hpp"

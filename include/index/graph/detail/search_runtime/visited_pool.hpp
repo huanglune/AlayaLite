@@ -9,8 +9,8 @@
 #include <deque>
 #include <mutex>
 
-#include "index/graph/detail/search_runtime/query_utils.hpp"
 #include "index/graph/detail/search_runtime/hashset.hpp"
+#include "index/graph/detail/search_runtime/query_utils.hpp"
 
 namespace alaya {
 

@@ -18,12 +18,12 @@
 #include <vector>
 
 #include "core/log.hpp"
+#include "index/graph/detail/search_runtime/buffer.hpp"
+#include "index/graph/detail/search_runtime/hashset.hpp"
 #include "index/neighbor.hpp"
 #include "space/rabitq_space.hpp"
 #include "space/space_concepts.hpp"
 #include "utils/openmp.hpp"
-#include "index/graph/detail/search_runtime/buffer.hpp"
-#include "index/graph/detail/search_runtime/hashset.hpp"
 #include "utils/random.hpp"
 #include "utils/thread_config.hpp"
 
