@@ -35,7 +35,7 @@
 #include "index/collection/segmented_collection.hpp"
 #include "index/disk/disk_flat_segment.hpp"
 #include "platform/fs.hpp"
-#include "utils/binary_io.hpp"
+#include "index/collection/detail/binary_io.hpp"
 #include "utils/scalar_data.hpp"
 
 namespace alaya::internal::collection {
