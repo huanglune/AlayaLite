@@ -107,9 +107,8 @@ TEST_F(RaBitQSpaceTest, SaveAndLoad) {
   std::filesystem::remove(filename);
 }
 
-TEST_F(RaBitQSpaceTest, InvalidMetric3) {
-  EXPECT_THROW(space_ = std::make_shared<SpaceType>(capacity_, dim_, core::Metric::l2),
-               std::runtime_error);
+TEST_F(RaBitQSpaceTest, L2MetricIsAccepted) {
+  EXPECT_NO_THROW(space_ = std::make_shared<SpaceType>(capacity_, dim_, core::Metric::l2));
 }
 
 TEST_F(RaBitQSpaceTest, ItemCntOverflow) {
