@@ -26,7 +26,7 @@
 #include <limits>
 
 #include "core/value_types.hpp"
-#include "utils/rabitq_utils/defines.hpp"
+#include "space/quant/rabitq/defines.hpp"
 
 namespace alaya {
 

@@ -27,8 +27,8 @@
 #include "core/log.hpp"
 #include "core/value_types.hpp"
 #include "space/quant/rabitq_core.hpp"
-#include "utils/rabitq_utils/defines.hpp"
-#include "utils/rabitq_utils/fastscan.hpp"
+#include "space/quant/rabitq/defines.hpp"
+#include "space/quant/rabitq/fastscan.hpp"
 
 namespace alaya {
 template <typename DataType>

@@ -21,7 +21,7 @@
 #include "index/graph/laser/utils/scalar_quantize.hpp"
 #include "simd/cpu_features.hpp"
 #include "simd/laser_dispatch.hpp"
-#include "utils/rabitq_utils/fastscan.hpp"
+#include "space/quant/rabitq/fastscan.hpp"
 
 namespace alaya::laser {
 namespace {

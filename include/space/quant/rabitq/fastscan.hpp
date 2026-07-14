@@ -29,7 +29,7 @@
 
 #include "core/log.hpp"
 #include "simd/fastscan.hpp"
-#include "utils/rabitq_utils/defines.hpp"
+#include "space/quant/rabitq/defines.hpp"
 
 namespace alaya::fastscan {
 constexpr static size_t kBatchSize = 32;  // number of vectors in each batch

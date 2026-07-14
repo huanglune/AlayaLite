@@ -47,7 +47,7 @@
 #include "index/graph/laser/utils/memory.hpp"
 #include "platform/detect.hpp"
 #include "simd/laser_dispatch.hpp"
-#include "utils/rabitq_utils/rotator.hpp"
+#include "space/quant/rabitq/rotator.hpp"
 
 #if defined(ALAYA_ARCH_X86) && (defined(__GNUC__) || defined(__clang__))
   #include "third_party/ffht/fht_avx.hpp"

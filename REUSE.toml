@@ -49,12 +49,12 @@ SPDX-License-Identifier = "Apache-2.0"
 [[annotations]]
 path = [
   "include/simd/fht.ipp",
-  "include/utils/rabitq_utils/defines.hpp",
-  "include/utils/rabitq_utils/fastscan.hpp",
-  "include/utils/rabitq_utils/lut.hpp",
-  "include/utils/rabitq_utils/rotator.hpp",
-  "include/utils/rabitq_utils/search_utils/buffer.hpp",
-  "include/utils/rabitq_utils/search_utils/hashset.hpp",
+  "include/space/quant/rabitq/defines.hpp",
+  "include/space/quant/rabitq/fastscan.hpp",
+  "include/space/quant/rabitq/lut.hpp",
+  "include/space/quant/rabitq/rotator.hpp",
+  "include/index/graph/detail/search_runtime/buffer.hpp",
+  "include/index/graph/detail/search_runtime/hashset.hpp",
 ]
 precedence = "override"
 SPDX-FileCopyrightText = "2025 VectorDB.NTU"
@@ -62,7 +62,7 @@ SPDX-License-Identifier = "Apache-2.0"
 
 [[annotations]]
 path = [
-  "include/utils/rabitq_utils/search_utils/visited_pool.hpp",
+  "include/index/graph/detail/search_runtime/visited_pool.hpp",
   "include/index/graph/laser/qg/qg_builder.hpp",
   "include/index/graph/laser/qg/qg.hpp",
   "include/index/graph/laser/quantization/rabitq.hpp",

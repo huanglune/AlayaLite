@@ -11,8 +11,8 @@
 #include <stdexcept>
 #include <string>
 
-#include "utils/rabitq_utils/defines.hpp"
-#include "utils/rabitq_utils/rotator.hpp"
+#include "space/quant/rabitq/defines.hpp"
+#include "space/quant/rabitq/rotator.hpp"
 
 namespace alaya {
 // NOLINTBEGIN
