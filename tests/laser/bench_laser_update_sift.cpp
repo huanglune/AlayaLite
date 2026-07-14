@@ -44,6 +44,7 @@
 #include <vector>
 
 #include "bench_laser_update_sift_support.hpp"
+#include "bench_laser_oracles.hpp"
 #include "index/graph/laser/qg/qg.hpp"
 #include "index/graph/laser/qg/qg_builder.hpp"
 #include "index/graph/laser/qg/qg_updater.hpp"
@@ -191,11 +192,14 @@ struct Args {
   size_t ef_insert = 100, prune_cap = 300, alpha_check_max = 16;
   size_t batch = 4096, insert_threads = 32;
   uint32_t consolidate = 0, r_target = 0;
-  uint32_t reuse = 0;             // churn: 1 = allocate from consolidated free-list first
-  uint32_t checkpoint_every = 1;  // churn: superblock cadence in rounds
+  size_t consolidate_every = 1;     // churn: consolidate every N rounds; 0 = never
+  uint32_t bloom_consolidate = 0;  // 1 = read-only Bloom prefilter before consolidate_row
+  uint32_t reuse = 0;              // churn: 1 = allocate from consolidated free-list first
+  uint32_t checkpoint_every = 1;   // churn: superblock cadence in rounds
   uint32_t garden = 0;
   double garden_frac = 0.05;
   size_t ef_maintenance = 200, pump_budget = 4;
+  uint32_t garden_pump_only = 0;
   std::string garden_policy = "lowdeg";
   float alpha = 1.2F;
   uint64_t seed = 42;
@@ -208,14 +212,18 @@ struct Args {
   uint32_t write_cache = 1;  // 0 = immediate per-patch writes (P0.1-era control)
   size_t cache_cap_pages = 0;              // 0 = retain UpdateParams default
   size_t maintenance_evict_stride = 4096;  // 0 = phase-boundary-only legacy behavior
+  double garden_churn_threshold =
+      0.0;                // 0 = garden every call; >0 = skip until churn >= threshold*N
   uint32_t pipeline = 0;  // staged mode only: overlap drain(i) with batch i+1 (2-batch isolation)
   uint32_t stage = 0;     // 1 = stage backlinks + barrier drain; 0 = inline patches into pool
+  uint32_t qpatch = 0;    // 1 = lock-free RaBitQ preencode + generation-validated apply
   size_t flush_threads = 0;       // threads for the overlapped flush; 0 = insert_threads
   uint32_t query_threads = 16;    // mixed: closed-loop query clients
   uint32_t mixed_ef = 100;        // mixed: updater pool-search ef
   double mixed_seconds = 10.0;    // mixed: duration of each insert/query window
   uint32_t mixed_rate_pct = 100;  // mixed: 0|25|50|100; 100 is unlimited
   double mixed_full_rate = 0.0;   // token-bucket 100% reference QPS for 25/50
+  size_t samples = 1000;          // oracle modes: accepted samples
   std::string csv;                // mixed: append one row per phase
   std::vector<uint32_t> efs = {60, 80, 100, 150, 200, 300};
 };
@@ -224,7 +232,8 @@ Args parse(int argc, char **argv) {
   Args a;
   if (argc < 2) {
     throw std::runtime_error(
-        "usage: bench_laser_update_sift <build|insert|churn|eval|mixed> [--k v ...]; "
+        "usage: bench_laser_update_sift "
+        "<build|insert|churn|eval|mixed|fastscan_oracle|twohop_oracle> [--k v ...]; "
         "churn --efs E0,E1,... reports E0 as round/round_age and later values as round_ef");
   }
   a.mode = argv[1];
@@ -296,6 +305,10 @@ Args parse(int argc, char **argv) {
       a.insert_threads = std::stoull(v);
     else if (k == "--consolidate")
       a.consolidate = std::stoul(v);
+    else if (k == "--consolidate_every")
+      a.consolidate_every = std::stoull(v);
+    else if (k == "--bloom_consolidate")
+      a.bloom_consolidate = std::stoul(v);
     else if (k == "--r_target")
       a.r_target = std::stoul(v);
     else if (k == "--reuse")
@@ -310,6 +323,8 @@ Args parse(int argc, char **argv) {
       a.ef_maintenance = std::stoull(v);
     else if (k == "--pump_budget")
       a.pump_budget = std::stoull(v);
+    else if (k == "--garden_pump_only")
+      a.garden_pump_only = std::stoul(v);
     else if (k == "--garden_policy")
       a.garden_policy = v;
     else if (k == "--direct")
@@ -320,10 +335,14 @@ Args parse(int argc, char **argv) {
       a.cache_cap_pages = parse_cache_cap_pages(v);
     else if (k == "--maintenance_evict_stride")
       a.maintenance_evict_stride = std::stoull(v);
+    else if (k == "--garden_churn_threshold")
+      a.garden_churn_threshold = std::stod(v);
     else if (k == "--pipeline")
       a.pipeline = std::stoul(v);
     else if (k == "--stage")
       a.stage = std::stoul(v);
+    else if (k == "--qpatch")
+      a.qpatch = std::stoul(v);
     else if (k == "--flush_threads")
       a.flush_threads = std::stoull(v);
     else if (k == "--query_threads")
@@ -336,6 +355,8 @@ Args parse(int argc, char **argv) {
       a.mixed_rate_pct = std::stoul(v);
     else if (k == "--mixed_full_rate")
       a.mixed_full_rate = std::stod(v);
+    else if (k == "--samples")
+      a.samples = std::stoull(v);
     else if (k == "--csv")
       a.csv = v;
     else if (k == "--alpha")
@@ -361,8 +382,14 @@ Args parse(int argc, char **argv) {
   if (a.reuse > 1) {
     throw std::runtime_error("--reuse must be 0 or 1");
   }
+  if (a.bloom_consolidate > 1) {
+    throw std::runtime_error("--bloom_consolidate must be 0 or 1");
+  }
   if (a.splice > 1) {
     throw std::runtime_error("--splice must be 0 or 1");
+  }
+  if (a.qpatch > 1) {
+    throw std::runtime_error("--qpatch must be 0 or 1");
   }
   if (!std::isfinite(a.evict_margin) || a.evict_margin < 0) {
     throw std::runtime_error("--evict_margin must be finite and nonnegative");
@@ -488,13 +515,15 @@ int do_insert(const Args &a) {
   p.direct_io = a.direct != 0;
   p.write_cache = a.write_cache != 0;
   p.stage_backlinks = a.stage != 0;
+  p.preencode_patch_intents = a.qpatch != 0;
   p.maintenance_evict_stride = a.maintenance_evict_stride;
+  p.garden_churn_threshold = a.garden_churn_threshold;
   apply_cache_cap_pages(a.cache_cap_pages, p);
   alaya::laser::QGUpdater upd(qg, p);
   const int ins_threads = static_cast<int>(std::max<size_t>(1, a.insert_threads));
   std::cout << "[insert] batch=" << a.batch << " insert_threads=" << ins_threads
             << " direct_io=" << (upd.direct_io() ? 1 : 0)
-            << " cache_cap_pages=" << upd.cache_cap_pages() << "\n";
+            << " cache_cap_pages=" << upd.cache_cap_pages() << " qpatch=" << a.qpatch << "\n";
   const size_t fl_threads = a.flush_threads == 0 ? a.insert_threads : a.flush_threads;
   const bool explicit_cache_cap = a.cache_cap_pages != 0;
   auto t0 = std::chrono::steady_clock::now();
@@ -566,7 +595,9 @@ int do_insert(const Args &a) {
             << " evictions=" << s.evictions << " est_skips=" << s.est_skips
             << " alpha_skips=" << s.alpha_skips << " degenerate=" << s.degenerate_skips
             << " full_recomputes=" << s.full_recomputes << " forced_links=" << s.forced_links
-            << "\n";
+            << " intents_prepared=" << s.patch_intents_prepared
+            << " intents_applied=" << s.patch_intents_applied
+            << " intent_stale=" << s.patch_intent_stale_fallbacks << "\n";
   std::cout << "round,1,recall,-1";
   print_telemetry(s);
   std::cout << "\n";
@@ -617,9 +648,12 @@ int do_churn(const Args &a) {
   p.direct_io = a.direct != 0;
   p.write_cache = a.write_cache != 0;
   p.stage_backlinks = a.stage != 0;
+  p.preencode_patch_intents = a.qpatch != 0;
   p.maintain_indegree = a.garden != 0;
   p.maintain_turnover = a.garden != 0 && a.garden_policy == "turnover";
   p.maintenance_evict_stride = a.maintenance_evict_stride;
+  p.consolidate_every = a.consolidate_every;
+  p.garden_churn_threshold = a.garden_churn_threshold;
   apply_cache_cap_pages(a.cache_cap_pages, p);
   alaya::laser::QGUpdater upd(qg, p);
   if (a.garden != 0) upd.init_indegree(a.insert_threads);
@@ -628,7 +662,7 @@ int do_churn(const Args &a) {
             << " cache_cap_pages=" << upd.cache_cap_pages()
             << " maintenance_evict_stride=" << upd.maintenance_evict_stride()
             << " cache_low_pages=" << upd.cache_cap_pages() / 2 << " splice=" << a.splice
-            << " evict_margin=" << a.evict_margin << "\n";
+            << " evict_margin=" << a.evict_margin << " qpatch=" << a.qpatch << "\n";
   std::vector<uint32_t> results(static_cast<size_t>(query.n) * a.topk);
   const std::vector<int> query_groups = read_query_groups(a.query_groups, query.n);
   const uint32_t ef_eval = a.efs.empty() ? 100 : a.efs[0];
@@ -716,9 +750,20 @@ int do_churn(const Args &a) {
               << ",forced," << s.forced_links << ",indeg_p1," << pct(0.01) << ",indeg_p5,"
               << pct(0.05) << ",indeg_p50," << pct(0.50) << ",file_pages," << upd.file_pages()
               << ",pool_pages," << upd.pool_pages() << ",maintenance_peak_pool_pages,"
-              << s.maintenance_peak_pool_pages << ",freed,"
-              << s.freed_slots - last_round_stats.freed_slots << ",reused,"
-              << s.reused_slots - last_round_stats.reused_slots << ",live_frac,"
+              << s.maintenance_peak_pool_pages << ",garden_skipped," << s.garden_skipped
+              << ",freed," << s.freed_slots - last_round_stats.freed_slots << ",reused,"
+              << s.reused_slots - last_round_stats.reused_slots << ",consolidated,"
+              << s.consolidated_rows - last_round_stats.consolidated_rows << ",bloom_candidates,"
+              << s.bloom_candidate_rows - last_round_stats.bloom_candidate_rows << ",bloom_scan_ms,"
+              << static_cast<double>(s.bloom_scan_us - last_round_stats.bloom_scan_us) / 1000.0
+              << ",bloom_row_ms,"
+              << static_cast<double>(s.bloom_row_us - last_round_stats.bloom_row_us) / 1000.0
+              << ",bloom_finalize_ms,"
+              << static_cast<double>(s.bloom_finalize_us - last_round_stats.bloom_finalize_us) /
+                     1000.0
+              << ",intents_prepared," << s.patch_intents_prepared << ",intents_applied,"
+              << s.patch_intents_applied << ",intent_stale," << s.patch_intent_stale_fallbacks
+              << ",live_frac,"
               << (upd.allocated_points() == 0
                       ? 0.0
                       : static_cast<double>(upd.live_count()) / upd.allocated_points());
@@ -800,7 +845,9 @@ int do_churn(const Args &a) {
   std::cout << "[churn] base_n=" << a.n << " rounds=" << a.runs << " count=" << a.count
             << " arm=" << a.arm << " ef_eval=" << ef_eval << " insert_threads=" << ins_threads
             << " consolidate=" << a.consolidate << " r_target=" << a.r_target
-            << " reuse=" << a.reuse << " checkpoint_every=" << a.checkpoint_every << "\n";
+            << " consolidate_every=" << a.consolidate_every
+            << " bloom_consolidate=" << a.bloom_consolidate << " reuse=" << a.reuse
+            << " checkpoint_every=" << a.checkpoint_every << "\n";
   eval_round(0);
   for (uint64_t r = 0; r < a.runs; ++r) {
     for (uint64_t i = 0; i < a.count; ++i) {
@@ -813,8 +860,9 @@ int do_churn(const Args &a) {
       source_to_pid[source] = alaya::laser::kPidMax;
     }
     auto tc0 = std::chrono::steady_clock::now();
-    if (a.consolidate != 0 || a.reuse != 0) {
-      upd.consolidate(a.insert_threads, a.r_target, a.reuse != 0);
+    if (a.consolidate != 0 && a.consolidate_every != 0 &&
+        (r + 1) % a.consolidate_every == 0) {
+      upd.consolidate(a.insert_threads, a.r_target, a.reuse != 0, a.bloom_consolidate != 0);
       if (explicit_cache_cap) flush_update_pool(upd, fl_threads, true);
     }
     auto tc1 = std::chrono::steady_clock::now();
@@ -826,6 +874,7 @@ int do_churn(const Args &a) {
       gp.ef_maintenance = a.ef_maintenance;
       gp.pump_budget = a.pump_budget;
       gp.r_target = a.r_target;
+      gp.pump_only = a.garden_pump_only != 0;
       if (a.garden_policy == "lowdeg")
         gp.policy = alaya::laser::GardenParams::Policy::kLowIndegree;
       else if (a.garden_policy == "random")
@@ -1195,9 +1244,11 @@ int do_mixed(const Args &a) {
   p.direct_io = a.direct != 0;
   p.write_cache = a.write_cache != 0;
   p.stage_backlinks = a.stage != 0;
+  p.preencode_patch_intents = a.qpatch != 0;
   p.maintain_indegree = true;
   p.maintain_turnover = a.garden_policy == "turnover";
   p.maintenance_evict_stride = a.maintenance_evict_stride;
+  p.garden_churn_threshold = a.garden_churn_threshold;
   apply_cache_cap_pages(a.cache_cap_pages, p);
   alaya::laser::QGUpdater upd(qg, p);
   upd.init_indegree(a.insert_threads);
@@ -1275,7 +1326,7 @@ int do_mixed(const Args &a) {
 
   phases.push_back(
       measure_mixed_phase("consolidate", true, upd, query, gt, a, dead, [&]() -> uint64_t {
-        upd.consolidate(a.insert_threads, a.r_target, a.reuse != 0);
+        upd.consolidate(a.insert_threads, a.r_target, a.reuse != 0, a.bloom_consolidate != 0);
         if (explicit_cache_cap) flush_update_pool(upd, flush_threads, true);
         return 0;
       }));
@@ -1454,6 +1505,22 @@ int main(int argc, char **argv) {
     }
     if (a.mode == "mixed") {
       return do_mixed(a);
+    }
+    if (a.mode == "fastscan_oracle" || a.mode == "twohop_oracle") {
+      alaya::laser::bench::OracleConfig config;
+      config.prefix = a.prefix;
+      config.base = a.base;
+      config.degree = a.R;
+      config.main_dim = a.main_dim;
+      config.samples = a.samples;
+      config.ef_maintenance = a.ef_maintenance;
+      config.prune_pool_cap = a.prune_cap;
+      config.r_target = a.r_target;
+      config.alpha = a.alpha;
+      config.seed = a.seed;
+      return a.mode == "fastscan_oracle"
+                 ? alaya::laser::bench::run_fastscan_oracle(config)
+                 : alaya::laser::bench::run_twohop_oracle(config);
     }
     throw std::runtime_error("unknown mode " + a.mode);
   } catch (const std::exception &e) {

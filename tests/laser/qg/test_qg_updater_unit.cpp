@@ -613,27 +613,30 @@ TEST_F(QGUpdaterIndexTest, MaintenanceInPassEvictionBoundsPoolAndPreservesRows) 
     std::vector<uint64_t> page_hashes;
     size_t pool_pages = 0;
     uint64_t peak_pool_pages = 0;
+    uint64_t consolidated_rows = 0;
   };
 
-  auto run_consolidate = [&](const std::string &name, size_t stride, size_t cache_cap) {
-    const std::string prefix = (tiny_->dir / name).string();
-    copy_index_artifact(tiny_->v1_prefix, prefix);
-    Result result;
-    {
-      QuantizedGraph qg(kN, kDeg, kDim, kDim);
-      qg.load_disk_index(prefix.c_str(), 0.0F);
-      UpdateParams params;
-      params.cache_cap_pages = cache_cap;
-      params.maintenance_evict_stride = stride;
-      QGUpdater upd(qg, params);
-      for (PID id = 200; id < 232; ++id) upd.tombstone(id);
-      upd.consolidate(1, kDeg - 4, false);
-      result.pool_pages = upd.pool_pages();
-      result.peak_pool_pages = upd.stats().maintenance_peak_pool_pages;
-    }
-    result.page_hashes = index_page_hashes(prefix + index_suffix(), kSectorLen);
-    return result;
-  };
+  auto run_consolidate =
+      [&](const std::string &name, size_t stride, size_t cache_cap, bool bloom_consolidate) {
+        const std::string prefix = (tiny_->dir / name).string();
+        copy_index_artifact(tiny_->v1_prefix, prefix);
+        Result result;
+        {
+          QuantizedGraph qg(kN, kDeg, kDim, kDim);
+          qg.load_disk_index(prefix.c_str(), 0.0F);
+          UpdateParams params;
+          params.cache_cap_pages = cache_cap;
+          params.maintenance_evict_stride = stride;
+          QGUpdater upd(qg, params);
+          for (PID id = 200; id < 232; ++id) upd.tombstone(id);
+          upd.consolidate(bloom_consolidate ? 4 : 1, kDeg - 4, false, bloom_consolidate);
+          result.pool_pages = upd.pool_pages();
+          result.peak_pool_pages = upd.stats().maintenance_peak_pool_pages;
+          result.consolidated_rows = upd.stats().consolidated_rows;
+        }
+        result.page_hashes = index_page_hashes(prefix + index_suffix(), kSectorLen);
+        return result;
+      };
 
   auto run_garden = [&](const std::string &name, size_t stride, size_t cache_cap) {
     const std::string prefix = (tiny_->dir / name).string();
@@ -662,16 +665,25 @@ TEST_F(QGUpdaterIndexTest, MaintenanceInPassEvictionBoundsPoolAndPreservesRows) 
     return result;
   };
 
-  const Result consolidate_old = run_consolidate("maintenance_consolidate_old", 0, kCacheCap);
-  const Result consolidate_new = run_consolidate("maintenance_consolidate_new", kStride, kCacheCap);
+  const Result consolidate_old =
+      run_consolidate("maintenance_consolidate_old", 0, kCacheCap, false);
+  const Result consolidate_new =
+      run_consolidate("maintenance_consolidate_new", kStride, kCacheCap, false);
   EXPECT_GT(consolidate_old.pool_pages, kCacheCap);
   EXPECT_LE(consolidate_new.peak_pool_pages, kCacheCap);
   EXPECT_LE(consolidate_new.pool_pages, kCacheCap);
   EXPECT_EQ(consolidate_new.page_hashes, consolidate_old.page_hashes);
   const Result consolidate_unreachable =
-      run_consolidate("maintenance_consolidate_unreachable", kStride, kN);
+      run_consolidate("maintenance_consolidate_unreachable", kStride, kN, false);
   EXPECT_EQ(consolidate_unreachable.peak_pool_pages, consolidate_unreachable.pool_pages);
   EXPECT_EQ(consolidate_unreachable.page_hashes, consolidate_old.page_hashes);
+  const Result consolidate_bloom =
+      run_consolidate("maintenance_consolidate_bloom", kStride, kCacheCap, true);
+  EXPECT_GT(consolidate_bloom.consolidated_rows, 0U);
+  EXPECT_EQ(consolidate_bloom.consolidated_rows, consolidate_old.consolidated_rows);
+  EXPECT_LE(consolidate_bloom.peak_pool_pages, kCacheCap);
+  EXPECT_LE(consolidate_bloom.pool_pages, kCacheCap);
+  EXPECT_EQ(consolidate_bloom.page_hashes, consolidate_old.page_hashes);
 
   const Result garden_old = run_garden("maintenance_garden_old", 0, kCacheCap);
   const Result garden_new = run_garden("maintenance_garden_new", kStride, kCacheCap);
@@ -1428,6 +1440,76 @@ TEST_F(QGUpdaterIndexTest, WriteCacheCoalescesAndMatchesImmediateWrites) {
   const std::vector<char> bytes_b((std::istreambuf_iterator<char>(b)), {});
   EXPECT_EQ(bytes_a, bytes_b)
       << "single-thread staged drain order is deterministic across cache modes";
+}
+
+TEST_F(QGUpdaterIndexTest, QPatchPreencodeIsByteIdenticalToLegacyPatch) {
+  const std::string legacy_prefix = (tiny_->dir / "qpatch_legacy").string();
+  const std::string qpatch_prefix = (tiny_->dir / "qpatch_preencoded").string();
+  const std::string staged_legacy_prefix = (tiny_->dir / "qpatch_staged_legacy").string();
+  const std::string staged_qpatch_prefix = (tiny_->dir / "qpatch_staged_preencoded").string();
+  copy_index_artifact(tiny_->v1_prefix, legacy_prefix);
+  copy_index_artifact(tiny_->v1_prefix, qpatch_prefix);
+  copy_index_artifact(tiny_->v1_prefix, staged_legacy_prefix);
+  copy_index_artifact(tiny_->v1_prefix, staged_qpatch_prefix);
+
+  constexpr size_t n_insert = 64;
+  const auto new_data = make_data(n_insert, kDim, 20260713);
+  const auto run = [&](const std::string &prefix, bool qpatch, bool staged = false) {
+    QuantizedGraph qg(kN, kDeg, kDim, kDim);
+    qg.load_disk_index(prefix.c_str(), 0.0F);
+    qg.set_params(64, 1, 4);
+    UpdateParams params;
+    params.ef_insert = 64;
+    params.prune_pool_cap = 96;
+    params.backlink_mode = UpdateParams::Backlink::kAlphaEvict;
+    params.max_points = kN + n_insert;
+    params.write_cache = true;
+    params.stage_backlinks = staged;
+    params.preencode_patch_intents = qpatch;
+    QGUpdater upd(qg, params);
+    for (size_t i = 0; i < n_insert; ++i) {
+      upd.insert_with_id(new_data.data() + i * kDim, static_cast<PID>(kN + i));
+    }
+    upd.flush(1);
+    upd.publish(kN + n_insert);
+    upd.finalize();
+    return upd.stats();
+  };
+
+  const UpdateStats legacy = run(legacy_prefix, false);
+  const UpdateStats qpatch = run(qpatch_prefix, true);
+  const UpdateStats staged_legacy = run(staged_legacy_prefix, false, true);
+  const UpdateStats staged_qpatch = run(staged_qpatch_prefix, true, true);
+  EXPECT_EQ(legacy.patch_intents_prepared, 0U);
+  EXPECT_GT(qpatch.patch_intents_prepared, 0U);
+  EXPECT_GT(qpatch.patch_intents_applied, 0U);
+  EXPECT_EQ(qpatch.patch_intent_stale_fallbacks, 0U);
+  EXPECT_EQ(qpatch.free_slot_fills, legacy.free_slot_fills);
+  EXPECT_EQ(qpatch.evictions, legacy.evictions);
+  EXPECT_EQ(qpatch.est_skips, legacy.est_skips);
+  EXPECT_EQ(qpatch.alpha_skips, legacy.alpha_skips);
+  EXPECT_EQ(staged_legacy.patch_intents_prepared, 0U);
+  EXPECT_GT(staged_qpatch.patch_intents_prepared, 0U);
+  EXPECT_GT(staged_qpatch.patch_intents_applied, 0U);
+  EXPECT_EQ(staged_qpatch.patch_intent_stale_fallbacks, 0U);
+
+  std::ifstream legacy_file(legacy_prefix + index_suffix(), std::ios::binary);
+  std::ifstream qpatch_file(qpatch_prefix + index_suffix(), std::ios::binary);
+  ASSERT_TRUE(legacy_file.is_open());
+  ASSERT_TRUE(qpatch_file.is_open());
+  const std::vector<char> legacy_bytes((std::istreambuf_iterator<char>(legacy_file)), {});
+  const std::vector<char> qpatch_bytes((std::istreambuf_iterator<char>(qpatch_file)), {});
+  EXPECT_EQ(qpatch_bytes, legacy_bytes);
+
+  std::ifstream staged_legacy_file(staged_legacy_prefix + index_suffix(), std::ios::binary);
+  std::ifstream staged_qpatch_file(staged_qpatch_prefix + index_suffix(), std::ios::binary);
+  ASSERT_TRUE(staged_legacy_file.is_open());
+  ASSERT_TRUE(staged_qpatch_file.is_open());
+  const std::vector<char> staged_legacy_bytes((std::istreambuf_iterator<char>(staged_legacy_file)),
+                                              {});
+  const std::vector<char> staged_qpatch_bytes((std::istreambuf_iterator<char>(staged_qpatch_file)),
+                                              {});
+  EXPECT_EQ(staged_qpatch_bytes, staged_legacy_bytes);
 }
 
 TEST_F(QGUpdaterIndexTest, ExactEvictRemovesExactFarthestNeighbor) {

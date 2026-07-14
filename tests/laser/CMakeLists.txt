@@ -143,7 +143,11 @@ alaya_add_test(
 alaya_cc_target(
   bench_laser_update_sift
   BARE
-  SRCS bench_laser_update_sift.cpp
+  SRCS bench_laser_update_sift.cpp bench_laser_oracles.cpp
   LIBS alaya_laser
   OPTS ${_laser_test_opts}
 )
+# The vendored FFHT header contains non-inline helper definitions. Keep the
+# bench's split source files maintainable while compiling them as one translation
+# unit, as the original single-source target did.
+set_target_properties(bench_laser_update_sift PROPERTIES UNITY_BUILD ON)
