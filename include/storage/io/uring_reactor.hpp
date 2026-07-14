@@ -55,7 +55,7 @@
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
 #include "platform/detect.hpp"
-#include "storage/io/io_engine.hpp"
+#include "storage/io/types.hpp"
 #include "utils/macros.hpp"
 
 #ifdef ALAYA_OS_LINUX
