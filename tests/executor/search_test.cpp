@@ -11,7 +11,7 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include "executor/jobs/graph_search_job.hpp"
+#include "index/graph/detail/search_runtime/graph_search_job.hpp"
 #include "index/graph/graph.hpp"
 #include "index/graph/hnsw/detail/hnsw_segment_bridge.hpp"
 #include "index/graph/hnsw/hnsw_segment.hpp"

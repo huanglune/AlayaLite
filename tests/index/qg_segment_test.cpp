@@ -25,7 +25,7 @@
 #include <vector>
 
 #include "core/capabilities.hpp"
-#include "executor/jobs/graph_search_job.hpp"
+#include "index/graph/detail/search_runtime/graph_search_job.hpp"
 #include "index/graph/qg/detail/qg_builder_kernel.hpp"
 #include "index/graph/qg/detail/qg_segment_bridge.hpp"
 #include "index/graph/qg/qg_segment.hpp"

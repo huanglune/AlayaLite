@@ -25,7 +25,7 @@
 #include <vector>
 
 #include "core/capabilities.hpp"
-#include "executor/jobs/graph_search_job.hpp"
+#include "index/graph/detail/search_runtime/graph_search_job.hpp"
 #include "index/graph/detail/memory_graph_segment.hpp"
 #include "index/graph/nsg/detail/nsg_builder_kernel.hpp"
 #include "index/graph/nsg/nsg_segment.hpp"

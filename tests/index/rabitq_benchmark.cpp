@@ -18,7 +18,7 @@
 #include <string_view>
 #include <vector>
 
-#include "executor/jobs/graph_search_job.hpp"
+#include "index/graph/detail/search_runtime/graph_search_job.hpp"
 #include "index/graph/qg/detail/qg_builder_kernel.hpp"
 #include "space/rabitq_space.hpp"
 #include "utils/evaluate.hpp"

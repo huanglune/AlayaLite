@@ -22,7 +22,7 @@
 #include <vector>
 
 #include "core/capabilities.hpp"
-#include "executor/jobs/graph_search_job.hpp"
+#include "index/graph/detail/search_runtime/graph_search_job.hpp"
 #include "index/graph/detail/memory_graph_segment.hpp"
 #include "index/graph/fusion/detail/fusion_builder_kernel.hpp"
 #include "index/graph/fusion/fusion_segment.hpp"

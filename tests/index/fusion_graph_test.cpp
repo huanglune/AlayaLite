@@ -10,7 +10,7 @@
 #include <memory>
 #include <string_view>
 
-#include "executor/jobs/graph_search_job.hpp"
+#include "index/graph/detail/search_runtime/graph_search_job.hpp"
 #include "index/graph/fusion/detail/fusion_builder_kernel.hpp"
 #include "index/graph/graph.hpp"
 #include "index/graph/hnsw/detail/hnsw_builder_kernel.hpp"

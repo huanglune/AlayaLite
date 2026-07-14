@@ -15,7 +15,7 @@
 
 #include <gtest/gtest.h>
 
-#include "executor/jobs/graph_search_job.hpp"
+#include "index/graph/detail/search_runtime/graph_search_job.hpp"
 #include "index/collection/legacy_disk_adapter.hpp"
 #include "index/collection/legacy_memory_adapter.hpp"
 #include "index/collection/segmented_collection.hpp"

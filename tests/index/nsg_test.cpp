@@ -11,7 +11,7 @@
 #include <string_view>
 #include "index/graph/nsg/detail/nsg_builder_kernel.hpp"
 
-#include "executor/jobs/graph_search_job.hpp"
+#include "index/graph/detail/search_runtime/graph_search_job.hpp"
 #include "index/graph/graph.hpp"
 #include "space/raw_space.hpp"
 #include "utils/dataset_utils.hpp"
