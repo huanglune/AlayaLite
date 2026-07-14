@@ -12,10 +12,14 @@ import statistics
 import subprocess
 from pathlib import Path
 
-
 SIMD = [
-    "fht_benchmark", "ip_full_benchmark", "ip_sq4_benchmark", "ip_sq8_benchmark",
-    "l2_sqr_full_benchmark", "l2_sqr_sq4_benchmark", "l2_sqr_sq8_benchmark",
+    "fht_benchmark",
+    "ip_full_benchmark",
+    "ip_sq4_benchmark",
+    "ip_sq8_benchmark",
+    "l2_sqr_full_benchmark",
+    "l2_sqr_sq4_benchmark",
+    "l2_sqr_sq8_benchmark",
 ]
 
 
@@ -43,7 +47,7 @@ def time_fields(text: str) -> dict:
     seconds = None
     if elapsed:
         parts = [float(x) for x in elapsed.split(":")]
-        seconds = sum(value * 60 ** power for power, value in enumerate(reversed(parts)))
+        seconds = sum(value * 60**power for power, value in enumerate(reversed(parts)))
     rss = field("Maximum resident set size (kbytes)")
     return {"duration_s": seconds, "peak_rss_kb": int(rss) if rss else None}
 
@@ -78,19 +82,27 @@ def parse_simd(host: str, raw: str) -> list[dict]:
                     if ns:
                         by_key.setdefault((dim, variant), []).append(float(ns.group(1)))
         for (dim, variant), values in sorted(by_key.items()):
-            results.append({
-                "name": f"{binary}:{variant}:d{dim}",
-                "binary": f"build/Release/tests/simd/{binary}",
-                "dataset": "deterministic_generated_seeded_vectors",
-                "params": {"dimension": dim, "variant": variant, "iterations_per_round": 100000},
-                "threads": 1, "rounds": 5, "unit": "ns_per_call",
-                "median": statistics.median(values), "p50": percentile(values, .50),
-                "p95": percentile(values, .95), "p99": percentile(values, .99),
-                "round_values": values, "qps": None, "recall": None,
-                "peak_rss_kb": max(x for x in rss if x is not None),
-                "duration_s_median": statistics.median(x for x in durations if x is not None),
-                "artifact_sha256": None,
-            })
+            results.append(
+                {
+                    "name": f"{binary}:{variant}:d{dim}",
+                    "binary": f"build/Release/tests/simd/{binary}",
+                    "dataset": "deterministic_generated_seeded_vectors",
+                    "params": {"dimension": dim, "variant": variant, "iterations_per_round": 100000},
+                    "threads": 1,
+                    "rounds": 5,
+                    "unit": "ns_per_call",
+                    "median": statistics.median(values),
+                    "p50": percentile(values, 0.50),
+                    "p95": percentile(values, 0.95),
+                    "p99": percentile(values, 0.99),
+                    "round_values": values,
+                    "qps": None,
+                    "recall": None,
+                    "peak_rss_kb": max(x for x in rss if x is not None),
+                    "duration_s_median": statistics.median(x for x in durations if x is not None),
+                    "artifact_sha256": None,
+                }
+            )
     return results
 
 
@@ -108,42 +120,65 @@ def parse_qg(host: str, raw: str, tmp: str) -> dict:
     for ef, values in sorted(curves.items()):
         qps_values = [x["qps"] for x in values]
         recall_values = [x["recall"] for x in values]
-        rows.append({"ef": ef, "qps_median": statistics.median(qps_values),
-                     "recall_median": statistics.median(recall_values), "round_values": values})
+        rows.append(
+            {
+                "ef": ef,
+                "qps_median": statistics.median(qps_values),
+                "recall_median": statistics.median(recall_values),
+                "round_values": values,
+            }
+        )
     warm = [x["duration_s"] for x in timings[1:] if x["duration_s"] is not None]
     return {
-        "name": "rabitq_qg_deep1m_l2", "binary": "build/Release/tests/index/rabitq_performance_test",
+        "name": "rabitq_qg_deep1m_l2",
+        "binary": "build/Release/tests/index/rabitq_performance_test",
         "dataset": "deep1M (1,000,000 x 96, L2)",
-        "params": {"gtest_filter": "RaBitQDeep1MTest.Deep1MQGTest", "topk": 10,
-                   "efs": sorted(curves), "internal_rounds_per_process": 3},
+        "params": {
+            "gtest_filter": "RaBitQDeep1MTest.Deep1MQGTest",
+            "topk": 10,
+            "efs": sorted(curves),
+            "internal_rounds_per_process": 3,
+        },
         "threads": "builder default; NUMA node0 affinity (48 logical CPUs), search serial",
-        "rounds": 5, "median": None, "p50": None, "p95": None, "p99": None,
-        "qps_recall_curve": rows, "peak_rss_kb": max(x["peak_rss_kb"] for x in timings if x["peak_rss_kb"]),
+        "rounds": 5,
+        "median": None,
+        "p50": None,
+        "p95": None,
+        "p99": None,
+        "qps_recall_curve": rows,
+        "peak_rss_kb": max(x["peak_rss_kb"] for x in timings if x["peak_rss_kb"]),
         "cold_total_duration_s": timings[0]["duration_s"],
         "warm_total_duration_s_median": statistics.median(warm),
         "estimated_build_duration_s": timings[0]["duration_s"] - statistics.median(warm),
-        "artifact": f"{tmp}/work/data/deep1M/deep1M_rabitq.qg", "artifact_size_bytes": size,
+        "artifact": f"{tmp}/work/data/deep1M/deep1M_rabitq.qg",
+        "artifact_size_bytes": size,
         "artifact_sha256": sha_line,
     }
 
 
 def collect_environment(host: str, repo: Path, raw: str) -> dict:
-    remote = ssh(host, "hostname; lscpu | grep -m1 'Model name'; nproc; uname -r; "
-                       "cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>&1; "
-                       "numactl --hardware 2>&1; uptime")
+    remote = ssh(
+        host,
+        "hostname; lscpu | grep -m1 'Model name'; nproc; uname -r; "
+        "cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>&1; "
+        "numactl --hardware 2>&1; uptime",
+    )
     cache = (repo / "build/Release/CMakeCache.txt").read_text(encoding="utf-8")
-    cmake = {key: match.group(1) for key in ("CMAKE_BUILD_TYPE", "CMAKE_CXX_COMPILER",
-             "CMAKE_CXX_FLAGS", "CMAKE_CXX_FLAGS_RELEASE")
-             if (match := re.search(rf"^{key}:[^=]*=(.*)$", cache, re.MULTILINE))}
+    cmake = {
+        key: match.group(1)
+        for key in ("CMAKE_BUILD_TYPE", "CMAKE_CXX_COMPILER", "CMAKE_CXX_FLAGS", "CMAKE_CXX_FLAGS_RELEASE")
+        if (match := re.search(rf"^{key}:[^=]*=(.*)$", cache, re.MULTILINE))
+    }
     return {
-        "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(), "remote_snapshot": remote,
+        "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "remote_snapshot": remote,
         "load_before_qg": remote_cat(host, f"{raw}/qg/load-before.txt").strip(),
         "load_after_qg": remote_cat(host, f"{raw}/qg/load-after.txt").strip(),
         "compiler_version": run([cmake["CMAKE_CXX_COMPILER"], "--version"]).splitlines()[0],
         "cmake": cmake,
         "release_binary_build_time": dt.datetime.fromtimestamp(
-            (repo / "build/Release/tests/simd/fht_benchmark").stat().st_mtime,
-            dt.timezone.utc).isoformat(),
+            (repo / "build/Release/tests/simd/fht_benchmark").stat().st_mtime, dt.timezone.utc
+        ).isoformat(),
         "git_commit": run(["git", "rev-parse", "HEAD"]).strip(),
     }
 
@@ -178,23 +213,38 @@ def main() -> int:
     parser.add_argument("--data-root", default="/md1/huangliang/data")
     parser.add_argument("--remote-tmp", default="/md1/huangliang/tmp/perf-baseline")
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--collect-existing", action="store_true",
-                        help="collect previously generated raw files without rerunning")
+    parser.add_argument(
+        "--collect-existing", action="store_true", help="collect previously generated raw files without rerunning"
+    )
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[2]
     if not args.collect_existing:
         execute(args, repo)
     raw = f"{args.remote_tmp}/raw"
     result = {
-        "schema_version": 1, "environment": collect_environment(args.host, repo, raw),
-        "method": {"host": args.host, "numa_binding": "--cpunodebind=0 --membind=0",
-                   "external_rounds": 5, "gate_regression_threshold_pct": 3.0},
+        "schema_version": 1,
+        "environment": collect_environment(args.host, repo, raw),
+        "method": {
+            "host": args.host,
+            "numa_binding": "--cpunodebind=0 --membind=0",
+            "external_rounds": 5,
+            "gate_regression_threshold_pct": 3.0,
+        },
         "simd": parse_simd(args.host, raw),
         "qg": [parse_qg(args.host, raw, args.remote_tmp)],
-        "laser": {"status": "skipped", "cpp_inventory": ["test_laser_compile", "test_rotator_dump",
-                  "test_laser_page_layout_round_trip", "test_threadpool_file_reader",
-                  "test_iocp_file_reader", "laser_simd_dispatch_test", "rabitq_factor_equivalence_test"],
-                  "reason": "No LASER build/search perf C++ target exists; Python perf requires alayalite bindings and this worktree has no .venv. BUILD_PYTHON intentionally not enabled."},
+        "laser": {
+            "status": "skipped",
+            "cpp_inventory": [
+                "test_laser_compile",
+                "test_rotator_dump",
+                "test_laser_page_layout_round_trip",
+                "test_threadpool_file_reader",
+                "test_iocp_file_reader",
+                "laser_simd_dispatch_test",
+                "rabitq_factor_equivalence_test",
+            ],
+            "reason": "No LASER build/search perf C++ target exists; Python perf requires alayalite bindings and this worktree has no .venv. BUILD_PYTHON intentionally not enabled.",
+        },
         "coverage_exceptions": [
             "gist1m QG skipped: rabitq_performance_test hard-codes deep1M L2 and disabled T2I-1M only.",
             "DiskANN update benchmark intentionally deferred until wave3 per task decision.",

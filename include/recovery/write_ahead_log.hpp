@@ -7,7 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
-#include <filesystem>  // NOLINT(build/c++17)
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <mutex>

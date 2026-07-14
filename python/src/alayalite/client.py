@@ -45,11 +45,7 @@ class Client:
         self.__url = os.path.abspath(url)
         os.makedirs(self.__url, exist_ok=True)
         logger.info("Loading AlayaLite data from %s", self.__url)
-        all_names = [
-            entry
-            for entry in os.listdir(self.__url)
-            if os.path.isdir(os.path.join(self.__url, entry))
-        ]
+        all_names = [entry for entry in os.listdir(self.__url) if os.path.isdir(os.path.join(self.__url, entry))]
         logger.debug("Discovered entries under client url: %s", all_names)
         for name in all_names:
             full_url = os.path.join(self.__url, name)

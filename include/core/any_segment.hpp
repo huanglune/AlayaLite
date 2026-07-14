@@ -22,7 +22,7 @@ namespace alaya::core {
 // Contract v3 is frozen. Engines register operations in this table; they must
 // not grow request/response/context structs or establish a parallel boundary.
 struct OperationHandle {
-  using Cancel = void (*)(void *) noexcept;
+  using Cancel = void (*)(void *) noexcept;  // NOLINT(readability/casting)
 
   VersionedStructHeader header{};
   std::shared_ptr<void> state{};

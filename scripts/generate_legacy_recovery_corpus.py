@@ -317,8 +317,7 @@ def _build_f32_u64_torn_tail(case_dir: Path) -> tuple[dict[str, Any], dict[str, 
         "expected_applied_through_op_id": 1,
         "wal_after_writer": "op 1 complete; op 2 PREPARE complete but COMMIT trailer torn",
         "reader_behavior": (
-            "stop at the torn COMMIT, replay only op 1, publish post_recovery snapshot, "
-            "and discard writer-live id 7"
+            "stop at the torn COMMIT, replay only op 1, publish post_recovery snapshot, and discard writer-live id 7"
         ),
     }
     return generation, expected
@@ -326,8 +325,7 @@ def _build_f32_u64_torn_tail(case_dir: Path) -> tuple[dict[str, Any], dict[str, 
 
 def _collection_items(data: np.ndarray) -> list[tuple[str, str, np.ndarray, dict[str, Any]]]:
     return [
-        (f"item-{i}", f"document-{i}", data[i], {"group": "base", "version": 1, "ordinal": i})
-        for i in range(len(data))
+        (f"item-{i}", f"document-{i}", data[i], {"group": "base", "version": 1, "ordinal": i}) for i in range(len(data))
     ]
 
 
@@ -339,9 +337,7 @@ def _build_i8_u32_collection_upsert_tail(case_dir: Path) -> tuple[dict[str, Any]
     collection = Collection(name, params)
     try:
         collection.insert(_collection_items(data[:count]))
-        collection.upsert(
-            [("item-1", "document-1-v2", data[count], {"group": "updated", "version": 2, "ordinal": 1})]
-        )
+        collection.upsert([("item-1", "document-1-v2", data[count], {"group": "updated", "version": 2, "ordinal": 1})])
         _schema(case_dir, "collection", params)
     finally:
         collection.close()

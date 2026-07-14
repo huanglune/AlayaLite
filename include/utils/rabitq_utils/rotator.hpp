@@ -42,7 +42,7 @@ class Rotator {
 
  public:
   explicit Rotator() = default;
-  explicit Rotator(size_t dim, size_t padded_dim) : dim_(dim), padded_dim_(padded_dim) {};
+  explicit Rotator(size_t dim, size_t padded_dim) : dim_(dim), padded_dim_(padded_dim) {}
   virtual ~Rotator() = default;
   virtual void rotate(const T *src, T *dst) const = 0;
   virtual void load(std::ifstream &) = 0;
@@ -101,6 +101,7 @@ template <typename T = float>
 class MatrixRotator : public Rotator<T> {
  private:
   kernels::linalg::RowMajorMatrix<T> rand_mat_;  // Rotation Maxtrix
+
  public:
   explicit MatrixRotator(size_t dim, size_t padded_dim)
       : Rotator<T>(dim, padded_dim), rand_mat_(dim, padded_dim) {
@@ -125,7 +126,8 @@ class MatrixRotator : public Rotator<T> {
 
   void load(std::ifstream &input) override {
     input.read(reinterpret_cast<char *>(rand_mat_.data()),
-               static_cast<long>(sizeof(T) * this->dim_ * this->padded_dim_));
+               static_cast<long>(  // NOLINT(runtime/int)
+                   sizeof(T) * this->dim_ * this->padded_dim_));
   }
 
   void save(std::ofstream &output) const override {
@@ -253,12 +255,12 @@ class FhtKacRotator : public Rotator<float> {
 
   void load(std::ifstream &input) override {
     input.read(reinterpret_cast<char *>(flip_.data()),
-               static_cast<long>(sizeof(uint8_t) * flip_.size()));
+               static_cast<long>(sizeof(uint8_t) * flip_.size()));  // NOLINT(runtime/int)
   }
 
   void save(std::ofstream &output) const override {
     output.write(reinterpret_cast<const char *>(flip_.data()),
-                 static_cast<long>(sizeof(uint8_t) * flip_.size()));
+                 static_cast<long>(sizeof(uint8_t) * flip_.size()));  // NOLINT(runtime/int)
   }
 
   FhtKacRotator &operator=(const FhtKacRotator &other) {

@@ -100,8 +100,7 @@ def _validate(config: dict[str, Any]) -> None:
         registered_engine = str(registry[implementation_key]["engine_factory_key"])
         if registered_engine != engine_factory_key:
             raise ValueError(
-                f"Implementation '{implementation_key}' belongs to '{registered_engine}', "
-                f"not '{engine_factory_key}'"
+                f"Implementation '{implementation_key}' belongs to '{registered_engine}', not '{engine_factory_key}'"
             )
         if quant == "RABITQ" and (data != "float" or id_type != "uint32_t"):
             raise ValueError(f"RaBitQ only supports float/uint32_t: {combo}")

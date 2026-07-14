@@ -144,20 +144,16 @@ def generate(build_dir: Path) -> dict[str, object]:
         disk_flat_segment_generator = build_dir / "tests/golden/artifact_disk_flat_segment_generator"
         if not disk_flat_segment_generator.is_file():
             raise RuntimeError(
-                "build the artifact_disk_flat_segment_generator target first: "
-                f"{disk_flat_segment_generator}"
+                f"build the artifact_disk_flat_segment_generator target first: {disk_flat_segment_generator}"
             )
         subprocess.run(
             [str(disk_flat_segment_generator), str(out / "disk_flat_segment")],
             check=True,
         )
-        disk_vamana_segment_generator = (
-            build_dir / "tests/golden/artifact_disk_vamana_segment_generator"
-        )
+        disk_vamana_segment_generator = build_dir / "tests/golden/artifact_disk_vamana_segment_generator"
         if not disk_vamana_segment_generator.is_file():
             raise RuntimeError(
-                "build the artifact_disk_vamana_segment_generator target first: "
-                f"{disk_vamana_segment_generator}"
+                f"build the artifact_disk_vamana_segment_generator target first: {disk_vamana_segment_generator}"
             )
         subprocess.run(
             [
@@ -168,24 +164,14 @@ def generate(build_dir: Path) -> dict[str, object]:
         )
         memory_qg_generator = build_dir / "tests/golden/artifact_memory_qg_generator"
         if not memory_qg_generator.is_file():
-            raise RuntimeError(
-                f"build the artifact_memory_qg_generator target first: {memory_qg_generator}"
-            )
+            raise RuntimeError(f"build the artifact_memory_qg_generator target first: {memory_qg_generator}")
         subprocess.run([str(memory_qg_generator), str(out / "memory_qg")], check=True)
         memory_vamana_generator = build_dir / "tests/golden/artifact_memory_vamana_generator"
         if not memory_vamana_generator.is_file():
-            raise RuntimeError(
-                "build the artifact_memory_vamana_generator target first: "
-                f"{memory_vamana_generator}"
-            )
-        subprocess.run(
-            [str(memory_vamana_generator), str(out / "memory_vamana")], check=True
-        )
+            raise RuntimeError(f"build the artifact_memory_vamana_generator target first: {memory_vamana_generator}")
+        subprocess.run([str(memory_vamana_generator), str(out / "memory_vamana")], check=True)
         laser_present = _generate_laser_fixture(out, build_dir)
-        artifacts = {
-            name: _inventory(path)
-            for name, path in sorted((p.name, p) for p in out.iterdir() if p.is_dir())
-        }
+        artifacts = {name: _inventory(path) for name, path in sorted((p.name, p) for p in out.iterdir() if p.is_dir())}
         return {
             "schema_version": 1,
             "seed": 20260712,

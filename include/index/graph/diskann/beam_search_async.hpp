@@ -67,8 +67,7 @@ struct BeamSearchCancelProbe {
 };
 
 namespace beam_async_detail {
-inline void check_wave(const std::vector<storage::io::ReadResult> &results,
-                       uint64_t page_size) {
+inline void check_wave(const std::vector<storage::io::ReadResult> &results, uint64_t page_size) {
   for (const auto &result : results) {
     if (result.status != storage::io::ReadStatus::ok || result.bytes != page_size) {
       throw std::runtime_error("beam_search_async: short/failed PageReader read");
@@ -89,9 +88,9 @@ class PoolExecutor final : public storage::io::ResumeExecutor {
 }  // namespace beam_async_detail
 
 /// Coroutine No-PQ greedy search: one reactor wave per expansion.
-/// Preconditions: ctx describes a No-PQ index and @p td is exclusively owned by this coroutine until it
-/// completes (acquire it through a suspending gate, never a thread-blocking
-/// pool — a blocked pool thread cannot run the resume that frees a td).
+/// Preconditions: ctx describes a No-PQ index and @p td is exclusively owned by this coroutine
+/// until it completes (acquire it through a suspending gate, never a thread-blocking pool — a
+/// blocked pool thread cannot run the resume that frees a td).
 inline auto disk_greedy_search_async(const SearchContext &ctx,
                                      const float *query,
                                      uint32_t top_k,
@@ -178,7 +177,8 @@ inline auto disk_greedy_search_async(const SearchContext &ctx,
       }
       if (!seeded) {
         std::vector<storage::io::ReadRequest> seed_req;
-        seed_req.push_back(beam_io_detail::request(seed_off, page_size, ctx.medoid, td.wave_scratch));
+        seed_req.push_back(
+            beam_io_detail::request(seed_off, page_size, ctx.medoid, td.wave_scratch));
         auto seed_results = co_await storage::io::read_pages(reader, executor, seed_req);
         beam_async_detail::check_wave(seed_results, page_size);
         if (page_io != nullptr) {

@@ -82,10 +82,11 @@ __all__ = [
 ]
 
 
-def __getattr__(name: str):
+def __getattr__(name: str):  # pylint: disable=invalid-name
     if name in {"Index", "DiskCollection"}:
         raise_removed_legacy_api(name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 try:
     from importlib.metadata import PackageNotFoundError

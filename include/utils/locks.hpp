@@ -17,7 +17,7 @@
 
 #include <atomic>
 #include <cassert>
-#include <filesystem>  // NOLINT(build/c++17)
+#include <filesystem>
 
 namespace alaya {
 /**

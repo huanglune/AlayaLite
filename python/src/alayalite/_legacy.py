@@ -28,6 +28,5 @@ def raise_removed_legacy_api(api_name: str) -> None:
 
     replacement = _REMOVED_API_REPLACEMENTS[api_name]
     raise AlayaLiteLegacyApiWarning(
-        f"alayalite.{api_name} was removed in AlayaLite {LEGACY_API_V_REMOVE}; "
-        f"use {replacement} instead."
+        f"alayalite.{api_name} was removed in AlayaLite {LEGACY_API_V_REMOVE}; use {replacement} instead."
     )

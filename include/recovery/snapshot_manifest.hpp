@@ -6,7 +6,7 @@
 
 #include <charconv>
 #include <chrono>
-#include <filesystem>  // NOLINT(build/c++17)
+#include <filesystem>
 #include <limits>
 #include <optional>
 #include <sstream>

@@ -17,22 +17,21 @@ inline constexpr std::uint32_t kAlignment = 64;
 // A distance policy owns metric semantics and query preparation. It does not
 // own metadata, persistence, mutation, or graph adjacency.
 template <typename T>
-concept DistanceSpace = requires(const T space,
-                                 typename T::IDTypeAlias lhs,
-                                 typename T::IDTypeAlias rhs) {
-  typename T::DataTypeAlias;
-  typename T::DistanceTypeAlias;
-  { space.get_dim() } -> std::same_as<std::uint32_t>;
-  { space.metric() } -> std::same_as<core::Metric>;
-  { space.get_distance(lhs, rhs) } -> std::same_as<typename T::DistanceTypeAlias>;
-};
+concept DistanceSpace =
+    requires(const T space, typename T::IDTypeAlias lhs, typename T::IDTypeAlias rhs) {
+      typename T::DataTypeAlias;
+      typename T::DistanceTypeAlias;
+      { space.get_dim() } -> std::same_as<std::uint32_t>;
+      { space.metric() } -> std::same_as<core::Metric>;
+      { space.get_distance(lhs, rhs) } -> std::same_as<typename T::DistanceTypeAlias>;
+    };
 
 // Quantized and exact spaces both expose a typed query computer. For an exact
 // space this is the identity/no-code quantizer. SIMD dispatch remains private
 // to the concrete query computer rather than part of this public contract.
 template <typename T>
 concept Quantizer = requires(const T quantizer, const typename T::DataTypeAlias *query) {
-  { quantizer.get_query_computer(query) };
+  { quantizer.get_query_computer(query) };  // NOLINT(readability/braces)
 };
 
 // Vector ownership is independent from external IDs. Counts cross this
@@ -47,7 +46,7 @@ concept VectorStore = requires(T store,
   { const_store.get_data_size() } -> std::convertible_to<std::size_t>;
   { const_store.get_capacity() } -> std::convertible_to<core::RowCount>;
   { const_store.get_data_num() } -> std::convertible_to<core::RowCount>;
-  { const_store.get_data_by_id(id) };
+  { const_store.get_data_by_id(id) };  // NOLINT(readability/braces)
   { store.fit(data, rows) } -> std::same_as<void>;
 };
 

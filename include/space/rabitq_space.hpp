@@ -451,9 +451,7 @@ class RaBitQSpace {
                : (metric_ == MetricType::IP ? core::Metric::inner_product : core::Metric::cosine);
   }
 
-  auto get_dist_func() const -> DistanceFunction {
-    return distance_cal_func_;
-  }
+  auto get_dist_func() const -> DistanceFunction { return distance_cal_func_; }
 
   auto get_data_num() const -> IDType { return item_cnt_; }
 
@@ -469,15 +467,15 @@ class RaBitQSpace {
   struct QueryComputer {
    private:
     // Cached hot-path data (avoid distance_space_ indirection chain)
-    const char *storage_ptr_;                           ///< Raw storage data pointer
-    size_t data_chunk_size_;                            ///< Node chunk size in bytes
-    size_t qc_offset_;                                  ///< Quantization codes offset
-    size_t f_add_offset_;                               ///< f_add offset
-    size_t f_rescale_offset_;                           ///< f_rescale offset
-    size_t nei_id_offset_;                              ///< Neighbor ID offset
+    const char *storage_ptr_;     ///< Raw storage data pointer
+    size_t data_chunk_size_;      ///< Node chunk size in bytes
+    size_t qc_offset_;            ///< Quantization codes offset
+    size_t f_add_offset_;         ///< f_add offset
+    size_t f_rescale_offset_;     ///< f_rescale offset
+    size_t nei_id_offset_;        ///< Neighbor ID offset
     DistanceFunction dist_func_;  ///< Distance function
-    uint32_t dim_;                                      ///< Original dimension
-    size_t padded_dim_;                                 ///< Padded dimension
+    uint32_t dim_;                ///< Original dimension
+    size_t padded_dim_;           ///< Padded dimension
 
     const DataType *query_;
     IDType c_;
@@ -620,8 +618,8 @@ class RaBitQSpace {
     reader.read(reinterpret_cast<char *>(&type_), sizeof(type_));
     reader.read(reinterpret_cast<char *>(&ep_), sizeof(ep_));
 
-    const bool metric_valid = metric_ == MetricType::L2 || metric_ == MetricType::IP ||
-                              metric_ == MetricType::COS;
+    const bool metric_valid =
+        metric_ == MetricType::L2 || metric_ == MetricType::IP || metric_ == MetricType::COS;
     const bool rotator_valid = type_ == RotatorType::MatrixRotator ||
                                type_ == RotatorType::FhtKacRotator ||
                                type_ == RotatorType::FhtRotator;

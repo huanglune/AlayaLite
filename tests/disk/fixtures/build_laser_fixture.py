@@ -83,11 +83,7 @@ def _load_build_tree_extension(extension: Path, stage_root: Path) -> None:
     for module_name in tuple(sys.modules):
         if module_name == "alayalite" or module_name.startswith("alayalite."):
             del sys.modules[module_name]
-    sys.meta_path[:] = [
-        finder
-        for finder in sys.meta_path
-        if not type(finder).__module__.startswith("_editable_")
-    ]
+    sys.meta_path[:] = [finder for finder in sys.meta_path if not type(finder).__module__.startswith("_editable_")]
     try:
         from alayalite import _alayalitepy  # pylint: disable=import-outside-toplevel
     except ImportError as exc:
@@ -407,9 +403,7 @@ def _parse_args() -> argparse.Namespace:
         required=True,
         help="Exact build-tree laser_fixture_builder executable to use.",
     )
-    parser.add_argument(
-        "--force", action="store_true", help="Regenerate even when provenance matches."
-    )
+    parser.add_argument("--force", action="store_true", help="Regenerate even when provenance matches.")
     parser.add_argument("--prefix", default=DEFAULT_PREFIX)
     parser.add_argument("--count", type=int, default=DEFAULT_COUNT)
     parser.add_argument("--dim", type=int, default=DEFAULT_DIM)
@@ -438,9 +432,7 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _provenance(
-    args: argparse.Namespace, extension: Path, native_builder: Path, main_dim: int
-) -> dict[str, object]:
+def _provenance(args: argparse.Namespace, extension: Path, native_builder: Path, main_dim: int) -> dict[str, object]:
     return {
         "schema_version": 1,
         "generator_sha256": _sha256(Path(__file__).resolve()),
@@ -538,11 +530,7 @@ def main() -> int:
     expected_stamp = _provenance(args, extension, native_builder, main_dim)
     python_stage = tempfile.TemporaryDirectory(prefix="alaya-laser-python-stage-")
     _load_build_tree_extension(extension, Path(python_stage.name))
-    if (
-        not args.force
-        and _stamp_matches(output_dir, expected_stamp)
-        and _fixture_valid(output_dir, args, main_dim)
-    ):
+    if not args.force and _stamp_matches(output_dir, expected_stamp) and _fixture_valid(output_dir, args, main_dim):
         print(f"[laser-fixture] provenance matches, reusing: {output_dir}")
         return 0
 

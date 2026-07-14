@@ -27,8 +27,8 @@
 #include <stdexcept>
 #include <type_traits>
 
-#include "utils/log.hpp"
 #include "simd/fastscan.hpp"
+#include "utils/log.hpp"
 #include "utils/rabitq_utils/defines.hpp"
 
 namespace alaya::fastscan {
@@ -174,8 +174,8 @@ inline void accumulate(const uint8_t *ALAYA_RESTRICT codes,
   __m256i accu3 = _mm256_setzero_si256();
 
   for (size_t i = 0; i < code_length; i += 64) {
-    c = _mm256_loadu_si256((__m256i *)&codes[i]);
-    lut = _mm256_loadu_si256((__m256i *)&lp_table[i]);
+    c = _mm256_loadu_si256((__m256i *)&codes[i]);       // NOLINT(readability/casting)
+    lut = _mm256_loadu_si256((__m256i *)&lp_table[i]);  // NOLINT(readability/casting)
     lo = _mm256_and_si256(c, low_mask);
     hi = _mm256_and_si256(_mm256_srli_epi16(c, 4), low_mask);
 
@@ -187,8 +187,8 @@ inline void accumulate(const uint8_t *ALAYA_RESTRICT codes,
     accu2 = _mm256_add_epi16(accu2, res_hi);
     accu3 = _mm256_add_epi16(accu3, _mm256_srli_epi16(res_hi, 8));
 
-    c = _mm256_loadu_si256((__m256i *)&codes[i + 32]);
-    lut = _mm256_loadu_si256((__m256i *)&lp_table[i + 32]);
+    c = _mm256_loadu_si256((__m256i *)&codes[i + 32]);       // NOLINT(readability/casting)
+    lut = _mm256_loadu_si256((__m256i *)&lp_table[i + 32]);  // NOLINT(readability/casting)
     lo = _mm256_and_si256(c, low_mask);
     hi = _mm256_and_si256(_mm256_srli_epi16(c, 4), low_mask);
 
@@ -204,12 +204,12 @@ inline void accumulate(const uint8_t *ALAYA_RESTRICT codes,
   accu0 = _mm256_sub_epi16(accu0, _mm256_slli_epi16(accu1, 8));
   __m256i dis0 = _mm256_add_epi16(_mm256_permute2f128_si256(accu0, accu1, 0x21),
                                   _mm256_blend_epi32(accu0, accu1, 0xF0));
-  _mm256_storeu_si256((__m256i *)result, dis0);
+  _mm256_storeu_si256((__m256i *)result, dis0);  // NOLINT(readability/casting)
 
   accu2 = _mm256_sub_epi16(accu2, _mm256_slli_epi16(accu3, 8));
   __m256i dis1 = _mm256_add_epi16(_mm256_permute2f128_si256(accu2, accu3, 0x21),
                                   _mm256_blend_epi32(accu2, accu3, 0xF0));
-  _mm256_storeu_si256((__m256i *)&result[16], dis1);
+  _mm256_storeu_si256((__m256i *)&result[16], dis1);  // NOLINT(readability/casting)
 #else
   // Scalar fallback for non-x86 architectures (ARM, etc.)
   // This implementation is slower but functionally equivalent to the SIMD versions

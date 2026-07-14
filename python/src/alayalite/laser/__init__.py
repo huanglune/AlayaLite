@@ -25,7 +25,7 @@ def selected_simd() -> str:
     return "unavailable" if _laser_native is None else _laser_native.selected_simd()
 
 
-def __getattr__(name: str):
+def __getattr__(name: str):  # pylint: disable=invalid-name
     if name in {"Index", "RawIndex"}:
         raise_removed_legacy_api(f"laser.{name}")
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

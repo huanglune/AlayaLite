@@ -8,14 +8,12 @@ set(PYTHON_MODULE_NAME _alayalitepy)
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Codegen: dispatch.yaml -> the Python canonical identity test matrix. The output is committed to the source tree on
-# purpose, so the custom command only fires when an input is newer.
-# The aggregating target is named alaya_codegen because plain "codegen" is a reserved target name from CMake 3.31 on
-# (policy CMP0171).
+# purpose, so the custom command only fires when an input is newer. The aggregating target is named alaya_codegen
+# because plain "codegen" is a reserved target name from CMake 3.31 on (policy CMP0171).
 # ---------------------------------------------------------------------------------------------------------------------
 set(ALAYA_CODEGEN_DIR ${CMAKE_SOURCE_DIR}/tools/codegen)
-set(ALAYA_CODEGEN_INPUTS
-    ${ALAYA_CODEGEN_DIR}/dispatch.yaml ${ALAYA_CODEGEN_DIR}/gen.py
-    ${ALAYA_CODEGEN_DIR}/templates/test_matrix_params.py.j2
+set(ALAYA_CODEGEN_INPUTS ${ALAYA_CODEGEN_DIR}/dispatch.yaml ${ALAYA_CODEGEN_DIR}/gen.py
+                         ${ALAYA_CODEGEN_DIR}/templates/test_matrix_params.py.j2
 )
 set(ALAYA_CODEGEN_OUTPUTS ${CMAKE_SOURCE_DIR}/python/tests/client/_dispatch_matrix_params.py)
 
@@ -34,12 +32,7 @@ add_custom_target(alaya_codegen DEPENDS ${ALAYA_CODEGEN_OUTPUTS})
 # The module. pybind11 resolves Python through FindPython (PYBIND11_FINDPYTHON=ON set before find_package(pybind11) in
 # AlayaDependencies.cmake), i.e. the same interpreter as everything else.
 # ---------------------------------------------------------------------------------------------------------------------
-pybind11_add_module(
-  ${PYTHON_MODULE_NAME}
-  MODULE
-  NO_EXTRAS
-  src/pybind.cpp
-)
+pybind11_add_module(${PYTHON_MODULE_NAME} MODULE NO_EXTRAS src/pybind.cpp)
 add_dependencies(${PYTHON_MODULE_NAME} alaya_codegen)
 target_include_directories(${PYTHON_MODULE_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(${PYTHON_MODULE_NAME} PRIVATE AlayaLite pybind11::module)

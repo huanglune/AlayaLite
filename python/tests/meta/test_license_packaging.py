@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: 2025 AlayaDB.AI
 #
 # SPDX-License-Identifier: AGPL-3.0-only
+"""Verify third-party license materials are shipped in the wheel."""
 
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parents[3]
 REQUIRED_FILES = ("LICENSE", "LICENSES/*.txt", "REUSE.toml", "THIRD_PARTY_NOTICES.md")

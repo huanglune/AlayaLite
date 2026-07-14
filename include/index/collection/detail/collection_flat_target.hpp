@@ -9,7 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <filesystem>  // NOLINT(build/c++17)
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <span>

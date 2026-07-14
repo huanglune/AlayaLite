@@ -30,7 +30,7 @@ concept BatchSearchable =
 template <class T>
 concept AsyncSearchable =
     DescriptorProvider<T> && requires(const T &segment, SearchRequest request, void *completion) {
-      { segment.start_search(std::move(request), completion) };
+      { segment.start_search(std::move(request), completion) };  // NOLINT(readability/braces)
     };
 
 template <class T>

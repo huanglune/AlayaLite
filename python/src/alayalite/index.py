@@ -9,7 +9,7 @@ from ._legacy import raise_removed_legacy_api
 __all__: list[str] = []
 
 
-def __getattr__(name: str):
+def __getattr__(name: str):  # pylint: disable=invalid-name
     if name == "Index":
         raise_removed_legacy_api("Index")
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -21,7 +21,7 @@
   #include "utils/platform_fs.hpp"
 #endif
 
-#include <filesystem>  // NOLINT(build/c++17)
+#include <filesystem>
 
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"

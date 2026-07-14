@@ -331,7 +331,6 @@ class Collection:
                         self.__native.close()
                 finally:
                     self.__native = None
-                    self.__read_view = None
                     self.__dim = None
                     self.__dtype = None
                     if not root_existed and os.path.exists(self.__root):
@@ -381,7 +380,6 @@ class Collection:
                         self.__native.close()
                 finally:
                     self.__native = None
-                    self.__read_view = None
                     self.__dim = None
                     self.__dtype = None
                     if not root_existed and os.path.exists(self.__root):
@@ -695,7 +693,6 @@ class Collection:
             replacement = None
             native.close()
             self.__native = None
-            self.__read_view = None
             try:
                 os.replace(root, backup_root)
             except Exception:
@@ -709,7 +706,6 @@ class Collection:
                 raise
             try:
                 self.__native = _NativeCollection.open(os.fspath(root))
-                self.__read_view = None
             except Exception:
                 failed_root = root.parent / f".{root.name}.failed-{uuid.uuid4().hex}"
                 os.replace(root, failed_root)

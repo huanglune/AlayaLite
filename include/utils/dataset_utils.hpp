@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include <filesystem>  // NOLINT(build/c++17)
+#include <filesystem>
 #include <string>
 #include "utils/evaluate.hpp"
 #include "utils/io_utils.hpp"

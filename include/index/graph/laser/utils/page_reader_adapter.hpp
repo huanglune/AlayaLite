@@ -59,8 +59,9 @@ inline void collect_page_read(void *context, storage::io::ReadResult result) noe
 [[nodiscard]] inline auto submit_page_reads(storage::io::PageReader &reader,
                                             std::span<const storage::io::ReadRequest> requests,
                                             PageReadCompletions &completions) -> std::size_t {
-  [[maybe_unused]] auto handle = reader.submit(
-      requests, storage::io::Completion{.fn = collect_page_read, .context = &completions});
+  [[maybe_unused]] auto handle =
+      reader.submit(requests,
+                    storage::io::Completion{.fn = collect_page_read, .context = &completions});
   return requests.size();
 }
 

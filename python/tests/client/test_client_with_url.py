@@ -14,7 +14,7 @@ import numpy as np
 from alayalite import Client
 
 
-class TestClientWithURL(unittest.TestCase):
+class TestClientWithURL(unittest.TestCase):  # pylint: disable=missing-class-docstring
     def setUp(self):
         self.items = [
             (1, "Document 1", np.array([0.1, 0.2, 0.3], dtype=np.float32), {"category": "A"}),
@@ -71,9 +71,7 @@ class TestClientWithURL(unittest.TestCase):
     def test_sq8_collection_recovery_uses_canonical_checkpoint(self):
         collection = self.client.create_collection("recovering_sq8", quantization_type="sq8", metric="ip")
         collection.insert(self.items)
-        collection.upsert(
-            [(2, "Document 2 v2", np.array([0.4, 0.5, 0.7], dtype=np.float32), {"category": "new"})]
-        )
+        collection.upsert([(2, "Document 2 v2", np.array([0.4, 0.5, 0.7], dtype=np.float32), {"category": "new"})])
         self.client.reset()
 
         recovered = Client(self.temp_dir).get_collection("recovering_sq8")

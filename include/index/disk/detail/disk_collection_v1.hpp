@@ -19,7 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
-#include <filesystem>  // NOLINT(build/c++17)
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>

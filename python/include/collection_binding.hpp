@@ -13,7 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <filesystem>  // NOLINT(build/c++17)
+#include <filesystem>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -1001,7 +1001,6 @@ inline void register_collection(py::module_ &module) {
       .def("stats", &PyCollection::stats)
       .def("options", &PyCollection::options)
       .def("close", &PyCollection::close);
-
 }
 
 }  // namespace alaya::python::collection_binding

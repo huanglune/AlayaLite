@@ -15,7 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
-#include <filesystem>  // NOLINT(build/c++17)
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -834,7 +834,7 @@ inline void QuantizedGraph::update_qg_out_of_memory(
   size_t main_page_size = (dimension_ * sizeof(float) + kSectorLen - 1) / kSectorLen * kSectorLen;
 
   kernels::linalg::RowMajorMatrix<float> x_pad(cur_degree, padded_dim_);  // padded neighbors mat
-  kernels::linalg::RowMajorMatrix<float> c_pad(1, padded_dim_);           // padded duplicate centroid mat
+  kernels::linalg::RowMajorMatrix<float> c_pad(1, padded_dim_);  // padded duplicate centroid mat
   x_pad.setZero();
   c_pad.setZero();
 

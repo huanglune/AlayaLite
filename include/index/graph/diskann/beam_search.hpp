@@ -125,7 +125,8 @@ inline auto request(uint64_t offset, uint64_t size, uint32_t id, char *buffer)
 
 inline void complete(void *context, storage::io::ReadResult result) noexcept {
   auto &td = *static_cast<ThreadData *>(context);
-  while (td.io_lock.test_and_set(std::memory_order_acquire)) {}
+  while (td.io_lock.test_and_set(std::memory_order_acquire)) {
+  }
   td.completed_io.push_back(std::move(result));
   td.io_lock.clear(std::memory_order_release);
   td.completed_io_count.fetch_add(1, std::memory_order_release);
@@ -153,7 +154,8 @@ inline void wait(ThreadData &td, size_t count, std::vector<storage::io::ReadResu
     td.completed_io_count.wait(available, std::memory_order_acquire);
     available = td.completed_io_count.load(std::memory_order_acquire);
   }
-  while (td.io_lock.test_and_set(std::memory_order_acquire)) {}
+  while (td.io_lock.test_and_set(std::memory_order_acquire)) {
+  }
   while (count-- != 0) {
     out.push_back(std::move(td.completed_io.front()));
     td.completed_io.pop_front();

@@ -92,7 +92,10 @@ if(MSVC)
 else()
   # LASER keeps AVX2+FMA as its target baseline even when the core build is validating its generic x86 baseline.
   set(_alaya_laser_isa_options ${ALAYA_SIMD_COMPILE_OPTIONS})
-  if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64" AND NOT ALAYA_NATIVE_ARCH AND NOT ALAYA_X86_AVX2_BASELINE)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64"
+     AND NOT ALAYA_NATIVE_ARCH
+     AND NOT ALAYA_X86_AVX2_BASELINE
+  )
     set(_alaya_laser_isa_options -mavx2 -mfma)
   endif()
   set(_ALAYA_LASER_CONSUMER_OPTIONS

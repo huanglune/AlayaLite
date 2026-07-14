@@ -5,7 +5,6 @@
 #pragma once
 
 #include <omp.h>
-#include "kernels/linalg/types.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -16,6 +15,7 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
+#include "kernels/linalg/types.hpp"
 
 #include "utils/log.hpp"
 
@@ -55,8 +55,10 @@ inline void compute_vecs_l2sq(const float *data, size_t num_points, size_t dim, 
   if (num_points == 0 || dim == 0) {
     return;
   }
-  kernels::linalg::ConstRowMajorMatrixMap<float> d_view(
-      data, static_cast<kernels::linalg::Index>(num_points), static_cast<kernels::linalg::Index>(dim));
+  kernels::linalg::ConstRowMajorMatrixMap<float> d_view(data,
+                                                        static_cast<kernels::linalg::Index>(
+                                                            num_points),
+                                                        static_cast<kernels::linalg::Index>(dim));
   kernels::linalg::VectorMap<float> out_view(l2sq_out,
                                              static_cast<kernels::linalg::Index>(num_points));
   out_view = d_view.rowwise().squaredNorm();
@@ -95,9 +97,10 @@ inline void compute_closest_centers(const float *data,
   std::vector<float> centers_l2sq(num_centers);
   compute_vecs_l2sq(centers, num_centers, dim, centers_l2sq.data());
 
-  kernels::linalg::ConstRowMajorMatrixMap<float> c_view(
-      centers, static_cast<kernels::linalg::Index>(num_centers),
-      static_cast<kernels::linalg::Index>(dim));
+  kernels::linalg::ConstRowMajorMatrixMap<float> c_view(centers,
+                                                        static_cast<kernels::linalg::Index>(
+                                                            num_centers),
+                                                        static_cast<kernels::linalg::Index>(dim));
 
   const size_t block_size = std::min(num_points, detail::kClosestCentersBlockSize);
   const size_t num_blocks = (num_points + block_size - 1) / block_size;
@@ -112,9 +115,10 @@ inline void compute_closest_centers(const float *data,
     const size_t start = b * block_size;
     const size_t cur = std::min(block_size, num_points - start);
 
-    kernels::linalg::ConstRowMajorMatrixMap<float> d_block(
-        data + start * dim, static_cast<kernels::linalg::Index>(cur),
-        static_cast<kernels::linalg::Index>(dim));
+    kernels::linalg::ConstRowMajorMatrixMap<float> d_block(data + start * dim,
+                                                           static_cast<kernels::linalg::Index>(cur),
+                                                           static_cast<kernels::linalg::Index>(
+                                                               dim));
 
     compute_vecs_l2sq(data + start * dim, cur, dim, block_d_l2sq.data());
 
@@ -127,8 +131,9 @@ inline void compute_closest_centers(const float *data,
       dist_block.row(static_cast<kernels::linalg::Index>(i)).array() += norm_i;
     }
     // column j += ||c_j||²  (broadcast over rows)
-    kernels::linalg::ConstVectorMap<float> c_norm_view(
-        centers_l2sq.data(), static_cast<kernels::linalg::Index>(num_centers));
+    kernels::linalg::ConstVectorMap<float> c_norm_view(centers_l2sq.data(),
+                                                       static_cast<kernels::linalg::Index>(
+                                                           num_centers));
     dist_block.rowwise() += c_norm_view.transpose();
 
     // Top-k extraction per row. For k ≤ 4 a linear scan with a sorted small

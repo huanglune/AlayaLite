@@ -137,7 +137,7 @@ class Status {
 template <class T>
 class Result {
  public:
-  Result(Status status)
+  Result(Status status)  // NOLINT(runtime/explicit)
       : header(current_struct_header<Result>()), status_(std::move(status)), value_(std::nullopt) {
     if (status_.ok()) {
       status_ = Status::error(StatusCode::internal,
@@ -147,7 +147,7 @@ class Result {
     }
   }
 
-  Result(T value)
+  Result(T value)  // NOLINT(runtime/explicit)
       : header(current_struct_header<Result>()),
         status_(Status::success()),
         value_(std::move(value)) {}

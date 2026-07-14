@@ -115,7 +115,8 @@ class LibaioPageReader final : public PageReader {
       return stopping_ || outstanding_ + requests.size() <= constraints_.max_batch;
     });
     if (stopping_) throw std::runtime_error("PageReader is shut down");
-    const int submitted = ::io_submit(context_, static_cast<long>(cbs.size()), cbs.data());
+    const int submitted =
+        ::io_submit(context_, static_cast<long>(cbs.size()), cbs.data());  // NOLINT(runtime/int)
     if (submitted != static_cast<int>(cbs.size())) {
       if (submitted > 0) {
         outstanding_ += static_cast<std::size_t>(submitted);
@@ -178,8 +179,11 @@ class LibaioPageReader final : public PageReader {
     std::vector<io_event> events(constraints_.max_batch);
     for (;;) {
       timespec timeout{0, 10'000'000};
-      const int count =
-          ::io_getevents(context_, 0, static_cast<long>(events.size()), events.data(), &timeout);
+      const int count = ::io_getevents(context_,
+                                       0,
+                                       static_cast<long>(events.size()),  // NOLINT(runtime/int)
+                                       events.data(),
+                                       &timeout);
       if (count > 0) {
         for (int i = 0; i < count; ++i) complete(events[static_cast<std::size_t>(i)]);
       }

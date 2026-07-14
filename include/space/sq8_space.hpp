@@ -54,8 +54,11 @@ class SQ8Space {
   using DataTypeAlias = DataType;
   using IDTypeAlias = IDType;
   using DistanceTypeAlias = DistanceType;
-  using DistanceFunction = DistanceType (*)(const std::uint8_t *, const std::uint8_t *, std::size_t,
-                                            const DataType *, const DataType *);
+  using DistanceFunction = DistanceType (*)(const std::uint8_t *,
+                                            const std::uint8_t *,
+                                            std::size_t,
+                                            const DataType *,
+                                            const DataType *);
 
   using DistDataType = DataType;
 
@@ -479,11 +482,11 @@ class SQ8Space {
   MetricType metric_{MetricType::L2};  ///< Metric type
 
   DistanceFunction distance_calu_func_;  ///< Distance calculation function
-  uint32_t data_size_{0};                                  ///< Size of each data point in bytes
-  IDType item_cnt_{0};                                     ///< Number of data points (nodes)
-  IDType delete_cnt_{0};              ///< Number of deleted data points (nodes)
-  DataStorage data_storage_;          ///< Data storage for encoded data
-  SQ8Quantizer<DataType> quantizer_;  ///< The quantizer used to quantize the data
+  uint32_t data_size_{0};                ///< Size of each data point in bytes
+  IDType item_cnt_{0};                   ///< Number of data points (nodes)
+  IDType delete_cnt_{0};                 ///< Number of deleted data points (nodes)
+  DataStorage data_storage_;             ///< Data storage for encoded data
+  SQ8Quantizer<DataType> quantizer_;     ///< The quantizer used to quantize the data
 
   RocksDBConfig config_;  ///< Configuration for Scalar Data Storage
   std::unique_ptr<RocksDBStorage<IDType>>

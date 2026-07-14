@@ -15,8 +15,7 @@ namespace alaya::simd::fastscan {
 
 constexpr std::array<int, 16> kPackedLaneOrder =
     {0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15};
-constexpr std::array<int, 16> kLutPosition =
-    {3, 3, 2, 3, 1, 3, 2, 3, 0, 3, 2, 3, 1, 3, 2, 3};
+constexpr std::array<int, 16> kLutPosition = {3, 3, 2, 3, 1, 3, 2, 3, 0, 3, 2, 3, 1, 3, 2, 3};
 
 template <typename T>
 inline void build_lut(size_t dim, const T *ALAYA_RESTRICT query, T *ALAYA_RESTRICT lut) {
@@ -132,8 +131,7 @@ inline void accumulate_avx2(size_t dim,
   __m256i accu3 = _mm256_setzero_si256();
   for (size_t i = 0; i < code_length; i += 64) {
     for (size_t half = 0; half < 64; half += 32) {
-      const __m256i c =
-          _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&codes[i + half]));
+      const __m256i c = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&codes[i + half]));
       const __m256i lut =
           _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&lut_table[i + half]));
       const __m256i lo = _mm256_and_si256(c, low_mask);

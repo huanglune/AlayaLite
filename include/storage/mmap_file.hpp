@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <filesystem>  // NOLINT(build/c++17)
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <type_traits>

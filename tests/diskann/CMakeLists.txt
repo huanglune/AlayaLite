@@ -157,9 +157,8 @@ if(ALAYA_ENABLE_LASER)
   )
   alaya_cc_target(make_diskann_sift_update_trace SRCS make_diskann_sift_update_trace.cpp)
 
-  # Manual Gate-8 async performance sentinel. It is intentionally not
-  # registered with ctest: the benchmark runner launches two persistent
-  # processes and interleaves fixed-index samples across implementations.
+  # Manual Gate-8 async performance sentinel. It is intentionally not registered with ctest: the benchmark runner
+  # launches two persistent processes and interleaves fixed-index samples across implementations.
   alaya_cc_target(
     diskann_async_sentinel
     LASER

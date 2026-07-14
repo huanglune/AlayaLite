@@ -25,7 +25,7 @@ class _FakeClosable:
             raise RuntimeError("close failed")
 
 
-class TestClient(unittest.TestCase):
+class TestClient(unittest.TestCase):  # pylint: disable=missing-class-docstring
     def setUp(self):
         self.tmp_dir = tempfile.mkdtemp()
         self._original_rocksdb_dir = os.environ.get("ALAYALITE_ROCKSDB_DIR")
@@ -70,7 +70,7 @@ class TestClient(unittest.TestCase):
         os.makedirs(os.path.join(url, "collection_on_disk"))
         client = Client(url)
         collection = _FakeClosable()
-        client._Client__collection_map = {"collection_on_disk": collection}
+        client._Client__collection_map = {"collection_on_disk": collection}  # pylint: disable=protected-access
 
         client.reset(delete_on_disk=True)
 
@@ -80,7 +80,7 @@ class TestClient(unittest.TestCase):
 
     def test_close_helper_ignores_native_close_errors(self):
         collection = _FakeClosable(fail=True)
-        Client._close_collection(collection)
+        Client._close_collection(collection)  # pylint: disable=protected-access
         self.assertTrue(collection.closed)
 
     def test_collection_params(self):

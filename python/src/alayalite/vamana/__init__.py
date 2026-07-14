@@ -9,7 +9,7 @@ from alayalite._legacy import raise_removed_legacy_api
 __all__: list[str] = []
 
 
-def __getattr__(name: str):
+def __getattr__(name: str):  # pylint: disable=invalid-name
     if name == "build_index":
         raise_removed_legacy_api("vamana.build_index")
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

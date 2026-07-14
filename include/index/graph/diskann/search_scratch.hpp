@@ -139,8 +139,8 @@ struct ThreadData {
     }
     sector_scratch_bytes = config.n_page_slots * config.page_size;
     buffer_alignment = std::max<uint64_t>(kSectorLen, config.buffer_alignment);
-    sector_scratch = reinterpret_cast<char *>(
-        alaya_aligned_alloc_impl(sector_scratch_bytes, buffer_alignment));
+    sector_scratch =
+        reinterpret_cast<char *>(alaya_aligned_alloc_impl(sector_scratch_bytes, buffer_alignment));
     if (sector_scratch == nullptr) throw std::bad_alloc();
     if (config.pq_table_entries > 0) {
       pq_table.assign(config.pq_table_entries, 0.0f);

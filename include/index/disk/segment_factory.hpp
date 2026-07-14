@@ -5,7 +5,7 @@
 #pragma once
 
 #include <cstdint>
-#include <filesystem>  // NOLINT(build/c++17)
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <stdexcept>

@@ -255,7 +255,7 @@ inline void encode_logical_id(std::vector<std::byte> &output, const core::Logica
 
 [[nodiscard]] inline auto encode_wal_transaction(const WalMutationTransaction &transaction)
     -> std::vector<std::byte> {
-  using namespace mutation_wal_codec_detail;
+  using namespace mutation_wal_codec_detail;  // NOLINT(build/namespaces)
   if (transaction.rows.size() > kMaximumRows) {
     throw std::invalid_argument("mutation WAL transaction has too many rows");
   }
@@ -285,7 +285,7 @@ inline void encode_logical_id(std::vector<std::byte> &output, const core::Logica
 
 [[nodiscard]] inline auto decode_wal_transaction(std::span<const std::byte> payload)
     -> WalMutationTransaction {
-  using namespace mutation_wal_codec_detail;
+  using namespace mutation_wal_codec_detail;  // NOLINT(build/namespaces)
   Decoder decoder(payload);
   if (decoder.u16() != kPayloadVersion) {
     throw std::invalid_argument("mutation WAL payload version is unsupported");
@@ -340,7 +340,7 @@ inline void encode_logical_id(std::vector<std::byte> &output, const core::Logica
 
 [[nodiscard]] inline auto encode_batch_receipt_marker(const BatchMutationReceipt &receipt)
     -> std::vector<std::byte> {
-  using namespace mutation_wal_codec_detail;
+  using namespace mutation_wal_codec_detail;  // NOLINT(build/namespaces)
   if (receipt.rows.size() > kMaximumRows) {
     throw std::invalid_argument("batch receipt marker has too many rows");
   }
@@ -369,7 +369,7 @@ inline void encode_logical_id(std::vector<std::byte> &output, const core::Logica
 
 [[nodiscard]] inline auto decode_batch_receipt_marker(std::span<const std::byte> payload)
     -> BatchMutationReceipt {
-  using namespace mutation_wal_codec_detail;
+  using namespace mutation_wal_codec_detail;  // NOLINT(build/namespaces)
   Decoder decoder(payload);
   if (decoder.u16() != 1) {
     throw std::invalid_argument("batch receipt marker version is unsupported");

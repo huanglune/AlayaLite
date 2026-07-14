@@ -52,7 +52,8 @@ struct RaBitQCore {
     bits = (residual_arr > 0).template cast<int>();
 
     DataType binary_offset = -((1 << 1) - 1) / 2.F;
-    kernels::linalg::RowMajorArray<DataType> half_signed = bits.template cast<DataType>() + binary_offset;
+    kernels::linalg::RowMajorArray<DataType> half_signed =
+        bits.template cast<DataType>() + binary_offset;
     DataType centroid_dot_half_signed = dot_product<DataType>(centroid, half_signed.data(), dim);
     DataType residual_dot_half_signed =
         dot_product<DataType>(residual_arr.data(), half_signed.data(), dim);

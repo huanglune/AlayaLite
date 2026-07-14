@@ -19,7 +19,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstring>
-#include <filesystem>  // NOLINT(build/c++17)
+#include <filesystem>
 #include <functional>
 #include <limits>
 #include <memory>

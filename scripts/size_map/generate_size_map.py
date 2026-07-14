@@ -24,9 +24,7 @@ LEGACY_SYMBOL_PATTERNS = (
 def _text_bytes(binary: Path) -> int:
     output = subprocess.check_output(["size", "-A", str(binary)], text=True)
     return sum(
-        int(parts[1])
-        for line in output.splitlines()
-        if (parts := line.split()) and parts[0].startswith(".text")
+        int(parts[1]) for line in output.splitlines() if (parts := line.split()) and parts[0].startswith(".text")
     )
 
 
@@ -50,10 +48,7 @@ def main() -> int:
     obj = build / "python/CMakeFiles/_alayalitepy.dir/src/pybind.cpp.o"
     module = next((build / "python").glob("_alayalitepy*.so"))
     symbols = _demangled_symbols(module)
-    leaked = {
-        pattern: [name for name in symbols if pattern in name]
-        for pattern in LEGACY_SYMBOL_PATTERNS
-    }
+    leaked = {pattern: [name for name in symbols if pattern in name] for pattern in LEGACY_SYMBOL_PATTERNS}
     leaked = {pattern: names for pattern, names in leaked.items() if names}
     if leaked:
         raise RuntimeError(f"retired native symbols leaked into the extension: {sorted(leaked)}")
@@ -70,9 +65,7 @@ def main() -> int:
             "bytes": module.stat().st_size,
             "text_bytes": _text_bytes(module),
         },
-        "wheel": None
-        if args.wheel is None
-        else {"bytes": args.wheel.stat().st_size, "name": args.wheel.name},
+        "wheel": None if args.wheel is None else {"bytes": args.wheel.stat().st_size, "name": args.wheel.name},
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")

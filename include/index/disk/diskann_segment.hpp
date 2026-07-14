@@ -10,7 +10,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>  // NOLINT(build/c++17)
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -1013,7 +1013,9 @@ class DiskAnnSegment {
     // The method itself keeps `this` alive until the native operation's safe
     // completion. Erased async calls use the owning shared_ptr from AnySegment.
     auto self = std::shared_ptr<DiskAnnSegment>(const_cast<DiskAnnSegment *>(this),
-                                                [](DiskAnnSegment *) noexcept {});
+                                                [](DiskAnnSegment
+                                                       *) noexcept {  // NOLINT(readability/casting)
+                                                });
     auto started = start_native_search(self, std::move(wait_request), std::move(completion));
     if (!started.ok()) {
       return started.status();
@@ -1843,7 +1845,7 @@ class DiskAnnSegment {
                                            std::uint64_t checkpoint_generation)
       -> core::Result<internal::collection::ArtifactManifestV2> {
     try {
-      using namespace internal::collection;
+      using namespace internal::collection;  // NOLINT(build/namespaces)
       ArtifactManifestV2 manifest;
       const auto manifest_path = mutable_options_->collection_root / kCollectionManifestFilename;
       if (std::filesystem::is_regular_file(manifest_path)) {
@@ -2740,7 +2742,7 @@ class DiskAnnMutableSegmentFactory {
       return disabled("DiskAnn mutable Segment factory is disabled");
     }
     try {
-      using namespace internal::collection;
+      using namespace internal::collection;  // NOLINT(build/namespaces)
       const auto cleanup =
           ArtifactControlPlaneTransaction::cleanup_orphans(mutable_options.collection_root);
       if (!cleanup.ok()) {
@@ -2847,7 +2849,7 @@ class DiskAnnMutableSegmentFactory {
                                                       const DiskAnnMutableSegmentOptions &options)
       -> core::Status {
     try {
-      using namespace internal::collection;
+      using namespace internal::collection;  // NOLINT(build/namespaces)
       const auto wal_path = options.collection_root / ".alaya_internal" /
                             std::string(kCollectionWalNamespace) /
                             std::string(kCollectionWalFilename);

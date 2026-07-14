@@ -96,12 +96,13 @@ inline void rabitq_codes(kernels::linalg::RowMajorMatrix<float> &rotated_data,
   rabitq_factors(rotated_data, rotated_centroid, bin_x, triple_x, factor_dq, factor_vq);
 }
 
-static inline void rabitq_factors(const kernels::linalg::RowMajorMatrix<float> &rotated_data_residual,
-                                  const kernels::linalg::RowMajorMatrix<float> &rotated_centroid,
-                                  const kernels::linalg::RowMajorMatrix<int> &bin_x,
-                                  float *triple_x,
-                                  float *factor_dq,
-                                  float *factor_vq) {
+static inline void rabitq_factors(
+    const kernels::linalg::RowMajorMatrix<float> &rotated_data_residual,
+    const kernels::linalg::RowMajorMatrix<float> &rotated_centroid,
+    const kernels::linalg::RowMajorMatrix<int> &bin_x,
+    float *triple_x,
+    float *factor_dq,
+    float *factor_vq) {
   int64_t num_points = rotated_data_residual.rows();
   int64_t dim = rotated_data_residual.cols();
 
