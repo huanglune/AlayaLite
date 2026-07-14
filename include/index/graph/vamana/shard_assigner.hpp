@@ -16,7 +16,7 @@
 
 #include "core/log.hpp"
 #include "index/graph/vamana/kmeans_partition.hpp"
-#include "utils/timer.hpp"
+#include "index/graph/detail/timer.hpp"
 
 namespace alaya::vamana {
 

@@ -33,7 +33,7 @@
 #include "index/graph/vamana/shard_merger.hpp"
 #include "index/graph/vamana/vamana_builder.hpp"
 #include "index/graph/vamana/vamana_writer.hpp"
-#include "utils/timer.hpp"
+#include "index/graph/detail/timer.hpp"
 
 namespace alaya::vamana {
 

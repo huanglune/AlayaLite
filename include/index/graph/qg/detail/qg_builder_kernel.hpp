@@ -24,8 +24,8 @@
 #include "space/rabitq_space.hpp"
 #include "space/space_concepts.hpp"
 #include "utils/openmp.hpp"
-#include "utils/random.hpp"
-#include "utils/thread_config.hpp"
+#include "index/graph/detail/random.hpp"
+#include "index/graph/detail/thread_config.hpp"
 
 namespace alaya::detail {
 template <typename DistanceSpaceType>

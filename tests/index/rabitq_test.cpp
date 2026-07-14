@@ -19,7 +19,7 @@
 #include "utils/dataset_utils.hpp"
 #include "utils/evaluate.hpp"
 #include "core/log.hpp"
-#include "utils/timer.hpp"
+#include "index/graph/detail/timer.hpp"
 
 namespace alaya {
 class RaBitQSiftSmallTest : public ::testing::Test {

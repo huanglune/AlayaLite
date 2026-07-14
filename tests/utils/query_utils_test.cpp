@@ -4,7 +4,7 @@
 
 #include "index/graph/detail/search_runtime/query_utils.hpp"
 #include "index/graph/detail/search_runtime/hashset.hpp"
-#include "utils/thread_pool.hpp"
+#include "index/graph/detail/thread_pool.hpp"
 #include <gtest/gtest.h>
 
 namespace alaya {

@@ -17,8 +17,8 @@
 #include "space/raw_space.hpp"
 #include "utils/dataset_utils.hpp"
 #include "utils/evaluate.hpp"
-#include "utils/thread_config.hpp"
-#include "utils/timer.hpp"
+#include "index/graph/detail/thread_config.hpp"
+#include "index/graph/detail/timer.hpp"
 
 namespace alaya {
 

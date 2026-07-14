@@ -23,7 +23,7 @@
 #include "space/rabitq_space.hpp"
 #include "utils/evaluate.hpp"
 #include "utils/io_utils.hpp"
-#include "utils/timer.hpp"
+#include "index/graph/detail/timer.hpp"
 
 namespace {
 

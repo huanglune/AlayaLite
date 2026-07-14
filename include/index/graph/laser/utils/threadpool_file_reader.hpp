@@ -38,7 +38,7 @@
 
 #include "concurrentqueue.h"  // NOLINT
 #include "index/graph/laser/utils/aligned_file_reader.hpp"
-#include "utils/thread_config.hpp"
+#include "index/graph/detail/thread_config.hpp"
 
 struct ThreadPoolContext {
   moodycamel::ConcurrentQueue<AlignedReadEvent> completions;

@@ -18,10 +18,10 @@
 #include "index/graph/graph.hpp"
 #include "index/graph/knng/detail/nndescent_kernel.hpp"
 #include "index/neighbor.hpp"
-#include "utils/random.hpp"
-#include "utils/thread_config.hpp"
-#include "utils/thread_pool.hpp"
-#include "utils/timer.hpp"
+#include "index/graph/detail/random.hpp"
+#include "index/graph/detail/thread_config.hpp"
+#include "index/graph/detail/thread_pool.hpp"
+#include "index/graph/detail/timer.hpp"
 
 namespace alaya::detail {
 
