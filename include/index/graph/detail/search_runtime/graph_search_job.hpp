@@ -33,8 +33,8 @@
 #include "space/space_concepts.hpp"
 #include "utils/prefetch.hpp"
 #include "index/graph/detail/search_runtime/query_utils.hpp"
-#include "utils/rabitq_utils/search_utils/buffer.hpp"
-#include "utils/rabitq_utils/search_utils/visited_pool.hpp"
+#include "index/graph/detail/search_runtime/buffer.hpp"
+#include "index/graph/detail/search_runtime/visited_pool.hpp"
 
 #if defined(__linux__)
   #include "coro/task.hpp"

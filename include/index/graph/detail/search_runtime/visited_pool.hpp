@@ -10,7 +10,7 @@
 #include <mutex>
 
 #include "index/graph/detail/search_runtime/query_utils.hpp"
-#include "utils/rabitq_utils/search_utils/hashset.hpp"
+#include "index/graph/detail/search_runtime/hashset.hpp"
 
 namespace alaya {
 

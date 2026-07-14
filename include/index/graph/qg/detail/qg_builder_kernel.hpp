@@ -22,8 +22,8 @@
 #include "space/rabitq_space.hpp"
 #include "space/space_concepts.hpp"
 #include "utils/openmp.hpp"
-#include "utils/rabitq_utils/search_utils/buffer.hpp"
-#include "utils/rabitq_utils/search_utils/hashset.hpp"
+#include "index/graph/detail/search_runtime/buffer.hpp"
+#include "index/graph/detail/search_runtime/hashset.hpp"
 #include "utils/random.hpp"
 #include "utils/thread_config.hpp"
 

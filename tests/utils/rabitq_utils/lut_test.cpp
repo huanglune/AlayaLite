@@ -11,7 +11,7 @@
 #include <vector>
 
 #include "utils/rabitq_utils/lut.hpp"
-#include "utils/rabitq_utils/search_utils/buffer.hpp"
+#include "index/graph/detail/search_runtime/buffer.hpp"
 
 namespace alaya {
 
