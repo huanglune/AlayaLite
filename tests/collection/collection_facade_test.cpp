@@ -136,7 +136,6 @@ TEST(CollectionFacade, CanonicalResultsReceiptsStatsCheckpointAndReopen) {
 
   auto reopened = Collection::open(temporary.path());
   ASSERT_TRUE(reopened.ok()) << reopened.status().diagnostic();
-  EXPECT_FALSE(reopened.value()->imported_legacy_layout());
   auto record = reopened.value()->get_by_id(core::LogicalId::from_utf8("a"));
   ASSERT_TRUE(record.ok()) << record.status().diagnostic();
   ASSERT_TRUE(record.value().vector.has_value());

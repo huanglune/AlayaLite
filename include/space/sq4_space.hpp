@@ -11,7 +11,6 @@
 #include <fstream>
 #include <stdexcept>
 #include <string>
-#include <type_traits>
 #include "core/log.hpp"
 #include "core/value_types.hpp"
 #include "platform/detect.hpp"
@@ -22,19 +21,14 @@
 #include "storage/container/sequential_storage.hpp"
 #include "utils/math.hpp"
 #include "utils/prefetch.hpp"
-#include "utils/scalar_data.hpp"
 
 namespace alaya {
 
 template <typename DataType = float,
           typename DistanceType = float,
           typename IDType = uint32_t,
-          typename DataStorage = SequentialStorage<uint8_t, IDType>,
-          typename ScalarDataType = EmptyScalarData>
+          typename DataStorage = SequentialStorage<uint8_t, IDType>>
 class SQ4Space {
-  static_assert(std::is_same_v<ScalarDataType, EmptyScalarData>,
-                "ScalarDataType is deprecated; scalar data is managed by Collection");
-
  public:
   static constexpr bool has_scalar_data = false;
 

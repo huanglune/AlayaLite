@@ -26,7 +26,7 @@
 
 #include "index/collection/detail/canonical_flat_segment.hpp"
 #include "index/collection/detail/collection_flat_target.hpp"
-#include "index/collection/legacy_importer.hpp"
+#include "index/collection/segmented_collection.hpp"
 #include "index/collection/sha256.hpp"
 #include "platform/fs.hpp"
 
@@ -74,7 +74,6 @@ struct CollectionOptions {
   // Zero disables automatic rotation. A positive value rotates after the
   // active generation reaches this many physical rows.
   std::uint64_t auto_seal_rows{};
-  bool imported_legacy_layout{};
 };
 
 enum class CollectionSealFailPoint : std::uint8_t {
@@ -218,7 +217,7 @@ class Collection {
         return opened.status();
       }
       auto result = std::shared_ptr<Collection>(
-          new Collection(std::move(options), std::move(opened).value(), false, std::move(state)));
+          new Collection(std::move(options), std::move(opened).value(), std::move(state)));
       core::CheckpointContext context;
       context.durability_target = core::DurabilityTarget::full_checkpoint;
       auto checkpoint = result->checkpoint(context);
@@ -260,40 +259,14 @@ class Collection {
           if (!opened.ok()) {
             return opened.status();
           }
-          const auto imported_layout = options.value().imported_legacy_layout;
           auto result = std::shared_ptr<Collection>(new Collection(std::move(options).value(),
                                                                    std::move(opened).value(),
-                                                                   imported_layout,
                                                                    std::move(state)));
           status = result->recover_control_state();
           if (!status.ok()) {
             return status;
           }
           return result;
-        }
-        if (options.value().imported_legacy_layout) {
-          internal::collection::LegacyImportOptions import_options;
-          import_options.source_root = root;
-          import_options.target_root = root;
-          import_options.features.legacy_importer = true;
-          import_options.active_registration_factory = [](const auto &schema) {
-            return make_active_registration(schema);
-          };
-          auto imported = internal::collection::LegacyImporter::import(import_options);
-          if (!imported.ok()) {
-            return imported.status();
-          }
-          internal::collection::CollectionControlState state;
-          state.last_sealed_segment_id = 1;
-          state.last_sealed_generation = 1;
-          auto status = internal::collection::CollectionControlStore::save(root, state);
-          if (!status.ok()) {
-            return status;
-          }
-          return std::shared_ptr<Collection>(new Collection(std::move(options).value(),
-                                                            std::move(imported).value().collection,
-                                                            true,
-                                                            std::move(state)));
         }
         internal::collection::CollectionControlState state;
         state.auto_seal_rows = options.value().auto_seal_rows;
@@ -307,52 +280,13 @@ class Collection {
         }
         return std::shared_ptr<Collection>(new Collection(std::move(options).value(),
                                                           std::move(opened).value(),
-                                                          false,
                                                           std::move(state)));
       }
 
-      const auto route = internal::collection::LegacyImporter::resolve_open_route(root, root);
-      if (route == internal::collection::LegacyOpenRoute::unavailable) {
-        return error(core::StatusCode::not_found,
-                     core::OperationStage::open,
-                     core::StatusDetail::none,
-                     "canonical or supported legacy Collection layout was not found");
-      }
-      internal::collection::LegacyImportOptions import_options;
-      import_options.source_root = root;
-      import_options.target_root = root;
-      import_options.features.legacy_importer = true;
-      import_options.active_registration_factory = [](const auto &schema) {
-        return make_active_registration(schema);
-      };
-      auto imported = internal::collection::LegacyImporter::import(import_options);
-      if (!imported.ok()) {
-        return imported.status();
-      }
-      CollectionOptions options;
-      options.root = root;
-      options.dim = imported.value().audit.dim;
-      options.metric = core::Metric::l2;
-      options.scalar_type = imported.value().audit.source_scalar_type;
-      options.target_algorithm = core::algorithm::flat;
-      options.quantization = CollectionQuantization::none;
-      options.build_threads = 1;
-      options.imported_legacy_layout = true;
-      auto status = write_facade_schema(options);
-      if (!status.ok()) {
-        return status;
-      }
-      internal::collection::CollectionControlState state;
-      state.last_sealed_segment_id = 1;
-      state.last_sealed_generation = 1;
-      status = internal::collection::CollectionControlStore::save(root, state);
-      if (!status.ok()) {
-        return status;
-      }
-      return std::shared_ptr<Collection>(new Collection(std::move(options),
-                                                        std::move(imported).value().collection,
-                                                        true,
-                                                        std::move(state)));
+      return error(core::StatusCode::not_found,
+                   core::OperationStage::open,
+                   core::StatusDetail::none,
+                   "no canonical Collection layout found at this path");
     } catch (...) {
       return core::status_from_exception(core::OperationStage::open);
     }
@@ -675,7 +609,6 @@ class Collection {
         return "unknown";
     }
   }
-  [[nodiscard]] auto imported_legacy_layout() const noexcept -> bool { return imported_; }
 
   [[nodiscard]] auto close() -> core::Status {
     auto status = implementation_->close();
@@ -695,11 +628,9 @@ class Collection {
 
   Collection(CollectionOptions options,
              std::shared_ptr<internal::collection::SegmentedCollection> implementation,
-             bool imported,
              internal::collection::CollectionControlState control_state)
       : options_(std::move(options)),
         implementation_(std::move(implementation)),
-        imported_(imported),
         control_state_(std::move(control_state)) {}
 
   [[nodiscard]] static auto error(core::StatusCode code,
@@ -1917,7 +1848,6 @@ class Collection {
            "\nbuild_threads=" + std::to_string(options.build_threads) +
            "\nef_construction=" + std::to_string(options.ef_construction) +
            "\nmax_logical_id_bytes=" + std::to_string(options.max_logical_id_bytes) +
-           "\nimported_legacy_layout=" + std::to_string(options.imported_legacy_layout ? 1 : 0) +
            "\nactive_segment_id=" + std::to_string(kActiveSegmentId) +
            "\nactive_generation=" + std::to_string(kActiveSegmentGeneration) + "\n";
   }
@@ -1989,12 +1919,11 @@ class Collection {
         }
         return found->second;
       };
-      if (fields.size() != 14 || required("format") != "1" ||
+      if (fields.size() != 13 || required("format") != "1" ||
           required("public_version") != kCollectionPublicVersion ||
           required("checksum") != internal::collection::sha256(prefix).hex() ||
           parse_u64(required("active_segment_id")) != kActiveSegmentId ||
-          parse_u64(required("active_generation")) != kActiveSegmentGeneration ||
-          parse_u64(required("imported_legacy_layout")) > 1) {
+          parse_u64(required("active_generation")) != kActiveSegmentGeneration) {
         throw std::invalid_argument("canonical facade schema identity/checksum is invalid");
       }
       CollectionOptions options;
@@ -2008,7 +1937,6 @@ class Collection {
       options.build_threads = static_cast<std::uint32_t>(parse_u64(required("build_threads")));
       options.ef_construction = static_cast<std::uint32_t>(parse_u64(required("ef_construction")));
       options.max_logical_id_bytes = parse_u64(required("max_logical_id_bytes"));
-      options.imported_legacy_layout = parse_u64(required("imported_legacy_layout")) == 1;
       auto status = validate_options(options, core::OperationStage::open);
       if (!status.ok()) {
         return status;
@@ -2026,7 +1954,6 @@ class Collection {
 
   CollectionOptions options_{};
   std::shared_ptr<internal::collection::SegmentedCollection> implementation_{};
-  bool imported_{};
   mutable std::mutex control_mutex_{};
   internal::collection::CollectionControlState control_state_{};
   std::vector<PendingGcCandidate> pending_gc_{};

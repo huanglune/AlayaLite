@@ -412,9 +412,6 @@ struct CollectionFeatureFlags {
   bool collection_shell{true};
   bool experimental_persistence_writer{};
   bool wal_coordinator{};
-  // Independent Gate 7-B writer gate. Disabling it prevents discovery or
-  // continuation of a legacy import; already switched data remains readable.
-  bool legacy_importer{};
   // Roll-forward gate: disabling this bit prevents new manifest-v2
   // publications but never removes the v2 reader.
   bool manifest_v2_writer{};
