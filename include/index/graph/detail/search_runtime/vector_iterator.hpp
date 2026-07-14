@@ -18,7 +18,7 @@
 #include "index/graph/graph.hpp"
 #include "space/rabitq_space.hpp"
 #include "utils/prefetch.hpp"
-#include "utils/query_utils.hpp"
+#include "index/graph/detail/search_runtime/query_utils.hpp"
 #include "utils/rabitq_utils/search_utils/buffer.hpp"
 
 namespace alaya {

@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-#include "utils/query_utils.hpp"
+#include "index/graph/detail/search_runtime/query_utils.hpp"
 #include "utils/rabitq_utils/search_utils/hashset.hpp"
 #include "utils/thread_pool.hpp"
 #include <gtest/gtest.h>

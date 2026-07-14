@@ -10,8 +10,8 @@
 #include <type_traits>
 #include <unordered_set>
 #include <vector>
-#include "../index/neighbor.hpp"
-#include "memory.hpp"
+#include "index/neighbor.hpp"
+#include "utils/memory.hpp"
 
 #if defined(_MSC_VER)
   #include <intrin.h>
