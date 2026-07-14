@@ -38,8 +38,6 @@
   #endif
 #endif
 
-#include "core/log.hpp"
-
 namespace alaya::platform {
 
 namespace fs = std::filesystem;
@@ -167,9 +165,7 @@ inline auto sync_directory(const fs::path &path) -> void {
   }
 
 #ifdef _WIN32
-  LOG_INFO_ONCE(
-      "platform fallback: directory sync is unavailable on Windows, continuing with best-effort "
-      "semantics");
+  (void)path;  // directory sync is unavailable on Windows; best-effort no-op
 #else
   int flags = O_RDONLY;
   #ifdef O_DIRECTORY

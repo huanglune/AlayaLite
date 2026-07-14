@@ -17,7 +17,7 @@
 #include "index/graph/qg/qg_segment.hpp"
 #include "space/rabitq_space.hpp"
 #include "core/value_types.hpp"
-#include "core/platform.hpp"
+#include "platform/detect.hpp"
 
 #ifndef ALAYA_LASER_FIXTURE_DIR
   #define ALAYA_LASER_FIXTURE_DIR ""

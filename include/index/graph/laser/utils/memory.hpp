@@ -24,8 +24,8 @@
 #include <new>
 #include <type_traits>
 
-#include "core/platform.hpp"
 #include "index/graph/laser/utils/tools.hpp"
+#include "platform/detect.hpp"
 
 // _mm_prefetch lives in <xmmintrin.h>/<immintrin.h>; <intrin.h> from platform.hpp
 // already pulls it in on MSVC. GCC/Clang use the same header via <immintrin.h>.

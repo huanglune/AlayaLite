@@ -46,12 +46,12 @@
 #endif
 
 #include "core/log.hpp"
-#include "core/platform.hpp"
-#include "core/platform_fs.hpp"
 #include "core/value_types.hpp"
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
+#include "platform/detect.hpp"
+#include "platform/fs.hpp"
 #include "storage/mmap_file.hpp"
 
 namespace alaya::disk {

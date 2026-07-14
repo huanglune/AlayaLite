@@ -19,10 +19,10 @@
 #include <utility>
 #include <vector>
 
-#include "core/platform.hpp"
-#include "core/platform_fs.hpp"
 #include "index/collection/artifact_manifest_v2.hpp"
 #include "index/collection/types.hpp"
+#include "platform/detect.hpp"
+#include "platform/fs.hpp"
 
 namespace alaya::internal::collection {
 

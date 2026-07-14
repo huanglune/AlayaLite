@@ -15,7 +15,7 @@
 
 #include <cstddef>
 
-#include "core/platform.hpp"
+#include "platform/detect.hpp"
 #include "simd/distance_l2.hpp"
 #include "simd/laser_dispatch.hpp"
 

@@ -13,7 +13,7 @@
 #include <stdexcept>
 
 #include "core/log.hpp"
-#include "core/platform.hpp"
+#include "platform/detect.hpp"
 #include "simd/cpu_features.hpp"
 #include "simd/fastscan.hpp"
 

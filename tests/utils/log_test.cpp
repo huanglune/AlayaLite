@@ -14,8 +14,8 @@
 #include <sstream>
 #include <string>
 #include "utils/openmp.hpp"
-#include "core/platform.hpp"
-#include "core/platform_fs.hpp"
+#include "platform/detect.hpp"
+#include "platform/fs.hpp"
 
 namespace alaya {
 

@@ -31,13 +31,13 @@
 
 #include "core/algorithm_registry.hpp"
 #include "core/any_segment.hpp"
-#include "core/platform.hpp"
-#include "core/platform_fs.hpp"
 #include "index/collection/artifact_transaction.hpp"
 #include "index/collection/logical_wal.hpp"
 #include "index/collection/mutation_wal_codec.hpp"
 #include "index/disk/disk_engine_registry.hpp"
 #include "index/graph/diskann/diskann_index.hpp"
+#include "platform/detect.hpp"
+#include "platform/fs.hpp"
 
 namespace alaya::disk {
 

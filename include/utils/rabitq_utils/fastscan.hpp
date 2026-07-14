@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include "core/platform.hpp"
+#include "platform/detect.hpp"
 
 #include <array>
 #include <cassert>

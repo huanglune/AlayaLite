@@ -24,11 +24,11 @@
   #include <unistd.h>
 #endif
 
-#include "core/platform.hpp"
-#include "core/platform_fs.hpp"
 #include "core/value_types.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
+#include "platform/detect.hpp"
+#include "platform/fs.hpp"
 #include "storage/mmap_file.hpp"
 
 #if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER != 0

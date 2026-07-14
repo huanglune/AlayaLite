@@ -32,7 +32,7 @@
 #include <cstring>
 #include <vector>
 
-#include "core/platform.hpp"
+#include "platform/detect.hpp"
 #include "simd/fastscan.hpp"
 
 namespace alaya::laser {

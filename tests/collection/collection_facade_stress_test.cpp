@@ -13,7 +13,7 @@
 #include <gtest/gtest.h>
 
 #include "alaya/collection.hpp"
-#include "core/platform.hpp"
+#include "platform/detect.hpp"
 
 namespace alaya {
 namespace {

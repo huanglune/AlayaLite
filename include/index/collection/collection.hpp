@@ -24,11 +24,11 @@
 #include <utility>
 #include <vector>
 
-#include "core/platform_fs.hpp"
 #include "index/collection/detail/canonical_flat_segment.hpp"
 #include "index/collection/detail/collection_flat_target.hpp"
 #include "index/collection/legacy_importer.hpp"
 #include "index/collection/sha256.hpp"
+#include "platform/fs.hpp"
 
 namespace alaya {
 

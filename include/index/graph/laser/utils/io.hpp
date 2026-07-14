@@ -22,7 +22,7 @@
 #include <string>
 #include <type_traits>
 
-#include "core/platform_fs.hpp"
+#include "platform/fs.hpp"
 
 namespace alaya::laser {
 

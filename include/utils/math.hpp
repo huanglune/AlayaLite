@@ -15,7 +15,7 @@
   #include <bit>
 #endif
 
-#include "core/platform.hpp"
+#include "platform/detect.hpp"
 
 namespace alaya::math {
 

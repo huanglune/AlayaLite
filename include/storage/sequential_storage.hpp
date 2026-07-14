@@ -9,7 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include "core/platform.hpp"
+#include "platform/detect.hpp"
 #include "utils/math.hpp"
 
 namespace alaya {

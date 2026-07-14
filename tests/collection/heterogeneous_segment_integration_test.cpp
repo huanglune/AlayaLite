@@ -21,7 +21,7 @@
 #include "index/disk/disk_vamana_segment.hpp"
 #include "index/graph/hnsw/hnsw_segment.hpp"
 #include "space/raw_space.hpp"
-#include "core/platform.hpp"
+#include "platform/detect.hpp"
 
 namespace alaya::internal::collection {
 namespace {

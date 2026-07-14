@@ -52,9 +52,9 @@
 #include <vector>
 
 #include "core/log.hpp"
-#include "core/platform.hpp"
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
+#include "platform/detect.hpp"
 #include "storage/io/io_engine.hpp"
 #include "utils/macros.hpp"
 

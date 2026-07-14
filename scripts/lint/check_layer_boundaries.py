@@ -50,6 +50,17 @@ RULES: list[tuple[str, list[str], str]] = [
         ],
         "graph kernels must not depend on collection or disk segment internals",
     ),
+    (
+        "include/platform/",
+        [
+            "core/",
+            "index/",
+            "space/",
+            "storage/",
+            "utils/",
+        ],
+        "platform/ is the lowest layer and must not depend on any project code",
+    ),
 ]
 
 EXCEPTIONS: set[str] = {

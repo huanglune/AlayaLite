@@ -31,10 +31,10 @@
 #include <utility>
 #include <vector>
 
-#include "core/platform.hpp"
 #include "index/graph/diskann/disk_layout.hpp"
 #include "index/graph/diskann/visited_bitset.hpp"
 #include "index/graph/vamana/robust_prune.hpp"
+#include "platform/detect.hpp"
 #include "storage/io/page_reader.hpp"
 
 namespace alaya::diskann {

@@ -43,9 +43,9 @@
 #include <stdexcept>
 #include <string>
 
-#include "core/platform.hpp"
 #include "index/graph/laser/utils/array.hpp"
 #include "index/graph/laser/utils/memory.hpp"
+#include "platform/detect.hpp"
 #include "simd/laser_dispatch.hpp"
 #include "utils/rabitq_utils/rotator.hpp"
 

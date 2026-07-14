@@ -10,7 +10,7 @@
 #include <span>
 #include <string_view>
 
-#include "core/platform.hpp"
+#include "platform/detect.hpp"
 #include "utils/macros.hpp"
 
 #ifdef ALAYA_OS_LINUX

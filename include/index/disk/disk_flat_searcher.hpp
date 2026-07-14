@@ -15,11 +15,11 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include "core/platform.hpp"
 #include "core/value_types.hpp"
 #include "index/disk/disk_flat_builder.hpp"  // bit-pattern helpers in alaya::disk::detail
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
+#include "platform/detect.hpp"
 #include "simd/distance_ip.hpp"
 #include "simd/distance_l2.hpp"
 #include "storage/mmap_file.hpp"

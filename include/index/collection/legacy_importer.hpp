@@ -32,9 +32,9 @@
 #include <variant>
 #include <vector>
 
-#include "core/platform_fs.hpp"
 #include "index/collection/segmented_collection.hpp"
 #include "index/disk/disk_flat_segment.hpp"
+#include "platform/fs.hpp"
 #include "utils/binary_io.hpp"
 #include "utils/scalar_data.hpp"
 

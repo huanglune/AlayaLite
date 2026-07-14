@@ -19,7 +19,7 @@
 #include "alaya/collection.hpp"
 #include "index/collection/logical_wal.hpp"
 #include "index/collection/sha256.hpp"
-#include "core/platform.hpp"
+#include "platform/detect.hpp"
 
 namespace alaya {
 namespace internal::collection {

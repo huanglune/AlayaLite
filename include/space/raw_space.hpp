@@ -13,8 +13,8 @@
 #include <string_view>
 #include "../utils/prefetch.hpp"
 #include "core/log.hpp"
-#include "core/platform.hpp"
 #include "core/value_types.hpp"
+#include "platform/detect.hpp"
 #include "simd/distance_ip.hpp"
 #include "simd/distance_l2.hpp"
 #include "space_concepts.hpp"

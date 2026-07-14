@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include "core/platform.hpp"
+#include "platform/detect.hpp"
 
 namespace alaya::simd {
 

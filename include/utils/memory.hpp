@@ -8,7 +8,7 @@
 #include <limits>
 #include <new>
 #include <type_traits>
-#include "core/platform.hpp"
+#include "platform/detect.hpp"
 #include "utils/math.hpp"
 
 namespace alaya {
