@@ -64,7 +64,7 @@
 #include "simd/distance_l2.hpp"
 #include "storage/io/page_reader_factory.hpp"
 #include "storage/io/uring_reactor.hpp"
-#include "utils/coro_gate.hpp"
+#include "index/graph/diskann/detail/coro_gate.hpp"
 
 namespace alaya::diskann {
 

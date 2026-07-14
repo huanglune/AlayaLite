@@ -24,7 +24,7 @@
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
 #include "coro/when_all.hpp"
-#include "utils/coro_gate.hpp"
+#include "index/graph/diskann/detail/coro_gate.hpp"
 
 #if defined(__linux__)
   #include <fcntl.h>
