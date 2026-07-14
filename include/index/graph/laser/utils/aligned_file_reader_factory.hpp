@@ -4,24 +4,17 @@
 
 #pragma once
 
-// Deprecated compatibility factory. New LASER consumers explicitly select a
-// storage::io::PageReaderBackend; retain this forwarding/legacy seam until M7.
-
 #include <memory>
 
 #include "index/graph/laser/utils/aligned_file_reader.hpp"
 
 #if defined(ALAYA_LASER_USE_THREADPOOL)
   #include "index/graph/laser/utils/threadpool_file_reader.hpp"
-#elif defined(ALAYA_LASER_USE_IOCP)
-  #include "index/graph/laser/utils/iocp_file_reader.hpp"
 #endif
 
 inline std::unique_ptr<AlignedFileReader> make_aligned_file_reader() {
 #if defined(ALAYA_LASER_USE_THREADPOOL)
   return std::make_unique<ThreadPoolFileReader>();
-#elif defined(ALAYA_LASER_USE_IOCP)
-  return std::make_unique<IOCPFileReader>();
 #else
   return std::make_unique<LinuxAlignedFileReader>();
 #endif

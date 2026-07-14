@@ -22,54 +22,6 @@
 #define LOWBIT(x) ((x) & (-(x)))
 
 namespace alaya {
-// Eigen::Matrix<T, Rows, Cols, Options>
-// A dense linear algebra matrix supporting mathematical operations (e.g., multiplication,
-// inversion). Designed for linear algebra — operators like * mean matrix multiplication. Use it
-// when you need standard matrix math (e.g., A * B, A.inverse(), A.transpose()).
-
-// Eigen::Array<T, Rows, Cols, Options>
-// A general-purpose multidimensional array supporting coefficient-wise operations (e.g., +, *, sin,
-// <). Designed for element-wise math — operators like * mean element-wise multiplication. Use for
-// signal processing, per-pixel operations, or when you need "array-style" math, not linear algebra.
-
-// Eigen::Map<MatrixType>
-// Zero-copy wrapper that maps existing raw memory (e.g., T*) to an Eigen Matrix or Array interface.
-// Allows external buffers (from C arrays, std::vector, etc.) to be used as Eigen objects without
-// copying. Ideal for interoperability and performance-critical code. Modifying the Map modifies the
-// original memory.
-template <typename T>
-using RowMajorMatrix [[deprecated("use kernels::linalg::RowMajorMatrix")]] =
-    kernels::linalg::RowMajorMatrix<T>;
-
-template <typename T>
-using RowMajorMatrixMap [[deprecated("use kernels::linalg::RowMajorMatrixMap")]] =
-    kernels::linalg::RowMajorMatrixMap<T>;
-
-template <typename T>
-using ConstRowMajorMatrixMap [[deprecated("use kernels::linalg::ConstRowMajorMatrixMap")]] =
-    kernels::linalg::ConstRowMajorMatrixMap<T>;
-
-template <typename T>
-using RowMajorArray [[deprecated("use kernels::linalg::RowMajorArray")]] =
-    kernels::linalg::RowMajorArray<T>;
-
-template <typename T>
-using Vector [[deprecated("use kernels::linalg::Vector")]] = kernels::linalg::Vector<T>;
-
-template <typename T>
-using RowMajorArrayMap [[deprecated("use kernels::linalg::RowMajorArrayMap")]] =
-    kernels::linalg::RowMajorArrayMap<T>;
-
-template <typename T>
-using ConstRowMajorArrayMap [[deprecated("use kernels::linalg::ConstRowMajorArrayMap")]] =
-    kernels::linalg::ConstRowMajorArrayMap<T>;
-
-template <typename T>
-using VectorMap [[deprecated("use kernels::linalg::VectorMap")]] = kernels::linalg::VectorMap<T>;
-
-template <typename T>
-using ConstVectorMap [[deprecated("use kernels::linalg::ConstVectorMap")]] =
-    kernels::linalg::ConstVectorMap<T>;
 
 template <typename T>
 auto dot_product(const T *ALAYA_RESTRICT vec0, const T *ALAYA_RESTRICT vec1, size_t dim) -> T {

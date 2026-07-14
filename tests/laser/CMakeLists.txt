@@ -76,25 +76,6 @@ alaya_add_test(
   LABELS laser threadpool
 )
 
-# IOCP backend test (Windows-only payload; on Linux/macOS the file compiles to a single SUCCEED placeholder so the CTest
-# matrix stays uniform). MSVC has different flag syntax, so the GCC/Clang-only options are attached conditionally.
-alaya_cc_target(
-  test_iocp_file_reader
-  BARE GTEST
-  SRCS utils/test_iocp_file_reader.cpp
-  LIBS ${_laser_reader_libs}
-)
-if(WIN32)
-  target_compile_definitions(test_iocp_file_reader PRIVATE ALAYA_LASER_USE_IOCP=1)
-endif()
-if(NOT MSVC)
-  target_compile_options(test_iocp_file_reader PRIVATE ${_laser_test_opts})
-endif()
-alaya_add_test(
-  NAME laser_test_iocp_file_reader
-  TARGET test_iocp_file_reader
-  LABELS laser iocp
-)
 
 alaya_cc_target(
   laser_simd_dispatch_test
