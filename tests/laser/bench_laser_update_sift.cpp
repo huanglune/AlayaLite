@@ -48,6 +48,7 @@
 #include "index/graph/laser/qg/qg.hpp"
 #include "index/graph/laser/qg/qg_builder.hpp"
 #include "index/graph/laser/qg/qg_updater.hpp"
+#include "index/graph/laser/utils/pca_transform.hpp"
 #include "index/graph/vamana/vamana_builder.hpp"
 #include "index/graph/vamana/vamana_writer.hpp"
 
@@ -444,11 +445,32 @@ int do_build(const Args &a) {
             << "s, medoid=" << vb.medoid() << "\n";
 
   const std::string pca_base_path = a.prefix + "_pca_base.fbin";
+  const std::string pca_param_path = a.prefix + "_pca.bin";
   if (a.pca_preprocessed == 0) {
-    write_fbin(pca_base_path,
-               base.data.data(),
-               static_cast<int32_t>(base.n),
-               static_cast<int32_t>(dim));
+    if (main_dim < dim) {
+      std::cout << "[build] training PCA " << dim << " -> " << main_dim << " on " << base.n
+                << " vectors...\n";
+      alaya::laser::PCATransform pca(dim);
+      pca.train(base.data.data(), base.n);
+      auto tp = std::chrono::steady_clock::now();
+      std::cout << "[build] PCA trained in "
+                << std::chrono::duration<double>(tp - t1).count() << "s, projecting...\n";
+      std::vector<float> projected(static_cast<size_t>(base.n) * dim);
+      for (size_t i = 0; i < base.n; ++i) {
+        pca.transform(base.row(i), projected.data() + i * dim);
+      }
+      write_fbin(pca_base_path, projected.data(),
+                 static_cast<int32_t>(base.n), static_cast<int32_t>(dim));
+      pca.save(pca_param_path);
+      auto tw = std::chrono::steady_clock::now();
+      std::cout << "[build] PCA projected+saved in "
+                << std::chrono::duration<double>(tw - tp).count() << "s\n";
+    } else {
+      write_fbin(pca_base_path,
+                 base.data.data(),
+                 static_cast<int32_t>(base.n),
+                 static_cast<int32_t>(dim));
+    }
   } else {
     std::ifstream pca_base(pca_base_path, std::ios::binary);
     int32_t pca_n = 0;
@@ -461,8 +483,8 @@ int do_build(const Args &a) {
         std::filesystem::file_size(pca_base_path) != expected_size) {
       throw std::runtime_error("invalid preprocessed PCA base: " + pca_base_path);
     }
-    if (main_dim < dim && !std::filesystem::exists(a.prefix + "_pca.bin")) {
-      throw std::runtime_error("missing preprocessed PCA params: " + a.prefix + "_pca.bin");
+    if (main_dim < dim && !std::filesystem::exists(pca_param_path)) {
+      throw std::runtime_error("missing preprocessed PCA params: " + pca_param_path);
     }
     std::cout << "[build] using preprocessed PCA base " << pca_base_path << "\n";
   }
