@@ -1,62 +1,5 @@
 {
   "artifacts": {
-    "disk_flat": {
-      "files": {
-        "collection_manifest.txt": {
-          "bytes": 116,
-          "fields": {
-            "dim": 8,
-            "index_type": "disk_flat",
-            "metric": "L2",
-            "next_segment_id": 2,
-            "segment": "seg_00000001",
-            "version": 1,
-            "x_max_pending_bytes": 536870912
-          },
-          "sha256": "f65dd61c164005f68773a70b2b9f35b4bf66ebd070e1bb0aaf884bb0bc9c7c1a"
-        },
-        "segments/seg_00000001/ids.u64.bin": {
-          "bytes": 512,
-          "header": {
-            "first_32_hex": "e803000000000000e903000000000000ea03000000000000eb03000000000000",
-            "u32le_0_3": [
-              1000,
-              0,
-              1001,
-              0
-            ]
-          },
-          "sha256": "6c9b1e00ce539e33d8cfa43e73a7aa0f83c1ec234a654b25e8d2cc697d616e88"
-        },
-        "segments/seg_00000001/manifest.txt": {
-          "bytes": 130,
-          "fields": {
-            "count": 64,
-            "dim": 8,
-            "ids_file": "ids.u64.bin",
-            "index_type": "disk_flat",
-            "metric": "L2",
-            "segment_id": "seg_00000001",
-            "vectors_file": "vectors.f32.bin",
-            "version": 1
-          },
-          "sha256": "e3978e99bdb12495fe0c00edb2749935c44a867343094dd61f236bee0971be21"
-        },
-        "segments/seg_00000001/vectors.f32.bin": {
-          "bytes": 2048,
-          "header": {
-            "first_32_hex": "52163d3f4d7f2e3fc8ddd53e6437d23e2223d43e9109e93ed0256cbe6fb7043f",
-            "u32le_0_3": [
-              1060968018,
-              1060011853,
-              1054203336,
-              1053964132
-            ]
-          },
-          "sha256": "9172020f6cc588801c3f1bab6b9b86c7e66c562209e97faa1c4f76cc24795fe2"
-        }
-      }
-    },
     "disk_flat_segment": {
       "files": {
         "collection_manifest.txt": {
@@ -209,87 +152,6 @@
             ]
           },
           "sha256": "ddca8788cb55f92860cc40adc2be033d18062c1068c626ee09fa3b2814d2bbcd"
-        }
-      }
-    },
-    "disk_vamana": {
-      "files": {
-        "collection_manifest.txt": {
-          "bytes": 213,
-          "fields": {
-            "dim": 8,
-            "index_type": "disk_vamana",
-            "metric": "L2",
-            "next_segment_id": 2,
-            "segment": "seg_00000001",
-            "version": 1,
-            "x_max_pending_bytes": 536870912,
-            "x_vamana_L": 24,
-            "x_vamana_R": 8,
-            "x_vamana_alpha": "1.200000",
-            "x_vamana_num_threads": 1,
-            "x_vamana_seed": 424242
-          },
-          "sha256": "9fdfeb3563becb5a65f2aec4890528d0a5a8c9505a36f208184389b57e15afb6"
-        },
-        "segments/seg_00000001/graph.index": {
-          "bytes": 1848,
-          "header": {
-            "first_32_hex": "3807000000000000080000002b00000000000000000000000800000026000000",
-            "u32le_0_3": [
-              1848,
-              0,
-              8,
-              43
-            ]
-          },
-          "sha256": "3a7622d455bac96b15d15f2468207e76e18e17036d79c53512ae5cb99689cb73"
-        },
-        "segments/seg_00000001/ids.u64.bin": {
-          "bytes": 512,
-          "header": {
-            "first_32_hex": "e803000000000000e903000000000000ea03000000000000eb03000000000000",
-            "u32le_0_3": [
-              1000,
-              0,
-              1001,
-              0
-            ]
-          },
-          "sha256": "6c9b1e00ce539e33d8cfa43e73a7aa0f83c1ec234a654b25e8d2cc697d616e88"
-        },
-        "segments/seg_00000001/manifest.txt": {
-          "bytes": 213,
-          "fields": {
-            "count": 64,
-            "dim": 8,
-            "ids_file": "ids.u64.bin",
-            "index_type": "disk_vamana",
-            "metric": "L2",
-            "segment_id": "seg_00000001",
-            "vectors_file": "vectors.f32.bin",
-            "version": 1,
-            "x_L": 24,
-            "x_R": 8,
-            "x_alpha": "1.200000",
-            "x_graph_file": "graph.index",
-            "x_medoid": 43,
-            "x_seed": 424242
-          },
-          "sha256": "a806a9786544598267ffff805bbb316fd6ba162f439ab5cd27b1a472002c544f"
-        },
-        "segments/seg_00000001/vectors.f32.bin": {
-          "bytes": 2048,
-          "header": {
-            "first_32_hex": "52163d3f4d7f2e3fc8ddd53e6437d23e2223d43e9109e93ed0256cbe6fb7043f",
-            "u32le_0_3": [
-              1060968018,
-              1060011853,
-              1054203336,
-              1053964132
-            ]
-          },
-          "sha256": "9172020f6cc588801c3f1bab6b9b86c7e66c562209e97faa1c4f76cc24795fe2"
         }
       }
     },
@@ -633,17 +495,17 @@
           "sha256": "47daa3754d01fa03ea6618ef6db430e44e174bab17bc74b75548b01ea47c1c44"
         },
         "raw.data": {
-          "bytes": 6220,
+          "bytes": 6217,
           "header": {
-            "first_32_hex": "0000000020000000080000005000000000000000600000002000000000000000",
+            "first_32_hex": "0020000000080000005000000000000000600000002000000000000000400000",
             "u32le_0_3": [
-              0,
-              32,
-              8,
-              80
+              8192,
+              2048,
+              20480,
+              0
             ]
           },
-          "sha256": "362d91ef8e860c3012ff0d2cca6582c9cadaf8d20289dbb7cba2f91f3fd7d861"
+          "sha256": "3907ecb7855cc71dcee4fc61be43b1477aef7f34404fc83c84fc80ad3c57f739"
         }
       }
     },
@@ -663,30 +525,30 @@
           "sha256": "47daa3754d01fa03ea6618ef6db430e44e174bab17bc74b75548b01ea47c1c44"
         },
         "raw.data": {
-          "bytes": 6220,
+          "bytes": 6217,
           "header": {
-            "first_32_hex": "0000000020000000080000005000000000000000600000002000000000000000",
+            "first_32_hex": "0020000000080000005000000000000000600000002000000000000000400000",
             "u32le_0_3": [
-              0,
-              32,
-              8,
-              80
+              8192,
+              2048,
+              20480,
+              0
             ]
           },
-          "sha256": "362d91ef8e860c3012ff0d2cca6582c9cadaf8d20289dbb7cba2f91f3fd7d861"
+          "sha256": "3907ecb7855cc71dcee4fc61be43b1477aef7f34404fc83c84fc80ad3c57f739"
         },
         "sq8.data": {
-          "bytes": 6288,
+          "bytes": 6285,
           "header": {
-            "first_32_hex": "0000000008000000080000005000000000000000600000000800000000000000",
+            "first_32_hex": "0008000000080000005000000000000000600000000800000000000000400000",
             "u32le_0_3": [
-              0,
-              8,
-              8,
-              80
+              2048,
+              2048,
+              20480,
+              0
             ]
           },
-          "sha256": "8243da248f64e4ab77e0d705a13fe1e514df48c460fceeada891a39eddd42e72"
+          "sha256": "3f71dd9da7ea8b1cab9730a852bbf067d91c7a3c1ce3f7bbc2ded7b77c616cd5"
         }
       }
     },
@@ -706,17 +568,17 @@
           "sha256": "a07f3fe3eaedf030de6988034a1247f9105fb0b8db765d7a435f78d34da98a2f"
         },
         "raw.data": {
-          "bytes": 5194,
+          "bytes": 5191,
           "header": {
-            "first_32_hex": "0000000020000000080000004000000000000000500000002000000000000000",
+            "first_32_hex": "0020000000080000004000000000000000500000002000000000000000400000",
             "u32le_0_3": [
-              0,
-              32,
-              8,
-              64
+              8192,
+              2048,
+              16384,
+              0
             ]
           },
-          "sha256": "14ed22f20b12894703ce587a1b201147c51fedcf8379e2e6d753dc1f58f270e3"
+          "sha256": "b1d478e0aa9aa5d873cba33a7c0d8500b28352ad704f682bf29b83dbd9bc12fc"
         }
       }
     },
@@ -736,30 +598,30 @@
           "sha256": "a07f3fe3eaedf030de6988034a1247f9105fb0b8db765d7a435f78d34da98a2f"
         },
         "raw.data": {
-          "bytes": 5194,
+          "bytes": 5191,
           "header": {
-            "first_32_hex": "0000000020000000080000004000000000000000500000002000000000000000",
+            "first_32_hex": "0020000000080000004000000000000000500000002000000000000000400000",
             "u32le_0_3": [
-              0,
-              32,
-              8,
-              64
+              8192,
+              2048,
+              16384,
+              0
             ]
           },
-          "sha256": "14ed22f20b12894703ce587a1b201147c51fedcf8379e2e6d753dc1f58f270e3"
+          "sha256": "b1d478e0aa9aa5d873cba33a7c0d8500b28352ad704f682bf29b83dbd9bc12fc"
         },
         "sq8.data": {
-          "bytes": 5262,
+          "bytes": 5259,
           "header": {
-            "first_32_hex": "0000000008000000080000004000000000000000500000000800000000000000",
+            "first_32_hex": "0008000000080000004000000000000000500000000800000000000000400000",
             "u32le_0_3": [
-              0,
-              8,
-              8,
-              64
+              2048,
+              2048,
+              16384,
+              0
             ]
           },
-          "sha256": "fcf6529a12ccfe1430d1c389a09ad3bc60528b56637246a1df15b3cd1540593b"
+          "sha256": "0a8e333efc65c727d001dad142e57de44ca4b0f061e14d610efcae6c8531156f"
         }
       }
     },
@@ -779,17 +641,17 @@
           "sha256": "1936f4cce405b70b841fe810b85f57fc053a74970e320cbb7c96e01d0c08c0ab"
         },
         "raw.data": {
-          "bytes": 6220,
+          "bytes": 6217,
           "header": {
-            "first_32_hex": "0000000020000000080000005000000000000000600000002000000000000000",
+            "first_32_hex": "0020000000080000005000000000000000600000002000000000000000400000",
             "u32le_0_3": [
-              0,
-              32,
-              8,
-              80
+              8192,
+              2048,
+              20480,
+              0
             ]
           },
-          "sha256": "362d91ef8e860c3012ff0d2cca6582c9cadaf8d20289dbb7cba2f91f3fd7d861"
+          "sha256": "3907ecb7855cc71dcee4fc61be43b1477aef7f34404fc83c84fc80ad3c57f739"
         }
       }
     },
@@ -809,47 +671,47 @@
           "sha256": "1936f4cce405b70b841fe810b85f57fc053a74970e320cbb7c96e01d0c08c0ab"
         },
         "raw.data": {
-          "bytes": 6220,
+          "bytes": 6217,
           "header": {
-            "first_32_hex": "0000000020000000080000005000000000000000600000002000000000000000",
+            "first_32_hex": "0020000000080000005000000000000000600000002000000000000000400000",
             "u32le_0_3": [
-              0,
-              32,
-              8,
-              80
+              8192,
+              2048,
+              20480,
+              0
             ]
           },
-          "sha256": "362d91ef8e860c3012ff0d2cca6582c9cadaf8d20289dbb7cba2f91f3fd7d861"
+          "sha256": "3907ecb7855cc71dcee4fc61be43b1477aef7f34404fc83c84fc80ad3c57f739"
         },
         "sq8.data": {
-          "bytes": 6288,
+          "bytes": 6285,
           "header": {
-            "first_32_hex": "0000000008000000080000005000000000000000600000000800000000000000",
+            "first_32_hex": "0008000000080000005000000000000000600000000800000000000000400000",
             "u32le_0_3": [
-              0,
-              8,
-              8,
-              80
+              2048,
+              2048,
+              20480,
+              0
             ]
           },
-          "sha256": "8243da248f64e4ab77e0d705a13fe1e514df48c460fceeada891a39eddd42e72"
+          "sha256": "3f71dd9da7ea8b1cab9730a852bbf067d91c7a3c1ce3f7bbc2ded7b77c616cd5"
         }
       }
     },
     "memory_qg": {
       "files": {
         "rabitq.data": {
-          "bytes": 43069,
+          "bytes": 43066,
           "header": {
-            "first_32_hex": "000000004000000030000000300000000100000000a032d3fe909ebf72c7e2fd",
+            "first_32_hex": "004000000030000000300000000100000000a032d3fe909ebf72c7e2fdbfc6c2",
             "u32le_0_3": [
-              0,
-              64,
-              48,
-              48
+              16384,
+              12288,
+              12288,
+              256
             ]
           },
-          "sha256": "5b1ea1027dc4933b7181ceef010ecdade6dd2f4fb920cde4898200e247c4136f"
+          "sha256": "15f69cc0a31b67a02dd4c1f69056877219e215c8a82cd4570f64876a6200ab0b"
         }
       }
     },

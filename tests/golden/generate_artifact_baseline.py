@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate or verify deterministic pre-refactor persistence artifacts."""
+"""Generate or verify deterministic current-format persistence artifacts."""
 
 from __future__ import annotations
 
@@ -64,11 +64,11 @@ def _vectors(rows: int, dim: int) -> np.ndarray:
     return rng.standard_normal((rows, dim)).astype(np.float32)
 
 
-def _generate_retained_v1_artifacts(out: Path, build_dir: Path) -> None:
-    generator = build_dir / "tests/golden/artifact_legacy_v1_generator"
+def _generate_memory_graph_artifacts(out: Path, build_dir: Path) -> None:
+    generator = build_dir / "tests/golden/artifact_memory_graph_generator"
     if not generator.is_file():
-        raise RuntimeError(f"build the artifact_legacy_v1_generator target first: {generator}")
-    vectors_path = out / ".retained-v1-vectors.fbin"
+        raise RuntimeError(f"build the artifact_memory_graph_generator target first: {generator}")
+    vectors_path = out / ".memory-graph-vectors.fbin"
     vectors = _vectors(80, 8)
     with vectors_path.open("wb") as stream:
         np.array(vectors.shape, dtype=np.int32).tofile(stream)
@@ -87,22 +87,18 @@ def _build_tree_extension(build_dir: Path) -> Path | None:
     return candidates[0]
 
 
-def _generate_laser_fixture(out: Path, build_dir: Path) -> bool:
+def _generate_laser_fixture(out: Path, build_dir: Path) -> None:
     extension = _build_tree_extension(build_dir)
     if extension is None:
-        print(
-            f"LASER fixture omitted: expected exactly one build-tree extension under {build_dir / 'python'}",
-            file=sys.stderr,
+        raise RuntimeError(
+            f"build _alayalitepy first; expected exactly one extension under {build_dir / 'python'}"
         )
-        return False
     target = out / "laser_fixture"
     native_builder = build_dir / "tests/disk/laser_fixture_builder"
     if not native_builder.is_file():
-        print(
-            f"LASER fixture omitted: build the native fixture builder first: {native_builder}",
-            file=sys.stderr,
+        raise RuntimeError(
+            f"build the laser_fixture_builder target first: {native_builder}"
         )
-        return False
     command = [
         sys.executable,
         str(ROOT / "tests/disk/fixtures/build_laser_fixture.py"),
@@ -125,18 +121,13 @@ def _generate_laser_fixture(out: Path, build_dir: Path) -> bool:
         "42",
         "--optional-sidecars",
     ]
-    try:
-        subprocess.run(command, check=True)
-    except (OSError, subprocess.CalledProcessError) as exc:
-        print(f"LASER fixture omitted: generation unavailable: {exc}", file=sys.stderr)
-        return False
-    return True
+    subprocess.run(command, check=True)
 
 
 def generate(build_dir: Path) -> dict[str, object]:
     with tempfile.TemporaryDirectory(prefix="alaya-artifact-golden-") as temp:
         out = Path(temp)
-        _generate_retained_v1_artifacts(out, build_dir)
+        _generate_memory_graph_artifacts(out, build_dir)
         diskann_generator = build_dir / "tests/golden/artifact_diskann_generator"
         if not diskann_generator.is_file():
             raise RuntimeError(f"build the artifact_diskann_generator target first: {diskann_generator}")
@@ -170,13 +161,13 @@ def generate(build_dir: Path) -> dict[str, object]:
         if not memory_vamana_generator.is_file():
             raise RuntimeError(f"build the artifact_memory_vamana_generator target first: {memory_vamana_generator}")
         subprocess.run([str(memory_vamana_generator), str(out / "memory_vamana")], check=True)
-        laser_present = _generate_laser_fixture(out, build_dir)
+        _generate_laser_fixture(out, build_dir)
         artifacts = {name: _inventory(path) for name, path in sorted((p.name, p) for p in out.iterdir() if p.is_dir())}
         return {
             "schema_version": 1,
             "seed": 20260712,
             "generator": "tests/golden/generate_artifact_baseline.py",
-            "laser_fixture_present": laser_present,
+            "laser_fixture_present": True,
             "artifacts": artifacts,
         }
 
