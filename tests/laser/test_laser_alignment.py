@@ -18,8 +18,10 @@ CLI:
     uv run tests/laser/test_laser_alignment.py \\
         --dataset synth_100k_512d \\
         --vamana alayaV \\
-        --baseline-dir $ALAYA_BUILD_GRAPH_DIR/laser_port/baseline_20260421 \\
-        --port-out-dir $ALAYA_BUILD_GRAPH_DIR/laser_port/validation_20260421
+        --data-root /path/to/data \\
+        --build-graph-root /path/to/build_graph \\
+        --baseline-dir /path/to/build_graph/laser_port/baseline_20260421 \\
+        --port-out-dir /path/to/build_graph/laser_port/validation_20260421
 
 Exit codes:
     0  — both tiers pass
@@ -35,7 +37,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import os
 import struct
 import subprocess
 import sys
@@ -67,9 +68,7 @@ PARETO_RECALL_TOL_PP: float = 0.1
 # regressions (which would show up across multiple EFs and datasets).
 PARETO_QPS_REL_TOL: float = 0.07
 
-AL_REPO = Path(os.environ.get("ALAYA_REPO_DIR", Path(__file__).resolve().parents[2]))
-DATA_ROOT = Path(os.environ.get("ALAYA_TEST_DATA_DIR", AL_REPO / "data"))
-BG_ROOT = Path(os.environ.get("ALAYA_BUILD_GRAPH_DIR", "."))
+AL_REPO = Path(__file__).resolve().parents[2]
 
 
 # ── Combo → input paths ────────────────────────────────────────────────────
@@ -86,79 +85,80 @@ class ComboSpec:
     vamana_index: Path
 
 
-_COMBOS: dict[tuple[str, str], ComboSpec] = {
+def _build_combos(data_root: Path, bg_root: Path) -> dict[tuple[str, str], ComboSpec]:
+  return {
     ("gist1m", "alayaV"): ComboSpec(
         combo_key="gist1m_alayaV",
         dataset="gist1m",
         toml_name="gist",  # the original Laser gist.toml uses name="gist"
-        base_fbin=DATA_ROOT / "gist1m" / "gist_base.fbin",
-        query_fbin=DATA_ROOT / "gist1m" / "gist_query.fbin",
-        gt_ibin=DATA_ROOT / "gist1m" / "gist_gt.ibin",
-        vamana_index=BG_ROOT / "gist1m" / "alaya" / "R64_L100_a1.2" / "graph.index",
+        base_fbin=data_root / "gist1m" / "gist_base.fbin",
+        query_fbin=data_root / "gist1m" / "gist_query.fbin",
+        gt_ibin=data_root / "gist1m" / "gist_gt.ibin",
+        vamana_index=bg_root / "gist1m" / "alaya" / "R64_L100_a1.2" / "graph.index",
     ),
     ("gist1m", "diskV"): ComboSpec(
         combo_key="gist1m_diskV",
         dataset="gist1m",
         toml_name="gist",
-        base_fbin=DATA_ROOT / "gist1m" / "gist_base.fbin",
-        query_fbin=DATA_ROOT / "gist1m" / "gist_query.fbin",
-        gt_ibin=DATA_ROOT / "gist1m" / "gist_gt.ibin",
-        vamana_index=BG_ROOT / "gist1m" / "diskann_gt" / "R64_L100_a1.2" / "graph",
+        base_fbin=data_root / "gist1m" / "gist_base.fbin",
+        query_fbin=data_root / "gist1m" / "gist_query.fbin",
+        gt_ibin=data_root / "gist1m" / "gist_gt.ibin",
+        vamana_index=bg_root / "gist1m" / "diskann_gt" / "R64_L100_a1.2" / "graph",
     ),
     ("synth_100k_512d", "alayaV"): ComboSpec(
         combo_key="synth_alayaV",
         dataset="synth_100k_512d",
         toml_name="synth_100k_512d",
-        base_fbin=DATA_ROOT / "synth_100k_512d" / "base.fbin",
-        query_fbin=DATA_ROOT / "synth_100k_512d" / "query.fbin",
-        gt_ibin=DATA_ROOT / "synth_100k_512d" / "gt.ibin",
-        vamana_index=BG_ROOT / "synth_100k_512d" / "alaya" / "R64_L100_a1.2" / "graph.index",
+        base_fbin=data_root / "synth_100k_512d" / "base.fbin",
+        query_fbin=data_root / "synth_100k_512d" / "query.fbin",
+        gt_ibin=data_root / "synth_100k_512d" / "gt.ibin",
+        vamana_index=bg_root / "synth_100k_512d" / "alaya" / "R64_L100_a1.2" / "graph.index",
     ),
     ("synth_100k_512d", "diskV"): ComboSpec(
         combo_key="synth_diskV",
         dataset="synth_100k_512d",
         toml_name="synth_100k_512d",
-        base_fbin=DATA_ROOT / "synth_100k_512d" / "base.fbin",
-        query_fbin=DATA_ROOT / "synth_100k_512d" / "query.fbin",
-        gt_ibin=DATA_ROOT / "synth_100k_512d" / "gt.ibin",
-        vamana_index=BG_ROOT / "synth_100k_512d" / "diskann_gt" / "R64_L100_a1.2" / "graph.index",
+        base_fbin=data_root / "synth_100k_512d" / "base.fbin",
+        query_fbin=data_root / "synth_100k_512d" / "query.fbin",
+        gt_ibin=data_root / "synth_100k_512d" / "gt.ibin",
+        vamana_index=bg_root / "synth_100k_512d" / "diskann_gt" / "R64_L100_a1.2" / "graph.index",
     ),
     # 10M datasets (Vamana is R=64 L=200 α=1.2 — not L=100 like gist/synth)
     ("bigcode", "alayaV"): ComboSpec(
         combo_key="bigcode_alayaV",
         dataset="bigcode",
         toml_name="bigcode",
-        base_fbin=DATA_ROOT / "bigcode" / "bigcode_base.fbin",
-        query_fbin=DATA_ROOT / "bigcode" / "bigcode_query.fbin",
-        gt_ibin=DATA_ROOT / "bigcode" / "bigcode_gt",
-        vamana_index=BG_ROOT / "bigcode" / "alaya" / "R64_L200_a1.2" / "graph.index",
+        base_fbin=data_root / "bigcode" / "bigcode_base.fbin",
+        query_fbin=data_root / "bigcode" / "bigcode_query.fbin",
+        gt_ibin=data_root / "bigcode" / "bigcode_gt",
+        vamana_index=bg_root / "bigcode" / "alaya" / "R64_L200_a1.2" / "graph.index",
     ),
     ("bigcode", "diskV"): ComboSpec(
         combo_key="bigcode_diskV",
         dataset="bigcode",
         toml_name="bigcode",
-        base_fbin=DATA_ROOT / "bigcode" / "bigcode_base.fbin",
-        query_fbin=DATA_ROOT / "bigcode" / "bigcode_query.fbin",
-        gt_ibin=DATA_ROOT / "bigcode" / "bigcode_gt",
-        vamana_index=BG_ROOT / "bigcode" / "diskann_gt" / "R64_L200_a1.2" / "graph_mem.index",
+        base_fbin=data_root / "bigcode" / "bigcode_base.fbin",
+        query_fbin=data_root / "bigcode" / "bigcode_query.fbin",
+        gt_ibin=data_root / "bigcode" / "bigcode_gt",
+        vamana_index=bg_root / "bigcode" / "diskann_gt" / "R64_L200_a1.2" / "graph_mem.index",
     ),
     ("cohere", "alayaV"): ComboSpec(
         combo_key="cohere_alayaV",
         dataset="cohere",
         toml_name="cohere",
-        base_fbin=DATA_ROOT / "cohere" / "cohere_base.fbin",
-        query_fbin=DATA_ROOT / "cohere" / "cohere_query.fbin",
-        gt_ibin=DATA_ROOT / "cohere" / "cohere_gt",
-        vamana_index=BG_ROOT / "cohere" / "alaya" / "R64_L200_a1.2" / "graph.index",
+        base_fbin=data_root / "cohere" / "cohere_base.fbin",
+        query_fbin=data_root / "cohere" / "cohere_query.fbin",
+        gt_ibin=data_root / "cohere" / "cohere_gt",
+        vamana_index=bg_root / "cohere" / "alaya" / "R64_L200_a1.2" / "graph.index",
     ),
     ("cohere", "diskV"): ComboSpec(
         combo_key="cohere_diskV",
         dataset="cohere",
         toml_name="cohere",
-        base_fbin=DATA_ROOT / "cohere" / "cohere_base.fbin",
-        query_fbin=DATA_ROOT / "cohere" / "cohere_query.fbin",
-        gt_ibin=DATA_ROOT / "cohere" / "cohere_gt",
-        vamana_index=BG_ROOT / "cohere" / "diskann_gt" / "R64_L200_a1.2" / "graph_mem.index",
+        base_fbin=data_root / "cohere" / "cohere_base.fbin",
+        query_fbin=data_root / "cohere" / "cohere_query.fbin",
+        gt_ibin=data_root / "cohere" / "cohere_gt",
+        vamana_index=bg_root / "cohere" / "diskann_gt" / "R64_L200_a1.2" / "graph_mem.index",
     ),
 }
 
@@ -423,6 +423,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     p.add_argument("--vamana", choices=["alayaV", "diskV"], required=True)
     p.add_argument("--baseline-dir", type=Path, required=True)
     p.add_argument("--port-out-dir", type=Path, required=True)
+    p.add_argument("--data-root", type=Path, required=True, help="Root directory for test datasets")
+    p.add_argument("--build-graph-root", type=Path, required=True, help="Root directory for build_graph outputs")
     p.add_argument(
         "--skip-run",
         action="store_true",
@@ -435,7 +437,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     )
     args = p.parse_args(argv)
 
-    spec = _COMBOS.get((args.dataset, args.vamana))
+    combos = _build_combos(args.data_root, args.build_graph_root)
+    spec = combos.get((args.dataset, args.vamana))
     if spec is None:
         print(f"[ERR] no combo spec for {args.dataset}/{args.vamana}", file=sys.stderr)
         return 12

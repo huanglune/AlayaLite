@@ -44,6 +44,8 @@
 #include <string_view>
 #include <vector>
 
+#include "test_config.hpp"
+
 namespace {
 
 struct VamanaIndex {
@@ -64,9 +66,10 @@ struct Args {
   std::string data_path;
   std::string query_path;
   std::string gt_path;
-  std::string result_path_prefix;  // scratch location for search_memory_index
-  std::string search_memory_index_bin =
-      []() -> std::string { if (auto *v = std::getenv("DISKANN_SEARCH_BIN")) return v; return "search_memory_index"; }();
+  std::string data_root = alaya::test::kDataDir;
+  std::string build_graph_root = alaya::test::kBuildGraphDir;
+  std::string result_path_prefix;
+  std::string search_memory_index_bin = alaya::test::kDiskannSearchBin;
   uint32_t R = 64;
   uint32_t L = 100;
   float alpha = 1.2f;
@@ -127,6 +130,8 @@ void print_help(std::ostream &os) {
      << "                                  and fails early if the counts differ.\n"
      << "  --alaya_shard_work_dir <path>   Override default shard-work location\n"
      << "                                  (default: `<alaya_index>_shard_work`)\n"
+     << "  --data_root <path>              Root dir for datasets (required with --dataset)\n"
+     << "  --build_graph_root <path>       Root dir for build_graph outputs (required with --dataset)\n"
      << "  --search_memory_index_bin <p>   Override DiskANN search binary path\n"
      << "  -h, --help                      This message\n";
 }
@@ -164,8 +169,8 @@ void resolve_dataset_defaults(Args &a) {
     return;
   }
   const std::string prefix = dataset_base_prefix(a.dataset);
-  const std::string data_dir = []() -> std::string { if (auto *v = std::getenv("ALAYA_TEST_DATA_DIR")) return v; return "."; }() + "/" + a.dataset;
-  const std::string bg_dir = []() -> std::string { if (auto *v = std::getenv("ALAYA_BUILD_GRAPH_DIR")) return v; return "."; }() + "/" + a.dataset;
+  const std::string data_dir = a.data_root + "/" + a.dataset;
+  const std::string bg_dir = a.build_graph_root + "/" + a.dataset;
   const std::string param_tag =
       "R" + std::to_string(a.R) + "_L" + std::to_string(a.L) + "_a" +
       (a.alpha == static_cast<int>(a.alpha)
@@ -214,6 +219,10 @@ Args parse_args(int argc, char **argv) {
       a.gt_path = need_value(i);
     else if (f == "--result_path_prefix")
       a.result_path_prefix = need_value(i);
+    else if (f == "--data_root")
+      a.data_root = need_value(i);
+    else if (f == "--build_graph_root")
+      a.build_graph_root = need_value(i);
     else if (f == "--search_memory_index_bin")
       a.search_memory_index_bin = need_value(i);
     else if (f == "-R")

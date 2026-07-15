@@ -5,29 +5,20 @@
 #pragma once
 
 #include <cstdint>
-#include <cstdlib>
 #include <filesystem>
 #include <string>
 
 #include <unistd.h>
 
+#include "test_config.hpp"
+
 namespace alaya::test {
 
-inline auto data_dir() -> std::filesystem::path {
-  if (const auto *env = std::getenv("ALAYA_TEST_DATA_DIR"); env && *env) {
-    return env;
-  }
-#ifdef ALAYA_TEST_DATA_DIR_DEFAULT
-  return ALAYA_TEST_DATA_DIR_DEFAULT;
-#else
-  return std::filesystem::current_path().parent_path() / "data";
-#endif
-}
+inline auto data_dir() -> std::filesystem::path { return kDataDir; }
+inline auto source_dir() -> std::filesystem::path { return kSourceDir; }
+inline auto build_dir() -> std::filesystem::path { return kBuildDir; }
 
 inline auto tmp_root() -> std::filesystem::path {
-  if (const auto *env = std::getenv("ALAYA_TEST_TMP_DIR"); env && *env) {
-    return env;
-  }
   return std::filesystem::temp_directory_path();
 }
 
