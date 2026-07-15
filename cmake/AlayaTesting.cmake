@@ -30,6 +30,20 @@ configure_file(
   @ONLY
 )
 
+# --- Dataset download targets (opt-in, never part of default build) ---
+set(_ALAYA_DOWNLOAD_SCRIPT "${CMAKE_SOURCE_DIR}/scripts/download_dataset.sh")
+set(_ALAYA_DATASETS siftsmall deep1m)
+
+add_custom_target(test-data)
+foreach(_ds IN LISTS _ALAYA_DATASETS)
+  add_custom_target(test-data-${_ds}
+    COMMAND ${_ALAYA_DOWNLOAD_SCRIPT} ${_ds} ${ALAYA_TEST_DATA_DIR}
+    COMMENT "Downloading dataset: ${_ds}"
+    VERBATIM
+  )
+  add_dependencies(test-data test-data-${_ds})
+endforeach()
+
 function(alaya_cc_target target_name)
   set(flag_keywords GTEST LASER BARE)
   set(one_value_keywords)
