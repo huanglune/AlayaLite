@@ -91,7 +91,7 @@ struct MemoryCollectionTargetDefinition {
   std::uint64_t value{};
   const auto suffix = segment_id.substr(4);
   const auto [end, error] = std::from_chars(suffix.data(), suffix.data() + suffix.size(), value);
-  if (error != std::errc{} || end != suffix.data() + suffix.size()) {
+  if (error != std::errc() || end != suffix.data() + suffix.size()) {
     return memory_target_error(core::StatusCode::invalid_argument,
                                core::StatusDetail::malformed_struct,
                                "memory target segment identity has a non-numeric suffix");

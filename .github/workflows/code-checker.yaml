@@ -39,56 +39,11 @@ jobs       :
         checkAllCommitMessages: 'true'
         accessToken: ${{ secrets.GITHUB_TOKEN }}
 
-  # Automatically detect spelling errors in the code library
-  # Pure spelling checks, such as "receive" for "receive" and "environment" for "environment."
-  typo-check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-    - name: Checkout Actions Repository
-      uses: actions/checkout@v4
-    - name: Spell Check Repo
-      uses: crate-ci/typos@v1.36.1
-      with:
-        config: ./.typo.toml
-
-  py-format-check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Check formatting with Ruff
-      uses: astral-sh/ruff-action@v3
-      with:
-        version: 0.12.2
-        args: format --check --diff
-
-    - name: Lint code with Ruff
-      uses: astral-sh/ruff-action@v3
-      with:
-        version: 0.12.2
-        args: check
-
-
-  py-lint-check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-    - uses: actions/checkout@v4
-
-    - name: Install uv
-      uses: astral-sh/setup-uv@v5
-      with:
-        enable-cache: true
-        cache-dependency-glob: uv.lock
-
-    - name: Analysing the code with pylint
-      run: |
-        uvx pylint --rcfile=./python/.pylintrc \
-          ./examples/**/*.py \
-          ./python/src/alayalite/**/*.py \
-          ./python/tests/**/*.py
+  # Ruff (format + lint), pylint, and typos are intentionally NOT duplicated here.
+  # They run in precommit-checker.yaml via `pre-commit run --all-files`, which is the
+  # single source of truth for every tool version (pinned in .pre-commit-config.yaml).
+  # Keeping separate unpinned copies here previously let CI's ruff/pylint drift ahead
+  # of the pinned versions and fail on files that pre-commit considered clean.
 
   codegen-drift-check:
     runs-on: ubuntu-latest

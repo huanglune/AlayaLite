@@ -81,7 +81,7 @@ struct CollectionTargetRegistration {
   std::string_view factory_key{};
   TargetSupport (*supports)(const CollectionSchema &,
                             core::RowCount,
-                            const CollectionTargetBuildParams &){};
+                            const CollectionTargetBuildParams &) = nullptr;
   BuildTargetFn build{};
   OpenTargetFn open{};
 };

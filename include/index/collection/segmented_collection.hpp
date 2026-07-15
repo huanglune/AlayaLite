@@ -1531,7 +1531,7 @@ class SegmentedCollection {
               }
             }
             segment_extensions.push_back(make(effective));
-          };
+          };  // NOLINT(readability/braces)
           ::alaya::HnswSearchExtension hnsw_effort;
           ::alaya::NsgSearchExtension nsg_effort;
           ::alaya::FusionSearchExtension fusion_effort;
