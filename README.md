@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="https://github.com/AlayaDB-AI"><img src="https://github.com/AlayaDB-AI/AlayaLite/blob/main/.assets/banner.jpg?raw=true" width=300 alt="AlayaDB Log"></a>
+  <a href="https://github.com/AlayaDB-AI"><img src="https://github.com/AlayaDB-AI/AlayaLite/blob/main/docs/images/banner.jpg?raw=true" width=300 alt="AlayaDB Log"></a>
 </p>
 
 
@@ -176,7 +176,7 @@ We evaluate the in-memory path against other vector database systems using
 [ANN-Benchmark](https://github.com/erikbern/ann-benchmarks) (compile locally and
 open `-march=native` in your `CMakeLists.txt` to reproduce the results).
 
-|     ![Fashion-MNIST	784 Euclidean](https://raw.githubusercontent.com/AlayaDB-AI/AlayaLite/main/.assets/fashion-mnist-784-euclidean.png)     |    ![Gist 960 Euclidean](https://raw.githubusercontent.com/AlayaDB-AI/AlayaLite/main/.assets/gist-960-euclidean.png)    |
+|     ![Fashion-MNIST	784 Euclidean](https://raw.githubusercontent.com/AlayaDB-AI/AlayaLite/main/docs/images/fashion-mnist-784-euclidean.png)     |    ![Gist 960 Euclidean](https://raw.githubusercontent.com/AlayaDB-AI/AlayaLite/main/docs/images/gist-960-euclidean.png)    |
 | :---------------------------------------------------------: | :-----------------------------------------------------------: |
 | <div style="text-align: center;">**Fashion-MNIST	784 Euclidean**</div> | <div style="text-align: center;">**Gist 960 Euclidean**</div> |
 
@@ -187,9 +187,9 @@ are involved. We evaluate this filtered retrieval workflow using
 **Medium Cohere** dataset (1M vectors, 768 dimensions). The following results
 report QPS under 0.1% selectivity filters at concurrency 1 and 80.
 
-![Integer filter 0.1% selectivity QPS](https://raw.githubusercontent.com/AlayaDB-AI/AlayaLite/main/.assets/int-0p1p_qps_c1_c80.png)
+![Integer filter 0.1% selectivity QPS](https://raw.githubusercontent.com/AlayaDB-AI/AlayaLite/main/docs/images/int-0p1p_qps_c1_c80.png)
 
-![String equality filter 0.1% selectivity QPS](https://raw.githubusercontent.com/AlayaDB-AI/AlayaLite/main/.assets/strequ-0p1p_qps_c1_c80.png)
+![String equality filter 0.1% selectivity QPS](https://raw.githubusercontent.com/AlayaDB-AI/AlayaLite/main/docs/images/strequ-0p1p_qps_c1_c80.png)
 
 ### On-disk LASER vs. other large-scale systems
 
@@ -199,7 +199,7 @@ directly from the benchmark output — see the
 [AlayaLaser paper](https://arxiv.org/abs/2602.23342) (SIGMOD 2026) for the
 algorithm details.
 
-![LASER vs other on-disk systems on DPR100M](https://raw.githubusercontent.com/AlayaDB-AI/AlayaLite/main/.assets/laser-vs-disk-anns.png)
+![LASER vs other on-disk systems on DPR100M](https://raw.githubusercontent.com/AlayaDB-AI/AlayaLite/main/docs/images/laser-vs-disk-anns.png)
 
 At Recall@10 ≈ 0.97, LASER serves about **725 QPS** — roughly 4.4× DiskANN
 (165), 9.2× Qdrant (79), and 66× LanceDB (11) on this dataset, while Milvus
@@ -232,7 +232,7 @@ If you have any questions or suggestions, please feel free to open an issue or c
 For Chinese-speaking users, you can join our WeChat discussion group by scanning the QR code below:
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/AlayaDB-AI/AlayaLite/main/.assets/wechat-group-qr.png" width="240" alt="AlayaLite WeChat discussion group QR code">
+  <img src="https://raw.githubusercontent.com/AlayaDB-AI/AlayaLite/main/docs/images/wechat-group-qr.png" width="240" alt="AlayaLite WeChat discussion group QR code">
 </p>
 
 

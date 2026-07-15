@@ -152,7 +152,7 @@ repos:
   hooks:
   - id: no-chinese-characters
     name: Check for Chinese characters in code
-    entry: python scripts/check_chinese.py
+    entry: python .github/scripts/check_chinese.py
     language: python
     files: (Makefile|\.(c|cc|cpp|cxx|h|hpp|hxx|ipp|py|yaml|yml|sh|cmake|txt))$
     exclude: ^(docs/|build/)
@@ -164,7 +164,7 @@ repos:
   hooks:
   - id: layer-boundaries
     name: Check include layer boundaries
-    entry: python scripts/lint/check_layer_boundaries.py
+    entry: python .github/scripts/check_layer_boundaries.py
     language: python
     always_run: true
     pass_filenames: false

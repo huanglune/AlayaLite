@@ -24,4 +24,4 @@ jobs:
     - name: Install Conan
       run: pip install 'conan>=2,<3'
     - name: Compile ${{ matrix.case }}
-      run: scripts/build_matrix/run_matrix.sh '${{ matrix.case }}'
+      run: .github/scripts/run_matrix.sh '${{ matrix.case }}'

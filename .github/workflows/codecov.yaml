@@ -15,8 +15,8 @@ on  :
     - pyproject.toml
     - python/CMakeLists.txt
     - cmake/**
-    - scripts/ci/codecov/**
-    - codecov.yml
+    - .github/scripts/codecov/**
+    - .github/codecov.yml
   push:
     branches: [main]
     paths:
@@ -31,8 +31,8 @@ on  :
     - pyproject.toml
     - python/CMakeLists.txt
     - cmake/**
-    - scripts/ci/codecov/**
-    - codecov.yml
+    - .github/scripts/codecov/**
+    - .github/codecov.yml
 
 jobs:
   codecov-python:
@@ -87,7 +87,7 @@ jobs:
     - name: Run python code coverage
       env:
         PYTHONFAULTHANDLER: '1'
-      run: bash scripts/ci/codecov/python_coverage_with_crash_diagnostics.sh
+      run: bash .github/scripts/codecov/python_coverage_with_crash_diagnostics.sh
 
     - name: Upload Python crash diagnostics
       if: failure()
@@ -143,7 +143,7 @@ jobs:
       with:
         key: >-
           codecov-cpp-portable-v2-${{ runner.os }}-${{ runner.arch }}-Debug-${{ hashFiles('CMakeLists.txt',
-          'tests/CMakeLists.txt', 'conanfile.py', 'cmake/**/*.cmake', 'scripts/ci/codecov/gnu_codecoverage.sh') }}
+          'tests/CMakeLists.txt', 'conanfile.py', 'cmake/**/*.cmake', '.github/scripts/codecov/gnu_codecoverage.sh') }}
         restore-keys: |
           codecov-cpp-portable-v2-${{ runner.os }}-${{ runner.arch }}-Debug-
 
@@ -151,7 +151,7 @@ jobs:
       run: sudo apt-get install -y lcov libaio-dev
 
     - name: Run c++ code coverage
-      run: CMAKE_CXX_COMPILER_LAUNCHER=ccache bash scripts/ci/codecov/gnu_codecoverage.sh
+      run: CMAKE_CXX_COMPILER_LAUNCHER=ccache bash .github/scripts/codecov/gnu_codecoverage.sh
 
     - name: Save Conan cache
       if: steps.conan-cache.outputs.cache-hit != 'true'
