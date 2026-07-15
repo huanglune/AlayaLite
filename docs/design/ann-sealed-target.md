@@ -200,7 +200,7 @@ never gates the merge.
 - **Contract B** (lossy — QG/RaBitQ, LASER): either emit a calibrated distance
   from the retained vector, or set `score_kind=rank_only` and register a
   `SegmentRegistration.exact_rerank` closure (`types.hpp:170`) over the
-  Collection-owned vectors — else merge hard-fails or silently mis-ranks.
+  Collection-owned vectors — else merge hard-fails or silently ranks incorrectly.
 
 Two routing fixes before enabling ANN seal: (1) filter the shared
 `SearchOptions.extensions` span per target descriptor (engines reject other-algorithm

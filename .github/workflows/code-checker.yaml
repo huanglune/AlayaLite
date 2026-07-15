@@ -61,11 +61,13 @@ jobs       :
     - name: Check formatting with Ruff
       uses: astral-sh/ruff-action@v3
       with:
+        version: 0.12.2
         args: format --check --diff
 
     - name: Lint code with Ruff
       uses: astral-sh/ruff-action@v3
       with:
+        version: 0.12.2
         args: check
 
 

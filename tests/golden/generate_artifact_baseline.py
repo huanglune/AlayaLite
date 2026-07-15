@@ -90,15 +90,11 @@ def _build_tree_extension(build_dir: Path) -> Path | None:
 def _generate_laser_fixture(out: Path, build_dir: Path) -> None:
     extension = _build_tree_extension(build_dir)
     if extension is None:
-        raise RuntimeError(
-            f"build _alayalitepy first; expected exactly one extension under {build_dir / 'python'}"
-        )
+        raise RuntimeError(f"build _alayalitepy first; expected exactly one extension under {build_dir / 'python'}")
     target = out / "laser_fixture"
     native_builder = build_dir / "tests/disk/laser_fixture_builder"
     if not native_builder.is_file():
-        raise RuntimeError(
-            f"build the laser_fixture_builder target first: {native_builder}"
-        )
+        raise RuntimeError(f"build the laser_fixture_builder target first: {native_builder}")
     command = [
         sys.executable,
         str(ROOT / "tests/disk/fixtures/build_laser_fixture.py"),

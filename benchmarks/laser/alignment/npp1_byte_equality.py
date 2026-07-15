@@ -28,9 +28,7 @@ from pathlib import Path
 
 DEFAULT_NAME = "synth_20k_768d"
 DEFAULT_PREFIX = f"dsqg_{DEFAULT_NAME}"
-DEFAULT_BASELINE_DIR = Path(
-    ""
-)
+DEFAULT_BASELINE_DIR = Path("")
 DEFAULT_BASELINE = DEFAULT_BASELINE_DIR / f"{DEFAULT_PREFIX}_R64_MD256.post_layout_fix.index"
 DEFAULT_BASELINE_SHA = "f1554f3ebaa9d986f975878354749c287ba777d4f6aa82265d565e32c4c16f32"  # pragma: allowlist secret  # noqa: E501 commit 589152c
 DEFAULT_VAMANA = Path("")
