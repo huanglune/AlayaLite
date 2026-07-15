@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import yaml
@@ -42,8 +43,11 @@ def _named_step(steps: list[dict], name: str) -> dict:
 
 
 def test_python_only_jobs_do_not_use_conan_cache_action() -> None:
+    # Python-only jobs must not restore the C++ Conan cache. Ruff/pylint linting now
+    # lives in precommit-checker's `pre-commit` job (the old code-checker py-lint-check
+    # was folded into it); codegen-drift-check is the remaining uv-only job here.
     assert not _uses(_steps("precommit-checker.yaml", "pre-commit"), "./.github/actions/cache-restore")
-    assert not _uses(_steps("code-checker.yaml", "py-lint-check"), "./.github/actions/cache-restore")
+    assert not _uses(_steps("code-checker.yaml", "codegen-drift-check"), "./.github/actions/cache-restore")
 
 
 def test_precommit_has_dedicated_hook_environment_cache() -> None:
@@ -136,7 +140,7 @@ def test_codecov_python_replaces_unit_test_gate_without_upload_flakes() -> None:
 
 
 def test_codecov_python_logs_laser_simd_selection() -> None:
-    codecov_script = (ROOT / "scripts" / "ci" / "codecov" / "python_coverage_with_crash_diagnostics.sh").read_text(
+    codecov_script = (ROOT / ".github" / "scripts" / "codecov" / "python_coverage_with_crash_diagnostics.sh").read_text(
         encoding="utf-8"
     )
 
@@ -144,10 +148,25 @@ def test_codecov_python_logs_laser_simd_selection() -> None:
     assert "laser.selected_simd()" in codecov_script
 
 
-def test_codecov_cpp_builds_laser_simd_dispatch_test() -> None:
-    codecov_script = (ROOT / "scripts" / "ci" / "codecov" / "gnu_codecoverage.sh").read_text(encoding="utf-8")
+def test_codecov_cpp_covers_laser_simd_dispatch_via_labels() -> None:
+    # The C++ coverage build derives its targets from CTest labels rather than a hard-coded
+    # list, so "is the LASER SIMD dispatch test covered?" is answered by its label being in
+    # the coverage label set -- not by a literal target name in the script.
+    codecov_script = (ROOT / ".github" / "scripts" / "codecov" / "gnu_codecoverage.sh").read_text(encoding="utf-8")
+    assert "--show-only=json-v1" in codecov_script
+    assert '-L "${CTEST_LABELS}"' in codecov_script
 
-    assert "laser_simd_dispatch_test" in codecov_script
+    cpp_env = _yaml(WORKFLOWS / "codecov.yaml")["jobs"]["codecov-cpp"]["env"]
+    coverage_labels = set(str(cpp_env["CTEST_LABELS"]).split("|"))
+
+    laser_cmake = (ROOT / "tests" / "laser" / "CMakeLists.txt").read_text(encoding="utf-8")
+    registration = re.search(r"alaya_add_test\([^)]*laser_simd_dispatch_test[^)]*\)", laser_cmake)
+    assert registration, "laser_simd_dispatch_test is not registered as a CTest"
+    labels = re.search(r"LABELS\s+([A-Za-z0-9_ ]+)", registration.group(0))
+    assert labels, "laser_simd_dispatch_test has no LABELS"
+    assert set(labels.group(1).split()) & coverage_labels, (
+        "laser_simd_dispatch_test is not selected by the C++ coverage CTest labels"
+    )
 
 
 def test_codecov_python_build_uses_unit_build_configuration() -> None:
@@ -175,8 +194,8 @@ def test_codecov_workflow_keeps_coverage_trigger_scope() -> None:
         "pyproject.toml",
         "python/CMakeLists.txt",
         "cmake/**",
-        "scripts/ci/codecov/**",
-        "codecov.yml",
+        ".github/scripts/codecov/**",
+        ".github/codecov.yml",
     ]
 
     assert triggers is not None
@@ -189,7 +208,7 @@ def test_ccache_builds_disable_native_arch() -> None:
 
     coverage_steps = _steps("codecov.yaml", "codecov-python")
     wheel_env = _yaml(WORKFLOWS / "cibuildwheel.yaml")["jobs"]["build_wheels"]["env"]
-    codecov_script = (ROOT / "scripts" / "ci" / "codecov" / "gnu_codecoverage.sh").read_text(encoding="utf-8")
+    codecov_script = (ROOT / ".github" / "scripts" / "codecov" / "gnu_codecoverage.sh").read_text(encoding="utf-8")
 
     assert "-DALAYA_NATIVE_ARCH=OFF" in _named_step(coverage_steps, "Build Python coverage environment")["run"]
     assert "-DALAYA_NATIVE_ARCH=OFF" in wheel_env["CMAKE_ARGS"]
