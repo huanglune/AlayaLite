@@ -389,7 +389,7 @@ class LaserSegment {
   }
 
  private:
-  friend class LaserSegmentLegacyFactory;
+
 
   LaserSegment(std::shared_ptr<LaserSegmentSearcher> searcher,
                SegmentManifest native,
@@ -875,74 +875,6 @@ class LaserSegmentFactory {
                                std::move(diagnostic));
   }
 };
-
-class LaserSegmentLegacyFactory {
- public:
-  static constexpr auto registration = internal::disk::kDiskLaserRegistration;
-
-  struct DifferentialOpen {
-    std::shared_ptr<LaserSegmentSearcher> direct{};
-    std::unique_ptr<LaserSegment> segment{};
-  };
-
-  [[nodiscard]] static auto open(const std::filesystem::path &segment_directory) noexcept
-      -> core::Result<std::unique_ptr<LaserSegmentSearcher>> {
-#if !ALAYA_DISK_LASER_SEGMENT_SUPPORTED
-    (void)segment_directory;
-    return core::Status::error(core::StatusCode::not_supported,
-                               core::OperationStage::open,
-                               core::StatusDetail::operation_slot_absent,
-                               "legacy disk_laser path is unavailable in this build");
-#else
-    try {
-      return std::make_unique<LaserSegmentSearcher>(segment_directory);
-    } catch (...) {
-      return core::status_from_exception(core::OperationStage::open);
-    }
-#endif
-  }
-
-  // LASER's asynchronous page completion may choose a different valid
-  // rank-only frontier across independent graph instances. Differential
-  // tooling therefore shares the one direct searcher with the thin segment
-  // adapter, isolating wrapper translation from kernel scheduling variance.
-  [[nodiscard]] static auto open_differential(const std::filesystem::path &segment_directory,
-                                              core::OpenContext &context) noexcept
-      -> core::Result<DifferentialOpen> {
-#if !ALAYA_DISK_LASER_SEGMENT_SUPPORTED
-    (void)segment_directory;
-    (void)context;
-    return core::Status::error(core::StatusCode::not_supported,
-                               core::OperationStage::open,
-                               core::StatusDetail::operation_slot_absent,
-                               "legacy disk_laser path is unavailable in this build");
-#else
-    try {
-      auto direct = std::make_shared<LaserSegmentSearcher>(segment_directory);
-      auto adapted = LaserSegment::adapt_open_searcher(direct, segment_directory, context);
-      if (!adapted.ok()) {
-        return adapted.status();
-      }
-      DifferentialOpen result;
-      result.direct = std::move(direct);
-      result.segment = std::move(adapted).value();
-      return result;
-    } catch (...) {
-      return core::status_from_exception(core::OperationStage::open);
-    }
-#endif
-  }
-
-  // Captures the direct searcher return from the same invocation before v3
-  // sink translation. Normal LaserSegment search never copies this vector.
-  [[nodiscard]] static auto search_differential(
-      const LaserSegment &segment,
-      const core::SearchRequest &request,
-      std::vector<std::vector<DiskSearchHit>> &direct_results) -> core::Status {
-    return segment.execute_search(request, std::addressof(direct_results));
-  }
-};
-
 }  // namespace alaya::disk
 
 #undef ALAYA_DISK_LASER_SEGMENT_SUPPORTED

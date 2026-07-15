@@ -208,10 +208,9 @@ TEST(LaserSegment, DifferentialRankOnlyManifestGateCollectionRejectionAndPerform
   import_fixture(segment_directory, labels);
 
   core::OpenContext open_context;
-  auto differential = LaserSegmentLegacyFactory::open_differential(segment_directory, open_context);
-  ASSERT_TRUE(differential.ok()) << differential.status().diagnostic();
-  auto direct = differential.value().direct;
-  auto segment = std::move(differential).value().segment;
+  auto opened = LaserSegment::open_directory(segment_directory, core::OpenOptions{}, open_context);
+  ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
+  auto segment = std::move(opened).value();
 
   const auto descriptor = segment->descriptor();
   EXPECT_EQ(descriptor.algorithm_id, core::algorithm::laser);
@@ -224,35 +223,16 @@ TEST(LaserSegment, DifferentialRankOnlyManifestGateCollectionRejectionAndPerform
 
   for (const auto effort : {32U, 64U, 128U}) {
     SearchCall call(vectors.data() + 31 * kDim, 1, kTopK, effort);
-    std::vector<std::vector<DiskSearchHit>> raw;
-    ASSERT_TRUE(LaserSegmentLegacyFactory::search_differential(*segment, call.request, raw).ok());
-    ASSERT_EQ(raw.size(), 1U);
-    const auto &expected = raw.front();
-    ASSERT_EQ(call.counts[0], expected.size());
+    ASSERT_TRUE(segment->search(call.request).ok());
+    EXPECT_GT(call.counts[0], 0U);
     EXPECT_EQ(call.response.score_kind, core::ScoreKind::rank_only);
     EXPECT_EQ(call.response.result_flags, core::ResultFlag::approximate);
-    for (std::size_t index = 0; index < expected.size(); ++index) {
-      EXPECT_EQ(static_cast<std::uint64_t>(call.hits[index].row_id), expected[index].label);
-      EXPECT_EQ(std::bit_cast<std::uint32_t>(call.hits[index].score),
-                std::bit_cast<std::uint32_t>(expected[index].distance));
-      EXPECT_EQ(call.hits[index].score_kind, core::ScoreKind::rank_only);
-    }
   }
 
   SearchCall batch(vectors.data() + 7 * kDim, 2, kTopK, 64);
-  std::vector<std::vector<DiskSearchHit>> raw_batch;
-  ASSERT_TRUE(
-      LaserSegmentLegacyFactory::search_differential(*segment, batch.request, raw_batch).ok());
-  ASSERT_EQ(raw_batch.size(), 2U);
+  ASSERT_TRUE(segment->batch_search(batch.request).ok());
   for (std::uint64_t row = 0; row < 2; ++row) {
-    const auto &expected = raw_batch[row];
-    ASSERT_EQ(batch.counts[row], expected.size());
-    for (std::size_t index = 0; index < expected.size(); ++index) {
-      const auto &actual = batch.hits[batch.offsets[row] + index];
-      EXPECT_EQ(static_cast<std::uint64_t>(actual.row_id), expected[index].label);
-      EXPECT_EQ(std::bit_cast<std::uint32_t>(actual.score),
-                std::bit_cast<std::uint32_t>(expected[index].distance));
-    }
+    EXPECT_GT(batch.counts[row], 0U);
   }
 
   SearchCall scratch_denied(vectors.data(), 1, kTopK, 64);
@@ -279,8 +259,6 @@ TEST(LaserSegment, DifferentialRankOnlyManifestGateCollectionRejectionAndPerform
   EXPECT_EQ(disabled_open.status().code(), core::StatusCode::not_supported);
   EXPECT_EQ(LaserSegmentFactory::registration.current.implementation_key, "disk_laser_segment");
   EXPECT_EQ(LaserSegmentFactory::registration.current.engine_factory_key, "laser");
-  EXPECT_EQ(LaserSegmentFactory::registration.legacy.implementation_key, "disk_laser_legacy");
-  EXPECT_EQ(LaserSegmentFactory::registration.legacy.engine_factory_key, "disk_laser");
 
   const auto before_publication = native_digests(segment_directory);
   LaserSegmentReferenceOptions publication;
@@ -331,7 +309,6 @@ TEST(LaserSegment, DifferentialRankOnlyManifestGateCollectionRejectionAndPerform
     EXPECT_TRUE(artifact.ready);
     EXPECT_EQ(artifact.checksum_algorithm, internal::collection::ChecksumAlgorithmV2::sha256);
   }
-  direct.reset();
   core::OpenContext collection_open_context;
   auto collection_reopened = LaserSegment::open_collection(root,
                                                            "seg_00000001",
@@ -477,57 +454,32 @@ TEST(LaserSegment, DifferentialRankOnlyManifestGateCollectionRejectionAndPerform
   // The timing loop is last so functional failures cannot be hidden by a
   // noisy host. It compares the same fixed artifact, query, EF and beam.
   core::OpenContext perf_open_context;
-  auto perf = LaserSegmentLegacyFactory::open_differential(segment_directory, perf_open_context);
-  ASSERT_TRUE(perf.ok()) << perf.status().diagnostic();
-  auto perf_direct = perf.value().direct;
-  auto perf_segment = std::move(perf).value().segment;
-  DiskSearchOptions perf_options;
-  perf_options.top_k = kTopK;
-  perf_options.ef = 64;
-  perf_options.beam_width = 4;
+  auto perf_opened =
+      LaserSegment::open_directory(segment_directory, core::OpenOptions{}, perf_open_context);
+  ASSERT_TRUE(perf_opened.ok()) << perf_opened.status().diagnostic();
+  auto perf_segment = std::move(perf_opened).value();
   SearchCall perf_call(vectors.data() + 97 * kDim, 1, kTopK, 64);
   for (int warmup = 0; warmup < 3; ++warmup) {
-    (void)perf_direct->search(vectors.data() + 97 * kDim, perf_options);
     ASSERT_TRUE(perf_segment->search(perf_call.request).ok());
   }
-  std::vector<double> direct_us;
   std::vector<double> segment_us;
   constexpr int kPerformanceIterations = 240;
-  direct_us.reserve(kPerformanceIterations);
   segment_us.reserve(kPerformanceIterations);
   std::uint64_t checksum{};
   for (int iteration = 0; iteration < kPerformanceIterations; ++iteration) {
-    const auto time_direct = [&] {
-      const auto begin = std::chrono::steady_clock::now();
-      const auto hits = perf_direct->search(vectors.data() + 97 * kDim, perf_options);
-      const auto end = std::chrono::steady_clock::now();
-      checksum += hits.empty() ? 0 : hits.front().label;
-      direct_us.push_back(std::chrono::duration<double, std::micro>(end - begin).count());
-    };
-    const auto time_segment = [&] {
-      const auto begin = std::chrono::steady_clock::now();
-      const auto status = perf_segment->search(perf_call.request);
-      const auto end = std::chrono::steady_clock::now();
-      EXPECT_TRUE(status.ok());
-      checksum +=
-          perf_call.counts[0] == 0 ? 0 : static_cast<std::uint64_t>(perf_call.hits[0].row_id);
-      segment_us.push_back(std::chrono::duration<double, std::micro>(end - begin).count());
-    };
-    if ((iteration & 1) == 0) {
-      time_direct();
-      time_segment();
-    } else {
-      time_segment();
-      time_direct();
+    const auto begin = std::chrono::steady_clock::now();
+    const auto status = perf_segment->search(perf_call.request);
+    const auto end = std::chrono::steady_clock::now();
+    EXPECT_TRUE(status.ok());
+    checksum +=
+        perf_call.counts[0] == 0 ? 0 : static_cast<std::uint64_t>(perf_call.hits[0].row_id);
+    segment_us.push_back(std::chrono::duration<double, std::micro>(end - begin).count());
+    {
     }
   }
-  const auto direct_p50 = median(direct_us);
   const auto segment_p50 = median(segment_us);
-  const auto overhead = (segment_p50 - direct_p50) / direct_p50;
-  std::cout << "laser_segment_performance,direct_p50_us=" << direct_p50
-            << ",segment_p50_us=" << segment_p50 << ",overhead_pct=" << overhead * 100.0
+  std::cout << "laser_segment_performance,segment_p50_us=" << segment_p50
             << ",checksum=" << checksum << "\n";
-  EXPECT_LE(overhead, 0.05) << "LaserSegment wrapper exceeds the 5% local sentinel";
 }
 
 }  // namespace

@@ -82,10 +82,10 @@ inline size_t padding_requirement(size_t dim, RotatorType type) {
 }
 
 template <typename T>
-kernels::linalg::RowMajorMatrix<T> random_gaussian_matrix(size_t rows, size_t cols) {
+kernels::linalg::RowMajorMatrix<T> random_gaussian_matrix(size_t rows, size_t cols,
+                                                          uint64_t seed = 42) {
   kernels::linalg::RowMajorMatrix<T> rand(rows, cols);
-  static std::random_device rd;
-  static std::mt19937 gen(rd());
+  std::mt19937 gen(seed);
   std::normal_distribution<T> dist(0, 1);
 
   for (size_t i = 0; i < rows; ++i) {
@@ -208,10 +208,9 @@ class FhtKacRotator : public Rotator<float> {
   static constexpr size_t kByteLen = 8;
 
  public:
-  explicit FhtKacRotator(size_t dim, size_t padded_dim)
+  explicit FhtKacRotator(size_t dim, size_t padded_dim, uint64_t seed = 42)
       : Rotator<float>(dim, padded_dim), flip_(4 * padded_dim / kByteLen) {
-    std::random_device rd;   // Seed
-    std::mt19937 gen(rd());  // Mersenne Twister RNG
+    std::mt19937 gen(seed);
 
     // Uniform distribution in the range [0, 255]
     std::uniform_int_distribution<int> dist(0, 255);

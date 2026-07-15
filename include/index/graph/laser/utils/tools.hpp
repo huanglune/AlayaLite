@@ -18,12 +18,11 @@
 namespace alaya::laser {
 
 inline auto thread_local_random_seed() -> std::mt19937::result_type {
-  std::random_device random_device;
+  constexpr std::mt19937::result_type kDefaultSeed = 42;
   const std::hash<std::thread::id> thread_hasher;
-  const auto random_seed = static_cast<std::mt19937::result_type>(random_device());
   const auto thread_seed =
       static_cast<std::mt19937::result_type>(thread_hasher(std::this_thread::get_id()));
-  return static_cast<std::mt19937::result_type>(random_seed + thread_seed);
+  return static_cast<std::mt19937::result_type>(kDefaultSeed + thread_seed);
 }
 
 /** @brief Thread-safe random integer generator in range [min, max]. */

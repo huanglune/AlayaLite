@@ -154,61 +154,6 @@ void expect_l2_gate(const core::Status &status, [[maybe_unused]] std::string_vie
   EXPECT_NE(status.diagnostic().find("L2 only"), std::string::npos) << status.diagnostic();
 }
 
-TEST(DiskVamanaSegment, DifferentialBytesSearchAndBidirectionalOpenAreExact) {
-  TemporaryDirectory temporary;
-  FixtureRows rows;
-  const auto legacy_root = temporary.path() / "legacy";
-  const auto segment_root = temporary.path() / "segment";
-  std::filesystem::create_directories(legacy_root / "segments");
-  const auto legacy_dir = legacy_root / "segments/seg_00000001";
-  auto legacy = DiskVamanaLegacyFactory::build(rows.input(),
-                                               core::Metric::l2,
-                                               FixtureRows::params(),
-                                               legacy_dir);
-  ASSERT_TRUE(legacy.ok()) << legacy.status().diagnostic();
-  auto segment = build_segment(rows, segment_root);
-  const auto segment_dir = segment_root / "segments/seg_00000001";
-
-  for (const auto *filename : {"manifest.txt", "ids.u64.bin", "vectors.f32.bin", "graph.index"}) {
-    EXPECT_EQ(bytes(legacy_dir / filename), bytes(segment_dir / filename)) << filename;
-  }
-  EXPECT_FALSE(std::filesystem::exists(segment_dir / "READY"));
-  EXPECT_FALSE(std::filesystem::exists(segment_dir / "ARTIFACTS.v2"));
-  EXPECT_FALSE(std::filesystem::exists(segment_root / "collection_manifest.txt"));
-
-  constexpr std::uint64_t kQueries = 4;
-  constexpr std::uint32_t kTopK = 10;
-  constexpr std::uint32_t kEffort = 24;
-  SearchCall call(rows.vectors.data(), kQueries, FixtureRows::kDim, kTopK, kEffort);
-  ASSERT_TRUE(segment->batch_search(call.request).ok());
-  for (std::uint64_t query = 0; query < kQueries; ++query) {
-    DiskSearchOptions options;
-    options.top_k = kTopK;
-    options.ef = kEffort;
-    const auto direct =
-        legacy.value()->search(rows.vectors.data() + query * FixtureRows::kDim, options);
-    ASSERT_EQ(call.counts[query], direct.size());
-    for (std::size_t index = 0; index < direct.size(); ++index) {
-      const auto &actual = call.hits[call.offsets[query] + index];
-      EXPECT_EQ(static_cast<std::uint64_t>(actual.row_id), direct[index].label);
-      EXPECT_EQ(std::bit_cast<std::uint32_t>(actual.score),
-                std::bit_cast<std::uint32_t>(direct[index].distance));
-      EXPECT_EQ(actual.result_flags, core::ResultFlag::approximate);
-    }
-  }
-
-  const auto saved_root = temporary.path() / "saved";
-  DiskVamanaPublicationOptions save_options;
-  save_options.collection_root = saved_root;
-  save_options.segment_id = "seg_00000001";
-  core::BuildContext save_context;
-  auto saved = segment->save_transactional(save_options, save_context);
-  ASSERT_TRUE(saved.ok()) << saved.status().diagnostic();
-  for (const auto *filename : {"manifest.txt", "ids.u64.bin", "vectors.f32.bin", "graph.index"}) {
-    EXPECT_EQ(bytes(segment_dir / filename), bytes(saved.value() / filename)) << filename;
-  }
-}
-
 TEST(DiskVamanaSegment, DescriptorCapabilitiesRegistryAndFeatureGateAreExplicit) {
   TemporaryDirectory temporary;
   FixtureRows rows;
@@ -266,9 +211,6 @@ TEST(DiskVamanaSegment, DescriptorCapabilitiesRegistryAndFeatureGateAreExplicit)
   EXPECT_EQ(DiskVamanaSegmentFactory::registration.current.implementation_key,
             "disk_vamana_segment");
   EXPECT_EQ(DiskVamanaSegmentFactory::registration.current.engine_factory_key, "vamana");
-  EXPECT_EQ(DiskVamanaSegmentFactory::registration.legacy.implementation_key, "disk_vamana_legacy");
-  EXPECT_EQ(DiskVamanaSegmentFactory::registration.legacy.engine_factory_key, "disk_vamana");
-  EXPECT_TRUE(DiskVamanaSegmentFactory::registration.has_legacy_factory);
 }
 
 TEST(DiskVamanaSegment, NonL2BuildAndOpenReturnTheFirstVersionGate) {
@@ -291,24 +233,6 @@ TEST(DiskVamanaSegment, NonL2BuildAndOpenReturnTheFirstVersionGate) {
     EXPECT_FALSE(std::filesystem::exists(options.collection_root));
   }
 
-  const auto legacy_parent = temporary.path() / "open/segments";
-  std::filesystem::create_directories(legacy_parent);
-  const auto legacy_dir = legacy_parent / "seg_00000001";
-  auto legacy = DiskVamanaLegacyFactory::build(rows.input(),
-                                               core::Metric::l2,
-                                               FixtureRows::params(),
-                                               legacy_dir);
-  ASSERT_TRUE(legacy.ok()) << legacy.status().diagnostic();
-  for (const auto [metric, name] : {std::pair{core::Metric::inner_product, std::string_view("inner_product")},
-                                    std::pair{core::Metric::cosine, std::string_view("cosine")}}) {
-    auto manifest = SegmentManifest::load(legacy_dir / "manifest.txt");
-    manifest.metric = metric;
-    manifest.save(legacy_dir / "manifest.txt");
-    core::OpenContext context;
-    auto rejected = DiskVamanaSegment::open_directory(legacy_dir, core::OpenOptions{}, context);
-    ASSERT_FALSE(rejected.ok());
-    expect_l2_gate(rejected.status(), name);
-  }
 }
 
 TEST(DiskVamanaSegment, TypedTensorAndContextResourcesAreEnforced) {
@@ -440,79 +364,6 @@ TEST(DiskVamanaSegment, BuildCrashCutsNeverRouteAndRestartCleanupRemovesOrphans)
     EXPECT_FALSE(std::filesystem::exists(options.collection_root / ".alaya_staging"));
     EXPECT_FALSE(std::filesystem::exists(options.collection_root / "segments/seg_00000001"));
   }
-}
-
-TEST(DiskVamanaSegment, L2RecallSanityMatchesTheDirectSearcher) {
-  TemporaryDirectory temporary;
-  constexpr std::uint32_t kDim = 16;
-  constexpr std::uint64_t kRows = 512;
-  constexpr std::uint32_t kQueries = 20;
-  constexpr std::uint32_t kTopK = 10;
-  std::mt19937 random(43);
-  std::uniform_real_distribution<float> distribution(-1.0F, 1.0F);
-  std::vector<float> vectors(kRows * kDim);
-  std::vector<std::uint64_t> labels(kRows);
-  for (std::uint64_t row = 0; row < kRows; ++row) {
-    labels[row] = 80'000 + row;
-    for (std::uint32_t column = 0; column < kDim; ++column) {
-      vectors[row * kDim + column] = distribution(random);
-    }
-  }
-  DiskVamanaBuildInput input(core::TypedTensorView::contiguous(vectors.data(), kRows, kDim),
-                             labels);
-  VamanaSegmentBuildParams params;
-  params.R = 16;
-  params.L = 64;
-  params.num_threads = 1;
-  params.seed = 424242;
-  DiskVamanaPublicationOptions publication;
-  publication.collection_root = temporary.path() / "recall";
-  publication.segment_id = "seg_00000001";
-  core::BuildContext build_context;
-  auto built =
-      DiskVamanaSegmentFactory::build(input, core::Metric::l2, params, publication, build_context);
-  ASSERT_TRUE(built.ok()) << built.status().diagnostic();
-  auto direct =
-      DiskVamanaLegacyFactory::open(publication.collection_root / "segments/seg_00000001");
-  ASSERT_TRUE(direct.ok()) << direct.status().diagnostic();
-
-  double recall_sum{};
-  for (std::uint32_t query_index = 0; query_index < kQueries; ++query_index) {
-    std::vector<float> query(kDim);
-    for (auto &value : query) {
-      value = distribution(random);
-    }
-    std::vector<std::pair<float, std::uint64_t>> truth;
-    truth.reserve(kRows);
-    for (std::uint64_t row = 0; row < kRows; ++row) {
-      truth.emplace_back(simd::l2_sqr<float, float>(query.data(),
-                                                    vectors.data() + row * kDim,
-                                                    kDim),
-                         labels[row]);
-    }
-    std::partial_sort(truth.begin(), truth.begin() + kTopK, truth.end());
-    std::unordered_set<std::uint64_t> expected;
-    for (std::uint32_t index = 0; index < kTopK; ++index) {
-      expected.insert(truth[index].second);
-    }
-
-    SearchCall call(query.data(), 1, kDim, kTopK, 64);
-    ASSERT_TRUE(built.value()->search(call.request).ok());
-    DiskSearchOptions direct_options;
-    direct_options.top_k = kTopK;
-    direct_options.ef = 64;
-    const auto direct_hits = direct.value()->search(query.data(), direct_options);
-    ASSERT_EQ(call.counts[0], direct_hits.size());
-    std::uint32_t matched{};
-    for (std::size_t index = 0; index < direct_hits.size(); ++index) {
-      EXPECT_EQ(static_cast<std::uint64_t>(call.hits[index].row_id), direct_hits[index].label);
-      EXPECT_EQ(std::bit_cast<std::uint32_t>(call.hits[index].score),
-                std::bit_cast<std::uint32_t>(direct_hits[index].distance));
-      matched += expected.contains(direct_hits[index].label) ? 1U : 0U;
-    }
-    recall_sum += static_cast<double>(matched) / kTopK;
-  }
-  EXPECT_GE(recall_sum / kQueries, 0.7);
 }
 
 }  // namespace

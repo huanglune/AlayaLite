@@ -124,18 +124,13 @@ class FHTRotator : public alaya::Rotator<float> {
  public:
   FHTRotator() = default;
 
-  explicit FHTRotator(size_t dim, uint64_t seed = 0)
+  explicit FHTRotator(size_t dim, uint64_t seed = 42)
       : Rotator<float>(dim, size_t{1} << ceil_log2(dim)),
         mat_(std::vector<size_t>{1, padded_dim_}) {
     size_t log_b = ceil_log2(dim);
 
-    // seed == 0 preserves upstream Laser's pre-change `std::random_device`
-    // path so the single-arg call FHTRotator(dim) stays bit-identical to
-    // upstream origin/main. Non-zero seeds pin the Bernoulli draw for the
-    // Tier A byte-equality gate (align-laser-with-upstream design.md D2).
     std::uniform_int_distribution<int> bernoulli(0, 1);
-    std::mt19937_64 gen =
-        (seed == 0) ? std::mt19937_64(std::random_device()()) : std::mt19937_64(seed);
+    std::mt19937_64 gen(seed);
     for (size_t i = 0; i < padded_dim_; ++i) {
       mat_[i] =
           static_cast<float>((2 * bernoulli(gen)) - 1) / std::sqrt(static_cast<float>(padded_dim_));

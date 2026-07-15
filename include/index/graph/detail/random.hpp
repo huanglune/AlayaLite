@@ -14,8 +14,7 @@ namespace alaya {
 template <typename IDType>
 inline auto rand_integer(IDType min, IDType max) -> IDType {
   static thread_local std::mt19937 generator(
-      std::random_device{}() +  // NOLINT(whitespace/braces)
-      std::hash<std::thread::id>()(std::this_thread::get_id()));
+      42 + std::hash<std::thread::id>()(std::this_thread::get_id()));
   std::uniform_int_distribution<IDType> distribution(min, max);
   return distribution(generator);
 }

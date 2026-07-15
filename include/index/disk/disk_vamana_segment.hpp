@@ -579,7 +579,7 @@ class DiskVamanaSegment {
   }
 
  private:
-  friend class DiskVamanaLegacyFactory;
+
 
   DiskVamanaSegment(std::shared_ptr<VamanaSegmentSearcher> searcher,
                     std::filesystem::path directory)
@@ -1051,53 +1051,6 @@ class DiskVamanaSegmentFactory {
               "DiskVamanaSegment factory is disabled; DiskCollection v1 is unchanged");
   }
 };
-
-class DiskVamanaLegacyFactory {
- public:
-  static constexpr auto registration = internal::disk::kDiskVamanaRegistration;
-
-  [[nodiscard]] static auto build(const DiskVamanaBuildInput &input,
-                                  core::Metric metric,
-                                  const VamanaSegmentBuildParams &build_params,
-                                  const std::filesystem::path &segment_directory) noexcept
-      -> core::Result<std::unique_ptr<VamanaSegmentSearcher>> {
-    if (metric != core::Metric::l2) {
-      return DiskVamanaSegment::l2_gate_status(core::OperationStage::build,
-                                               DiskVamanaSegment::legacy_metric(metric));
-    }
-    try {
-      if (input.vectors.scalar_type != core::ScalarType::float32 || input.vectors.rows < 2 ||
-          input.logical_ids.size() != input.vectors.rows) {
-        return core::Status::error(core::StatusCode::invalid_argument,
-                                   core::OperationStage::build,
-                                   core::StatusDetail::malformed_struct,
-                                   "legacy DiskVamana factory input is invalid");
-      }
-      VamanaSegmentBuilder builder(input.vectors.dim, core::Metric::l2, build_params);
-      for (core::RowCount row = 0; row < input.vectors.rows; ++row) {
-        builder.add_batch(input.vectors.row<float>(row), input.logical_ids.data() + row, 1);
-      }
-      (void)builder.finish(segment_directory);
-      return std::make_unique<VamanaSegmentSearcher>(segment_directory);
-    } catch (...) {
-      return core::status_from_exception(core::OperationStage::build);
-    }
-  }
-
-  [[nodiscard]] static auto open(const std::filesystem::path &segment_directory) noexcept
-      -> core::Result<std::unique_ptr<VamanaSegmentSearcher>> {
-    try {
-      const auto native = SegmentManifest::load(segment_directory / "manifest.txt");
-      if (native.metric != core::Metric::l2) {
-        return DiskVamanaSegment::l2_gate_status(core::OperationStage::open, native.metric);
-      }
-      return std::make_unique<VamanaSegmentSearcher>(segment_directory);
-    } catch (...) {
-      return core::status_from_exception(core::OperationStage::open);
-    }
-  }
-};
-
 static_assert(core::Searchable<DiskVamanaSegment>);
 static_assert(core::BatchSearchable<DiskVamanaSegment>);
 static_assert(core::Saveable<DiskVamanaSegment>);

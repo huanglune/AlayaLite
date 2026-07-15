@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 #include "index/graph/graph.hpp"
 #include "index/graph/graph_concepts.hpp"
@@ -113,12 +114,8 @@ struct FusionBuilderKernel {
     }
     return final_graph;
   }
-  /**
-   * @TODO Implement the function to prune the graph.
-   *
-   */
-  void prune_graph(const std::unique_ptr<Graph<DataType, IDType>> &graph) {
-    // Prune the graph
+  void prune_graph(const std::unique_ptr<Graph<DataType, IDType>> & /*graph*/) {
+    throw std::runtime_error("FusionBuilderKernel::prune_graph is not implemented");
   }
 };
 

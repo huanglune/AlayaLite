@@ -120,88 +120,6 @@ struct SearchCall {
   return std::move(built).value();
 }
 
-TEST(DiskFlatSegment, DifferentialBytesSearchExportAndLegacyBidirectionalOpen) {
-  TemporaryDirectory temporary;
-  FixtureRows rows;
-  const auto legacy_root = temporary.path() / "legacy";
-  const auto segment_root = temporary.path() / "segment";
-  std::filesystem::create_directories(legacy_root / "segments");
-  const auto legacy_dir = legacy_root / "segments/seg_00000001";
-  auto legacy_built = DiskFlatLegacyFactory::build(rows.input(), core::Metric::l2, legacy_dir);
-  ASSERT_TRUE(legacy_built.ok()) << legacy_built.status().diagnostic();
-  auto segment = build_segment(rows, segment_root);
-  const auto segment_dir = segment_root / "segments/seg_00000001";
-
-  for (const auto *filename : {"manifest.txt", "ids.u64.bin", "vectors.f32.bin"}) {
-    EXPECT_EQ(bytes(legacy_dir / filename), bytes(segment_dir / filename)) << filename;
-  }
-  EXPECT_FALSE(std::filesystem::exists(segment_dir / "READY"));
-  EXPECT_FALSE(std::filesystem::exists(segment_dir / "ARTIFACTS.v2"));
-
-  constexpr std::uint64_t kQueries = 3;
-  constexpr std::uint32_t kTopK = 6;
-  SearchCall call(rows.vectors.data(), kQueries, FixtureRows::kDim, kTopK);
-  ASSERT_TRUE(segment->batch_search(call.request).ok());
-  for (std::uint64_t query = 0; query < kQueries; ++query) {
-    DiskSearchOptions options;
-    options.top_k = kTopK;
-    const auto direct =
-        legacy_built.value()->search(rows.vectors.data() + query * FixtureRows::kDim, options);
-    ASSERT_EQ(call.counts[query], direct.size());
-    for (std::size_t index = 0; index < direct.size(); ++index) {
-      const auto &actual = call.hits[call.offsets[query] + index];
-      EXPECT_EQ(static_cast<std::uint64_t>(actual.row_id), direct[index].label);
-      EXPECT_EQ(std::bit_cast<std::uint32_t>(actual.score),
-                std::bit_cast<std::uint32_t>(direct[index].distance));
-      EXPECT_EQ(actual.result_flags, core::ResultFlag::none);
-    }
-  }
-
-  DiskFlatExportRequest typed_export;
-  typed_export.batch_rows = 5;
-  std::shared_ptr<DiskFlatExportState> export_owner;
-  typed_export.lifetime_owner = std::addressof(export_owner);
-  core::OpaqueOperationRequest export_request;
-  export_request.payload = std::addressof(typed_export);
-  export_request.payload_size = sizeof(typed_export);
-  core::ExportCursor cursor;
-  ASSERT_TRUE(segment->export_rows(export_request, cursor).ok());
-  ASSERT_NE(export_owner, nullptr);
-  std::vector<std::uint64_t> exported_ids;
-  std::vector<float> exported_vectors;
-  for (;;) {
-    DiskFlatExportBatch batch;
-    ASSERT_TRUE(export_owner->next(batch).ok());
-    exported_ids.insert(exported_ids.end(), batch.logical_ids.begin(), batch.logical_ids.end());
-    for (core::RowCount row = 0; row < batch.vectors.rows; ++row) {
-      const auto *vector = batch.vectors.row<float>(row);
-      exported_vectors.insert(exported_vectors.end(), vector, vector + batch.vectors.dim);
-    }
-    ASSERT_EQ(batch.metadata_references.size(), batch.logical_ids.size());
-    for (const auto reference : batch.metadata_references) {
-      EXPECT_TRUE(reference.empty());
-    }
-    if (batch.done) {
-      break;
-    }
-  }
-  EXPECT_EQ(exported_ids, rows.labels);
-  ASSERT_EQ(exported_vectors.size(), rows.vectors.size());
-  EXPECT_TRUE(std::ranges::equal(std::as_bytes(std::span(exported_vectors)),
-                                 std::as_bytes(std::span(rows.vectors))));
-
-  const auto saved_root = temporary.path() / "saved";
-  DiskFlatPublicationOptions save_options;
-  save_options.collection_root = saved_root;
-  save_options.segment_id = "seg_00000001";
-  core::BuildContext save_context;
-  auto saved = segment->save_transactional(save_options, save_context);
-  ASSERT_TRUE(saved.ok()) << saved.status().diagnostic();
-  for (const auto *filename : {"manifest.txt", "ids.u64.bin", "vectors.f32.bin"}) {
-    EXPECT_EQ(bytes(segment_dir / filename), bytes(saved.value() / filename)) << filename;
-  }
-}
-
 TEST(DiskFlatSegment, DescriptorCapabilitiesAndDisabledFactoryAreExplicit) {
   TemporaryDirectory temporary;
   FixtureRows rows;
@@ -251,8 +169,6 @@ TEST(DiskFlatSegment, DescriptorCapabilitiesAndDisabledFactoryAreExplicit) {
   EXPECT_EQ(rejected_open.status().code(), core::StatusCode::not_supported);
   EXPECT_EQ(DiskFlatSegmentFactory::registration.current.implementation_key, "disk_flat_segment");
   EXPECT_EQ(DiskFlatSegmentFactory::registration.current.engine_factory_key, "flat");
-  EXPECT_EQ(DiskFlatSegmentFactory::registration.legacy.implementation_key, "disk_flat_legacy");
-  EXPECT_TRUE(DiskFlatSegmentFactory::registration.has_legacy_factory);
 }
 
 TEST(DiskFlatSegment, ManifestV2GatePublishesAndReaderSurvivesRuntimeDisable) {

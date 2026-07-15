@@ -41,7 +41,6 @@
 
 namespace alaya::disk {
 
-class DiskAnnSegmentLegacyFactory;
 class DiskAnnMutableSegmentFactory;
 
 // DiskANN search knobs remain algorithm-keyed. The scratch ceiling is fixed at
@@ -589,7 +588,7 @@ class DiskAnnSegment {
   }
 
  private:
-  friend class DiskAnnSegmentLegacyFactory;
+
   friend class DiskAnnMutableSegmentFactory;
 
   struct NativeMetaSummary {
@@ -2946,44 +2945,4 @@ class DiskAnnMutableSegmentFactory {
                                std::move(diagnostic));
   }
 };
-
-class DiskAnnSegmentLegacyFactory {
- public:
-  static constexpr auto registration = internal::disk::kDiskAnnRegistration;
-
-  [[nodiscard]] static auto open(const std::filesystem::path &directory) noexcept
-      -> core::Result<std::unique_ptr<diskann::DiskANNIndex>> {
-    try {
-      auto native = std::make_unique<diskann::DiskANNIndex>();
-      diskann::DiskANNLoadParams load;
-      load.num_threads = DiskAnnSegment::kSearchThreads;
-      load.beam_width = DiskAnnSegment::kBeamWidth;
-      load.scratch_search_list_size = DiskAnnSegment::kScratchSearchListSize;
-      load.updatable = false;
-      load.search_page_cache = false;
-      native->load(directory.string(), load);
-      return native;
-    } catch (...) {
-      return core::status_from_exception(core::OperationStage::open);
-    }
-  }
-
-  // Differential/performance tooling invokes the retained public search API
-  // on the exact native instance wrapped by the Segment. No production search
-  // path bypasses the v3 translation through this helper.
-  [[nodiscard]] static auto search_differential(const DiskAnnSegment &segment,
-                                                const float *query,
-                                                std::uint32_t top_k,
-                                                std::uint64_t *labels,
-                                                float *distances,
-                                                const diskann::DiskANNSearchParams &options)
-      -> core::Result<std::uint32_t> {
-    try {
-      return segment.native_->search(query, top_k, labels, distances, options);
-    } catch (...) {
-      return core::status_from_exception(core::OperationStage::search);
-    }
-  }
-};
-
 }  // namespace alaya::disk

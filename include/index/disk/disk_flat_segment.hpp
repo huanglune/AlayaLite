@@ -557,8 +557,6 @@ class DiskFlatSegment {
   }
 
  private:
-  friend class DiskFlatLegacyFactory;
-
   DiskFlatSegment(std::shared_ptr<DiskFlatSegmentSearcher> searcher,
                   std::filesystem::path directory)
       : searcher_(std::move(searcher)), directory_(std::move(directory)) {
@@ -952,46 +950,6 @@ class DiskFlatSegmentFactory {
               "DiskFlatSegment factory is disabled; DiskCollection v1 is unchanged");
   }
 };
-
-// Explicit legacy registration target used by differential tests and rollback
-// tooling. It is intentionally not selected by DiskFlatSegmentFactory's flag.
-class DiskFlatLegacyFactory {
- public:
-  static constexpr auto registration = internal::disk::kDiskFlatRegistration;
-
-  [[nodiscard]] static auto build(const DiskFlatBuildInput &input,
-                                  core::Metric metric,
-                                  const std::filesystem::path &segment_directory) noexcept
-      -> core::Result<std::unique_ptr<DiskFlatSegmentSearcher>> {
-    try {
-      if (input.vectors.scalar_type != core::ScalarType::float32 || input.vectors.rows == 0 ||
-          input.logical_ids.size() != input.vectors.rows) {
-        return core::Status::error(core::StatusCode::invalid_argument,
-                                   core::OperationStage::build,
-                                   core::StatusDetail::malformed_struct,
-                                   "legacy DiskFlat factory input is invalid");
-      }
-      DiskFlatBuilder builder(input.vectors.dim, DiskFlatSegment::legacy_metric(metric));
-      for (core::RowCount row = 0; row < input.vectors.rows; ++row) {
-        builder.add_batch(input.vectors.row<float>(row), input.logical_ids.data() + row, 1);
-      }
-      (void)builder.finish(segment_directory);
-      return std::make_unique<DiskFlatSegmentSearcher>(segment_directory);
-    } catch (...) {
-      return core::status_from_exception(core::OperationStage::build);
-    }
-  }
-
-  [[nodiscard]] static auto open(const std::filesystem::path &segment_directory) noexcept
-      -> core::Result<std::unique_ptr<DiskFlatSegmentSearcher>> {
-    try {
-      return std::make_unique<DiskFlatSegmentSearcher>(segment_directory);
-    } catch (...) {
-      return core::status_from_exception(core::OperationStage::open);
-    }
-  }
-};
-
 static_assert(core::Searchable<DiskFlatSegment>);
 static_assert(core::BatchSearchable<DiskFlatSegment>);
 static_assert(core::Saveable<DiskFlatSegment>);
