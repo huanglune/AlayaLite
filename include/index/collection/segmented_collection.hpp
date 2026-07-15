@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <memory>
@@ -28,6 +29,10 @@
 
 #include "index/collection/collection_checkpoint.hpp"
 #include "index/collection/experimental_snapshot_writer.hpp"
+#include "index/graph/fusion/fusion_segment.hpp"
+#include "index/graph/hnsw/hnsw_segment.hpp"
+#include "index/graph/nsg/nsg_segment.hpp"
+#include "index/graph/qg/qg_segment.hpp"
 
 namespace alaya::internal::collection {
 
@@ -1493,10 +1498,67 @@ class SegmentedCollection {
                                      "collection fanout sink size is not representable");
         }
         SegmentSearchStorage storage(request.queries.rows, candidate_limit);
+        const auto descriptor = entry->segment.descriptor();
+        std::vector<core::AlgorithmSearchExtension> segment_extensions;
+        segment_extensions.reserve(request.options.extensions.size() + 1);
+        for (const auto &extension : request.options.extensions) {
+          if (extension.algorithm_id == descriptor.algorithm_id) {
+            segment_extensions.push_back(extension);
+          }
+        }
+        const auto is_memory_graph = descriptor.algorithm_id == core::algorithm::hnsw ||
+                                     descriptor.algorithm_id == core::algorithm::nsg ||
+                                     descriptor.algorithm_id == core::algorithm::fusion ||
+                                     descriptor.algorithm_id == core::algorithm::qg;
+        if (is_memory_graph) {
+          if (candidate_limit > std::numeric_limits<std::uint32_t>::max()) {
+            return core::Status::error(core::StatusCode::invalid_argument,
+                                       core::OperationStage::search,
+                                       core::StatusDetail::arithmetic_overflow,
+                                       "Collection memory graph candidate limit exceeds uint32");
+          }
+          auto synthesize_effort = [&]<typename Extension>(Extension &effective, auto make) {
+            effective.effort = std::max<std::uint32_t>(effective.effort,
+                                                       static_cast<std::uint32_t>(candidate_limit));
+            for (const auto &extension : segment_extensions) {
+              if (extension.payload == nullptr || extension.payload_size < sizeof(Extension)) {
+                continue;
+              }
+              Extension requested;
+              std::memcpy(std::addressof(requested), extension.payload, sizeof(Extension));
+              if (core::is_current_struct(requested)) {
+                effective.effort = std::max(effective.effort, requested.effort);
+              }
+            }
+            segment_extensions.push_back(make(effective));
+          };
+          ::alaya::HnswSearchExtension hnsw_effort;
+          ::alaya::NsgSearchExtension nsg_effort;
+          ::alaya::FusionSearchExtension fusion_effort;
+          ::alaya::QgSearchExtension qg_effort;
+          if (descriptor.algorithm_id == core::algorithm::hnsw) {
+            synthesize_effort(hnsw_effort, [](const auto &extension) {
+              return ::alaya::make_hnsw_search_extension(extension);
+            });
+          } else if (descriptor.algorithm_id == core::algorithm::nsg) {
+            synthesize_effort(nsg_effort, [](const auto &extension) {
+              return ::alaya::make_nsg_search_extension(extension);
+            });
+          } else if (descriptor.algorithm_id == core::algorithm::fusion) {
+            synthesize_effort(fusion_effort, [](const auto &extension) {
+              return ::alaya::make_fusion_search_extension(extension);
+            });
+          } else {
+            synthesize_effort(qg_effort, [](const auto &extension) {
+              return ::alaya::make_qg_search_extension(extension);
+            });
+          }
+        }
         core::SearchRequest segment_request;
         segment_request.queries = request.queries;
         segment_request.options = request.options;
         segment_request.options.top_k = candidate_limit;
+        segment_request.options.extensions = segment_extensions;
         if (execution == core::FilterExecution::traversal && request.filter.active()) {
           segment_request.filter.kind = core::SegmentFilterKind::predicate;
           segment_request.filter.exact = false;
@@ -1511,7 +1573,7 @@ class SegmentedCollection {
         segment_request.lifetime_pin = std::const_pointer_cast<RoutingSnapshot>(snapshot);
 
         const auto capabilities = entry->segment.capabilities();
-        if (request.stats != nullptr && entry->segment.descriptor().medium == core::Medium::disk) {
+        if (request.stats != nullptr && descriptor.medium == core::Medium::disk) {
           std::uint64_t requests{};
           std::uint64_t bytes{};
           std::uint64_t row_bytes{};

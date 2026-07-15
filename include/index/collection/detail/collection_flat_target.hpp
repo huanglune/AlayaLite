@@ -261,10 +261,10 @@ struct FlatTargetBuildResult {
   return FlatTargetBuildResult{std::move(erased).value(), bytes};
 }
 
-[[nodiscard]] inline auto flat_segment_name(std::uint64_t segment_id) -> std::string {
+[[nodiscard]] inline auto collection_segment_name(std::uint64_t segment_id) -> std::string {
   auto digits = std::to_string(segment_id);
   if (digits.size() > 8) {
-    throw std::invalid_argument("Flat target segment id exceeds the native eight-digit namespace");
+    throw std::invalid_argument("Collection segment id exceeds the native eight-digit namespace");
   }
   return "seg_" + std::string(8 - digits.size(), '0') + digits;
 }

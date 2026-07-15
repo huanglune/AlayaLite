@@ -25,7 +25,8 @@
 #include <vector>
 
 #include "index/collection/detail/canonical_flat_segment.hpp"
-#include "index/collection/detail/collection_flat_target.hpp"
+#include "index/collection/detail/collection_segment_factory.hpp"
+#include "index/collection/detail/collection_target_builder.hpp"
 #include "index/collection/segmented_collection.hpp"
 #include "index/collection/sha256.hpp"
 #include "platform/fs.hpp"
@@ -37,7 +38,7 @@ class CollectionTestAccess;
 }  // namespace internal::collection
 
 inline constexpr std::string_view kCollectionPublicVersion{"1.1.0"};
-inline constexpr std::string_view kCollectionLegacyRemovalVersion{"1.2.0"};
+inline constexpr std::string_view kCollectionLegacyRemovalVersion{"1.1.0"};
 
 enum class CollectionQuantization : std::uint8_t {
   none = 0,
@@ -69,6 +70,7 @@ struct CollectionOptions {
   core::AlgorithmId target_algorithm{core::algorithm::hnsw};
   CollectionQuantization quantization{CollectionQuantization::none};
   std::uint32_t build_threads{1};
+  std::uint32_t max_neighbors{32};
   std::uint32_t ef_construction{400};
   std::uint64_t max_logical_id_bytes{64U * 1024U};
   // Zero disables automatic rotation. A positive value rotates after the
@@ -97,6 +99,10 @@ struct CollectionSealReceipt {
   core::RowCount sealed_rows{};
   std::uint64_t sealed_bytes{};
   std::uint64_t manifest_generation{};
+  core::AlgorithmId built_algorithm{core::algorithm::flat};
+  std::uint32_t effective_ef_construction{};
+  bool flat_fallback{};
+  std::string fallback_reason{};
 };
 
 struct CollectionCompactReceipt {
@@ -106,6 +112,10 @@ struct CollectionCompactReceipt {
   std::uint64_t input_bytes{};
   std::uint64_t output_bytes{};
   std::uint64_t manifest_generation{};
+  core::AlgorithmId built_algorithm{core::algorithm::flat};
+  std::uint32_t effective_ef_construction{};
+  bool flat_fallback{};
+  std::string fallback_reason{};
 };
 
 struct CollectionGcReceipt {
@@ -578,36 +588,14 @@ class Collection {
     return core::algorithm::flat;
   }
   [[nodiscard]] auto target_implementation_key() const -> std::string_view {
-    switch (options_.target_algorithm) {
-      case core::algorithm::flat:
-        return "disk_flat_segment";
-      case core::algorithm::hnsw:
-        return "hnsw_segment";
-      case core::algorithm::nsg:
-        return "nsg_segment";
-      case core::algorithm::fusion:
-        return "fusion_segment";
-      case core::algorithm::qg:
-        return "qg_segment";
-      default:
-        return "unknown";
-    }
+    const auto *registration = internal::collection::detail::find_collection_target_registration(
+        options_.target_algorithm);
+    return registration == nullptr ? std::string_view{"unknown"} : registration->implementation_key;
   }
   [[nodiscard]] auto target_engine_factory_key() const -> std::string_view {
-    switch (options_.target_algorithm) {
-      case core::algorithm::flat:
-        return "flat";
-      case core::algorithm::hnsw:
-        return "hnsw";
-      case core::algorithm::nsg:
-        return "nsg";
-      case core::algorithm::fusion:
-        return "fusion";
-      case core::algorithm::qg:
-        return "qg";
-      default:
-        return "unknown";
-    }
+    const auto *registration = internal::collection::detail::find_collection_target_registration(
+        options_.target_algorithm);
+    return registration == nullptr ? std::string_view{"unknown"} : registration->factory_key;
   }
 
   [[nodiscard]] auto close() -> core::Status {
@@ -640,11 +628,64 @@ class Collection {
     return core::Status::error(code, stage, detail, std::move(diagnostic));
   }
 
+  struct BuildAlgorithmResolution {
+    core::AlgorithmId algorithm{core::algorithm::flat};
+    bool flat_fallback{};
+    std::string fallback_reason{};
+  };
+
+  [[nodiscard]] static auto resolve_build_algorithm(
+      core::AlgorithmId requested_algorithm,
+      const internal::collection::CollectionSchema &schema,
+      core::RowCount live_row_count,
+      const internal::collection::detail::CollectionTargetBuildParams &params)
+      -> BuildAlgorithmResolution {
+    const auto *registration =
+        internal::collection::detail::find_collection_target_registration(requested_algorithm);
+    if (registration != nullptr && registration->supports(schema, live_row_count, params) ==
+                                       internal::collection::detail::TargetSupport::supported) {
+      return {requested_algorithm, false, {}};
+    }
+
+    BuildAlgorithmResolution resolution;
+    resolution.algorithm = core::algorithm::flat;
+    resolution.flat_fallback = true;
+    if (registration == nullptr) {
+      resolution.fallback_reason = "requested Collection target algorithm " +
+                                   std::to_string(requested_algorithm) +
+                                   " has no registered sealed builder; built Flat instead";
+    } else if ((requested_algorithm == core::algorithm::nsg ||
+                requested_algorithm == core::algorithm::fusion) &&
+               live_row_count < 65) {
+      resolution.fallback_reason =
+          std::string(registration->factory_key) + " requires >=65 live rows; built Flat instead";
+    } else if ((requested_algorithm == core::algorithm::nsg ||
+                requested_algorithm == core::algorithm::fusion) &&
+               schema.metric == core::Metric::cosine) {
+      resolution.fallback_reason = std::string(registration->factory_key) +
+                                   " cosine requires raw float32 vectors; built Flat instead";
+    } else if (requested_algorithm == core::algorithm::qg && live_row_count <= 32) {
+      resolution.fallback_reason = "qg requires >32 live rows; built Flat instead";
+    } else if (requested_algorithm == core::algorithm::qg &&
+               schema.metric == core::Metric::cosine) {
+      resolution.fallback_reason = "qg cosine is not enabled for RaBitQ; built Flat instead";
+    } else if (requested_algorithm == core::algorithm::qg &&
+               schema.scalar_type != core::ScalarType::float32) {
+      resolution.fallback_reason = "qg requires float32 vectors; built Flat instead";
+    } else {
+      resolution.fallback_reason = "requested Collection target '" +
+                                   std::string(registration->factory_key) +
+                                   "' is unsupported for this schema or live row count; built "
+                                   "Flat instead";
+    }
+    return resolution;
+  }
+
   [[nodiscard]] static auto validate_options(const CollectionOptions &options,
                                              core::OperationStage stage) -> core::Status {
     if (options.root.empty() || options.dim == 0 || options.max_logical_id_bytes == 0 ||
         core::scalar_type_size(options.scalar_type) == 0 || options.build_threads == 0 ||
-        options.ef_construction == 0) {
+        options.max_neighbors == 0 || options.ef_construction == 0) {
       return error(core::StatusCode::invalid_argument,
                    stage,
                    core::StatusDetail::malformed_struct,
@@ -667,12 +708,20 @@ class Collection {
                                  options.target_algorithm == core::algorithm::hnsw ||
                                  options.target_algorithm == core::algorithm::nsg ||
                                  options.target_algorithm == core::algorithm::fusion ||
-                                 options.target_algorithm == core::algorithm::qg;
+                                 options.target_algorithm == core::algorithm::qg ||
+                                 options.target_algorithm == core::algorithm::vamana;
     if (!algorithm_valid) {
       return error(core::StatusCode::not_supported,
                    stage,
                    core::StatusDetail::operation_slot_absent,
                    "canonical Collection target algorithm is unsupported");
+    }
+    if (options.target_algorithm == core::algorithm::vamana &&
+        options.ef_construction < options.max_neighbors) {
+      return error(core::StatusCode::invalid_argument,
+                   stage,
+                   core::StatusDetail::malformed_struct,
+                   "canonical Collection Vamana requires ef_construction >= max_neighbors");
     }
     if (options.quantization == CollectionQuantization::rabitq &&
         options.target_algorithm != core::algorithm::qg) {
@@ -688,7 +737,8 @@ class Collection {
                    core::StatusDetail::malformed_struct,
                    "canonical Collection qg requires quantization=rabitq");
     }
-    if (options.quantization != CollectionQuantization::none &&
+    if ((options.quantization == CollectionQuantization::sq8 ||
+         options.quantization == CollectionQuantization::sq4) &&
         options.scalar_type != core::ScalarType::float32) {
       return error(core::StatusCode::not_supported,
                    stage,
@@ -710,7 +760,7 @@ class Collection {
 
   [[nodiscard]] static auto numeric_segment_id(std::string_view segment_id) -> std::uint64_t {
     if (!segment_id.starts_with("seg_") || segment_id.size() != 12) {
-      throw std::invalid_argument("Gate-10 Flat segment identity is malformed");
+      throw std::invalid_argument("Collection segment identity is malformed");
     }
     return parse_u64(segment_id.substr(4));
   }
@@ -735,9 +785,10 @@ class Collection {
           continue;
         }
         core::OpenContext context;
-        auto erased = internal::collection::detail::open_collection_flat_entry(options.root,
+        auto erased =
+            internal::collection::detail::CollectionSegmentFactory::open_entry(options.root,
                                                                                entry,
-                                                                               options.scalar_type,
+                                                                               schema,
                                                                                context);
         if (!erased.ok()) {
           return erased.status();
@@ -820,57 +871,58 @@ class Collection {
       const internal::collection::RoutingSnapshot &snapshot,
       std::span<const internal::collection::RowAddress> sources,
       std::uint64_t target_segment_id,
-      std::uint64_t target_generation,
-      bool preserve_source_row_ids) -> core::Result<ReplacementBuildData> {
+      std::uint64_t target_generation) -> core::Result<ReplacementBuildData> {
     ReplacementBuildData result;
     std::uint64_t next_row{};
-    for (const auto &[logical_id, version] : snapshot.versions) {
-      if (!address_is_source(version.address, sources)) {
-        continue;
-      }
-      const auto target_row =
-          preserve_source_row_ids ? static_cast<std::uint64_t>(version.address.row_id) : next_row++;
-      internal::collection::RowAddress target{target_segment_id,
-                                              target_generation,
-                                              core::SegmentRowId(target_row)};
-      result.replacements.push_back({logical_id, version.address, target, version.upsert_sequence});
-      result.rows.push_back(
-          {logical_id, target.row_id, version.upsert_sequence, version.state, version.payload});
-      if (version.state == internal::collection::VersionState::live) {
-        ++result.live_rows;
-      }
-      std::uint64_t row_bytes = version.payload.document.size();
-      if (version.payload.vector.has_value() &&
-          !core::checked_add(row_bytes, version.payload.vector->bytes().size(), row_bytes)) {
-        return error(core::StatusCode::resource_exhausted,
-                     core::OperationStage::freeze,
-                     core::StatusDetail::arithmetic_overflow,
-                     "seal snapshot accounting overflowed");
-      }
-      for (const auto &[key, value] : version.payload.metadata) {
-        std::uint64_t scalar_bytes = key.size();
-        std::visit(
-            [&](const auto &item) {
-              using T = std::decay_t<decltype(item)>;
-              if constexpr (std::is_same_v<T, std::string>) {
-                scalar_bytes += item.size();
-              } else {
-                scalar_bytes += sizeof(item);
-              }
-            },
-            value);
-        if (!core::checked_add(row_bytes, scalar_bytes, row_bytes)) {
+    for (const auto state : {internal::collection::VersionState::live,
+                             internal::collection::VersionState::tombstone}) {
+      for (const auto &[logical_id, version] : snapshot.versions) {
+        if (version.state != state || !address_is_source(version.address, sources)) {
+          continue;
+        }
+        internal::collection::RowAddress target{target_segment_id,
+                                                target_generation,
+                                                core::SegmentRowId(next_row++)};
+        result.replacements.push_back(
+            {logical_id, version.address, target, version.upsert_sequence});
+        result.rows.push_back(
+            {logical_id, target.row_id, version.upsert_sequence, version.state, version.payload});
+        if (version.state == internal::collection::VersionState::live) {
+          ++result.live_rows;
+        }
+        std::uint64_t row_bytes = version.payload.document.size();
+        if (version.payload.vector.has_value() &&
+            !core::checked_add(row_bytes, version.payload.vector->bytes().size(), row_bytes)) {
           return error(core::StatusCode::resource_exhausted,
                        core::OperationStage::freeze,
                        core::StatusDetail::arithmetic_overflow,
-                       "seal metadata accounting overflowed");
+                       "seal snapshot accounting overflowed");
         }
-      }
-      if (!core::checked_add(result.snapshot_bytes, row_bytes, result.snapshot_bytes)) {
-        return error(core::StatusCode::resource_exhausted,
-                     core::OperationStage::freeze,
-                     core::StatusDetail::arithmetic_overflow,
-                     "seal snapshot total accounting overflowed");
+        for (const auto &[key, value] : version.payload.metadata) {
+          std::uint64_t scalar_bytes = key.size();
+          std::visit(
+              [&](const auto &item) {
+                using T = std::decay_t<decltype(item)>;
+                if constexpr (std::is_same_v<T, std::string>) {
+                  scalar_bytes += item.size();
+                } else {
+                  scalar_bytes += sizeof(item);
+                }
+              },
+              value);
+          if (!core::checked_add(row_bytes, scalar_bytes, row_bytes)) {
+            return error(core::StatusCode::resource_exhausted,
+                         core::OperationStage::freeze,
+                         core::StatusDetail::arithmetic_overflow,
+                         "seal metadata accounting overflowed");
+          }
+        }
+        if (!core::checked_add(result.snapshot_bytes, row_bytes, result.snapshot_bytes)) {
+          return error(core::StatusCode::resource_exhausted,
+                       core::OperationStage::freeze,
+                       core::StatusDetail::arithmetic_overflow,
+                       "seal snapshot total accounting overflowed");
+        }
       }
     }
     return result;
@@ -915,11 +967,11 @@ class Collection {
       return error(core::StatusCode::corruption,
                    core::OperationStage::save,
                    core::StatusDetail::malformed_struct,
-                   "Flat target build did not publish manifest v2");
+                   "Collection target build did not publish manifest v2");
     }
     auto manifest = std::move(*loaded.value());
     const auto target_name =
-        internal::collection::detail::flat_segment_name(control_state_.target_segment_id);
+        internal::collection::detail::collection_segment_name(control_state_.target_segment_id);
     const auto target = std::ranges::find_if(manifest.segments, [&](const auto &entry) {
       return entry.segment_id == target_name &&
              entry.generation == control_state_.target_generation;
@@ -928,12 +980,13 @@ class Collection {
       return error(core::StatusCode::corruption,
                    core::OperationStage::save,
                    core::StatusDetail::malformed_struct,
-                   "published manifest omits the Flat replacement target");
+                   "published manifest omits the Collection replacement target");
     }
     target->lifecycle = internal::collection::SegmentLifecycleV2::sealed;
     target->source_retention.clear();
     for (const auto &source : control_state_.sources) {
-      const auto source_name = internal::collection::detail::flat_segment_name(source.segment_id);
+      const auto source_name =
+          internal::collection::detail::collection_segment_name(source.segment_id);
       target->source_retention.push_back(source_name);
       const auto source_entry = std::ranges::find_if(manifest.segments, [&](const auto &entry) {
         return entry.segment_id == source_name && entry.generation == source.generation;
@@ -984,7 +1037,7 @@ class Collection {
     const auto target_name =
         state.target_segment_id == 0
             ? std::string{}
-            : internal::collection::detail::flat_segment_name(state.target_segment_id);
+            : internal::collection::detail::collection_segment_name(state.target_segment_id);
     const auto target_published =
         manifest.value().has_value() &&
         std::ranges::any_of(manifest.value()->segments, [&](const auto &entry) {
@@ -999,7 +1052,7 @@ class Collection {
       return error(core::StatusCode::corruption,
                    core::OperationStage::open,
                    core::StatusDetail::malformed_struct,
-                   "Gate-10 state says manifest-published but the target is absent");
+                   "Collection state says manifest-published but the target is absent");
     }
     if (state.phase == internal::collection::CollectionControlPhase::building &&
         !target_published) {
@@ -1042,7 +1095,8 @@ class Collection {
     auto pinned = implementation_->pin_routing_snapshot();
     for (const auto &source : control_state_.sources) {
       if (auto entry = pinned->find_segment(source.segment_id, source.generation)) {
-        const auto source_name = internal::collection::detail::flat_segment_name(source.segment_id);
+        const auto source_name =
+            internal::collection::detail::collection_segment_name(source.segment_id);
         pending_gc_.push_back(
             {source_name,
              control_state_.operation == internal::collection::CollectionControlOperation::compact
@@ -1132,7 +1186,7 @@ class Collection {
         return error(core::StatusCode::resource_exhausted,
                      core::OperationStage::freeze,
                      core::StatusDetail::arithmetic_overflow,
-                     "Flat segment namespace is exhausted");
+                     "Collection segment namespace is exhausted");
       }
       control_state_.operation = internal::collection::CollectionControlOperation::seal;
       control_state_.phase = internal::collection::CollectionControlPhase::cut_pending;
@@ -1195,8 +1249,7 @@ class Collection {
     auto build_data = collect_replacement_rows(*pinned,
                                                control_state_.sources,
                                                control_state_.target_segment_id,
-                                               control_state_.target_generation,
-                                               true);
+                                               control_state_.target_generation);
     if (!build_data.ok()) {
       return build_data.status();
     }
@@ -1231,10 +1284,10 @@ class Collection {
     if (!base_manifest.ok()) {
       return base_manifest.status();
     }
-    disk::DiskFlatPublicationOptions publication;
+    internal::collection::detail::CollectionTargetPublication publication;
     publication.collection_root = options_.root;
     publication.segment_id =
-        internal::collection::detail::flat_segment_name(control_state_.target_segment_id);
+        internal::collection::detail::collection_segment_name(control_state_.target_segment_id);
     publication.segment_generation = control_state_.target_generation;
     publication.manifest_generation =
         std::max(control_state_.manifest_generation + 1,
@@ -1268,10 +1321,21 @@ class Collection {
                                                   options_.metric,
                                                   options_.scalar_type,
                                                   options_.max_logical_id_bytes};
-    auto built = internal::collection::detail::build_collection_flat_target(schema,
-                                                                            build_data.value().rows,
-                                                                            publication,
-                                                                            build_context);
+    internal::collection::detail::CollectionTargetBuildParams build_params;
+    build_params.quantization = options_.quantization;
+    build_params.max_neighbors = options_.max_neighbors;
+    build_params.ef_construction = options_.ef_construction;
+    build_params.thread_count = options_.build_threads;
+    const auto resolution = resolve_build_algorithm(options_.target_algorithm,
+                                                    schema,
+                                                    build_data.value().live_rows,
+                                                    build_params);
+    auto built = internal::collection::detail::build_collection_target(resolution.algorithm,
+                                                                       schema,
+                                                                       build_data.value().rows,
+                                                                       build_params,
+                                                                       publication,
+                                                                       build_context);
     if (options.fail_point == CollectionSealFailPoint::during_export_build &&
         options.failpoint_hook) {
       fire_seal_failpoint(options, CollectionSealFailPoint::during_export_build);
@@ -1280,6 +1344,12 @@ class Collection {
       return built.status();
     }
     auto built_target = std::move(built).value();
+    built_target.requested_algorithm = options_.target_algorithm;
+    built_target.flat_fallback = resolution.flat_fallback;
+    built_target.fallback_reason = resolution.fallback_reason;
+    if (resolution.flat_fallback) {
+      built_target.built_algorithm = core::algorithm::flat;
+    }
     status = patch_published_target_manifest();
     if (!status.ok()) {
       return status;
@@ -1294,7 +1364,7 @@ class Collection {
     for (const auto &source : control_state_.sources) {
       if (auto entry = pinned->find_segment(source.segment_id, source.generation)) {
         pending_gc_.push_back(
-            {internal::collection::detail::flat_segment_name(source.segment_id), {}, entry});
+            {internal::collection::detail::collection_segment_name(source.segment_id), {}, entry});
       }
     }
     internal::collection::SegmentRegistration target;
@@ -1330,6 +1400,10 @@ class Collection {
     receipt.sealed_rows = build_data.value().live_rows;
     receipt.sealed_bytes = built_target.artifact_bytes;
     receipt.manifest_generation = control_state_.manifest_generation;
+    receipt.built_algorithm = built_target.built_algorithm;
+    receipt.effective_ef_construction = built_target.effective_ef_construction;
+    receipt.flat_fallback = built_target.flat_fallback;
+    receipt.fallback_reason = built_target.fallback_reason;
     const auto mapping_file = control_state_.mapping_file;
     control_state_.operation = internal::collection::CollectionControlOperation::idle;
     control_state_.phase = internal::collection::CollectionControlPhase::idle;
@@ -1504,7 +1578,7 @@ class Collection {
     const auto target_segment_id = control_state_.next_segment_id++;
     constexpr std::uint64_t kTargetGeneration = 1;
     auto build_data =
-        collect_replacement_rows(*pinned, sources, target_segment_id, kTargetGeneration, false);
+        collect_replacement_rows(*pinned, sources, target_segment_id, kTargetGeneration);
     if (!build_data.ok()) {
       return build_data.status();
     }
@@ -1541,9 +1615,10 @@ class Collection {
       return status;
     }
 
-    ::alaya::disk::DiskFlatPublicationOptions publication;
+    internal::collection::detail::CollectionTargetPublication publication;
     publication.collection_root = options_.root;
-    publication.segment_id = internal::collection::detail::flat_segment_name(target_segment_id);
+    publication.segment_id =
+        internal::collection::detail::collection_segment_name(target_segment_id);
     publication.segment_generation = kTargetGeneration;
     publication.manifest_generation =
         std::max(base_manifest.publication.generation + 1, control_state_.manifest_generation + 1);
@@ -1569,14 +1644,31 @@ class Collection {
                                                   options_.metric,
                                                   options_.scalar_type,
                                                   options_.max_logical_id_bytes};
-    auto built = internal::collection::detail::build_collection_flat_target(schema,
-                                                                            build_data.value().rows,
-                                                                            publication,
-                                                                            build_context);
+    internal::collection::detail::CollectionTargetBuildParams build_params;
+    build_params.quantization = options_.quantization;
+    build_params.max_neighbors = options_.max_neighbors;
+    build_params.ef_construction = options_.ef_construction;
+    build_params.thread_count = options_.build_threads;
+    const auto resolution = resolve_build_algorithm(options_.target_algorithm,
+                                                    schema,
+                                                    build_data.value().live_rows,
+                                                    build_params);
+    auto built = internal::collection::detail::build_collection_target(resolution.algorithm,
+                                                                       schema,
+                                                                       build_data.value().rows,
+                                                                       build_params,
+                                                                       publication,
+                                                                       build_context);
     if (!built.ok()) {
       return built.status();
     }
     auto built_target = std::move(built).value();
+    built_target.requested_algorithm = options_.target_algorithm;
+    built_target.flat_fallback = resolution.flat_fallback;
+    built_target.fallback_reason = resolution.fallback_reason;
+    if (resolution.flat_fallback) {
+      built_target.built_algorithm = core::algorithm::flat;
+    }
     status = patch_published_target_manifest();
     if (!status.ok()) {
       return status;
@@ -1588,7 +1680,8 @@ class Collection {
     }
 
     for (const auto &source : sources) {
-      const auto source_name = internal::collection::detail::flat_segment_name(source.segment_id);
+      const auto source_name =
+          internal::collection::detail::collection_segment_name(source.segment_id);
       if (auto entry = pinned->find_segment(source.segment_id, source.generation)) {
         pending_gc_.push_back({source_name, options_.root / "segments" / source_name, entry});
       }
@@ -1627,6 +1720,10 @@ class Collection {
     receipt.input_bytes = input_bytes;
     receipt.output_bytes = built_target.artifact_bytes;
     receipt.manifest_generation = control_state_.manifest_generation;
+    receipt.built_algorithm = built_target.built_algorithm;
+    receipt.effective_ef_construction = built_target.effective_ef_construction;
+    receipt.flat_fallback = built_target.flat_fallback;
+    receipt.fallback_reason = built_target.fallback_reason;
     const auto mapping_file = control_state_.mapping_file;
     if (!core::checked_add(control_state_.compacted_bytes,
                            input_bytes,
@@ -1665,7 +1762,7 @@ class Collection {
     std::vector<std::string> reclaim;
     const auto retained = control_state_.last_sealed_segment_id == 0
                               ? std::string{}
-                              : internal::collection::detail::flat_segment_name(
+                              : internal::collection::detail::collection_segment_name(
                                     control_state_.last_sealed_segment_id);
     for (const auto &segment_id : manifest.gc.pending_segment_ids) {
       if (segment_id == retained) {
@@ -1846,6 +1943,7 @@ class Collection {
            "\ntarget_algorithm=" + std::to_string(options.target_algorithm) +
            "\nquantization=" + std::to_string(static_cast<unsigned>(options.quantization)) +
            "\nbuild_threads=" + std::to_string(options.build_threads) +
+           "\nmax_neighbors=" + std::to_string(options.max_neighbors) +
            "\nef_construction=" + std::to_string(options.ef_construction) +
            "\nmax_logical_id_bytes=" + std::to_string(options.max_logical_id_bytes) +
            "\nactive_segment_id=" + std::to_string(kActiveSegmentId) +
@@ -1919,7 +2017,7 @@ class Collection {
         }
         return found->second;
       };
-      if (fields.size() != 13 || required("format") != "1" ||
+      if (fields.size() != 14 || required("format") != "1" ||
           required("public_version") != kCollectionPublicVersion ||
           required("checksum") != internal::collection::sha256(prefix).hex() ||
           parse_u64(required("active_segment_id")) != kActiveSegmentId ||
@@ -1935,6 +2033,7 @@ class Collection {
       options.quantization =
           static_cast<CollectionQuantization>(parse_u64(required("quantization")));
       options.build_threads = static_cast<std::uint32_t>(parse_u64(required("build_threads")));
+      options.max_neighbors = static_cast<std::uint32_t>(parse_u64(required("max_neighbors")));
       options.ef_construction = static_cast<std::uint32_t>(parse_u64(required("ef_construction")));
       options.max_logical_id_bytes = parse_u64(required("max_logical_id_bytes"));
       auto status = validate_options(options, core::OperationStage::open);

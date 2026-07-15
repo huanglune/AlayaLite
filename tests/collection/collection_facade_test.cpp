@@ -66,6 +66,12 @@ class TemporaryDirectory {
   return result;
 }
 
+[[nodiscard]] auto flat_options(const std::filesystem::path &root) -> CollectionOptions {
+  auto result = options(root);
+  result.target_algorithm = core::algorithm::flat;
+  return result;
+}
+
 [[nodiscard]] auto item(std::string id,
                         const std::array<float, 2> &vector,
                         std::string document = {},
@@ -255,7 +261,7 @@ TEST(CollectionFacade, CxxDirectParitySequenceUsesTheCanonicalWireShape) {
 
 TEST(CollectionFacade, SealRotatesToSuccessorPublishesFlatAndReopens) {
   TemporaryDirectory temporary;
-  auto created = Collection::create(options(temporary.path()));
+  auto created = Collection::create(flat_options(temporary.path()));
   ASSERT_TRUE(created.ok()) << created.status().diagnostic();
   auto collection = std::move(created).value();
   std::vector<std::array<float, 2>> vectors{{0.0F, 0.0F}, {1.0F, 0.0F}, {2.0F, 0.0F}, {3.0F, 0.0F}};
@@ -316,7 +322,7 @@ TEST(CollectionFacade, SealRotatesToSuccessorPublishesFlatAndReopens) {
 
 TEST(CollectionFacade, FlatCompactPreservesRowsAndGcDeletesOnlyReleasedSources) {
   TemporaryDirectory temporary;
-  auto created = Collection::create(options(temporary.path()));
+  auto created = Collection::create(flat_options(temporary.path()));
   ASSERT_TRUE(created.ok()) << created.status().diagnostic();
   auto collection = std::move(created).value();
   const std::array<std::array<float, 2>, 4> vectors{

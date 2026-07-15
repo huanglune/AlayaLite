@@ -18,6 +18,54 @@ alaya_add_test(
 )
 
 alaya_cc_target(
+  collection_vamana_seal_test
+  SRCS collection_vamana_seal_test.cpp
+  GTEST
+)
+alaya_add_test(
+  NAME collection_vamana_seal_test
+  TARGET collection_vamana_seal_test
+  LABELS integration collection disk
+  TIMEOUT 120
+)
+
+alaya_cc_target(
+  collection_hnsw_seal_test
+  SRCS collection_hnsw_seal_test.cpp
+  GTEST
+)
+alaya_add_test(
+  NAME collection_hnsw_seal_test
+  TARGET collection_hnsw_seal_test
+  LABELS integration collection memory
+  TIMEOUT 180
+)
+
+alaya_cc_target(
+  collection_nsg_fusion_seal_test
+  SRCS collection_nsg_fusion_seal_test.cpp
+  GTEST
+)
+alaya_add_test(
+  NAME collection_nsg_fusion_seal_test
+  TARGET collection_nsg_fusion_seal_test
+  LABELS integration collection memory
+  TIMEOUT 600
+)
+
+alaya_cc_target(
+  collection_qg_seal_test
+  SRCS collection_qg_seal_test.cpp
+  GTEST
+)
+alaya_add_test(
+  NAME collection_qg_seal_test
+  TARGET collection_qg_seal_test
+  LABELS integration collection memory
+  TIMEOUT 300
+)
+
+alaya_cc_target(
   collection_facade_stress_test
   SRCS collection_facade_stress_test.cpp
   GTEST

@@ -153,7 +153,9 @@ class HnswSegment {
     descriptor.metric = search_space_->metric();
     descriptor.stored_scalar_type = core::scalar_type_for<DataType>;
     descriptor.medium = core::Medium::memory;
-    descriptor.preprocessing = core::MetricPreprocessing::none;
+    descriptor.preprocessing = std::is_same_v<SearchSpaceType, BuildSpaceType>
+                                   ? core::MetricPreprocessing::none
+                                   : core::MetricPreprocessing::engine_quantized;
     descriptor.engine_factory_id = core::algorithm::hnsw;
     return descriptor;
   }
