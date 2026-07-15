@@ -25,8 +25,7 @@ namespace alaya {
 class RaBitQDeep1MTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    std::filesystem::path data_dir = test::data_dir();
-    config_ = deep1m(data_dir);
+    config_ = deep1m();
     ds_ = load_dataset(config_);
   }
 
@@ -41,14 +40,14 @@ TEST_F(RaBitQDeep1MTest, Deep1MQGTest) {
   // ***************INDEX******************
   LOG_INFO("Building QG on Deep1M...");
   std::filesystem::path index_file =
-      fmt::format("{}_rabitq.qg", config_.dir_.string() + "/deep1M");
+      fmt::format("{}_rabitq.qg", config_.dir.string() + "/deep1M");
   std::string_view path = index_file.native();
 
   if (!std::filesystem::exists(index_file)) {
     std::shared_ptr<alaya::RaBitQSpace<>> space =
-        std::make_shared<alaya::RaBitQSpace<>>(ds_.data_num_, ds_.dim_, core::Metric::l2);
-    space->fit(ds_.data_.data(), ds_.data_num_);
-    LOG_INFO("Successfully fit data into space, data_num={}, dim={}", ds_.data_num_, ds_.dim_);
+        std::make_shared<alaya::RaBitQSpace<>>(ds_.data_num, ds_.dim, core::Metric::l2);
+    space->fit(ds_.data.data(), ds_.data_num);
+    LOG_INFO("Successfully fit data into space, data_num={}, dim={}", ds_.data_num, ds_.dim);
 
     auto qg = alaya::detail::QgBuilderKernel<RaBitQSpace<>>(space);
     qg.build_graph();
@@ -69,7 +68,7 @@ TEST_F(RaBitQDeep1MTest, Deep1MQGTest) {
   std::vector<std::vector<float>> all_qps(test_round, std::vector<float>(efs.size()));
   std::vector<std::vector<float>> all_recall(test_round, std::vector<float>(efs.size()));
 
-  LOG_INFO("Start querying Deep1M, query_num={}, topk={}, test_round={}", ds_.query_num_, topk,
+  LOG_INFO("Start querying Deep1M, query_num={}, topk={}, test_round={}", ds_.query_num, topk,
            test_round);
   for (size_t r = 0; r < test_round; ++r) {
     for (size_t i = 0; i < efs.size(); ++i) {  // NOLINT
@@ -78,24 +77,24 @@ TEST_F(RaBitQDeep1MTest, Deep1MQGTest) {
       float total_time = 0;
       std::vector<IDType> results(topk);
       LOG_INFO("Round {}/{}, ef={}", r + 1, test_round, ef);
-      for (uint32_t n = 0; n < ds_.query_num_; ++n) {
+      for (uint32_t n = 0; n < ds_.query_num; ++n) {
         timer.reset();
-        search_job->rabitq_search_solo(ds_.queries_.data() + (n * ds_.dim_), topk, results.data(),
+        search_job->rabitq_search_solo(ds_.queries.data() + (n * ds_.dim), topk, results.data(),
                                        ef);
 
         total_time += timer.elapsed_us();
         // recall
         for (size_t k = 0; k < topk; ++k) {
           for (size_t j = 0; j < topk; ++j) {
-            if (results[k] == ds_.ground_truth_[(n * ds_.gt_dim_) + j]) {
+            if (results[k] == ds_.ground_truth[(n * ds_.gt_dim) + j]) {
               total_correct++;
               break;
             }
           }
         }
       }
-      float qps = static_cast<float>(ds_.query_num_) / (total_time / 1e6F);
-      float recall = static_cast<float>(total_correct) / static_cast<float>(ds_.query_num_ * topk);
+      float qps = static_cast<float>(ds_.query_num) / (total_time / 1e6F);
+      float recall = static_cast<float>(total_correct) / static_cast<float>(ds_.query_num * topk);
 
       all_qps[r][i] = qps;
       all_recall[r][i] = recall;

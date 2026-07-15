@@ -9,8 +9,9 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-#include "core/log.hpp"
+
 #include "simd/distance_l2.hpp"
+
 namespace alaya {
 
 template <typename DataType = float, typename DistanceType = float, typename IDType = uint32_t>
@@ -21,12 +22,11 @@ auto find_exact_gt(const std::vector<DataType> &queries,
                    std::unordered_set<IDType> *deleted = nullptr) -> std::vector<IDType> {
   if (queries.empty() || data_view.empty() || queries.size() % dim != 0 ||
       data_view.size() % dim != 0) {
-    LOG_ERROR("The input data to find ground truth is invalid.");
     return {};
   }
   auto query_num = queries.size() / dim;
-
   std::vector<IDType> res(topk * query_num, 0);
+
   for (IDType i = 0; i < query_num; i++) {
     std::vector<std::pair<IDType, DistanceType>> dists;
     for (uint32_t j = 0; j < data_view.size() / dim; j++) {
@@ -38,8 +38,8 @@ auto find_exact_gt(const std::vector<DataType> &queries,
                                                         dim);
       dists.emplace_back(j, dist);
     }
-    std::sort(dists.begin(), dists.end(), [](const auto &lhs, const auto &rhs) -> auto {
-      return lhs.second < rhs.second;
+    std::sort(dists.begin(), dists.end(), [](const auto &a, const auto &b) {
+      return a.second < b.second;
     });
     for (uint32_t j = 0; j < topk; j++) {
       res[(i * topk) + j] = dists[j].first;
@@ -65,7 +65,7 @@ auto calc_recall(const IDType *res,
       }
     }
   }
-  return static_cast<float>(cnt) / (query_num * topk);
+  return static_cast<float>(cnt) / static_cast<float>(query_num * topk);
 }
 
 template <typename IDType>
@@ -85,25 +85,22 @@ auto calc_recall(const std::vector<std::vector<IDType>> &res,
       }
     }
   }
-  return static_cast<float>(cnt) / (query_num * topk);
+  return static_cast<float>(cnt) / static_cast<float>(query_num * topk);
 }
 
 template <typename T>
 auto horizontal_avg(const std::vector<std::vector<T>> &data) -> std::vector<T> {
-  size_t rows = data.size();
-  size_t cols = data[0].size();
-
+  auto rows = data.size();
+  auto cols = data[0].size();
   std::vector<T> avg(cols, 0);
-  for (auto &row : data) {
-    for (size_t j = 0; j < cols; ++j) {
+  for (const auto &row : data) {
+    for (std::size_t j = 0; j < cols; ++j) {
       avg[j] += row[j];
     }
   }
-
-  for (size_t j = 0; j < cols; ++j) {
-    avg[j] /= rows;
+  for (std::size_t j = 0; j < cols; ++j) {
+    avg[j] /= static_cast<T>(rows);
   }
-
   return avg;
 }
 

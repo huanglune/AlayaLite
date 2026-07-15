@@ -72,14 +72,14 @@ auto max_thread_num() -> uint32_t { return configured_thread_limit(); }
 
 
 auto make_raw_space(const Dataset &ds) -> std::shared_ptr<RawSpaceType> {
-  auto space = std::make_shared<RawSpaceType>(ds.data_num_, ds.dim_, core::Metric::l2);
-  space->fit(ds.data_.data(), ds.data_num_);
+  auto space = std::make_shared<RawSpaceType>(ds.data_num, ds.dim, core::Metric::l2);
+  space->fit(ds.data.data(), ds.data_num);
   return space;
 }
 
 auto make_sq8_space(const Dataset &ds) -> std::shared_ptr<SQ8SpaceType> {
-  auto space = std::make_shared<SQ8SpaceType>(ds.data_num_, ds.dim_, core::Metric::l2);
-  space->fit(ds.data_.data(), ds.data_num_);
+  auto space = std::make_shared<SQ8SpaceType>(ds.data_num, ds.dim, core::Metric::l2);
+  space->fit(ds.data.data(), ds.data_num);
   return space;
 }
 
@@ -116,22 +116,22 @@ auto make_graph_from_edges(const std::vector<std::vector<uint32_t>> &adjacency)
 }
 
 auto selective_score_threshold(const Dataset &ds) -> double {
-  auto tail_count = std::min<uint32_t>(kSparseTailCount, ds.data_num_);
-  auto cutoff = ds.data_num_ > tail_count ? ds.data_num_ - tail_count : ds.data_num_ / 2;
+  auto tail_count = std::min<uint32_t>(kSparseTailCount, ds.data_num);
+  auto cutoff = ds.data_num > tail_count ? ds.data_num - tail_count : ds.data_num / 2;
   return static_cast<double>(cutoff) * 10.0;
 }
 
 auto sparse_id_threshold(const Dataset &ds) -> int64_t {
-  auto tail_count = std::min<uint32_t>(kSparseTailCount, ds.data_num_);
-  if (tail_count >= ds.data_num_) {
+  auto tail_count = std::min<uint32_t>(kSparseTailCount, ds.data_num);
+  if (tail_count >= ds.data_num) {
     return 0;
   }
-  return static_cast<int64_t>(ds.data_num_ - tail_count);
+  return static_cast<int64_t>(ds.data_num - tail_count);
 }
 
 auto load_or_build_hnsw_graph(const Dataset &ds, const std::shared_ptr<RawSpaceType> &space)
     -> std::shared_ptr<GraphType> {
-  auto graph_path = test_cache_dir() / fmt::format("{}_M{}.HNSW", ds.name_, kHnswM);
+  auto graph_path = test_cache_dir() / fmt::format("{}_M{}.HNSW", ds.name, kHnswM);
   auto lock_path = graph_path;
   lock_path += ".lock";
   auto graph_path_str = graph_path.string();
@@ -143,9 +143,9 @@ auto load_or_build_hnsw_graph(const Dataset &ds, const std::shared_ptr<RawSpaceT
 
       core::BuildContext build_context;
       auto segment =
-          HnswSegment<RawSpaceType>::build({core::TypedTensorView::contiguous(ds.data_.data(),
-                                                                              ds.data_num_,
-                                                                              ds.dim_),
+          HnswSegment<RawSpaceType>::build({core::TypedTensorView::contiguous(ds.data.data(),
+                                                                              ds.data_num,
+                                                                              ds.dim),
                                             space,
                                             space},
                                            {.thread_count = max_thread_num()},
@@ -165,7 +165,7 @@ auto load_or_build_hnsw_graph(const Dataset &ds, const std::shared_ptr<RawSpaceT
     }
   }
 
-  auto graph = std::make_shared<GraphType>(ds.data_num_, kHnswM);
+  auto graph = std::make_shared<GraphType>(ds.data_num, kHnswM);
   graph->load(graph_path_str);
   return graph;
 }
@@ -174,16 +174,16 @@ template <typename SearchJobPtr>
 auto run_parallel_search(SearchJobPtr &search_job, Dataset &ds, uint32_t topk, uint32_t ef)
     -> std::vector<std::vector<uint32_t>> {
   Timer timer{};
-  std::vector<std::vector<uint32_t>> res_pool(ds.query_num_, std::vector<uint32_t>(topk));
+  std::vector<std::vector<uint32_t>> res_pool(ds.query_num, std::vector<uint32_t>(topk));
   const size_t search_thread_num =
       std::min<size_t>(cap_thread_count(16),
-                       std::max<size_t>(1, static_cast<size_t>(ds.query_num_)));
+                       std::max<size_t>(1, static_cast<size_t>(ds.query_num)));
   std::vector<std::thread> tasks(search_thread_num);
 
   auto search_knn = [&](uint32_t i) {
-    for (; i < ds.query_num_; i += search_thread_num) {
+    for (; i < ds.query_num; i += search_thread_num) {
       std::vector<uint32_t> ids(topk);
-      auto cur_query = ds.queries_.data() + i * ds.dim_;
+      auto cur_query = ds.queries.data() + i * ds.dim;
       search_job->search_solo(cur_query, ids.data(), topk, ef);
 
       auto id_set = std::set(ids.begin(), ids.end());
@@ -214,7 +214,7 @@ struct BaseSearchResources {
   std::shared_ptr<GraphType> hnsw_graph_;
 
   BaseSearchResources()
-      : ds_(load_dataset(sift_micro(test_data_dir()))),
+      : ds_(load_dataset(sift_micro())),
         raw_space_(make_raw_space(ds_)),
         hnsw_graph_(load_or_build_hnsw_graph(ds_, raw_space_)) {}
 };
@@ -250,10 +250,10 @@ TEST_F(SearchTest, FullGraphTest) {
   auto &dataset = ds();
   const auto &load_graph = *graph();
 
-  std::vector<uint32_t> inpoint_num(dataset.data_num_);
-  std::vector<uint32_t> outpoint_num(dataset.data_num_);
+  std::vector<uint32_t> inpoint_num(dataset.data_num);
+  std::vector<uint32_t> outpoint_num(dataset.data_num);
 
-  for (uint32_t i = 0; i < dataset.data_num_; ++i) {
+  for (uint32_t i = 0; i < dataset.data_num; ++i) {
     for (uint32_t j = 0; j < load_graph.max_nbrs_; ++j) {
       auto id = load_graph.at(i, j);
       if (id == Graph<uint32_t>::kEmptyId) {
@@ -266,7 +266,7 @@ TEST_F(SearchTest, FullGraphTest) {
 
   uint64_t zero_outpoint_cnt = 0;
   uint64_t zero_inpoint_cnt = 0;
-  for (uint32_t i = 0; i < dataset.data_num_; ++i) {
+  for (uint32_t i = 0; i < dataset.data_num; ++i) {
     if (outpoint_num[i] != 0) {
       zero_outpoint_cnt++;
     }
@@ -275,10 +275,10 @@ TEST_F(SearchTest, FullGraphTest) {
     }
   }
 
-  auto inpoint_ratio = static_cast<double>(zero_inpoint_cnt) / dataset.data_num_;
+  auto inpoint_ratio = static_cast<double>(zero_inpoint_cnt) / dataset.data_num;
   LOG_INFO("no_zero_inpoint = {} , no_zero_oupoint = {}", zero_inpoint_cnt, zero_outpoint_cnt);
   EXPECT_GE(inpoint_ratio, 0.9);
-  EXPECT_EQ(zero_outpoint_cnt, dataset.data_num_);
+  EXPECT_EQ(zero_outpoint_cnt, dataset.data_num);
 }
 
 TEST_F(SearchTest, SearchHNSWTest) {
@@ -287,9 +287,9 @@ TEST_F(SearchTest, SearchHNSWTest) {
 
   auto res_pool = run_parallel_search(search_job, dataset, kDefaultTopk, kDefaultEf);
   auto recall = calc_recall(res_pool,
-                            dataset.ground_truth_.data(),
-                            dataset.query_num_,
-                            dataset.gt_dim_,
+                            dataset.ground_truth.data(),
+                            dataset.query_num,
+                            dataset.gt_dim,
                             kDefaultTopk);
   LOG_INFO("recall is {}.", recall);
   EXPECT_GE(recall, 0.5);
@@ -304,9 +304,9 @@ TEST_F(SearchTest, SearchHNSWTestSQSpace) {
 
   auto res_pool = run_parallel_search(search_job, dataset, kDefaultTopk, kDefaultEf);
   auto recall = calc_recall(res_pool,
-                            dataset.ground_truth_.data(),
-                            dataset.query_num_,
-                            dataset.gt_dim_,
+                            dataset.ground_truth.data(),
+                            dataset.query_num,
+                            dataset.gt_dim,
                             kDefaultTopk);
   LOG_INFO("sq8 recall is {}.", recall);
   EXPECT_GE(recall, 0.5);

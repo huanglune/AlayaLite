@@ -12,10 +12,10 @@ namespace alaya {
 TEST(DatasetTest, SiftMicroConfig) {
   auto config = sift_micro();
 
-  EXPECT_EQ(config.name_, "siftmicro");
-  EXPECT_EQ(config.max_data_num_, 1000);
-  EXPECT_EQ(config.max_query_num_, 50);
-  EXPECT_TRUE(config.data_file_.string().find("siftsmall") != std::string::npos);
+  EXPECT_EQ(config.name, "siftmicro");
+  EXPECT_EQ(config.max_data_num, 1000);
+  EXPECT_EQ(config.max_query_num, 50);
+  EXPECT_TRUE(config.data_file.string().find("siftsmall") != std::string::npos);
 }
 
 TEST(DatasetTest, NoArgOverloadsUseTestDataDir) {
@@ -23,9 +23,9 @@ TEST(DatasetTest, NoArgOverloadsUseTestDataDir) {
   auto sm = sift_micro();
   auto d1 = deep1m();
 
-  EXPECT_EQ(ss.dir_.parent_path(), test::data_dir());
-  EXPECT_EQ(sm.dir_.parent_path(), test::data_dir());
-  EXPECT_EQ(d1.dir_.parent_path(), test::data_dir());
+  EXPECT_EQ(ss.dir.parent_path(), test::data_dir());
+  EXPECT_EQ(sm.dir.parent_path(), test::data_dir());
+  EXPECT_EQ(d1.dir.parent_path(), test::data_dir());
 }
 
 }  // namespace alaya

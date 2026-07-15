@@ -7,234 +7,116 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
-#include <memory>
+#include <stdexcept>
 #include <string>
-#include <string_view>
 #include <vector>
-#include "core/log.hpp"
+
 namespace alaya {
 
-/**
- * @brief Load the vector data from fvecs file.
- *
- * @param filepath The filename.
- * @param data     The data position that will be loaded to.
- * @param num      The number of data.
- * @param dim      The dimension of vector.
- * File format: [num] [dim] [vector1] [vector2] ...
- */
-template <typename T>
-inline void load_vecs(const std::filesystem::path &filepath,
-                      std::vector<T> &data,
-                      uint32_t &num,
-                      uint32_t &dim) {
-  std::ifstream reader(filepath, std::ios::binary);
+namespace detail {
 
-  if (!reader.is_open()) {
-    LOG_CRITICAL("Open fvecs file error {}.", filepath.string());
-    exit(-1);
+inline void check_open(const std::ifstream &stream, const std::filesystem::path &path) {
+  if (!stream.is_open()) {
+    throw std::runtime_error("Cannot open file: " + path.string());
   }
-
-  reader.read(reinterpret_cast<char *>(&num), 4);
-  reader.read(reinterpret_cast<char *>(&dim), 4);
-  data.reserve(num * dim);
-
-  LOG_INFO("Read {} , data number = {} , data dimension = {}.", filepath.string(), num, dim);
-
-  for (size_t i = 0; i < num; i++) {
-    reader.read(reinterpret_cast<char *>(data.data() + (i * dim)), dim * sizeof(T));
-  }
-  reader.close();
 }
 
-/**
- * @brief Save the vector data to ivecs file, usually used for groudture file.
- *
- * @param filename The filename.
- * @param data     The data position.
- * @param num      The number of data.
- * @param dim      The dimension of vector.
- * File format: [num] [dim] [vector1] [vector2] ...
- */
+}  // namespace detail
+
 template <typename T>
-inline void save_ivecs(const std::filesystem::path &filepath, T *data, uint32_t num, uint32_t dim) {
-  std::ofstream writer(filepath, std::ios::binary);
-  if (!writer.is_open()) {
-    LOG_CRITICAL("Open fvecs file error for writing . {}", filepath.string());
-    exit(-1);
-  }
-
-  writer.write(reinterpret_cast<char *>(&num), 4);
-
-  for (unsigned i = 0; i < num; ++i) {
-    writer.write(reinterpret_cast<char *>(&dim), 4);
-    writer.write(reinterpret_cast<char *>(data + (i * dim)), dim * sizeof(T));
-  }
-
-  writer.close();
-}
-
-/**
- * @brief Load the ground truth ids from the file
- *
- * @param filename The filename.
- * @param data     The data position that will be loaded to.
- * @param num      The number of query.
- * @param gt_topk  Each query has gt_topk ground truth ids.
- * File format: [num] [gt_topk] [id1] [id2] ...
- */
-template <typename T>
-inline void load_gt(const std::filesystem::path &filepath,
-                    std::vector<T> &data,
-                    uint32_t &num,
-                    uint32_t &gt_topk) {
+void load_fvecs(const std::filesystem::path &filepath,
+                std::vector<T> &data,
+                uint32_t &num,
+                uint32_t &dim) {
   std::ifstream reader(filepath, std::ios::binary);
-  if (!reader.is_open()) {
-    LOG_CRITICAL("Open ivecs file error {}.", filepath.string());
-    exit(-1);
-  }
-
-  reader.read(reinterpret_cast<char *>(&num), 4);
-  reader.read(reinterpret_cast<char *>(&gt_topk), 4);
-
-  data.reserve(num * gt_topk);
-
-  for (size_t i = 0; i < num; i++) {
-    reader.read(reinterpret_cast<char *>(data.data() + (i * gt_topk)), gt_topk * sizeof(T));
-  }
-  reader.close();
-}
-
-/**
- * @brief Load the vector data from fvecs file.
- *
- * @param filepath The filename.
- * @param data  The data position that will be loaded to.
- * @param num The number of data.
- * @param dim The dimension of each vector.
- *
- */
-template <typename T>
-inline void load_fvecs(const std::filesystem::path &filepath,
-                       std::vector<T> &data,
-                       uint32_t &num,
-                       uint32_t &dim) {
-  std::ifstream reader(filepath, std::ios::binary);
-
-  if (!reader.is_open()) {
-    LOG_CRITICAL("Open fvecs file error {}.", filepath.string());
-    exit(-1);
-  }
+  detail::check_open(reader, filepath);
 
   num = 0;
   data.clear();
 
-  while (!reader.eof()) {
-    reader.read(reinterpret_cast<char *>(&dim), 4);
-    if (reader.eof()) {
-      break;
-    }
+  while (reader.read(reinterpret_cast<char *>(&dim), 4)) {
     if (dim == 0) {
-      LOG_CRITICAL("file {} is empty.", filepath.string());
-      exit(-1);
+      throw std::runtime_error("Zero dimension in file: " + filepath.string());
     }
-    std::vector<T> vec(dim);
-    reader.read(reinterpret_cast<char *>(vec.data()), dim * sizeof(T));
-    if (reader.gcount() != dim * static_cast<int>(sizeof(T))) {
-      LOG_CRITICAL("file {} is not valid.", filepath.string());
-      exit(-1);
+    auto offset = data.size();
+    data.resize(offset + dim);
+    reader.read(reinterpret_cast<char *>(data.data() + offset), dim * sizeof(T));
+    if (!reader) {
+      throw std::runtime_error("Truncated record in file: " + filepath.string());
     }
-    data.insert(data.end(), vec.begin(), vec.end());
-    num++;
+    ++num;
   }
-
-  reader.close();
 }
 
-/**
- * @brief Load the vector data from bvecs file.
- *
- * @param filepath The filename.
- * @param data     The data position that will be loaded to.
- * @param num      The number of data.
- * @param dim      The dimension of each vector.
- *
- */
 template <typename T>
-inline void load_bvecs(const std::filesystem::path &filepath,
-                       std::vector<T> &data,
-                       uint32_t &num,
-                       uint32_t &dim) {
+void load_ivecs(const std::filesystem::path &filepath,
+                std::vector<T> &data,
+                uint32_t &num,
+                uint32_t &dim) {
   std::ifstream reader(filepath, std::ios::binary);
+  detail::check_open(reader, filepath);
 
-  if (!reader.is_open()) {
-    LOG_CRITICAL("Open fvecs file error {}.", filepath.string());
-    exit(-1);
+  reader.read(reinterpret_cast<char *>(&dim), sizeof(uint32_t));
+  if (!reader) {
+    throw std::runtime_error("Cannot read dimension from: " + filepath.string());
   }
 
-  // get byte size of file
-  reader.read(reinterpret_cast<char *>(&dim), 4);
   reader.seekg(0, std::ios::end);
-  size_t total_file_size = reader.tellg();
-
+  auto file_size = static_cast<std::size_t>(reader.tellg());
   reader.seekg(0, std::ios::beg);
-  num = total_file_size / (4 + dim * sizeof(T));
 
-  data.reserve(num * dim);
-
-  LOG_INFO("Read {} , data number = {} , data dimension = {}.", filepath.string(), num, dim);
-
-  for (size_t i = 0; i < num; i++) {
-    reader.seekg(4, std::ios::cur);
-    for (int j = 0; j < dim; j++) {
-      reader.read(reinterpret_cast<char *>(data.data() + (i * dim + j)), sizeof(T));
-    }
-  }
-  reader.close();
-}
-
-/**
- * @brief Load the vector data from ivecs file.
- *
- * @param filepath The filename.
- * @param data     The data position that will be loaded to.
- * @param num      The number of data.
- * @param dim      The dimension of each vector.
- *
- */
-template <typename T>
-inline void load_ivecs(const std::filesystem::path &filepath,
-                       std::vector<T> &data,
-                       uint32_t &num,
-                       uint32_t &dim) {
-  std::ifstream file(filepath, std::ios::binary);
-
-  if (!file.is_open()) {
-    LOG_CRITICAL("Open fvecs file error {}.", filepath.string());
-    exit(-1);
-  }
-
-  file.read(reinterpret_cast<char *>(&dim), sizeof(uint32_t));
-  if (file.fail()) {
-    std::cerr << "Failed to read dimension from file: " << filepath.string() << '\n';
-  }
-
-  file.seekg(0, std::ios::end);
-  size_t file_size = file.tellg();
-  file.seekg(0, std::ios::beg);
-
-  // num = file_size / (sizeof(uint32_t) + dim * sizeof(float));
-  num = file_size / (sizeof(uint32_t) + dim * sizeof(T));
+  num = static_cast<uint32_t>(file_size / (sizeof(uint32_t) + dim * sizeof(T)));
   data.resize(num * dim);
 
   for (uint32_t i = 0; i < num; ++i) {
-    file.read(reinterpret_cast<char *>(&dim), sizeof(uint32_t));
-    // file.read(reinterpret_cast<char *>(data.data() + i * dim), dim * sizeof(float));
-    file.read(reinterpret_cast<char *>(data.data() + (i * dim)), dim * sizeof(T));
-    if (file.fail()) {
-      throw std::runtime_error("Failed to read data from file: " + filepath.string());
+    uint32_t row_dim{};
+    reader.read(reinterpret_cast<char *>(&row_dim), sizeof(uint32_t));
+    reader.read(reinterpret_cast<char *>(data.data() + (i * dim)), dim * sizeof(T));
+    if (!reader) {
+      throw std::runtime_error("Truncated record at row " + std::to_string(i) +
+                               " in: " + filepath.string());
     }
+  }
+}
+
+template <typename T>
+void load_bvecs(const std::filesystem::path &filepath,
+                std::vector<T> &data,
+                uint32_t &num,
+                uint32_t &dim) {
+  std::ifstream reader(filepath, std::ios::binary);
+  detail::check_open(reader, filepath);
+
+  reader.read(reinterpret_cast<char *>(&dim), 4);
+  reader.seekg(0, std::ios::end);
+  auto file_size = static_cast<std::size_t>(reader.tellg());
+  reader.seekg(0, std::ios::beg);
+
+  num = static_cast<uint32_t>(file_size / (4 + dim));
+  data.resize(num * dim);
+
+  std::vector<uint8_t> row(dim);
+  for (uint32_t i = 0; i < num; ++i) {
+    uint32_t row_dim{};
+    reader.read(reinterpret_cast<char *>(&row_dim), 4);
+    reader.read(reinterpret_cast<char *>(row.data()), dim);
+    for (uint32_t j = 0; j < dim; ++j) {
+      data[i * dim + j] = static_cast<T>(row[j]);
+    }
+  }
+}
+
+template <typename T>
+void save_ivecs(const std::filesystem::path &filepath, const T *data, uint32_t num, uint32_t dim) {
+  std::ofstream writer(filepath, std::ios::binary);
+  if (!writer.is_open()) {
+    throw std::runtime_error("Cannot open file for writing: " + filepath.string());
+  }
+
+  writer.write(reinterpret_cast<const char *>(&num), 4);
+  for (uint32_t i = 0; i < num; ++i) {
+    writer.write(reinterpret_cast<const char *>(&dim), 4);
+    writer.write(reinterpret_cast<const char *>(data + (i * dim)), dim * sizeof(T));
   }
 }
 
