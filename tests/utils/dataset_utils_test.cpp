@@ -13,7 +13,7 @@ namespace alaya {
 class DatasetTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    data_dir_ = std::filesystem::current_path().parent_path() / "data";
+    data_dir_ = test::data_dir();
   }
 
   std::filesystem::path data_dir_;

@@ -73,6 +73,10 @@ function(alaya_cc_target target_name)
     target_compile_options(${target_name} PRIVATE ${ARG_OPTS})
   endif()
 
+  target_compile_definitions(${target_name} PRIVATE
+    ALAYA_TEST_DATA_DIR_DEFAULT="${CMAKE_SOURCE_DIR}/data"
+  )
+
   add_coverage_to_target(${target_name})
 endfunction()
 

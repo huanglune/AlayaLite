@@ -66,7 +66,7 @@ struct Args {
   std::string gt_path;
   std::string result_path_prefix;  // scratch location for search_memory_index
   std::string search_memory_index_bin =
-      "/home/huangliang/alaya-dev/DiskANN/build/apps/search_memory_index";
+      []() -> std::string { if (auto *v = std::getenv("DISKANN_SEARCH_BIN")) return v; return "search_memory_index"; }();
   uint32_t R = 64;
   uint32_t L = 100;
   float alpha = 1.2f;
@@ -165,8 +165,8 @@ void resolve_dataset_defaults(Args &a) {
     return;
   }
   const std::string prefix = dataset_base_prefix(a.dataset);
-  const std::string data_dir = "/md1/huangliang/alaya-dev/data/" + a.dataset;
-  const std::string bg_dir = "/md1/huangliang/alaya-dev/build_graph/" + a.dataset;
+  const std::string data_dir = []() -> std::string { if (auto *v = std::getenv("ALAYA_TEST_DATA_DIR")) return v; return "."; }() + "/" + a.dataset;
+  const std::string bg_dir = []() -> std::string { if (auto *v = std::getenv("ALAYA_BUILD_GRAPH_DIR")) return v; return "."; }() + "/" + a.dataset;
   const std::string param_tag =
       "R" + std::to_string(a.R) + "_L" + std::to_string(a.L) + "_a" +
       (a.alpha == static_cast<int>(a.alpha)

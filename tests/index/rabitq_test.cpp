@@ -25,7 +25,7 @@ namespace alaya {
 class RaBitQSiftSmallTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    std::filesystem::path data_dir = std::filesystem::current_path().parent_path() / "data";
+    std::filesystem::path data_dir = test::data_dir();
     config_ = sift_small(data_dir);
     ds_ = load_dataset(config_);
   }

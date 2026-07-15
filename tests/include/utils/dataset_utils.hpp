@@ -4,21 +4,19 @@
 
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
+#include <stdexcept>
 #include <string>
+#include <vector>
+
 #include "utils/evaluate.hpp"
 #include "utils/io_utils.hpp"
 #include "utils/locks.hpp"
+#include "utils/test_paths.hpp"
 
 namespace alaya {
 
-/**
- * @brief Loaded dataset containing vectors, queries and ground truth.
- *
- * Usage:
- *   auto ds = load_dataset(sift_small("/path/to/data"));
- *   space->fit(ds.data_.data(), ds.data_num_);
- */
 struct Dataset {
   std::string name_;
   std::vector<float> data_;
@@ -30,9 +28,6 @@ struct Dataset {
   uint32_t gt_dim_ = 0;
 };
 
-/**
- * @brief Configuration for loading a dataset.
- */
 struct DatasetConfig {
   std::string name_;
   std::filesystem::path dir_;
@@ -42,13 +37,10 @@ struct DatasetConfig {
   std::string download_url_;
   std::string archive_name_ = "data.tar.gz";
   int strip_components_ = 1;
-  uint32_t max_data_num_ = 0;   ///< Max vectors to load (0 = all)
-  uint32_t max_query_num_ = 0;  ///< Max queries to load (0 = all)
+  uint32_t max_data_num_ = 0;
+  uint32_t max_query_num_ = 0;
 };
 
-/**
- * @brief Create config for SIFT small dataset (10K vectors, 128 dim).
- */
 inline auto sift_small(const std::filesystem::path &data_dir) -> DatasetConfig {
   auto dir = data_dir / "siftsmall";
   return DatasetConfig{
@@ -61,12 +53,8 @@ inline auto sift_small(const std::filesystem::path &data_dir) -> DatasetConfig {
   };
 }
 
-/**
- * @brief Create config for SIFT micro dataset (subset of siftsmall: 1K vectors, 128 dim).
- *
- * This is a smaller subset for fast CI testing. Uses the same files as siftsmall
- * but limits the number of vectors loaded.
- */
+inline auto sift_small() -> DatasetConfig { return sift_small(test::data_dir()); }
+
 inline auto sift_micro(const std::filesystem::path &data_dir) -> DatasetConfig {
   auto dir = data_dir / "siftsmall";
   return DatasetConfig{
@@ -81,9 +69,8 @@ inline auto sift_micro(const std::filesystem::path &data_dir) -> DatasetConfig {
   };
 }
 
-/**
- * @brief Create config for DEEP1M dataset (1M vectors, 96 dim).
- */
+inline auto sift_micro() -> DatasetConfig { return sift_micro(test::data_dir()); }
+
 inline auto deep1m(const std::filesystem::path &data_dir) -> DatasetConfig {
   auto dir = data_dir / "deep1M";
   return DatasetConfig{
@@ -97,10 +84,8 @@ inline auto deep1m(const std::filesystem::path &data_dir) -> DatasetConfig {
   };
 }
 
-/**
- * @brief Create config for T2I-1M dataset (1M vectors, 200 dim, IP metric).
- * This dataset must be prepared locally; no automatic download is available.
- */
+inline auto deep1m() -> DatasetConfig { return deep1m(test::data_dir()); }
+
 inline auto t2i1m(const std::filesystem::path &data_dir) -> DatasetConfig {
   auto dir = data_dir / "t2i-1m";
   return DatasetConfig{
@@ -112,28 +97,17 @@ inline auto t2i1m(const std::filesystem::path &data_dir) -> DatasetConfig {
   };
 }
 
-/**
- * @brief Load dataset from config. Downloads if needed.
- *
- * Uses file locking to prevent concurrent downloads when multiple tests run in parallel.
- *
- * Usage:
- *   auto ds = load_dataset(sift_small("/data"));
- *   // Use ds.data_, ds.queries_, ds.ground_truth_ directly
- */
+inline auto t2i1m() -> DatasetConfig { return t2i1m(test::data_dir()); }
+
 inline auto load_dataset(const DatasetConfig &config) -> Dataset {
-  // Ensure lock directory exists before creating lock file
   auto lock_dir = config.dir_.parent_path();
   if (!std::filesystem::exists(lock_dir)) {
     std::filesystem::create_directories(lock_dir);
   }
 
-  // Use file lock to prevent concurrent downloads
-  // Lock based on directory name (not dataset name) to handle configs sharing the same dir
   auto lock_file = lock_dir / (config.dir_.filename().string() + ".lock");
   FileLock lock(lock_file);
 
-  // Download if files don't exist (check again after acquiring lock)
   bool files_exist = std::filesystem::exists(config.data_file_) &&
                      std::filesystem::exists(config.query_file_) &&
                      std::filesystem::exists(config.gt_file_);
@@ -164,32 +138,27 @@ inline auto load_dataset(const DatasetConfig &config) -> Dataset {
   load_ivecs(config.gt_file_, ds.ground_truth_, ds.query_num_, ds.gt_dim_);
 
   if (data_dim != query_dim) {
-    LOG_CRITICAL("Dimension mismatch: data_dim={}, query_dim={}", data_dim, query_dim);
-    exit(-1);
+    throw std::runtime_error("Dimension mismatch: data_dim=" + std::to_string(data_dim) +
+                             ", query_dim=" + std::to_string(query_dim));
   }
   ds.dim_ = data_dim;
 
-  // Check if we need to truncate data
   bool data_truncated = config.max_data_num_ > 0 && ds.data_num_ > config.max_data_num_;
   bool query_truncated = config.max_query_num_ > 0 && ds.query_num_ > config.max_query_num_;
 
-  // Apply data limit
   if (data_truncated) {
     ds.data_num_ = config.max_data_num_;
     ds.data_.resize(ds.data_num_ * ds.dim_);
   }
 
-  // Apply query limit
   if (query_truncated) {
     ds.query_num_ = config.max_query_num_;
     ds.queries_.resize(ds.query_num_ * ds.dim_);
   }
 
-  // Recompute ground truth if data was truncated (original GT IDs may be invalid)
   if (data_truncated) {
     ds.ground_truth_ = find_exact_gt(ds.queries_, ds.data_, ds.dim_, ds.gt_dim_);
   } else if (query_truncated) {
-    // Only query truncated, just resize GT
     ds.ground_truth_.resize(ds.query_num_ * ds.gt_dim_);
   }
 

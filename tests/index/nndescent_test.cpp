@@ -30,7 +30,7 @@ static_assert(!internal::memory::kKnngKernelRegistration.has_legacy_factory);
 class NnDescentTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    std::filesystem::path data_dir = std::filesystem::current_path().parent_path() / "data";
+    std::filesystem::path data_dir = test::data_dir();
     ds_ = load_dataset(sift_micro(data_dir));
 
     space_ = std::make_shared<RawSpace<>>(ds_.data_num_, ds_.dim_, core::Metric::l2);
@@ -59,7 +59,7 @@ TEST_F(NnDescentTest, BuildGraphTest) {
 class NnDescentSearchTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    std::filesystem::path data_dir = std::filesystem::current_path().parent_path() / "data";
+    std::filesystem::path data_dir = test::data_dir();
     ds_ = load_dataset(sift_micro(data_dir));
   }
 

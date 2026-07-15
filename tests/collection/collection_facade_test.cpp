@@ -20,6 +20,7 @@
 #include "index/collection/logical_wal.hpp"
 #include "index/collection/sha256.hpp"
 #include "platform/detect.hpp"
+#include "utils/test_paths.hpp"
 
 namespace alaya {
 namespace internal::collection {
@@ -428,7 +429,7 @@ TEST(CollectionFacade, SealFourPointSigkillRecoveryRollsBackOrForward) {
                          CollectionSealFailPoint::after_successor_switch,
                          CollectionSealFailPoint::during_export_build,
                          CollectionSealFailPoint::after_manifest_publish};
-  auto battery_root = std::filesystem::path("/home/huangliang/md1/tmp") /
+  auto battery_root = test::tmp_root() /
                       ("alaya-g10-seal-crash-" + std::to_string(platform::get_pid()));
   std::filesystem::remove_all(battery_root);
   std::filesystem::create_directories(battery_root);

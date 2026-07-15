@@ -25,7 +25,7 @@ namespace alaya {
 class RaBitQDeep1MTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    std::filesystem::path data_dir = std::filesystem::current_path().parent_path() / "data";
+    std::filesystem::path data_dir = test::data_dir();
     config_ = deep1m(data_dir);
     ds_ = load_dataset(config_);
   }
@@ -116,7 +116,7 @@ TEST_F(RaBitQDeep1MTest, Deep1MQGTest) {
 class RaBitQT2I1MTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    std::filesystem::path data_dir = std::filesystem::current_path().parent_path() / "data";
+    std::filesystem::path data_dir = test::data_dir();
     config_ = t2i1m(data_dir);
     ds_ = load_dataset(config_);
   }

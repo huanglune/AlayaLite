@@ -40,7 +40,7 @@ using SQ8SpaceType = SQ8Space<>;
 
 
 auto test_data_dir() -> std::filesystem::path {
-  return std::filesystem::current_path().parent_path() / "data";
+  return test::data_dir();
 }
 
 auto test_cache_dir() -> const std::filesystem::path & {
