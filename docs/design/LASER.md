@@ -1,7 +1,7 @@
 # Laser on-disk Quantized Graph (alayalite.laser)
 
 > The Python `Index`/`RawIndex` and `vamana.build_index` entry points in this
-> historical implementation guide were removed in AlayaLite 1.2.0. The LASER
+> historical implementation guide were removed in AlayaLite 1.1.0. The LASER
 > format reader remains available through canonical `Collection` migration;
 > `alayalite.laser.selected_simd()` remains a diagnostic only.
 

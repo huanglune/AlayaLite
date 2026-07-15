@@ -1,8 +1,8 @@
 # AlayaLite Python Interfaces
 
-> AlayaLite 1.2.0 exposes canonical `Collection`. The `Index`,
+> AlayaLite 1.1.0 exposes canonical `Collection`. The `Index`,
 > `DiskCollection`, LASER builder, and Vamana builder examples below describe
-> the removed pre-1.2 API and are retained only as migration history.
+> the removed pre-1.1 API and are retained only as migration history.
 
 This page introduces the Python interfaces in AlayaLite, which include two layers:
 

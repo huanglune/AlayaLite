@@ -7,53 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-07-15
+
+AlayaLite 1.1.0 is a full architecture and engineering rewrite on top of the
+1.0 line. It replaces the legacy per-index Python/C++ types with a single
+canonical `Collection` facade over immutable, capability-typed segments, and
+removes the entire legacy surface in one release. **This is a breaking
+release: 1.1.0 does not preserve the pre-1.1 Python API and does not open
+pre-1.1 on-disk artifacts.**
+
+### ⚠ BREAKING CHANGES
+
+- The legacy Python/native API was removed (not deprecated). `Index`,
+  `DiskCollection`, `alayalite.laser.Index`/`RawIndex`,
+  `alayalite.vamana.build_index`, the six `Client` index methods, and the
+  `Collection.get_cpp_index()`/`get_index()` escape hatches are gone; importing
+  or calling them raises `AlayaLiteLegacyApiWarning` pointing at `Collection`.
+  Enter through `alayalite.Collection` and `Client` collection methods.
+- Pre-1.1 on-disk artifacts are no longer readable. The pre-rewrite import path
+  (the legacy PyIndex importer, the DiskCollection-v1 reader, and the read-only
+  RocksDB scalar-checkpoint decoder) and the legacy recovery corpus were
+  removed; the canonical `Collection` opens only its own manifest-v2 layout.
+  Convert any pre-1.1 data on a 1.0.x release before upgrading.
+- RocksDB is no longer a dependency; scalar/document/metadata state now lives in
+  the Collection checkpoint.
+- `quantization_type="rabitq"` now requires an explicit `index_type="qg"`. The
+  legacy spellings that silently mapped `{hnsw,nsg,fusion}+rabitq` to QG were
+  removed with the legacy `Index`.
+- Python memory indexes declared `nsg` or `fusion` now build the requested
+  algorithm; earlier releases silently built HNSW.
+
 ### Added
 
-- Added a default-off, Collection-internal mutable DiskANN Segment bundle with
-  dark WAL staging, COMMIT-before-publish ordering, strict tombstone/version
-  filtering, idempotent applied-op replay, per-row and atomic batch modes, and
-  manifest-v2 checkpoints. A mutation-free roll-forward reader remains able to
-  consume checkpointed state and a committed WAL tail; no DiskANN mutation API
-  is exposed through the canonical SDK or Python surface.
-
-- Added an independently gated readonly `DiskAnnSegment` over the native
-  DiskANN file family, with typed sync/native-async search and batch
-  translation, resource admission, stats, and an explicit `diskann_index`
-  direct-path identity. Cancellation and deadlines are cooperative at drained
-  beam-wave boundaries, with exactly-once lane delivery, pinned I/O buffers and
-  discard/retained-partial policies. The readonly adapter does not advertise
-  mutation or checkpoint capabilities.
-
-- Added the independently gated, non-destructive legacy PyIndex importer. It
-  directly decodes schema/CURRENT/raw snapshots/read-only RocksDB checkpoints
-  and complete-COMMIT WAL prefixes into a sealed DiskFlat exact-oracle segment,
-  Collection checkpoint/version graph, manifest v2, retained audit, and atomic
-  roll-forward marker. The six pinned dtype/ID/scalar corpus variants now cover
-  byte-exact terminal state, torn tails, idempotent restart, and every importer
-  crash cut without modifying the legacy source.
-
-- Added immutable C++ `VamanaMemSegment` with typed build/open/search/batch,
-  byte-compatible Vamana graph + `.fbin` persistence, fixed-seed deterministic
-  golden coverage, and a standalone feature-gated factory. NN-Descent is now
-  explicitly a detail-only KNNG build kernel rather than an implied searchable
-  index capability.
+- A canonical `alaya::Collection` facade over an internal `SegmentedCollection`
+  that owns the only logical WAL, mutation coordinator, checkpoint/version map,
+  and manifest-v2 control plane, routing across immutable contract-v3 segments
+  (HNSW/NSG/Fusion/memory-QG/Vamana-memory in RAM; DiskFlat/DiskVamana/LASER/
+  DiskANN on disk).
+- Collection-owned filter execution (prefilter/traversal/postfilter by
+  selectivity), RAII search leases with strict budget accounting, and a
+  successor-first `seal`/`compact`/`gc` state machine with epoch-delayed
+  reclamation.
+- A default-off, Collection-internal mutable DiskANN Segment bundle with dark
+  WAL staging, COMMIT-before-publish ordering, strict tombstone/version
+  filtering, idempotent applied-op replay, and manifest-v2 checkpoints. No
+  DiskANN mutation API is exposed through the SDK or Python surface.
+- An independently gated readonly `DiskAnnSegment` over the native DiskANN file
+  family, with typed sync/native-async search, cooperative cancel/deadline at
+  drained beam-wave boundaries, and exactly-once lane delivery.
+- Immutable C++ `VamanaMemSegment` with typed build/open/search/batch and
+  byte-compatible Vamana graph + `.fbin` persistence. NN-Descent is now a
+  detail-only KNNG build kernel, not an implied searchable index.
+- `ArtifactManifestV2`: a SHA-256 artifact inventory with a five-step
+  READY-bound publication transaction.
 
 ### Changed
 
-- Python memory indexes declared as `nsg` or `fusion` now build, save, open,
-  and search the requested algorithm across the 20 non-RaBitQ dispatch rows;
-  earlier releases silently built HNSW. NSG and Fusion now use immutable
-  contract-v3 segments with byte-compatible legacy artifact readers, SQ4/SQ8
-  search spaces, scalar-enabled variants, and independent feature-bit fallback
-  to the former HNSW behavior.
-- Legacy Python memory rows declared as `hnsw`, `nsg`, or `fusion` with
-  `quantization_type="rabitq"` still build the same memory QG as before. They
-  now run through immutable `QgSegment`, report the honest `qg_segment/qg`
-  runtime identity and QG descriptor/artifact fingerprint, and fall back to
-  `legacy_qg_model/qg` when the QG feature bit is disabled. This changes
-  introspection, not index behavior. Gate 9's canonical `Collection` entry will
-  require an explicit QG declaration while preserving this legacy-wrapper
-  compatibility quirk.
+- NSG and Fusion use immutable contract-v3 segments with byte-compatible
+  artifact readers, SQ4/SQ8 search spaces, and scalar-enabled variants. Memory
+  QG runs through an immutable `QgSegment` reporting the honest `qg_segment/qg`
+  runtime identity.
+
+### Removed
+
+- The legacy Python/native API surface and its native registrations
+  (`PyIndexInterface`, `Client`, `DiskCollection`, `_CollectionReadView`, and
+  the raw LASER/Vamana builder modules).
+- The source bridges `core/compat.hpp`, `index/compat.hpp`, and
+  `index/disk/disk_collection.hpp`.
+- The collection-level `legacy_importer.hpp`, `disk_collection_v1.hpp`,
+  `scalar_data.hpp`, the RocksDB storage stack, and the `include/recovery` and
+  `include/executor` modules.
+- The old Python dispatch factory and its 33 native template instantiations;
+  code generation now owns only the canonical identity test matrix.
 
 ## [1.0.3] - 2026-07-07
 
@@ -388,7 +414,8 @@ First stable release of AlayaLite. Highlights since the 0.1.x alpha line:
 - RAG components (embedders, chunkers)
 - Basic CI/CD pipeline
 
-[Unreleased]: https://github.com/AlayaDB-AI/AlayaLite/compare/v1.0.3...HEAD
+[Unreleased]: https://github.com/AlayaDB-AI/AlayaLite/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/AlayaDB-AI/AlayaLite/compare/v1.0.3...v1.1.0
 [1.0.3]: https://github.com/AlayaDB-AI/AlayaLite/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/AlayaDB-AI/AlayaLite/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/AlayaDB-AI/AlayaLite/compare/v1.0.0...v1.0.1

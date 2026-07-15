@@ -5,7 +5,7 @@
 """LASER format helpers.
 
 The public ``Index``/``RawIndex`` builder and search wrappers were removed in
-AlayaLite 1.2.0. The immutable LASER format reader remains behind canonical
+AlayaLite 1.1.0. The immutable LASER format reader remains behind canonical
 ``Collection.open``.
 """
 

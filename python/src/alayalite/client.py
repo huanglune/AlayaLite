@@ -4,7 +4,7 @@
 
 """Canonical Collection manager.
 
-The ``Client`` index-method family was removed in AlayaLite 1.2.0. Legacy
+The ``Client`` index-method family was removed in AlayaLite 1.1.0. Legacy
 PyIndex layouts discovered below a client URL are imported non-destructively
 through ``Collection.open`` and appear in the collection map.
 """

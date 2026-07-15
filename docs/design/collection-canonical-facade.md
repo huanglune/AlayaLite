@@ -6,6 +6,17 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 # Canonical Collection facade audit
 
+> **Superseded / historical.** This is the Gate 9-A/9-B audit record. Two of its
+> pinned decisions no longer hold: (1) the two-phase version window collapsed —
+> the canonical API and the legacy-API removal both ship in a single **1.1.0**
+> release (there is no `V_remove=1.2.0`); and (2) the "format readers are never
+> retired" rule was reversed. The post-cutover engineering wave removed the
+> pre-rewrite backward-compat readers (`LegacyImporter`, `disk_collection_v1.hpp`,
+> the RocksDB scalar decoder) and the legacy recovery corpus, so 1.1.0 does not
+> open pre-1.1 artifacts by design. The `1.2.0` strings and the "does not retire
+> a persisted-format reader" statements below are kept verbatim as the original
+> record; see `legacy-cleanup.md` for the current version and reader inventory.
+
 ## Audit status
 
 This document is the audit-first deliverable for Gate 9-A.  The audit was

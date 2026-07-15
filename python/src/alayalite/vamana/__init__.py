@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""Import tombstone for the Vamana builder removed in AlayaLite 1.2.0."""
+"""Import tombstone for the Vamana builder removed in AlayaLite 1.1.0."""
 
 from alayalite._legacy import raise_removed_legacy_api
 

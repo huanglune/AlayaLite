@@ -2,7 +2,7 @@
 
 This document freezes the historical observable state of the public index APIs
 before the index/segment abstraction migration. Those Python APIs were removed
-in AlayaLite 1.2.0; the table is retained only as migration evidence and is not
+in AlayaLite 1.1.0; the table is retained only as migration evidence and is not
 a description of the current public surface. Current users enter through
 `Collection`; “adapter” below describes the pre-removal implementation.
 

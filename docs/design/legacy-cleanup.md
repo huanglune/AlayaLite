@@ -1,9 +1,17 @@
 # Gate 11 legacy cleanup and reader inventory
 
-Gate 11 reaches the `V_remove=1.2.0` boundary without changing canonical
-`Collection` semantics or deleting any reader needed by an existing artifact.
-API legacy, source compatibility, and persisted formats remain independent
-decisions.
+The legacy cleanup ships in AlayaLite **1.1.0** as a single hard cutover. The
+architecture/engineering rewrite lands on top of the 1.0 line and does **not**
+preserve backward compatibility with pre-1.1 artifacts. There is no
+deprecate-at-1.1 / remove-at-1.2 window: the legacy Python/native API **and**
+the pre-rewrite on-disk import path are both removed in 1.1.0.
+
+> Historical note: earlier drafts of this document staged the API removal at a
+> separate `V_remove=1.2.0` and pledged to retain every format reader. Both
+> decisions were superseded. The version collapsed to a single 1.1.0 release,
+> and the post-cutover engineering wave physically removed the pre-rewrite
+> backward-compat readers listed under "Removed backward-compatibility readers"
+> below.
 
 ## Retired surfaces
 
@@ -15,25 +23,42 @@ decisions.
   `DiskCollection`, `_CollectionReadView`, the raw LASER/Vamana builders, or
   the old memory-engine feature object.
 - The public source bridges `core/compat.hpp`, `index/compat.hpp`, and
-  `index/disk/disk_collection.hpp` are gone. The DiskCollection-v1 reader and
-  writer remain internal at `index/disk/detail/disk_collection_v1.hpp`.
+  `index/disk/disk_collection.hpp` are gone. The internal DiskCollection-v1
+  reader/writer (`index/disk/detail/disk_collection_v1.hpp`) was also removed;
+  the canonical `Collection` opens only its own manifest-v2 layout.
 - The old Python dispatch factory, its 33 template instantiations, runtime
   templates, feature rollback fields, and legacy factory identities are gone.
   Code generation now owns only the canonical identity test matrix.
 
-## Retained format readers
+## Removed backward-compatibility readers
+
+The pre-rewrite import path is gone. 1.1.0 cannot open artifacts produced by
+the pre-1.1 Python/native indexes, and this is intentional — there is no
+compatibility promise across the rewrite.
+
+| Removed reader | Path (deleted) | Note |
+|---|---|---|
+| Collection-level legacy PyIndex importer | `index/collection/legacy_importer.hpp` | Decoded schema/CURRENT/raw snapshots, read-only RocksDB checkpoints, and complete-COMMIT WAL prefixes into a sealed DiskFlat oracle. |
+| DiskCollection-v1 reader/writer | `index/disk/detail/disk_collection_v1.hpp` | Old on-disk collection manifest/segment layout. |
+| RocksDB scalar payload + dependency | `storage/rocksdb_storage.hpp`, `storage/scalar_data.hpp` | RocksDB is no longer a dependency; scalar state lives in the Collection checkpoint. |
+| Legacy recovery corpus + matrix test | `tests/collection/legacy_importer_test.cpp` and the checked-in `legacy_recovery_corpus` fixtures | The pinned recovery variants were retired with the importer. |
+
+The collection manifest reader is now v2-only and `Collection::open` has no
+importer fallback: a directory without a canonical manifest-v2 layout returns
+`not_found`.
+
+## Retained current-format readers
+
+These are not backward-compatibility shims. They read formats the current build
+still produces and are pinned by the golden families.
 
 | Inventory | Reader | Why retained |
 |---|---|---|
-| Legacy memory graph/space layouts (HNSW, NSG, Fusion; raw and quantized variants) | `LegacyImporter` plus the v1 graph and Space loaders | Checked-in legacy corpus and user `type=index` artifacts still require canonical open/import. |
-| Legacy memory RaBitQ layout | the memory-QG/RaBitQ v1 loader | It is a distinct memory wire format and remains covered by its own golden family. |
-| DiskCollection-v1 Flat/Vamana/LASER layouts | internal `disk_collection_v1.hpp`, segment manifest/factory readers, and the LASER importer | Existing disk manifests and native segment payloads must continue to open through canonical migration. |
-| Legacy PyIndex recovery snapshot, RocksDB scalar payload, and WAL frames | bounded readers in `LegacyImporter` | The recovery corpus includes committed records and torn-tail cases; import must preserve op-id, tombstone, and WAL-cut semantics. |
-| Canonical collection WAL v1 and manifest v1/v2 | canonical collection recovery and dual-manifest readers | These are current formats, not legacy retirement candidates. |
-
-No format reader is retired in Gate 11. The canonical importer is the retained
-converter: it validates a source fingerprint, emits a canonical checkpoint,
-and records an audit/activation marker without rewriting the source artifact.
+| Memory graph/space segment layouts (HNSW, NSG, Fusion; raw and quantized) | the graph/Space loaders in `index/graph/detail/memory_graph_segment.hpp` | Current canonical memory-segment serialization; covered by the memory golden families. |
+| Memory RaBitQ layout | the memory-QG/RaBitQ v1 loader in `index/graph/qg/qg_segment.hpp` | A distinct memory wire format with its own golden family; never shares a reader with LASER (see `rabitq-formats.md`). |
+| LASER segment layout | `index/disk/laser_segment_importer.hpp` | `disk_laser_qg` is a live supported wire format with a deterministic fixture. |
+| Disk segment manifest / factory | `index/disk/segment_manifest.hpp`, `index/disk/segment_factory.hpp` | Read the current manifest-v2 disk-segment inventory. |
+| Canonical collection WAL v1 and manifest v2 | canonical collection recovery + manifest reader | Current formats. |
 
 Memory RaBitQ and LASER are mathematically related but never share a reader.
 The independent `rabitq_format_separation_test` wraps a real memory-QG file in
@@ -59,7 +84,10 @@ returning.
 
 ## Golden generation after API removal
 
-The 14 artifact families are still generated and compared byte-for-byte. A
-test-only native retained-v1 generator replaces the removed Python wrappers;
-the LASER fixture uses a standalone native builder. Neither helper is linked
-into the wheel or re-exposes a public legacy API.
+The 12 live current-format artifact families are generated and compared
+byte-for-byte. The dead DiskCollection-v1 `disk_flat` and `disk_vamana`
+collection layouts are not part of the 1.1.0 baseline because their only
+writer was removed. A focused test-only native generator exercises the current
+HNSW/NSG/Fusion segment `build` + `save` paths, and the LASER fixture uses its
+standalone native builder. Neither helper is linked into the wheel or exposes a
+legacy API.

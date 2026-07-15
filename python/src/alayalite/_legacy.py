@@ -4,11 +4,11 @@
 
 """Stable tombstones for Python APIs removed at the Gate-11 boundary."""
 
-LEGACY_API_V_REMOVE = "1.2.0"
+LEGACY_API_V_REMOVE = "1.1.0"
 
 
 class AlayaLiteLegacyApiWarning(DeprecationWarning):
-    """Raised when code accesses a Python API removed in AlayaLite 1.2.0."""
+    """Raised when code accesses a Python API removed in AlayaLite 1.1.0."""
 
 
 _REMOVED_API_REPLACEMENTS = {
@@ -24,7 +24,7 @@ _REMOVED_API_REPLACEMENTS = {
 
 
 def raise_removed_legacy_api(api_name: str) -> None:
-    """Raise the stable 1.2.0 tombstone for a removed public entry."""
+    """Raise the stable 1.1.0 tombstone for a removed public entry."""
 
     replacement = _REMOVED_API_REPLACEMENTS[api_name]
     raise AlayaLiteLegacyApiWarning(
