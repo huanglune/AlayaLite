@@ -20,6 +20,17 @@ alaya_add_test(
   LABELS unit core
 )
 
+alaya_cc_target(
+  core_log_test
+  GTEST
+  SRCS log_test.cpp
+)
+alaya_add_test(
+  NAME core_log_test
+  TARGET core_log_test
+  LABELS unit core
+)
+
 alaya_cc_target(core_value_types_header_closure SRCS value_types_header_closure.cpp)
 alaya_cc_target(core_capabilities_header_closure SRCS capabilities_header_closure.cpp)
 alaya_cc_target(core_status_header_closure SRCS status_header_closure.cpp)

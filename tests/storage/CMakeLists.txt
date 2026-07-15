@@ -23,6 +23,17 @@ if(TARGET AIO::aio)
   target_compile_definitions(page_reader_contract_test PRIVATE ALAYA_LASER_USE_LIBAIO=1)
 endif()
 
+alaya_cc_target(
+  mmap_file_test
+  GTEST
+  SRCS mmap_file_test.cpp
+)
+
+alaya_add_test(
+  NAME storage_test_mmap_file
+  TARGET mmap_file_test
+  LABELS storage
+)
 alaya_add_test(
   NAME storage_test_sequential_storage
   TARGET storage_test

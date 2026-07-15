@@ -59,6 +59,22 @@ alaya_cc_target(
 )
 alaya_cc_target(rabitq_benchmark SRCS rabitq_benchmark.cpp)
 
+alaya_cc_target(
+  graph_search_test
+  GTEST
+  SRCS search_test.cpp
+)
+alaya_cc_target(
+  coro_mutex_test
+  GTEST
+  SRCS mutex_test.cpp
+)
+alaya_cc_target(
+  query_utils_test
+  GTEST
+  SRCS query_utils_test.cpp
+)
+
 alaya_add_test(NAME index_test_fusion_graph TARGET fusion_graph_test)
 alaya_add_test(NAME index_test_fusion_segment TARGET fusion_segment_test)
 alaya_add_test(
@@ -98,4 +114,28 @@ alaya_add_test(
   TARGET rabitq_performance_test
   LABELS performance
   TIMEOUT 1800
+)
+alaya_add_test(
+  NAME index_test_graph_search
+  TARGET graph_search_test
+  FILTER SearchTest.*
+  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
+alaya_add_test(
+  NAME index_test_graph_search_unit
+  TARGET graph_search_test
+  FILTER GraphSearchJobUnitTest.*
+  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
+alaya_add_test(
+  NAME index_test_graph_search_rabitq
+  TARGET graph_search_test
+  FILTER RaBitQGraphSearchJobTest.*
+  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+)
+alaya_add_test(NAME index_test_coro_mutex TARGET coro_mutex_test)
+alaya_add_test(
+  NAME index_test_query_utils
+  TARGET query_utils_test
+  LABELS utils
 )

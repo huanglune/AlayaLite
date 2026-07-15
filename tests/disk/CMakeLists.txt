@@ -15,11 +15,6 @@ alaya_cc_target(
   SRCS segment_manifest_test.cpp
 )
 alaya_cc_target(
-  mmap_file_test
-  GTEST
-  SRCS mmap_file_test.cpp
-)
-alaya_cc_target(
   disk_flat_builder_test
   GTEST
   SRCS disk_flat_builder_test.cpp
@@ -53,16 +48,6 @@ alaya_cc_target(
   SRCS disk_flat_segment_stress_test.cpp
 )
 alaya_cc_target(
-  test_vamana_reader
-  GTEST
-  SRCS test_vamana_reader.cpp
-)
-alaya_cc_target(
-  test_vamana_greedy_search
-  GTEST
-  SRCS test_vamana_greedy_search.cpp
-)
-alaya_cc_target(
   test_vamana_segment_builder
   GTEST
   SRCS test_vamana_segment_builder.cpp
@@ -74,7 +59,6 @@ alaya_cc_target(
 )
 alaya_add_test(NAME disk_test_types TARGET disk_types_test)
 alaya_add_test(NAME disk_test_segment_manifest TARGET segment_manifest_test)
-alaya_add_test(NAME disk_test_mmap_file TARGET mmap_file_test)
 alaya_add_test(NAME disk_test_flat_builder TARGET disk_flat_builder_test)
 alaya_add_test(NAME disk_test_flat_searcher TARGET disk_flat_searcher_test)
 alaya_add_test(
@@ -99,8 +83,6 @@ alaya_add_test(
   LABELS disk segment stress tsan
   TIMEOUT 120
 )
-alaya_add_test(NAME test_vamana_reader TARGET test_vamana_reader)
-alaya_add_test(NAME test_vamana_greedy_search TARGET test_vamana_greedy_search)
 alaya_add_test(NAME test_vamana_segment_builder TARGET test_vamana_segment_builder)
 alaya_add_test(NAME test_vamana_segment_searcher TARGET test_vamana_segment_searcher)
 if(ALAYA_ENABLE_LASER)

@@ -121,7 +121,7 @@ TEST(LogTest, MacrosEmitFormattedMessagesAndLogOnce) {
   spdlog::default_logger()->flush();
   const auto output = normalize_path_separators(stream.str());
 
-  EXPECT_NE(output.find("[Alaya] [tests/utils/log_test.cpp:"), std::string::npos);
+  EXPECT_NE(output.find("[Alaya] [tests/core/log_test.cpp:"), std::string::npos);
   EXPECT_NE(output.find("trace 1"), std::string::npos);
   EXPECT_NE(output.find("debug 2"), std::string::npos);
   EXPECT_NE(output.find("info 3"), std::string::npos);

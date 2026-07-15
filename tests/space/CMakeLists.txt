@@ -63,3 +63,24 @@ alaya_add_test(
   TARGET rabitq_space_test
   LABELS space
 )
+
+alaya_cc_target(
+  rabitq_rotator_test
+  GTEST
+  SRCS rabitq_utils/rotator_test.cpp
+)
+alaya_cc_target(
+  rabitq_lut_test
+  GTEST
+  SRCS rabitq_utils/lut_test.cpp
+)
+alaya_add_test(
+  NAME space_test_rabitq_rotator
+  TARGET rabitq_rotator_test
+  LABELS space
+)
+alaya_add_test(
+  NAME space_test_rabitq_lut
+  TARGET rabitq_lut_test
+  LABELS space
+)
