@@ -18,14 +18,9 @@ alaya_cc_target(
   SRCS raw_space_test.cpp
 )
 alaya_cc_target(
-  sq4_space_test
+  sqx_space_test
   GTEST
-  SRCS sq4_space_test.cpp
-)
-alaya_cc_target(
-  sq8_space_test
-  GTEST
-  SRCS sq8_space_test.cpp
+  SRCS sqx_space_test.cpp
 )
 alaya_cc_target(
   rabitq_space_test
@@ -49,13 +44,8 @@ alaya_add_test(
   LABELS space
 )
 alaya_add_test(
-  NAME space_test_sq4_space
-  TARGET sq4_space_test
-  LABELS space
-)
-alaya_add_test(
-  NAME space_test_sq8_space
-  TARGET sq8_space_test
+  NAME space_test_sqx_space
+  TARGET sqx_space_test
   LABELS space
 )
 alaya_add_test(
