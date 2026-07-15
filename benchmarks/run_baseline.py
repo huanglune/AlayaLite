@@ -251,7 +251,7 @@ def main() -> int:
         ],
     }
     commit8 = result["environment"]["git_commit"][:8]
-    output = args.output or repo / f"scripts/perf_baseline/baseline-{commit8}-{args.host}.json"
+    output = args.output or repo / f"benchmarks/baselines/baseline-{commit8}-{args.host}.json"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(output)

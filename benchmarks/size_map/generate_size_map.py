@@ -42,7 +42,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--build-dir", type=Path, default=ROOT / "build/Release")
     parser.add_argument("--wheel", type=Path)
-    parser.add_argument("--output", type=Path, default=ROOT / "scripts/size_map/baseline.json")
+    parser.add_argument("--output", type=Path, default=ROOT / "benchmarks/size_map/baseline.json")
     args = parser.parse_args()
     build = args.build_dir.resolve()
     obj = build / "python/CMakeFiles/_alayalitepy.dir/src/pybind.cpp.o"

@@ -20,7 +20,7 @@ Additionally, a Pareto-dominance check at each EF: no combo's
 than (+0.1 pp, +2 %).
 
 Usage:
-    uv run python scripts/laser_alignment/tier_b_statistical.py \\
+    uv run python benchmarks/laser_alignment/tier_b_statistical.py \\
         --csv-a  <alayaV_alayaP>/results/gist/dsqg/dsqg_R64_MD256_TOP10_T1.csv \\
         --csv-b  <alayaV_origP>/results/gist/dsqg/dsqg_R64_MD256_TOP10_T1.csv \\
         --csv-c  <diskV_alayaP>/results/gist/dsqg/dsqg_R64_MD256_TOP10_T1.csv \\

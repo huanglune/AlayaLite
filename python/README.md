@@ -62,7 +62,7 @@ hits = idx.batch_search(queries, 10)
 ```
 
 <p align="center">
-    <img src="https://github.com/AlayaDB-AI/AlayaLite/blob/main/.assets/user-portrait.svg?raw=true" width=800 alt="AlayaDB Logo"></a>
+    <img src="https://github.com/AlayaDB-AI/AlayaLite/blob/main/docs/images/user-portrait.svg?raw=true" width=800 alt="AlayaDB Logo"></a>
 </p>
 
 In particular, collections and indexes are managed by **Client**.

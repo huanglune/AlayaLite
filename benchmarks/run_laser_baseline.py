@@ -104,7 +104,7 @@ efs = [100, 200, 300]
 def execute(args: argparse.Namespace, repo: Path) -> None:
     root, tmp = shlex.quote(str(repo)), shlex.quote(args.tmp_root)
     python = shlex.quote(str(repo / ".venv/bin/python"))
-    script = shlex.quote(str(repo / "scripts/perf_baseline/run_laser_baseline.py"))
+    script = shlex.quote(str(repo / "benchmarks/run_laser_baseline.py"))
     ssh(
         args.host,
         f"rm -rf {tmp}; {python} {script} --worker-prepare --data-root {shlex.quote(args.data_root)} --tmp-root {tmp}; uptime > {tmp}/raw/load-before.txt",
@@ -215,7 +215,7 @@ def main() -> None:
     parser.add_argument("--host", default="g03")
     parser.add_argument("--data-root", default="/md1/huangliang/data")
     parser.add_argument("--tmp-root", default="/md1/huangliang/tmp/perf-baseline/14ad5369-laser")
-    parser.add_argument("--output", type=Path, default=Path("scripts/perf_baseline/baseline-14ad5369-g03-laser.json"))
+    parser.add_argument("--output", type=Path, default=Path("benchmarks/baselines/baseline-14ad5369-g03-laser.json"))
     parser.add_argument("--collect-existing", action="store_true")
     parser.add_argument("--worker-prepare", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
