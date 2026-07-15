@@ -21,7 +21,6 @@
 #include "space/sq8_space.hpp"
 #include "utils/dataset_utils.hpp"
 #include "utils/evaluate.hpp"
-#include "utils/locks.hpp"
 #include "core/log.hpp"
 #include "index/graph/detail/thread_config.hpp"
 #include "index/graph/detail/timer.hpp"
@@ -37,36 +36,7 @@ constexpr uint32_t kSparseTailCount = 50;
 using RawSpaceType = RawSpace<>;
 using GraphType = Graph<>;
 using SQ8SpaceType = SQ8Space<>;
-
-
-auto test_data_dir() -> std::filesystem::path {
-  return test::data_dir();
-}
-
-auto test_cache_dir() -> const std::filesystem::path & {
-  static const auto dir = [] {
-    auto cache_dir = std::filesystem::current_path() / "search_test_cache";
-    std::filesystem::create_directories(cache_dir);
-    return cache_dir;
-  }();
-  return dir;
-}
-
-void remove_path_if_exists(const std::filesystem::path &path) {
-  if (std::filesystem::exists(path)) {
-    std::filesystem::remove_all(path);
-  }
-}
-
-struct ScopedTempDbDir {
-  explicit ScopedTempDbDir(std::string name) : path_(test_cache_dir() / std::move(name)) {
-    remove_path_if_exists(path_);
-  }
-
-  ~ScopedTempDbDir() { remove_path_if_exists(path_); }
-
-  std::filesystem::path path_;
-};
+using test::Dataset;
 
 auto max_thread_num() -> uint32_t { return configured_thread_limit(); }
 
@@ -129,45 +99,18 @@ auto sparse_id_threshold(const Dataset &ds) -> int64_t {
   return static_cast<int64_t>(ds.data_num - tail_count);
 }
 
-auto load_or_build_hnsw_graph(const Dataset &ds, const std::shared_ptr<RawSpaceType> &space)
+auto build_hnsw_graph(const Dataset &ds, const std::shared_ptr<RawSpaceType> &space)
     -> std::shared_ptr<GraphType> {
-  auto graph_path = test_cache_dir() / fmt::format("{}_M{}.HNSW", ds.name, kHnswM);
-  auto lock_path = graph_path;
-  lock_path += ".lock";
-  auto graph_path_str = graph_path.string();
-
-  {
-    FileLock lock(lock_path);
-    if (!std::filesystem::exists(graph_path)) {
-      auto build_start = std::chrono::steady_clock::now();
-
-      core::BuildContext build_context;
-      auto segment =
-          HnswSegment<RawSpaceType>::build({core::TypedTensorView::contiguous(ds.data.data(),
-                                                                              ds.data_num,
-                                                                              ds.dim),
-                                            space,
-                                            space},
-                                           {.thread_count = max_thread_num()},
-                                           build_context);
-      auto hnsw_graph = detail::HnswSegmentBridge<RawSpaceType, RawSpaceType>::graph(*segment);
-
-      auto build_end = std::chrono::steady_clock::now();
-      auto build_time = static_cast<std::chrono::duration<double>>(build_end - build_start).count();
-      LOG_INFO("Building cached HNSW graph took {}s, saving to {}", build_time, graph_path_str);
-
-      auto tmp_graph_path = graph_path;
-      tmp_graph_path += ".tmp";
-      remove_path_if_exists(tmp_graph_path);
-      auto tmp_graph_path_str = tmp_graph_path.string();
-      hnsw_graph->save(tmp_graph_path_str);
-      std::filesystem::rename(tmp_graph_path, graph_path);
-    }
-  }
-
-  auto graph = std::make_shared<GraphType>(ds.data_num, kHnswM);
-  graph->load(graph_path_str);
-  return graph;
+  core::BuildContext build_context;
+  auto segment =
+      HnswSegment<RawSpaceType>::build({core::TypedTensorView::contiguous(ds.data.data(),
+                                                                          ds.data_num,
+                                                                          ds.dim),
+                                        space,
+                                        space},
+                                       {.thread_count = max_thread_num()},
+                                       build_context);
+  return detail::HnswSegmentBridge<RawSpaceType, RawSpaceType>::graph(*segment);
 }
 
 template <typename SearchJobPtr>
@@ -214,9 +157,9 @@ struct BaseSearchResources {
   std::shared_ptr<GraphType> hnsw_graph_;
 
   BaseSearchResources()
-      : ds_(load_dataset(sift_micro())),
+      : ds_(test::random_dataset()),
         raw_space_(make_raw_space(ds_)),
-        hnsw_graph_(load_or_build_hnsw_graph(ds_, raw_space_)) {}
+        hnsw_graph_(build_hnsw_graph(ds_, raw_space_)) {}
 };
 
 auto base_search_resources() -> BaseSearchResources & {

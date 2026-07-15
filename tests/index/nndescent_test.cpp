@@ -21,6 +21,7 @@
 #include "index/graph/detail/timer.hpp"
 
 namespace alaya {
+using test::Dataset;
 
 static_assert(internal::memory::kKnngKernelRegistration.role ==
               internal::memory::EngineRole::build_kernel);
@@ -30,7 +31,7 @@ static_assert(!internal::memory::kKnngKernelRegistration.has_legacy_factory);
 class NnDescentTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    ds_ = load_dataset(sift_micro());
+    ds_ = test::random_dataset();
 
     space_ = std::make_shared<RawSpace<>>(ds_.data_num, ds_.dim, core::Metric::l2);
     space_->fit(ds_.data.data(), ds_.data_num);
@@ -58,7 +59,7 @@ TEST_F(NnDescentTest, BuildGraphTest) {
 class NnDescentSearchTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    ds_ = load_dataset(sift_micro());
+    ds_ = test::random_dataset();
   }
 
   void TearDown() override {}

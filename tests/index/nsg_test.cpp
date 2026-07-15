@@ -20,6 +20,7 @@
 #include "index/graph/detail/timer.hpp"
 
 namespace alaya {
+using test::Dataset;
 namespace {
 
 auto make_one_dim_space(const std::vector<float> &values) -> std::shared_ptr<RawSpace<>> {
@@ -34,7 +35,7 @@ auto make_one_dim_space(const std::vector<float> &values) -> std::shared_ptr<Raw
 class NSGTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    ds_ = load_dataset(sift_micro());
+    ds_ = test::random_dataset();
 
     space_ = std::make_shared<RawSpace<>>(ds_.data_num, ds_.dim, core::Metric::l2);
     space_->fit(ds_.data.data(), ds_.data_num);
@@ -132,7 +133,7 @@ TEST(NSGInternalTest, InsertIntoPoolRejectsDuplicateAndFarNeighbor) {
 class NSGSearchTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    ds_ = load_dataset(sift_micro());
+    ds_ = test::random_dataset();
   }
 
   void TearDown() override {}

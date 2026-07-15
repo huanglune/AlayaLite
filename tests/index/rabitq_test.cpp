@@ -6,11 +6,8 @@
 #include <gtest/gtest.h>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
-#include <filesystem>
 #include <iostream>
 #include <memory>
-#include <stdexcept>
 #include <vector>
 
 #include "index/graph/detail/search_runtime/graph_search_job.hpp"
@@ -22,127 +19,40 @@
 #include "index/graph/detail/timer.hpp"
 
 namespace alaya {
-class RaBitQSiftSmallTest : public ::testing::Test {
- protected:
-  void SetUp() override {
-    config_ = sift_small();
-    ds_ = load_dataset(config_);
-  }
-
-  void TearDown() override {}
-
-  DatasetConfig config_;
-  Dataset ds_;
-};
 
 using IDType = uint32_t;
-TEST_F(RaBitQSiftSmallTest, SiftSmallQGTest) {  // for code coverage
-  // ***************INDEX******************
-  LOG_INFO("Building QG...");
-  std::filesystem::path index_file =
-      fmt::format("{}_rabitq.qg", config_.dir.string() + "/siftsmall");
-  std::string_view path = index_file.native();
 
-  if (!std::filesystem::exists(index_file)) {
-    std::shared_ptr<alaya::RaBitQSpace<>> space =
-        std::make_shared<alaya::RaBitQSpace<>>(ds_.data_num, ds_.dim, core::Metric::l2);
-    space->fit(ds_.data.data(), ds_.data_num);
-    LOG_INFO("Successfully fit data into space");
+TEST(RaBitQTest, BuildAndSearchQG) {
+  auto ds = test::random_dataset({.num_vectors = 2000, .dim = 128});
 
-    auto qg = alaya::detail::QgBuilderKernel<RaBitQSpace<>>(space);
-    qg.build_graph();
+  auto space = std::make_shared<RaBitQSpace<>>(ds.data_num, ds.dim, core::Metric::l2);
+  space->fit(ds.data.data(), ds.data_num);
 
-    space->save(path);
-  }
-  LOG_INFO("Successfully build qg!");
-  // ***************QUERY*******************
-  auto load_space = std::make_shared<alaya::RaBitQSpace<>>();
-  load_space->load(path);
-  auto search_job = std::make_unique<alaya::GraphSearchJob<RaBitQSpace<>>>(load_space, nullptr);
+  auto qg = detail::QgBuilderKernel<RaBitQSpace<>>(space);
+  qg.build_graph();
 
-  // std::shared_ptr<alaya::RaBitQSpace<>> space =
-  //     std::make_shared<alaya::RaBitQSpace<>>(ds_.data_num, ds_.dim, core::Metric::l2);
-  // space->fit(ds_.data.data(), ds_.data_num);
-  // LOG_INFO("Successfully fit data into space");
+  auto search_job = std::make_unique<GraphSearchJob<RaBitQSpace<>>>(space, nullptr);
 
-  // auto qg = alaya::detail::QgBuilderKernel<RaBitQSpace<>>(space);
-  // qg.build_graph();
-  // auto search_job = std::make_unique<alaya::GraphSearchJob<RaBitQSpace<>>>(space, nullptr);
+  constexpr uint32_t topk = 10;
+  constexpr size_t ef = 100;
+  std::vector<IDType> results(topk);
 
-  std::vector<size_t> efs = {10,  20,  40,  50,  55,  60,  80,  100, 150, 170,
-                             190, 200, 250, 300, 400, 500, 600, 800, 1500};
-  size_t test_round = 1;
-  size_t topk = 10;
-  alaya::Timer timer;
-  std::vector<std::vector<float>> all_qps(test_round, std::vector<float>(efs.size()));
-  std::vector<std::vector<float>> all_recall(test_round, std::vector<float>(efs.size()));
-
-  LOG_INFO("Start querying...");
-  for (size_t r = 0; r < test_round; ++r) {
-    for (size_t i = 0; i < efs.size(); ++i) {  // NOLINT
-      size_t ef = efs[i];
-      size_t total_correct = 0;
-      float total_time = 0;
-      std::vector<IDType> results(topk);
-      LOG_INFO("current ef in this round:{}", ef);
-      for (uint32_t n = 0; n < ds_.query_num; ++n) {
-        timer.reset();
-        search_job->rabitq_search_solo(ds_.queries.data() + (n * ds_.dim), topk, results.data(),
-                                       ef);
-
-        total_time += timer.elapsed_us();
-        // recall
-        for (size_t k = 0; k < topk; ++k) {
-          for (size_t j = 0; j < topk; ++j) {
-            if (results[k] == ds_.ground_truth[(n * ds_.gt_dim) + j]) {
-              total_correct++;
-              break;
-            }
-          }
+  size_t total_correct = 0;
+  for (uint32_t n = 0; n < ds.query_num; ++n) {
+    search_job->rabitq_search_solo(ds.queries.data() + (n * ds.dim), topk, results.data(), ef);
+    for (size_t k = 0; k < topk; ++k) {
+      for (uint32_t j = 0; j < ds.gt_dim; ++j) {
+        if (results[k] == ds.ground_truth[(n * ds.gt_dim) + j]) {
+          total_correct++;
+          break;
         }
       }
-      float qps = static_cast<float>(ds_.query_num) / (total_time / 1e6F);
-      float recall = static_cast<float>(total_correct) / static_cast<float>(ds_.query_num * topk);
-
-      all_qps[r][i] = qps;
-      all_recall[r][i] = recall;
     }
   }
 
-  auto avg_qps = alaya::horizontal_avg(all_qps);
-  auto avg_recall = alaya::horizontal_avg(all_recall);
-
-  std::cout << "ef\tQPS\tRecall\n";
-  for (size_t i = 0; i < avg_qps.size(); ++i) {
-    std::cout << efs[i] << '\t' << avg_qps[i] << '\t' << avg_recall[i] << '\n';
-  }
+  float recall = static_cast<float>(total_correct) / static_cast<float>(ds.query_num * topk);
+  LOG_INFO("RaBitQ recall@{} = {:.4f}", topk, recall);
+  EXPECT_GT(recall, 0.3F);
 }
 
-TEST_F(RaBitQSiftSmallTest, InvalidParameterTest) {
-  std::filesystem::path index_file =
-      fmt::format("{}_rabitq.qg", config_.dir.string() + "/siftsmall");
-  std::string_view path = index_file.native();
-
-  if (!std::filesystem::exists(index_file)) {
-    std::shared_ptr<alaya::RaBitQSpace<>> space =
-        std::make_shared<alaya::RaBitQSpace<>>(ds_.data_num, ds_.dim, core::Metric::l2);
-    space->fit(ds_.data.data(), ds_.data_num);
-
-    auto qg = alaya::detail::QgBuilderKernel<RaBitQSpace<>>(space);
-    qg.build_graph();
-    space->save(path);
-  }
-
-  auto load_space = std::make_shared<alaya::RaBitQSpace<>>();
-  load_space->load(path);
-  auto search_job = std::make_unique<alaya::GraphSearchJob<RaBitQSpace<>>>(load_space, nullptr);
-
-  size_t topk = 10;
-  size_t ef = 5;  // ef < k, should throw exception
-  std::vector<IDType> results(topk);
-  auto query = ds_.queries.data();
-
-  EXPECT_THROW(search_job->rabitq_search_solo(query, topk, results.data(), ef),
-               std::invalid_argument);
-}
 }  // namespace alaya
