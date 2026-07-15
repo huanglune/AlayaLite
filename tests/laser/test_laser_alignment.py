@@ -18,8 +18,8 @@ CLI:
     uv run tests/laser/test_laser_alignment.py \\
         --dataset synth_100k_512d \\
         --vamana alayaV \\
-        --baseline-dir /md1/huangliang/alaya-dev/build_graph/laser_port/baseline_20260421 \\
-        --port-out-dir /md1/huangliang/alaya-dev/build_graph/laser_port/validation_20260421
+        --baseline-dir $ALAYA_BUILD_GRAPH_DIR/laser_port/baseline_20260421 \\
+        --port-out-dir $ALAYA_BUILD_GRAPH_DIR/laser_port/validation_20260421
 
 Exit codes:
     0  — both tiers pass
@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import struct
 import subprocess
 import sys
@@ -66,9 +67,9 @@ PARETO_RECALL_TOL_PP: float = 0.1
 # regressions (which would show up across multiple EFs and datasets).
 PARETO_QPS_REL_TOL: float = 0.07
 
-AL_REPO = Path("/md1/huangliang/alaya-dev/AlayaLite")
-DATA_ROOT = Path("/md1/huangliang/alaya-dev/data")
-BG_ROOT = Path("/md1/huangliang/alaya-dev/build_graph")
+AL_REPO = Path(os.environ.get("ALAYA_REPO_DIR", Path(__file__).resolve().parents[2]))
+DATA_ROOT = Path(os.environ.get("ALAYA_TEST_DATA_DIR", AL_REPO / "data"))
+BG_ROOT = Path(os.environ.get("ALAYA_BUILD_GRAPH_DIR", "."))
 
 
 # ── Combo → input paths ────────────────────────────────────────────────────

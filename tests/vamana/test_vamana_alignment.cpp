@@ -150,8 +150,7 @@ std::vector<uint32_t> parse_csv_u32(const std::string &s) {
   return out;
 }
 
-// Dataset shorthand mapping for convenience flag. See D10 in design.md:
-// data under /md1/.../data/<dataset>/, prefixed by a short label.
+// Dataset shorthand mapping: dataset name → file prefix.
 std::string dataset_base_prefix(const std::string &dataset) {
   if (dataset == "sift1m") return "sift";
   if (dataset == "gist1m") return "gist";
