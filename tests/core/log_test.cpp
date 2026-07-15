@@ -96,9 +96,9 @@ TEST(LogTest, ExtractRelativePathHandlesSourceMarkersAndFallbacks) {
                "include\\core\\log.hpp");
   EXPECT_STREQ(extract_relative_path("/repo/src/module.cpp"), "src/module.cpp");
   EXPECT_STREQ(extract_relative_path("C:\\repo\\src\\module.cpp"), "src\\module.cpp");
-  EXPECT_STREQ(extract_relative_path("/repo/tests/utils/log_test.cpp"), "tests/utils/log_test.cpp");
-  EXPECT_STREQ(extract_relative_path("C:\\repo\\tests\\utils\\log_test.cpp"),
-               "tests\\utils\\log_test.cpp");
+  EXPECT_STREQ(extract_relative_path("/repo/tests/core/log_test.cpp"), "tests/core/log_test.cpp");
+  EXPECT_STREQ(extract_relative_path("C:\\repo\\tests\\core\\log_test.cpp"),
+               "tests\\core\\log_test.cpp");
   EXPECT_STREQ(extract_relative_path("/tmp/generated.cpp"), "generated.cpp");
   EXPECT_STREQ(extract_relative_path("C:\\tmp\\generated.cpp"), "generated.cpp");
   EXPECT_STREQ(extract_relative_path("generated.cpp"), "generated.cpp");
