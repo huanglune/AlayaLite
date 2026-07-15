@@ -175,7 +175,7 @@ def generate(build_dir: Path) -> dict[str, object]:
         return {
             "schema_version": 1,
             "seed": 20260712,
-            "generator": "benchmarks/golden/generate_artifact_baseline.py",
+            "generator": "tests/golden/generate_artifact_baseline.py",
             "laser_fixture_present": laser_present,
             "artifacts": artifacts,
         }

@@ -7,21 +7,21 @@ host (CPU, NUMA, toolchain) and are meaningless on a different machine.
 ## Generate a baseline
 
 ```bash
-benchmarks/run_baseline.py \
+benchmarks/perf/run_baseline.py \
   --host <hostname> \
   --data-root /path/to/data \
   --remote-tmp /tmp/perf-baseline \
-  --output benchmarks/baselines/baseline-<commit>-<host>.json
+  --output benchmarks/perf/baselines/baseline-<commit>-<host>.json
 ```
 
 LASER baseline:
 
 ```bash
-.venv/bin/python benchmarks/run_laser_baseline.py \
+.venv/bin/python benchmarks/perf/run_laser_baseline.py \
   --host <hostname> \
   --data-root /path/to/data \
   --tmp-root /tmp/perf-baseline \
-  --output benchmarks/baselines/baseline-<commit>-<host>-laser.json
+  --output benchmarks/perf/baselines/baseline-<commit>-<host>-laser.json
 ```
 
 ## Compare against a candidate

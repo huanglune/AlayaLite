@@ -17,7 +17,7 @@ Design (see openspec/changes/port-laser-disk-index/design.md D10):
 - Ground truth is top-100 by L2 over the rotated base (brute force, float32 BLAS).
 
 Usage:
-    python benchmarks/laser_alignment/gen_synth_100k_512d.py \\
+    python benchmarks/laser/alignment/gen_synth_100k_512d.py \\
         --out /path/to/data/synth_100k_512d
 """
 
@@ -170,7 +170,7 @@ def main() -> None:
         "\n"
         "## Reproduction\n"
         "```\n"
-        "python benchmarks/laser_alignment/gen_synth_100k_512d.py --out <this dir>\n"
+        "python benchmarks/laser/alignment/gen_synth_100k_512d.py --out <this dir>\n"
         "```\n"
         "\n"
         "## sha256\n"

@@ -10,7 +10,7 @@ through `vamana/pca/medoid/index` was retired when that example became
 a compact `Index.fit` wrapper.
 
 Usage:
-    uv run python benchmarks/laser_alignment/tier_a_byte_equal.py \\
+    uv run python benchmarks/laser/alignment/tier_a_byte_equal.py \\
         --port-config examples/laser/configs/synth_20k_768d_alayaP.toml \\
         --upstream-config /path/to/Laser/configs/synth_20k_768d_origP.toml \\
         --out-root /path/to/output/ \\

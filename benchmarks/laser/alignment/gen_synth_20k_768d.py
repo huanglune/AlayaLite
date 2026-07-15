@@ -19,7 +19,7 @@ Design (see openspec/changes/align-laser-with-upstream/design.md D5):
   which avoids the preserved qg_builder.hpp:256 page-layout bug.
 
 Usage:
-    python benchmarks/laser_alignment/gen_synth_20k_768d.py \\
+    python benchmarks/laser/alignment/gen_synth_20k_768d.py \\
         --out /path/to/data/synth_20k_768d
 """
 
@@ -171,7 +171,7 @@ def main() -> None:
         "\n"
         "## Reproduction\n"
         "```\n"
-        "python benchmarks/laser_alignment/gen_synth_20k_768d.py --out <this dir>\n"
+        "python benchmarks/laser/alignment/gen_synth_20k_768d.py --out <this dir>\n"
         "```\n"
         "\n"
         "## sha256\n"

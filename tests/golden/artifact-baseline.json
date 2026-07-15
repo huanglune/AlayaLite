@@ -875,7 +875,7 @@
       }
     }
   },
-  "generator": "benchmarks/golden/generate_artifact_baseline.py",
+  "generator": "tests/golden/generate_artifact_baseline.py",
   "laser_fixture_present": true,
   "schema_version": 1,
   "seed": 20260712

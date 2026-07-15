@@ -1,43 +1,31 @@
-# Python benchmark harnesses
+# Benchmarks
 
-This directory houses thin wrappers around the canonical Python
-benchmark CLIs that live in `python/src/alayalite/bench/`.
+```
+benchmarks/
+├── perf/                 # Hot-path performance baseline (SIMD/QG/LASER)
+│   ├── run_baseline.py       # QG + SIMD baseline runner (SSH to target host)
+│   ├── run_laser_baseline.py # LASER baseline runner
+│   └── baselines/            # Machine-local baseline JSONs (gitignored)
+├── laser/                # LASER-specific benchmarks and alignment harnesses
+│   ├── disk_laser_smoke.py        # Legacy stdout compatibility wrapper
+│   ├── laser_unified_fit_bench.py # Unified fit benchmark
+│   ├── laser_unified_fit_plot.py  # Recall-QPS curve renderer
+│   └── alignment/                 # Port-LASER tier A/B alignment verification
+├── size_map/             # Binary size tracking
+├── adapters/             # External benchmark framework adapters
+│   └── annbenchmark/         # ANN-benchmarks integration
+└── README.md
+```
 
-## Available CLIs
+Golden artifact generators live in `tests/golden/` (test infrastructure,
+not benchmarks).
 
-- `python -m alayalite.bench.disk_collection` — the unified
-  DiskCollection sweep harness (engines: `disk_flat`, `disk_vamana`,
-  `disk_laser`). See OpenSpec capability `disk-collection-benchmark`.
-- `python -m alayalite.bench.laser_compare` — paired native
-  `alayalite.laser.Index` vs
-  `DiskCollection(index_type="disk_laser")` harness; loads one
-  precomputed LASER artifact directory and emits a `comparison` JSON
-  block quantifying the wrapper-layer adapter overhead. See OpenSpec
-  capability
-  [`laser-native-equivalence-benchmark`](../../openspec/specs/laser-native-equivalence-benchmark/spec.md)
-  and archived change
-  [`python-laser-native-equivalence-benchmark`](../../openspec/changes/archive/2026-05-02-python-laser-native-equivalence-benchmark/).
+## Python benchmark CLIs
 
-The paired harness is gated on the runtime probe
-`alayalite.bench._engines.probe_disk_laser_supported`; on builds without
-`ALAYA_ENABLE_LASER=ON` it prints a single skip line and exits 0
-without writing any output.
+- `python -m alayalite.bench.disk_collection` — unified DiskCollection
+  sweep harness (engines: `disk_flat`, `disk_vamana`, `disk_laser`).
+- `python -m alayalite.bench.laser_compare` — paired native vs
+  DiskCollection LASER adapter overhead harness.
 
-The smoke test for `laser_compare` is
-`python/tests/test_bench_laser_compare_smoke.py`; it is collected
-as `skipped` on unsupported builds and runs end-to-end on the
-deterministic 256-row / 128-dim fixture from
-`python/tests/fixtures/laser/builder.py` on supported builds.
-
-## Notes
-
-- The legacy `disk_laser_smoke.py` script in this directory is a
-  compatibility wrapper preserving the historical stdout contract;
-  new work should target the canonical CLIs above.
-- Large external datasets are off by default. The unified
-  `disk_collection` harness opts in via `--dataset-root <PATH>`; the
-  paired `laser_compare` harness takes its inputs through
-  `--laser-src-dir`, `--vectors`, `--queries-path`, and
-  `--ground-truth` flags directly. CI does not exercise large
-  datasets — the `laser_compare` smoke test is the only LASER paired
-  path exercised on every build.
+Large external datasets are off by default. CI exercises only the
+`laser_compare` smoke test on a deterministic 256-row fixture.

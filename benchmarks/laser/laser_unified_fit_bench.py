@@ -9,7 +9,7 @@
 Outputs a JSON report plus a markdown table suitable for PR descriptions.
 
 Example:
-    uv run python/benchmarks/laser_unified_fit_bench.py \
+    uv run benchmarks/laser/laser_unified_fit_bench.py \
       --dataset-root /path/to/data/gist1m \
       --datasets gist1m \
       --output-dir results/laser_unified_fit_bench \
