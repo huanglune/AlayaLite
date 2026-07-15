@@ -82,7 +82,8 @@ inline size_t padding_requirement(size_t dim, RotatorType type) {
 }
 
 template <typename T>
-kernels::linalg::RowMajorMatrix<T> random_gaussian_matrix(size_t rows, size_t cols,
+kernels::linalg::RowMajorMatrix<T> random_gaussian_matrix(size_t rows,
+                                                          size_t cols,
                                                           uint64_t seed = 42) {
   kernels::linalg::RowMajorMatrix<T> rand(rows, cols);
   std::mt19937 gen(seed);

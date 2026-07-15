@@ -19,7 +19,6 @@
 #include "kernels/linalg/types.hpp"
 #include "platform/detect.hpp"
 
-
 namespace alaya {
 
 template <typename T>

@@ -579,8 +579,6 @@ class DiskVamanaSegment {
   }
 
  private:
-
-
   DiskVamanaSegment(std::shared_ptr<VamanaSegmentSearcher> searcher,
                     std::filesystem::path directory)
       : searcher_(std::move(searcher)), directory_(std::move(directory)) {

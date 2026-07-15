@@ -88,8 +88,11 @@ class ScalarQuantizedSpace {
   auto get_data_by_id(IDType id) const -> uint8_t * { return data_storage_[id]; }
 
   auto get_distance(IDType i, IDType j) const -> DistanceType {
-    return distance_calc_func_(
-        get_data_by_id(i), get_data_by_id(j), dim_, quantizer_.get_min(), quantizer_.get_max());
+    return distance_calc_func_(get_data_by_id(i),
+                               get_data_by_id(j),
+                               dim_,
+                               quantizer_.get_min(),
+                               quantizer_.get_max());
   }
 
   auto get_data_num() const -> IDType { return item_cnt_; }
@@ -101,7 +104,7 @@ class ScalarQuantizedSpace {
     return metric_ == core::Metric::l2
                ? core::Metric::l2
                : (metric_ == core::Metric::inner_product ? core::Metric::inner_product
-                                                          : core::Metric::cosine);
+                                                         : core::Metric::cosine);
   }
 
   auto get_quantizer() const -> QuantizerType { return quantizer_; }
@@ -179,10 +182,10 @@ class ScalarQuantizedSpace {
 
     auto operator()(IDType u) const -> DistanceType {
       return distance_space_.distance_calc_func_(query_,
-                                                  distance_space_.get_data_by_id(u),
-                                                  distance_space_.get_dim(),
-                                                  distance_space_.get_quantizer().get_min(),
-                                                  distance_space_.get_quantizer().get_max());
+                                                 distance_space_.get_data_by_id(u),
+                                                 distance_space_.get_dim(),
+                                                 distance_space_.get_quantizer().get_min(),
+                                                 distance_space_.get_quantizer().get_max());
     }
   };
 

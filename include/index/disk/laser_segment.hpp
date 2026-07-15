@@ -389,8 +389,6 @@ class LaserSegment {
   }
 
  private:
-
-
   LaserSegment(std::shared_ptr<LaserSegmentSearcher> searcher,
                SegmentManifest native,
                std::filesystem::path directory,

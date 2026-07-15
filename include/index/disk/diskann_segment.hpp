@@ -588,7 +588,6 @@ class DiskAnnSegment {
   }
 
  private:
-
   friend class DiskAnnMutableSegmentFactory;
 
   struct NativeMetaSummary {
