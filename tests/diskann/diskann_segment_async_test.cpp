@@ -356,4 +356,3 @@ TEST_F(DiskAnnSegmentTest, ConcurrentNativeAsyncAndSyncMixedStress) {
 }
 
 }  // namespace
-

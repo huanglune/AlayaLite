@@ -97,4 +97,3 @@ TEST_F(DiskAnnSegmentTest, TypedInputEmptyAndCancelledPartialSemanticsAreExplici
 }
 
 }  // namespace
-

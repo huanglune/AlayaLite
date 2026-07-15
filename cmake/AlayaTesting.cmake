@@ -38,17 +38,18 @@ configure_file(
 )
 
 # --- Dataset download targets (opt-in, never part of default build) ---
-set(_ALAYA_DOWNLOAD_SCRIPT "${CMAKE_SOURCE_DIR}/scripts/download_dataset.sh")
-set(_ALAYA_DATASETS siftsmall deep1m)
+set(ALAYA_DOWNLOAD_SCRIPT "${CMAKE_SOURCE_DIR}/scripts/download_dataset.sh")
+set(ALAYA_DATASETS siftsmall deep1m)
 
 add_custom_target(test-data)
-foreach(_ds IN LISTS _ALAYA_DATASETS)
-  add_custom_target(test-data-${_ds}
-    COMMAND ${_ALAYA_DOWNLOAD_SCRIPT} ${_ds} ${ALAYA_TEST_DATA_DIR}
-    COMMENT "Downloading dataset: ${_ds}"
+foreach(ds IN LISTS ALAYA_DATASETS)
+  add_custom_target(
+    test-data-${ds}
+    COMMAND ${ALAYA_DOWNLOAD_SCRIPT} ${ds} ${ALAYA_TEST_DATA_DIR}
+    COMMENT "Downloading dataset: ${ds}"
     VERBATIM
   )
-  add_dependencies(test-data test-data-${_ds})
+  add_dependencies(test-data test-data-${ds})
 endforeach()
 
 function(alaya_cc_target target_name)

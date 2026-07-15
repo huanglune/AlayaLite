@@ -1264,4 +1264,3 @@ TEST_F(DiskAnnSegmentTest, MutableCheckpointFiveStepFailuresPreserveOldGeneratio
 }
 
 }  // namespace
-
