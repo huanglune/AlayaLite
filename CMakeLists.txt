@@ -61,6 +61,7 @@ if(BUILD_TESTING)
   set(GTEST_LIBS GTest::gtest GTest::gtest_main)
   include(cmake/AlayaTesting.cmake)
   add_subdirectory(tests)
+  add_subdirectory(benchmarks)
 endif()
 
 if(BUILD_PYTHON)

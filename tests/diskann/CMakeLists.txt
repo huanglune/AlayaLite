@@ -162,27 +162,4 @@ if(ALAYA_ENABLE_LASER)
     TIMEOUT 600
   )
 
-  # Standalone SIFT1M benchmarks (manual; NOT registered with ctest). bench_diskann_sift measures recall / latency /
-  # disk-reads-per-query so the index can be compared against the official DiskANN `search_disk_index` tool on the same
-  # data and metrics. bench_diskann_sift_update replays Yi-format update traces (see make_diskann_sift_update_trace)
-  # through mixed search+update workloads. Build the target, then execute the binary explicitly.
-  alaya_cc_target(
-    bench_diskann_sift
-    LASER
-    SRCS bench_diskann_sift.cpp
-  )
-  alaya_cc_target(
-    bench_diskann_sift_update
-    LASER
-    SRCS bench_diskann_sift_update.cpp
-  )
-  alaya_cc_target(make_diskann_sift_update_trace SRCS make_diskann_sift_update_trace.cpp)
-
-  # Manual Gate-8 async performance sentinel. It is intentionally not registered with ctest: the benchmark runner
-  # launches two persistent processes and interleaves fixed-index samples across implementations.
-  alaya_cc_target(
-    diskann_async_sentinel
-    LASER
-    SRCS diskann_async_sentinel.cpp
-  )
 endif()

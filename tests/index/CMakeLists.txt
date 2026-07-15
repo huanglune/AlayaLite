@@ -57,8 +57,6 @@ alaya_cc_target(
   GTEST
   SRCS rabitq_performance_test.cpp
 )
-alaya_cc_target(rabitq_benchmark SRCS rabitq_benchmark.cpp)
-
 alaya_cc_target(
   graph_search_test
   GTEST
