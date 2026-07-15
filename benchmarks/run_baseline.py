@@ -210,8 +210,8 @@ uptime > \"$OUT/load-after.txt\"; sha256sum \"$IDX\" > \"$OUT/deep1m.sha256\"; s
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="g03")
-    parser.add_argument("--data-root", default="/md1/huangliang/data")
-    parser.add_argument("--remote-tmp", default="/md1/huangliang/tmp/perf-baseline")
+    parser.add_argument("--data-root", required=True)
+    parser.add_argument("--remote-tmp", required=True)
     parser.add_argument("--output", type=Path)
     parser.add_argument(
         "--collect-existing", action="store_true", help="collect previously generated raw files without rerunning"

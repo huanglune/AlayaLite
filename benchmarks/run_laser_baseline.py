@@ -213,8 +213,8 @@ def collect(args: argparse.Namespace, repo: Path) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="g03")
-    parser.add_argument("--data-root", default="/md1/huangliang/data")
-    parser.add_argument("--tmp-root", default="/md1/huangliang/tmp/perf-baseline/14ad5369-laser")
+    parser.add_argument("--data-root", required=True)
+    parser.add_argument("--tmp-root", required=True)
     parser.add_argument("--output", type=Path, default=Path("benchmarks/baselines/baseline-14ad5369-g03-laser.json"))
     parser.add_argument("--collect-existing", action="store_true")
     parser.add_argument("--worker-prepare", action="store_true", help=argparse.SUPPRESS)

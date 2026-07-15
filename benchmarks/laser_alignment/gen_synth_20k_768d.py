@@ -20,7 +20,7 @@ Design (see openspec/changes/align-laser-with-upstream/design.md D5):
 
 Usage:
     python benchmarks/laser_alignment/gen_synth_20k_768d.py \\
-        --out /md1/huangliang/alaya-dev/data/synth_20k_768d
+        --out /path/to/data/synth_20k_768d
 """
 
 from __future__ import annotations

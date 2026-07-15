@@ -9,8 +9,8 @@ From the repository root:
 ```bash
 scripts/perf_baseline/run_baseline.py \
   --host g03 \
-  --data-root /md1/huangliang/data \
-  --remote-tmp /md1/huangliang/tmp/perf-baseline \
+  --data-root /path/to/data \
+  --remote-tmp /tmp/perf-baseline \
   --output /tmp/candidate-g03.json
 ```
 
@@ -24,8 +24,8 @@ The LASER baseline additionally requires the uv-managed worktree venv and a
 ```bash
 .venv/bin/python scripts/perf_baseline/run_laser_baseline.py \
   --host g03 \
-  --data-root /md1/huangliang/data \
-  --tmp-root /md1/huangliang/tmp/perf-baseline/14ad5369-laser \
+  --data-root /path/to/data \
+  --tmp-root /tmp/perf-baseline \
   --output /tmp/candidate-g03-laser.json
 ```
 
@@ -59,4 +59,4 @@ Treat a regression over 3% in any gated row as rollback-worthy unless a reviewed
 
 The committed snapshots are `baseline-14ad5369-g03.json` and
 `baseline-14ad5369-g03-laser.json`. Raw LASER logs and its fresh artifacts
-remain under `/md1/huangliang/tmp/perf-baseline/14ad5369-laser/` on g03.
+remain under `/tmp/perf-baseline/` on g03.

@@ -29,13 +29,13 @@ from pathlib import Path
 DEFAULT_NAME = "synth_20k_768d"
 DEFAULT_PREFIX = f"dsqg_{DEFAULT_NAME}"
 DEFAULT_BASELINE_DIR = Path(
-    "/md1/huangliang/alaya-dev/build_graph/laser_alignment/tier_a_20260423/synth_20k_768d/port/data/synth_20k_768d"  # pragma: allowlist secret
+    ""
 )
 DEFAULT_BASELINE = DEFAULT_BASELINE_DIR / f"{DEFAULT_PREFIX}_R64_MD256.post_layout_fix.index"
 DEFAULT_BASELINE_SHA = "f1554f3ebaa9d986f975878354749c287ba777d4f6aa82265d565e32c4c16f32"  # pragma: allowlist secret  # noqa: E501 commit 589152c
-DEFAULT_VAMANA = Path("/md1/huangliang/alaya-dev/build_graph/synth_20k_768d/alaya/R64_L100_a1.2/graph.index")
+DEFAULT_VAMANA = Path("")
 DEFAULT_VAMANA_SHA = "133298cbded6774b36ec32a5fc70a1d2036e71f3e693f3e618a817e84fd6be75"  # pragma: allowlist secret
-DEFAULT_OUTPUT_ROOT = Path("/md1/huangliang/alaya-dev/build_graph/laser_npp1_byte_equality")
+DEFAULT_OUTPUT_ROOT = Path("")
 K_SECTOR_LEN = 4096
 PRE_QG_SUFFIXES = ("pca.bin", "pca_base.fbin", "medoids_indices", "medoids")
 

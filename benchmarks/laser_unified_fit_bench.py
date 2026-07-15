@@ -10,7 +10,7 @@ Outputs a JSON report plus a markdown table suitable for PR descriptions.
 
 Example:
     uv run python/benchmarks/laser_unified_fit_bench.py \
-      --dataset-root /md1/huangliang/alaya-dev/data/gist1m \
+      --dataset-root /path/to/data/gist1m \
       --datasets gist1m \
       --output-dir results/laser_unified_fit_bench \
       --threads 8 --efs 100,200 --build-repeats 1

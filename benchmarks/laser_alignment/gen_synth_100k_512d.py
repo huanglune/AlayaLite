@@ -18,7 +18,7 @@ Design (see openspec/changes/port-laser-disk-index/design.md D10):
 
 Usage:
     python benchmarks/laser_alignment/gen_synth_100k_512d.py \\
-        --out /md1/huangliang/alaya-dev/data/synth_100k_512d
+        --out /path/to/data/synth_100k_512d
 """
 
 from __future__ import annotations
