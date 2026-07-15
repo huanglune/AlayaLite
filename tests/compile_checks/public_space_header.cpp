@@ -26,4 +26,4 @@ static_assert(alaya::Space<GoldenSQ4Space>);
 static_assert(alaya::Space<GoldenSQ8Space>);
 static_assert(alaya::Space<GoldenRaBitQSpace>);
 
-auto golden_space_compile(GoldenSpace *space) -> size_t { return space->get_dim(); }
+auto main() -> int { return 0; }

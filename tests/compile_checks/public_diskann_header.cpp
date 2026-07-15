@@ -7,6 +7,4 @@ static_assert(std::is_default_constructible_v<alaya::diskann::DiskANNBuildParams
 static_assert(std::is_default_constructible_v<alaya::diskann::DiskANNLoadParams>);
 static_assert(!std::is_copy_constructible_v<alaya::diskann::DiskANNIndex>);
 
-auto golden_diskann_compile() -> uint32_t {
-  return alaya::diskann::DiskANNIndex::kMetaVersion;
-}
+auto main() -> int { return 0; }

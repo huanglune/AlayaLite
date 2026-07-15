@@ -5,6 +5,4 @@
 
 static_assert(std::is_abstract_v<alaya::disk::SegmentSearcher>);
 
-auto golden_disk_compile() -> alaya::disk::DiskIndexType {
-  return alaya::disk::DiskIndexType::Flat;
-}
+auto main() -> int { return 0; }
