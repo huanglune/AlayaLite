@@ -37,26 +37,40 @@ cmake .. \
 # target set from CTest (instead of hard-coding it) keeps the coverage build in lockstep
 # with the tests as they are renamed, added, or removed -- a stale hard-coded list silently
 # breaks the build ("No rule to make target ...") or the run ("Unable to find executable").
+#
+# `ctest --show-only` filters by label correctly pre-build, but its JSON `command` field is
+# null until the targets are built; CTest instead resolves each $<TARGET_FILE:> into the
+# generated CTestTestfile.cmake at configure time, so map the label-selected test names to
+# their executables through those files.
 mapfile -t COVERAGE_TARGETS < <(
   ctest --test-dir "${BUILD_DIR}" --show-only=json-v1 -L "${CTEST_LABELS}" \
     | BUILD_DIR="${BUILD_DIR}" python3 -c '
-import json, os, sys
+import json, os, re, sys
 
-build_prefix = os.path.abspath(os.environ["BUILD_DIR"]) + os.sep
+build = os.path.abspath(os.environ["BUILD_DIR"])
+selected = {test["name"] for test in json.load(sys.stdin).get("tests", [])}
+add_test = re.compile(r"add_test\(\s*\[=\[(?P<name>[^\]]+)\]=\]\s+\"(?P<exe>[^\"]+)\"")
+targets = []
 seen = set()
-for test in json.load(sys.stdin).get("tests", []):
-    command = test.get("command") or []
-    if not command:
+for root, _dirs, files in os.walk(build):
+    if "CTestTestfile.cmake" not in files:
         continue
-    executable = os.path.abspath(command[0])
-    # Keep only executables this build produces (their basename is the CMake target);
-    # skip tests driven by a system tool such as cmake -P header-boundary scripts.
-    if not executable.startswith(build_prefix):
-        continue
-    target = os.path.basename(executable)
-    if target not in seen:
-        seen.add(target)
-        print(target)
+    with open(os.path.join(root, "CTestTestfile.cmake"), encoding="utf-8") as handle:
+        testfile = handle.read()
+    for match in add_test.finditer(testfile):
+        if match.group("name") not in selected:
+            continue
+        executable = os.path.abspath(match.group("exe"))
+        # Skip tests driven by a system tool (e.g. cmake -P header-boundary scripts);
+        # keep only executables this build produces, whose basename is the CMake target.
+        if not executable.startswith(build + os.sep):
+            continue
+        target = os.path.basename(executable)
+        if target not in seen:
+            seen.add(target)
+            targets.append(target)
+for target in targets:
+    print(target)
 '
 )
 
