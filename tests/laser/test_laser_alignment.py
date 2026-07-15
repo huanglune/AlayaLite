@@ -86,81 +86,81 @@ class ComboSpec:
 
 
 def _build_combos(data_root: Path, bg_root: Path) -> dict[tuple[str, str], ComboSpec]:
-  return {
-    ("gist1m", "alayaV"): ComboSpec(
-        combo_key="gist1m_alayaV",
-        dataset="gist1m",
-        toml_name="gist",  # the original Laser gist.toml uses name="gist"
-        base_fbin=data_root / "gist1m" / "gist_base.fbin",
-        query_fbin=data_root / "gist1m" / "gist_query.fbin",
-        gt_ibin=data_root / "gist1m" / "gist_gt.ibin",
-        vamana_index=bg_root / "gist1m" / "alaya" / "R64_L100_a1.2" / "graph.index",
-    ),
-    ("gist1m", "diskV"): ComboSpec(
-        combo_key="gist1m_diskV",
-        dataset="gist1m",
-        toml_name="gist",
-        base_fbin=data_root / "gist1m" / "gist_base.fbin",
-        query_fbin=data_root / "gist1m" / "gist_query.fbin",
-        gt_ibin=data_root / "gist1m" / "gist_gt.ibin",
-        vamana_index=bg_root / "gist1m" / "diskann_gt" / "R64_L100_a1.2" / "graph",
-    ),
-    ("synth_100k_512d", "alayaV"): ComboSpec(
-        combo_key="synth_alayaV",
-        dataset="synth_100k_512d",
-        toml_name="synth_100k_512d",
-        base_fbin=data_root / "synth_100k_512d" / "base.fbin",
-        query_fbin=data_root / "synth_100k_512d" / "query.fbin",
-        gt_ibin=data_root / "synth_100k_512d" / "gt.ibin",
-        vamana_index=bg_root / "synth_100k_512d" / "alaya" / "R64_L100_a1.2" / "graph.index",
-    ),
-    ("synth_100k_512d", "diskV"): ComboSpec(
-        combo_key="synth_diskV",
-        dataset="synth_100k_512d",
-        toml_name="synth_100k_512d",
-        base_fbin=data_root / "synth_100k_512d" / "base.fbin",
-        query_fbin=data_root / "synth_100k_512d" / "query.fbin",
-        gt_ibin=data_root / "synth_100k_512d" / "gt.ibin",
-        vamana_index=bg_root / "synth_100k_512d" / "diskann_gt" / "R64_L100_a1.2" / "graph.index",
-    ),
-    # 10M datasets (Vamana is R=64 L=200 α=1.2 — not L=100 like gist/synth)
-    ("bigcode", "alayaV"): ComboSpec(
-        combo_key="bigcode_alayaV",
-        dataset="bigcode",
-        toml_name="bigcode",
-        base_fbin=data_root / "bigcode" / "bigcode_base.fbin",
-        query_fbin=data_root / "bigcode" / "bigcode_query.fbin",
-        gt_ibin=data_root / "bigcode" / "bigcode_gt",
-        vamana_index=bg_root / "bigcode" / "alaya" / "R64_L200_a1.2" / "graph.index",
-    ),
-    ("bigcode", "diskV"): ComboSpec(
-        combo_key="bigcode_diskV",
-        dataset="bigcode",
-        toml_name="bigcode",
-        base_fbin=data_root / "bigcode" / "bigcode_base.fbin",
-        query_fbin=data_root / "bigcode" / "bigcode_query.fbin",
-        gt_ibin=data_root / "bigcode" / "bigcode_gt",
-        vamana_index=bg_root / "bigcode" / "diskann_gt" / "R64_L200_a1.2" / "graph_mem.index",
-    ),
-    ("cohere", "alayaV"): ComboSpec(
-        combo_key="cohere_alayaV",
-        dataset="cohere",
-        toml_name="cohere",
-        base_fbin=data_root / "cohere" / "cohere_base.fbin",
-        query_fbin=data_root / "cohere" / "cohere_query.fbin",
-        gt_ibin=data_root / "cohere" / "cohere_gt",
-        vamana_index=bg_root / "cohere" / "alaya" / "R64_L200_a1.2" / "graph.index",
-    ),
-    ("cohere", "diskV"): ComboSpec(
-        combo_key="cohere_diskV",
-        dataset="cohere",
-        toml_name="cohere",
-        base_fbin=data_root / "cohere" / "cohere_base.fbin",
-        query_fbin=data_root / "cohere" / "cohere_query.fbin",
-        gt_ibin=data_root / "cohere" / "cohere_gt",
-        vamana_index=bg_root / "cohere" / "diskann_gt" / "R64_L200_a1.2" / "graph_mem.index",
-    ),
-}
+    return {
+        ("gist1m", "alayaV"): ComboSpec(
+            combo_key="gist1m_alayaV",
+            dataset="gist1m",
+            toml_name="gist",  # the original Laser gist.toml uses name="gist"
+            base_fbin=data_root / "gist1m" / "gist_base.fbin",
+            query_fbin=data_root / "gist1m" / "gist_query.fbin",
+            gt_ibin=data_root / "gist1m" / "gist_gt.ibin",
+            vamana_index=bg_root / "gist1m" / "alaya" / "R64_L100_a1.2" / "graph.index",
+        ),
+        ("gist1m", "diskV"): ComboSpec(
+            combo_key="gist1m_diskV",
+            dataset="gist1m",
+            toml_name="gist",
+            base_fbin=data_root / "gist1m" / "gist_base.fbin",
+            query_fbin=data_root / "gist1m" / "gist_query.fbin",
+            gt_ibin=data_root / "gist1m" / "gist_gt.ibin",
+            vamana_index=bg_root / "gist1m" / "diskann_gt" / "R64_L100_a1.2" / "graph",
+        ),
+        ("synth_100k_512d", "alayaV"): ComboSpec(
+            combo_key="synth_alayaV",
+            dataset="synth_100k_512d",
+            toml_name="synth_100k_512d",
+            base_fbin=data_root / "synth_100k_512d" / "base.fbin",
+            query_fbin=data_root / "synth_100k_512d" / "query.fbin",
+            gt_ibin=data_root / "synth_100k_512d" / "gt.ibin",
+            vamana_index=bg_root / "synth_100k_512d" / "alaya" / "R64_L100_a1.2" / "graph.index",
+        ),
+        ("synth_100k_512d", "diskV"): ComboSpec(
+            combo_key="synth_diskV",
+            dataset="synth_100k_512d",
+            toml_name="synth_100k_512d",
+            base_fbin=data_root / "synth_100k_512d" / "base.fbin",
+            query_fbin=data_root / "synth_100k_512d" / "query.fbin",
+            gt_ibin=data_root / "synth_100k_512d" / "gt.ibin",
+            vamana_index=bg_root / "synth_100k_512d" / "diskann_gt" / "R64_L100_a1.2" / "graph.index",
+        ),
+        # 10M datasets (Vamana is R=64 L=200 α=1.2 — not L=100 like gist/synth)
+        ("bigcode", "alayaV"): ComboSpec(
+            combo_key="bigcode_alayaV",
+            dataset="bigcode",
+            toml_name="bigcode",
+            base_fbin=data_root / "bigcode" / "bigcode_base.fbin",
+            query_fbin=data_root / "bigcode" / "bigcode_query.fbin",
+            gt_ibin=data_root / "bigcode" / "bigcode_gt",
+            vamana_index=bg_root / "bigcode" / "alaya" / "R64_L200_a1.2" / "graph.index",
+        ),
+        ("bigcode", "diskV"): ComboSpec(
+            combo_key="bigcode_diskV",
+            dataset="bigcode",
+            toml_name="bigcode",
+            base_fbin=data_root / "bigcode" / "bigcode_base.fbin",
+            query_fbin=data_root / "bigcode" / "bigcode_query.fbin",
+            gt_ibin=data_root / "bigcode" / "bigcode_gt",
+            vamana_index=bg_root / "bigcode" / "diskann_gt" / "R64_L200_a1.2" / "graph_mem.index",
+        ),
+        ("cohere", "alayaV"): ComboSpec(
+            combo_key="cohere_alayaV",
+            dataset="cohere",
+            toml_name="cohere",
+            base_fbin=data_root / "cohere" / "cohere_base.fbin",
+            query_fbin=data_root / "cohere" / "cohere_query.fbin",
+            gt_ibin=data_root / "cohere" / "cohere_gt",
+            vamana_index=bg_root / "cohere" / "alaya" / "R64_L200_a1.2" / "graph.index",
+        ),
+        ("cohere", "diskV"): ComboSpec(
+            combo_key="cohere_diskV",
+            dataset="cohere",
+            toml_name="cohere",
+            base_fbin=data_root / "cohere" / "cohere_base.fbin",
+            query_fbin=data_root / "cohere" / "cohere_query.fbin",
+            gt_ibin=data_root / "cohere" / "cohere_gt",
+            vamana_index=bg_root / "cohere" / "diskann_gt" / "R64_L200_a1.2" / "graph_mem.index",
+        ),
+    }
 
 
 def _write_toml(spec: ComboSpec, out_dir: Path, toml_path: Path) -> None:

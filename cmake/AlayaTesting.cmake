@@ -21,13 +21,20 @@
 include_guard(GLOBAL)
 
 # --- Test config generation (once per configure) ---
-set(ALAYA_TEST_DATA_DIR "${CMAKE_SOURCE_DIR}/data" CACHE PATH "Root directory for test datasets")
-set(ALAYA_BUILD_GRAPH_DIR "" CACHE PATH "Root directory for build-graph artifacts")
-set(ALAYA_DISKANN_SEARCH_BIN "search_memory_index" CACHE FILEPATH "Path to DiskANN search_memory_index binary")
+set(ALAYA_TEST_DATA_DIR
+    "${CMAKE_SOURCE_DIR}/data"
+    CACHE PATH "Root directory for test datasets"
+)
+set(ALAYA_BUILD_GRAPH_DIR
+    ""
+    CACHE PATH "Root directory for build-graph artifacts"
+)
+set(ALAYA_DISKANN_SEARCH_BIN
+    "search_memory_index"
+    CACHE FILEPATH "Path to DiskANN search_memory_index binary"
+)
 configure_file(
-  ${CMAKE_SOURCE_DIR}/tests/include/utils/test_config.hpp.in
-  ${CMAKE_BINARY_DIR}/generated/test_config.hpp
-  @ONLY
+  ${CMAKE_SOURCE_DIR}/tests/include/utils/test_config.hpp.in ${CMAKE_BINARY_DIR}/generated/test_config.hpp @ONLY
 )
 
 # --- Dataset download targets (opt-in, never part of default build) ---
@@ -75,10 +82,7 @@ function(alaya_cc_target target_name)
   else()
     target_link_libraries(${target_name} PRIVATE AlayaLite alaya_build_flags ${ARG_LIBS})
   endif()
-  target_include_directories(${target_name} PRIVATE
-    ${CMAKE_SOURCE_DIR}/tests/include
-    ${CMAKE_BINARY_DIR}/generated
-  )
+  target_include_directories(${target_name} PRIVATE ${CMAKE_SOURCE_DIR}/tests/include ${CMAKE_BINARY_DIR}/generated)
 
   if(ARG_GTEST)
     target_link_libraries(${target_name} PRIVATE GTest::gtest GTest::gtest_main)

@@ -76,7 +76,6 @@ alaya_add_test(
   LABELS laser threadpool
 )
 
-
 alaya_cc_target(
   laser_simd_dispatch_test
   BARE GTEST
