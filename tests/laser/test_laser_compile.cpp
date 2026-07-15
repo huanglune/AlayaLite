@@ -10,9 +10,7 @@
 
 #include "index/graph/laser/common.hpp"
 #include "index/graph/laser/space/bitwise.hpp"
-#include "index/graph/laser/space/inner_product.hpp"
 #include "index/graph/laser/space/l2.hpp"
-#include "index/graph/laser/space/space.hpp"
 #include "index/graph/laser/utils/aligned_file_reader.hpp"
 #include "index/graph/laser/utils/buffer.hpp"
 #include "index/graph/laser/utils/concurrent_queue.hpp"

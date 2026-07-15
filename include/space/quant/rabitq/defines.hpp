@@ -19,7 +19,6 @@
 #include "kernels/linalg/types.hpp"
 #include "platform/detect.hpp"
 
-#define LOWBIT(x) ((x) & (-(x)))
 
 namespace alaya {
 

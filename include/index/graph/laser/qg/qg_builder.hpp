@@ -22,7 +22,6 @@
 
 #include "index/graph/laser/common.hpp"
 #include "index/graph/laser/qg/qg.hpp"
-#include "index/graph/laser/space/space.hpp"
 #include "index/graph/laser/utils/aligned_file_reader.hpp"
 #include "index/graph/laser/utils/aligned_file_reader_factory.hpp"
 #include "index/graph/laser/utils/tools.hpp"

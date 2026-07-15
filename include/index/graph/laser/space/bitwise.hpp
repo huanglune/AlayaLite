@@ -13,23 +13,12 @@
 
 #pragma once
 
-#include <bit>
 #include <cstddef>
 #include <cstdint>
 
 #include "platform/detect.hpp"
 
 namespace alaya::laser::space {
-
-/** @brief Counts total set bits (popcount) across a binary vector. */
-inline auto popcount(size_t dim, const uint64_t *ALAYA_RESTRICT data) -> size_t {
-  size_t ret = 0;
-  for (size_t i = 0; i < dim / 64; ++i) {
-    ret += std::popcount(*data);
-    ++data;
-  }
-  return ret;
-}
 
 /** @brief Packs 0/1 integer array into uint64 bit-packed format. */
 inline void pack_binary(const int *ALAYA_RESTRICT bin_x,

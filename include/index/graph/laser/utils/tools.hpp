@@ -10,39 +10,12 @@
 #pragma once
 
 #include <cstddef>
-#include <ctime>
-#include <functional>
-#include <random>
 #include <thread>
 
 namespace alaya::laser {
 
-inline auto thread_local_random_seed() -> std::mt19937::result_type {
-  constexpr std::mt19937::result_type kDefaultSeed = 42;
-  const std::hash<std::thread::id> thread_hasher;
-  const auto thread_seed =
-      static_cast<std::mt19937::result_type>(thread_hasher(std::this_thread::get_id()));
-  return static_cast<std::mt19937::result_type>(kDefaultSeed + thread_seed);
-}
-
-/** @brief Thread-safe random integer generator in range [min, max]. */
-template <typename T>
-inline T rand_integer(T min, T max) {
-  // Brace-init avoids the most-vexing-parse: with parens, gcc tries to parse
-  // the initializer as a function declarator and reads `std::random_device()()`
-  // as "function returning function".
-  // NOLINTNEXTLINE(whitespace/braces)
-  static thread_local std::mt19937 generator{thread_local_random_seed()};
-  std::uniform_int_distribution<T> distribution(min, max);
-  return distribution(generator);
-}
-
-constexpr size_t div_round_up(size_t val, size_t div) {
-  return (val / div) + static_cast<size_t>((val % div) != 0);
-}
-
 constexpr size_t round_up_to_multiple(size_t val, size_t multiple_of) {
-  return multiple_of * (div_round_up(val, multiple_of));
+  return ((val + multiple_of - 1) / multiple_of) * multiple_of;
 }
 
 inline size_t ceil_log2(size_t val) {

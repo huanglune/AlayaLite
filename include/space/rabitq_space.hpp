@@ -46,7 +46,7 @@ class RaBitQSpace {
   size_t data_chunk_size_{0};
 
   using DistanceFunction = DistanceType (*)(const DataType *, const DataType *, std::size_t);
-  DistanceFunction distance_cal_func_;
+  DistanceFunction distance_calc_func_;
 
   StaticStorage<> storage_;
   std::unique_ptr<RaBitQQuantizer<DataType>> quantizer_;
@@ -111,11 +111,11 @@ class RaBitQSpace {
   void set_metric_function() {
     switch (metric_) {
       case core::Metric::l2:
-        distance_cal_func_ = simd::get_l2_sqr_func();
+        distance_calc_func_ = simd::get_l2_sqr_func();
         break;
       case core::Metric::cosine:
       case core::Metric::inner_product:
-        distance_cal_func_ = simd::get_ip_sqr_func();
+        distance_calc_func_ = simd::get_ip_sqr_func();
         break;
       default:
         throw std::runtime_error("invalid metric type.");
@@ -181,7 +181,7 @@ class RaBitQSpace {
   }
 
   auto get_distance(IDType i, IDType j) const -> DistanceType {
-    return distance_cal_func_(get_data_by_id(i), get_data_by_id(j), dim_);
+    return distance_calc_func_(get_data_by_id(i), get_data_by_id(j), dim_);
   }
 
   [[nodiscard]] auto get_data_by_id(IDType id) const -> const DataType * {
@@ -250,7 +250,7 @@ class RaBitQSpace {
                                                          : core::Metric::cosine);
   }
 
-  auto get_dist_func() const -> DistanceFunction { return distance_cal_func_; }
+  auto get_dist_func() const -> DistanceFunction { return distance_calc_func_; }
 
   auto get_data_num() const -> IDType { return item_cnt_; }
 
@@ -322,7 +322,7 @@ class RaBitQSpace {
           f_add_offset_(distance_space.f_add_offset_),
           f_rescale_offset_(distance_space.f_rescale_offset_),
           nei_id_offset_(distance_space.nei_id_offset_),
-          dist_func_(distance_space.distance_cal_func_),
+          dist_func_(distance_space.distance_calc_func_),
           dim_(distance_space.dim_),
           padded_dim_(distance_space.get_padded_dim()),
           query_(query) {

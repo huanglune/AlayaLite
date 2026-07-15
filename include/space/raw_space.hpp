@@ -43,7 +43,7 @@ class RawSpace {
   using DistanceTypeAlias = DistanceType;
   using DistanceFunction = DistanceType (*)(const DataType *, const DataType *, std::size_t);
 
-  DistanceFunction distance_calu_func_;
+  DistanceFunction distance_calc_func_;
 
   IDType capacity_{0};
   uint32_t dim_{0};
@@ -59,7 +59,7 @@ class RawSpace {
   RawSpace(IDType capacity, size_t dim, core::Metric metric)
       : capacity_(capacity), dim_(dim), metric_(metric) {
     data_size_ = dim * sizeof(DataType);
-    distance_calu_func_ = simd::l2_sqr<DataType, DistanceType>;
+    distance_calc_func_ = simd::l2_sqr<DataType, DistanceType>;
 
     data_storage_.init(data_size_, capacity);
 
@@ -81,11 +81,11 @@ class RawSpace {
   void set_metric_function() {
     switch (metric_) {
       case core::Metric::l2:
-        distance_calu_func_ = simd::l2_sqr<DataType, DistanceType>;
+        distance_calc_func_ = simd::l2_sqr<DataType, DistanceType>;
         break;
       case core::Metric::inner_product:
       case core::Metric::cosine:
-        distance_calu_func_ = simd::ip_sqr<DataType, DistanceType>;
+        distance_calc_func_ = simd::ip_sqr<DataType, DistanceType>;
         break;
       default:
         break;
@@ -119,7 +119,7 @@ class RawSpace {
   auto get_data_by_id(IDType id) const -> DataType * { return data_storage_[id]; }
 
   auto get_distance(IDType i, IDType j) const -> DistanceType {
-    return distance_calu_func_(get_data_by_id(i), get_data_by_id(j), dim_);
+    return distance_calc_func_(get_data_by_id(i), get_data_by_id(j), dim_);
   }
 
   auto get_data_num() const -> IDType { return item_cnt_; }
@@ -130,7 +130,7 @@ class RawSpace {
 
   auto get_data_size() const -> size_t { return data_size_; }
 
-  auto get_dist_func() const -> DistanceFunction { return distance_calu_func_; }
+  auto get_dist_func() const -> DistanceFunction { return distance_calc_func_; }
 
   auto get_dim() const -> uint32_t { return dim_; }
 
@@ -203,7 +203,7 @@ class RawSpace {
       if (!distance_space_.data_storage_.is_valid(u)) {
         return std::numeric_limits<float>::max();
       }
-      return distance_space_.distance_calu_func_(query_,
+      return distance_space_.distance_calc_func_(query_,
                                                  distance_space_.get_data_by_id(u),
                                                  distance_space_.dim_);
     }
