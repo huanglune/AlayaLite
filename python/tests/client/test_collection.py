@@ -125,6 +125,25 @@ class TestCollection(unittest.TestCase):
 
         self.assertEqual(collection.options()["build_threads"], 7)
 
+    def test_insert_forwards_ann_build_params_and_keeps_defaults(self):
+        items = [
+            (1, "Document 1", np.array([0.1, 0.2, 0.3], dtype=np.float32), {}),
+            (2, "Document 2", np.array([0.4, 0.5, 0.6], dtype=np.float32), {}),
+        ]
+        self.collection.insert(items)
+        defaults = self.collection.options()
+        self.assertEqual(defaults["max_neighbors"], 32)
+        self.assertEqual(defaults["ef_construction"], 400)
+
+        collection = self._create_collection(
+            "test_collection_ann_params",
+            self._collection_params(max_nbrs=17, ef_construction=123),
+        )
+        collection.insert(items)
+        configured = collection.options()
+        self.assertEqual(configured["max_neighbors"], 17)
+        self.assertEqual(configured["ef_construction"], 123)
+
     def test_upsert_fit_and_concat(self):
         items = [
             (1, "Document 1", np.array([0.1, 0.2, 0.3], dtype=np.float32), {"category": "A"}),
@@ -719,6 +738,8 @@ class TestCollection(unittest.TestCase):
         rebuilt_options = self.collection.options()
         self.assertEqual(rebuilt_options["ef_construction"], 211)
         self.assertEqual(rebuilt_options["build_threads"], 3)
+        self.assertEqual(rebuilt_options["max_neighbors"], 32)
+        self.assertEqual(self.collection.get_index_params().ef_construction, 211)
 
         # --- Recall check after reindex ---
         remaining_vectors = vectors[900:]  # 100 remaining vectors

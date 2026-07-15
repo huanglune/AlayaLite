@@ -170,7 +170,7 @@ def test_gate10_filter_policies_overfetch_stats_and_budget_reuse(tmp_path):
 def test_gate10_python_seal_compact_gc_and_collection_stats(tmp_path):
     collection = Collection(
         "gate10-lifecycle",
-        IndexParams(storage_path=str(tmp_path / "gate10-lifecycle" / "storage")),
+        IndexParams(index_type="flat", storage_path=str(tmp_path / "gate10-lifecycle" / "storage")),
     )
     collection.add([_item("a", [0, 0]), _item("b", [1, 0])])
     first = collection.seal()

@@ -682,6 +682,7 @@ class PyCollection {
                                    const std::string &index_type,
                                    const std::string &quantization_type,
                                    std::uint32_t build_threads,
+                                   std::uint32_t max_neighbors,
                                    std::uint32_t ef_construction,
                                    std::uint64_t auto_seal_rows) -> std::shared_ptr<PyCollection> {
     CollectionOptions options;
@@ -692,6 +693,7 @@ class PyCollection {
     options.target_algorithm = algorithm(index_type);
     options.quantization = quantization(quantization_type);
     options.build_threads = build_threads;
+    options.max_neighbors = max_neighbors;
     options.ef_construction = ef_construction;
     options.auto_seal_rows = auto_seal_rows;
     return std::make_shared<PyCollection>(unwrap(Collection::create(std::move(options))));
@@ -917,6 +919,7 @@ class PyCollection {
     result["index_type"] = algorithm_name(options.target_algorithm);
     result["quantization_type"] = quantization_name(options.quantization);
     result["build_threads"] = options.build_threads;
+    result["max_neighbors"] = options.max_neighbors;
     result["ef_construction"] = options.ef_construction;
     result["implementation_key"] = collection_->target_implementation_key();
     result["engine_factory_key"] = collection_->target_engine_factory_key();
@@ -947,6 +950,7 @@ inline void register_collection(py::module_ &module) {
                   py::arg("index_type"),
                   py::arg("quantization_type"),
                   py::arg("build_threads") = 1,
+                  py::arg("max_neighbors") = 32,
                   py::arg("ef_construction") = 400,
                   py::arg("auto_seal_rows") = 0)
       .def_static("open", &PyCollection::open, py::arg("root"))

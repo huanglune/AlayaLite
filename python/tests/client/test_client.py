@@ -96,6 +96,29 @@ class TestClient(unittest.TestCase):  # pylint: disable=missing-class-docstring
         second.insert(items)
         self.assertEqual(second.get_index_params().quantization_type, "sq8")
 
+    def test_collection_ann_build_kwargs_reach_native_and_validate(self):
+        items = [
+            (1, "Document 1", np.array([0.1, 0.2, 0.3], dtype=np.float32), {}),
+            (2, "Document 2", np.array([0.4, 0.5, 0.6], dtype=np.float32), {}),
+        ]
+        collection = self.client.create_collection(
+            "ann_params",
+            max_nbrs=19,
+            ef_construction=157,
+        )
+        collection.insert(items)
+
+        options = collection.options()
+        self.assertEqual(options["max_neighbors"], 19)
+        self.assertEqual(options["ef_construction"], 157)
+        self.assertEqual(collection.get_index_params().max_nbrs, 19)
+        self.assertEqual(collection.get_index_params().ef_construction, 157)
+
+        with self.assertRaisesRegex(ValueError, "Max neighbors must be greater than 0"):
+            self.client.create_collection("invalid_max_neighbors", max_nbrs=0)
+        with self.assertRaisesRegex(ValueError, "ef_construction must be greater than 0"):
+            self.client.create_collection("invalid_ef_construction", ef_construction=0)
+
 
 if __name__ == "__main__":
     unittest.main()

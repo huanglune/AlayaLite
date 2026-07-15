@@ -41,6 +41,7 @@ class IndexParams:
     metric: str = None
     capacity: np.uint32 = None
     max_nbrs: int = None
+    ef_construction: Optional[int] = None
     build_threads: Optional[int] = None
     materialized_view_build_threads: Optional[int] = None
     storage_path: str = ""  # Collection storage directory
@@ -74,6 +75,8 @@ class IndexParams:
             self.capacity = 100000
         if self.max_nbrs is None:
             self.max_nbrs = 32
+        if self.ef_construction is None:
+            self.ef_construction = 400
 
     def to_json_dict(self) -> dict:
         return {
@@ -84,6 +87,7 @@ class IndexParams:
             "metric": self.metric,
             "capacity": self.capacity,
             "max_nbrs": self.max_nbrs,
+            "ef_construction": self.ef_construction,
             "build_threads": self.build_threads,
             "materialized_view_build_threads": self.materialized_view_build_threads,
             "storage_path": self.storage_path,
@@ -102,6 +106,7 @@ class IndexParams:
             metric=data["metric"],
             capacity=data["capacity"],
             max_nbrs=data["max_nbrs"],
+            ef_construction=data.get("ef_construction", 400),
             build_threads=data.get("build_threads") or None,
             materialized_view_build_threads=data.get("materialized_view_build_threads") or None,
             storage_path=data.get("storage_path", ""),
@@ -118,6 +123,7 @@ class IndexParams:
         metric = None
         capacity = None
         max_nbrs = None
+        ef_construction = None
         build_threads = None
         materialized_view_build_threads = None
         storage_path = ""
@@ -143,6 +149,10 @@ class IndexParams:
             capacity = valid_capacity_type(kwargs.get("capacity"))
         if kwargs.get("max_nbrs") is not None:
             max_nbrs = valid_max_nbrs(kwargs.get("max_nbrs"))
+        if kwargs.get("ef_construction") is not None:
+            ef_construction = int(kwargs.get("ef_construction"))
+            if ef_construction <= 0:
+                raise ValueError("ef_construction must be greater than 0")
         if kwargs.get("build_threads") is not None:
             build_threads = valid_thread_count(kwargs.get("build_threads"))
         if kwargs.get("materialized_view_build_threads") is not None:
@@ -159,6 +169,7 @@ class IndexParams:
             metric=metric,
             capacity=capacity,
             max_nbrs=max_nbrs,
+            ef_construction=ef_construction,
             build_threads=build_threads,
             materialized_view_build_threads=materialized_view_build_threads,
             storage_path=storage_path,

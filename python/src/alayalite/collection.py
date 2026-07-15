@@ -193,6 +193,11 @@ class Collection:
             raise ValueError("canonical Collection index_type must be flat, hnsw, nsg, fusion, or qg")
         if self.__index_params.quantization_type not in ("none", "sq4", "sq8", "rabitq"):
             raise ValueError("canonical Collection quantization_type is unsupported")
+        _assert(int(self.__index_params.max_nbrs) > 0, "index_params.max_nbrs must be greater than 0")
+        _assert(
+            int(self.__index_params.ef_construction) > 0,
+            "index_params.ef_construction must be greater than 0",
+        )
         return self.__index_params
 
     def _create_native(self, dim: int, dtype) -> _NativeCollection:
@@ -212,8 +217,9 @@ class Collection:
             params.index_type,
             params.quantization_type,
             int(build_threads),
-            400,
-            self.__auto_seal_rows,
+            max_neighbors=int(params.max_nbrs),
+            ef_construction=int(params.ef_construction),
+            auto_seal_rows=self.__auto_seal_rows,
         )
         self.__dim = int(dim)
         self.__dtype = dtype
@@ -286,7 +292,7 @@ class Collection:
         if self.__native is None:
             return
         schema_path = os.path.join(self.__root, "schema.json")
-        if self.__native.options()["imported_legacy_layout"] and os.path.exists(schema_path):
+        if self.__native.options().get("imported_legacy_layout", False) and os.path.exists(schema_path):
             return
         save_schema(
             schema_path,
@@ -679,8 +685,9 @@ class Collection:
                 options["index_type"],
                 options["quantization_type"],
                 int(threads),
-                int(ef_construction),
-                int(options["auto_seal_rows"]),
+                max_neighbors=int(options["max_neighbors"]),
+                ef_construction=int(ef_construction),
+                auto_seal_rows=int(options["auto_seal_rows"]),
             )
             if records:
                 ids = [str(record["id"]) for record in records]
@@ -716,6 +723,9 @@ class Collection:
                     shutil.rmtree(failed_root)
                 raise
             shutil.rmtree(backup_root)
+            self.__index_params.max_nbrs = int(options["max_neighbors"])
+            self.__index_params.ef_construction = int(ef_construction)
+            self.__index_params.build_threads = int(threads)
             self._persist_discovery_schema()
             return self.__native.checkpoint()
         finally:
