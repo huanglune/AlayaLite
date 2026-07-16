@@ -59,6 +59,7 @@
 #include "index/graph/diskann/search_scratch.hpp"
 #include "index/graph/diskann/slot_allocator.hpp"
 #include "index/graph/diskann/tombstone_bitmap.hpp"
+#include "index/graph/frozen_graph_snapshot.hpp"
 #include "index/graph/laser/utils/concurrent_queue.hpp"
 #include "index/graph/vamana/robust_prune.hpp"
 #include "index/graph/vamana/vamana_builder.hpp"
@@ -90,6 +91,17 @@ struct DiskANNBuildParams {
   uint32_t pq_train_iters = 15;
   uint64_t seed = 1234;
   bool verbose = false;  ///< print per-phase build wall-times to stderr
+};
+
+/// Artifact parameters used when the graph topology is already frozen.
+struct DiskANNMaterializeParams {
+  uint32_t record_capacity = 0;  ///< 0 => snapshot.max_degree()
+  uint32_t pq_n_chunks = 0;      ///< 0 => no PQ
+  double cache_ratio = 0.05;     ///< BFS cache fraction
+  uint32_t num_threads = 0;      ///< 0 => all cores (PQ train/encode)
+  uint32_t pq_train_iters = 15;
+  uint64_t seed = 1234;
+  bool verbose = false;
 };
 
 /// Load-time configuration (sizes the thread-scratch pool).
@@ -223,16 +235,8 @@ class DiskANNIndex {
       }
     } dir_guard{index_dir};
 
-    // Per-phase wall-clock timing (opt-in; mirrors official build_disk_index logging).
-    using clk = std::chrono::steady_clock;
-    auto stamp = [&params](const char *name, clk::time_point a, clk::time_point b) {
-      if (params.verbose) {
-        std::cerr << "[build] " << name << ": " << std::chrono::duration<double>(b - a).count()
-                  << " s\n";
-      }
-    };
-
     // 1. Vamana graph.
+    using clk = std::chrono::steady_clock;
     auto t_vamana0 = clk::now();
     alaya::vamana::VamanaBuildParams vparams;
     vparams.R = params.R;
@@ -245,7 +249,7 @@ class DiskANNIndex {
     const auto &graph = builder.graph();
     const uint32_t medoid = builder.medoid();
     auto t_vamana1 = clk::now();
-    stamp("vamana", t_vamana0, t_vamana1);
+    log_build_phase(params.verbose, "build", "vamana", t_vamana0, t_vamana1);
 
     // Records are sized for `capacity` neighbor slots (>= the built degree);
     // the update-time degree bound follows the capacity.
@@ -253,52 +257,95 @@ class DiskANNIndex {
     if (capacity < params.R) {
       throw std::invalid_argument("DiskANNIndex::build: record_capacity must be >= R");
     }
-    const DiskLayoutGeometry geom = DiskLayoutGeometry::compute(dim, capacity);
 
-    // 2. Sector-aligned disk layout.  3. External labels.
-    write_disk_layout(path(index_dir, "diskann.index"), vectors, graph, {n, dim, capacity, medoid});
-    write_ids(path(index_dir, "ids.bin"), labels, n);
-    auto t_layout = clk::now();
-    stamp("layout+ids", t_vamana1, t_layout);
-
-    // 4. Optional PQ.
-    const bool has_pq = params.pq_n_chunks > 0;
-    if (has_pq) {
-      PQTable pq;
-      pq.train(vectors,
-               n,
-               dim,
-               params.pq_n_chunks,
-               params.pq_train_iters,
-               params.seed,
-               params.num_threads);
-      pq.encode(vectors, n, params.num_threads);
-      pq.save(path(index_dir, "pq_pivots.bin"), path(index_dir, "pq_compressed.bin"));
-    }
-    auto t_pq = clk::now();
-    stamp("pq(train+encode+save)", t_layout, t_pq);
-
-    // 5. BFS cache.
-    NodeCache cache;
-    cache.generate(graph, vectors, medoid, n, dim, capacity, params.cache_ratio);
-    cache.save(path(index_dir, "cache_ids.bin"), path(index_dir, "cache_nodes.bin"));
-    stamp("cache", t_pq, clk::now());
-
-    // 6. Metadata.
-    MetaHeader meta;
-    meta.num_points = n;
-    meta.dim = dim;
-    meta.max_degree = capacity;
-    meta.medoid = medoid;
-    meta.has_pq = has_pq ? 1 : 0;
-    meta.pq_n_chunks = params.pq_n_chunks;
-    meta.node_len = geom.node_len;
-    meta.nodes_per_sector = geom.nodes_per_sector;
-    meta.max_slot_id = n;  // fresh build: file capacity == num_points
-    meta.live_count = n;   // fresh build: every slot is live
-    write_meta(path(index_dir, "meta.bin"), meta);
+    DiskANNMaterializeParams materialize_params;
+    materialize_params.record_capacity = capacity;
+    materialize_params.pq_n_chunks = params.pq_n_chunks;
+    materialize_params.cache_ratio = params.cache_ratio;
+    materialize_params.num_threads = params.num_threads;
+    materialize_params.pq_train_iters = params.pq_train_iters;
+    materialize_params.seed = params.seed;
+    materialize_params.verbose = params.verbose;
+    materialize_graph(index_dir,
+                      vectors,
+                      labels,
+                      n,
+                      dim,
+                      graph,
+                      medoid,
+                      materialize_params,
+                      "build");
 
     dir_guard.committed = true;  // build complete — keep the directory
+  }
+
+  /**
+   * @brief Materialize a complete read-only DiskANN directory from a finalized graph.
+   *
+   * The point count, entry point, and graph degree bound come from @p snapshot;
+   * topology construction parameters are intentionally absent. The caller must
+   * provide one vector and external label for every snapshot node.
+   */
+  static void build_from_graph(const std::string &index_dir,
+                               const FrozenGraphSnapshot &snapshot,
+                               const float *vectors,
+                               const uint64_t *labels,
+                               uint64_t dim,
+                               const DiskANNMaterializeParams &params = {}) {
+    if (dim == 0) {
+      throw std::invalid_argument("DiskANNIndex::build_from_graph: dim must be > 0");
+    }
+    if (vectors == nullptr || labels == nullptr) {
+      throw std::invalid_argument("DiskANNIndex::build_from_graph: null vectors/labels");
+    }
+    snapshot.validate();
+    if (snapshot.frozen_pts() != 0) {
+      throw std::invalid_argument(
+          "DiskANNIndex::build_from_graph: frozen points are not supported by the disk layout");
+    }
+    if (params.pq_n_chunks > 0 && dim % params.pq_n_chunks != 0) {
+      throw std::invalid_argument(
+          "DiskANNIndex::build_from_graph: dim not divisible by pq_n_chunks");
+    }
+
+    const uint32_t capacity =
+        params.record_capacity != 0 ? params.record_capacity : snapshot.max_degree();
+    if (capacity < snapshot.max_degree()) {
+      throw std::invalid_argument(
+          "DiskANNIndex::build_from_graph: record_capacity must be >= snapshot max_degree");
+    }
+
+    namespace fs = std::filesystem;
+    if (fs::exists(index_dir)) {
+      throw std::runtime_error("DiskANNIndex::build_from_graph: index_dir already exists: " +
+                               index_dir);
+    }
+    if (!fs::create_directories(index_dir)) {
+      throw std::runtime_error("DiskANNIndex::build_from_graph: cannot create " + index_dir);
+    }
+    struct DirGuard {
+      const std::string &dir;
+      bool committed = false;
+      ~DirGuard() {
+        if (!committed) {
+          std::error_code ec;
+          std::filesystem::remove_all(dir, ec);
+        }
+      }
+    } dir_guard{index_dir};
+
+    auto effective_params = params;
+    effective_params.record_capacity = capacity;
+    materialize_graph(index_dir,
+                      vectors,
+                      labels,
+                      static_cast<uint64_t>(snapshot.num_points()),
+                      dim,
+                      snapshot.adjacency(),
+                      snapshot.entry_point(),
+                      effective_params,
+                      "build_from_graph");
+    dir_guard.committed = true;
   }
 
   // ------------------------------------------------------------------- load
@@ -1070,6 +1117,79 @@ class DiskANNIndex {
 
   static std::string path(const std::string &dir, const char *name) {
     return (std::filesystem::path(dir) / name).string();
+  }
+
+  static void log_build_phase(bool verbose,
+                              const char *method,
+                              const char *phase,
+                              std::chrono::steady_clock::time_point begin,
+                              std::chrono::steady_clock::time_point end) {
+    if (verbose) {
+      std::cerr << '[' << method << "] " << phase << ": "
+                << std::chrono::duration<double>(end - begin).count() << " s\n";
+    }
+  }
+
+  static void materialize_graph(const std::string &index_dir,
+                                const float *vectors,
+                                const uint64_t *labels,
+                                uint64_t n,
+                                uint64_t dim,
+                                const std::vector<std::vector<uint32_t>> &graph,
+                                uint32_t medoid,
+                                const DiskANNMaterializeParams &params,
+                                const char *method) {
+    using clk = std::chrono::steady_clock;
+    const uint32_t capacity = params.record_capacity;
+    const DiskLayoutGeometry geom = DiskLayoutGeometry::compute(dim, capacity);
+
+    // Sector-aligned disk layout and external labels.
+    auto begin = clk::now();
+    write_disk_layout(path(index_dir, "diskann.index"), vectors, graph, {n, dim, capacity, medoid});
+    write_ids(path(index_dir, "ids.bin"), labels, n);
+    auto end = clk::now();
+    log_build_phase(params.verbose, method, "layout+ids", begin, end);
+
+    // Optional product quantization artifacts.
+    begin = clk::now();
+    const bool has_pq = params.pq_n_chunks > 0;
+    if (has_pq) {
+      PQTable pq;
+      pq.train(vectors,
+               n,
+               dim,
+               params.pq_n_chunks,
+               params.pq_train_iters,
+               params.seed,
+               params.num_threads);
+      pq.encode(vectors, n, params.num_threads);
+      pq.save(path(index_dir, "pq_pivots.bin"), path(index_dir, "pq_compressed.bin"));
+    }
+    end = clk::now();
+    log_build_phase(params.verbose, method, "pq(train+encode+save)", begin, end);
+
+    // BFS node cache.
+    begin = clk::now();
+    NodeCache cache;
+    cache.generate(graph, vectors, medoid, n, dim, capacity, params.cache_ratio);
+    cache.save(path(index_dir, "cache_ids.bin"), path(index_dir, "cache_nodes.bin"));
+    end = clk::now();
+    log_build_phase(params.verbose, method, "cache", begin, end);
+
+    // Metadata is written last, so its presence continues to mean that every
+    // required read-only artifact was successfully materialized.
+    MetaHeader meta;
+    meta.num_points = n;
+    meta.dim = dim;
+    meta.max_degree = capacity;
+    meta.medoid = medoid;
+    meta.has_pq = has_pq ? 1 : 0;
+    meta.pq_n_chunks = params.pq_n_chunks;
+    meta.node_len = geom.node_len;
+    meta.nodes_per_sector = geom.nodes_per_sector;
+    meta.max_slot_id = n;
+    meta.live_count = n;
+    write_meta(path(index_dir, "meta.bin"), meta);
   }
 
   SearchSnapshot make_search_snapshot() const {

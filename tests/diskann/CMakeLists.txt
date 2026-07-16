@@ -111,6 +111,11 @@ if(ALAYA_ENABLE_LASER)
     GTEST LASER
     SRCS test_diskann_update_e2e.cpp
   )
+  alaya_cc_target(
+    test_diskann_build_from_graph
+    GTEST LASER
+    SRCS test_diskann_build_from_graph.cpp
+  )
 
   alaya_add_test(
     NAME test_diskann_beam_search
@@ -153,6 +158,12 @@ if(ALAYA_ENABLE_LASER)
     NAME test_diskann_update_e2e
     TARGET test_diskann_update_e2e
     LABELS diskann
+  )
+  alaya_add_test(
+    NAME test_diskann_build_from_graph
+    TARGET test_diskann_build_from_graph
+    LABELS diskann seal
+    TIMEOUT 600
   )
   # The end-to-end build+search test is heavier; give it a generous timeout.
   alaya_add_test(
