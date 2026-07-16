@@ -38,6 +38,7 @@ alaya_cc_target(
   SRCS rabitq_performance_test.cpp
 )
 alaya_cc_target(rabitq_benchmark SRCS rabitq_benchmark.cpp)
+alaya_cc_target(bench_memqg_native SRCS bench_memqg_native.cpp)
 # Built for CI coverage but not registered with ctest; run manually when profiling quantization hybrids.
 alaya_cc_target(
   hybrid_quantization_performance_test
