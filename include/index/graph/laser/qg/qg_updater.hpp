@@ -534,6 +534,13 @@ class QGUpdater {
       row_generations_[id].store(id < committed ? 1 : 0, std::memory_order_relaxed);
     }
     refresh_routing_snapshot();
+    // Resident-arena seam: pre-size the arena for every PID this updater can
+    // allocate so appends land inside a stable allocation; write_at() then
+    // mirrors committed page writes into it. Reservation happens at ctor time,
+    // never concurrently with readers.
+    if (qg_.arena_resident()) {
+      qg_.arena_reserve_rows(row_generations_.size());
+    }
     qg_.set_result_filter(&deleted_);
   }
 
@@ -2624,6 +2631,7 @@ class QGUpdater {
       }
       done += static_cast<size_t>(w);
     }
+    qg_.arena_mirror_write(off, buf, len);
     stats_.page_writes++;
   }
 
