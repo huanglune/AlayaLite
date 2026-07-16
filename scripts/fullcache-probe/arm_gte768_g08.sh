@@ -16,6 +16,8 @@ SRC=/home/huangliang/workspace/alaya-dev/data/emb-fbin/gte768
 OUT=/home/huangliang/workspace/alaya-dev/data/laser-update/fullcache-20260715/results/scale-dim
 LOCAL=/tmp/huangliang-uprobe-gte768
 BUILD=${BENCH_DIR:-$WT/build/RN-$(hostname)}
+# remote hosts may lack runtime libs (g08 has no libaio.so.1); ship them via NFS
+export LD_LIBRARY_PATH="$BUILD/shlib:${LD_LIBRARY_PATH:-}"
 ST=$OUT/status-gte768.log
 N=1006717
 NUMA="numactl --cpunodebind=1 --membind=1"
@@ -37,9 +39,13 @@ for f in base.fbin query.fbin gt.ibin; do
 done
 note "data staged"
 
-# 2) MemQG native arm (768 -> FhtKac pad 1024)
-$NUMA "$MEMQG" "$LOCAL/base.fbin" "$LOCAL/query.fbin" "$LOCAL/gt.ibin" 100 5 \
-  > "$OUT/gte768_memqg_g08.csv" 2>&1 && note "memqg ok" || note "FAIL memqg"
+# 2) MemQG native arm (768 -> FhtKac pad 1024); idempotent across relaunches
+if grep -q '^memqg_native' "$OUT/gte768_memqg_g08.csv" 2>/dev/null; then
+  note "memqg skipped (csv present)"
+else
+  $NUMA "$MEMQG" "$LOCAL/base.fbin" "$LOCAL/query.fbin" "$LOCAL/gt.ibin" 100 5 \
+    > "$OUT/gte768_memqg_g08.csv" 2>&1 && note "memqg ok" || note "FAIL memqg"
+fi
 
 # 3) LASER R32 builds: main448 (PCA split) + main768 (full dim)
 build_idx() { # prefix main_dim
