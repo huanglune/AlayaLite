@@ -110,9 +110,17 @@ auto main(int argc, char **argv) -> int {
               << builder.entry_point() << "\n";
   }
 
-  const std::vector<size_t> efs = {40, 60, 100, 200};
-  const std::vector<size_t> topks = {10, 100};
-  const std::vector<int> thread_arms = {1, 16};
+  // Profile mode (kernel-gap probe): PROFILE_EF=100 pins the sweep to a
+  // single {ef, topk=10, threads=1} config so perf can attach to a long
+  // steady-state search window (crank rounds via argv[5]).
+  std::vector<size_t> efs = {40, 60, 100, 200};
+  std::vector<size_t> topks = {10, 100};
+  std::vector<int> thread_arms = {1, 16};
+  if (const char *pe = std::getenv("PROFILE_EF")) {
+    efs = {std::stoul(pe)};
+    topks = {10};
+    thread_arms = {1};
+  }
 
   std::cout << "arm,topk,ef,threads,recall,qps,mean_us\n";
   for (const size_t topk : topks) {
