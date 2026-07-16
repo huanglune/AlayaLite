@@ -714,16 +714,6 @@ class Collection {
       resolution.fallback_reason = "requested Collection target algorithm " +
                                    std::to_string(requested_algorithm) +
                                    " has no registered sealed builder; built Flat instead";
-    } else if ((requested_algorithm == core::algorithm::nsg ||
-                requested_algorithm == core::algorithm::fusion) &&
-               live_row_count < 65) {
-      resolution.fallback_reason =
-          std::string(registration->factory_key) + " requires >=65 live rows; built Flat instead";
-    } else if ((requested_algorithm == core::algorithm::nsg ||
-                requested_algorithm == core::algorithm::fusion) &&
-               schema.metric == core::Metric::cosine) {
-      resolution.fallback_reason = std::string(registration->factory_key) +
-                                   " cosine requires raw float32 vectors; built Flat instead";
     } else if (requested_algorithm == core::algorithm::qg && live_row_count <= 32) {
       resolution.fallback_reason = "qg requires >32 live rows; built Flat instead";
     } else if (requested_algorithm == core::algorithm::qg &&
@@ -766,8 +756,6 @@ class Collection {
     }
     const auto algorithm_valid = options.target_algorithm == core::algorithm::flat ||
                                  options.target_algorithm == core::algorithm::hnsw ||
-                                 options.target_algorithm == core::algorithm::nsg ||
-                                 options.target_algorithm == core::algorithm::fusion ||
                                  options.target_algorithm == core::algorithm::qg ||
                                  options.target_algorithm == core::algorithm::vamana;
     if (!algorithm_valid) {

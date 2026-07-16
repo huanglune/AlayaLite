@@ -21,7 +21,7 @@ namespace alaya::internal::collection::detail {
 // Collection graph targets use cosine's exact score domain by storing
 // normalized float32 vectors and forwarding normalized queries to an inner
 // negative-dot segment. These helpers live above the engine boundary so the
-// same adapter can be reused by HNSW, NSG, and Fusion.
+// same adapter can be reused by HNSW and QG.
 [[nodiscard]] inline auto l2_normalize_float_rows(std::span<float> values,
                                                   std::uint32_t dim,
                                                   core::OperationStage stage) -> core::Status {

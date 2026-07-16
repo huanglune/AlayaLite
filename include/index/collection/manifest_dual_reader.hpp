@@ -36,8 +36,6 @@ struct ManifestReaderOptions {
                                            "disk_flat_segment",
                                            "disk_vamana_segment",
                                            "hnsw_segment",
-                                           "nsg_segment",
-                                           "fusion_segment",
                                            "qg_segment",
                                            "disk_laser_segment"};
 };

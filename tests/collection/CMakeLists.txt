@@ -54,18 +54,6 @@ alaya_add_test(
 )
 
 alaya_cc_target(
-  collection_nsg_fusion_seal_test
-  SRCS collection_nsg_fusion_seal_test.cpp
-  GTEST
-)
-alaya_add_test(
-  NAME collection_nsg_fusion_seal_test
-  TARGET collection_nsg_fusion_seal_test
-  LABELS integration collection memory
-  TIMEOUT 600
-)
-
-alaya_cc_target(
   collection_qg_seal_test
   SRCS collection_qg_seal_test.cpp
   GTEST

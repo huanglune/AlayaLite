@@ -3,16 +3,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 
 alaya_cc_target(
-  fusion_graph_test
-  GTEST
-  SRCS fusion_graph_test.cpp
-)
-alaya_cc_target(
-  fusion_segment_test
-  GTEST
-  SRCS fusion_segment_test.cpp
-)
-alaya_cc_target(
   graph_test
   GTEST
   SRCS graph_test.cpp
@@ -21,21 +11,6 @@ alaya_cc_target(
   hnsw_test
   GTEST
   SRCS hnsw_test.cpp
-)
-alaya_cc_target(
-  nndescent_test
-  GTEST
-  SRCS nndescent_test.cpp
-)
-alaya_cc_target(
-  nsg_test
-  GTEST
-  SRCS nsg_test.cpp
-)
-alaya_cc_target(
-  nsg_segment_test
-  GTEST
-  SRCS nsg_segment_test.cpp
 )
 alaya_cc_target(
   qg_segment_test
@@ -74,22 +49,6 @@ alaya_cc_target(
 )
 
 alaya_add_test(
-  NAME index_test_fusion_graph
-  TARGET fusion_graph_test
-  LABELS unit
-)
-alaya_add_test(
-  NAME index_test_fusion_segment
-  TARGET fusion_segment_test
-  LABELS unit segment
-)
-alaya_add_test(
-  NAME index_test_fusion_segment_tsan
-  TARGET fusion_segment_test
-  FILTER FusionSegmentTest.ConcurrentSearchOnlyIsReentrant
-  LABELS tsan
-)
-alaya_add_test(
   NAME index_test_graph
   TARGET graph_test
   LABELS unit
@@ -98,27 +57,6 @@ alaya_add_test(
   NAME index_test_hnsw
   TARGET hnsw_test
   LABELS unit
-)
-alaya_add_test(
-  NAME index_test_nndescent
-  TARGET nndescent_test
-  LABELS unit
-)
-alaya_add_test(
-  NAME index_test_nsg
-  TARGET nsg_test
-  LABELS unit
-)
-alaya_add_test(
-  NAME index_test_nsg_segment
-  TARGET nsg_segment_test
-  LABELS unit segment
-)
-alaya_add_test(
-  NAME index_test_nsg_segment_tsan
-  TARGET nsg_segment_test
-  FILTER NsgSegmentTest.ConcurrentSearchOnlyIsReentrant
-  LABELS tsan
 )
 alaya_add_test(
   NAME index_test_qg_segment

@@ -466,15 +466,27 @@ INSTANTIATE_TEST_SUITE_P(QgFloat32,
                          });
 
 TEST(CollectionQgFallback, RejectsForeignRabitqAndHonestlyFallsBackForUnsupportedQgSchemas) {
-  for (const auto algorithm :
-       {core::algorithm::hnsw, core::algorithm::nsg, core::algorithm::fusion}) {
-    TemporaryDirectory temporary("foreign-rabitq-" + std::to_string(algorithm));
+  {
+    TemporaryDirectory temporary("foreign-rabitq-hnsw");
     auto options = make_options(temporary.path(), core::Metric::l2);
-    options.target_algorithm = algorithm;
+    options.target_algorithm = core::algorithm::hnsw;
     auto rejected = Collection::create(options);
     ASSERT_FALSE(rejected.ok());
     EXPECT_EQ(rejected.status().code(), core::StatusCode::invalid_argument);
     EXPECT_NE(rejected.status().diagnostic().find("explicit index_type=qg"), std::string::npos);
+  }
+
+  // NSG and Fusion are retired: their algorithm ids stay reserved (never
+  // reused) but are no longer accepted at all, so the capability gate
+  // rejects them outright instead of reaching the rabitq/qg cross-check.
+  for (const auto algorithm : {core::algorithm::nsg, core::algorithm::fusion}) {
+    TemporaryDirectory temporary("retired-algorithm-" + std::to_string(algorithm));
+    auto options = make_options(temporary.path(), core::Metric::l2);
+    options.target_algorithm = algorithm;
+    auto rejected = Collection::create(options);
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.status().code(), core::StatusCode::not_supported);
+    EXPECT_NE(rejected.status().diagnostic().find("target algorithm is unsupported"), std::string::npos);
   }
 
   {

@@ -29,9 +29,7 @@
 
 #include "index/collection/collection_checkpoint.hpp"
 #include "index/collection/experimental_snapshot_writer.hpp"
-#include "index/graph/fusion/fusion_segment.hpp"
 #include "index/graph/hnsw/hnsw_segment.hpp"
-#include "index/graph/nsg/nsg_segment.hpp"
 #include "index/graph/qg/qg_segment.hpp"
 
 namespace alaya::internal::collection {
@@ -1507,8 +1505,6 @@ class SegmentedCollection {
           }
         }
         const auto is_memory_graph = descriptor.algorithm_id == core::algorithm::hnsw ||
-                                     descriptor.algorithm_id == core::algorithm::nsg ||
-                                     descriptor.algorithm_id == core::algorithm::fusion ||
                                      descriptor.algorithm_id == core::algorithm::qg;
         if (is_memory_graph) {
           if (candidate_limit > std::numeric_limits<std::uint32_t>::max()) {
@@ -1533,20 +1529,10 @@ class SegmentedCollection {
             segment_extensions.push_back(make(effective));
           };  // NOLINT(readability/braces)
           ::alaya::HnswSearchExtension hnsw_effort;
-          ::alaya::NsgSearchExtension nsg_effort;
-          ::alaya::FusionSearchExtension fusion_effort;
           ::alaya::QgSearchExtension qg_effort;
           if (descriptor.algorithm_id == core::algorithm::hnsw) {
             synthesize_effort(hnsw_effort, [](const auto &extension) {
               return ::alaya::make_hnsw_search_extension(extension);
-            });
-          } else if (descriptor.algorithm_id == core::algorithm::nsg) {
-            synthesize_effort(nsg_effort, [](const auto &extension) {
-              return ::alaya::make_nsg_search_extension(extension);
-            });
-          } else if (descriptor.algorithm_id == core::algorithm::fusion) {
-            synthesize_effort(fusion_effort, [](const auto &extension) {
-              return ::alaya::make_fusion_search_extension(extension);
             });
           } else {
             synthesize_effort(qg_effort, [](const auto &extension) {

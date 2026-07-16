@@ -13,9 +13,7 @@
 #include <type_traits>
 #include <vector>
 
-#include "index/graph/fusion/fusion_segment.hpp"
 #include "index/graph/hnsw/hnsw_segment.hpp"
-#include "index/graph/nsg/nsg_segment.hpp"
 #include "space/raw_space.hpp"
 #include "space/sq8_space.hpp"
 
@@ -147,32 +145,6 @@ auto main(int argc, char **argv) -> int {
                                                                                      input.dim,
                                                                                      80,
                                                                                      hnsw);
-
-    alaya::NsgBuildOptions nsg;
-    nsg.max_neighbors = 8;
-    nsg.ef_construction = 32;
-    nsg.thread_count = 1;
-    build_pair<alaya::NsgSegment<RawSpace>, alaya::NsgSegment<Sq8Space, RawSpace>>(output,
-                                                                                   "nsg",
-                                                                                   input.values
-                                                                                       .data(),
-                                                                                   input.rows,
-                                                                                   input.dim,
-                                                                                   96,
-                                                                                   nsg);
-
-    alaya::FusionBuildOptions fusion;
-    fusion.max_neighbors = 8;
-    fusion.ef_construction = 32;
-    fusion.thread_count = 1;
-    build_pair<alaya::FusionSegment<RawSpace>,
-               alaya::FusionSegment<Sq8Space, RawSpace>>(output,
-                                                         "fusion",
-                                                         input.values.data(),
-                                                         input.rows,
-                                                         input.dim,
-                                                         96,
-                                                         fusion);
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "artifact_memory_graph_generator: " << error.what() << '\n';

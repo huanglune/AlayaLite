@@ -34,8 +34,6 @@ QUANTIZATION_MAP = {
 }
 INDEX_TYPE_MAP = {
     "HNSW": "hnsw",
-    "NSG": "nsg",
-    "FUSION": "fusion",
 }
 
 

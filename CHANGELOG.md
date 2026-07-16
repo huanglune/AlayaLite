@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- The NSG and Fusion memory graph engines (`nsg_segment`/`fusion_segment`),
+  their build kernels, and the NN-Descent kernel they built on. The
+  `algorithm::nsg`/`algorithm::fusion` registry ids remain reserved and are
+  rejected by the capability gate; `flat`, `hnsw`, and `qg` are unaffected.
+
 ## [1.1.0] - 2026-07-15
 
 AlayaLite 1.1.0 is a full architecture and engineering rewrite on top of the

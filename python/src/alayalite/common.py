@@ -37,7 +37,7 @@ DistanceMetric: TypeAlias = Literal["euclidean", "l2", "ip", "cosine", "cos"]
 """ Type alias for one of {"euclidean", "l2", "ip", "cosine", "cos"} """
 QuantizationType: TypeAlias = Literal[None, "none", "sq8", "sq4", "rabitq"]
 """ Type alias for one of {None, "none", "sq8", "sq4"} """
-IndexType: TypeAlias = Literal["flat", "hnsw", "nsg", "fusion", "qg"]
+IndexType: TypeAlias = Literal["flat", "hnsw", "qg"]
 """Canonical Collection algorithm spelling."""
 VectorLike: TypeAlias = npt.NDArray[VectorDType]  # type: ignore
 """ Type alias for something that can be treated as a vector """
@@ -47,7 +47,7 @@ VectorLikeBatch: TypeAlias = npt.NDArray[VectorDType]  # type: ignore
 _VALID_IDTYPES = [np.uint64, np.uint32]
 _VALID_DTYPES = [np.dtype(np.float32), np.dtype(np.int8), np.dtype(np.uint8)]
 _VALID_METRIC_TYPES = ["euclidean", "l2", "ip", "cosine", "cos"]
-_VALID_INDEX_TYPES = ["flat", "hnsw", "nsg", "fusion", "qg"]
+_VALID_INDEX_TYPES = ["flat", "hnsw", "qg"]
 _VALID_SQ_TYPES = [None, "none", "sq8", "sq4", "rabitq"]
 
 __all__ = [

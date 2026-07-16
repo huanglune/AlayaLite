@@ -13,12 +13,8 @@ def test_artifact_baseline_covers_every_current_family():
         "disk_vamana_segment",
         "diskann",
         "laser_fixture",
-        "memory_fusion_none",
-        "memory_fusion_sq8",
         "memory_hnsw_none",
         "memory_hnsw_sq8",
-        "memory_nsg_none",
-        "memory_nsg_sq8",
         "memory_qg",
         "memory_vamana",
     }

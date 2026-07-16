@@ -6,7 +6,6 @@
 
 #include <cmath>
 #include <cstdint>
-#include <cstring>
 
 namespace alaya {
 
@@ -43,52 +42,5 @@ struct Node {
 
   auto operator<(const Node &other) const -> bool { return distance_ < other.distance_; }
 };
-
-/**
- * @brief This is used by nsg.
- *
- * @tparam IDType The data type for storing IDs is determined by the number of
- vectors that need to be indexed, with the default type being uint64_t.
- */
-template <typename IDType = uint64_t>
-inline auto insert_into_pool(Neighbor<IDType> *addr, int K, Neighbor<IDType> nn) -> int {
-  // find the location to insert
-  int left = 0;
-  int right = K - 1;
-  if (addr[left].distance_ > nn.distance_) {
-    memmove(&addr[left + 1], &addr[left], K * sizeof(Neighbor<IDType>));
-    addr[left] = nn;
-    return left;
-  }
-  if (addr[right].distance_ < nn.distance_) {
-    addr[K] = nn;
-    return K;
-  }
-  while (left < right - 1) {
-    int mid = (left + right) / 2;
-    if (addr[mid].distance_ > nn.distance_) {
-      right = mid;
-    } else {
-      left = mid;
-    }
-  }
-  // check equal ID
-
-  while (left > 0) {
-    if (addr[left].distance_ < nn.distance_) {
-      break;
-    }
-    if (addr[left].id_ == nn.id_) {
-      return K + 1;
-    }
-    left--;
-  }
-  if (addr[left].id_ == nn.id_ || addr[right].id_ == nn.id_) {
-    return K + 1;
-  }
-  memmove(&addr[right + 1], &addr[right], (K - right) * sizeof(Neighbor<IDType>));
-  addr[right] = nn;
-  return right;
-}
 
 }  // namespace alaya

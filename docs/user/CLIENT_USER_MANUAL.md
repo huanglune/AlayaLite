@@ -708,7 +708,7 @@ client.create_collection(
 
 Common values:
 
-- `index_type`: `"hnsw"`, `"nsg"`, `"fusion"`.
+- `index_type`: `"flat"`, `"hnsw"`, `"qg"`.
 - `metric`: `"l2"`, `"euclidean"`, `"ip"`, `"cosine"`, `"cos"`.
 - `quantization_type`: `"none"`, `"sq8"`, `"sq4"`, `"rabitq"`.
 - `data_type`: `np.float32`, `np.int8`, `np.uint8`.

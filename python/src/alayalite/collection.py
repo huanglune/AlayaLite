@@ -189,8 +189,8 @@ class Collection:
         self.__index_params.metric = str(self.__index_params.metric).lower()
         self.__index_params.quantization_type = str(self.__index_params.quantization_type).lower()
         self.__index_params.index_type = str(self.__index_params.index_type).lower()
-        if self.__index_params.index_type not in ("hnsw", "nsg", "fusion", "qg", "flat"):
-            raise ValueError("canonical Collection index_type must be flat, hnsw, nsg, fusion, or qg")
+        if self.__index_params.index_type not in ("hnsw", "qg", "flat"):
+            raise ValueError("canonical Collection index_type must be flat, hnsw, or qg")
         if self.__index_params.quantization_type not in ("none", "sq4", "sq8", "rabitq"):
             raise ValueError("canonical Collection quantization_type is unsupported")
         _assert(int(self.__index_params.max_nbrs) > 0, "index_params.max_nbrs must be greater than 0")

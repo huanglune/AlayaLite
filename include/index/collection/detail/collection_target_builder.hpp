@@ -24,9 +24,7 @@
 #include "index/collection/detail/collection_memory_target.hpp"
 #include "index/collection/detail/collection_normalized_segment.hpp"
 #include "index/disk/disk_vamana_segment.hpp"
-#include "index/graph/fusion/fusion_segment.hpp"
 #include "index/graph/hnsw/hnsw_segment.hpp"
-#include "index/graph/nsg/nsg_segment.hpp"
 #include "index/graph/qg/qg_segment.hpp"
 #include "space/sq4_space.hpp"
 #include "space/sq8_space.hpp"
@@ -105,16 +103,6 @@ struct CollectionTargetRegistration {
                                               const CollectionTargetBuildParams &params)
     -> TargetSupport;
 
-[[nodiscard]] inline auto nsg_target_support(const CollectionSchema &schema,
-                                             core::RowCount row_count,
-                                             const CollectionTargetBuildParams &params)
-    -> TargetSupport;
-
-[[nodiscard]] inline auto fusion_target_support(const CollectionSchema &schema,
-                                                core::RowCount row_count,
-                                                const CollectionTargetBuildParams &params)
-    -> TargetSupport;
-
 [[nodiscard]] inline auto qg_target_support(const CollectionSchema &schema,
                                             core::RowCount row_count,
                                             const CollectionTargetBuildParams &params)
@@ -142,20 +130,6 @@ struct CollectionTargetRegistration {
     core::BuildContext &context) -> core::Result<CollectionTargetBuildResult>;
 
 [[nodiscard]] inline auto build_hnsw_collection_target(
-    const CollectionSchema &schema,
-    std::span<const RegisteredRow> rows,
-    const CollectionTargetBuildParams &params,
-    const CollectionTargetPublication &publication,
-    core::BuildContext &context) -> core::Result<CollectionTargetBuildResult>;
-
-[[nodiscard]] inline auto build_nsg_collection_target(
-    const CollectionSchema &schema,
-    std::span<const RegisteredRow> rows,
-    const CollectionTargetBuildParams &params,
-    const CollectionTargetPublication &publication,
-    core::BuildContext &context) -> core::Result<CollectionTargetBuildResult>;
-
-[[nodiscard]] inline auto build_fusion_collection_target(
     const CollectionSchema &schema,
     std::span<const RegisteredRow> rows,
     const CollectionTargetBuildParams &params,
@@ -193,25 +167,13 @@ struct CollectionTargetRegistration {
                                                       core::OpenContext &context)
     -> core::Result<core::AnySegment>;
 
-[[nodiscard]] inline auto open_nsg_collection_target(const std::filesystem::path &root,
-                                                     const SegmentEntryV2 &entry,
-                                                     const CollectionSchema &schema,
-                                                     core::OpenContext &context)
-    -> core::Result<core::AnySegment>;
-
-[[nodiscard]] inline auto open_fusion_collection_target(const std::filesystem::path &root,
-                                                        const SegmentEntryV2 &entry,
-                                                        const CollectionSchema &schema,
-                                                        core::OpenContext &context)
-    -> core::Result<core::AnySegment>;
-
 [[nodiscard]] inline auto open_qg_collection_target(const std::filesystem::path &root,
                                                     const SegmentEntryV2 &entry,
                                                     const CollectionSchema &schema,
                                                     core::OpenContext &context)
     -> core::Result<core::AnySegment>;
 
-inline constexpr std::array<CollectionTargetRegistration, 8> kCollectionTargetRegistrations{
+inline constexpr std::array<CollectionTargetRegistration, 6> kCollectionTargetRegistrations{
     CollectionTargetRegistration{core::algorithm::flat,
                                  "disk_flat_segment",
                                  "flat",
@@ -224,18 +186,6 @@ inline constexpr std::array<CollectionTargetRegistration, 8> kCollectionTargetRe
                                  hnsw_target_support,
                                  build_hnsw_collection_target,
                                  open_hnsw_collection_target},
-    CollectionTargetRegistration{core::algorithm::nsg,
-                                 "nsg_segment",
-                                 "nsg",
-                                 nsg_target_support,
-                                 build_nsg_collection_target,
-                                 open_nsg_collection_target},
-    CollectionTargetRegistration{core::algorithm::fusion,
-                                 "fusion_segment",
-                                 "fusion",
-                                 fusion_target_support,
-                                 build_fusion_collection_target,
-                                 open_fusion_collection_target},
     CollectionTargetRegistration{core::algorithm::qg,
                                  "qg_segment",
                                  "qg",
@@ -328,31 +278,6 @@ inline constexpr std::array<CollectionTargetRegistration, 8> kCollectionTargetRe
   return (raw_supported || scalar_quantized) && metric_supported && row_count >= 1
              ? TargetSupport::supported
              : TargetSupport::unsupported;
-}
-
-[[nodiscard]] inline auto memory_graph_target_support(const CollectionSchema &schema,
-                                                      core::RowCount row_count,
-                                                      const CollectionTargetBuildParams &params,
-                                                      core::RowCount minimum_rows)
-    -> TargetSupport {
-  if (row_count < minimum_rows) {
-    return TargetSupport::unsupported;
-  }
-  return hnsw_target_support(schema, row_count, params);
-}
-
-[[nodiscard]] inline auto nsg_target_support(const CollectionSchema &schema,
-                                             core::RowCount row_count,
-                                             const CollectionTargetBuildParams &params)
-    -> TargetSupport {
-  return memory_graph_target_support(schema, row_count, params, 65);
-}
-
-[[nodiscard]] inline auto fusion_target_support(const CollectionSchema &schema,
-                                                core::RowCount row_count,
-                                                const CollectionTargetBuildParams &params)
-    -> TargetSupport {
-  return memory_graph_target_support(schema, row_count, params, 65);
 }
 
 [[nodiscard]] inline auto qg_target_support(const CollectionSchema &schema,
@@ -450,39 +375,6 @@ template <typename SearchSpace, typename BuildSpace>
     ::alaya::HnswBuildOptions options;
     options.max_neighbors = params.max_neighbors;
     options.ef_construction = params.ef_construction;
-    options.thread_count = params.thread_count;
-    auto built = Segment::build(std::move(input), options, context);
-    return Segment::into_any(std::move(built));
-  } catch (...) {
-    return core::status_from_exception(core::OperationStage::build);
-  }
-}
-
-template <typename Segment>
-[[nodiscard]] inline auto build_typed_memory_graph_segment(
-    const CollectionSchema &schema,
-    const CollectionTargetBuildParams &params,
-    std::uint32_t effective_ef_construction,
-    const std::vector<typename Segment::SearchSpaceTypeAlias::DataTypeAlias> &vectors,
-    core::BuildContext &context) -> core::Result<core::AnySegment> {
-  using SearchSpace = typename Segment::SearchSpaceTypeAlias;
-  using BuildSpace = typename Segment::BuildSpaceTypeAlias;
-  using Scalar = typename SearchSpace::DataTypeAlias;
-  static_assert(std::is_same_v<Scalar, typename BuildSpace::DataTypeAlias>);
-  try {
-    const auto count = static_cast<std::uint32_t>(vectors.size() / schema.dim);
-    auto search_space = std::make_shared<SearchSpace>(count, schema.dim, schema.metric);
-    auto build_space = std::make_shared<BuildSpace>(count, schema.dim, schema.metric);
-    search_space->fit(vectors.data(), count);
-    build_space->fit(vectors.data(), count);
-    typename Segment::BuildInput input(core::TypedTensorView::contiguous(vectors.data(),
-                                                                         count,
-                                                                         schema.dim),
-                                       std::move(search_space),
-                                       std::move(build_space));
-    typename Segment::BuildOptions options;
-    options.max_neighbors = params.max_neighbors;
-    options.ef_construction = effective_ef_construction;
     options.thread_count = params.thread_count;
     auto built = Segment::build(std::move(input), options, context);
     return Segment::into_any(std::move(built));
@@ -690,210 +582,6 @@ template <typename Segment>
   result.artifact_bytes = published.value();
   result.effective_ef_construction = params.ef_construction;
   return result;
-}
-
-template <core::AlgorithmId AlgorithmId, template <typename, typename> typename SegmentTemplate>
-[[nodiscard]] inline auto build_memory_graph_collection_target(
-    const CollectionSchema &schema,
-    std::span<const RegisteredRow> rows,
-    const CollectionTargetBuildParams &params,
-    const CollectionTargetPublication &publication,
-    core::BuildContext &context) -> core::Result<CollectionTargetBuildResult> {
-  std::uint64_t live_count{};
-  for (const auto &row : rows) {
-    live_count += row.state == VersionState::live ? 1U : 0U;
-  }
-  if (live_count < 65) {
-    const auto *registration = find_collection_target_registration(AlgorithmId);
-    return core::Status::error(core::StatusCode::not_supported,
-                               core::OperationStage::build,
-                               core::StatusDetail::operation_slot_absent,
-                               "Collection " + std::string(registration->factory_key) +
-                                   " requires at least 65 live rows");
-  }
-
-  const auto engine_limit = AlgorithmId == core::algorithm::fusion
-                                ? std::uint64_t{std::numeric_limits<std::uint16_t>::max()}
-                                : std::uint64_t{std::numeric_limits<std::uint32_t>::max()};
-  const auto effective_ef = static_cast<std::uint32_t>(
-      std::min({std::uint64_t{params.ef_construction}, live_count, engine_limit}));
-  core::AnySegment erased;
-  std::string quantization_name;
-  std::string data_filename;
-  std::string quant_filename;
-  const auto quantization = static_cast<std::uint8_t>(params.quantization);
-  const auto *registration = find_collection_target_registration(AlgorithmId);
-  if (schema.metric == core::Metric::cosine &&
-      (schema.scalar_type != core::ScalarType::float32 || quantization != 0)) {
-    return core::Status::error(core::StatusCode::not_supported,
-                               core::OperationStage::build,
-                               core::StatusDetail::operation_slot_absent,
-                               "Collection cosine " + std::string(registration->factory_key) +
-                                   " requires raw float32 vectors");
-  }
-
-  if (schema.scalar_type == core::ScalarType::float32) {
-    auto harvested = harvest_memory_graph_vectors<float>(schema, rows, registration->factory_key);
-    if (!harvested.ok()) {
-      return harvested.status();
-    }
-    auto vectors = std::move(harvested).value();
-    if (schema.metric == core::Metric::cosine) {
-      auto status = l2_normalize_float_rows(vectors, schema.dim, core::OperationStage::build);
-      if (!status.ok()) {
-        return status;
-      }
-    }
-    core::Result<core::AnySegment> built =
-        core::Status::error(core::StatusCode::not_supported,
-                            core::OperationStage::build,
-                            core::StatusDetail::operation_slot_absent,
-                            "unsupported float32 memory graph quantization");
-    if (quantization == 0) {
-      using Space = ::alaya::RawSpace<float>;
-      using Segment = SegmentTemplate<Space, Space>;
-      built =
-          build_typed_memory_graph_segment<Segment>(schema, params, effective_ef, vectors, context);
-      quantization_name = "none";
-    } else if (quantization == 1) {
-      using Segment = SegmentTemplate<::alaya::SQ8Space<>, ::alaya::RawSpace<float>>;
-      built =
-          build_typed_memory_graph_segment<Segment>(schema, params, effective_ef, vectors, context);
-      quantization_name = "sq8";
-      quant_filename = "quant.sq8.bin";
-    } else if (quantization == 2) {
-      using Segment = SegmentTemplate<::alaya::SQ4Space<>, ::alaya::RawSpace<float>>;
-      built =
-          build_typed_memory_graph_segment<Segment>(schema, params, effective_ef, vectors, context);
-      quantization_name = "sq4";
-      quant_filename = "quant.sq4.bin";
-    }
-    if (!built.ok()) {
-      return built.status();
-    }
-    erased = std::move(built).value();
-    if (schema.metric == core::Metric::cosine) {
-      auto normalized = make_l2_normalized_query_segment(std::move(erased));
-      if (!normalized.ok()) {
-        return normalized.status();
-      }
-      erased = std::move(normalized).value();
-    }
-    data_filename = "data.f32.bin";
-  } else if (schema.scalar_type == core::ScalarType::int8 && quantization == 0) {
-    auto harvested =
-        harvest_memory_graph_vectors<std::int8_t>(schema, rows, registration->factory_key);
-    if (!harvested.ok()) {
-      return harvested.status();
-    }
-    using Space = ::alaya::RawSpace<std::int8_t>;
-    using Segment = SegmentTemplate<Space, Space>;
-    auto built = build_typed_memory_graph_segment<Segment>(schema,
-                                                           params,
-                                                           effective_ef,
-                                                           harvested.value(),
-                                                           context);
-    if (!built.ok()) {
-      return built.status();
-    }
-    erased = std::move(built).value();
-    quantization_name = "none";
-    data_filename = "data.i8.bin";
-  } else if (schema.scalar_type == core::ScalarType::uint8 && quantization == 0) {
-    auto harvested =
-        harvest_memory_graph_vectors<std::uint8_t>(schema, rows, registration->factory_key);
-    if (!harvested.ok()) {
-      return harvested.status();
-    }
-    using Space = ::alaya::RawSpace<std::uint8_t>;
-    using Segment = SegmentTemplate<Space, Space>;
-    auto built = build_typed_memory_graph_segment<Segment>(schema,
-                                                           params,
-                                                           effective_ef,
-                                                           harvested.value(),
-                                                           context);
-    if (!built.ok()) {
-      return built.status();
-    }
-    erased = std::move(built).value();
-    quantization_name = "none";
-    data_filename = "data.u8.bin";
-  } else {
-    return core::Status::
-        error(core::StatusCode::not_supported,
-              core::OperationStage::build,
-              core::StatusDetail::operation_slot_absent,
-              "Collection " + std::string(registration->factory_key) +
-                  " builder received an unsupported scalar/quantization combination");
-  }
-
-  using FormatSegment = SegmentTemplate<::alaya::RawSpace<float>, ::alaya::RawSpace<float>>;
-  MemoryCollectionTargetDefinition definition;
-  definition.algorithm_id = AlgorithmId;
-  definition.implementation_key = registration->implementation_key;
-  definition.factory_key = registration->factory_key;
-  definition.format_version = FormatSegment::kFormatVersion;
-  definition.preprocessing = schema.metric == core::Metric::cosine
-                                 ? core::MetricPreprocessing::l2_normalized
-                             : quantization == 0 ? core::MetricPreprocessing::none
-                                                 : core::MetricPreprocessing::engine_quantized;
-  definition.entry_extensions.emplace("quantization", quantization_name);
-  definition.entry_extensions.emplace("ef_construction_requested",
-                                      std::to_string(params.ef_construction));
-  definition.entry_extensions.emplace("ef_construction_effective", std::to_string(effective_ef));
-  definition.entry_extensions.emplace("max_neighbors", std::to_string(params.max_neighbors));
-  definition.entry_extensions.emplace("thread_count", std::to_string(params.thread_count));
-  definition.artifacts = {
-      {std::string(FormatSegment::kGraphArtifactName), "graph.bin", true, {}},
-      {std::string(FormatSegment::kDataArtifactName), data_filename, true, {}},
-  };
-  if (!quant_filename.empty()) {
-    definition.artifacts.push_back(
-        {std::string(FormatSegment::kQuantArtifactName), quant_filename, true, {}});
-  }
-  auto published =
-      publish_memory_collection_target(erased, schema, publication, std::move(definition), context);
-  if (!published.ok()) {
-    return published.status();
-  }
-
-  CollectionTargetBuildResult result;
-  result.segment = std::move(erased);
-  result.requested_algorithm = AlgorithmId;
-  result.built_algorithm = AlgorithmId;
-  result.implementation_key = registration->implementation_key;
-  result.factory_key = registration->factory_key;
-  result.artifact_bytes = published.value();
-  result.effective_ef_construction = effective_ef;
-  return result;
-}
-
-[[nodiscard]] inline auto build_nsg_collection_target(
-    const CollectionSchema &schema,
-    std::span<const RegisteredRow> rows,
-    const CollectionTargetBuildParams &params,
-    const CollectionTargetPublication &publication,
-    core::BuildContext &context) -> core::Result<CollectionTargetBuildResult> {
-  return build_memory_graph_collection_target<core::algorithm::nsg,
-                                              ::alaya::NsgSegment>(schema,
-                                                                   rows,
-                                                                   params,
-                                                                   publication,
-                                                                   context);
-}
-
-[[nodiscard]] inline auto build_fusion_collection_target(
-    const CollectionSchema &schema,
-    std::span<const RegisteredRow> rows,
-    const CollectionTargetBuildParams &params,
-    const CollectionTargetPublication &publication,
-    core::BuildContext &context) -> core::Result<CollectionTargetBuildResult> {
-  return build_memory_graph_collection_target<core::algorithm::fusion,
-                                              ::alaya::FusionSegment>(schema,
-                                                                      rows,
-                                                                      params,
-                                                                      publication,
-                                                                      context);
 }
 
 [[nodiscard]] inline auto build_qg_collection_target(const CollectionSchema &schema,
@@ -1308,114 +996,6 @@ template <typename Segment>
                              core::OperationStage::open,
                              core::StatusDetail::operation_slot_absent,
                              "HNSW replacement type/quantization combination is unsupported");
-}
-
-template <core::AlgorithmId AlgorithmId, template <typename, typename> typename SegmentTemplate>
-[[nodiscard]] inline auto open_memory_graph_collection_target(const std::filesystem::path &root,
-                                                              const SegmentEntryV2 &entry,
-                                                              const CollectionSchema &schema,
-                                                              core::OpenContext &context)
-    -> core::Result<core::AnySegment> {
-  using FormatSegment = SegmentTemplate<::alaya::RawSpace<float>, ::alaya::RawSpace<float>>;
-  const auto *registration = find_collection_target_registration(AlgorithmId);
-  if (entry.algorithm_id != AlgorithmId || entry.format_version != FormatSegment::kFormatVersion ||
-      entry.lifecycle == SegmentLifecycleV2::retired ||
-      (schema.metric != core::Metric::l2 && schema.metric != core::Metric::inner_product &&
-       schema.metric != core::Metric::cosine)) {
-    return core::Status::error(core::StatusCode::not_supported,
-                               core::OperationStage::open,
-                               core::StatusDetail::operation_slot_absent,
-                               "Collection " + std::string(registration->factory_key) +
-                                   " opener received an incompatible segment entry");
-  }
-
-  auto persisted = persisted_memory_graph_target(entry);
-  if (!persisted.ok()) {
-    return persisted.status();
-  }
-  const auto target = persisted.value();
-  if (target.stored_scalar_type != schema.scalar_type) {
-    return core::Status::error(core::StatusCode::corruption,
-                               core::OperationStage::open,
-                               core::StatusDetail::malformed_struct,
-                               std::string(registration->factory_key) +
-                                   " replacement stored scalar type disagrees with the "
-                                   "Collection schema");
-  }
-  const auto quantized = target.quantization == "sq8" || target.quantization == "sq4";
-  const auto expected_preprocessing = schema.metric == core::Metric::cosine
-                                          ? core::MetricPreprocessing::l2_normalized
-                                      : quantized ? core::MetricPreprocessing::engine_quantized
-                                                  : core::MetricPreprocessing::none;
-  if (target.preprocessing != expected_preprocessing) {
-    return core::Status::error(core::StatusCode::corruption,
-                               core::OperationStage::open,
-                               core::StatusDetail::malformed_struct,
-                               std::string(registration->factory_key) +
-                                   " replacement preprocessing disagrees with its "
-                                   "quantization");
-  }
-  if (schema.metric == core::Metric::cosine &&
-      (target.stored_scalar_type != core::ScalarType::float32 || target.quantization != "none")) {
-    return core::Status::error(core::StatusCode::corruption,
-                               core::OperationStage::open,
-                               core::StatusDetail::malformed_struct,
-                               "cosine " + std::string(registration->factory_key) +
-                                   " replacement is not raw float32");
-  }
-
-  if (target.stored_scalar_type == core::ScalarType::float32 && target.quantization == "none") {
-    using Space = ::alaya::RawSpace<float>;
-    using Segment = SegmentTemplate<Space, Space>;
-    auto opened = open_typed_memory_graph_segment<Segment>(root, entry, context);
-    if (!opened.ok() || schema.metric != core::Metric::cosine) {
-      return opened;
-    }
-    return make_l2_normalized_query_segment(std::move(opened).value());
-  }
-  if (target.stored_scalar_type == core::ScalarType::float32 && target.quantization == "sq8") {
-    using Segment = SegmentTemplate<::alaya::SQ8Space<>, ::alaya::RawSpace<float>>;
-    return open_typed_memory_graph_segment<Segment>(root, entry, context);
-  }
-  if (target.stored_scalar_type == core::ScalarType::float32 && target.quantization == "sq4") {
-    using Segment = SegmentTemplate<::alaya::SQ4Space<>, ::alaya::RawSpace<float>>;
-    return open_typed_memory_graph_segment<Segment>(root, entry, context);
-  }
-  if (target.stored_scalar_type == core::ScalarType::int8 && target.quantization == "none") {
-    using Space = ::alaya::RawSpace<std::int8_t>;
-    using Segment = SegmentTemplate<Space, Space>;
-    return open_typed_memory_graph_segment<Segment>(root, entry, context);
-  }
-  if (target.stored_scalar_type == core::ScalarType::uint8 && target.quantization == "none") {
-    using Space = ::alaya::RawSpace<std::uint8_t>;
-    using Segment = SegmentTemplate<Space, Space>;
-    return open_typed_memory_graph_segment<Segment>(root, entry, context);
-  }
-  return core::Status::error(core::StatusCode::not_supported,
-                             core::OperationStage::open,
-                             core::StatusDetail::operation_slot_absent,
-                             std::string(registration->factory_key) +
-                                 " replacement type/quantization combination is unsupported");
-}
-
-[[nodiscard]] inline auto open_nsg_collection_target(const std::filesystem::path &root,
-                                                     const SegmentEntryV2 &entry,
-                                                     const CollectionSchema &schema,
-                                                     core::OpenContext &context)
-    -> core::Result<core::AnySegment> {
-  return open_memory_graph_collection_target<core::algorithm::nsg, ::alaya::NsgSegment>(root,
-                                                                                        entry,
-                                                                                        schema,
-                                                                                        context);
-}
-
-[[nodiscard]] inline auto open_fusion_collection_target(const std::filesystem::path &root,
-                                                        const SegmentEntryV2 &entry,
-                                                        const CollectionSchema &schema,
-                                                        core::OpenContext &context)
-    -> core::Result<core::AnySegment> {
-  return open_memory_graph_collection_target<core::algorithm::fusion,
-                                             ::alaya::FusionSegment>(root, entry, schema, context);
 }
 
 [[nodiscard]] inline auto open_qg_collection_target(const std::filesystem::path &root,

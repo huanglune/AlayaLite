@@ -10,45 +10,17 @@
 # reason about matrix diffs without reconstructing a Cartesian product.
 implementation_registry:
   hnsw_segment: {engine_factory_key: hnsw, artifact_identity: hnsw}
-  nsg_segment: {engine_factory_key: nsg, artifact_identity: nsg}
-  fusion_segment: {engine_factory_key: fusion, artifact_identity: fusion}
   qg_segment: {engine_factory_key: qg, artifact_identity: qg}
 
 combinations           :
 - {data: float, id: uint32_t, quant: NONE, index: HNSW, implementation_key: hnsw_segment, engine_factory_key: hnsw}
-- {data: float, id: uint32_t, quant: NONE, index: NSG, implementation_key: nsg_segment, engine_factory_key: nsg}
-- {data: float, id: uint32_t, quant: NONE, index: FUSION, implementation_key: fusion_segment, engine_factory_key: fusion}
 - {data: float, id: uint32_t, quant: SQ8, index: HNSW, implementation_key: hnsw_segment, engine_factory_key: hnsw}
-- {data: float, id: uint32_t, quant: SQ8, index: NSG, implementation_key: nsg_segment, engine_factory_key: nsg}
-- {data: float, id: uint32_t, quant: SQ8, index: FUSION, implementation_key: fusion_segment, engine_factory_key: fusion}
 - {data: float, id: uint32_t, quant: SQ4, index: HNSW, implementation_key: hnsw_segment, engine_factory_key: hnsw}
-- {data: float, id: uint32_t, quant: SQ4, index: NSG, implementation_key: nsg_segment, engine_factory_key: nsg}
-- {data: float, id: uint32_t, quant: SQ4, index: FUSION, implementation_key: fusion_segment, engine_factory_key: fusion}
 - {data: float, id: uint32_t, quant: RABITQ, index: HNSW, implementation_key: qg_segment, engine_factory_key: qg}
-- {data: float, id: uint32_t, quant: RABITQ, index: NSG, implementation_key: qg_segment, engine_factory_key: qg}
-- {data: float, id: uint32_t, quant: RABITQ, index: FUSION, implementation_key: qg_segment, engine_factory_key: qg}
 - {data: float, id: uint64_t, quant: NONE, index: HNSW, implementation_key: hnsw_segment, engine_factory_key: hnsw}
-- {data: float, id: uint64_t, quant: NONE, index: NSG, implementation_key: nsg_segment, engine_factory_key: nsg}
-- {data: float, id: uint64_t, quant: NONE, index: FUSION, implementation_key: fusion_segment, engine_factory_key: fusion}
 - {data: float, id: uint64_t, quant: SQ8, index: HNSW, implementation_key: hnsw_segment, engine_factory_key: hnsw}
-- {data: float, id: uint64_t, quant: SQ8, index: NSG, implementation_key: nsg_segment, engine_factory_key: nsg}
-- {data: float, id: uint64_t, quant: SQ8, index: FUSION, implementation_key: fusion_segment, engine_factory_key: fusion}
 - {data: float, id: uint64_t, quant: SQ4, index: HNSW, implementation_key: hnsw_segment, engine_factory_key: hnsw}
-- {data: float, id: uint64_t, quant: SQ4, index: NSG, implementation_key: nsg_segment, engine_factory_key: nsg}
-- {data: float, id: uint64_t, quant: SQ4, index: FUSION, implementation_key: fusion_segment, engine_factory_key: fusion}
 - {data: int8_t, id: uint32_t, quant: NONE, index: HNSW, implementation_key: hnsw_segment, engine_factory_key: hnsw}
-- {data: int8_t, id: uint32_t, quant: NONE, index: NSG, implementation_key: nsg_segment, engine_factory_key: nsg}
-- {data: int8_t, id: uint32_t, quant: NONE, index: FUSION, implementation_key: fusion_segment, engine_factory_key: 
-    fusion}
 - {data: int8_t, id: uint64_t, quant: NONE, index: HNSW, implementation_key: hnsw_segment, engine_factory_key: hnsw}
-- {data: int8_t, id: uint64_t, quant: NONE, index: NSG, implementation_key: nsg_segment, engine_factory_key: nsg}
-- {data: int8_t, id: uint64_t, quant: NONE, index: FUSION, implementation_key: fusion_segment, engine_factory_key: 
-    fusion}
 - {data: uint8_t, id: uint32_t, quant: NONE, index: HNSW, implementation_key: hnsw_segment, engine_factory_key: hnsw}
-- {data: uint8_t, id: uint32_t, quant: NONE, index: NSG, implementation_key: nsg_segment, engine_factory_key: nsg}
-- {data: uint8_t, id: uint32_t, quant: NONE, index: FUSION, implementation_key: fusion_segment, engine_factory_key: 
-    fusion}
 - {data: uint8_t, id: uint64_t, quant: NONE, index: HNSW, implementation_key: hnsw_segment, engine_factory_key: hnsw}
-- {data: uint8_t, id: uint64_t, quant: NONE, index: NSG, implementation_key: nsg_segment, engine_factory_key: nsg}
-- {data: uint8_t, id: uint64_t, quant: NONE, index: FUSION, implementation_key: fusion_segment, engine_factory_key: 
-    fusion}
