@@ -20,6 +20,7 @@
 #include "core/algorithm_registry.hpp"
 #include "core/any_segment.hpp"
 #include "index/graph/detail/search_runtime/graph_search_job.hpp"
+#include "index/graph/frozen_graph_snapshot.hpp"
 #include "index/graph/qg/detail/qg_builder_kernel.hpp"
 #include "index/graph/qg/detail/qg_graph.hpp"
 #include "space/rabitq_space.hpp"
@@ -143,6 +144,33 @@ class QgSegment {
     descriptor.preprocessing = core::MetricPreprocessing::engine_quantized;
     descriptor.engine_factory_id = kAlgorithmId;
     return descriptor;
+  }
+
+  // Export the finalized Segment-owned topology. QG stores exactly
+  // kDegreeBound edge slots per node; sanitize those slots at the format
+  // boundary so every downstream seal consumer receives a simple graph.
+  [[nodiscard]] auto export_graph_snapshot() const -> FrozenGraphSnapshot {
+    const auto num_points = static_cast<std::size_t>(space_->get_data_num());
+    FrozenGraphSnapshot::Adjacency adjacency(num_points);
+    for (std::size_t node = 0; node < num_points; ++node) {
+      auto &neighbors = adjacency[node];
+      neighbors.reserve(GraphType::kDegreeBound);
+      const auto *edges = graph_->get_edges(static_cast<IDType>(node));
+      for (std::size_t edge = 0; edge < GraphType::kDegreeBound; ++edge) {
+        const IDType neighbor = edges[edge];
+        if (static_cast<std::size_t>(neighbor) == node ||
+            std::find(neighbors.begin(), neighbors.end(), neighbor) != neighbors.end()) {
+          continue;
+        }
+        neighbors.push_back(neighbor);
+      }
+    }
+
+    FrozenGraphSnapshot snapshot(std::move(adjacency),
+                                 graph_->get_ep(),
+                                 static_cast<std::uint32_t>(GraphType::kDegreeBound));
+    snapshot.validate();
+    return snapshot;
   }
 
   [[nodiscard]] static auto make_search_extension(const SearchExtension &options)

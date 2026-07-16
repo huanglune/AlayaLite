@@ -29,7 +29,6 @@ class LaserPageLayoutRoundTripTest : public ::testing::Test {
  protected:
   std::filesystem::path root_;
   std::filesystem::path prefix_;
-  std::filesystem::path vamana_path_;
   std::vector<float> vectors_;
 
   void SetUp() override {
@@ -38,9 +37,7 @@ class LaserPageLayoutRoundTripTest : public ::testing::Test {
     std::filesystem::remove_all(root_);
     std::filesystem::create_directories(root_);
     prefix_ = root_ / "tiny";
-    vamana_path_ = root_ / "tiny.vamana";
     vectors_ = write_vectors(prefix_);
-    write_vamana_graph(vamana_path_);
   }
 
   void TearDown() override { std::filesystem::remove_all(root_); }
@@ -64,29 +61,17 @@ class LaserPageLayoutRoundTripTest : public ::testing::Test {
     return vectors;
   }
 
-  static void write_vamana_graph(const std::filesystem::path &path) {
-    const size_t header_size =
-        sizeof(size_t) + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(size_t);
-    const size_t record_size = sizeof(uint32_t) + kDegree * sizeof(uint32_t);
-    const size_t expected_file_size = header_size + kNumPoints * record_size;
-    const uint32_t max_observed_degree = static_cast<uint32_t>(kDegree);
-    const uint32_t start = 0;
-    const size_t frozen_points = 0;
-
-    std::ofstream out(path, std::ios::binary);
-    out.write(reinterpret_cast<const char *>(&expected_file_size), sizeof(expected_file_size));
-    out.write(reinterpret_cast<const char *>(&max_observed_degree), sizeof(max_observed_degree));
-    out.write(reinterpret_cast<const char *>(&start), sizeof(start));
-    out.write(reinterpret_cast<const char *>(&frozen_points), sizeof(frozen_points));
-
+  static auto make_graph_snapshot() -> alaya::FrozenGraphSnapshot {
+    alaya::FrozenGraphSnapshot::Adjacency adjacency(kNumPoints);
     for (uint32_t i = 0; i < kNumPoints; ++i) {
-      const uint32_t degree = static_cast<uint32_t>(kDegree);
-      out.write(reinterpret_cast<const char *>(&degree), sizeof(degree));
+      adjacency[i].reserve(kDegree);
       for (uint32_t j = 0; j < kDegree; ++j) {
-        const uint32_t neighbor = (i + j + 1) % static_cast<uint32_t>(kNumPoints);
-        out.write(reinterpret_cast<const char *>(&neighbor), sizeof(neighbor));
+        adjacency[i].push_back((i + j + 1) % static_cast<uint32_t>(kNumPoints));
       }
     }
+    return alaya::FrozenGraphSnapshot(std::move(adjacency),
+                                      /*entry_point=*/0,
+                                      static_cast<std::uint32_t>(kDegree));
   }
 
   static auto open_fd_count() -> size_t {
@@ -115,7 +100,8 @@ TEST_F(LaserPageLayoutRoundTripTest, BuilderPacksLowDimNodesPerReadPathLayout) {
 
   (void)open_fd_count();
   const size_t fds_before = open_fd_count();
-  builder.build(vamana_path_.string().c_str(), prefix_.string().c_str());
+  const auto snapshot = make_graph_snapshot();
+  builder.build_from_graph(snapshot, prefix_.string().c_str());
   const size_t fds_after = open_fd_count();
   EXPECT_LE(fds_after, fds_before) << "QGBuilder leaked file descriptors";
 

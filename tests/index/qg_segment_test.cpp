@@ -267,6 +267,23 @@ TEST_F(QgSegmentTest, SegmentOwnsGraphViewAndEntryPointWhileSpaceRetainsCodecByt
   EXPECT_EQ(loaded.get_ep(), owned_entry);
 }
 
+TEST_F(QgSegmentTest, ExportedTopologyIsValidAndRetainsFixedDegree) {
+  const auto graph = detail::QgSegmentBridge<Space>::graph(*segment_);
+  auto snapshot = segment_->export_graph_snapshot();
+
+  EXPECT_EQ(snapshot.num_points(), kRows);
+  EXPECT_EQ(snapshot.max_degree(), Space::kDegreeBound);
+  EXPECT_EQ(snapshot.entry_point(), graph->get_ep());
+  EXPECT_NO_THROW(snapshot.validate());
+
+  std::size_t edge_count = 0;
+  for (const auto &neighbors : snapshot.adjacency()) {
+    EXPECT_EQ(neighbors.size(), Space::kDegreeBound);
+    edge_count += neighbors.size();
+  }
+  EXPECT_EQ(edge_count, static_cast<std::size_t>(kRows) * Space::kDegreeBound);
+}
+
 TEST_F(QgSegmentTest, LoadedArtifactMatchesLegacySearchBitForBitAndMeetsRecallSanity) {
   const auto artifact_path = (root_ / "legacy.qg").string();
   space_->save(artifact_path);

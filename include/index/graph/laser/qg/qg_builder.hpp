@@ -5,11 +5,14 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -20,11 +23,13 @@
 #include <utility>
 #include <vector>
 
+#include "index/graph/frozen_graph_snapshot.hpp"
 #include "index/graph/laser/common.hpp"
 #include "index/graph/laser/qg/qg.hpp"
 #include "index/graph/laser/utils/aligned_file_reader.hpp"
 #include "index/graph/laser/utils/aligned_file_reader_factory.hpp"
 #include "index/graph/laser/utils/tools.hpp"
+#include "platform/fs.hpp"
 #include "third_party/ngt/hashset.hpp"
 
 namespace alaya::laser {
@@ -114,6 +119,48 @@ class QGBuilder {
 
   void set_node_payload_observer(std::function<void(PID, const char *, size_t)> observer) {
     node_payload_observer_ = std::move(observer);
+  }
+
+  /**
+   * @brief Build through the existing Vamana-file entry point from an in-memory snapshot.
+   *
+   * The current LASER packer remains file-oriented. This convenience overload
+   * writes a temporary Vamana file, calls build(), and removes the temporary on
+   * both success and exception paths.
+   */
+  void build_from_graph(const FrozenGraphSnapshot &snapshot, const char *filename) {
+    snapshot.validate();
+    if (snapshot.num_points() != num_nodes_) {
+      throw std::invalid_argument(
+          "QGBuilder::build_from_graph: snapshot size does not match QuantizedGraph");
+    }
+    if (snapshot.max_degree() != degree_bound_) {
+      throw std::invalid_argument(
+          "QGBuilder::build_from_graph: snapshot max_degree does not match QuantizedGraph");
+    }
+    if (snapshot.frozen_pts() != 0) {
+      throw std::invalid_argument(
+          "QGBuilder::build_from_graph: frozen points are not supported by the LASER packer");
+    }
+
+    static std::atomic<std::uint64_t> sequence{0};
+    const auto serial = sequence.fetch_add(1, std::memory_order_relaxed);
+    const auto tick = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto temporary_path =
+        std::filesystem::temp_directory_path() /
+        ("alayalite-laser-seal-" + std::to_string(::alaya::platform::get_pid()) + "-" +
+         std::to_string(tick) + "-" + std::to_string(serial) + ".index");
+    struct ScopedTemporaryFile {
+      std::filesystem::path path;
+      ~ScopedTemporaryFile() {
+        std::error_code error;
+        std::filesystem::remove(path, error);
+      }
+    } temporary{temporary_path};
+
+    snapshot.save(temporary.path);
+    const auto path_string = temporary.path.string();
+    build(path_string.c_str(), filename);
   }
 
   /**
