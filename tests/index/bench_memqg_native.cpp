@@ -122,6 +122,7 @@ auto main(int argc, char **argv) -> int {
     thread_arms = {1};
   }
 
+  ALAYA_KSP_RESET();  // drop build-phase (find_candidates) accumulation
   std::cout << "arm,topk,ef,threads,recall,qps,mean_us\n";
   for (const size_t topk : topks) {
     for (const int threads : thread_arms) {
@@ -159,6 +160,7 @@ auto main(int argc, char **argv) -> int {
         std::printf("memqg_native,%zu,%zu,%d,%.4f,%.1f,%.1f\n", topk, ef, threads, recall,
                     best_qps, 1e6 * threads / best_qps);
         std::fflush(stdout);
+        ALAYA_KSP_REPORT("memqg");
       }
     }
   }

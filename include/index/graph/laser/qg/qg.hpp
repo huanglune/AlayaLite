@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>  // NOLINT(build/c++17)
@@ -47,6 +48,7 @@
 #include "index/graph/laser/utils/pca_transform.hpp"
 #include "index/graph/laser/utils/rotator.hpp"
 #include "third_party/ngt/hashset.hpp"
+#include "utils/kernel_section_profile.hpp"
 #include "utils/platform.hpp"
 
 namespace alaya::laser {
@@ -89,6 +91,34 @@ struct QGPageGeometry {
 };
 
 /** Derive page geometry for newly built indexes, reserving one v2 trailer per row. */
+// Loop-form row prefetch: the Duff-device helpers in utils/memory.hpp cap at
+// 20 cache lines, but an arena row is up to 120 lines (7,680 B at 768d).
+inline void prefetch_row_l1(const char *ptr, size_t num_lines) {
+  for (size_t i = 0; i < num_lines; ++i) {
+    memory::prefetch_l1(ptr + i * 64);
+  }
+}
+
+inline void prefetch_row_l2(const char *ptr, size_t num_lines) {
+  for (size_t i = 0; i < num_lines; ++i) {
+    memory::prefetch_l2(ptr + i * 64);
+  }
+}
+
+// Candidate-row prefetch depth for the resident-arena kernel, in 64B lines.
+// The memory QG kernel issues mem_prefetch_l2(next candidate, 10 lines) after
+// every pool insert; the arena kernel historically issued none, which showed
+// up as +19.5% LLC misses at the same ef. Default 10 = memqg parity; 0
+// disables (A/B control); larger values cover more of the row (48 = full raw
+// vector at 768d, 120 = whole row).
+inline size_t arena_prefetch_lines() {
+  static const size_t kLines = [] {
+    const char *v = std::getenv("ALAYA_ARENA_PF_LINES");
+    return v == nullptr ? size_t{10} : static_cast<size_t>(std::strtoul(v, nullptr, 10));
+  }();
+  return kLines;
+}
+
 inline QGPageGeometry qg_page_geometry(size_t node_len) {
   if (node_len == 0) {
     throw std::invalid_argument("qg_page_geometry: node_len must be > 0");
@@ -291,12 +321,17 @@ class QuantizedGraph {
                                AlignedFileReader &,
                                ThreadData);
 
+  // pf_base/pf_lines: resident-arena candidate prefetch — after each pool
+  // insert, prefetch the head of the current-best candidate's row (memqg
+  // kernel parity). nullptr/0 (the disk path) keeps behavior unchanged.
   float scan_neighbors(const QGQuery &q_obj,
                        const float *cur_data,
                        float *appro_dist,
                        buffer::SearchBuffer &search_pool,
                        uint32_t cur_degree,
-                       const HashBasedBooleanSet &visited) const;
+                       const HashBasedBooleanSet &visited,
+                       const char *pf_base = nullptr,
+                       size_t pf_lines = 0) const;
 
  public:
   explicit QuantizedGraph(size_t num,
@@ -520,6 +555,8 @@ inline void QuantizedGraph::arena_search_with(ThreadData &data,
   data.visited_.clear();
   data.search_pool_.clear();
 
+  ALAYA_KSP_COUNT(queries);
+  ALAYA_KSP_BEGIN(prep);
   const float *transformed_query = query;
   if (pca_transform_.is_loaded()) {
     pca_transform_.transform(query, data.pca_query_scratch_);
@@ -551,10 +588,16 @@ inline void QuantizedGraph::arena_search_with(ThreadData &data,
     data.search_pool_.insert(best_medoid, FLT_MAX);
   }
   data.search_pool_.insert(entry_point_, FLT_MAX);
+  ALAYA_KSP_END(prep);
 
   buffer::ResultBuffer res_pool(knn);
   std::vector<float> appro_dist(degree_bound_);
   const char *arena = cache_nodes_.data();
+  const size_t pf_lines = arena_prefetch_lines();
+  const char *pf_base = pf_lines > 0 ? arena : nullptr;
+  if (pf_base != nullptr) {
+    prefetch_row_l1(arena + static_cast<size_t>(entry_point_) * node_len_, pf_lines);
+  }
 
   while (data.search_pool_.has_next()) {
     const PID cur_node = data.search_pool_.pop();
@@ -569,7 +612,9 @@ inline void QuantizedGraph::arena_search_with(ThreadData &data,
                                  appro_dist.data(),
                                  data.search_pool_,
                                  this->degree_bound_,
-                                 data.visited_);
+                                 data.visited_,
+                                 pf_base,
+                                 pf_lines);
     if (residual_dimension_ > 0) {
       sqr_y += space::l2_sqr(cur_data + dimension_, residual_query, residual_dimension_);
     }
@@ -941,12 +986,18 @@ inline float QuantizedGraph::scan_neighbors(const QGQuery &q_obj,
                                             float *appro_dist,
                                             buffer::SearchBuffer &search_pool,
                                             uint32_t cur_degree,
-                                            const HashBasedBooleanSet &visited) const {
+                                            const HashBasedBooleanSet &visited,
+                                            const char *pf_base,
+                                            size_t pf_lines) const {
+  ALAYA_KSP_COUNT(pops);
+  ALAYA_KSP_BEGIN(exact);
   float sqr_y = space::l2_sqr(q_obj.query_data(), cur_data, dimension_);
+  ALAYA_KSP_END(exact);
 
   /* Compute approximate distance by Fast Scan */
   const auto *packed_code = reinterpret_cast<const uint8_t *>(&cur_data[code_offset_]);
   const auto *factor = &cur_data[factor_offset_];
+  ALAYA_KSP_BEGIN(scan);
   this->scanner_.scan_neighbors(appro_dist,
                                 q_obj.lut().data(),
                                 sqr_y,
@@ -956,7 +1007,9 @@ inline float QuantizedGraph::scan_neighbors(const QGQuery &q_obj,
                                 q_obj.sumq(),
                                 packed_code,
                                 factor);
+  ALAYA_KSP_END(scan);
 
+  ALAYA_KSP_BEGIN(pool);
   const PID *ptr_nb = reinterpret_cast<const PID *>(&cur_data[neighbor_offset_]);
   for (uint32_t i = 0; i < cur_degree; ++i) {
     PID cur_neighbor = ptr_nb[i];
@@ -965,7 +1018,11 @@ inline float QuantizedGraph::scan_neighbors(const QGQuery &q_obj,
       continue;
     }
     search_pool.insert(cur_neighbor, tmp_dist);
+    if (pf_base != nullptr) {
+      prefetch_row_l2(pf_base + static_cast<size_t>(search_pool.next_id()) * node_len_, pf_lines);
+    }
   }
+  ALAYA_KSP_END(pool);
 
   return sqr_y;
 }

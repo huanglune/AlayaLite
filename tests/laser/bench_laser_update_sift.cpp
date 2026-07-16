@@ -1517,6 +1517,8 @@ int do_eval(const Args &a) {
       for (const double v : run_recalls) std::cout << "," << v;
       std::cout << "\n";
     }
+    std::cout.flush();
+    ALAYA_KSP_REPORT("laser");
   }
   qg.set_result_filter(nullptr);
   return 0;
