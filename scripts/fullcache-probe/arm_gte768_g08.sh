@@ -49,7 +49,8 @@ fi
 
 # 3) LASER R32 builds: main448 (PCA split) + main768 (full dim)
 build_idx() { # prefix main_dim
-  [ -f "$1_R32_MD$2.index" ] && return 0
+  # -s not -f: a failed writer leaves a 0-byte .index behind
+  [ -s "$1_R32_MD$2.index" ] && return 0
   $NUMA flock /tmp/.aio-uprobe.lock "$BENCH" build --base "$LOCAL/base.fbin" \
     --prefix "$1" --n $N --R 32 --main_dim "$2" --threads 48 \
     > "$LOCAL/laser_build_md$2.log" 2>&1
