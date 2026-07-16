@@ -9,7 +9,6 @@ alaya_cc_target(no_laser_header_closure SRCS no_laser_header_closure.cpp)
 alaya_cc_target(public_graph_closure SRCS public_graph_header.cpp)
 alaya_cc_target(public_space_closure SRCS public_space_header.cpp)
 alaya_cc_target(public_disk_closure SRCS public_disk_header.cpp)
-alaya_cc_target(public_diskann_closure SRCS public_diskann_header.cpp)
 
 alaya_add_test(
   NAME compile_check_no_laser
@@ -29,10 +28,5 @@ alaya_add_test(
 alaya_add_test(
   NAME compile_check_disk
   TARGET public_disk_closure
-  LABELS compile
-)
-alaya_add_test(
-  NAME compile_check_diskann
-  TARGET public_diskann_closure
   LABELS compile
 )

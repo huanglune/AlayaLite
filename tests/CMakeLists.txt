@@ -1,5 +1,4 @@
 add_subdirectory(disk)
-add_subdirectory(diskann)
 add_subdirectory(core)
 add_subdirectory(collection)
 add_subdirectory(golden)

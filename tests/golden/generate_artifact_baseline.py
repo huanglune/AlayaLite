@@ -124,10 +124,6 @@ def generate(build_dir: Path) -> dict[str, object]:
     with tempfile.TemporaryDirectory(prefix="alaya-artifact-golden-") as temp:
         out = Path(temp)
         _generate_memory_graph_artifacts(out, build_dir)
-        diskann_generator = build_dir / "tests/golden/artifact_diskann_generator"
-        if not diskann_generator.is_file():
-            raise RuntimeError(f"build the artifact_diskann_generator target first: {diskann_generator}")
-        subprocess.run([str(diskann_generator), str(out / "diskann")], check=True)
         disk_flat_segment_generator = build_dir / "tests/golden/artifact_disk_flat_segment_generator"
         if not disk_flat_segment_generator.is_file():
             raise RuntimeError(

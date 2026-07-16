@@ -154,7 +154,7 @@ struct CollectionTargetRegistration {
                                                     core::OpenContext &context)
     -> core::Result<core::AnySegment>;
 
-inline constexpr std::array<CollectionTargetRegistration, 5> kCollectionTargetRegistrations{
+inline constexpr std::array<CollectionTargetRegistration, 4> kCollectionTargetRegistrations{
     CollectionTargetRegistration{core::algorithm::flat,
                                  "disk_flat_segment",
                                  "flat",
@@ -176,12 +176,6 @@ inline constexpr std::array<CollectionTargetRegistration, 5> kCollectionTargetRe
     CollectionTargetRegistration{core::algorithm::laser,
                                  "disk_laser_segment",
                                  "laser",
-                                 unsupported_target_support,
-                                 build_unsupported_collection_target,
-                                 open_unsupported_collection_target},
-    CollectionTargetRegistration{core::algorithm::diskann,
-                                 "diskann_segment",
-                                 "diskann",
                                  unsupported_target_support,
                                  build_unsupported_collection_target,
                                  open_unsupported_collection_target},

@@ -13,6 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their build kernels, and the NN-Descent kernel they built on. The
   `algorithm::nsg`/`algorithm::fusion` registry ids remain reserved and are
   rejected by the capability gate; `flat`, `hnsw`, and `qg` are unaffected.
+- The standalone Vamana segment engines, disk (`disk_vamana_segment`) and
+  memory (`vamana_mem_segment`), and `DiskIndexType::Vamana`. Vamana's
+  build primitives are unaffected: they remain the sole producer of the
+  LASER on-disk QG format. `algorithm::vamana` remains reserved and is
+  rejected by the capability gate, matching nsg/fusion.
+- The DiskANN segment engine (`diskann_segment`/`diskann_mutable_segment`)
+  and its beam-search/disk-layout implementation. `algorithm::diskann`
+  remains reserved and is rejected by the capability gate. The research
+  line lives on in the `feat/diskann-delete-repair` branch.
 
 ## [1.1.0] - 2026-07-15
 
