@@ -1,0 +1,1717 @@
+# LASER 动态更新可行性探索(研究原型 + 实验)
+
+> 课题:AlayaLite 集成的 LASER(on-disk 量化图)当前纯静态,能否支持 insert/delete?
+> 结论、机制、原型实现(`include/index/graph/laser/qg/qg_updater.hpp`)、SIFT1M 实验与生产化差距。
+> 配套独立设计评审见 `docs/laser_update_design_review.md`(codex 并行评审,结论互相印证)。
+
+## TL;DR
+
+**可以。** LASER 的 edge-resident RaBitQ 量化(每条边的 1-bit 码 + 3 因子)只依赖固定 FHT rotator
+和边两端的 raw 向量——没有全局码本可失效,这使得**原地局部更新在数学上闭合**。本原型证明:
+
+1. **插入**:追加新行(纯 id 算术寻址,文件尾追加新页)+ 每个被选邻居一次 4K 页 RMW
+   反向边补丁,单写者即可流式插入;`patch == 整行重算` 已被逐字节测试锁定
+   (码位与邻居 id 完全一致,因子仅有 -Ofast 跨调用点的 ≤1e-5 相对舍入差)。
+2. **删除**:内存 tombstone + 结果过滤(路由仍穿过删除点)零成本可用;拓扑修复
+   (splice/repair)是后续工作。
+3. 质量/成本数字见下文实验表(SIFT1M,R=64,main_dim=128 免 PCA)。
+
+生产化门槛(格式 valid-degree、页原子性/WAL、并发控制、collection 集成)在文末与
+评审文档中列明——那是工程量问题,不是结构可行性问题。
+
+## 1. 为什么此前不支持更新
+
+- 静态管线:`Index.fit` = (可选 PCA) → Vamana 建图 → `QGBuilder::build` 量化落盘;
+  没有任何写路径。
+- `DiskCollection` 对 LASER 只有 `import_laser_segment`(整段导入),`add_batch` 直接
+  throw,tombstone 是 v1 桩。
+- 表面上的"硬"障碍:每个节点的 row 里存的是**其全部 `degree_bound` 个邻居的量化码**
+  (SymphonyQG 风格边上量化)。插入一个点要给 R 个已有节点加反向边 ⇒ 改 R 个节点的
+  码区;直觉上"牵一发动全身"。
+
+## 2. 为什么其实可以:三个结构事实
+
+1. **逐边局部量化**。边 (u→v) 的码 = sign(rot(v)−rot(u)),三个因子
+   (`triple_x/factor_dq/factor_vq`)只是 (u,v) 的函数(rabitq.hpp),rotator 是固定
+   随机 FHT、数据无关;残差维只以 `||v_r||²` 形式预加进 `triple_x`。
+   ⇒ 加/换一条边只需要边两端 raw 向量,而 raw 向量就存在各自 row 的头部。
+2. **FastScan 打包是无损重排**。32 邻居一块的交织(`pack_codes`)由字节反序、nibble
+   交换、`kPerm0` 置换组成,完全可逆(`unpack_codes_block`,往返测试锁定)。
+   ⇒ 换一个 slot = 解包该 32-slot 块 → 换码 → 重打包,块内其它 slot 不动。
+3. **寻址纯 id 算术**。`page_offset(id) = 4096 + page_size·(id/npp)`,无分配器、无
+   page table。⇒ 新节点即文件尾新页(npp>1 时是末页 RMW)。
+
+## 3. 原型设计(qg_updater.hpp)
+
+插入 = FreshDiskANN 语义在 LASER 布局上的实例化:
+
+```
+insert(x):
+  tvec = PCA(x)                    # 与查询同路径;SIFT 配置为恒等
+  pool = beam_search(tvec, ef)     # 同步 pread 版磁盘搜索;捕获每个展开节点的
+                                   #   {id, 精确距离, 整行字节}(raw 向量随行免费得到)
+  sel  = alpha_robust_prune(pool)  # 精确距离 + 捕获的 raw 向量,纯内存,α=1.2
+  row  = assemble_row(tvec, sel)   # 与 builder 完全同构(复用 rabitq_codes)
+  append_page(new_id, row)
+  for v in sel:                    # 反向边:每邻居一次 4K 页 RMW
+    patch_reverse_edge(v, new_id)
+  if 没有任何反向边成功: 强制在最近邻居上驱逐一条(可达性保底)
+```
+
+反向边四臂(实验对照):
+
+| 臂 | 行为 | 每反向边额外 I/O |
+|---|---|---|
+| `none` | 不加反向边(下界对照,新点几乎不可达) | 0 |
+| `evict` | 先填幽灵空槽;否则以 v 自身为查询跑一遍 FastScan 估计边长,新边更短则驱逐最远边("nearest-only replacement") | 1 读 + 1 写 |
+| `alpha` | evict + **免费 α 检验**:v 的现有邻居若已在本次搜索捕获池中,用其 raw 向量做 α-遮蔽检查,被遮蔽则放弃加边(零额外 I/O 的近似 RobustPrune) | 1 读 + 1 写 |
+| `full` | 读回 v 全部活邻居 raw 向量,完整 α-RobustPrune,整行重写(质量参照上界) | ~R 读 + 1 写 |
+
+关键实现点:
+
+- **幽灵槽**:v1 行格式无 valid-degree;Vamana 欠满节点尾部 slot 是 0 填充
+  (id=0、码=0、因子=0)。判空用三条件联合(id、三因子、该 slot 全部码位均为零),
+  真实的"到 0 号点的边"不会误判(除非严格重复向量,那条边本身可弃)。这是启发式,
+  格式 v2 应加显式 degree —— 见评审文档 §1.3。
+- **因子位级一致**:单边因子不手写公式,而是调 1 行矩阵的 `rabitq_codes`,与 builder
+  的 Eigen 归约逐位对齐(-Ofast 下跨调用点仍可能有最后一位舍入差,单测以码位/ID
+  逐字节 + 因子 1e-5 相对误差锁定)。
+- **写路径**:buffered `pwrite` 整页 RMW;搜索读路径是 O_DIRECT libaio,Linux 语义下
+  direct read 会先回写脏页缓存范围,`finalize()` 再统一 fsync + 重写 meta sector
+  (num_points、file size),重载校验通过。
+- **删除**:`QuantizedGraph::set_result_filter(&tombstones)`——结果过滤但路由穿透
+  (三行侵入改动)。修复(splice/图整形)未实现。
+
+## 4. 正确性证据(单元测试,tests/laser/qg/test_qg_updater_unit.cpp,5/5 通过)
+
+1. `UnpackRoundTrip`:pack→unpack 恒等;补丁一个 slot 后重打包 == 直接打包修改后的码。
+2. `EdgePayloadMatchesRabitqCodes`:单边 payload 与 builder 内核输出位级一致。
+3. `AssembleRowMatchesBuilder`:对静态构建的真实索引逐行重组,`memcmp == 0`。
+4. `InsertPatchTombstoneEndToEnd`(2000 点真实小索引,npp=3 共享页路径):
+   插入 64 点 → 被补丁行与整行重算等价;重载后 ≥90% 插入点 top1 命中自身;
+   tombstone 后结果零泄漏。
+5. `GhostSlotDetection`:真实边/幽灵槽全部判定正确。
+
+## 5. SIFT1M 实验(E0/E1/E2)
+
+配置:SIFT1M(128 维,2 的幂 ⇒ main_dim=128、免 PCA、残差 0),R=64,L=200,
+ef_indexing=200;900k 基础索引 53s 构建、1M 87s(48 线程)。评估:10k 查询,
+recall@10,GT 深度 100,masked recall(live 集上重取 top-10 真值);QPS 为
+16 线程 batch_search 三轮最优;beam=16;缓存关闭(dram_budget=0)。
+插入:单写者,ef_insert=100,α=1.2。
+
+### E0 静态基线(参照)
+
+| ef | 1M 全建 recall@10 | QPS(16T) | 900k 全建 recall@10(masked) |
+|---|---|---|---|
+| 60 | 0.9713 | 10715 | 0.9712 |
+| 100 | 0.9905 | 8865 | 0.9909 |
+| 200 | 0.9978 | 6249 | 0.9977 |
+| 300 | 0.9987 | 4858 | 0.9986 |
+
+构建成本:900k 53s / 1M 87s(48 线程,Vamana+量化全程)。
+
+### E1 插入(900k 建 + 单写者流式插入 100k,对照 1M 静态全建)
+
+整体 recall@10(全量 1M GT):
+
+| ef | 静态 1M | none | evict | alpha | full |
+|---|---|---|---|---|---|
+| 60 | 0.9713 | 0.8793 | **0.9667** | 0.9675 | 0.9649 |
+| 100 | 0.9905 | 0.8952 | **0.9883** | 0.9885 | 0.9891 |
+| 200 | 0.9978 | 0.9003 | **0.9971** | 0.9971 | 0.9971 |
+| 300 | 0.9987 | 0.9010 | **0.9983** | 0.9983 | 0.9985 |
+
+仅统计落在插入段(id ≥ 900k,9824 条 GT 条目)的 recall:
+
+| ef | 静态 1M(上界) | none | evict | alpha | full |
+|---|---|---|---|---|---|
+| 60 | 0.9565 | 0.0 | **0.9506** | 0.9348 | 0.9421 |
+| 100 | 0.9864 | 0.0 | **0.9800** | 0.9728 | 0.9778 |
+| 200 | 0.9983 | 0.0 | **0.9944** | 0.9927 | 0.9945 |
+| 300 | 0.9994 | 0.0 | **0.9969** | 0.9963 | 0.9975 |
+
+插入成本(单写者,页缓存热;4K 页 I/O 逻辑计数):
+
+| 臂 | inserts/s | 搜索读/插入 | 补丁读/插入 | 页写/插入 | 反向边构成 |
+|---|---|---|---|---|---|
+| none | 3441 | 81 | 0 | 1 | — |
+| evict | 1809 | 81 | 40.0 | 35.6 | 19.6 填空槽 + 15.0 驱逐 + 5.4 skip |
+| alpha | 1841 | 81 | 40.3 | 28.9 | 16.0 填空槽 + 11.9 驱逐 + 8.2 α-skip + 4.2 skip |
+| full | 205 | 82 | **2303** | 41.8 | 40.8 整行重算 |
+
+**读数**:
+
+1. `none` 臂 new_recall 恒为 0 —— 只追加行、不维护反向边,插入点完全不可达。
+   反向边补丁是唯一命脉;这就是"把 LASER 当普通索引追加"不行的实证。
+2. **廉价结构补丁(evict)与 9× 昂贵的完整 RobustPrune(full)recall 曲线重合**
+   (差异 ≤0.2pp,在噪声内;full 在插入点上甚至略低——过度剪枝压低了新点入度)。
+   单次 10% 插入时,填空槽 + FastScan 估边长驱逐最远,就足以逼平质量上界。
+3. 流式插入后的索引离静态全建只差:低 ef 0.46pp / ef≥150 约 0.1pp;插入点
+   自身与"生而在库"的差距 0.6pp(ef60)→ 0.25pp(ef300)。
+4. 每插入总 I/O ≈ 157×4K(evict),其中搜索占一半;QPS 侧无衰退。
+
+### E2 删除(1M 建,tombstone 10%,对照 900k 静态重建)
+
+| ef | tombstone(路由穿透+结果过滤) | 900k 重建(理想删除) |
+|---|---|---|
+| 60 | 0.9660 | 0.9712 |
+| 100 | 0.9887 | 0.9909 |
+| 200 | 0.9974 | 0.9977 |
+| 300 | 0.9986 | 0.9986 |
+
+10% 懒删除几乎免费:低 ef 差 0.3-0.5pp,ef≥200 与完全重建重合,QPS 不变。
+(高删除比例 / 持续 churn 下的空间与路由 ballast 需要 consolidation,见 E3。)
+
+### E1b 追加臂:headroom(利用定宽行的免费更新余量)
+
+LASER 行固定 `degree_bound` 槽、字节先付;Vamana 用 R=56 建、degree_bound=64
+⇒ 每行天然 ≥8 个空槽,反向边优先填空、零驱逐零质量损失。
+
+| ef | hr 静态 900k(R56) | hr 插入后整体 | hr 插入点 new_recall | 静态 1M 上界(new) |
+|---|---|---|---|---|
+| 60 | 0.9728 | 0.9695 | **0.9618** | 0.9565 |
+| 100 | 0.9907 | 0.9894 | **0.9837** | 0.9864 |
+| 200 | 0.9974 | 0.9973 | **0.9962** | 0.9983 |
+| 300 | 0.9985 | 0.9985 | **0.9981** | 0.9994 |
+
+- R56 欠满建图本身不掉点(0.9728@60 ≥ R64 的 0.9712),QPS 还略高;
+- 插入后整体离静态 1M 只差 0.18pp(ef60),**插入点 recall 在低 ef 超过静态上界**
+  (0.9618 vs 0.9565)——新点通过填空槽获得高入度,而旧图几乎不被驱逐破坏
+  (每插入 34.2 次填空槽 vs 仅 3.9 次驱逐);插入后 QPS 为所有臂最高(12.9k@60)。
+- 这是定宽行布局特有的红利:普通变长度索引"少建边"=省存储但伤质量,LASER 的
+  空槽字节反正已付,欠满建图即免费预留更新余量。
+
+### E3 持续 churn(滑动窗口,原库 100% 换血)
+
+500k 基础,10 轮 ×(tombstone 最老 50k + 插入新 50k),ef_eval=100,evict/alpha 两臂。
+注意本实验是**无 consolidation 的最坏情形**:tombstone 只做结果过滤、从不清除,
+10 轮后路由图里一半节点是墓碑 ballast;衰减同时来自边质量侵蚀与墓碑稀释。
+
+| 轮(换血%) | 0 | 2 (20%) | 4 (40%) | 6 (60%) | 8 (80%) | 10 (100%) |
+|---|---|---|---|---|---|---|
+| evict | 0.9919 | 0.9815 | 0.9661 | 0.9494 | 0.9242 | 0.8887 |
+| alpha | 0.9916 | 0.9797 | 0.9618 | 0.9380 | 0.9088 | 0.8636 |
+
+- 每轮 −0.5→−2.0pp,**缓降且加速,不趋平**:墓碑从不清除 ⇒ 活节点的出边越来越多
+  指向死点(有效出度衰减)、搜索 beam 浪费在死区;这与 DiskANN 侧 fig13 战役的
+  "入度年龄衰减"是同一类机制,解法也相同——周期 consolidation(清墓碑 + splice +
+  重剪枝),其行级原语(`full_reverse_recompute`)本原型已具备,缺的只是调度。
+- alpha 臂在 churn 下**更差**(−12.8pp vs evict −10.3pp):α 检验拒掉 ~20% 反向边
+  ⇒ 新节点入度更低,在老节点持续死亡的环境里雪上加霜。单次增量里无所谓的
+  多样性保险,在持续换血下是负资产——**churn 场景要的是入度,不是保守剪枝**。
+- 插入吞吐在 churn 中稳定(2.1k→2.8k inserts/s,墓碑使剪枝池变小反而略快)。
+
+## 6. 结论
+
+**回答课题:LASER 能支持更新,且不是靠通用方法,而是靠它自己的结构。**
+
+1. **结构可行性(定性)**:逐边局部量化(无全局码本)+ FastScan 可逆置换 + 纯 id
+   算术寻址,三者使"追加行 + 页级反向边补丁"成为闭合操作;patch 与整行重算逐字节
+   等价已被单测锁定。相较之下,PQ 系磁盘索引(DiskANN 等)插入新点要么忍受码本
+   漂移、要么重训——LASER 的 RaBitQ 结构在这点上**天生适合更新**。
+2. **质量(单次 10% 增量)**:廉价补丁(每插入 ~157 次 4K I/O,1.8k inserts/s 单写者)
+   与 9× 成本的完整 RobustPrune 打平,离静态全建 0.1-0.5pp;headroom 欠满建图后,
+   插入点 recall 甚至**超过**静态上界,整体差距缩到 0.18pp。
+3. **删除**:10% 懒删除(路由穿透 + 结果过滤)几乎免费。
+4. **持续 churn 是真正的边界**:无 consolidation 时 recall 每轮缓降且加速
+   (100% 换血后 −10.3pp,见 E3 表),与 DiskANN 侧 fig13 的经验同类——流式更新的
+   长期质量必须靠周期性整形(清墓碑/splice/合并重建)兜底。这与"能否支持更新"是
+   两个问题:更新原语本身已经闭合,整形是在原语之上的调度策略
+   (`full_reverse_recompute` 即整行整形原语)。附带教训:α-保守剪枝在 churn 下
+   是负资产(alpha 臂 −12.8pp 更差),持续换血场景要优先保证新点入度。
+
+### 生产化差距(按优先序;详见 laser_update_design_review.md §5-7)
+
+1. **格式 v2**:显式 valid-degree(替代幽灵槽启发式)、双 superblock(committed N /
+   generation / checksum,取代"meta 断言拒载")、追加页崩溃一致性。
+2. **并发**:单写者 + 页锁 + committed high-water mark;O_DIRECT 读与缓冲写的
+   混合路径要么统一 O_DIRECT 整页写、要么 WAL full-page redo。
+3. **删除修复**:delta 反向表 + splice/consolidation(原语已有,缺调度);
+   墓碑持久化。
+4. **DiskCollection 集成**:推荐混合路线——小增量进可写 active segment 原地
+   patch(本原型),阈值触发后台合并成不可变段;跨段 top-k 需先修 LASER 段
+   NaN 距离问题。
+5. **PCA/medoid 陈旧**:固定线性映射保证正确性,分布漂移只降质量;medoid/入口
+   可周期重算(本实验静态入口在 10% 增量下无可见损失)。
+
+## 7. v2:并行插入 + consolidation(回应"性能/效果都差")
+
+v1 原型的两处硬伤及 v2 修复(设计经 codex 并发评审修正:批次三阶段发布替代票据自旋、
+页 seqlock 版本号消除撕页读、splice 用 FastScan 召回 + raw 精排):
+
+### 7.1 性能:多写者批式插入
+
+批次三阶段:并行(搜索/构行/反向边补丁,页锁保护写)→ barrier → 每批发布一次
+committed 水位;批内搜索一律用批前快照(mini-batch 语义)。搜索读无锁,靠每页
+seqlock 版本校验重试。
+
+| 配置 | inserts/s | 页写/插入 | 对 v1 串行加速 |
+|---|---|---|---|
+| v1 串行(evict) | 1809 | 35.6 | 1× |
+| T=32(evict,batch 4096) | 7203 | 35.8 | 4.0× |
+| T=64(evict) | 7329 | 35.8 | 4.05× |
+| T=64(evict,捕获裁剪后) | 8015 | 35.8 | 4.4× |
+| **T=64(none 臂 = 每插入 1 写,搜索侧上限)** | **17654** | 1.0 | 9.8× |
+| churn 内(500k 图,T=32) | 10.6k–12.9k | — | — |
+
+质量零损失:T=32 并行后 recall 0.9661/0.9879/0.9969(@60/100/200)与串行
+0.9667/0.9883/0.9971 重合;headroom+并行 0.9688@60、插入点 0.9583(仍超静态上界)。
+
+**扩展性瓶颈已定位并量化在写路径**:evict 臂 T=32/T=64/裁剪后总页写速率同为
+~260–287k pwrites/s(平台期),而把写降到 1/插入的 none 臂立刻到 17.7k inserts/s
+——ext 系文件系统上 buffered `pwrite` 走排他 inode 锁,单文件多写者天然串行。
+工程出路(未实现,已量化收益上限):(a) 对齐 O_DIRECT 写(ext4/XFS 走共享
+ilock,可并行,但牺牲读侧页缓存);(b) 用户态写合并(批内同页补丁合并一次写,
+热点页收益大);(c) 分段文件。按 none 臂上限,写路径解锁后 evict 臂应到
+~15k+ inserts/s(64T)。
+
+### 7.2 效果:consolidation 拉平 churn 曲线
+
+`consolidate(threads, r_target)`:并行扫活行,死邻居槽 = 用死节点自己的行做
+FastScan 召回(码以死点为中心,估计量仍是 ||u−n||,零额外 I/O)→ top-4 读 raw
+精排 → patch;无候选或已达 r_target 则清零成幽灵空槽(**headroom 再生**)。
+r_target=56 保持 8 槽更新余量,不回填满 64。每 churn 轮(删 50k 后)执行一次,
+32 线程 4–5 秒。
+
+| 轮(换血%) | 0 | 2 | 4 | 6 | 8 | 10 (100%) |
+|---|---|---|---|---|---|---|
+| 无整形(v1) | 0.9919 | 0.9815 | 0.9661 | 0.9494 | 0.9242 | 0.8887 |
+| **+consolidation** | 0.9918 | 0.9873 | 0.9804 | 0.9802 | 0.9752 | **0.9748** |
+
+- 无整形曲线加速下坠(尾轮 −2.0pp);consolidation 后**第 4 轮起趋平**
+  (尾 6 轮共 −0.6pp 且减速,第 5→6 轮回升)——有界收敛稳态,+8.6pp@100% 换血。
+  与 DiskANN fig13/garden 战役"churn 自平衡 + 整形提平台"结论同构。
+- 累计填空槽 13.8M vs 驱逐 2.0M:consolidation 清出的空槽被后续插入吸收,
+  purge↔headroom 闭环成立。
+- 不变量测试:consolidate 后所有活行零死边引用(单测覆盖)。
+
+### 实验局限
+
+单数据集(SIFT1M)、单次序(自然顺序)、单 seed、128 维免 PCA 路径;残差维
+(main_dim < dim)与 npp>1 大规模路径仅有单测覆盖;并发读写、崩溃注入未做。
+这些是论文级 battery 的下一步,不改变可行性结论。
+
+## 8. 参考 Yi 的对照与下一步计划
+
+Yi(原版 `~/workspace/alaya-dev/Yi`,SPDK/io_uring 全异步)与其在 AlayaLite 的
+迁移版(`include/index/graph/diskann/`,经 fig13 复现与 delete-repair 战役检验)
+是同一套 in-place 更新协议的两个实现。读码结论如下。
+
+### 8.1 Yi 更新架构画像(读码证据)
+
+- **纯 in-place,无 fresh 层**:Yi 没有 FreshDiskANN 式内存增量图与 StreamingMerger;
+  插入/删除直接改磁盘图(经 buffer pool)。更新任务是协程
+  (`QueryContext::co_update` / `co_update_ipdiskann`),轮次 = 批量懒删 → 批量插入
+  → 并发搜索评估(`Yi/src/runner/update_runner.cpp`)。
+- **写路径 = 用户态脏页缓存 + 延迟写回**:更新在 buffer pool 页内 RMW 并标脏,
+  热路径零 pwrite;写回移出更新路径(迁移版 `disk_page_io.hpp` 明确注释
+  "Yi defers write-back out of the update path"),flush 时每脏页只写一次,
+  O_DIRECT 对齐写(独立 `O_DIRECT|O_RDWR` fd,绕开 buffered 写的排他 inode 锁)。
+- **反向边暂存(Yi `_inserted_edges` / 迁移版 `StagedEdges`,
+  diskann_index.hpp:1574)**:插入把 `选中邻居 → 新槽` 的回链塞进按邻居分桶的暂存表,
+  哪个 reconnect 任务先到该邻居就 drain 全部暂存边,一次 RMW 落多条回链——
+  天然去重 + 图层面的写合并。
+- **批内无 barrier**:端到端插入协程(搜索→分配→写→publish→暂存→reconnect),
+  每 chunk 一个 when_all;并发靠每节点互斥锁 + 暗槽协议。迁移版注释明确记录:
+  早期四段 barrier 相位流水线让 32 线程比 8 线程还慢(与我们 v2 的三阶段 barrier
+  是同一族设计,Yi 的经验是 barrier 越少扩展性越好)。外部 API 层面更新调用串行
+  (`update_serial_mutex_`),并行度全部在批内。
+- **槽位生命周期(设计 D5,`slot_allocator.hpp`)**:LIFO free-list + tombstone
+  位图一体;`alloc()` 复用最近释放槽,**暗至 publish**(数据落盘/入缓存前搜索
+  不可见,防复用槽旧字节在新 label 下泄漏);`free()` 入 free-list 并置 tombstone;
+  `save()/load()` 一个文件持久化完整分配状态。
+- **删除 = 懒删 + 二跳旁路**:`remove()` 缓存死节点邻居表(Yi 用容量 4% 的 LRU,
+  迁移版 `DiskUpdateContext::removed_node_nbrs_`),搜索遇 tombstone 经缓存二跳
+  绕行(每死邻居最多取 5 个活二跳候选,重连池 heap 上限 degree+32);修图推迟到
+  下次插入触达或 safety-net(tombstone 比例 ≥5% 且久无插入时主动重连,
+  `disk_update_context.hpp:35`)。Yi 另有更激进的 IP-DiskANN 删除变体
+  `co_delete_ipdiskann`:以被删向量搜索候选,对全部受影响活点 fan-out 修复任务
+  (活旧边 + 搜索候选最近 3 个再剪枝)——这是 Yi 里最接近"删除即整形"的路径。
+- **写回调度细节**(codex 读 Yi 原版证实):更新只改内存页版本号,脏页进 dirty
+  LRU;worker 事件循环在队列深度允许时逐页写回,脏页积压超 30k 一次调度 32 页;
+  io_uring 后端 `O_RDWR|O_DIRECT`、每线程深度 256 的 ring,**未用** registered
+  buffer/SQPOLL——Yi 的收益来自"同页多次修改合成一次设备写",不是 io_uring 高级特性。
+- **崩溃一致性**:Yi 与迁移版都没有 WAL;研究系统定位,与我们相同。
+
+### 8.2 与 LASER 原型逐项对照
+
+| 机制 | Yi/迁移版 diskann | LASER v2 现状 | 差距 |
+|---|---|---|---|
+| 写路径 | 脏页缓存 RMW + flush 每页一次 + O_DIRECT | 每补丁立即 buffered pwrite(35.8 写/插入),287k pwrites/s inode 锁墙 | **主要吞吐差距** |
+| 反向边 | StagedEdges 按邻居聚合,一次 RMW 落多条 | 每条回链独立 解包→改槽→打包→写 | 写放大 + CPU 放大 |
+| 批内同步 | 无 barrier,节点锁 + 暗槽 | 三阶段 barrier + 页锁 + seqlock | 扩展性上限 |
+| 槽位复用 | free-list+tombstone 一体,暗至 publish,可持久化 | append-only + 幽灵槽回填,无复用、不持久化 | 空间回收缺失 |
+| 删除路由 | 懒删 + 二跳旁路缓存 | tombstone 结果过滤 + 路由穿透(行字节还在,免费) | 我们更简单且够用(购槽复用前) |
+| 整形 | 插入驱动 reconnect + safety-net + gardening(P3 战役:入度刷新砍 40% 衰减) | 手动 consolidate(purge+splice) | 触发策略 + 质量杠杆 |
+| 量化 | PQ 码在 RAM(`encode_pq_slot`),修图不碰量化 | 码在行内逐边,回链 RMW 要重打包 | 结构差异:LASER 免 RAM 码表,代价可被页缓存+暂存吸收 |
+
+关键判断:**Yi 用纯 in-place 跑通了持续 churn,没有 fresh 层**;我们的 v2 数据
+(0.9748 平台)也说明 in-place 质量够。fresh 层(内存增量图+双路搜索+后台 merge)
+只在要求 >20k/s 持续插入或插入 P99 延迟敏感时才值得,现阶段不做。
+
+### 8.3 计划
+
+**P0 写路径改造(照抄 Yi 两件套,目标 evict 臂 8k → 12–15k/s 或 ≥none 上限的 70%)**
+1. **P0.1 O_DIRECT 归因臂(2–4 人日)**:最小改动——更新 fd 换
+   `O_DIRECT|O_RDWR` + 对齐页 buffer,其余语义不变。若 T=32→64 不再同卡,
+   证实 287k 墙 = buffered inode 锁;若无改善,先 lockstat/perf 重新归因再动大刀。
+   附带修正一个现存隐患:LASER 搜索读本来就是 O_DIRECT
+   (`utils/aligned_file_reader.hpp:359`),而更新 fd 是 buffered O_RDWR
+   (`qg_updater.hpp:253`)——buffered 写对 O_DIRECT 读的可见性靠内核先回写脏区,
+   有隐藏回写税,两侧统一 direct 才干净(迁移版 `disk_page_io.hpp` 头注同一结论)。
+2. **P0.2 分片脏页缓存(1–1.5 人周)**:抽取 `diskann/disk_page_cache.hpp` 的
+   分片 LRU/dirty 语义,QGUpdater 所有行写改为缓存页内 RMW+标脏,批末
+   `flush_dirty_pages()`(每脏页一次 O_DIRECT 对齐写)→ 再 `publish()`。
+   flush 先行保证搜索只见已落盘状态,搜索侧无需查更新缓存;若后续把 flush
+   进一步解耦(跨批合并/后台写回),读路径须加页级 overlay snapshot(不抄
+   diskann 的整节点 NodeCache override——LASER 行大,按页 overlay 才不产生双份行)。
+   同时上 StagedEdges 反向边暂存:按邻居聚合回链,drain 时该邻居行**解包一次、
+   改 k 槽、打包一次、写一次**(现在是 k 次全套)。
+3. 验证:none/evict 臂 T=1/8/16/32/64 吞吐;三层写计数
+   `逻辑页更新 / 唯一脏页 / 物理写`(收益不足时用唯一页比率解释,而不是盲调线程);
+   "同页 N 次 patch 只 1 次 flush"、并发 patch 不丢更新、cache 开关字节等价单测;
+   单次 10% 插入 recall 与 v2 持平;ctest 全绿。
+
+**P1 质量闭环(移植 delete-repair 战役判决,目标稳态 0.9748 → ≥0.985)**
+1. 更深维护搜索:再插入式刷新用独立 `ef_maintenance ∈ {100,200,400}` 消融
+   (oracle 判决:残余是边质量欠账,深搜是杠杆;garden 侧 128→200 同理)。
+   注意仅调大 `splice_rerank` 无效——splice 候选只来自死点旧邻域,改善的是
+   候选内精排,扩不了候选来源;深 beam 才是扩源。
+2. gardening:RAM 入度 delta 计数器(uint16/槽,patch/zero/插入时增减,
+   checkpoint 可扫 id SoA 重建,不必持久化)+ 每轮对最低入度分位(bottom 5%)
+   + 高年龄/高驱逐行做再插入式深搜刷新、整行 `assemble_row` 重写 +
+   densification(欠满行填满,headroom 臂已证明满行更优)。**反向泵要有预算**
+   (B∈{0,4,8},优先填幽灵槽):LASER 每条回链要重算 1-bit 码+三因子,
+   不能像 DiskANN 无预算 fan-out;同页泵靠 P0 页缓存合并。diskann 判决:
+   入度定向刷新砍 ~40% 老化衰减。
+3. 触发策略:tombstone 比例 + ops-since-insert 的 safety-net(照抄
+   `needs_safety_net_reconnect` 语义),替代手动每轮调用。
+4. 验证:六臂消融(purge-only / 现 splice / +浅刷 / +深刷 / 深刷+泵 /
+   **等预算随机刷新对照**),≥3 seeds,跑到 100–300% 换血;同时报结构指标
+   (入度 p1/p5/中位、entry 可达率、活出度、边年龄、新边存活率)。
+   长稳态复用 g03 协议(稳态回收 + 永不删固定队列)。
+   门槛:recall@100 ≥0.985 且维护摊销 ≤前台更新 CPU/IO 的 20%。
+   工程量:观测+消融 4–6 人日(可与 P0.2 并行),胜出臂做成带预算的
+   正式 scheduler 再 1–1.5 人周。
+
+**P1.5 插入流水线协程化(1–2 人周,P0 判决后,可与 P1 scheduler 并行)**
+- 动机:协程基建在仓已全(C++20 全项目、coro 库、`storage/io/uring_reactor.hpp`,
+  diskann 更新路径已跑在其上);none 臂 17.7k/s 上限含可观 IO 等待,libaio 每线程
+  一个 io context(MAX_EVENTS=1024,全机 ≤64 线程,实测撞过两次);协程 + reactor
+  少数 ring 服务几百并发,并发数与线程数解耦。
+- 做法:给 qg 插入搜索做异步变体,照 `diskann/beam_search_async.hpp` 的契约
+  (cache 命中在挂起前内联吸收、锁不跨挂起点、结果与同步版逐字节一致);bench 的
+  OpenMP parallel-for 换 `coro::thread_pool` + `when_all`
+  (`batch_insert_locked_with_pool` 现成模式);搜索 peek P0.2 分片缓存并按版本
+  协议回填——分片缓存升级为 Yi 式统一 buffer pool。
+- 边界:协程不解决写路径 inode 锁(P0 的事),不加速 FastScan(CPU bound)。
+- 验证:none/evict 吞吐 × 线程数扫描,并发>线程数的扩展性,io context 计数 O(1)。
+
+**P2 槽位复用与格式 v2(空间回收,长 churn 文件不再无限涨;1–2 人周)**
+1. 移植 SlotAllocator:purge 清净入边的死槽进 free-list(入度计数器守门:入度>0
+   不得复用),插入优先复用,暗至 publish;分配状态(free-list+tombstone)随
+   finalize 持久化(照抄 `slot_allocator.hpp` 的 save/load 格式)。
+2. 格式 v2:行头 valid-degree(或槽位位图)替代幽灵槽三条件启发式;A/B 双
+   superblock 存 geometry / allocated-committed N / generation / checksum,给后续
+   WAL 提供锚点;v1 只读兼容 + 离线迁移工具。
+3. 验证:长 churn 下文件大小有界;复用槽无旧字节泄漏、id=0 真边、欠满行、
+   npp>1、旧格式兼容单测。
+
+**P3 生产化(按需)**
+- WAL/崩溃一致性(2–3 人周):full-page redo WAL(batch 级 begin / 页
+  after-image+checksum / commit,先 durable WAL 再写数据页,A/B superblock 翻转
+  提交;**不用 shadow page**——它会把纯 id 算术寻址逼成 page table)。
+  tombstone 位图与 meta 纳入同一事务。Yi 也没做,原型阶段标注 non-durable 不阻塞。
+- io_uring 异步 flush(可选,5–8 人日):页缓存合并之后的写回引擎,有界 QD +
+  固定对齐 buffer 池,隐藏 O_DIRECT 写延迟;profile 证明有收益再上 registered
+  buffer(Yi 自己也没用)。
+- collection 集成:活跃可更新 LASER 段 + 持久 label 映射/tombstone + 后台把老段
+  重建为不可变段、原子发布 manifest(周期全量重建作为质量/空间兜底)。
+
+### 8.4 明确不做(及重启条件)
+
+- **fresh 内存增量层**:Yi 本身就是纯 in-place;引入双图要付出双搜索路径合并、
+  merge 时逐边重生成码/因子、manifest 发布、崩溃恢复四份复杂度,而且它不消灭
+  LASER 边码写,只把写延后成更大的 merge。设为触发式备选,满足任一才立项:
+  (a) P0 后 evict 仍 <10k 且瓶颈已被证明是设备随机 IOPS 而非软件;(b) 更新可见
+  延迟 + fsync 成本使按批 in-place 提交不可接受;(c) collection 本就要做多段
+  merge,可复用其框架;(d) 更新分布高度局部而页缓存合并率仍低。即使触发,也做
+  在 collection 层(内存 delta + 不可变 base 段),不把 QGUpdater 改成双图。
+- **分段文件**:与纯 id 算术寻址冲突,留给 collection 层的段管理,不进单段格式。
+- **SPDK/全协程调度移植**:Yi 的 io_uring reactor 读路径迁移版已有,LASER 搜索有
+  自己的 IO 栈;写侧只需要 O_DIRECT flush(+可选 io_uring 写回),不需要 reactor。
+
+### 8.5 执行顺序与判决点
+
+1. P0.1 归因臂先行:O_DIRECT-only 若 T=32→64 仍同卡 ~287k 写/s,暂停页缓存
+   大改,先重新归因;否则立即进 P0.2。
+2. P0.2(写路径)与 P1 观测/消融并行——写路径先解决,gardening 的反向泵成本
+   结论才不被旧墙污染。P1.5 协程化排在 P0 判决之后:若 P0 后吞吐已贴 none 上限,
+   它是抬上限的下一根杠杆。
+3. P0/P1 末 go/no-go:吞吐 ≥12k 且深刷稳态 ≥0.985 → 锁定纯 in-place,进入
+   P2 格式/复用与 P3 WAL;未达标按唯一页 IOPS / 结构指标分别定位,不直接跳 fresh。
+
+> 详细版(逐文件/行号证据、Yi 并发协议逐段拆解、各方案风险表、验证门槛全文)
+> 见 `docs/LASER_UPDATE_NEXT_PLAN_YI.md`——codex 独立调研终报,与本节交叉核对
+> 后一致;本节采纳了其两处修正:P0 拆归因臂+页缓存两步、工程量估计以其为准。
+
+## 9. P0 执行记录
+
+### 9.1 P0.1 O_DIRECT 归因臂:判决与意外(2026-07-12)
+
+实现:双 fd——读保持 buffered(OS 页缓存伺服 ~82 页读/插入),写路由到独立
+`O_RDWR|O_DIRECT` fd(`UpdateParams::direct_io`,bench `--direct`);页缓冲全部
+换 4K 对齐 `AlignedBuf`,非对齐公共调用者走线程本地 bounce。seqlock 版本序
+(写完 pwrite 返回后才翻偶,DIO 写自带页缓存失效)保证 buffered 读 + DIO 写
+进程内一致。质量 eval 与 buffered 完全重合(0.965@60 / 0.988@100 / 0.997@200)。
+
+吞吐(SIFT1M 900k+100k,evict 臂 35.8 页写/插入,NVMe ext4):
+
+| 配置 | inserts/s |
+|---|---|
+| buffered(对照,当日复现) | 7439 (64T) |
+| 每补丁同步 DIO,克隆未 sync | 2030 (64T) / 2269 (32T) |
+| 每补丁同步 DIO,克隆后 sync | 5934 (64T) |
+| none 臂 DIO(1 追加写/插入) | **18559** (64T) |
+
+**判决:每补丁同步 O_DIRECT 写不可行,且推翻了"inode 锁是主敌"的原始归因。**
+1. 未 sync 坍塌 3.7×:DIO 写命中脏页缓存区间强制同步回写
+   (`filemap_write_and_wait_range`)——克隆刚 cp 完 3.4GB 全脏。教训:凡 DIO
+   写实验,克隆后必须 `sync`。
+2. sync 后仍输 buffered ~20%:同步设备往返(~25-100µs)压在页锁临界区与插入
+   关键路径里,替代的是 buffered 的 ~µs 级页缓存 memcpy——**内核页缓存本来就是
+   写回缓存**,287k pwrites/s 平台是 buffered 写路径(页拷贝+ilock+脏页记账)的
+   软件成本,不是设备。
+3. 真正的解法与 Yi 一致:P0.2 用户态脏页缓存——热路径零 syscall、批内同页
+   RMW 去重、批末受控 flush(DIO fd 留作 flush 通道)。none 臂 18.6k/s 说明
+   搜索侧上限还在,追加写(含 DIO)无碍。
+
+默认值已回翻 buffered(`direct_io=false`);P0.2 进行中(实现已按简报派发 codex,
+DIO flush 模式选型另有并行诊断)。
+
+### 9.2 P0.2 → P0.2b:从批末写回到驻留 buffer pool(2026-07-12)
+
+**第二判决:批末写回两种口味都输,写次数才是敌人。** P0.2 初版(批内脏页缓存、
+批末每唯一页一次写回、flush→publish)写次数 35.8→28.3/插入,但吞吐反降至
+3.4k/s:相位计时显示 flush 21s(buffered+sync_file_range 只有 134k 页/s——
+批末回写与下一批打架)、DIO flush 更慢(70k/s,同步 completion)。inline 基线
+的 287k/s 本质是"写与搜索重叠"的产物,拆成独立相位后怎么写都亏。
+
+**解法 = Yi 的 buffer pool 终局形态(P0.2b)**:缓存跨批驻留
+(`cache_cap_pages` 水位,默认 4GB),回链目标高度偏斜(hub 行),跨批合并把
+物理写压到 **8.6/插入(−4.15×)**,且全部推迟到水位驱逐/consolidate/finalize;
+批内 flush=0。搜索改为**穿透池读**(`read_node_page` overlay,命中 shard 锁内
+memcpy),缓存页变异纳入既有每页 seqlock(改前奇改后偶),批内安全性由快照守卫
+(`cur/nb >= snapshot`)保证;外部进程 reader 的边界仍是 `finalize()+fsync`。
+
+**第三判决:第二个串行点是 glibc 堆伸缩,不是锁也不是设备。** 池化后 drain
+(补丁应用)阶段成为主项且 T32≈T64 不随线程扩展——存在 ~330k patches/s 全局顶
+(v2 inline 的 266k patches/s 是同一个顶,当时被搜索重叠掩盖)。perf 归因:
+每条补丁数次短命对齐分配(Eigen RowMatrix、QGQuery 的 lut/rotate/quantize
+scratch、patch_slot 的 pad/rot/bins)→ glibc memalign 反复 grow/shrink 堆 →
+`mprotect` 压 `mmap_sem`(内核全局)。修复:五处 thread_local scratch +
+`QGQuery::rebind()` 每线程复用 + `EdgePayload` 按 thread_local 引用返回 +
+bench 侧 `mallopt(M_TRIM_THRESHOLD/M_TOP_PAD/M_MMAP_THRESHOLD)`。
+drain 10.9s→4.8s(64T),恢复线程扩展。
+
+**P0 终局数字**(SIFT1M 900k+100k,evict,batch=4096):
+
+| 配置 | inserts/s | 物理写/插入 | 备注 |
+|---|---|---|---|
+| inline 立即写(基线) | 7439 (64T) | 35.8 | 写搜重叠,287k 写/s 顶 |
+| 池化 P0.2b | 7126 (32T) / **8319 (64T)** | **8.6** | 含 finalize 一次性写回;循环净速率 ~10.3k/s |
+| 池化 none 臂 | **20271** (64T) | 1.0 | 搜索侧上限较 buffered 版 +15%(overlay 读) |
+
+质量逐点持平(0.9658@60 / 0.9881@100 / 0.9969@200,new_recall 0.9763@100);
+churn 100% 换血 + consolidation:0.9740(≈v2 0.9748),轮内 QPS 略升。
+单测新增:同页去重断言、缓存开/关文件逐字节一致;laser 全套 11/11。
+
+**下一杠杆**(P0 收尾/P1.5 衔接):drain(4.8s)与下一批搜索(4.9s)目前是
+串行相位——bench 级双批流水(drain(i) 与 batch i+1 搜索重叠,隔离度等效
+batch×2,forced-links 语义有一处批间分裂的小注意点,实测 forced=0 风险可忽略)
+估计可到 ~14k/s;再往上是 P1.5 协程端到端流水线。教训入档:**测并行写路径前
+先划相位计时;"不随线程扩展"优先怀疑全局串行点(本例 mmap_sem),而不是加锁
+粒度。**
+
+### 9.3 P0 收官:inline 补丁 + 驻留池 = 13.2k–14.7k inserts/s(2026-07-13)
+
+**双批流水验证为负结果**:drain(i) 与 batch i+1 搜索重叠(--pipeline)仅 +2%
+(8489 vs 8319,64T;flush_threads=16 反而 6229)——两相位共享池/锁/分配器结构,
+重叠被相互拖慢抵消。这个负结果指回正解:**staging 的写合并收益本来就来自池
+(同页补丁在池内天然合并,与相位无关),相位分离才是 2× 的代价**。
+
+**终解(--stage 0,现默认)**:恢复 v2 的 inline 反向边补丁,但补丁落池不落盘
+——搜索 IO 与补丁 CPU 在同线程自然重叠(v2 已证),零写 syscall,kAlphaEvict
+的捕获池检查也回来了。分配器串行点已修(§9.2),补丁不再有 330k/s 顶:
+
+| 配置 | inserts/s | vs 基线 7439 |
+|---|---|---|
+| inline+池 evict 64T | **13216** | 1.78× |
+| inline+池 evict 128T | **14691**(仍在扩展) | 1.97× |
+| inline+池 alpha 64T | 14280 | 1.92× |
+
+物理写维持 8.6/插入(−4.15×);质量逐点持平(0.9666@60 / 0.9882@100 /
+0.9968@200,new_recall 0.975@100;alpha 臂 new_recall@60 低 0.8pp,与 E1 一致,
+默认仍 evict)。**P0 目标带 12–15k 达成。**
+
+**意外红利:池即统一 buffer pool。** churn(500k 索引 1.9GB < 池容 4GB)中,
+补丁与 consolidate 逐轮把全图带进池,搜索读退化为 shard 锁内 memcpy——轮内
+插入速率 89k→118k/s 递增(50k 插入 <0.5s),consolidate 从 6.3s 降到 ~2.7s/轮,
+churn recall 轨迹不变(0.9742@100%)。索引装得下内存时,更新路径自动获得
+Yi 式统一缓冲池;装不下时按 cache_cap_pages 水位驱逐。后续知识点:读缺失
+目前不入池(只有写路径入池),"populate-on-read" 可作为 P1.5 的一个便宜旋钮。
+
+**StagedEdges 路径保留为 --stage 1 对照臂**(相位分离变体,含双批流水),
+研究价值:分相位的 barrier 设计在共享结构上会互相拖慢,Yi 的"批内无 barrier"
+经验在 LASER 上二次验证。
+
+### 9.4 P1 质量消融:插入深度是主杠杆,gardening 是配角(2026-07-13)
+
+机制(codex 按简报实现,已审查合并):RAM 入度计数器(可选,增量维护 + 单测
+锁定"增量==重扫");`garden()` = 低入度分位(或等预算随机对照)选点 →
+ef_maintenance 深搜 → 精确 RobustPrune → 整行重写 → 预算反向泵。
+churn 序:tombstone → consolidate → garden → insert → eval。
+
+SIFT 500k 滑窗 churn,10 轮 100% 换血,recall@100(第 10 轮):
+
+| 臂 | recall | Δ | 入度 p1/p5(活点) |
+|---|---|---|---|
+| consolidate-only(ef_insert=100) | 0.9736 | — | 0 / 0 |
+| + garden lowdeg ef100-400,无泵,frac .05 | 0.9750–0.9756 | +0.2pp | 8 / 14 |
+| + garden lowdeg ef200/400 + 泵4,frac .05 | 0.9774 / 0.9776 | +0.4pp | 15-16 / 18-19 |
+| + garden **random** ef200 + 泵4(等预算对照) | 0.9760 | +0.24pp | 8 / 13 |
+| + garden lowdeg,frac **.20**(4× 剂量) | 0.9831 | +0.95pp | 15 / 23 |
+| **仅 ef_insert 100→200,无 garden** | **0.9828** | **+0.92pp** | 0 / 0 |
+| ef_insert 200 + garden frac .05 | 0.9842 | +1.06pp | 17 / 21 |
+| **ef_insert 200 + garden frac .20(终选)** | **0.9865** | **+1.29pp,门槛 0.985 通过** | 16 / 24 |
+
+**判决:**
+1. **oracle"深搜是杠杆"在 LASER 上以 `ef_insert` 的形式成立**:100→200 一步
+   +0.92pp,是所有单项里最大的;残差主体是**插入时的边质量欠账**,不是老化。
+2. **入度尾巴修复成功但只值 +0.4pp**:gardening+泵把活点入度 p1 从 0 拉到 15+,
+   recall 增益却有限——与 DiskANN 战役"入度刷新砍 40% 衰减"不同构。结构解释:
+   LASER 的 evict 反向边补丁在每次插入时持续换血老节点(每轮 ~30 万次驱逐),
+   入度年龄衰减本来就弱;R64+headroom 下 p50=37 不饥饿。
+3. 定向 > 随机(+0.14pp)、泵 > 无泵(泵贡献 ≈ 无泵增益的一倍)、剂量近似
+   线性(frac .05→.20:+0.4→+0.95pp),且 garden 剂量与插入深度可互换
+   (f.20@ins100 ≈ ins200)——预算该花在哪取决于插入吞吐要求。
+4. 成本:churn 内(池驻留,搜索读为 RAM)ef_insert 200 与 garden 的代价都
+   可忽略(轮内插入 ~10 万/s 量级不变);**单次冷池插入**场景 ef_insert 200 预计
+   吞吐减半(搜索读翻倍),是显式的质量/速度旋钮。
+
+**50 轮长时域确证**(500k 基座,50 轮 × 10k = 100% 换血,ef_insert=200):
+
+| 轮 | 0 | 10 | 20 | 30 | 40 | 50 |
+|---|---|---|---|---|---|---|
+| consolidate-only | 0.9915 | 0.9894 | 0.9855 | 0.9862 | 0.9837 | 0.9831 |
+| + garden(f.20/ef200/泵4) | 0.9918 | 0.9906 | 0.9893 | 0.9899 | 0.9881 | **0.9878** |
+
+- 两臂都有界收敛(与 diskann g03 稳态判决同构);cons-only 尾段仍缓渗
+  −0.03pp/轮,garden 臂尾段 −0.005pp/轮 ≈ 全平。
+- **garden 的价值随时域放大**:第 10 轮 +0.12pp → 第 50 轮 +0.46pp——老化是
+  慢变量,短 churn 低估维护收益;这与"入度尾巴只值 +0.4pp"并不矛盾,长时域下
+  尾巴不断再生,定期修剪的复利显现。
+- 小轮次(2%/轮)比大轮次(10%/轮)整体平台更高(0.9878 vs 0.9865):修复
+  节奏越接近流式,质量越好。
+- 局限照旧:单数据集、单 seed;100 轮 × 大轮次需要数据集侧回收机制
+  (diskann 侧的稳态回收协议),留待 collection 集成后补。
+
+**P1 定案**:ef_insert 200 + 每轮 garden(lowdeg,frac 0.20,ef_maintenance 200,
+泵 4)= 100% 换血 recall@100 **0.9865(10×50k)/ 0.9878(50×10k)**,门槛 0.985
+通过;质量预算的分配次序:先插入深度,后 garden 剂量,最后泵。
+
+## 10. 下一阶段路线图(2026-07-12 定,故事线定稿后;证据基线 = §9 + LASER_UPDATE_STORY.md)
+
+> 原则:**先赌注后装修**。漂移实验决定论文命题上限,最先做;工程项按"论文刚需"
+> 排序而非工程趣味(协程降级为条件项)。预计全包 6–10 周(并行化后)。
+
+### Phase A(1–2 周,机时便宜)— 下注 + 封便宜攻击
+
+1. **分布漂移实验 v0(全计划最重要一项)**:cluster-holdout 建图(80% 簇)+
+   held-out 簇 OOD 插入流;eval 分新簇/老簇查询两组;对照臂 = 自家 DiskANN 线
+   (冻结 PQ 码本 + 原地更新,同 harness 同 trace)。判决:免码本是否拉开差距
+   → 直接决定标题/摘要档位(激进版 vs 机制版)。
+2. exact-evict 臂 + evict 误差遥测(FastScan argmax vs 精确 argmax 命中率、
+   rank regret、按轮累积曲线);full 臂同池化公平化。堵 A7/A11。
+3. R56 建的 1M 静态上界对照(堵 A6 "headroom 参数巧合")。
+4. 口径脚本化:≥3 seeds、recall@10/@100 双报、插入点/老点/全体三组分层。
+
+### Phase B(2–3 周)— 工程双项,全是论文刚需
+
+5. **P2 槽复用 + 格式 v2**:free-list + 墓碑持久化 + 零入度回收 + valid-degree +
+   A/B superblock。解锁:300%+ 换血、文件大小平台化(A13 "sustained" claim)、
+   大轮次 churn 的数据集回收。
+6. **P3a 读写路径统一 + 并发干扰曲面**:统一读(现 O_DIRECT)写(现 buffered)
+   语义;测 query QPS/p50/p99 × update rate 二维曲面,分 insert/delete/
+   consolidate/garden 四相。堵 A4(系统论文必答)。
+- (P1.5 协程 = **条件项**:若并发曲线难看或 deep10m 吞吐缩水过狠再上——它抬
+  none 上限 20.3k 与 IO 重叠,但不在论文关键路径。)
+
+### Phase C(2–4 周,机时大头)— 规模与基线
+
+7. deep10m 主表复跑 + RAM-cap 扫描(0.5/1/4/16GB,working set > pool,报
+   cache hit/唯一脏页/设备读写);100m 视机时(g03 数据须搬本地 /md1)。堵 A3。
+8. fresh-layer 基线:最小实现(内存 fresh 图 + 周期 merge 全量重打包)或严格
+   成本核算 + FreshDiskANN 文献数字。堵 A2。
+9. 非 2 次幂维度数据集一个(强制走 PCA 残差路径 + npp>1 几何)。堵 A12。
+
+### Phase D — 写作与判决点
+
+10. 按 RQ1–7 重组评测(STORY §7);WAL 设计章 + 微基准(研究轨 scope out 完整
+    恢复);文献精读核查(CleANN/OasisANN/PipeANN)→ novelty 句定稿。
+11. PVLDB rolling(每月 1 号)投稿制,无悬崖:P0 包做完即投。
+
+### 判决点与资源交织
+
+- **JP-1(Phase A 末)**:漂移正向 → 激进标题+免码本主 claim;负向 → 机制主张,
+  论文仍成立。
+- **JP-2(Phase C 初)**:deep10m 吞吐缩水程度 → 是否启动 P1.5 协程。
+- **与工业轨交织**:工业轨冻结线 2026-10(SIGMOD)/12(VLDB);本线 Phase C 机时
+  重头应避开工业轨战役期;Phase A 便宜且决定赌注,建议立即执行。
+
+## 11. Phase A 执行记录
+
+### 11.1 A6 对照判决:headroom"反超静态"不成立,主张降级(2026-07-12,T3)
+
+R56(容量 64)静态 1M 全建 vs 已有数字,new 段 = GT id≥900k(与 E1b 同口径):
+
+| ef | R64 静态 new 段 | **R56 静态 new 段** | hr 插入点 new(E1b) | hr − R56 静态 |
+|---|---|---|---|---|
+| 60 | 0.9569 | **0.9644** | 0.9618 | −0.26pp |
+| 100 | 0.9860 | **0.9872** | 0.9837 | −0.35pp |
+| 200 | 0.9975 | **0.9975** | 0.9962 | −0.13pp |
+| 300 | 0.9994 | **0.9989** | 0.9981 | −0.08pp |
+
+- E1b 的"插入点反超静态上界(0.9618>0.9565)"**只对 R64 基线成立**;换成同参数
+  (R56 建/容量 64)静态上界后,反超消失——hr 插入点距上界 0.08–0.35pp。
+- 附带观察:R56 欠满建的静态索引本身在低 ef 优于 R64(总 0.9726 vs 0.9705@60,
+  new 段 +0.75pp@60),与 E1b 在 900k 上的观察一致。
+- **主张定稿(预判被证实,见 STORY §5 A6)**:headroom 的正确卖点是
+  "零增量行字节改善质量/更新 tradeoff——欠满建图不损静态质量,流式插入点逼近
+  同参数静态上界(≤0.35pp)",不是"反超静态"。E1b 原文的"反超"表述以本节为准修正。
+- 复核:R64 复建与既有数字偏差 ≤0.08pp,实验链可信。产物 data/laser-update/r56upper/。
+
+### 11.2 JP-1 分布漂移判决:正向,免码本敏感度小 2–4×(2026-07-12,T1/T4 + LASER 臂)
+
+设计:SIFT1M 聚 64 簇,外围 12 簇 198,588 点做 held-out OOD 插入流(按簇心距升序
+渐进加剧),建图集 801,412;null 对照 = 随机同量划分。查询按 top-10 GT 落 held-out
+比例分组(g0=old 6303 / g1=mixed 1493 / g2=new 2204;ctrl 组下 g2=298,噪声 ±0.6pp)。
+两臂同机同 trace:LASER(evict,ins200) vs 自家 DiskANN 原地线(PQ32 建图时训练,
+冻结证据=pivots SHA-256 建前后一致 + 插入仅 encode_one,L=25)。
+
+**干净口径**(两腿终态同为全量 1M;与同底座静态 1M 全建对照,同查询/GT/分组,
+唯一差异 = 尾段 198k 流式 vs 建入):
+
+| @ef100 | drift 腿 g2 流式惩罚 | drift g0 | ctrl g2 | ctrl g0 | 漂移特异超额(双差) |
+|---|---|---|---|---|---|
+| LASER | −1.17pp | −0.06 | −0.37 | −0.38 | **−1.12pp**(@ef60:−1.67) |
+
+DiskANN(pre→post 双差,掩码人群漂移在双差中对消):drift 腿 g2 −4.92pp/g0 −0.81,
+ctrl 两组均匀 −1.9 → **漂移特异超额 −4.16pp**。
+
+**判决**:
+1. 冻结码本在 OOD 区域确凿开裂(−4.2pp 特异超额,剂量响应单调);LASER 同口径
+   敏感度小 2–4×(−1.1~−2.1pp,视口径)。**JP-1 正向**,免码本主张可升级为
+   实测优势(带量级,不带"免疫")。
+2. LASER 残余惩罚的归因:LASER 无任何训练产物(FHT 数据无关、免 PCA 配置),
+   其 −1.1pp 只能是**拓扑冷启动**(新簇首批点无既有邻域);DiskANN 的 −4.2pp =
+   拓扑冷启动 + 码本开裂两项之和 ⇒ 码本特异成分 ≈ −2~−3pp。要坐实分解,需补
+   DiskANN 同底座静态 1M 参照腿(工具已备,便宜)。
+3. LASER 漂移腿 g2 随簇外围度渐进变差(ckpt0 0.9883 → ckpt3 0.9817),ctrl 平
+   ——剂量响应支持因果。
+4. 论文级还需:DiskANN 静态参照腿、L 扫描(当前 L=25 单点)、≥3 seeds、
+   周期重训 oracle 臂(升级敏感度上界)。
+数据:data/laser-update/drift/(runs/、diskann-runs/);事故记录:首轮 LASER 臂
+脚本漏传 --from(默认 0)误插建图集头部向量,已废弃重跑——**bench insert 模式
+--from 无默认化,永远显式传**。
+
+### 11.3 A7/A11 判决:估距误差无累积、零质量代价;full 直移植在现代配置下更差(2026-07-12)
+
+单次 900k+100k(并行,ins200,驻留池,同配置三臂):
+
+| 臂 | inserts/s | new_recall@ef60 | @ef100 | @ef200 |
+|---|---|---|---|---|
+| evict(FastScan 估距) | **10473** | **0.9654** | 0.9861 | 0.9956 |
+| exact-evict(精确距离) | 3775(2.8×慢) | 0.9613 | 0.9845 | 0.9954 |
+| full(完整 RobustPrune) | 2125(4.9×慢) | **0.8836** | 0.9345 | 0.9701 |
+
+churn 10×50k 双臂(evict vs exact,同配置,无 r_target):逐轮 recall 双向抖动
+±0.4pp,终点 0.9361 vs 0.9348——精确距离全程无优势。遥测(p=0.05):argmax
+一致率 57%→47%(行内近平手边随轮增多),但 rank regret p50 = 0→1、相对误差
+1.67%→1.69% 全程平——**分歧发生在平手场景,误差既不增长也不转化为 recall 差**。
+
+**判决**:(1) A7 封口:估距误差不累积(10 轮遥测平 + exact 臂零增益 + 50 轮
+recall 平台三重证据);(2) A11 封口:同池同并行下 exact 2.8×/full 4.9×,均无质量
+增益——"9×"修正为"2.8–4.9×(并行池化口径)",且代价换不来质量;(3) 新发现:
+full 直移植在 ins200 并行下 new_recall 崩 8pp(E1 单写者 ef100 时代仅 −0.85pp)
+——深候选池加剧 α-过度剪枝压新点入度,叠加行粒度重写对批内并发的敌意
+(读-剪-写跨锁窗口 vs evict 的槽粒度原子补丁);机理拆分待查,headline 不变:
+**G2"直移植不只贵,还更差"从 0.2pp 加强到 8pp**。exact-evict 臂保留为诊断工具。
+注意:本轮 churn 未传 --r_target,绝对值不可与 §9.4(0.9878)横比,臂间对照有效。
+
+## 12. P3a 设计契约:查询走池的并发读写统一(待 P2 落地后实施)
+
+**问题**:搜索读是 O_DIRECT libaio(aligned_file_reader),更新写是 buffered+驻留池
+——并发下 (a) DIO 读绕过页缓存看到陈旧盘态;(b) DIO 读命中脏页缓存范围触发同步回写
+(§9.1 实证的性能干扰);(c) 4K 页回写对并发 DIO 读无原子性保证 ⇒ 撕裂行。
+
+**P3a 方案(bench 级,不动 QuantizedGraph)**:混合负载模式让查询线程**读穿驻留池**
+——QGUpdater 增查询路径(search_for_insert 的 top-k 返回变体,同一 read_node_page
++ seqlock 协议),新鲜度语义 = published 水位 + tombstone 过滤(与插入搜索一致)。
+池即 Yi 式统一 buffer pool 的过渡形态;QuantizedGraph 原生读者的池对接留给
+collection 集成(P3 本体)。
+
+**测量矩阵(bench --mixed 模式)**:固定查询负载(16T)× 插入速率
+{0, 25%, 50%, 100% 无限速}(限速用令牌桶);固定插入(64T)× 查询并发 {4,16,32}。
+每格报:query QPS / p50 / p99 / recall(vs 当前 live GT)、insert 吞吐、
+维护相位(consolidate/garden)期间的查询尾延迟单列。四相分开:纯插入、
+插入+删除、+consolidate、+garden。
+
+**验收**:干扰曲面成图(A4 封口的数据);查询 p99 在 100% 插入负载下的膨胀系数
+量化;seqlock 重试率计数(读写热页冲突的直接观测)。
+
+### 11.2b JP-1 判决修正:v0 = 零结果(2026-07-12,T5 静态参照腿落地后)
+
+**§11.2 的"正向,−4.2pp"作废**。DiskANN 同底座静态 1M 参照腿(PQ 训练于全量 1M)
+落地后,干净口径(流式终态 − 静态 1M,同查询/GT/分组)显示:
+
+| @L25 | drift g2 | drift g0 | ctrl g2 | ctrl g0 | 交互项 |
+|---|---|---|---|---|---|
+| DiskANN 流式惩罚 | −0.95pp | −0.88pp | +0.87pp | −0.30pp | **−1.24pp** |
+| LASER(@ef100,§11.2) | −1.17pp | −0.06pp | −0.37pp | −0.38pp | **−1.12pp** |
+
+两系统交互项统计上不可区分(ctrl g2 仅 298 查询,±0.6–0.9pp 噪声带)。
+
+**为什么 §11.2 的 −4.2pp 是伪影**:pre→post 口径里,新区查询 pre 时只在稀疏存活
+GT 上打分(掩码虚高 97.8%),而其真实 GT 在 L=25 下即使静态全建也只有 93.8%
+——"题目变难"被计入"索引退化";且 drift/ctrl 两腿 g2 人群的硬度轨迹不同
+(−4.0 vs −2.8pp),双差消不掉。**方法论教训(论文级):masked-recall 的
+pre→post 双差在人群构成变化的组上不可用;必须用同终态的静态参照口径。**
+
+**修正后判决**:
+1. SIFT1M 温和簇漂移(held-out/内部 NN 距离比 1.29×)+ 全精度 rerank 兜底下,
+   冻结 PQ **无可检出的码本特异退化**——rerank 把中等码本误差全部吸收。
+2. 免码本主张退回**机制优势**(永无重训练义务、无全局耦合产物);recall 优势
+   的兑现条件收窄为:更强漂移(跨域/真实时序)、rerank 受限或 PQ 预算更小的
+   工况。激进档标题不解锁,主命题维持 codex 收窄版(§STORY.1)。
+3. 附带正面读数:LASER 流式对老区几乎零损(g0 −0.06pp vs DiskANN −0.88pp),
+   且 LASER 的 OOD 流式惩罚(−1.17pp)与 DiskANN(−0.95pp)同量级——
+   "量化打包行的原地更新不因格式付出额外漂移代价"这个防守性结论成立。
+4. v1 实验设计(若追求兑现 recall 优势,P1 级):跨域插入流(如 big-ann T2I
+   clustered runbook / 异源 embedding)、holdout 加大、PQ chunks 16 压力臂、
+   candidates-only(无 rerank)召回遥测直接观测码本开裂;或接受零结果,
+   论文以机制主张 + 防守性结论定稿。
+
+### 11.4 多 seed 批:顺序不敏感成立;shuffle 发布语义混杂待修(2026-07-12)
+
+3 seeds × 最优配置 churn(10×50k,cons+r_target56+garden f.20+ins200,--shuffle_seed):
+r10 recall = 0.9640 / 0.9629 / 0.9627,**种子间散布 ±0.06pp**;free_fills/evictions
+逐 seed 几乎恒等(18.91M/5.45M)——插入顺序不敏感 + 维护行为确定性,防守性证据。
+
+**但绝对值比 seed=0 协议(§9.4 的 0.9878)低 2.4pp——口径混杂**:shuffle≠0 走
+"整段快照 + 段末统一发布"语义(T2 实现权衡:乱序 id 无法推进连续水位),轮内新点
+互不可见,intra-cohort 边缺失。**本批不可用作 0.9878 的误差棒**。修法(Phase C 前任
+一):(a) 批内洗牌(水位语义保留,随机性弱化);(b) 数据级洗牌(drift_prep 式预重排
+底座,运行时语义原封,随机性来自数据)——推荐 (b),随 Phase C 规模批一起做。
+
+### 11.1b A6 判决 max 复核:方向维持,逐格数字修正(2026-07-12,V2 审计)
+
+T3 原跑在 medium 档,V2(max)独立复核结论:**CORRECTED(细节)/ CONFIRMED(方向)**。
+
+1. **最高危错误排除**:直接解析 Vamana 产物——R56 腿 100 万节点最大出度 56、
+   64 度节点 0 个;R64 腿 max 64、64 度节点 25.9 万。R56 构建真实生效,
+   LASER 容量均为 64(node_len=2560 反解),rotator 逐字节相同。
+2. **低 ef 单跑不可复现**:同一冻结二进制/索引/查询复跑两次,R64@ef60 相差
+   +0.60/+0.12pp、R56@ef60 −0.30/−0.35pp——**§11.1 表的 ef60 逐格数字作废**;
+   ef≥100 稳定(±0.06pp 内)。新方法论红线:**低 ef 的单跑 recall 差 <0.5pp
+   视为噪声,结论必须 ≥3 跑取均**(嫌疑:16 线程 eval 的遍历序非确定性,待查)。
+3. **修正后 A6 对照**(hr 插入点 − R56 静态,复跑两次):ef60 +0.04/+0.09pp
+   (噪声内持平)、ef100 −0.37/−0.33pp、ef200 −0.06pp、ef300 −0.11pp。
+4. **判决**:"反超静态"不可复现(原 E1b 的 ef60 反超 R64 也在噪声带内),
+   "R56 静态全 ef 压 hr"同样不成立——**headroom 的定稿卖点:零增量行字节、
+   欠满建图不损静态质量、流式插入点在 ef≥100 逼近同参数上界 ≤0.37pp、
+   低 ef 与上界统计持平**。E1b 对照口径公平性经独立核验无偏。
+
+### 11.5 medium 档执行审计台账(2026-07-12,V1/V2/V3 全部 max 档独立复核)
+
+背景:T1(漂移数据)/T3(R56 上界)/T5(DiskANN 静态腿)三个任务曾以 medium
+档执行,其上压着 A6 与 JP-1 两个判决。三个 max 档审计员独立复核(不读原报告、
+自写验证代码、冻结二进制复跑、原始 CSV 重算):
+
+| 审计 | 对象 | 裁决 |
+|---|---|---|
+| V1 | 漂移数据地基 | **4×CONFIRMED**(置换双射零差/GT 384 查询×7.68 亿距离对零差/分组标签 1 万行零差/n_build 零差)+ 1×UNVERIFIABLE(manifest 未存 64×128 簇心坐标,"12 个最外围簇"语义待补簇心落盘后严格复核;经验块中心距离严格升序 + 尾段自指派 98.6% 作辅助支持) |
+| V2 | A6(headroom) | **方向 CONFIRMED,ef60 逐格 CORRECTED**(§11.1b):R56 构建真实(产物级取证),但低 ef 单跑有 ±0.3–0.6pp 运行间波动,"反超/全面落后"均不可复现;定稿=ef≥100 逼近上界 ≤0.37pp、低 ef 统计持平 |
+| V3 | JP-1(漂移零结果) | **CONFIRMED**:T5 配置法证确认(PQ 训练集=全量 1M:pivots 首 128 浮点与全量均值逐 bit 一致;流式腿码本哈希冻结);复跑 7/8 格过 ±0.1pp(ctrl g2 小组单格 UNVERIFIABLE,只加宽噪声带);主会话手算十格最大偏差 0.0064pp;**伪影分解:−4.157pp = 干净交互 −1.234 + 掩码/硬度伪影 −2.923**;两系统交互差 0.115pp,合并 SE 0.90pp,z=0.127 |
+
+**补注(V3 建议)**:§11.2b 表中 DiskANN ctrl g2(298 查询)为单次点估计,
+8 线程异步评估存在 ~0.3pp 波动;−1.24pp 交互项应按 ±0.9pp(1σ)噪声带解读。
+
+**结论**:medium 档执行的三个任务方向性结论全部站住,数字级修正两处(低 ef
+逐格、小组点估计),数据地基零差错。两条新方法论红线沉淀:① 低 ef / 小查询组
+的单跑 recall 差 <0.5pp 视为噪声,≥3 跑取均;② 多线程 eval 的 recall 非确定性
+(LASER 16T 与 DiskANN 8T 均观测到)值得代码级排查(疑遍历序/并列打破)。
+
+## 13. P2 落地判决:格式 v2 + 槽复用(2026-07-12,T6 max 档实施,commit 9220b05)
+
+### 13.1 实现范围(全部按 §10-P2 设计契约)
+
+- **页尾 trailer**(npp×4B):每行 `{valid_degree:u16, flags:u16(bit0 tombstone, bit1 free)}`,
+  更新侧一律走紧凑有效前缀,删槽尾移。trailer 写在页 slack 区 ⇒ **v2 新增格式约束:
+  页 slack ≥ npp×4B,零 slack 几何(如 R32/d64 恰满 4096B)按契约拒载**(单测夹具
+  因此迁到 R64/d64);SIFT R64/128d slack 1536B,余量充足。
+- **A/B superblock**(512B×2,offset 0/512):magic/version/generation/num_points/
+  live_count/free_list_head/free_count/CRC32 + 镜像几何字段;checkpoint = 数据页
+  flush 后交替单次 pwrite(512)+fsync;开文件选 generation 最大的合法块,两块全坏
+  时拒绝误读为 v1。只读 QuantizedGraph loader 同步认识 v2(几何/文件大小校验)。
+- **v1→v2 原地迁移**(首次 update-open):逐行 ghost 槽压紧 + 写 trailer(只写
+  slack 区,中断后文件仍是合法 v1,重放幂等),superblock 最后写。
+- **LIFO free-list**:死行首 8B 串链;consolidate(reclaim) 在 purge 全部落盘后才
+  入链;链损坏从 trailer flags 重建。entry-point 若被删,入链前先迁移到存活 PID。
+- **暗至发布**:复用 PID 低于水位,靠 `deleted_` 结果过滤压暗;publish 先清
+  trailer 位、再删过滤项(可见点),追加段仍由 committed 水位门控。
+- bench:`--reuse/--checkpoint_every`,复用下维护源 ID→PID 映射保 GT 正确,输出
+  `file_pages/freed/reused/live_frac`。
+
+### 13.2 验收冒烟(500k 底座,10×50k 轮回收 churn,alpha 臂,ef_insert=200,r_target=56,32 写线程)
+
+| 指标 | reuse=1 | append(reuse=0) | 差 | 验收门 |
+|---|---:|---:|---:|---|
+| file_pages 终态 | **500,000(全程恒定)** | 1,000,000(线性涨) | −50% | 平台化 ✓ |
+| 10 轮均值 recall@10 | 0.98417 | 0.98660 | −0.24pp | ≤0.3pp ✓ |
+| 尾轮 recall | 0.98513 | 0.98417 | +0.10pp | — |
+| 平均插入吞吐 | 37,292/s | 40,405/s | −7.7% | ≤10% ✓ |
+
+逐轮瞬时差最大 0.38pp(单轮点估计,按 §11.5 红线不作数);freed=reused=50,000/轮
+严格守恒,live_frac 恒 1。**判决:槽复用把磁盘占用从线性增长钉死为常数,recall 与
+吞吐代价均在验收门内 —— C3(evict 补丁≈full prune)之后,C4(定宽行=原地复用单元)
+也有了实证腿。**
+
+### 13.3 遗留与边界(实施者自报 + 复核确认)
+
+- 尚无 WAL/页撕裂恢复;checkpoint 语义 = 静默点一致性,非任意崩溃点恢复。
+  WAL 叠加路径已勘察(redo 次序:purge 落盘 → free-push 记录;复用 publish 记录
+  reused 集+水位+计数+entry-point,先 fsync WAL 再清 tombstone;superblock reserved
+  区可挂 checkpoint LSN)——留待需要崩溃一致性主张时实施。
+- publish/过滤变更仍要求阶段隔离,与外部搜索的无锁并发留给 P3a(§12)。
+- `allocate_and_insert` 中途异常无 free-pop 回滚(WAL/事务层职责)。
+- 100% 全删瞬间可能无存活路由根;平台测试只覆盖空间指标,不宣称该瞬间搜索质量。
+
+### 13.4 V1 审计尾项关闭(2026-07-12,C1 max 档,commit 9f70035)
+
+§11.5 中 V1 唯一 UNVERIFIABLE 项(manifest 缺 64×128 簇心)已关闭:确定性重放
+`MiniBatchKMeans(k=64, seed=42)` 全链路,五层核对全 PASS——center_dist 64/64
+零偏差、12 簇选择/sizes/skips 逐项一致、**perm.u32 全量 1M 项逐字节复现**(MD5
+一致)、标签分区零违规、外围贪心语义成立(所有更外围被跳簇均因超 heldout_max
+204,000 上界)。裁决:**"drift 尾段确为 12 个最外围 kmeans 簇" = CONFIRMED**。
+簇心/标签已落盘(kmeans_centroids_64x128.fbin / kmeans_labels.u16 + manifest
+`centroid_artifacts`,sklearn 1.8.0),drift_prep.py 此后生成时自动持久化。
+
+## 14. ND1 判决:多线程 eval recall 非确定性根因(2026-07-12,max 档诊断,只诊断未改码)
+
+### 14.1 根因裁决
+
+**(a) 异步 I/O 完成序 = 根因,但"须由精确等距并列触发"被证伪。** 两套系统
+(LASER beam search / DiskANN beam search)都把 I/O 完成序直接变成节点逻辑扩展序,
+有限 ef/L 预算下不同完成序 ⇒ 访问不同图路径 ⇒ top-k 不同。精确 L2 核验:LASER
+ef60 的 2,206 个跑间变化查询中仅 8 个涉及等距并列;DiskANN 1T/关缓存的 672 个变化
+查询中 **0** 个——分岔不需要并列,预算截断本身就把完成序放大成路径分歧。
+LASER 另有放大器:**尾部完成项插入新候选后不重进主循环**(候选被静默丢弃)。
+(b) scratch/visited 残留、(c) 结果聚合竞争、(d) 浮点归约序,均排除。
+DiskANN 侧 1T + 关缓存仍抖;deterministic barrier 或 beam=1 后逐位稳定——收敛证据链。
+
+### 14.2 波动边界(≥3 跑定量)
+
+- LASER 总体 recall:**ef≥100 稳定确认,最大散布 ~0.035pp**;但小查询组 ef100
+  仍可达 **0.204pp**——总体稳定不可外推到分组;
+- DiskANN g2(298 查询):八跑散布 0.302pp 复现,与 V3 观测一致。
+
+### 14.3 对已入档判决的定量核对
+
+| 判决 | 影响 |
+|---|---|
+| A6(§11.1b) | 方向不变;**"ef≥100 逼近上界 ≤0.37pp"不能作逐跑硬上界**,观测包络至 −0.46pp——表述改为"逼近上界(多跑包络 ≤0.5pp)" |
+| JP-1(§11.2b) | **null 判决稳固**;g2 单格点估计可移动 ~0.3pp,已按 ±0.9pp 噪声带解读,无需再改 |
+| §13.2 P2 冒烟 | 空间/吞吐结论稳定;recall 门余量仅 0.057pp ⇒ **已启动外部多进程复评**(3×双臂,冻结 9220b05 二进制 md5 795094be…,协议同 T6:拷 v1 base500k → churn 首开迁移;结果落 §14.5) |
+
+### 14.4 工具账与方法论修订
+
+- **bench 真 bug:`--runs N` 的 recall 只报最后一跑,从不取均**——红线①修订为:
+  **多跑必须是外部独立进程**(进程内重复既不取均、也共享完成序温床)。bench 修复
+  (逐跑输出+均值)排队至 T7 落地后(文件当前归 T7)。
+- 最小正确修复(如需确定性模式):按 submission sequence 做逻辑 commit/reorder
+  buffer + 尾部候选续搜;仅 PID 并列定序不够(并列非主因)。整批 barrier 实测
+  QPS 代价 36.8–40.3%,只配作 eval 专用旗标,不进生产路径。
+- 纪律披露:诊断中 DiskANN bench 在 rounds=0 仍无条件 flush(),原索引 7 个
+  sidecar 的 mtime 被更新(内容与审计前副本逐字节一致,无实质改动)——顺带暴露
+  eval-only 路径应只读打开的 bench 疵点,同排队。
+- 完整材料:data/laser-update/scratch_nd1_20260712/(终报/散布 CSV/逐查询分析)。
+
+### 14.5 P2 冒烟外部复评:门槛焊死(2026-07-12,3×双臂独立进程,冻结 9220b05)
+
+| 臂 | 三进程 r1-10 均值 | 跨进程散布 | 尾轮 |
+|---|---:|---:|---:|
+| append | 0.986434 / 0.986456 / 0.986416(均 **0.986435**) | 0.004pp | 0.9838/0.9835/0.9842 |
+| reuse | 0.984163 / 0.984188 / 0.984007(均 **0.984119**) | 0.018pp | 0.9851/0.9849/0.9844 |
+
+**均值差 −0.2316pp,门 −0.3pp:余量 0.068pp = 跨进程散布的 ~16 倍,GATE HOLDS。**
+T6 单跑(−0.243pp)被证实有代表性;churn 十轮均值口径的跑间噪声(≤0.02pp)远小于
+静态低 ef 单跑噪声——插入路径的随机性在轮均值里被平掉。reuse 三段 file_pages 全程
+钉死 500,000、freed=reused=50,000/轮守恒;维护计数器跨进程几乎恒等
+(free_fills 14.28M/15.12M 逐臂恒定,§11.4 确定性回声)。尾轮 reuse 仍略高(+0.08pp 均)。
+§13.2 判决自此按外部多进程口径成立,无保留项。
+
+**工具修复同日入库(8fdb492)**:eval `--runs` 改为逐跑计量、CSV 报均值、
+`# recall_runs` 行露散布(实测 ef100 三跑散布 0.029pp,与 §14.2 包络吻合);
+DiskANN bench 零轮运行不再终局 flush(eval-only 不碰 sidecar)。
+
+## 15. P3a 完整干扰矩阵:A4 封口数据(2026-07-12,24 格,tools/run_laser_mixed_matrix.sh)
+
+500k 底座(v1 迁移后),SIFT 查询,ef=100,每格 5s 窗口,recall 按冻结窗末水位窗外评。
+原始 CSV:data/laser-update/p3a-matrix/mixed_matrix.csv。
+
+### 15.1 插入速率轴(16 查询线程 × 64 写线程)
+
+| 相位 | 速率 | qQPS | p50/p99(us) | recall | 插入/s | seqlock 重试率 |
+|---|---:|---:|---|---:|---:|---:|
+| pure_insert | 0% | 9,284 | 1724 / 2228 | 0.99225 | 0 | 0% |
+| pure_insert | 25% | 31,772 | 418 / 2204 | 0.99084 | 12,317 | 0.02% |
+| pure_insert | 50% | 20,298 | 701 / 2900 | 0.98953 | 23,578 | 0.02% |
+| pure_insert | 100% | 24,748 | 540 / 3424 | 0.98615 | 49,553 | 0.06% |
+| insert_delete | 100% | 13,320 | 508 / **16,321** | 0.98116 | 24,856 | 0.06% |
+| consolidate | 100% | 34,483 | 317 / 1551 | 0.98223 | — | **36.4%** |
+| garden | 100% | 36,302 | 382 / 1497 | 0.98380 | — | 0.5% |
+
+### 15.2 查询并发轴(100% 插入速率 × 64 写线程,pure_insert 相)
+
+| 查询线程 | qQPS | p50/p99(us) | recall | 插入/s |
+|---:|---:|---|---:|---:|
+| 4 | 4,730 | 786 / 2580 | 0.98644 | 48,750 |
+| 16 | 24,748 | 540 / 3424 | 0.98615 | 49,553 |
+| 32 | 33,543 | 791 / 3725 | 0.98780 | 40,437 |
+
+### 15.3 判决(A4:"并发读写互相残杀?"——否)
+
+1. **池耦合对查询净收益为正**:全表最慢格是 0% 插入(冷盘 p50 1.72ms);任何插入
+   活动都把页拉进驻留池,查询 p50 降 2-4×。"更新干扰查询"的直觉在读穿池架构下
+   反转——更新流即预热流。
+2. **全速插入下无崩溃**:49.6k 插入/s 与 24.7k 查询 QPS 共存,p99 膨胀 1.54×
+   (3.42ms vs 0% 档 2.23ms),recall 罚 0.61pp(0.98615 vs 0.99225,同为窗末水位口径)。
+3. **维护相位不挡查询**:consolidate/garden 与查询并发时 QPS 28-83k、p99 ≤4.2ms;
+   consolidate@100% 的 36.4% seqlock 重试率证明协议在全行扫描压力下以微自旋
+   而非停顿消化冲突(p99 仍 1.55ms)。
+4. **插入吞吐对查询压力鲁棒**:4→32 查询线程,插入吞吐 48.8k→40.4k(−17.6%)。
+5. **最坏尾巴 = 100% 插入+删除混合**:p99 16.3ms(p50 仍 508us)——tombstone 页
+   RMW 突发与插入争锁的长尾,唯一超 5ms 的格;P3b/WAL 阶段的第一优化目标,
+   论文如实报告(不影响"无崩溃"主张,p50 健康)。
+6. 查询并发扩展:4→16→32 线程 qQPS 4.7k→24.7k→33.5k,16 后亚线性(与 64 写
+   线程争核),32Q 仍正扩展。
+
+**Phase B 至此收官**:P2(§13)+ P3a 实现(d065076)+ 干扰曲面(本节)。
+剩余尾项:mixed 复用槽扩展(source→PID 映射)、insert_delete 尾延迟优化,
+均排入 P3b/Phase C。
+
+## 16. S1 判决:数据级 shuffle 多 seed 误差棒(2026-07-12,修复 §11.4 混杂;Phase C 首项)
+
+**协议**:预重排底座插入段(行 [500k,1M) 内部按 seed 101/102/103 置换,前 500k 逐字节
+不动)+ 运行时零 --shuffle_seed(连续水位发布语义原封)。4 底座(identity+3)×
+2 臂(reuse/append)= 8 段,10×50k churn,cons+r_target56+garden f.20+ef_insert200,
+冻结 9220b05 二进制。**执行修正**:bench 按 source id 计 recall ⇒ 置换底座必须对 GT
+做置换双射的纯 id 重标号(不动距离/邻居/掩码)——简报原断言"GT 不需重算"在标签
+层错误,实施者(codex)发现错位、隔离污染跑(forensic_invalid_gt/)后修正。
+
+| 臂 | identity | seed101 | seed102 | seed103 | 随机间散布 | 含 identity |
+|---|---:|---:|---:|---:|---:|---:|
+| reuse r10 | 0.988409 | 0.990839 | 0.990829 | 0.990329 | **0.051pp** | 0.243pp |
+| append r10 | 0.987529 | 0.988899 | 0.988579 | 0.987999 | **0.090pp** | 0.137pp |
+
+**判决**:
+1. **干净口径下插入顺序不敏感成立**:随机 seed 间散布 ≤0.09pp;论文误差棒取
+   ±0.05–0.09pp(随机序),保守上界 0.24pp(含顺序插入这一非典型端点)。
+2. **随机序一致优于顺序序**(全部正偏差,无退化);顺序插入是 reuse 臂的最坏况
+   (LIFO 复用 + 相邻数据相关放置)。真实工况(乱序到达)反而更优。
+3. **旗舰正结论:garden 开启时 reuse 反超 append**(0.9903-0.9908 vs 0.9880-0.9889,
+   +0.19~0.23pp)——§14.5 的 −0.23pp 代价是无 garden 语境;维护配齐后槽复用
+   不再是质量代价,叠加 50% 磁盘节省。C4 卖点升级。
+4. **维护近确定性**:free_fills/evictions 跨 seed 相对散布 0.07–0.25%(§11.4 回声,
+   这次口径干净)。
+5. **§11.4 诊断定量证实**:干净 r10 0.9875–0.9908,比统一发布混杂批(0.963x)高
+   ~2.4pp,与预测一致;§11.4 的误差棒表述自此由本节取代。
+
+产物:data/laser-update/shuffleseeds/(变体底座+md5、8 日志、summary.csv、
+generate/run 脚本、final_report.md)。
+
+## 17. D0 判决:LASER 96 维直通,Phase C 闸门放行(2026-07-12,deep1m 侦察)
+
+**裁决:96 维只差一个过时闸门,小补丁后全链路贯通(已入库)。** 旧
+`dimension_ != padded_dim_` 检查(只放行 2 的幂)是死条款——padding 数据流本已
+完整(rotator 零填充 [dim,pd),FHT/RaBitQ/FastScan 全在 pd 上运算);改为真实
+不变量 `pd ≥ dim 且 pd % 64 == 0` 后,全主维 96/pd128 直通。
+
+### 17.1 deep1m(96d)静态质量(R64,--runs 3 均值±散布)
+
+| ef | recall@10 | 散布 | QPS |
+|---:|---:|---:|---:|
+| 60 | 0.9709 | 0.066pp | 10,394 |
+| 100 | **0.9883** | 0.014pp | 8,530 |
+| 200 | 0.9968 | 0.016pp | 6,070 |
+
+对照:raw 64+32 无 PCA 仅 0.7165@ef100;正确 PCA 64+32 也只 0.9198(残差 32 维
+占 10.3% 方差,近似损失非布局错误)。**deep(96d)腿 = 全主维 96,不用残差切分。**
+
+**范围限定(2026-07-12 校正,用户定位)**:LASER 的设计主场是**高维向量**
+(嵌入模型 768/1024/1536d),PCA 主/残差切分正是为高维设计——本节"全主维优于
+残差切分"是 96 维低维特例的判决(残差仅 32 维还占 10.3% 方差,切分本就不该用),
+**不得外推**。Phase C 数据集策略修订:高维为第一梯队(GIST1M 960d 侦察中,
+嵌入集按叙事后补),deep10m 降为规模/低维鲁棒点,SIFT 保留可比性锚。高维待验证
+项:node_len 超 4KiB 的多扇区页几何(如 960d 全精度行 ≈ raw 3.84KB + 码/因子/邻居,
+npp=1、page_size 多扇区)在 builder/updater/P2 trailer 下的正确性——D1 侦察。
+
+### 17.2 行几何与 P2 约束(96d)
+
+| 路径 | node_len | npp | slack | trailer | 1M 索引 |
+|---|---:|---:|---:|---:|---:|
+| 全主维 96/pd128 | 2,432B | 1 | 1,664B | 4B | 4.10GB |
+| PCA 64+32/pd64 | 1,920B | **2** | 256B | 8B | 2.05GB |
+
+### 17.3 npp=2 churn 冒烟(P2 首次多行页实证)
+
+PCA 64+32 腿,5×20k reuse churn:file_pages 恒 250,000、freed=reused=20k/轮、
+live_frac=1;终态双 superblock CRC 正确、50 万 trailer 全扫通过、flags 全零、
+度分布 4/58/64(min/p50/max)。**P2 回收链路在多行页几何下正确。**
+(全主维 pd128 也做了 100k 两轮探针,严格复用无崩。)
+
+### 17.4 Phase C 执行参数(deep10m 主战役)
+
+- 建图:1M 60.7s ⇒ 10M 预算 10–15 分钟;索引 40.96GB + 等大对齐临时文件,
+  scratch 预留 ≥100GB;
+- **RAM-cap 设计**:cache_cap_pages 现默认 1,048,576 页(4GiB)且 bench 未暴露;
+  eval 读 O_DIRECT 绕页缓存,但 update 搜索 buffered pread 占页缓存,churn 还把
+  base 全量读进匿名内存(deep10m 3.84GB)——**RAM 扫描前置改造:base 改
+  mmap/窗口读、暴露 --cache_cap_pages**;外层 cgroup v2 memory.max +
+  memory.swap.max=0,扫 4/8/16/32GiB,记录 anon/file、refault、PSI、io.stat;
+- v2 迁移一次,各 cell reflink 克隆;
+- Python 前端(Index.fit)仍有 raw_dim≥128 与 main_dim 2 次幂两道闸,bench 之外
+  用到时需同步放开(记入 D 线依赖重构)。
+
+### 17.5 T8 落地:RAM-cap 前置改造完成,cgroup 试跑被容器权限阻塞(2026-07-12,max 档,commit 343e173)
+
+§17.4 的两项前置全部落地,bench 更新模式(insert/churn/mixed)具备 RAM 扫描效度:
+
+- **base 改 mmap**:`MappedFloatMatrix`(bench-only 头,PROT_READ+MAP_PRIVATE+
+  MADV_SEQUENTIAL,顺序批完成后对整页窗口 MADV_DONTNEED;--shuffle_seed 下访问
+  乱序,跳过主动丢页,交内核回收)。base 从匿名 vector 变 file-backed 可回收页;
+  build 模式保持全内存(随机访问,不在扫描范围)。峰值 RssAnon −693MiB
+  (payload 本身 488MiB)。
+- **--cache_cap_pages 暴露**(0=默认 1,048,576 页;low 水位=库内既有 high/2),
+  churn 轮行输出 `pool_pages` 供扫描核对。cap=65536(256MiB)实测三轮
+  pool_pages≤high ✓。显式 cap 时 bench 切 RAM-scan 分配器体制(capped flush 后
+  malloc_trim + 小 trim/top-pad;consolidate/garden 相位边界水位执行);cap=0
+  旧路径逐字节不变。
+- **行为不变性**:§16 同配置 500k×10 轮,r10 recall 改造前后 −0.012pp
+  (门 ±0.05pp),复拍 +0.002pp;free_fills/evictions 计数吻合。ctest -R laser
+  14/14(新增 mmap 三测 + cap 透传测)。
+
+**已知边界(Phase C 设计输入):**
+
+1. **maintenance 相位内部峰值不受池 cap 约束**:cap=256MiB 下峰值 RssAnon 仍
+   6.27GiB——consolidate/garden 单次调用内部触页在相位边界 enforcement 之前。
+   ⇒ 4GiB cell 定位为 OOM 边界探针而非可行点;若要求全程 hard-cap,需
+   consolidate/garden 按行区间分块(挂 P3b 邻项,本次不做)。
+2. **capped 吞吐代价**:256MiB 池插入 2.8k/s vs 默认池 31.7k/s(×11)——扫描
+   cell 的时间预算按此放大。
+3. **本容器无法建 cgroup cell**:PID 1=tini 无 systemd bus、cgroup2 只读挂载、
+   无 CAP_SYS_ADMIN,sudo 也无济于事。委托环境一键脚本
+   `data/laser-update/ramcap-prep/run_delegated_cgroup_trial.sh` 已备;
+   **候选宿主:g03**(稳定性对照战役已在其上跑通;数据须搬其本地盘)。
+   不限内存 anon 峰值 6.27GiB ⇒ delegated preflight 从 8GiB 起步,向下探 7/6。
+4. 建议 cell 表(MemoryMax × cache_cap_pages)与逐 cell 记录项
+   (memory.events/stat、workingset_refault_file、PSI、io.stat)见
+   `data/laser-update/ramcap-prep/final_report.md`。
+
+插入吞吐参考值注意:mmap 化后 bench 的 insert/s 基线整体与旧二进制不可比
+(单轮带宽本就 30–38k/s 摆动,且冻结二进制协议本禁止跨二进制比吞吐);recall
+不变性是唯一门槛,已过。
+
+## 18. D1 判决:高维设计点成立,GIST 主臂 main_dim=512;多扇区页全档点火(2026-07-12,max 档,GIST1M 960d)
+
+数据:GIST1M(1M×960d,ann-benchmarks 全量精确 GT-100,`data/gist-fbin/`)。
+四臂 main_dim ∈ {960 全主维, 512, 256, 128},R64/L200,外部 PCA(D0 工具链,
+250k 训练样本 IncrementalPCA,方差降序,单一正交基四臂共用)。产物
+`data/laser-update/gist-scout/`(static_recall/geometry/build_summary/churn_smoke/
+pca_variance_summary/embedding_candidates.csv + final_report.md)。**零仓库补丁。**
+
+### 18.1 main_dim 档位扫描:残差切分在高维进入设计甜点
+
+| main_dim | 主维方差 | ef60 | ef100 | ef200 | 页 | 1M 索引 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 960(全主维) | 100% | 0.9158 | 0.9510 | **0.9780** | 16KiB | 16.38GB |
+| **512(主臂)** | **98.34%** | 0.8909 | 0.9391 | **0.9740** | **12KiB** | **12.29GB** |
+| 256 | 93.58% | 0.8610 | 0.9169 | 0.9647 | 8KiB | 8.19GB |
+| 128 | 86.40% | 0.8052 | 0.8793 | 0.9462 | 8KiB | 8.19GB |
+
+(recall@10,3 跑均值;SD ≤0.4pp,ef200 全臂 ≤0.12pp。)
+
+**裁决:主臂 main_dim=512**——ef200 距全主维仅 −0.403pp,索引/每跳页省 25%。
+与 96d 判决(§17)的对照叙事:DEEP96 残差 32 维承载 10.33% 方差 ⇒ ef100 塌
+6.85pp,必须全主维;GIST960 残差 448 维只承载 1.66% ⇒ ef200 仅 −0.40pp,跨过
+16→12KiB 页档。**PCA 主/残差切分正是为高维设计的,96d"全主维更好"是低维特例
+(证实用户定位校正)。**选档经验规则:主维解释方差 ≥98% 处切。pd128 与 pd256
+同页大小、质量更差、QPS 无优势=严格劣化点,弃。ef60/100 档 512 还差 2.7/1.2pp,
+残差不是免费——headline 用 ef200,ef100 留吞吐膝点。
+
+### 18.2 多扇区页几何:四档全点火
+
+node_len 5,888–13,056B,npp=1,page_size ∈ {8192, 12288, 16384}B,P2 trailer
+余量 1,276–3,324B 全正;v1 header/node_len/npp/file_size 与 stat 逐字节相等,
+build/eval/churn 全链路无断言/错址/短读。**LASER 行几何在 node_len>4KiB 的
+多扇区页(含非 2 幂 12KiB 三扇区页)下结构完好。**
+
+### 18.3 500k pd512 回收 churn:P2 首次多扇区实测通过
+
+5×20k reuse churn(§16 缩配,garden f.20/ef200/泵4,ef_insert200):freed=reused
+=20k/轮、file_pages 恒 500k、live_frac=1;终态文件字节精确、双 superblock CRC
+正确、50 万 trailer 全扫 flags 全零、degree 1/56/64(min/p50/max)。recall
+0.9533→0.9433(5 轮 −1.00pp,无单调崩塌但比 SIFT 同协议陡)——高维维护深度
+(garden/ef_insert 剂量)是 Phase C 正式战役的调参课题。插入 16.9k/s
+(SIFT 同配方 ~38k/s 的 0.44×);**caveat:round1 后 pool_pages=500k=整索引驻池,
+后四轮属驻留池逻辑成本,不可冒充冷 NVMe 稳态**(正式战役配 RAM-cap,T8 已备)。
+
+### 18.4 行内码免费距离信号:相对收益随维度放大(定量线索)
+
+五轮 3.04M 次满行 evict 决策,行内 FastScan 估距拒绝 51.2%(逐轮 41%→56%),
+按逻辑页避免 ~17.8GiB 写候选流量;exact-evict 对照的逻辑读上界 2,224.8GiB
+(3.04M×64 邻×12KiB)+960d 精确 L2。页 4→12KiB、精确距离 128→960d 都推高
+exact 成本,行内信号零额外页 I/O。Phase C 待加 `evict_scan_ns` 计时器 +
+5% exact 抽检遥测,把决策计数拆成 CPU/缓存命中/真实避免 I/O。
+
+### 18.5 Phase C 战役参数(高维第一梯队)
+
+- **GIST 正式 cell**:pd512 主臂,ef200 headline + ef100 膝点;churn 500k+10×50k
+  100% 唯一换血,identity+3 tail-shuffle seeds(§16 口径,GT source-id 重标);
+  全主维 960 只留静态 oracle,pd256 留 8KiB 容量控制腿;GIST1M 只够一次 100%
+  换血,300% 战役上更大嵌入集。
+- **bench 缺口:do_churn 只取 --efs 首项**——正式战役要同一 checkpoint 双 ef
+  读出,避免为不同 ef 重跑更新轨迹(排 E2 小改,round 行格式保持兼容)。
+- **RAM-cap cell 按页大小换算**:pd512 页 12KiB ⇒ 默认池 cap 1,048,576 页=
+  12GiB high/6GiB low(非 SIFT 的 4/2GiB);cgroup 4/8/16/32GiB 起跑池档
+  65,536/131,072/262,144/524,288 页。
+- **AIO 配额协调必须覆盖 build**:48T QGBuilder 注册 49,152 aio 事件,与并行
+  churn(32,768)相加超 fs.aio-max-nr=65,536 ⇒ io_setup EAGAIN(D1 实测两次,
+  等待重试原参数全过)。Phase C 驱动脚本用全局锁串行化 build/eval/churn 的
+  AIO 重段。
+- **嵌入集清单(核对过行数/体积/license,均无 GT,须自造:1k 查询 holdout+
+  精确 top-100,注意归一化口径)**:768d 首选 Qdrant gte-multilingual-ads-1M
+  (1.008M 行,2.98GB 单 parquet,原生 f32,Apache-2.0);1536d 首选
+  Qdrant/dbpedia-entities-openai3-text-embedding-3-large-1536-1M(1M 行,
+  9.55GB 26 shards,f64,MIT);1024d 备选 dbpedia-openai-1024d(8.7GB,
+  license 未标)或 BGE-m3(19.4GB 下载,dense 仅 4.1GB)。首轮 main_dim 臂:
+  768→{512,全};1024→{512,全};1536→{1024,全};加档按"主维方差 ≥98%"规则。
+- **I/O 形态对比 SIFT128**:pd512 每跳 3× 字节,静态 QPS 64–69%(非线性跌,
+  AIO 并发/CPU 仍占大头);consolidate/garden ~6.7/6.3s(SIFT ~4/2.8s,批量
+  不同只作量级对照)。
+
+方法论记录:T8 与 D1 共享 worktree/build 并行,bench 中途重链(pd960/pd256 与
+pd512/pd128/churn 二进制不同,身份存 binary_identity.csv)——T8 的差异仅更新
+模式 mmap/cap 旋钮且本次未传 cap,build/eval 函数未改,判决不受影响;但重申
+冻结二进制纪律:正式战役每 cell 锚定单一 md5。
+
+## 19. E3 判决:GIST 旗舰 cell——顺序稳健性成立,静态终态门失败 −2.3~−3.3pp(2026-07-12,4 seeds,冻结 bench b24a0f6c)
+
+Cell:GIST1M pd512(§18 主臂),identity + tail-shuffle {20260712,42,7},每臂
+500k build(共享 build 克隆)+ 10×50k 回收 churn(100% 唯一换血,§16 配方:
+reuse/r_target56/garden f.20-ef200-pump4/ef_insert200/32T),--efs 200,100 双读出
+(E2)。静态终态参照=同人口([500k,1M) 重标)独立重建,GT 过滤断言全过(暴力
+fallback 0)。产物 data/laser-update/gist-battery/。
+
+### 19.1 顺序稳健性:成立(§16 跨数据集复核)
+
+r10 终点跨 4 seed:ef200 0.9553±0.0015(极差 0.30pp),ef100 0.9216±0.0022
+(极差 0.50pp);三条随机序在两个 ef 档全部 ≥ identity(ef200 +0.03/+0.30/+0.22pp)。
+**随机序仍优于顺序序,顺序效应与下述缺口无关。**不扩 5 seeds(缺口远离边缘,
+扩样无意义——E3 自报,采纳)。
+
+### 19.2 静态终态门:明确失败(高维维护质量缺口,Phase C 关键发现)
+
+| ef | churn r10(4 seed 均值) | 静态参照(3 跑) | 缺口 |
+|---:|---:|---:|---:|
+| 200 | 0.9553 | 0.9801±0.0004 | **−2.32~−2.62pp** |
+| 100 | 0.9216 | 0.9514±0.0004 | **−2.79~−3.29pp** |
+
+轨迹 r0 0.983 → r10 0.954(ef200),后段趋平(r8-r10 ≈0.954-0.956)——**有界
+收敛复现(平台存在),但平台位置距静态重建 ~2.5pp**,而 SIFT 同配方平台距门
+≤0.5pp。**SIFT 调好的维护剂量在 960d 顶不住:边质量欠账随维度放大**(与 D1
+冒烟 −0.2pp/轮预警、DiskANN 线 Oracle"深搜修边"结论同构)。E5 剂量前沿扫描
+在跑(ef_insert 400 / garden ef400 / f.40+pump8 / r_target48 四臂),判定缺口
+是剂量问题还是结构问题。
+
+### 19.3 pd256 容量腿与维护相位
+
+pd256 identity:r10 ef200 −0.85pp/ef100 −2.19pp 换页字节 −33.3%(4.10GB)、
+QPS +23~25%——8KiB 档可作容量选项,不替代旗舰。维护相位(pd512):插入
+18.0-18.8k/s(D1 17k 之上,无竞争 caveat),consolidate 8.1-8.6s、garden
+5.7-6.0s/轮;freed=reused=50k/轮全臂成立,file_pages 恒 500k,pool_pages r1 起
+=500k(**整索引驻池 caveat 持续:非冷盘稳态,RAM-cap 校正待委托宿主**)。
+P2 终态:双 superblock CRC 正确(gen 11/10),50 万 trailer flags 全零,degree
+1/57/64。
+
+### 19.4 执行账
+
+全程 AIO 全局锁(flock data/.aio.lock)覆盖 build/eval/churn,零 EAGAIN;
+bench 冻结 md5 b24a0f6c…(始末复核一致);文件系统无 FICLONE,reflink 回退
+字节克隆(只影响克隆耗时,不影响轨迹);31GB 中间产物删,5MB 审计件留。
+dbp1536 base=999k:未来 100% 正式 cell(500k+10×50k)差 1k 行,须补数据或
+明示缩配,不得默改(E3 自报,记档)。
+
+### 19.5 Phase C 收尾排期(E3 建议 + 编排裁决)
+
+1. **E5 维护剂量前沿**(在跑):收复 pp × 吞吐成本曲线,边际枯竭点;
+2. **E4 嵌入集选档**(在跑):gte768/dbp1536 各两臂静态 + 基线配方冒烟
+   (含 768d/512 零 slack 几何探雷、1536d 全主维 20KiB 五扇区页新领地);
+3. 正式嵌入 cell = E4 选档 × E5 剂量合流后定;
+4. RAM-cap 扫描:等委托 cgroup 宿主(候选 g03),按 §17.5/§18.5 cell 表执行,
+   用于校正驻池外推——**不能替代剂量缺口修复**。
+
+## 20. E5 判决:维护剂量前沿——ins400 收复 0.72pp 后边际枯竭,剩余 ~1.4-2pp 是结构缺口(2026-07-12,GIST pd512,冻结 bench b24a0f6c)
+
+E3 静态门缺口(§19.2)的剂量响应,identity 序,10×50k,静态参照复用
+0.980133/0.951367(PCA 底座 md5 与 E3 逐字节一致)。产物
+data/laser-update/gist-dosage/{rounds,frontier}.csv。
+
+### 20.1 质量/成本前沿
+
+| 臂 | 配方 | r10 ef200 | Δ静态门 | 收复 | insert/s | garden s/轮 | 总维护 s/轮 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| A | ins200 + gdn f.20/ef200/p4(E3 基线) | 0.9539 | −2.62pp | — | 18,817 | 5.7 | 16.4 |
+| B | **ins400**,gdn 同 A | 0.9611 | −1.90pp | **+0.72pp** | 12,291 | 5.9 | 18.9 |
+| C | ins400 + gdn **ef400** | 0.9598 | −2.03pp | +0.59pp | 12,297 | 8.3 | 21.1 |
+| D | ins400 + gdn ef400 **f.40/p8** | 0.9605 | −1.96pp | +0.66pp | 12,186 | 16.1 | 29.1 |
+| F | **ins600** + gdn ef600 f.40/p8 | 0.9663 | −1.38pp | +1.24pp | 9,586 | 20.1 | 34.3 |
+
+(ef100 同构:B +0.70pp,F 终点 0.9313 差门 −2.01pp。E=r_target48 臂按门控
+规则省略——B→C/C→D 均 <0.1pp。)
+
+**三条硬结论:**
+1. **插入深度是唯一稳定正杠杆**:ins 200→400 收复 0.72pp 换 −34.7% 插入吞吐;
+   但弹性低于 SIFT 先验(P1 +0.92pp,低 ~22%)——深搜的边际修复力随维度缩水;
+2. **garden 在高维近零效应**:搜索深度翻倍 −0.13pp,覆盖率+泵翻倍 +0.07pp,
+   而 SIFT 短 churn 上 garden 值 +0.4pp——低入度刷新修不动 960d 的质量欠账
+   (被修节点的问题不在入度:E3/E5 终态 degree p50=60、max=64,入度不缺);
+3. **剂量天花板**:F(ins600,插入吞吐减半,维护 34s/轮)仍差门 1.38pp,
+   边际在 400 附近枯竭 ⇒ **剩余缺口是结构问题**。
+
+### 20.2 结构假设排序(E5 自报,采纳;判别实验=E6)
+
+1. **插入搜索经过已退化图的复利(最强)**:逐轮缓降轨迹 + 唯一有效杠杆是插入
+   深度,符合"深搜缓解但消不掉路径依赖";
+2. **headroom 再生不足(中)**:r_target=56 但终态 p50=60/max=64,8 槽余量被
+   快速回填;缺 r_target48 隔离臂(E 被门控省略);
+3. **splice 主维估距噪声(弱)**:主 512 维已 98.34% 方差,且 splice 候选 top-4
+   本就 raw 精排,机制上界小。
+
+判别路径(E6,等 E4 释放 bench 冻结后发):churn 评估按 truth 成员插入年龄
+分解 recall(base/本轮新插/1-3 轮/≥4 轮,附加行不动 round 行)——复刻
+DiskANN Fig13 成分分解方法论:各年龄同等落后 ⇒ 插入布线质量(复利);老龄
+显著更差 ⇒ 后插入侵蚀(evict/splice 撕旧边)。加 r_target48 隔离臂补 H2。
+
+### 20.3 论文口径落点(gap-12 素材)
+
+高维叙事从"单点配方"改为**显式前沿**:维护深度是随维度上升的成本旋钮,
+GIST960 上 0.72pp/34.7% 吞吐的兑换率 + 400 后枯竭 + 结构余量 ~1.4pp 待归因。
+P2/平台/复用全程健康(freed=reused、file_pages 恒、CRC/trailer 过)——缺口
+纯属图质量层,不是格式/回收层。
+
+## 21. E4 判决:嵌入集选档——gte448 反超全主维;两处工程暗礁引爆(零 slack 拒载 + pd2048 崩塌)(2026-07-12,冻结 bench b24a0f6c)
+
+数据:E1 备料的 gte768(1.007M×768)与 dbp1536(999k×1536),均单位范数。
+产物 data/laser-update/emb-scout/。
+
+### 21.1 关键工程发现:FHT padding 是"下一个 2 的幂"
+
+rotator 为 FHT,**padded_dim = next_pow2(main_dim)**(非仅 %64):448→512、
+768→1024、1536→2048。几何规划必须按 2 幂 padding 推 node_len。两个直接后果:
+
+- **零 slack 拒载(gte768 全灭)**:main448(pd512)node_len 恰 8192B、
+  main768(pd1024)恰 12288B——页选择给零 slack 页,P2 v2 要求 slack≥npp×4B,
+  QGUpdater 拒载(build/静态 eval 能跑,更新路径全废)。**W1 修复:页几何
+  预留 npp×4B**(在跑);
+- **pd2048 质量崩塌(疑似真 bug)**:dbp1536 全主维(pd2048,24KiB 六扇区页)
+  全链路零断言但 ef200 仅 0.3662,同数据 pd1024 臂 0.9949;GIST 960→pd1024
+  零填充 6.7% 无恙,量级不符合零填充退化——**W2 根因诊断**(在跑;层层剥离:
+  估距相关性→码/因子打包位宽→FHT 11 层→rerank)。
+
+### 21.2 静态选档
+
+| 数据集 | 臂 | pd | 主维方差 | ef200 recall | 几何 | 状态 |
+|---|---|---:|---:|---:|---|---|
+| gte768 | **main448** | 512 | **99.71%** | **0.98870** | node 8192(修后 12KiB 页) | W1 后即用 |
+| gte768 | 全主 768 | 1024 | 100% | 0.98637 | node 12288(修后 16KiB 页) | 对照 |
+| dbp1536 | **main1024** | 1024 | 96.89% | **0.99487** | node 15360→16KiB,slack 1024 | **即用旗舰** |
+| dbp1536 | 全主 1536 | 2048 | 100% | 0.36617 | node→24KiB 六扇区 | W2 诊断中 |
+
+**gte448 反超全主维 +0.233pp**——99.7% 方差集中下,512bit 高信噪码+rerank 兜底
+优于 1024bit 稀释码,**残差切分在 768d 比 GIST960 更甜**(设计论点再添一腿,
+方差集中度越高残差档越占优)。dbp1024 方差 96.89% 未达"≥98%"启发式但质量
+0.9949 说话 ⇒ **选档规则修订:主维方差 ≥98% 或实测 ef200 距最优可行臂 ≤0.5pp,
+以实测为准**;main1146(98% 切点,pd 仍 2048)是否补测取决于 W2。
+
+### 21.3 churn 冒烟(基线配方 5×20k,与 D1 同口径)
+
+| 档位 | ef200 斜率 | ef100 斜率 | 对照 D1 GIST(ef100 −0.200pp/轮) |
+|---|---:|---:|---|
+| gte main256(绕行臂,97.05% 方差) | −0.136pp/轮 | −0.218pp/轮 | 相当 |
+| **dbp main1024** | **−0.122pp/轮** | **−0.162pp/轮** | **最浅** |
+| dbp 全主 1536(失效档诊断读数) | −0.716 | −0.558 | 绝对质量不可比 |
+
+真嵌入(单位范数,内在维度低)churn 退化比 GIST 温和;E3/E5 的静态门缺口
+问题在嵌入正式 cell 上待复测(合流建议:只加 ins400 对照臂,若收复 <0.5pp
+即转查 headroom/splice,不再堆高剂量——E4 自报,采纳)。机械层:16KiB 与
+24KiB 页、npp=1 全链路零断言,freed=reused/file_pages 平台全成立。
+
+### 21.4 Phase C 嵌入正式 cell(W1/W2 后定稿)
+
+- gte768:main448(W1 解锁)10×50k ×2 seed + ins400 对照;
+- dbp1536:main1024 即可开跑;100% 换血 cell 差 1k 行(§19.4),用 9×50k+49k
+  明示缩配或补数;
+- 全主臂:gte768 留对照;dbp1536 全主/1146 等 W2 裁决。
+
+### 21.5 W1/W2 收口:两雷皆排,嵌入全臂解锁(2026-07-12,commits 8de2823 / 07355d4)
+
+**W1(零 slack,8de2823)**:`qg_page_geometry(node_len)` 成为几何唯一权威——
+恰满页预留 npp×4B(多行页缩 npp:2048B 行 npp2→1、1024B 行 npp4→3;单行页升
+一扇区:4096→8192、8192→12288、12288→16384),既有非零 slack 几何 12 例回归表
+逐字节不变;loader 以真校验取代 Release 空 assert,新旧 v1 几何双兼容(旧零
+slack 只读可载,v2 迁移仍明确拒)。gte768 main448 端到端解锁:100k 迁移+插入
++回收+checkpoint,eval ef200 0.9983。
+
+**W2(pd2048 崩塌,07355d4)**:根因=**FastScan uint16 累加器被按 int16 符号
+扩展**。累加器是非负 uint8 LUT 项的模和(accumulate 里的 sub_epi16 是高低字节
+车道校正,最终位模式=真和,真和 <65536 时精确);pd2048 典型和 36-40K 越过
+INT16_MAX,符号扩展 −65536、×2 后每距离偏 −131072 ⇒ "零断言的 0.37 recall"。
+pd≤1024 典型和 15-18K 未触雷(全部既有数据集无恙,A/B 证实 pd1024 不变)。
+修复=三路(AVX-512/AVX2/generic)零扩展;**只在读侧,盘上码无恙,存量 pd2048
+索引换二进制即愈**。dbp 8k A/B:main1146 ef200 0.397→1.000、main1536
+0.446→0.999。**效度域:真和 <65536;pd4096 稠密 LUT 需更宽累加器**(记档)。
+诊断链(FHT 正交性 8.4e-8 / 打包 SIMD==32 位标量参照 / 布局无窄类型截断 /
+换 eval 二进制即愈)在 data/laser-update/w2-pd2048/。
+
+**Phase C 影响**:dbp1536 全主维与 main1146(98% 方差切点)臂全部可行;
+嵌入正式 cell 不再有几何/量化拦路虎。附注:8de2823 的 +109 行 updater 测试
+含 W2 的 pd1024/2048 pack round-trip(并行任务共树,提交归属混批,记录在案)。
+
+### 21.6 E7 判决:RAM-cap 预飞通过(g03 委托 cgroup),最小可行 8GiB,夹住后零可测退化(2026-07-12)
+
+g03 探明可用(systemd PID1,user scope memory.max/swap.max 实测精确生效,
+/md1 22T,空转)。500k SIFT §16 缩配 3 轮 churn,冻结二进制 bench_frozen_w1w2
+(md5 d791…,含 W1+W2),数据全部 g03 本地 /md1。产物 data/laser-update/ramcap-g03/。
+
+| MemoryMax | 池档 | 结果 |
+|---:|---|---|
+| 不限 | 0 / 65k | 通过(对照) |
+| **8GiB** | 65k / 131k | **通过** |
+| 6GiB | 65k | 第 2 轮 insert OOM |
+| 4 / 2GiB | 65k | 第 1 轮 insert OOM |
+
+- **8GiB/65k vs 不限/65k:recall +0.02pp、吞吐 +2.16%——页缓存被夹住后零可测
+  退化**;refault 174k 次、full PSI 185ms(131k 池:refault 89k/PSI 168ms,
+  池越大 refault 越少,机制方向正确);
+- OOM 地板=insert/maintenance 匿名峰值(T8 §17.5 已知边界的实测确认),
+  不是页缓存——mmap base(file 页可回收)按设计工作;
+- 池压到 65k 的代价与 T8 一致(−88.3% 插入吞吐,malloc_trim 体制);
+- g03 限制:io controller 未委托 ⇒ 无 scope io.stat,退化用 /proc/<pid>/io;
+- **E8 已发**:deep10m(41GB 索引)正式扫描,g03 本地 build,粗轴
+  不限/32/16/8/4GiB × 池档,3 轮 cell,预算 7-12h——"索引 5× 于 RAM"的
+  堵缓存玩具主战役。
+
+## 22. E6 判决:结构缺口归因=侵蚀,不是复利(2026-07-12,max 档,年龄分解三臂,冻结 bench bcaca692)
+
+方法:churn masked recall 按 truth 成员插入年龄四桶分解(base/fresh/mid/old,
+bench 5a18ea6,round 行不动)——DiskANN Fig13 成分分解方法论移植。三臂
+(GIST pd512,identity,10×50k):A′=ins200 基线、B′=ins400、E′=ins400+garden
+ef400+r_target48(H2 隔离)。产物 data/laser-update/gist-age/。
+
+### 22.1 r10 年龄谱(ef200)
+
+| 臂 | total | fresh(n=991) | mid(n=3016) | old(n=5993) | old−fresh |
+|---|---:|---:|---:|---:|---:|
+| A′ ins200 | 0.9529 | **0.9798** | 0.9731 | 0.9383 | **−4.16pp** |
+| B′ ins400 | 0.9621 | **0.9889** | 0.9808 | 0.9483 | −4.06pp |
+| E′ +r48/gdn400 | 0.9600 | 0.9839 | 0.9801 | 0.9459 | −3.79pp |
+
+**判决:**
+1. **H1 复利反证**:fresh 桶 ≈ 静态水平(0.9798-0.9889 vs 静态 0.9801)且轨迹
+   零衰减(OLS +0.011~+0.022pp/轮)——第 10 轮的新插入布线与第 1 轮一样好,
+   "插入搜索经过退化图产生复利"不成立(至多次级交互);
+2. **侵蚀实锤**:old−fresh 从 r5 −1.40pp 扩到 r10 −4.16pp,base 幸存者早期
+   −0.69pp/轮——**节点入图后被后续更新逐步撕坏**(嫌疑机制:满行 evict 补丁
+   的破坏性替换、splice 重连质量);与 DiskANN Fig13 结构同形(老降新恒),
+   机制候选不同;
+3. **H2 headroom 反证**:E′ 对 B′ 全桶无改善(−0.5/−0.1/−0.2pp)——r_target48
+   +深 garden 不回收缺口,headroom 再生不是主因;
+4. ins400 的 +0.92pp 均匀惠及全桶(+0.91/+0.76/+1.00)=更好的候选发现,与侵蚀
+   正交——**这解释 E5 全部现象**:剂量改善插入侧(全桶平移),garden 修低入度
+   (错靶,侵蚀不表现为入度缺损),侵蚀本体无人管。
+
+(二进制账:E6 bench 含年龄分解,md5 bcaca692 与 E3/E5 不同;A′/B′ 总量与 E5
+同臂差 ±0.10pp,年龄裁决只用本次同二进制对照。)
+
+### 22.2 响应设计排序(E6 建议+编排裁决;E9 隔离矩阵先行)
+
+破坏者候选隔离(**E9,在跑**,B′ 底盘 + 年龄谱读数):
+- **X1 exact-evict**(零代码:Phase A 旧臂 --backlink exact):evict 决策换
+  精确距离——old 桶恢复 ⇒ 破坏者=行内估距误差驱动的错误驱逐。A7 判决(SIFT
+  128d 零增益)在 960d/pd512 残差几何下须重检:主维只覆盖 98.3% 方差,估距误差
+  比 128d 免 PCA 大一个量级;
+- **X2 no-splice**(小旋钮:consolidate 关 splice,死边留洞)——old 恢复 ⇒
+  破坏者=splice 重连质量;
+- **X3 evict 滞回**(小旋钮:替换需估距优势 > margin)——保护剂量-响应曲线。
+
+隔离后修复方向(按 E6 排序,待 X 矩阵定案):老边保护/驱逐滞回(限成熟节点
+单轮破坏预算)→ victim-directed repair(修被 tombstone/backlink/evict 触碰的行,
+替代低入度泛 garden)→ 破坏性补丁前 raw 距复核。
+
+## 23. E9 判决:三嫌全无罪——侵蚀不在受害者误选/splice/驱逐总量(2026-07-12,max 档,冻结 bench c458f737)
+
+B′ 底盘(ins400)三隔离臂 + 年龄谱,产物 data/laser-update/gist-destroyer/,
+诊断旋钮入库 fd64a13(evict_margin/splice_enabled,默认零行为变化)。
+
+### 23.1 r10 年龄谱矩阵(ef200;fresh/mid/old n=991/3016/5993)
+
+| 臂 | total | fresh | old | old−fresh | old vs B′ |
+|---|---:|---:|---:|---:|---:|
+| B′ 对照 | 0.9628 | 0.9869 | 0.9484 | −3.84pp | — |
+| X1 exact-evict | 0.9610 | 0.9869 | 0.9479 | −3.89pp | **−0.05pp** |
+| X2 no-splice | 0.9605 | 0.9849 | 0.9461 | −3.88pp | **−0.23pp** |
+| X3 滞回 τ=.05 | 0.9619 | 0.9889 | 0.9489 | −4.00pp | **+0.05pp** |
+| X3 τ=.10(驱逐 −37%) | 0.9593 | 0.9828 | 0.9478 | −3.51pp | −0.07pp |
+
+**裁决:**
+1. **估距误选无罪**:精确距离驱逐决策 old 桶 −0.05pp——A7 的 SIFT 零增益判决
+   在 960d/pd512 复核成立(行内码估距质量足够,即便主维只 98.3% 方差);
+2. **splice 无罪**:关掉重连 old 桶反而 −0.23pp(splice 略有正贡献);
+3. **驱逐总量无罪**:滞回减 21%/37% 驱逐,old 桶 ±0.07pp 无剂量响应
+   (τ=.10 的 old−fresh 收窄是 fresh 掉 0.4pp 的假象,total 损 0.35-0.49pp);
+   滞回作为修复方向废弃。
+
+### 23.2 剩余主嫌(E10 定罪试验在跑)
+
+- **H-garden**:每轮 lowdeg 全行重写 ~90k 行,**全部历史臂从未关过 garden**;
+  同分 PID 序+槽复用可能年龄偏置重复受害;重写经当前图搜索,质量可能低于原
+  布线 ⇒ E10 三臂:garden-off / 等预算 random-garden(分离选择偏置 vs 重写
+  本身)/ fill-only(τ→∞ 终点排除);
+- **H-patch**:backlink 补丁 fill+evict 共同写行路径在 pd512+res448 几何下的
+  静默损伤(W2 前科;损伤∝接收补丁次数∝年龄;X3 减 37% 驱逐无效 ⇒ 若存在
+  必在共同路径)⇒ E10 性质测试:该几何 patch==整行重算逐槽 byte 审计 +
+  未触碰槽 hash + 单/多线程末态页 hash。
+
+方法论注:E9 让"驱逐撕好边"这个直觉假设在两个正交维度(选择质量、总量)上
+同时被证伪——年龄谱是比 total recall 强得多的判别工具,后续维护机制评审一律
+带年龄谱读数。
+
+## 24. E10 判决:第二轮两嫌也无罪——garden 净保护 +0.75pp,补丁路径逐位干净;主假设收敛"邻域机会主义稀释"(2026-07-12,max 档)
+
+三臂(B′ 底盘)+ pd512 性质审计,产物 data/laser-update/gist-eroder2/,
+审计测试入库 b09f36d。
+
+### 24.1 定罪试验(r10,ef200)
+
+| 臂 | total | fresh | old | old vs B′ |
+|---|---:|---:|---:|---:|
+| B′(garden lowdeg f.20) | 0.9628 | 0.9869 | 0.9484 | — |
+| G0 garden-off | 0.9571 | 0.9869 | 0.9409 | **−0.75pp** |
+| GR random-garden 等预算 | 0.9499 | 0.9818 | 0.9351 | **−1.33pp** |
+| FO fill-only(零驱逐) | 0.9190 | **0.7296** | 0.9554 | +0.70pp |
+
+1. **garden 无罪且净保护**:关掉 old 掉 0.75pp——garden 的全行重写(u 视角
+   重搜+重剪)在补多样性,E5 的"剂量零响应"是饱和不是无用;
+2. **lowdeg 选靶是必要成分**:random 等预算更糟(−1.33pp)——泛重写有害,
+   选靶信号有真实价值;
+3. **FO 反向定理:新节点需要破坏性 backlink 安置**——纯填充下 fresh 崩至
+   0.73(驱逐压力=新节点入图质量的来源),old 仅 +0.70pp ⇒ 驱逐对老节点
+   代价远小于缺口,E9 赦免维持;
+4. **补丁完整性逐位干净**:pd512+res448 性质审计(1,575 补丁行 vs 整行重算
+   byte 一致、83,910 未触碰槽 hash 稳、res448 保留、串行/32T 末态 2,432 页
+   hash 全同、3/3 重复)——H-patch 排除,该几何写行路径无 W2 级损伤。
+
+### 24.2 五嫌全排除后的主假设:邻域机会主义稀释(E11 验证在跑)
+
+老节点 build 期 RobustPrune 多样化邻域,随原始邻居死亡被 purge,替换为
+"碰巧到达"的 backlink/splice 边——**度数不缺(p50=60)但遮挡多样性退化**,
+recall 随邻域换血比例(∝年龄)下滑。一并解释:garden 重写为何保护(重建
+多样性)、lowdeg 靶为何饱和(侵蚀不表现为低入度)、五个触碰/写坏类假设为何
+全无罪(问题在边的来源结构)。**E11:每行邻域周转计数器 + garden kTurnover
+靶向 policy,等预算 A/B——T1 old ≥ B′+1pp 即假设成立且修复方向在手**(即
+victim-directed repair 的一个有原则的受害者信号:边周转量,非低入度、非被写)。
+
+## 25. E11 判决:turnover 靶向=反靶,高周转行是路由骨干;侵蚀定性为"有界内在维护成本",机制深挖暂停(2026-07-12,max 档,实现入库 099dad8)
+
+### 25.1 A/B 结果(r10,ef200;靶向遥测:被选行周转 1.895× 全体=信号确实咬中)
+
+| 臂 | total | old | old vs B′ |
+|---|---:|---:|---:|
+| B′ lowdeg f.20 | 0.9617 | 0.9471 | — |
+| T1 kTurnover f.20 等预算 | 0.9115 | 0.8930 | **−5.41pp** |
+| T2 kTurnover f.40 | 0.8970 | 0.8830 | **−6.41pp(负剂量响应)** |
+
+**机会主义稀释假设按预注册标准不成立,降权。**反向机制浮出:r10 入度 p50 从
+34(B′)掉到 25/24(T1/T2)——**高周转行是路由骨干(hub),其"碰巧积累"的
+边是承重结构;整行 RobustPrune 重写(α 遮挡剪枝)恰好拆掉导航冗余**。泛重写
+有害(E10 GR)、hub 重写更有害(E11)、lowdeg 温和重写有益(E10 G0)——
+维护重写必须 hub 规避,这是新的一般性观察。生产配置维持 lowdeg f.20;
+kTurnover 保留为诊断仪器(默认关)。
+
+### 25.2 侵蚀问题阶段性定案(§19-25 侦查链收束)
+
+六轮实验(剂量前沿/年龄归因/三嫌隔离/两嫌定罪/反修复)后的定性:GIST 960d
+100% 换血下,残余 ~1.9pp(B′ 口径,ef200 0.962 vs 静态 0.980)的老节点侵蚀是
+**有界(平台化)、插入深度可调(0.72pp/35% 吞吐兑换)、且不可归因于任何单一
+可修缺陷的内在维护成本**。正面资产:插入路径健康(fresh≈静态、零轮衰)、
+garden lowdeg +0.75pp 保护、驱逐压力是新节点质量来源(FO 反向定理)、补丁
+路径逐位干净、hub 敏感性。
+**论文口径(gap-12 最终形)**:显式前沿曲线 + 年龄谱法证归因 + 有界衰减定理
++ hub-aware 维护红线——比"单点配方达标"强得多的一章。
+未竟探针(记档待续,不阻塞 Phase C):incoming-route diversity(选择器与修复
+算子分离:diverse pump only / degree-floor rewrite / hub 白名单)。
+
+### 25.3 方法论沉淀
+
+- 年龄谱(round_age)是维护机制评审的标准判别读数(E9-E11 三轮定罪全靠它);
+- 预注册裁决标准("old ≥ 对照+1pp 才算成立")防止把噪声当机制;
+- 负结果三连(滞回/随机重写/turnover 靶向)都带反向定理,负结果≠零信息。
+
+## 26. E8 判决:deep10m RAM-cap 曲面——页缓存侧 20× out-of-core 成立,匿名墙=maintenance 趟内驻留 2.2× 索引(2026-07-12,g03,14 cells)
+
+Cell:deep10m(10M×96d 全主维 pd128,索引 41GB),g03 本地 build+v2 迁移一次、
+每 cell 字节克隆,基线配方(ins200/garden f.20)3 轮 churn,--efs 100,200,
+冻结 bench d791…(W1+W2)。产物 data/laser-update/ramcap-deep10m/。
+14 cells:7 PASS / 7 OOM。
+
+### 26.1 双面判决
+
+**页缓存侧(核心正结论):92GiB/131k 池 vs 不限/同池——ef100 recall −0.014pp、
+插入吞吐保 97.8%、全程吞吐保 76.9%,refault 35.68M、PSI 18.84s。**匿名占
+~90GiB 后,41GB 索引实际运行在 ~2GiB 有效页缓存上 = **I/O 路径 20× 超订仍
+质量无损**;128→92GiB 区间 refault/PSI 平滑退化,无质量悬崖——"堵缓存玩具"
+的核心证据成立。
+
+**匿名墙(量化的工程债):最小可行 92GiB,88GiB round1 insert OOM。**根因=
+maintenance 匿名峰值 ~89.8GiB(≈2.2× 索引),不是索引页缓存。机制:池水位
+enforcement 只在相位边界(T8 §17.5 已知边界),consolidate/garden 单趟触遍
+全索引 ⇒ 趟内池无界膨胀到 O(index)。500k 时 6.27GiB 无害,10M 放大成墙。
+
+### 26.2 修复路径(E13,排队)
+
+**趟内水位驱逐**:consolidate/garden 循环内池超 high 即 evict(而非趟尾)。
+预期把匿名地板从 2.2× 索引压到 池 cap+O(batch) ⇒ 8-16GiB cell 对 41GB 索引
+可行,out-of-core 叙事全线诚实。E12(嵌入战役)释放构建树后实施+g03 复扫
+8/16/32GiB 档。
+
+### 26.3 执行账
+
+g03 本地 build+迁移+克隆;v1 build 与 v2 pristine 保留在 g03 供复扫;结果收回
+NFS。全程无源码/仓库改动。
+
+## 27. E12 判决:嵌入正式战役——缺口收窄至 −1.2~−1.7pp,年龄谱与 GIST 反相:嵌入的病是插入欠账,不是老化侵蚀(2026-07-12,冻结 bench 0792840f)
+
+四臂(gte448/dbp1024 × ins200/ins400,identity,10 轮,dbp 明示缩配 49.9k/轮)
++ 双静态终态门 + 年龄谱。产物 data/laser-update/emb-battery/。
+
+### 27.1 静态门与弹性
+
+| 数据集 | 臂 | r10 ef200/100 | 静态缺口 ef200/100 |
+|---|---|---:|---:|
+| gte448 | i200 | 0.9705 / 0.9596 | −1.71 / −2.55pp |
+| gte448 | **i400** | 0.9739 / 0.9708 | **−1.37 / −1.43pp** |
+| dbp1024 | i200 | 0.9799 / 0.9734 | −1.49 / −1.73pp |
+| dbp1024 | **i400** | 0.9831 / 0.9767 | **−1.17 / −1.40pp** |
+
+全部小于 GIST 同档(i200 −2.6/i400 −1.9pp)——**LASER 主场(真嵌入,单位范数)
+上 churn 质量保持显著好于 GIST 最难況**。弹性 i200→400:gte +0.34/dbp +0.32pp
+(GIST +0.72),吞吐代价 −30.8%/−19.0%;**caveat:弹性量级≈顺序误差棒
+(~0.3pp),精确弹性主张需 paired tail-shuffle 误差棒**(定性结论不受影响)。
+
+### 27.2 年龄谱反相:失效模式是数据集依赖的(论文级发现)
+
+四臂全部 **fresh < old**(gte i200 old−fresh **+4.83pp**,i400 +1.18;dbp
++0.95/+0.40)——与 GIST(old−fresh −3.8~−4.2pp,老化侵蚀)**完全反相**:
+- **嵌入模式=插入欠账**:新节点布线不足(fresh 距静态 1.55-5.77pp),随年龄
+  接收 backlink 反而变好(机会主义积累在嵌入几何下是净增益!)——插入深度
+  直接对症(i400 收窄 gte 4.83→1.18pp);
+- **GIST 模式=老化侵蚀**:fresh≈静态,old 随龄退化(§22-25 法证链);
+- 同一把年龄谱仪器诊断出两种病 ⇒ **"churn 质量缺口"不是单一现象,维护策略
+  应按失效模式选型**;E11 的 hub 重写反靶(GIST)与嵌入的"积累=增益"互为
+  印证:机会主义边的价值取决于数据几何。
+未竟探针(记档):嵌入侧 recency-targeted 轻修复(freshman boost——新插入
+下一轮回访补线;与 E11 反靶不同,靶向的是欠账新行而非承重 hub)。
+
+### 27.3 机械与配方定稿
+
+12KiB(pd512)/16KiB(pd1024)页大规模 churn 全链路零断言;freed=reused
+(500k/499k),file_pages 恒 500k;双数据集 i200 臂 P2 终态 CRC+trailer 全扫
+通过。gte 静态 GT 77 查询过滤存活 <10,全部单查询暴力重算(口径红线执行)。
+**配方定稿:ins400+garden lowdeg f.20=质量旗舰;ins200=吞吐档;不再堆插入
+剂量**(E12 自报,采纳)。
+
+## 28. E13 判决:maintenance 趟内水位驱逐——匿名墙拆除,41GB 索引 4GiB RAM 无损跑通(2026-07-13,冻结 bench a465888a,源码 6810f44)
+
+§26 遗留:池水位只在相位边界 enforce,consolidate/garden 单趟触遍全索引 ⇒
+趟内池膨胀 O(index)(deep10m 匿名峰 ~89.8GiB ≈ 2.2× 索引),RAM-cap 地板卡在
+92GiB。E13 в consolidate/garden/rebuild_free_chain 的**页批次之间**加
+high→low 驱逐:每 `maintenance_evict_stride`(默认 4096,0=旧语义)页,工作
+队整体退出并行区与页 latch,`flush_dirty()`(复用 P3a seqlock 写回)+
+`evict_clean(cap/2)`。守卫 `cache_cap_pages < file_pages()`:只在 out-of-core
+域生效,in-core 保持原单趟快路零开销。
+
+### 28.1 g03 deep10m 六格矩阵:全 PASS,地板 92GiB → ≤4GiB(≥23×)
+
+41GB 索引、3×50k churn(consolidate+garden 全开)、E8 同配方同母本:
+
+| cell | r3 ef100 | Δ vs E8 不限 | 峰值 RssAnon | run_s | 读放大 | insert qps |
+|---|---:|---:|---:|---:|---:|---:|
+| 32GiB/131k | 0.97530 | +0.005pp | 2.96GiB | 1,264 | 1.35TiB | 1,680 |
+| 16GiB/131k | 0.97495 | −0.030pp | 2.95GiB | 2,292 | 2.73TiB | 1,309 |
+| 8GiB/131k | 0.97499 | −0.026pp | 2.95GiB | 2,679 | 3.04TiB | 1,199 |
+| 8GiB/65k | 0.97523 | −0.002pp | 2.58GiB | 2,666 | 3.01TiB | 1,195 |
+| 6GiB/65k | 0.97564 | +0.039pp | 2.58GiB | 2,922 | 3.13TiB | 1,212 |
+| **4GiB/65k** | **0.97518** | **−0.007pp** | **2.58GiB** | 3,149 | 3.33TiB | 1,148 |
+
+E8 同六格全部 round1 OOM。判决:(a) **匿名峰与 MemoryMax 完全解耦**(池峰 =
+cap + ~40k/22k 页软超冲,与插入路径同语义);(b) **recall 无损**(带宽
+−0.030~+0.039pp,65k 池反而略优);(c) **退化平滑无悬崖**:32→4GiB 端到端
+2.49×、refault 337M→866M、PSI some 237→427s——瓶颈已从"匿名 OOM 悬崖"转为
+"refault/读放大成本曲线"(后续优化点:低水位策略/维护访问局部性,不属 E13
+功能边界)。头版:**41GB deep10m 在 4GiB cgroup 内完成三轮 churn,r3 ef100
+0.97518,差不限 RAM 对照 −0.007pp。**
+
+### 28.2 本机不变性:位次效应实证 + 去偏后入门
+
+500k SIFT(in-pass 生效)+ GIST pd512 B′(A/A:两臂同走快路)paired,n=4:
+- 正序(control 先跑)SIFT Δr3 三次同号 −0.062/−0.063/−0.043pp,均值
+  −0.056pp,**边缘超 ±0.05pp 门 0.006pp**;
+- GIST **A/A 对照也三次同号 −0.040/−0.010/−0.060pp** ⇒ 位次效应假设;
+- **倒序平衡实验**(inpass 先跑):SIFT Δ 收窄至 −0.015pp,GIST A/A 翻正
+  +0.12pp——先跑者占优坐实(0.02~0.12pp,方向随臂序翻转);
+- 裁决:位次去偏 SIFT 真效应 **−0.036pp**、n=4 合并 −0.046pp,均入门;GIST
+  A/A 四次合并 +0.003pp≈0 证无路径外偏差;叠加 deep10m 端到端 ≤0.04pp,判
+  **不变性 PASS**(原始正序均值越界如实入档,归因位次效应,证据
+  `e13-inpass/local/adjudication.csv`)。
+方法论沉淀:**固定臂序的 paired A/B 有 ~0.02-0.1pp 位次偏差,精确到 0.05pp
+的门必须倒序平衡或随机化臂序**(E12 的 tail-shuffle 误差棒建议同源)。
+
+SIFT 峰值 RssAnon −77.7%(6.24→1.39GiB);维护时长 consolidate +39.6%/garden
++24.1%(SIFT,池压到 65536 时)。**默认值裁决:默认开(4096),明示偏离预注册
+"<5% 才默认开"规则**——守卫把代价严格限制在"不开则匿名 OOM"的 out-of-core
+域,in-core 零开销,安全优先,逃生口 stride=0。
+
+### 28.3 机械与事故
+
+单测:consolidate/garden 新旧路径终态**页哈希逐页一致** + 全程 pool_pages ≤
+cap(旧路径实证超 cap)+ cap≥file_pages 快路等价;Release laser ctest 14/14、
+TSan(setarch -R)4/4 双方独立跑绿;重编 bench md5 与冻结件一致(可复现)。
+事故两则:(a) codex 会话两次死于上游模型容量错误(39.9 万/102.6 万 token),
+第二程死前工作已全部落盘,orchestrator 接管收尾;(b) 首跑 g03 矩阵在编排会话
+死亡后,残留 ssh stdout 管道被 TCP 收尸 ⇒ 后续 tee 与 cap6g/cap4g inner 全
+SIGPIPE(141)——克隆/已跑 cell 无损,setsid 全脱管重跑一次通过。教训入库:
+**远端长任务的驱动脚本必须自带 setsid+/dev/null stdin+文件重定向,不得依赖
+launcher 的继承管道**(后台七坑新增变体)。

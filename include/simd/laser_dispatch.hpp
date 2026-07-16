@@ -124,7 +124,7 @@ inline void convert_accum_to_float_generic(size_t count,
                                            int32_t sumq,
                                            float *ALAYA_RESTRICT result_float) {
   for (size_t i = 0; i < count; ++i) {
-    result_float[i] = static_cast<float>((static_cast<int16_t>(result[i]) << 1) - sumq);
+    result_float[i] = static_cast<float>((static_cast<int32_t>(result[i]) * 2) - sumq);
   }
 }
 
@@ -261,19 +261,17 @@ inline void convert_accum_to_float_avx512(size_t count,
                                           const uint16_t *ALAYA_RESTRICT result,
                                           int32_t sumq,
                                           float *ALAYA_RESTRICT result_float) {
-  // FastScan accumulators are stored as uint16 but carry int16 bit patterns
-  // (the _mm*_sub_epi16 in accumulate_impl_* can produce negatives). The SIMD
-  // path uses _mm*_cvtepi16_epi32 to sign-extend; the scalar tail mirrors this
-  // via static_cast<int16_t> -- changing it to int32_t would zero-extend and
-  // diverge from the SIMD output.
+  // FastScan accumulates non-negative uint8 LUT entries. Zero-extend the
+  // uint16 sum: at pd=2048 a normal sum is around 32K and frequently crosses
+  // INT16_MAX, but is still a valid positive accumulator.
   const __m512i qq = _mm512_set1_epi32(sumq);
   size_t i = 0;
   const size_t simd_count = count - (count % 32);
   for (; i < simd_count; i += 32) {
     __m256i i16a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&result[i]));
     __m256i i16b = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&result[i + 16]));
-    __m512i i32a = _mm512_cvtepi16_epi32(i16a);
-    __m512i i32b = _mm512_cvtepi16_epi32(i16b);
+    __m512i i32a = _mm512_cvtepu16_epi32(i16a);
+    __m512i i32b = _mm512_cvtepu16_epi32(i16b);
 
     i32a = _mm512_sub_epi32(_mm512_slli_epi32(i32a, 1), qq);
     i32b = _mm512_sub_epi32(_mm512_slli_epi32(i32b, 1), qq);
@@ -281,7 +279,7 @@ inline void convert_accum_to_float_avx512(size_t count,
     _mm512_storeu_ps(&result_float[i + 16], _mm512_cvtepi32_ps(i32b));
   }
   for (; i < count; ++i) {
-    result_float[i] = static_cast<float>((static_cast<int16_t>(result[i]) << 1) - sumq);
+    result_float[i] = static_cast<float>((static_cast<int32_t>(result[i]) * 2) - sumq);
   }
 }
 
@@ -295,12 +293,12 @@ inline void convert_accum_to_float_avx2(size_t count,
   const size_t simd_count = count - (count % 8);
   for (; i < simd_count; i += 8) {
     __m128i i16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(&result[i]));
-    __m256i i32 = _mm256_cvtepi16_epi32(i16);
+    __m256i i32 = _mm256_cvtepu16_epi32(i16);
     i32 = _mm256_sub_epi32(_mm256_slli_epi32(i32, 1), qq);
     _mm256_storeu_ps(&result_float[i], _mm256_cvtepi32_ps(i32));
   }
   for (; i < count; ++i) {
-    result_float[i] = static_cast<float>((static_cast<int16_t>(result[i]) << 1) - sumq);
+    result_float[i] = static_cast<float>((static_cast<int32_t>(result[i]) * 2) - sumq);
   }
 }
 

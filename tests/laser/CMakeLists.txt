@@ -121,3 +121,62 @@ alaya_add_test(
   TARGET qg_naming_contract_test
   LABELS laser rabitq contract
 )
+
+# Streaming-update research prototype (qg_updater.hpp): patch primitives,
+# builder byte-equality, insert/tombstone end-to-end on a tiny index.
+alaya_cc_target(
+  test_qg_updater_unit
+  BARE GTEST
+  SRCS qg/test_qg_updater_unit.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_qg_updater_unit
+  TARGET test_qg_updater_unit
+  LABELS laser
+)
+
+# Residency seams behind UnifiedLaserSegment: prefetch budget default,
+# ResidencyProvider dispatch, ensure_resident_arena file materialization,
+# and the QGUpdater write_at -> arena mirror.
+alaya_cc_target(
+  test_unified_residency
+  BARE GTEST
+  SRCS qg/test_unified_residency.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_unified_residency
+  TARGET test_unified_residency
+  LABELS laser
+)
+
+# Bench-only fbin mmap view used by update modes under cgroup RAM caps.
+alaya_cc_target(
+  test_bench_laser_update_sift_support
+  BARE GTEST
+  SRCS test_bench_laser_update_sift_support.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_bench_laser_update_sift_support
+  TARGET test_bench_laser_update_sift_support
+  LABELS laser
+)
+
+# SIFT-scale update experiment harness (build / insert / delete / eval modes).
+# Not a ctest — run manually; see the usage string in the source.
+alaya_cc_target(
+  bench_laser_update_sift
+  BARE
+  SRCS bench_laser_update_sift.cpp bench_laser_oracles.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+# The vendored FFHT header contains non-inline helper definitions. Keep the
+# bench's split source files maintainable while compiling them as one translation
+# unit, as the original single-source target did.
+set_target_properties(bench_laser_update_sift PROPERTIES UNITY_BUILD ON)

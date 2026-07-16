@@ -7,12 +7,14 @@
 #include <omp.h>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cfloat>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -21,12 +23,14 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -50,6 +54,9 @@
 #include "index/graph/laser/utils/rotator.hpp"
 #include "platform/detect.hpp"
 #include "third_party/ngt/hashset.hpp"
+#include "utils/kernel_section_profile.hpp"
+#include "utils/memory.hpp"
+#include "utils/prefetch.hpp"
 
 namespace alaya::laser {
 /**
@@ -86,9 +93,147 @@ struct ClusterStats {
 };
 
 constexpr size_t kSectorLen = 4096;
+constexpr size_t kQGRowTrailerSize = 4;
+
+struct QGPageGeometry {
+  size_t node_per_page;
+  size_t page_size;
+};
+
+/** Derive page geometry for newly built indexes, reserving one v2 trailer per row. */
+// Loop-form row prefetch: the Duff-device helpers cap at 20 cache lines,
+// but an arena row is up to 120 lines (7,680 B at 768d).
+inline void prefetch_row_l1(const char *ptr, size_t num_lines) {
+  for (size_t i = 0; i < num_lines; ++i) {
+    ::alaya::prefetch_l1(ptr + i * 64);
+  }
+}
+
+inline void prefetch_row_l2(const char *ptr, size_t num_lines) {
+  for (size_t i = 0; i < num_lines; ++i) {
+    ::alaya::prefetch_l2(ptr + i * 64);
+  }
+}
+
+// Candidate-row prefetch depth for the resident-arena kernel, in 64B lines.
+// The memory QG kernel issues mem_prefetch_l2(next candidate, 10 lines) after
+// every pool insert; the arena kernel historically issued none, which showed
+// up as +19.5% LLC misses at the same ef. E1 (fullcache-adjudication 附4):
+// the win saturates at a fixed in-flight budget of ~20 lines (~1.3KB); short
+// rows want the whole row. Default = min(row_lines, 20); ALAYA_ARENA_PF_LINES
+// overrides (0 disables — A/B control).
+inline size_t arena_prefetch_default(size_t row_lines, long env_lines) {
+  if (env_lines >= 0) {
+    return static_cast<size_t>(env_lines);
+  }
+  constexpr size_t kBudgetLines = 20;
+  return std::min(row_lines, kBudgetLines);
+}
+
+inline size_t arena_prefetch_lines(size_t row_lines) {
+  static const long kEnvLines = [] {
+    const char *v = std::getenv("ALAYA_ARENA_PF_LINES");
+    return v == nullptr ? -1L : static_cast<long>(std::strtoul(v, nullptr, 10));
+  }();
+  return arena_prefetch_default(row_lines, kEnvLines);
+}
+
+inline QGPageGeometry qg_page_geometry(size_t node_len) {
+  if (node_len == 0) {
+    throw std::invalid_argument("qg_page_geometry: node_len must be > 0");
+  }
+  size_t node_per_page = std::max<size_t>(1, kSectorLen / node_len);
+  size_t page_size =
+      (node_per_page * node_len + kSectorLen - 1) / kSectorLen * kSectorLen;
+  while (node_per_page > 1 &&
+         page_size - node_per_page * node_len < node_per_page * kQGRowTrailerSize) {
+    --node_per_page;
+  }
+  if (node_per_page == 1 && page_size - node_len < kQGRowTrailerSize) {
+    page_size += kSectorLen;
+  }
+  return {node_per_page, page_size};
+}
+
+// LASER QG format-v2 metadata.  The two copies occupy [0, 512) and
+// [512, 1024) of the existing 4 KiB metadata sector.  The compatibility
+// fields let the ordinary read-only QG loader validate/open a
+// v2 file without changing any graph-search layout or addressing code.
+constexpr uint64_t kQGSuperblockMagic = 0x324751524553414cULL;  // "LASERQG2"
+constexpr uint32_t kQGFormatVersion = 2;
+constexpr size_t kQGSuperblockSize = 512;
+constexpr size_t kQGSuperblockCopies = 2;
+
+struct QGSuperblockV2 {
+  uint64_t magic = 0;
+  uint32_t format_version = 0;
+  uint32_t checksum = 0;
+  uint64_t generation = 0;
+  uint64_t num_points = 0;
+  uint64_t live_count = 0;
+  PID free_list_head = kPidMax;
+  uint32_t reserved0 = 0;
+  uint64_t free_count = 0;
+
+  // v1 loader metadata mirrored into the reserved portion of the 512-byte
+  // superblock. The required v2 fields above remain authoritative.
+  uint64_t entry_point = 0;
+  uint64_t dimension = 0;
+  uint64_t node_len = 0;
+  uint64_t node_per_page = 0;
+  uint64_t page_size = 0;
+  uint64_t file_size = 0;
+  std::array<uint8_t, 408> reserved{};
+};
+static_assert(sizeof(QGSuperblockV2) == kQGSuperblockSize);
+
+inline uint32_t qg_crc32(const void *data, size_t len) {
+  uint32_t crc = 0xffffffffU;
+  const auto *bytes = static_cast<const uint8_t *>(data);
+  for (size_t i = 0; i < len; ++i) {
+    crc ^= bytes[i];
+    for (int bit = 0; bit < 8; ++bit) {
+      crc = (crc >> 1U) ^ (0xedb88320U & (0U - (crc & 1U)));
+    }
+  }
+  return ~crc;
+}
+
+inline uint32_t qg_superblock_checksum(const QGSuperblockV2 &sb) {
+  QGSuperblockV2 copy = sb;
+  copy.checksum = 0;
+  return qg_crc32(&copy, sizeof(copy));
+}
+
+inline bool qg_superblock_valid(const QGSuperblockV2 &sb) {
+  return sb.magic == kQGSuperblockMagic && sb.format_version == kQGFormatVersion &&
+         sb.checksum == qg_superblock_checksum(sb);
+}
+
+// Returns 0 (A), 1 (B), or -1 when neither copy is valid.
+inline int select_qg_superblock(const char *header, QGSuperblockV2 &selected) {
+  QGSuperblockV2 copies[kQGSuperblockCopies];
+  std::memcpy(&copies[0], header, sizeof(QGSuperblockV2));
+  std::memcpy(&copies[1], header + kQGSuperblockSize, sizeof(QGSuperblockV2));
+  const bool valid_a = qg_superblock_valid(copies[0]);
+  const bool valid_b = qg_superblock_valid(copies[1]);
+  if (!valid_a && !valid_b) return -1;
+  const int slot = valid_b && (!valid_a || copies[1].generation > copies[0].generation) ? 1 : 0;
+  selected = copies[slot];
+  return slot;
+}
+
+inline bool qg_header_has_v2_magic(const char *header) {
+  uint64_t magic_a = 0;
+  uint64_t magic_b = 0;
+  std::memcpy(&magic_a, header, sizeof(magic_a));
+  std::memcpy(&magic_b, header + kQGSuperblockSize, sizeof(magic_b));
+  return magic_a == kQGSuperblockMagic || magic_b == kQGSuperblockMagic;
+}
 
 class QuantizedGraph {
   friend class QGBuilder;
+  friend class QGUpdater;  // research prototype: streaming updates (qg_updater.hpp)
 
  private:
   size_t num_points_ = 0;    // num points
@@ -131,8 +276,15 @@ class QuantizedGraph {
   std::vector<ClusterStats> cluster_stats_;
 
   std::vector<PID> cache_ids_;
-  std::vector<char> cache_nodes_;
+  // AlignedAlloc = 2MB-aligned + MADV_HUGEPAGE for large blocks. At 768d a row
+  // spans 2-3 4K pages; without hugepages every pop pays TLB walks and the HW
+  // streamer stops at each page boundary (memqg's StaticStorage already gets
+  // this via the same allocator — parity is required for the arena kernel).
+  std::vector<char, ::alaya::AlignedAlloc<char>> cache_nodes_;
   std::unordered_map<PID, char *> caches_;
+  // Full-cache probe: true when the loaded cache covers every node in identity
+  // order, so cache_nodes_ can be addressed as a resident arena (pid * node_len_).
+  bool arena_identity_ = false;
 
   int query_time_ = 0;
   float total_io_time_ = 0;
@@ -148,6 +300,11 @@ class QuantizedGraph {
   std::vector<PID> mem_graph_enter_points_;
 
   size_t nthreads_ = 1;
+
+  // Optional tombstone filter (research prototype): ids in this set are
+  // traversed for routing but excluded from search results. Owned by the
+  // caller (see QGUpdater); must outlive searches. nullptr = no filtering.
+  const std::unordered_set<PID> *result_filter_ = nullptr;
 
   /*
    * Position of different data in each row
@@ -191,12 +348,17 @@ class QuantizedGraph {
                                AlignedFileReader &,
                                ThreadData);
 
+  // pf_base/pf_lines: resident-arena candidate prefetch — after each pool
+  // insert, prefetch the head of the current-best candidate's row (memqg
+  // kernel parity). nullptr/0 (the disk path) keeps behavior unchanged.
   float scan_neighbors(const QGQuery &q_obj,
                        const float *cur_data,
                        float *appro_dist,
                        buffer::SearchBuffer &search_pool,
                        uint32_t cur_degree,
-                       const HashBasedBooleanSet &visited) const;
+                       const HashBasedBooleanSet &visited,
+                       const char *pf_base = nullptr,
+                       size_t pf_lines = 0) const;
 
  public:
   explicit QuantizedGraph(size_t num,
@@ -220,6 +382,8 @@ class QuantizedGraph {
 
   void set_ep(PID entry) { this->entry_point_ = entry; }
 
+  void set_result_filter(const std::unordered_set<PID> *filter) { result_filter_ = filter; }
+
   void load_disk_index(const char *, float);
 
   void set_params(size_t ef_search, size_t num_threads, int beam_width);
@@ -234,6 +398,35 @@ class QuantizedGraph {
 
   /* search and copy results to KNN */
   void search(const float *ALAYA_RESTRICT query, uint32_t knn, uint32_t *ALAYA_RESTRICT results);
+
+  // Full-cache probe: same scan_neighbors kernel on a resident arena — direct
+  // pid*node_len addressing over cache_nodes_, no beam/AIO orchestration.
+  void arena_search_qg(const float *ALAYA_RESTRICT query,
+                       uint32_t knn,
+                       uint32_t *ALAYA_RESTRICT results);
+  void arena_search_with(ThreadData &data,
+                         const float *ALAYA_RESTRICT query,
+                         uint32_t knn,
+                         uint32_t *ALAYA_RESTRICT results);
+  void arena_batch_search(const float *ALAYA_RESTRICT query,
+                          uint32_t knn,
+                          uint32_t *ALAYA_RESTRICT results,
+                          size_t num_queries);
+
+  // Residency seams (driven by the residency.hpp providers):
+  //  - arena_resident(): true when cache_nodes_ is a full identity-ordered arena.
+  //  - ensure_resident_arena(): materialize the arena straight from the index
+  //    file when the cache sidecar didn't already provide one — residency is a
+  //    load-time policy, not a build-time family choice. Not thread-safe
+  //    against concurrent searches.
+  //  - arena_reserve_rows()/arena_mirror_write(): QGUpdater seam — reserve
+  //    capacity for appendable PIDs up front, then reflect committed page
+  //    writes into the arena so resident searches observe updates
+  //    (pass-through mirror; no seqlock, research-grade like the updater).
+  [[nodiscard]] bool arena_resident() const noexcept { return arena_identity_; }
+  void ensure_resident_arena();
+  void arena_reserve_rows(size_t rows);
+  void arena_mirror_write(uint64_t file_off, const char *buf, size_t len);
 
   void batch_search(const float *ALAYA_RESTRICT query,
                     uint32_t knn,
@@ -298,12 +491,16 @@ inline QuantizedGraph::QuantizedGraph(size_t num,
   if (node_len_ == 0) {
     throw std::invalid_argument("QuantizedGraph: node_len_ must be > 0");
   }
-  node_per_page_ = std::max<size_t>(1, kSectorLen / node_len_);
-  page_size_ = (node_per_page_ * node_len_ + kSectorLen - 1) / kSectorLen * kSectorLen;
+  const QGPageGeometry geometry = qg_page_geometry(node_len_);
+  node_per_page_ = geometry.node_per_page;
+  page_size_ = geometry.page_size;
 
-  if (dimension_ != padded_dim_) {  // Currently only supports dimension that is a power of 2
-                                    // (dimension_ must equal padded_dim_)
-    throw std::invalid_argument("QuantizedGraph: dimension must be a power of two");
+  // FHT/RaBitQ/FastScan operate on padded_dim_; raw vectors and exact-distance
+  // terms keep using dimension_. The rotator zero-fills [dimension_, padded_dim_),
+  // so a non-power-of-two main dimension is a supported padded layout.
+  if (padded_dim_ < dimension_ || padded_dim_ % 64 != 0) {
+    throw std::invalid_argument(
+        "QuantizedGraph: padded dimension must cover the main dimension and be a multiple of 64");
   }
   // The disk write path packs node_per_page_ nodes per page in id order, matching
   // get_page_offset() and offset_to_node().
@@ -313,13 +510,14 @@ inline QuantizedGraph::QuantizedGraph(size_t num,
   if (node_per_page_ * node_len_ > page_size_) {
     throw std::invalid_argument("QuantizedGraph: node_per_page_ * node_len_ must be <= page_size_");
   }
-  if (node_per_page_ != std::max<size_t>(1, kSectorLen / node_len_)) {
-    throw std::invalid_argument("QuantizedGraph: node_per_page_ geometry mismatch");
+  if (node_per_page_ != geometry.node_per_page || page_size_ != geometry.page_size) {
+    throw std::invalid_argument("QuantizedGraph: page geometry mismatch");
   }
   assert(node_len_ > 0);
   assert(page_size_ % kSectorLen == 0);
   assert(node_per_page_ * node_len_ <= page_size_);
-  assert(node_per_page_ == std::max<size_t>(1, kSectorLen / node_len_));
+  assert(node_per_page_ == geometry.node_per_page);
+  assert(page_size_ == geometry.page_size);
   std::cout << "main_dim: " << main_dim << ", dim: " << dim << ", dimension_: " << dimension_
             << ", residual_dimension_: " << residual_dimension_ << std::endl;
   initialize();
@@ -390,6 +588,134 @@ inline void QuantizedGraph::batch_search(const float *ALAYA_RESTRICT query,
     const size_t i = static_cast<size_t>(ii);
     disk_search_qg(query + i * (dimension_ + residual_dimension_), knn, results + i * knn);
   }
+}
+
+inline void QuantizedGraph::arena_search_qg(const float *ALAYA_RESTRICT query,
+                                            uint32_t knn,
+                                            uint32_t *ALAYA_RESTRICT results) {
+  ThreadData data = thread_data_.pop();
+  while (data.sector_scratch_ == nullptr) {
+    this->thread_data_.wait_for_push_notify();
+    data = thread_data_.pop();
+  }
+  arena_search_with(data, query, knn, results);
+  thread_data_.push(data);
+  thread_data_.push_notify_all();
+}
+
+inline void QuantizedGraph::arena_search_with(ThreadData &data,
+                                              const float *ALAYA_RESTRICT query,
+                                              uint32_t knn,
+                                              uint32_t *ALAYA_RESTRICT results) {
+  if (!arena_identity_) {
+    throw std::runtime_error(
+        "arena_search_qg: requires a 100% identity-ordered node cache sidecar");
+  }
+  data.visited_.clear();
+  data.search_pool_.clear();
+
+  ALAYA_KSP_COUNT(queries);
+  ALAYA_KSP_BEGIN(prep);
+  const float *transformed_query = query;
+  if (pca_transform_.is_loaded()) {
+    pca_transform_.transform(query, data.pca_query_scratch_);
+    transformed_query = data.pca_query_scratch_;
+  }
+
+  QGQuery q_obj(transformed_query, padded_dim_);
+  q_obj.query_prepare(rotator_, scanner_);
+  const float *residual_query = transformed_query + dimension_;
+  float sqr_qr = 0;
+  for (size_t i = 0; i < residual_dimension_; ++i) {
+    sqr_qr += residual_query[i] * residual_query[i];
+  }
+  q_obj.set_sqr_qr(sqr_qr);
+
+  if (!medoids_.empty()) {
+    PID best_medoid = 0;
+    float best_dist = FLT_MAX;
+    for (size_t cur_m = 0; cur_m < medoids_.size(); cur_m++) {
+      float cur_expanded_dist =
+          space::l2_sqr(transformed_query,
+                        medoids_vector_.data() + (dimension_ + residual_dimension_) * cur_m,
+                        dimension_);
+      if (cur_expanded_dist < best_dist) {
+        best_medoid = medoids_[cur_m];
+        best_dist = cur_expanded_dist;
+      }
+    }
+    data.search_pool_.insert(best_medoid, FLT_MAX);
+  }
+  data.search_pool_.insert(entry_point_, FLT_MAX);
+  ALAYA_KSP_END(prep);
+
+  buffer::ResultBuffer res_pool(knn);
+  std::vector<float> appro_dist(degree_bound_);
+  const char *arena = cache_nodes_.data();
+  const size_t pf_lines = arena_prefetch_lines((node_len_ + 63) / 64);
+  const char *pf_base = pf_lines > 0 ? arena : nullptr;
+  if (pf_base != nullptr) {
+    prefetch_row_l1(arena + static_cast<size_t>(entry_point_) * node_len_, pf_lines);
+  }
+
+  while (data.search_pool_.has_next()) {
+    const PID cur_node = data.search_pool_.pop();
+    if (data.visited_.get(cur_node)) {
+      continue;
+    }
+    data.visited_.set(cur_node);
+    const auto *cur_data =
+        reinterpret_cast<const float *>(arena + static_cast<size_t>(cur_node) * node_len_);
+    float sqr_y = scan_neighbors(q_obj,
+                                 cur_data,
+                                 appro_dist.data(),
+                                 data.search_pool_,
+                                 this->degree_bound_,
+                                 data.visited_,
+                                 pf_base,
+                                 pf_lines);
+    if (residual_dimension_ > 0) {
+      sqr_y += space::l2_sqr(cur_data + dimension_, residual_query, residual_dimension_);
+    }
+    if (result_filter_ == nullptr || result_filter_->find(cur_node) == result_filter_->end()) {
+      res_pool.insert(cur_node, sqr_y);
+    }
+  }
+
+  res_pool.copy_results(results);
+}
+
+inline void QuantizedGraph::arena_batch_search(const float *ALAYA_RESTRICT query,
+                                               uint32_t knn,
+                                               uint32_t *ALAYA_RESTRICT results,
+                                               size_t num_queries) {
+  const int64_t num_queries_signed = static_cast<int64_t>(num_queries);
+  const int nthreads_signed = static_cast<int>(nthreads_);
+  // Check out one ThreadData per worker for the whole batch: per-query queue
+  // pop/push with notify_all throttles ~60us in-memory queries at high thread
+  // counts (futex storm), which is orchestration tax rather than engine cost.
+  std::vector<ThreadData> slots;
+  slots.reserve(nthreads_);
+  for (uint32_t t = 0; t < nthreads_; ++t) {
+    ThreadData d = thread_data_.pop();
+    while (d.sector_scratch_ == nullptr) {
+      this->thread_data_.wait_for_push_notify();
+      d = thread_data_.pop();
+    }
+    slots.push_back(d);
+  }
+#pragma omp parallel for schedule(dynamic) num_threads(nthreads_signed)
+  for (int64_t ii = 0; ii < num_queries_signed; ++ii) {
+    const size_t i = static_cast<size_t>(ii);
+    arena_search_with(slots[static_cast<size_t>(omp_get_thread_num())],
+                      query + i * (dimension_ + residual_dimension_),
+                      knn,
+                      results + i * knn);
+  }
+  for (auto &d : slots) {
+    thread_data_.push(d);
+  }
+  thread_data_.push_notify_all();
 }
 
 /**
@@ -559,8 +885,11 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
                              residual_query,
                              residual_dimension_);
     }
-    // Insert current node with exact distance into result pool
-    res_pool.insert(cur_node, sqr_y);
+    // Insert current node with exact distance into result pool (unless the
+    // node is tombstoned; routing still passes through it)
+    if (result_filter_ == nullptr || result_filter_->find(cur_node) == result_filter_->end()) {
+      res_pool.insert(cur_node, sqr_y);
+    }
   };
 
   // ==================== I/O Completion Handler Lambda ====================
@@ -739,12 +1068,18 @@ inline float QuantizedGraph::scan_neighbors(const QGQuery &q_obj,
                                             float *appro_dist,
                                             buffer::SearchBuffer &search_pool,
                                             uint32_t cur_degree,
-                                            const HashBasedBooleanSet &visited) const {
+                                            const HashBasedBooleanSet &visited,
+                                            const char *pf_base,
+                                            size_t pf_lines) const {
+  ALAYA_KSP_COUNT(pops);
+  ALAYA_KSP_BEGIN(exact);
   float sqr_y = space::l2_sqr(q_obj.query_data(), cur_data, dimension_);
+  ALAYA_KSP_END(exact);
 
   /* Compute approximate distance by Fast Scan */
   const auto *packed_code = reinterpret_cast<const uint8_t *>(&cur_data[code_offset_]);
   const auto *factor = &cur_data[factor_offset_];
+  ALAYA_KSP_BEGIN(scan);
   this->scanner_.scan_neighbors(appro_dist,
                                 q_obj.lut().data(),
                                 sqr_y,
@@ -754,7 +1089,9 @@ inline float QuantizedGraph::scan_neighbors(const QGQuery &q_obj,
                                 q_obj.sumq(),
                                 packed_code,
                                 factor);
+  ALAYA_KSP_END(scan);
 
+  ALAYA_KSP_BEGIN(pool);
   const PID *ptr_nb = reinterpret_cast<const PID *>(&cur_data[neighbor_offset_]);
   for (uint32_t i = 0; i < cur_degree; ++i) {
     PID cur_neighbor = ptr_nb[i];
@@ -763,7 +1100,11 @@ inline float QuantizedGraph::scan_neighbors(const QGQuery &q_obj,
       continue;
     }
     search_pool.insert(cur_neighbor, tmp_dist);
+    if (pf_base != nullptr) {
+      prefetch_row_l2(pf_base + static_cast<size_t>(search_pool.next_id()) * node_len_, pf_lines);
+    }
   }
+  ALAYA_KSP_END(pool);
 
   return sqr_y;
 }
@@ -917,16 +1258,61 @@ inline void QuantizedGraph::load_disk_index(const char *filename, float search_D
   std::ifstream input(index_file_name_, std::ios::binary);
   assert(input.is_open());
 
-  std::vector<uint64_t> metas(kSectorLen / sizeof(uint64_t), 0);
-  input.read(reinterpret_cast<char *>(metas.data()), kSectorLen);
+  std::array<char, kSectorLen> header{};
+  input.read(header.data(), header.size());
+  if (!input) {
+    throw std::runtime_error("QuantizedGraph::load_disk_index: short metadata sector");
+  }
 
-  assert(metas[0] == num_points_);
-  assert(metas[1] == dimension_);
-  assert(metas[3] == node_len_);
-  assert(metas[4] == node_per_page_);
-  assert(metas[8] == std::filesystem::file_size(index_file_name_));
+  QGSuperblockV2 sb;
+  const int sb_slot = select_qg_superblock(header.data(), sb);
+  if (sb_slot >= 0) {
+    if (sb.dimension != dimension_ || sb.node_len != node_len_ ||
+        sb.node_per_page != node_per_page_ || sb.page_size != page_size_) {
+      throw std::runtime_error("QuantizedGraph::load_disk_index: v2 geometry mismatch");
+    }
+    if (sb.file_size != std::filesystem::file_size(index_file_name_)) {
+      throw std::runtime_error("QuantizedGraph::load_disk_index: v2 file-size mismatch");
+    }
+    num_points_ = static_cast<size_t>(sb.num_points);
+    entry_point_ = static_cast<PID>(sb.entry_point);
+  } else {
+    if (qg_header_has_v2_magic(header.data())) {
+      throw std::runtime_error(
+          "QuantizedGraph::load_disk_index: both v2 superblocks have invalid checksums");
+    }
+    std::array<uint64_t, kSectorLen / sizeof(uint64_t)> metas{};
+    std::memcpy(metas.data(), header.data(), header.size());
+    const uint64_t file_size = std::filesystem::file_size(index_file_name_);
+    if (metas[0] != num_points_ || metas[1] != dimension_ || metas[3] != node_len_ ||
+        metas[4] == 0 || metas[8] != file_size) {
+      throw std::runtime_error("QuantizedGraph::load_disk_index: invalid v1 metadata");
+    }
 
-  entry_point_ = metas[2];
+    const size_t loaded_npp = static_cast<size_t>(metas[4]);
+    const size_t page_count = (num_points_ + loaded_npp - 1) / loaded_npp;
+    if (page_count == 0 || file_size < kSectorLen ||
+        (file_size - kSectorLen) % page_count != 0) {
+      throw std::runtime_error("QuantizedGraph::load_disk_index: invalid v1 file geometry");
+    }
+    const size_t loaded_page_size = static_cast<size_t>((file_size - kSectorLen) / page_count);
+    const QGPageGeometry new_geometry = qg_page_geometry(node_len_);
+    const size_t legacy_npp = std::max<size_t>(1, kSectorLen / node_len_);
+    const size_t legacy_page_size =
+        (legacy_npp * node_len_ + kSectorLen - 1) / kSectorLen * kSectorLen;
+    const bool is_new_geometry = loaded_npp == new_geometry.node_per_page &&
+                                 loaded_page_size == new_geometry.page_size;
+    const bool is_legacy_geometry =
+        loaded_npp == legacy_npp && loaded_page_size == legacy_page_size;
+    if (loaded_page_size % kSectorLen != 0 ||
+        loaded_npp * node_len_ > loaded_page_size ||
+        (!is_new_geometry && !is_legacy_geometry)) {
+      throw std::runtime_error("QuantizedGraph::load_disk_index: unsupported v1 page geometry");
+    }
+    node_per_page_ = loaded_npp;
+    page_size_ = loaded_page_size;
+    entry_point_ = static_cast<PID>(metas[2]);
+  }
 
   std::string rotator_path = std::string(index_file_name_) + "_rotator";
   std::ifstream rotator_input(rotator_path, std::ios::binary);
@@ -1027,6 +1413,99 @@ inline void QuantizedGraph::load_cache(std::string &cache_ids_file,
   for (unsigned i = 0; i < cache_ids_.size(); i++) {
     PID cur_id = cache_ids_[i];
     caches_[cur_id] = cache_nodes_.data() + i * node_len_;
+  }
+  arena_identity_ = cache_ids_.size() == num_points_;
+  if (arena_identity_) {
+    for (size_t i = 0; i < cache_ids_.size(); ++i) {
+      if (cache_ids_[i] != static_cast<PID>(i)) {
+        arena_identity_ = false;
+        break;
+      }
+    }
+  }
+}
+
+inline void QuantizedGraph::ensure_resident_arena() {
+  if (arena_identity_) {
+    return;
+  }
+  if (index_file_name_.empty()) {
+    throw std::logic_error("QuantizedGraph::ensure_resident_arena: call load_disk_index() first");
+  }
+  std::ifstream in(index_file_name_, std::ios::binary);
+  if (!in.is_open()) {
+    throw std::runtime_error("QuantizedGraph::ensure_resident_arena: cannot open " +
+                             index_file_name_);
+  }
+  // Zero-fill on the calling thread = NUMA first-touch placement (the
+  // NumaPolicy::kFirstTouch default needs no further action here).
+  std::vector<char, ::alaya::AlignedAlloc<char>> arena(num_points_ * node_len_, 0);
+  std::vector<char> page(page_size_);
+  const size_t num_pages = (num_points_ + node_per_page_ - 1) / node_per_page_;
+  for (size_t p = 0; p < num_pages; ++p) {
+    in.clear();
+    in.seekg(static_cast<std::streamoff>(kSectorLen + p * page_size_));
+    in.read(page.data(), static_cast<std::streamsize>(page_size_));
+    const auto got = static_cast<size_t>(std::max<std::streamsize>(in.gcount(), 0));
+    const size_t base = p * node_per_page_;
+    const size_t rows_in_page = std::min(node_per_page_, num_points_ - base);
+    if (got < rows_in_page * node_len_) {
+      throw std::runtime_error("QuantizedGraph::ensure_resident_arena: short read at page " +
+                               std::to_string(p) + " of " + index_file_name_);
+    }
+    for (size_t s = 0; s < rows_in_page; ++s) {
+      std::memcpy(arena.data() + (base + s) * node_len_, page.data() + s * node_len_, node_len_);
+    }
+  }
+  cache_nodes_ = std::move(arena);
+  cache_ids_.resize(num_points_);
+  std::iota(cache_ids_.begin(), cache_ids_.end(), PID{0});
+  caches_.clear();
+  for (size_t i = 0; i < cache_ids_.size(); ++i) {
+    caches_[cache_ids_[i]] = cache_nodes_.data() + i * node_len_;
+  }
+  arena_identity_ = true;
+}
+
+inline void QuantizedGraph::arena_reserve_rows(size_t rows) {
+  if (!arena_identity_) {
+    throw std::logic_error(
+        "QuantizedGraph::arena_reserve_rows: resident arena not materialized "
+        "(load a full cache sidecar or call ensure_resident_arena() first)");
+  }
+  const size_t want_bytes = rows * node_len_;
+  if (cache_nodes_.size() >= want_bytes) {
+    return;
+  }
+  // Reallocation moves the arena, so the paged-path pointer map must be
+  // rebuilt. Callers run this before serving searches (updater ctor time);
+  // growth never runs concurrently with readers.
+  cache_nodes_.resize(want_bytes, 0);
+  for (size_t i = 0; i < cache_ids_.size(); ++i) {
+    caches_[cache_ids_[i]] = cache_nodes_.data() + i * node_len_;
+  }
+}
+
+inline void QuantizedGraph::arena_mirror_write(uint64_t file_off, const char *buf, size_t len) {
+  if (!arena_identity_ || len == 0 || file_off < kSectorLen) {
+    return;  // metadata-sector writes (superblock A/B copies) carry no row bytes
+  }
+  const size_t arena_rows = cache_nodes_.size() / node_len_;
+  const uint64_t rel = file_off - kSectorLen;
+  const uint64_t end = rel + len;
+  for (uint64_t page = rel / page_size_; page * page_size_ < end; ++page) {
+    const uint64_t page_start = page * page_size_;
+    for (size_t slot = 0; slot < node_per_page_; ++slot) {
+      const uint64_t row_start = page_start + slot * node_len_;
+      if (row_start < rel || row_start + node_len_ > end) {
+        continue;  // the updater writes whole pages; partially covered rows stay paged
+      }
+      const size_t pid = static_cast<size_t>(page) * node_per_page_ + slot;
+      if (pid >= arena_rows) {
+        continue;
+      }
+      std::memcpy(cache_nodes_.data() + pid * node_len_, buf + (row_start - rel), node_len_);
+    }
   }
 }
 

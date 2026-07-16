@@ -23,7 +23,10 @@
 #endif
 
 #if ALAYA_DISK_SEGMENT_FACTORY_LASER_SUPPORTED
+  #include <cstdlib>
+  #include <optional>
   #include "index/disk/laser_segment_searcher.hpp"
+  #include "index/disk/unified_laser_segment_searcher.hpp"
 #endif
 
 namespace alaya::disk {
@@ -51,6 +54,26 @@ namespace detail {
                            std::string(index_type_to_string(type)) + "' not implemented in v1");
 }
 
+#if ALAYA_DISK_SEGMENT_FACTORY_LASER_SUPPORTED
+// Residency selection for a Laser segment. Explicit request only, so the
+// default load path stays byte-identical to the legacy searcher:
+//   segment manifest x_laser_residency = paged_pool | resident_arena
+//   env ALAYA_LASER_RESIDENCY overrides the manifest (same values)
+// Neither present -> nullopt -> legacy LaserSegmentSearcher.
+inline auto laser_residency_request(const SegmentManifest &sm)
+    -> std::optional<::alaya::laser::ResidencyMode> {
+  const char *env = std::getenv("ALAYA_LASER_RESIDENCY");
+  if (env != nullptr && *env != '\0') {
+    return ::alaya::laser::residency_mode_from_string(env);
+  }
+  const auto it = sm.x_extras.find("x_laser_residency");
+  if (it == sm.x_extras.end() || it->second.empty()) {
+    return std::nullopt;
+  }
+  return ::alaya::laser::residency_mode_from_string(it->second);
+}
+#endif
+
 }  // namespace detail
 
 [[nodiscard]] inline auto load_segment_from_manifest(const std::filesystem::path &seg_dir)
@@ -69,8 +92,15 @@ namespace detail {
       break;
     case DiskIndexType::Laser:
 #if ALAYA_DISK_SEGMENT_FACTORY_LASER_SUPPORTED
-      searcher = std::make_shared<LaserSegmentSearcher>(seg_dir);
+    {
+      const auto residency = detail::laser_residency_request(sm);
+      if (residency.has_value()) {
+        searcher = std::make_shared<UnifiedLaserSegmentSearcher>(seg_dir, *residency);
+      } else {
+        searcher = std::make_shared<LaserSegmentSearcher>(seg_dir);
+      }
       break;
+    }
 #else
       detail::throw_unsupported_engine(sm.index_type);
 #endif

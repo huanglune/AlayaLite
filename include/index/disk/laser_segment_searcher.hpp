@@ -351,6 +351,13 @@ class LaserSegmentSearcher : public SegmentSearcher {
     return set_params_call_count_.load(std::memory_order_relaxed);
   }
 
+  // Unified-segment seam: expose the loaded graph and the pid->label view so
+  // the residency-policy wrapper (UnifiedLaserSegmentSearcher) can drive
+  // alternative kernels over the same row store without re-running the
+  // manifest/artifact validation this constructor performs.
+  auto graph() noexcept -> alaya::laser::QuantizedGraph & { return *quantized_graph_; }
+  [[nodiscard]] auto labels() const noexcept -> const uint64_t * { return ids_view_; }
+
  private:
   struct LastSetParams {
     size_t ef_search;

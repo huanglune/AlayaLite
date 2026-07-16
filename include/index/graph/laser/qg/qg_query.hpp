@@ -51,18 +51,29 @@ class QGQuery {
         ,
         padded_dim_(padded_dim) {}
 
+  /** @brief Re-point this query object at a new vector so one instance (and
+   * its lut_ buffer) can be reused across many query_prepare() calls. */
+  void rebind(const float *q) { query_data_ = q; }
+
+  [[nodiscard]] size_t padded_dim() const { return padded_dim_; }
+
   /**
    * @brief Prepares query for RaBitQ distance computation.
    *
    * Steps: rotate -> quantize -> pack lookup table
    */
   void query_prepare(const FHTRotator &rotator, const QGScanner &scanner) {
-    // Rotate query using Fast Hadamard Transform
-    std::vector<float, memory::AlignedAllocator<float>> rd_query(padded_dim_);
+    // Rotate query using Fast Hadamard Transform. Scratch is thread_local:
+    // the updater's staged-backlink drain prepares millions of row-queries
+    // per batch, and per-call aligned allocations serialized all threads on
+    // glibc heap grow/shrink (mprotect under mmap_sem).
+    thread_local std::vector<float, memory::AlignedAllocator<float>> rd_query;
+    rd_query.resize(padded_dim_);
     rotator.rotate(query_data_, rd_query.data());
 
     // quantize query
-    std::vector<uint8_t, memory::AlignedAllocator<uint8_t, 64>> byte_query(padded_dim_);
+    thread_local std::vector<uint8_t, memory::AlignedAllocator<uint8_t, 64>> byte_query;
+    byte_query.resize(padded_dim_);
     scalar::data_range(rd_query.data(), padded_dim_, lower_val_, upper_val_);
     width_ = (upper_val_ - lower_val_) / ((1 << QG_BQUERY) - 1);
     scalar::quantize(byte_query.data(), rd_query.data(), padded_dim_, lower_val_, width_, sumq_);

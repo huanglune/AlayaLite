@@ -361,7 +361,10 @@ struct GraphSearchJob {
     size_t degree_bound = RaBitQSpace<>::kDegreeBound;
     auto entry = sp->get_ep();
     mem_prefetch_l1(sp->get_data_by_id(entry), 10);
+    ALAYA_KSP_COUNT(queries);
+    ALAYA_KSP_BEGIN(prep);
     auto q_computer = sp->get_query_computer(query);
+    ALAYA_KSP_END(prep);
 
     // sorted by estimated distance
     SearchBuffer<DistanceType> search_pool(ef);
@@ -384,6 +387,7 @@ struct GraphSearchJob {
 
       // scan cur_node's neighbors, insert them with estimated distances
       const IDType *cand_neighbors = sp->get_edges(cur_node);
+      ALAYA_KSP_BEGIN(pool);
       for (size_t i = 0; i < degree_bound; ++i) {
         auto cand_nei = cand_neighbors[i];
         DistanceType est_dist = q_computer(i);
@@ -397,6 +401,7 @@ struct GraphSearchJob {
         auto next_id = search_pool.next_id();
         mem_prefetch_l2(sp->get_data_by_id(next_id), 10);
       }
+      ALAYA_KSP_END(pool);
 
       // implicit rerank
       res_pool.insert(cur_node, q_computer.get_exact_qr_c_dist());

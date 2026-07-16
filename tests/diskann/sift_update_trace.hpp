@@ -18,6 +18,7 @@ namespace alaya::diskann::bench {
 enum class UpdateTraceMode {
   Random,
   YiSequential,
+  InsertOnly,
 };
 
 inline std::string trace_mode_name(UpdateTraceMode mode) {
@@ -26,6 +27,8 @@ inline std::string trace_mode_name(UpdateTraceMode mode) {
       return "random";
     case UpdateTraceMode::YiSequential:
       return "yi_sequential";
+    case UpdateTraceMode::InsertOnly:
+      return "insert_only";
   }
   throw std::invalid_argument("unknown update trace mode");
 }
@@ -165,6 +168,30 @@ inline void generate_yi_sequential_trace(const UpdateTraceConfig &cfg) {
   write_manifest(cfg);
 }
 
+inline void generate_insert_only_trace(const UpdateTraceConfig &cfg) {
+  uint32_t next_insert = cfg.initial_count;
+  for (uint32_t round = 0; round < cfg.rounds; ++round) {
+    const uint32_t delete_count = 0;
+    const uint32_t insert_count = cfg.update_size;
+    const std::filesystem::path path =
+        cfg.output_dir / (cfg.file_prefix + std::to_string(round));
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+      throw std::runtime_error("generate_insert_only_trace: cannot open " + path.string());
+    }
+    out.write(reinterpret_cast<const char *>(&delete_count), sizeof(delete_count));
+    out.write(reinterpret_cast<const char *>(&insert_count), sizeof(insert_count));
+    for (uint32_t i = 0; i < insert_count; ++i) {
+      out.write(reinterpret_cast<const char *>(&next_insert), sizeof(next_insert));
+      ++next_insert;
+    }
+    if (!out) {
+      throw std::runtime_error("generate_insert_only_trace: write failed " + path.string());
+    }
+  }
+  write_manifest(cfg);
+}
+
 inline void generate_update_trace(const UpdateTraceConfig &cfg) {
   validate_trace_config(cfg);
   std::filesystem::create_directories(cfg.output_dir);
@@ -173,6 +200,8 @@ inline void generate_update_trace(const UpdateTraceConfig &cfg) {
       return generate_random_trace(cfg);
     case UpdateTraceMode::YiSequential:
       return generate_yi_sequential_trace(cfg);
+    case UpdateTraceMode::InsertOnly:
+      return generate_insert_only_trace(cfg);
   }
   throw std::invalid_argument("generate_update_trace: unknown trace mode");
 }

@@ -16,6 +16,8 @@
 
 #include "core/log.hpp"
 #include "core/value_types.hpp"
+#include "utils/kernel_section_profile.hpp"
+
 #include "index/neighbor.hpp"
 #include "simd/distance_ip.hpp"
 #include "simd/distance_l2.hpp"
@@ -347,9 +349,14 @@ class RaBitQSpace {
 
       const char *base = storage_ptr_ + data_chunk_size_ * c_;
       const auto *centroid_vec = reinterpret_cast<const DataType *>(base);
+      ALAYA_KSP_COUNT(pops);
+      ALAYA_KSP_BEGIN(exact);
       g_add_ = dist_func_(query_, centroid_vec, dim_);
+      ALAYA_KSP_END(exact);
 
+      ALAYA_KSP_BEGIN(scan);
       batch_est_dist();
+      ALAYA_KSP_END(scan);
     }
 
     [[nodiscard]] auto get_edges() const -> const IDType * {
