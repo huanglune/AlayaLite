@@ -73,40 +73,80 @@ alaya_cc_target(
   SRCS query_utils_test.cpp
 )
 
-alaya_add_test(NAME index_test_fusion_graph TARGET fusion_graph_test)
-alaya_add_test(NAME index_test_fusion_segment TARGET fusion_segment_test)
+alaya_add_test(
+  NAME index_test_fusion_graph
+  TARGET fusion_graph_test
+  LABELS unit
+)
+alaya_add_test(
+  NAME index_test_fusion_segment
+  TARGET fusion_segment_test
+  LABELS unit segment
+)
 alaya_add_test(
   NAME index_test_fusion_segment_tsan
   TARGET fusion_segment_test
   FILTER FusionSegmentTest.ConcurrentSearchOnlyIsReentrant
   LABELS tsan
 )
-alaya_add_test(NAME index_test_graph TARGET graph_test)
-alaya_add_test(NAME index_test_hnsw TARGET hnsw_test)
-alaya_add_test(NAME index_test_nndescent TARGET nndescent_test)
-alaya_add_test(NAME index_test_nsg TARGET nsg_test)
-alaya_add_test(NAME index_test_nsg_segment TARGET nsg_segment_test)
+alaya_add_test(
+  NAME index_test_graph
+  TARGET graph_test
+  LABELS unit
+)
+alaya_add_test(
+  NAME index_test_hnsw
+  TARGET hnsw_test
+  LABELS unit
+)
+alaya_add_test(
+  NAME index_test_nndescent
+  TARGET nndescent_test
+  LABELS unit
+)
+alaya_add_test(
+  NAME index_test_nsg
+  TARGET nsg_test
+  LABELS unit
+)
+alaya_add_test(
+  NAME index_test_nsg_segment
+  TARGET nsg_segment_test
+  LABELS unit segment
+)
 alaya_add_test(
   NAME index_test_nsg_segment_tsan
   TARGET nsg_segment_test
   FILTER NsgSegmentTest.ConcurrentSearchOnlyIsReentrant
   LABELS tsan
 )
-alaya_add_test(NAME index_test_qg_segment TARGET qg_segment_test)
+alaya_add_test(
+  NAME index_test_qg_segment
+  TARGET qg_segment_test
+  LABELS unit segment
+)
 alaya_add_test(
   NAME index_test_qg_segment_tsan
   TARGET qg_segment_test
   FILTER QgSegmentTest.ConcurrentSearchOnlyIsReentrant
   LABELS tsan
 )
-alaya_add_test(NAME index_test_vamana_mem_segment TARGET vamana_mem_segment_test)
+alaya_add_test(
+  NAME index_test_vamana_mem_segment
+  TARGET vamana_mem_segment_test
+  LABELS unit segment
+)
 alaya_add_test(
   NAME index_test_vamana_mem_segment_tsan
   TARGET vamana_mem_segment_test
   FILTER VamanaMemSegmentTest.ConcurrentSearchOnlyIsReentrant
   LABELS tsan
 )
-alaya_add_test(NAME index_test_rabitq TARGET rabitq_test)
+alaya_add_test(
+  NAME index_test_rabitq
+  TARGET rabitq_test
+  LABELS unit
+)
 alaya_add_test(
   NAME index_test_rabitq_performance
   TARGET rabitq_performance_test
@@ -117,21 +157,28 @@ alaya_add_test(
   NAME index_test_graph_search
   TARGET graph_search_test
   FILTER SearchTest.*
+  LABELS unit
   WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )
 alaya_add_test(
   NAME index_test_graph_search_unit
   TARGET graph_search_test
   FILTER GraphSearchJobUnitTest.*
+  LABELS unit
   WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )
 alaya_add_test(
   NAME index_test_graph_search_rabitq
   TARGET graph_search_test
   FILTER RaBitQGraphSearchJobTest.*
+  LABELS unit
   WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )
-alaya_add_test(NAME index_test_coro_mutex TARGET coro_mutex_test)
+alaya_add_test(
+  NAME index_test_coro_mutex
+  TARGET coro_mutex_test
+  LABELS unit
+)
 alaya_add_test(
   NAME index_test_query_utils
   TARGET query_utils_test

@@ -33,7 +33,11 @@ alaya_cc_target(
   LIBS alaya_laser
   OPTS ${_laser_test_opts}
 )
-alaya_add_test(NAME laser_test_compile TARGET test_laser_compile)
+alaya_add_test(
+  NAME laser_test_compile
+  TARGET test_laser_compile
+  LABELS unit
+)
 
 # Round-trip test for FHTRotator::dump_signs: seeded determinism, seed sensitivity, and on-disk layout. See the test
 # source for details.
@@ -44,7 +48,11 @@ alaya_cc_target(
   LIBS alaya_laser
   OPTS ${_laser_test_opts}
 )
-alaya_add_test(NAME laser_test_rotator_dump TARGET test_rotator_dump)
+alaya_add_test(
+  NAME laser_test_rotator_dump
+  TARGET test_rotator_dump
+  LABELS unit
+)
 
 alaya_cc_target(
   test_laser_page_layout_round_trip

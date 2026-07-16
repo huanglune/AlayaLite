@@ -17,9 +17,21 @@ alaya_cc_target(
   GTEST
   SRCS test_vamana_reader.cpp
 )
-alaya_add_test(NAME vamana_test_build_dispatch TARGET vamana_build_dispatch_test)
-alaya_add_test(NAME vamana_test_greedy_search TARGET vamana_greedy_search_test)
-alaya_add_test(NAME vamana_test_reader TARGET vamana_reader_test)
+alaya_add_test(
+  NAME vamana_test_build_dispatch
+  TARGET vamana_build_dispatch_test
+  LABELS unit
+)
+alaya_add_test(
+  NAME vamana_test_greedy_search
+  TARGET vamana_greedy_search_test
+  LABELS unit
+)
+alaya_add_test(
+  NAME vamana_test_reader
+  TARGET vamana_reader_test
+  LABELS unit
+)
 
 # test_vamana_alignment — Gate 1 alignment harness, hand-written main with exit codes 10/11/12 for L1/L2/L3 tiers (not a
 # GTest target). Requires CLI args (--alaya_index, --diskann_index, --data_path, --query_path, --gt_path), so it is not
