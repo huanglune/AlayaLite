@@ -188,6 +188,7 @@ struct Args {
   uint64_t tombstone_from = 0, tombstone_n = 0;
   uint32_t R = 64, L = 200, ef_indexing = 200, threads = 64, beam = 16, topk = 10, runs = 3;
   uint32_t vamana_R = 0;  // build: Vamana degree < degree_bound leaves free slots ("headroom")
+  uint32_t reuse_graph = 0;  // build: skip VamanaBuilder, pack an existing <prefix>_vamana.index
   uint32_t main_dim = 0;  // 0 -> dim
   uint32_t pca_preprocessed = 0;  // build: reuse <prefix>_pca_{base.fbin,bin}
   size_t ef_insert = 100, prune_cap = 300, alpha_check_max = 16;
@@ -272,6 +273,8 @@ Args parse(int argc, char **argv) {
       a.R = std::stoul(v);
     else if (k == "--vamana_R")
       a.vamana_R = std::stoul(v);
+    else if (k == "--reuse_graph")
+      a.reuse_graph = std::stoul(v);
     else if (k == "--L")
       a.L = std::stoul(v);
     else if (k == "--ef_indexing")
@@ -433,22 +436,32 @@ int do_build(const Args &a) {
             << " alpha=" << a.alpha << " threads=" << a.threads << "\n";
 
   auto t0 = std::chrono::steady_clock::now();
-  alaya::vamana::VamanaBuildParams vp;
-  // Headroom build: grow the Vamana graph at a smaller degree than
-  // degree_bound so every row keeps free (ghost) slots for future backlinks.
-  vp.R = a.vamana_R == 0 ? a.R : a.vamana_R;
-  vp.L = a.L;
-  vp.alpha = a.alpha;
-  vp.num_threads = a.threads;
-  alaya::vamana::VamanaBuilder vb(base.data.data(), base.n, dim, vp);
-  vb.build();
   const std::string vamana_path = a.prefix + "_vamana.index";
-  // Header max_degree is written as degree_bound (a.R): QGBuilder asserts
-  // header == degree_bound; per-node degrees may be smaller.
-  alaya::vamana::save_graph(vb.graph(), vamana_path, a.R, vb.medoid());
+  if (a.reuse_graph != 0) {
+    // Topology-seal path: pack a pre-existing graph (any producer that wrote
+    // vamana format — e.g. the memory-QG topology dumped by bench_memqg_native).
+    if (!std::filesystem::exists(vamana_path)) {
+      throw std::runtime_error("--reuse_graph 1 but missing " + vamana_path);
+    }
+    std::cout << "[build] reusing graph " << vamana_path << "\n";
+  } else {
+    alaya::vamana::VamanaBuildParams vp;
+    // Headroom build: grow the Vamana graph at a smaller degree than
+    // degree_bound so every row keeps free (ghost) slots for future backlinks.
+    vp.R = a.vamana_R == 0 ? a.R : a.vamana_R;
+    vp.L = a.L;
+    vp.alpha = a.alpha;
+    vp.num_threads = a.threads;
+    alaya::vamana::VamanaBuilder vb(base.data.data(), base.n, dim, vp);
+    vb.build();
+    // Header max_degree is written as degree_bound (a.R): QGBuilder asserts
+    // header == degree_bound; per-node degrees may be smaller.
+    alaya::vamana::save_graph(vb.graph(), vamana_path, a.R, vb.medoid());
+    std::cout << "[build] vamana medoid=" << vb.medoid() << "\n";
+  }
   auto t1 = std::chrono::steady_clock::now();
-  std::cout << "[build] vamana done in " << std::chrono::duration<double>(t1 - t0).count()
-            << "s, medoid=" << vb.medoid() << "\n";
+  std::cout << "[build] graph ready in " << std::chrono::duration<double>(t1 - t0).count()
+            << "s\n";
 
   const std::string pca_base_path = a.prefix + "_pca_base.fbin";
   const std::string pca_param_path = a.prefix + "_pca.bin";

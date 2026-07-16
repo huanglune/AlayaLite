@@ -25,6 +25,7 @@
 
 #include "executor/jobs/graph_search_job.hpp"
 #include "index/graph/qg/qg_builder.hpp"
+#include "index/graph/vamana/vamana_writer.hpp"
 #include "space/rabitq_space.hpp"
 
 namespace {
@@ -62,7 +63,7 @@ auto read_bin(const std::string &path) -> Matrix {
 auto main(int argc, char **argv) -> int {
   if (argc < 4) {
     std::cerr << "usage: bench_memqg_native <base.fbin> <query.fbin> <gt.ibin> "
-                 "[ef_build=100] [rounds=3]\n";
+                 "[ef_build=100] [rounds=3] [dump_graph_path]\n";
     return 1;
   }
   const Matrix base = read_bin(argv[1]);
@@ -70,6 +71,7 @@ auto main(int argc, char **argv) -> int {
   const Matrix gt = read_bin(argv[3]);
   const size_t ef_build = argc > 4 ? std::stoul(argv[4]) : 100;
   const size_t rounds = argc > 5 ? std::stoul(argv[5]) : 3;
+  const std::string dump_graph = argc > 6 ? argv[6] : "";
   if (gt.n != query.n) {
     throw std::runtime_error("gt/query count mismatch");
   }
@@ -85,6 +87,28 @@ auto main(int argc, char **argv) -> int {
   builder.build_graph();
   auto t1 = std::chrono::steady_clock::now();
   std::cout << "build_seconds," << std::chrono::duration<double>(t1 - t0).count() << "\n";
+
+  if (!dump_graph.empty()) {
+    // Export the QG topology in vamana .index format so the LASER packer can
+    // seal it into its row format (fullcache probe: graph-quality isolation).
+    std::vector<std::vector<uint32_t>> adj(base.n);
+    size_t edges = 0;
+    for (size_t i = 0; i < base.n; ++i) {
+      std::unordered_set<uint32_t> seen;
+      adj[i].reserve(32);
+      for (const auto &nb : builder.final_neighbors(i)) {
+        const auto id = static_cast<uint32_t>(nb.id_);
+        if (id != i && id < base.n && seen.insert(id).second) {
+          adj[i].push_back(id);
+        }
+      }
+      edges += adj[i].size();
+    }
+    alaya::vamana::save_graph(adj, dump_graph, 32,
+                              static_cast<uint32_t>(builder.entry_point()));
+    std::cout << "dumped_graph," << dump_graph << ",edges," << edges << ",ep,"
+              << builder.entry_point() << "\n";
+  }
 
   const std::vector<size_t> efs = {40, 60, 100, 200};
   const std::vector<size_t> topks = {10, 100};

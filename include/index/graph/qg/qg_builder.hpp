@@ -87,6 +87,12 @@ class QGBuilder {
     ef_build_ = ef_build;
   }
 
+  // Probe-only read access (fullcache probe): final adjacency + entry point,
+  // for exporting the QG topology to other row formats. Valid after
+  // build_graph() — new_neighbors_ holds the last iteration's lists.
+  auto final_neighbors(size_t i) const -> const CandidateList & { return new_neighbors_[i]; }
+  auto entry_point() const -> IDType { return ep_; }
+
  private:
   static constexpr size_t kMaxBsIter = 5;  ///< max iter for binary search of pruning bar
   static constexpr size_t kMaxCandidatePoolSize = 750;  ///< max num of candidates for indexing
