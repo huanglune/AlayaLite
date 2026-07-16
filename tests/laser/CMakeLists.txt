@@ -124,6 +124,22 @@ alaya_add_test(
   LABELS laser
 )
 
+# Residency seams behind UnifiedLaserSegment: prefetch budget default,
+# ResidencyProvider dispatch, ensure_resident_arena file materialization,
+# and the QGUpdater write_at -> arena mirror.
+alaya_cc_target(
+  test_unified_residency
+  BARE GTEST
+  SRCS qg/test_unified_residency.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_unified_residency
+  TARGET test_unified_residency
+  LABELS laser
+)
+
 # Bench-only fbin mmap view used by update modes under cgroup RAM caps.
 alaya_cc_target(
   test_bench_laser_update_sift_support
