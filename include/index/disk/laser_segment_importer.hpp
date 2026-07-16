@@ -18,6 +18,7 @@
   #include <vector>
 
   #include "index/disk/disk_flat_builder.hpp"
+  #include "index/graph/laser/qg/residency.hpp"
   #include "platform/fs.hpp"
 #endif
 
@@ -39,6 +40,11 @@ struct LaserSegmentImportParams {
   uint32_t default_beam_width = 4;
   float search_dram_budget_gb = 0.5F;
   bool copy_files = true;
+  // Optional residency request recorded as manifest extra x_laser_residency
+  // ("paged_pool" | "resident_arena"). Empty = no extra; the segment loads
+  // through the legacy searcher exactly as before. See
+  // segment_factory.hpp::laser_residency_request for the load-side contract.
+  std::string residency{};
 };
 
 class LaserSegmentImporter {
@@ -335,6 +341,11 @@ inline auto LaserSegmentImporter::import_from(const std::filesystem::path &src_d
   manifest.x_extras["x_default_ef"] = std::to_string(params_.default_ef);
   manifest.x_extras["x_default_beam_width"] = std::to_string(params_.default_beam_width);
   manifest.x_extras["x_laser_native_format_version"] = "1";
+  if (!params_.residency.empty()) {
+    // Validate eagerly so a typo fails at import time, not at first load.
+    (void)::alaya::laser::residency_mode_from_string(params_.residency);
+    manifest.x_extras["x_laser_residency"] = params_.residency;
+  }
   manifest.x_extras["x_platform_requires"] = "linux+libaio";
   manifest.x_extras["x_laser_search_dram_budget_gb"] =
       laser_importer_detail::format_float(params_.search_dram_budget_gb);
@@ -364,6 +375,11 @@ struct LaserSegmentImportParams {
   uint32_t default_beam_width = 4;
   float search_dram_budget_gb = 0.5F;
   bool copy_files = true;
+  // Optional residency request recorded as manifest extra x_laser_residency
+  // ("paged_pool" | "resident_arena"). Empty = no extra; the segment loads
+  // through the legacy searcher exactly as before. See
+  // segment_factory.hpp::laser_residency_request for the load-side contract.
+  std::string residency{};
 };
 
 class LaserSegmentImporter {

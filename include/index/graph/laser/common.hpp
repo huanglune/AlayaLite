@@ -36,9 +36,7 @@ namespace alaya::laser {
 using PID = uint32_t;                     // Point ID type for graph nodes
 constexpr uint32_t kPidMax = 0xFFFFFFFF;  // Maximum valid PID value
 
-// Full-cache probe branch: cap lifted to 100% so the static node cache can hold the
-// entire index (adjudication experiment for unified-graph direction 4).
-constexpr float kCacheRatio = 1.0;
+constexpr float kCacheRatio = 0.15;  // Maximum ratio of nodes to cache in memory (15%)
 
 template <typename T>
 using RowMatrix [[deprecated("use kernels::linalg::RowMajorMatrix")]] =

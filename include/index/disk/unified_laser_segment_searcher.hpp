@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <thread>  // NOLINT(build/c++11)
 #include <vector>
 
 #include "index/disk/laser_segment_searcher.hpp"
@@ -96,6 +97,65 @@ class UnifiedLaserSegmentSearcher : public SegmentSearcher {
                                  std::to_string(size()));
       }
       out.push_back(DiskSearchHit{labels[pid], std::numeric_limits<float>::quiet_NaN()});
+    }
+    return out;
+  }
+
+  // Arena-mode batches route to the native batch kernel (per-thread slot
+  // borrowing inside QuantizedGraph::arena_batch_search). Paged mode keeps
+  // the base one-query-at-a-time fan-out, byte-identical to before.
+  auto batch_search(const float *queries, uint32_t num_queries, const DiskSearchOptions &opts) const
+      -> std::vector<std::vector<DiskSearchHit>> override {
+    if (provider_->mode() == laser::ResidencyMode::kPagedPool || num_queries == 0) {
+      return SegmentSearcher::batch_search(queries, num_queries, opts);
+    }
+    if (opts.top_k == 0) {
+      throw std::invalid_argument("UnifiedLaserSegmentSearcher: top_k must be > 0");
+    }
+    if (queries == nullptr) {
+      throw std::invalid_argument("UnifiedLaserSegmentSearcher: queries must not be null");
+    }
+    if (opts.beam_width > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+      throw std::invalid_argument("UnifiedLaserSegmentSearcher: beam_width exceeds int max");
+    }
+
+    const std::lock_guard<std::mutex> lock(search_mutex_);
+
+    auto &graph = legacy_.graph();
+    const auto effective_top_k =
+        static_cast<uint32_t>(std::min<uint64_t>(static_cast<uint64_t>(opts.top_k), size()));
+    const size_t batch_threads = std::max<size_t>(
+        1, std::min<size_t>(num_queries, std::thread::hardware_concurrency()));
+    const LastSetParams requested{
+        static_cast<size_t>(std::max(opts.ef, effective_top_k)),
+        batch_threads,
+        static_cast<int>(opts.beam_width),
+    };
+    if (requested != last_set_params_) {
+      graph.set_params(requested.ef_search, requested.num_threads, requested.beam_width);
+      set_params_call_count_.fetch_add(1, std::memory_order_relaxed);
+      last_set_params_ = requested;
+    }
+
+    std::vector<uint32_t> pid_buf(static_cast<size_t>(num_queries) * effective_top_k);
+    provider_->batch_search(graph, queries, effective_top_k, pid_buf.data(), num_queries);
+
+    const uint64_t *labels = legacy_.labels();
+    std::vector<std::vector<DiskSearchHit>> out;
+    out.reserve(num_queries);
+    for (uint32_t q = 0; q < num_queries; ++q) {
+      std::vector<DiskSearchHit> hits;
+      hits.reserve(effective_top_k);
+      for (uint32_t k = 0; k < effective_top_k; ++k) {
+        const uint32_t pid = pid_buf[static_cast<size_t>(q) * effective_top_k + k];
+        if (pid >= size()) {
+          throw std::runtime_error("UnifiedLaserSegmentSearcher: QuantizedGraph returned PID " +
+                                   std::to_string(pid) + " outside segment count " +
+                                   std::to_string(size()));
+        }
+        hits.push_back(DiskSearchHit{labels[pid], std::numeric_limits<float>::quiet_NaN()});
+      }
+      out.push_back(std::move(hits));
     }
     return out;
   }
