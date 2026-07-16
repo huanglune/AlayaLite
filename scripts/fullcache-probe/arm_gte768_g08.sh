@@ -15,23 +15,21 @@ PYV=/home/huangliang/workspace/alaya-dev/AlayaLite/.claude/worktrees/laser-updat
 SRC=/home/huangliang/workspace/alaya-dev/data/emb-fbin/gte768
 OUT=/home/huangliang/workspace/alaya-dev/data/laser-update/fullcache-20260715/results/scale-dim
 LOCAL=/tmp/huangliang-uprobe-gte768
-BUILD=$WT/build/RN-$(hostname)
+BUILD=${BENCH_DIR:-$WT/build/RN-$(hostname)}
 ST=$OUT/status-gte768.log
 N=1006717
 NUMA="numactl --cpunodebind=1 --membind=1"
 mkdir -p "$OUT" "$LOCAL"
 note() { echo "[$(date +%H:%M:%S)] $*" >> "$ST"; }
-note "start on $(hostname), cores=$(nproc)"
+note "start on $(hostname), cores=$(nproc), build=$BUILD"
 
-# 0) host-native build (node1-bound)
-$NUMA cmake -S "$WT" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
-  -DBUILD_PYTHON=OFF -DALAYA_NATIVE_ARCH=ON -DPython_EXECUTABLE="$PYV" \
-  > "$LOCAL/configure.log" 2>&1 || { note "FAIL configure"; touch "$OUT/DONE-gte768"; exit 1; }
-$NUMA cmake --build "$BUILD" --target bench_laser_update_sift bench_memqg_native -j 96 \
-  > "$LOCAL/compile.log" 2>&1 || { note "FAIL compile"; touch "$OUT/DONE-gte768"; exit 1; }
 BENCH=$BUILD/tests/laser/bench_laser_update_sift
 MEMQG=$BUILD/tests/index/bench_memqg_native
-note "build ok"
+if [ ! -x "$BENCH" ] || [ ! -x "$MEMQG" ]; then
+  note "FAIL no prebuilt binaries at $BUILD (remote home has no toolchain)"
+  touch "$OUT/DONE-gte768"; exit 1
+fi
+note "binaries ok"
 
 # 1) stage data locally
 for f in base.fbin query.fbin gt.ibin; do
