@@ -18,6 +18,18 @@ alaya_add_test(
 )
 
 alaya_cc_target(
+  collection_rotate_test
+  SRCS collection_rotate_test.cpp
+  GTEST
+)
+alaya_add_test(
+  NAME collection_rotate_test
+  TARGET collection_rotate_test
+  LABELS unit collection canonical crash
+  TIMEOUT 60
+)
+
+alaya_cc_target(
   collection_vamana_seal_test
   SRCS collection_vamana_seal_test.cpp
   GTEST
