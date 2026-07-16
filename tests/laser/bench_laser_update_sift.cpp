@@ -213,6 +213,7 @@ struct Args {
   uint32_t write_cache = 1;  // 0 = immediate per-patch writes (P0.1-era control)
   size_t cache_cap_pages = 0;              // 0 = retain UpdateParams default
   float dram_gb = 0.0F;                    // eval mode: static node-cache DRAM budget (GB)
+  bool arena = false;                      // eval mode: resident-arena search (no beam/AIO)
   size_t maintenance_evict_stride = 4096;  // 0 = phase-boundary-only legacy behavior
   double garden_churn_threshold =
       0.0;                // 0 = garden every call; >0 = skip until churn >= threshold*N
@@ -337,6 +338,8 @@ Args parse(int argc, char **argv) {
       a.cache_cap_pages = parse_cache_cap_pages(v);
     else if (k == "--dram_gb")
       a.dram_gb = std::stof(v);
+    else if (k == "--arena")
+      a.arena = std::stoul(v) != 0;
     else if (k == "--maintenance_evict_stride")
       a.maintenance_evict_stride = std::stoull(v);
     else if (k == "--garden_churn_threshold")
@@ -1466,7 +1469,11 @@ int do_eval(const Args &a) {
     };
     for (uint32_t r = 0; r < a.runs + 1; ++r) {  // first run = warmup
       auto t0 = std::chrono::steady_clock::now();
-      qg.batch_search(query.data.data(), a.topk, results.data(), query.n);
+      if (a.arena) {
+        qg.arena_batch_search(query.data.data(), a.topk, results.data(), query.n);
+      } else {
+        qg.batch_search(query.data.data(), a.topk, results.data(), query.n);
+      }
       auto t1 = std::chrono::steady_clock::now();
       const double secs = std::chrono::duration<double>(t1 - t0).count();
       if (r > 0) {

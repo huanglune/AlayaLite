@@ -225,6 +225,9 @@ class QuantizedGraph {
   std::vector<PID> cache_ids_;
   std::vector<char> cache_nodes_;
   std::unordered_map<PID, char *> caches_;
+  // Full-cache probe: true when the loaded cache covers every node in identity
+  // order, so cache_nodes_ can be addressed as a resident arena (pid * node_len_).
+  bool arena_identity_ = false;
 
   int query_time_ = 0;
   float total_io_time_ = 0;
@@ -333,6 +336,20 @@ class QuantizedGraph {
 
   /* search and copy results to KNN */
   void search(const float *ALAYA_RESTRICT query, uint32_t knn, uint32_t *ALAYA_RESTRICT results);
+
+  // Full-cache probe: same scan_neighbors kernel on a resident arena — direct
+  // pid*node_len addressing over cache_nodes_, no beam/AIO orchestration.
+  void arena_search_qg(const float *ALAYA_RESTRICT query,
+                       uint32_t knn,
+                       uint32_t *ALAYA_RESTRICT results);
+  void arena_search_with(ThreadData &data,
+                         const float *ALAYA_RESTRICT query,
+                         uint32_t knn,
+                         uint32_t *ALAYA_RESTRICT results);
+  void arena_batch_search(const float *ALAYA_RESTRICT query,
+                          uint32_t knn,
+                          uint32_t *ALAYA_RESTRICT results,
+                          size_t num_queries);
 
   void batch_search(const float *ALAYA_RESTRICT query,
                     uint32_t knn,
@@ -477,6 +494,124 @@ inline void QuantizedGraph::batch_search(const float *ALAYA_RESTRICT query,
     const size_t i = static_cast<size_t>(ii);
     disk_search_qg(query + i * (dimension_ + residual_dimension_), knn, results + i * knn);
   }
+}
+
+inline void QuantizedGraph::arena_search_qg(const float *ALAYA_RESTRICT query,
+                                            uint32_t knn,
+                                            uint32_t *ALAYA_RESTRICT results) {
+  ThreadData data = thread_data_.pop();
+  while (data.sector_scratch_ == nullptr) {
+    this->thread_data_.wait_for_push_notify();
+    data = thread_data_.pop();
+  }
+  arena_search_with(data, query, knn, results);
+  thread_data_.push(data);
+  thread_data_.push_notify_all();
+}
+
+inline void QuantizedGraph::arena_search_with(ThreadData &data,
+                                              const float *ALAYA_RESTRICT query,
+                                              uint32_t knn,
+                                              uint32_t *ALAYA_RESTRICT results) {
+  if (!arena_identity_) {
+    throw std::runtime_error(
+        "arena_search_qg: requires a 100% identity-ordered node cache sidecar");
+  }
+  data.visited_.clear();
+  data.search_pool_.clear();
+
+  const float *transformed_query = query;
+  if (pca_transform_.is_loaded()) {
+    pca_transform_.transform(query, data.pca_query_scratch_);
+    transformed_query = data.pca_query_scratch_;
+  }
+
+  QGQuery q_obj(transformed_query, padded_dim_);
+  q_obj.query_prepare(rotator_, scanner_);
+  const float *residual_query = transformed_query + dimension_;
+  float sqr_qr = 0;
+  for (size_t i = 0; i < residual_dimension_; ++i) {
+    sqr_qr += residual_query[i] * residual_query[i];
+  }
+  q_obj.set_sqr_qr(sqr_qr);
+
+  if (!medoids_.empty()) {
+    PID best_medoid = 0;
+    float best_dist = FLT_MAX;
+    for (size_t cur_m = 0; cur_m < medoids_.size(); cur_m++) {
+      float cur_expanded_dist =
+          space::l2_sqr(transformed_query,
+                        medoids_vector_.data() + (dimension_ + residual_dimension_) * cur_m,
+                        dimension_);
+      if (cur_expanded_dist < best_dist) {
+        best_medoid = medoids_[cur_m];
+        best_dist = cur_expanded_dist;
+      }
+    }
+    data.search_pool_.insert(best_medoid, FLT_MAX);
+  }
+  data.search_pool_.insert(entry_point_, FLT_MAX);
+
+  buffer::ResultBuffer res_pool(knn);
+  std::vector<float> appro_dist(degree_bound_);
+  const char *arena = cache_nodes_.data();
+
+  while (data.search_pool_.has_next()) {
+    const PID cur_node = data.search_pool_.pop();
+    if (data.visited_.get(cur_node)) {
+      continue;
+    }
+    data.visited_.set(cur_node);
+    const auto *cur_data =
+        reinterpret_cast<const float *>(arena + static_cast<size_t>(cur_node) * node_len_);
+    float sqr_y = scan_neighbors(q_obj,
+                                 cur_data,
+                                 appro_dist.data(),
+                                 data.search_pool_,
+                                 this->degree_bound_,
+                                 data.visited_);
+    if (residual_dimension_ > 0) {
+      sqr_y += space::l2_sqr(cur_data + dimension_, residual_query, residual_dimension_);
+    }
+    if (result_filter_ == nullptr || result_filter_->find(cur_node) == result_filter_->end()) {
+      res_pool.insert(cur_node, sqr_y);
+    }
+  }
+
+  res_pool.copy_results(results);
+}
+
+inline void QuantizedGraph::arena_batch_search(const float *ALAYA_RESTRICT query,
+                                               uint32_t knn,
+                                               uint32_t *ALAYA_RESTRICT results,
+                                               size_t num_queries) {
+  const int64_t num_queries_signed = static_cast<int64_t>(num_queries);
+  const int nthreads_signed = static_cast<int>(nthreads_);
+  // Check out one ThreadData per worker for the whole batch: per-query queue
+  // pop/push with notify_all throttles ~60us in-memory queries at high thread
+  // counts (futex storm), which is orchestration tax rather than engine cost.
+  std::vector<ThreadData> slots;
+  slots.reserve(nthreads_);
+  for (uint32_t t = 0; t < nthreads_; ++t) {
+    ThreadData d = thread_data_.pop();
+    while (d.sector_scratch_ == nullptr) {
+      this->thread_data_.wait_for_push_notify();
+      d = thread_data_.pop();
+    }
+    slots.push_back(d);
+  }
+#pragma omp parallel for schedule(dynamic) num_threads(nthreads_signed)
+  for (int64_t ii = 0; ii < num_queries_signed; ++ii) {
+    const size_t i = static_cast<size_t>(ii);
+    arena_search_with(slots[static_cast<size_t>(omp_get_thread_num())],
+                      query + i * (dimension_ + residual_dimension_),
+                      knn,
+                      results + i * knn);
+  }
+  for (auto &d : slots) {
+    thread_data_.push(d);
+  }
+  thread_data_.push_notify_all();
 }
 
 /**
@@ -1128,6 +1263,15 @@ inline void QuantizedGraph::load_cache(std::string &cache_ids_file,
   for (unsigned i = 0; i < cache_ids_.size(); i++) {
     PID cur_id = cache_ids_[i];
     caches_[cur_id] = cache_nodes_.data() + i * node_len_;
+  }
+  arena_identity_ = cache_ids_.size() == num_points_;
+  if (arena_identity_) {
+    for (size_t i = 0; i < cache_ids_.size(); ++i) {
+      if (cache_ids_[i] != static_cast<PID>(i)) {
+        arena_identity_ = false;
+        break;
+      }
+    }
   }
 }
 
