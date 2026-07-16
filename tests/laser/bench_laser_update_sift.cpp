@@ -212,6 +212,7 @@ struct Args {
   uint32_t direct = 0;       // 1 = O_DIRECT write fd (P0.1 attribution arm), 0 = buffered (default)
   uint32_t write_cache = 1;  // 0 = immediate per-patch writes (P0.1-era control)
   size_t cache_cap_pages = 0;              // 0 = retain UpdateParams default
+  float dram_gb = 0.0F;                    // eval mode: static node-cache DRAM budget (GB)
   size_t maintenance_evict_stride = 4096;  // 0 = phase-boundary-only legacy behavior
   double garden_churn_threshold =
       0.0;                // 0 = garden every call; >0 = skip until churn >= threshold*N
@@ -334,6 +335,8 @@ Args parse(int argc, char **argv) {
       a.write_cache = std::stoul(v);
     else if (k == "--cache_cap_pages")
       a.cache_cap_pages = parse_cache_cap_pages(v);
+    else if (k == "--dram_gb")
+      a.dram_gb = std::stof(v);
     else if (k == "--maintenance_evict_stride")
       a.maintenance_evict_stride = std::stoull(v);
     else if (k == "--garden_churn_threshold")
@@ -1399,7 +1402,7 @@ int do_eval(const Args &a) {
   }
 
   alaya::laser::QuantizedGraph qg(a.n, a.R, main_dim, dim);
-  qg.load_disk_index(a.prefix.c_str(), 0.0F);
+  qg.load_disk_index(a.prefix.c_str(), a.dram_gb);
   if (!dead.empty()) {
     qg.set_result_filter(&dead);
   }
