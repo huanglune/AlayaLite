@@ -17,6 +17,11 @@ alaya_cc_target(
   GTEST
   SRCS test_vamana_reader.cpp
 )
+alaya_cc_target(
+  frozen_graph_snapshot_test
+  GTEST
+  SRCS frozen_graph_snapshot_test.cpp
+)
 alaya_add_test(
   NAME vamana_test_build_dispatch
   TARGET vamana_build_dispatch_test
@@ -31,6 +36,11 @@ alaya_add_test(
   NAME vamana_test_reader
   TARGET vamana_reader_test
   LABELS unit
+)
+alaya_add_test(
+  NAME frozen_graph_snapshot_test
+  TARGET frozen_graph_snapshot_test
+  LABELS unit seal
 )
 
 # test_vamana_alignment — Gate 1 alignment harness, hand-written main with exit codes 10/11/12 for L1/L2/L3 tiers (not a

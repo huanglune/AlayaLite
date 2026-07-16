@@ -115,6 +115,14 @@ class VamanaBuilder {
   const std::vector<std::vector<uint32_t>> &graph() const { return graph_; }
   uint32_t medoid() const { return medoid_; }
 
+  // Transfer the completed adjacency without copying its edge storage. The
+  // builder remains destructible but its graph is empty after this call.
+  [[nodiscard]] auto release_graph() && -> std::vector<std::vector<uint32_t>> {
+    auto graph = std::move(graph_);
+    graph_.clear();
+    return graph;
+  }
+
  private:
   inline float l2_dist(uint32_t a, uint32_t b) const {
     return l2_(data_ + static_cast<size_t>(a) * dim_, data_ + static_cast<size_t>(b) * dim_, dim_);
