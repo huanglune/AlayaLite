@@ -105,6 +105,25 @@ struct CollectionSealReceipt {
   std::string fallback_reason{};
 };
 
+// Handle returned by Collection::prepare_successor() once a successor
+// segment has been built and durably published to the manifest (source
+// segment(s) marked gc_pending, successor marked sealed) but not yet routed
+// for queries. Pass it to Collection::rotate_to_successor() to atomically
+// switch query traffic over to the successor and retire the predecessor.
+//
+// This is the "successor is ready" precondition from the rotate-to-successor
+// design: everything upstream of a ready handle (how/when a successor gets
+// built) is out of scope here. seal() composes prepare_successor() +
+// rotate_to_successor() under one control_mutex_ hold, so its externally
+// observable behavior is unchanged by this split.
+struct CollectionRotationHandle {
+  std::vector<std::uint64_t> predecessor_segment_ids{};
+  std::uint64_t successor_segment_id{};
+  std::uint64_t successor_generation{};
+
+  [[nodiscard]] auto ready() const noexcept -> bool { return successor_segment_id != 0; }
+};
+
 struct CollectionCompactReceipt {
   std::vector<std::uint64_t> source_segment_ids{};
   std::uint64_t compacted_segment_id{};
@@ -516,6 +535,47 @@ class Collection {
     return seal_locked(context, options);
   }
 
+  // Explicit two-phase rotate-to-successor primitive that seal() is built
+  // from. prepare_successor() performs everything up to and including the
+  // durable manifest publish (source(s) -> gc_pending, successor ->
+  // sealed); the routing table still serves the predecessor at this point.
+  // rotate_to_successor() then atomically switches query routing to the
+  // successor and retires the predecessor (deferred reclaim via gc(), same
+  // as seal()/compact()). Splitting the call in two lets a successor be
+  // prepared out of band (see prepare_successor_locked()'s TODO) while
+  // keeping the atomic-switch/drain/reclaim step a single, independently
+  // testable operation.
+  //
+  // Distinct from the internal SegmentedCollection::rotate_to_successor()
+  // primitive used inside prepare_successor(): that one hands off *write*
+  // authority to a new empty active segment before the successor is even
+  // built; this one hands off *read* routing once the successor is ready.
+  [[nodiscard]] auto prepare_successor(CollectionSealOptions options = {})
+      -> core::Result<CollectionRotationHandle> {
+    core::SealContext context;
+    return prepare_successor(context, std::move(options));
+  }
+
+  [[nodiscard]] auto prepare_successor(core::SealContext &context,
+                                       CollectionSealOptions options = {})
+      -> core::Result<CollectionRotationHandle> {
+    std::lock_guard lock(control_mutex_);
+    return prepare_successor_locked(context, options);
+  }
+
+  [[nodiscard]] auto rotate_to_successor(const CollectionRotationHandle &handle)
+      -> core::Result<CollectionSealReceipt> {
+    core::SealContext context;
+    return rotate_to_successor(handle, context);
+  }
+
+  [[nodiscard]] auto rotate_to_successor(const CollectionRotationHandle &handle,
+                                         core::SealContext &context)
+      -> core::Result<CollectionSealReceipt> {
+    std::lock_guard lock(control_mutex_);
+    return rotate_to_successor_locked(handle, context);
+  }
+
   [[nodiscard]] auto compact() -> core::Result<CollectionCompactReceipt> {
     core::SealContext context;
     return compact(context);
@@ -852,6 +912,18 @@ class Collection {
     std::weak_ptr<internal::collection::SegmentEntry> epoch_reference{};
   };
 
+  // In-memory carrier for the piece of a prepared rotation that cannot be
+  // recovered from durable state without a full reopen: the already-built
+  // AnySegment handle plus the row/replacement map produced by
+  // prepare_successor_locked(). Everything else rotate_to_successor_locked()
+  // needs (source/target segment identities, wal_cut, mapping_file) stays in
+  // control_state_, which is what crash recovery (recover_control_state())
+  // independently reconstructs this same work from after a restart.
+  struct PendingRotation {
+    ReplacementBuildData build_data{};
+    internal::collection::detail::CollectionTargetBuildResult built_target{};
+  };
+
   static void fire_seal_failpoint(const CollectionSealOptions &options,
                                   CollectionSealFailPoint point) {
     if (options.fail_point == point && options.failpoint_hook) {
@@ -1149,6 +1221,34 @@ class Collection {
 
   [[nodiscard]] auto seal_locked(core::SealContext &context, const CollectionSealOptions &options)
       -> core::Result<CollectionSealReceipt> {
+    auto handle = prepare_successor_locked(context, options);
+    if (!handle.ok()) {
+      return handle.status();
+    }
+    return rotate_to_successor_locked(handle.value(), context);
+  }
+
+  // Builds a successor segment and durably publishes it (manifest: source(s)
+  // -> gc_pending, successor -> sealed) without touching query routing yet.
+  // See CollectionRotationHandle for the two-phase contract.
+  //
+  // TODO(rotate-to-successor): the only successor-construction strategy
+  // implemented today is this synchronous full row-export + rebuild (the
+  // same strategy the historical, single-call seal() used). A future
+  // scheduler could build the successor asynchronously/incrementally (e.g.
+  // from a FrozenGraphSnapshot exported off the live growing graph) and
+  // call rotate_to_successor_locked() directly once it has produced an
+  // equivalent handle; that scheduling policy is intentionally out of
+  // scope for this change.
+  [[nodiscard]] auto prepare_successor_locked(core::SealContext &context,
+                                              const CollectionSealOptions &options)
+      -> core::Result<CollectionRotationHandle> {
+    if (pending_rotation_.has_value()) {
+      return error(core::StatusCode::conflict,
+                   core::OperationStage::freeze,
+                   core::StatusDetail::none,
+                   "a successor is already prepared; call rotate_to_successor() first");
+    }
     auto status = core::validate_runtime_control(context.deadline,
                                                  context.cancellation,
                                                  core::OperationStage::freeze);
@@ -1361,25 +1461,78 @@ class Collection {
     }
     fire_seal_failpoint(options, CollectionSealFailPoint::after_manifest_publish);
 
+    // Register the predecessor(s) for deferred GC now, in the same
+    // control_mutex_ hold that just made them gc_pending in the durable
+    // manifest. gc() takes control_mutex_ too, so without this an
+    // interleaved gc() call between prepare_successor() and
+    // rotate_to_successor() would see a segment the manifest calls
+    // gc_pending but that pending_gc_ (in memory) knows nothing about yet,
+    // and could reclaim it on disk while it is still the live, routed
+    // predecessor. Registering it here means gc()'s weak_ptr check always
+    // finds it non-expired (still routed) until rotate_to_successor_locked()
+    // actually removes it from the routing table, so an interleaved gc()
+    // still correctly defers instead of reclaiming a live segment.
     for (const auto &source : control_state_.sources) {
       if (auto entry = pinned->find_segment(source.segment_id, source.generation)) {
         pending_gc_.push_back(
             {internal::collection::detail::collection_segment_name(source.segment_id), {}, entry});
       }
     }
+
+    CollectionRotationHandle handle;
+    handle.successor_segment_id = control_state_.target_segment_id;
+    handle.successor_generation = control_state_.target_generation;
+    handle.predecessor_segment_ids.reserve(control_state_.sources.size());
+    for (const auto &source : control_state_.sources) {
+      handle.predecessor_segment_ids.push_back(source.segment_id);
+    }
+    pending_rotation_ = PendingRotation{std::move(build_data).value(), std::move(built_target)};
+    return handle;
+  }
+
+  // Atomically switches query routing from the predecessor segment(s) to
+  // the successor identified by `handle` (as returned by a prior
+  // prepare_successor_locked() call on this same instance) and retires the
+  // predecessor (deferred reclaim; see gc()). The durable WAL/manifest
+  // ordering was already established by prepare_successor_locked(); this
+  // step is the in-memory routing swap plus bookkeeping, and it is itself
+  // self-healing: if the process dies before or during this call,
+  // Collection::open()'s automatic recovery (recover_control_state())
+  // redoes it from the durable manifest/mapping file on next open, with no
+  // explicit rotate_to_successor() call required.
+  [[nodiscard]] auto rotate_to_successor_locked(const CollectionRotationHandle &handle,
+                                                core::SealContext &context)
+      -> core::Result<CollectionSealReceipt> {
+    if (!pending_rotation_.has_value() ||
+        control_state_.phase != internal::collection::CollectionControlPhase::manifest_published ||
+        handle.successor_segment_id != control_state_.target_segment_id ||
+        handle.successor_generation != control_state_.target_generation ||
+        handle.predecessor_segment_ids.size() != control_state_.sources.size() ||
+        !std::equal(handle.predecessor_segment_ids.begin(),
+                    handle.predecessor_segment_ids.end(),
+                    control_state_.sources.begin(),
+                    [](std::uint64_t segment_id, const auto &source) {
+                      return segment_id == source.segment_id;
+                    })) {
+      return error(core::StatusCode::not_found,
+                   core::OperationStage::save,
+                   core::StatusDetail::none,
+                   "rotate_to_successor handle does not match a prepared successor");
+    }
+
+    auto &prepared = *pending_rotation_;
     internal::collection::SegmentRegistration target;
     target.segment_id = control_state_.target_segment_id;
     target.generation = control_state_.target_generation;
     target.role = internal::collection::SegmentRole::sealed;
-    target.segment = std::move(built_target.segment);
-    target.rows = build_data.value().rows;
-    status = implementation_->install_segment_replacement(control_state_.sources,
-                                                          std::move(target),
-                                                          build_data.value().replacements);
+    target.segment = std::move(prepared.built_target.segment);
+    target.rows = prepared.build_data.rows;
+    auto status = implementation_->install_segment_replacement(control_state_.sources,
+                                                                std::move(target),
+                                                                prepared.build_data.replacements);
     if (!status.ok()) {
       return status;
     }
-    pinned.reset();
     core::CheckpointContext checkpoint_context;
     checkpoint_context.deadline = context.deadline;
     checkpoint_context.cancellation = context.cancellation;
@@ -1397,13 +1550,13 @@ class Collection {
     receipt.successor_segment_id = control_state_.active_segment_id;
     receipt.sealed_segment_id = control_state_.target_segment_id;
     receipt.wal_cut = control_state_.wal_cut;
-    receipt.sealed_rows = build_data.value().live_rows;
-    receipt.sealed_bytes = built_target.artifact_bytes;
+    receipt.sealed_rows = prepared.build_data.live_rows;
+    receipt.sealed_bytes = prepared.built_target.artifact_bytes;
     receipt.manifest_generation = control_state_.manifest_generation;
-    receipt.built_algorithm = built_target.built_algorithm;
-    receipt.effective_ef_construction = built_target.effective_ef_construction;
-    receipt.flat_fallback = built_target.flat_fallback;
-    receipt.fallback_reason = built_target.fallback_reason;
+    receipt.built_algorithm = prepared.built_target.built_algorithm;
+    receipt.effective_ef_construction = prepared.built_target.effective_ef_construction;
+    receipt.flat_fallback = prepared.built_target.flat_fallback;
+    receipt.fallback_reason = prepared.built_target.fallback_reason;
     const auto mapping_file = control_state_.mapping_file;
     control_state_.operation = internal::collection::CollectionControlOperation::idle;
     control_state_.phase = internal::collection::CollectionControlPhase::idle;
@@ -1421,6 +1574,7 @@ class Collection {
       return status;
     }
     internal::collection::CollectionControlStore::remove_replacements(options_.root, mapping_file);
+    pending_rotation_.reset();
     return receipt;
   }
 
@@ -2056,6 +2210,7 @@ class Collection {
   mutable std::mutex control_mutex_{};
   internal::collection::CollectionControlState control_state_{};
   std::vector<PendingGcCandidate> pending_gc_{};
+  std::optional<PendingRotation> pending_rotation_{};
 };
 
 }  // namespace alaya
