@@ -109,6 +109,20 @@ alaya_add_test(
   LABELS laser simd
 )
 
+alaya_cc_target(
+  test_qg_scanner_fused
+  BARE GTEST
+  SRCS qg/test_qg_scanner_fused.cpp
+  LIBS alaya_laser
+  DEFS ALAYA_LASER_TESTING
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_qg_scanner_fused
+  TARGET test_qg_scanner_fused
+  LABELS laser
+)
+
 # Streaming-update research prototype (qg_updater.hpp): patch primitives,
 # builder byte-equality, insert/tombstone end-to-end on a tiny index.
 alaya_cc_target(
