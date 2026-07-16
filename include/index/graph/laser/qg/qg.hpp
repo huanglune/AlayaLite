@@ -49,6 +49,7 @@
 #include "index/graph/laser/utils/rotator.hpp"
 #include "third_party/ngt/hashset.hpp"
 #include "utils/kernel_section_profile.hpp"
+#include "utils/memory.hpp"
 #include "utils/platform.hpp"
 
 namespace alaya::laser {
@@ -253,7 +254,11 @@ class QuantizedGraph {
   std::vector<ClusterStats> cluster_stats_;
 
   std::vector<PID> cache_ids_;
-  std::vector<char> cache_nodes_;
+  // AlignedAlloc = 2MB-aligned + MADV_HUGEPAGE for large blocks. At 768d a row
+  // spans 2-3 4K pages; without hugepages every pop pays TLB walks and the HW
+  // streamer stops at each page boundary (memqg's StaticStorage already gets
+  // this via the same allocator — parity is required for the arena kernel).
+  std::vector<char, ::alaya::AlignedAlloc<char>> cache_nodes_;
   std::unordered_map<PID, char *> caches_;
   // Full-cache probe: true when the loaded cache covers every node in identity
   // order, so cache_nodes_ can be addressed as a resident arena (pid * node_len_).
