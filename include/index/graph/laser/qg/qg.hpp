@@ -304,6 +304,9 @@ class QuantizedGraph {
   // Optional tombstone filter (research prototype): ids in this set are
   // traversed for routing but excluded from search results. Owned by the
   // caller (see QGUpdater); must outlive searches. nullptr = no filtering.
+  // Contract: this seam evolves into the single admission predicate
+  // (user filter AND live bitmap) — docs/design/segment-admission-contract.md.
+  // Do not add a second per-candidate filter mechanism beside it.
   const std::unordered_set<PID> *result_filter_ = nullptr;
 
   /*

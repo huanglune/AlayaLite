@@ -35,6 +35,9 @@ enum class LogicalWalRecordType : std::uint8_t {
   commit = 2,
   publish_marker = 3,
   checkpoint = 4,
+  // 5 is reserved for SEGMENT_OP (segment-physical op family: row_patch,
+  // tombstone, consolidate barriers, publish, superblock_flip). Consult
+  // docs/design/unified-wal-vocabulary.md before assigning any new type.
 };
 
 enum class LogicalWalSync : std::uint8_t {
