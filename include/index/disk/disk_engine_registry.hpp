@@ -12,8 +12,6 @@ enum class EngineFeature {
   none,
   disk_flat_segment,
   flat = disk_flat_segment,
-  disk_vamana_segment,
-  vamana = disk_vamana_segment,
   disk_laser_segment,
   laser = disk_laser_segment,
   diskann_segment,
@@ -26,7 +24,6 @@ enum class EngineFeature {
 
 struct DiskEngineFeatureFlags {
   bool disk_flat_segment{true};
-  bool disk_vamana_segment{true};
   bool disk_laser_segment{true};
   bool diskann_segment{true};
   bool diskann_mutable_segment{};
@@ -37,8 +34,6 @@ struct DiskEngineFeatureFlags {
         return true;
       case EngineFeature::disk_flat_segment:
         return disk_flat_segment;
-      case EngineFeature::disk_vamana_segment:
-        return disk_vamana_segment;
       case EngineFeature::disk_laser_segment:
         return disk_laser_segment;
       case EngineFeature::diskann_segment:
@@ -76,13 +71,6 @@ inline constexpr FactoryRegistration kDiskFlatRegistration{
     {"disk_flat", "disk_flat_segment", "flat"},
     {"disk_flat", "disk_flat_legacy", "disk_flat"},
     EngineFeature::disk_flat_segment,
-    true,
-};
-
-inline constexpr FactoryRegistration kDiskVamanaRegistration{
-    {"disk_vamana", "disk_vamana_segment", "vamana"},
-    {"disk_vamana", "disk_vamana_legacy", "disk_vamana"},
-    EngineFeature::disk_vamana_segment,
     true,
 };
 

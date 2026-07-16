@@ -756,20 +756,12 @@ class Collection {
     }
     const auto algorithm_valid = options.target_algorithm == core::algorithm::flat ||
                                  options.target_algorithm == core::algorithm::hnsw ||
-                                 options.target_algorithm == core::algorithm::qg ||
-                                 options.target_algorithm == core::algorithm::vamana;
+                                 options.target_algorithm == core::algorithm::qg;
     if (!algorithm_valid) {
       return error(core::StatusCode::not_supported,
                    stage,
                    core::StatusDetail::operation_slot_absent,
                    "canonical Collection target algorithm is unsupported");
-    }
-    if (options.target_algorithm == core::algorithm::vamana &&
-        options.ef_construction < options.max_neighbors) {
-      return error(core::StatusCode::invalid_argument,
-                   stage,
-                   core::StatusDetail::malformed_struct,
-                   "canonical Collection Vamana requires ef_construction >= max_neighbors");
     }
     if (options.quantization == CollectionQuantization::rabitq &&
         options.target_algorithm != core::algorithm::qg) {

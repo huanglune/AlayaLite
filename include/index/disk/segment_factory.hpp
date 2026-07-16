@@ -13,8 +13,6 @@
 #include "index/disk/disk_flat_searcher.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
-#include "index/disk/vamana_segment_builder.hpp"
-#include "index/disk/vamana_segment_searcher.hpp"
 
 #if defined(ALAYA_ENABLE_LASER) && (ALAYA_ENABLE_LASER + 0) != 0
   #define ALAYA_DISK_SEGMENT_FACTORY_LASER_SUPPORTED 1
@@ -34,8 +32,6 @@ namespace alaya::disk {
 [[nodiscard]] constexpr auto engine_supported_v1(DiskIndexType type) noexcept -> bool {
   switch (type) {
     case DiskIndexType::Flat:
-      return true;
-    case DiskIndexType::Vamana:
       return true;
     case DiskIndexType::Laser:
 #if ALAYA_DISK_SEGMENT_FACTORY_LASER_SUPPORTED
@@ -86,9 +82,6 @@ inline auto laser_residency_request(const SegmentManifest &sm)
   switch (sm.index_type) {
     case DiskIndexType::Flat:
       searcher = std::make_shared<DiskFlatSegmentSearcher>(seg_dir);
-      break;
-    case DiskIndexType::Vamana:
-      searcher = std::make_shared<VamanaSegmentSearcher>(seg_dir);
       break;
     case DiskIndexType::Laser:
 #if ALAYA_DISK_SEGMENT_FACTORY_LASER_SUPPORTED

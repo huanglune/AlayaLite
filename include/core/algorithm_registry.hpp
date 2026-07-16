@@ -18,7 +18,7 @@ inline constexpr AlgorithmId hnsw = 2;
 inline constexpr AlgorithmId nsg = 3;  // retired engine — id reserved, never reuse (capability gate rejects)
 inline constexpr AlgorithmId fusion = 4;  // retired engine — id reserved, never reuse (capability gate rejects)
 inline constexpr AlgorithmId qg = 5;
-inline constexpr AlgorithmId vamana = 6;
+inline constexpr AlgorithmId vamana = 6;  // retired engine — id reserved, never reuse (capability gate rejects)
 inline constexpr AlgorithmId laser = 7;
 inline constexpr AlgorithmId diskann = 8;
 }  // namespace algorithm

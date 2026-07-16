@@ -8,11 +8,6 @@ alaya_cc_target(
   SRCS vamana_build_dispatch_test.cpp
 )
 alaya_cc_target(
-  vamana_greedy_search_test
-  GTEST
-  SRCS test_vamana_greedy_search.cpp
-)
-alaya_cc_target(
   vamana_reader_test
   GTEST
   SRCS test_vamana_reader.cpp
@@ -25,11 +20,6 @@ alaya_cc_target(
 alaya_add_test(
   NAME vamana_test_build_dispatch
   TARGET vamana_build_dispatch_test
-  LABELS unit
-)
-alaya_add_test(
-  NAME vamana_test_greedy_search
-  TARGET vamana_greedy_search_test
   LABELS unit
 )
 alaya_add_test(

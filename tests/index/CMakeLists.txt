@@ -18,11 +18,6 @@ alaya_cc_target(
   SRCS qg_segment_test.cpp
 )
 alaya_cc_target(
-  vamana_mem_segment_test
-  GTEST
-  SRCS vamana_mem_segment_test.cpp
-)
-alaya_cc_target(
   rabitq_test
   GTEST
   SRCS rabitq_test.cpp
@@ -67,17 +62,6 @@ alaya_add_test(
   NAME index_test_qg_segment_tsan
   TARGET qg_segment_test
   FILTER QgSegmentTest.ConcurrentSearchOnlyIsReentrant
-  LABELS tsan
-)
-alaya_add_test(
-  NAME index_test_vamana_mem_segment
-  TARGET vamana_mem_segment_test
-  LABELS unit segment
-)
-alaya_add_test(
-  NAME index_test_vamana_mem_segment_tsan
-  TARGET vamana_mem_segment_test
-  FILTER VamanaMemSegmentTest.ConcurrentSearchOnlyIsReentrant
   LABELS tsan
 )
 alaya_add_test(

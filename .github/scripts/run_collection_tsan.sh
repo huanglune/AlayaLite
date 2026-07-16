@@ -13,8 +13,7 @@ fi
 
 cmake --preset tsan -S "$ROOT"
 cmake --build --preset tsan --target \
-  segmented_collection_stress_test qg_segment_test \
-  vamana_mem_segment_test
+  segmented_collection_stress_test qg_segment_test
 
 export TSAN_OPTIONS=${TSAN_OPTIONS:-halt_on_error=1:history_size=7}
 setarch "$ARCH" -R "$ROOT/build/TSan/tests/collection/segmented_collection_stress_test"
@@ -23,5 +22,3 @@ setarch "$ARCH" -R "$ROOT/build/TSan/tests/collection/segmented_collection_stres
 # it, but keep this note for future test authors who add one.
 setarch "$ARCH" -R "$ROOT/build/TSan/tests/index/qg_segment_test" \
   --gtest_filter=QgSegmentTest.ConcurrentSearchOnlyIsReentrant
-setarch "$ARCH" -R "$ROOT/build/TSan/tests/index/vamana_mem_segment_test" \
-  --gtest_filter=VamanaMemSegmentTest.ConcurrentSearchOnlyIsReentrant

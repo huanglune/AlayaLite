@@ -18,7 +18,6 @@
 
 #include "index/collection/segmented_collection.hpp"
 #include "index/disk/disk_flat_segment.hpp"
-#include "index/disk/disk_vamana_segment.hpp"
 #include "index/graph/hnsw/hnsw_segment.hpp"
 #include "space/raw_space.hpp"
 #include "platform/detect.hpp"
@@ -109,33 +108,6 @@ struct Rows {
   return std::move(built).value();
 }
 
-[[nodiscard]] auto build_vamana(const Rows &rows,
-                                const std::filesystem::path &root,
-                                std::string segment_id)
-    -> std::unique_ptr<::alaya::disk::DiskVamanaSegment> {
-  ::alaya::disk::VamanaSegmentBuildParams params;
-  params.R = 8;
-  params.L = 32;
-  params.alpha = 1.2F;
-  params.num_threads = 1;
-  params.seed = 20260712;
-  ::alaya::disk::DiskVamanaPublicationOptions options;
-  options.collection_root = root;
-  options.segment_id = std::move(segment_id);
-  core::BuildContext context;
-  auto built = ::alaya::disk::DiskVamanaSegmentFactory::build(
-      {core::TypedTensorView::contiguous(rows.vectors.data(), kRowsPerSegment, kDim),
-       rows.physical_ids},
-      core::Metric::l2,
-      params,
-      options,
-      context);
-  if (!built.ok()) {
-    throw std::runtime_error(built.status().diagnostic());
-  }
-  return std::move(built).value();
-}
-
 struct SearchStorage {
   SearchStorage(const float *queries,
                 core::RowCount query_count,
@@ -168,7 +140,7 @@ struct SearchStorage {
 
 template <typename Segment>
 void expect_truncated_batch_contract(const Segment &segment, const float *queries) {
-  constexpr core::RowCount kQueries = 3;
+  constexpr core::RowCount kQueries = 2;
   constexpr core::RowCount kTopK = kRowsPerSegment + 7;
   SearchStorage storage(queries, kQueries, kTopK);
   const auto status = segment.batch_search(storage.request);
@@ -289,65 +261,53 @@ class PerQueryFailureProxy {
   return std::move(erased).value();
 }
 
-TEST(HeterogeneousSegmentIntegration,
-     HnswFlatAndVamanaMatchFlatOracleAndSuppressStaleDiskVersions) {
+TEST(HeterogeneousSegmentIntegration, HnswAndFlatMatchFlatOracleAndSuppressStaleDiskVersions) {
   TemporaryDirectory temporary;
   auto hnsw_rows = make_rows(1000, 101);
   auto flat_rows = make_rows(2000, 202);
-  auto vamana_rows = make_rows(3000, 303);
   flat_rows.physical_ids[kRowsPerSegment - 2] = 91'001;
   flat_rows.physical_ids[kRowsPerSegment - 1] = 91'002;
-  vamana_rows.physical_ids[kRowsPerSegment - 2] = 92'001;
-  vamana_rows.physical_ids[kRowsPerSegment - 1] = 92'002;
 
   auto hnsw = build_hnsw(hnsw_rows);
   auto flat = build_flat(flat_rows, temporary.path() / "flat", "seg_00000001");
-  auto vamana = build_vamana(vamana_rows, temporary.path() / "vamana", "seg_00000002");
 
   std::vector<float> queries;
   queries.insert(queries.end(), hnsw_rows.vectors.begin(), hnsw_rows.vectors.begin() + kDim);
   queries.insert(queries.end(), flat_rows.vectors.begin() + 7 * kDim,
                  flat_rows.vectors.begin() + 8 * kDim);
-  queries.insert(queries.end(), vamana_rows.vectors.begin() + 13 * kDim,
-                 vamana_rows.vectors.begin() + 14 * kDim);
   expect_truncated_batch_contract(*hnsw, queries.data());
   expect_truncated_batch_contract(*flat, queries.data());
-  expect_truncated_batch_contract(*vamana, queries.data());
 
   auto hnsw_any = Hnsw::into_any(std::move(hnsw));
   auto flat_any = ::alaya::disk::DiskFlatSegment::into_any(std::move(flat));
-  auto vamana_any = ::alaya::disk::DiskVamanaSegment::into_any(std::move(vamana));
   ASSERT_TRUE(hnsw_any.ok()) << hnsw_any.status().diagnostic();
   ASSERT_TRUE(flat_any.ok()) << flat_any.status().diagnostic();
-  ASSERT_TRUE(vamana_any.ok()) << vamana_any.status().diagnostic();
 
   auto hnsw_registration = normal_registration(1, std::move(hnsw_any).value(), hnsw_rows, true);
   auto flat_registration = normal_registration(2, std::move(flat_any).value(), flat_rows, false);
-  auto vamana_registration =
-      normal_registration(3, std::move(vamana_any).value(), vamana_rows, false);
 
+  // hnsw claims the same two logical ids as flat, at a newer upsert_sequence,
+  // so it wins the live duplicate and supersedes flat's copy with a tombstone.
   flat_registration.rows[kRowsPerSegment - 2].logical_id =
       core::LogicalId::from_legacy_uint64(kLiveDuplicateId);
   flat_registration.rows[kRowsPerSegment - 2].upsert_sequence = 1;
   flat_registration.rows[kRowsPerSegment - 1].logical_id =
       core::LogicalId::from_legacy_uint64(kDeletedId);
   flat_registration.rows[kRowsPerSegment - 1].upsert_sequence = 1;
-  vamana_registration.rows[kRowsPerSegment - 2].logical_id =
+  hnsw_registration.rows[kRowsPerSegment - 2].logical_id =
       core::LogicalId::from_legacy_uint64(kLiveDuplicateId);
-  vamana_registration.rows[kRowsPerSegment - 2].upsert_sequence = 2;
-  vamana_registration.rows[kRowsPerSegment - 1].logical_id =
+  hnsw_registration.rows[kRowsPerSegment - 2].upsert_sequence = 2;
+  hnsw_registration.rows[kRowsPerSegment - 1].logical_id =
       core::LogicalId::from_legacy_uint64(kDeletedId);
-  vamana_registration.rows[kRowsPerSegment - 1].upsert_sequence = 2;
-  vamana_registration.rows[kRowsPerSegment - 1].state = VersionState::tombstone;
+  hnsw_registration.rows[kRowsPerSegment - 1].upsert_sequence = 2;
+  hnsw_registration.rows[kRowsPerSegment - 1].state = VersionState::tombstone;
 
   auto opened = SegmentedCollection::open(
       {kDim, core::Metric::l2, core::ScalarType::float32},
-      {std::move(hnsw_registration),
-       std::move(flat_registration),
-       std::move(vamana_registration)});
+      {std::move(hnsw_registration), std::move(flat_registration)});
   ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
   auto collection = std::move(opened).value();
-  EXPECT_EQ(collection->stats().size, 3 * kRowsPerSegment - 3);
+  EXPECT_EQ(collection->stats().size, 2 * kRowsPerSegment - 3);
 
   Rows oracle_rows;
   auto append = [&](const Rows &source, std::uint64_t rows) {
@@ -358,12 +318,11 @@ TEST(HeterogeneousSegmentIntegration,
                                     source.physical_ids.begin(),
                                     source.physical_ids.begin() + static_cast<std::ptrdiff_t>(rows));
   };
-  append(hnsw_rows, kRowsPerSegment);
+  append(hnsw_rows, kRowsPerSegment - 2);
   append(flat_rows, kRowsPerSegment - 2);
-  append(vamana_rows, kRowsPerSegment - 2);
   oracle_rows.vectors.insert(oracle_rows.vectors.end(),
-                             vamana_rows.vectors.end() - 2 * kDim,
-                             vamana_rows.vectors.end() - kDim);
+                             hnsw_rows.vectors.end() - 2 * kDim,
+                             hnsw_rows.vectors.end() - kDim);
   oracle_rows.physical_ids.push_back(kLiveDuplicateId);
 
   ::alaya::disk::DiskFlatPublicationOptions oracle_options;
@@ -380,7 +339,7 @@ TEST(HeterogeneousSegmentIntegration,
       oracle_build_context);
   ASSERT_TRUE(oracle.ok()) << oracle.status().diagnostic();
 
-  constexpr core::RowCount kQueryCount = 3;
+  constexpr core::RowCount kQueryCount = 2;
   constexpr core::RowCount kTopK = 15;
   SearchStorage exact(queries.data(), kQueryCount, kTopK);
   ASSERT_TRUE(oracle.value()->batch_search(exact.request).ok());
@@ -417,7 +376,7 @@ TEST(HeterogeneousSegmentIntegration,
   const auto duplicate = snapshot->versions.find(
       core::LogicalId::from_legacy_uint64(kLiveDuplicateId));
   ASSERT_NE(duplicate, snapshot->versions.end());
-  EXPECT_EQ(duplicate->second.address.segment_id, 3U);
+  EXPECT_EQ(duplicate->second.address.segment_id, 1U);
   EXPECT_EQ(duplicate->second.upsert_sequence, 2U);
   const auto deleted = snapshot->versions.find(core::LogicalId::from_legacy_uint64(kDeletedId));
   ASSERT_NE(deleted, snapshot->versions.end());

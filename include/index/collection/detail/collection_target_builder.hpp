@@ -23,7 +23,6 @@
 #include "index/collection/detail/collection_flat_target.hpp"
 #include "index/collection/detail/collection_memory_target.hpp"
 #include "index/collection/detail/collection_normalized_segment.hpp"
-#include "index/disk/disk_vamana_segment.hpp"
 #include "index/graph/hnsw/hnsw_segment.hpp"
 #include "index/graph/qg/qg_segment.hpp"
 #include "space/sq4_space.hpp"
@@ -93,11 +92,6 @@ struct CollectionTargetRegistration {
                                                      const CollectionTargetBuildParams &)
     -> TargetSupport;
 
-[[nodiscard]] inline auto vamana_target_support(const CollectionSchema &schema,
-                                                core::RowCount row_count,
-                                                const CollectionTargetBuildParams &params)
-    -> TargetSupport;
-
 [[nodiscard]] inline auto hnsw_target_support(const CollectionSchema &schema,
                                               core::RowCount row_count,
                                               const CollectionTargetBuildParams &params)
@@ -116,13 +110,6 @@ struct CollectionTargetRegistration {
     core::BuildContext &context) -> core::Result<CollectionTargetBuildResult>;
 
 [[nodiscard]] inline auto build_unsupported_collection_target(
-    const CollectionSchema &schema,
-    std::span<const RegisteredRow> rows,
-    const CollectionTargetBuildParams &params,
-    const CollectionTargetPublication &publication,
-    core::BuildContext &context) -> core::Result<CollectionTargetBuildResult>;
-
-[[nodiscard]] inline auto build_vamana_collection_target(
     const CollectionSchema &schema,
     std::span<const RegisteredRow> rows,
     const CollectionTargetBuildParams &params,
@@ -155,12 +142,6 @@ struct CollectionTargetRegistration {
                                                              core::OpenContext &context)
     -> core::Result<core::AnySegment>;
 
-[[nodiscard]] inline auto open_vamana_collection_target(const std::filesystem::path &root,
-                                                        const SegmentEntryV2 &entry,
-                                                        const CollectionSchema &schema,
-                                                        core::OpenContext &context)
-    -> core::Result<core::AnySegment>;
-
 [[nodiscard]] inline auto open_hnsw_collection_target(const std::filesystem::path &root,
                                                       const SegmentEntryV2 &entry,
                                                       const CollectionSchema &schema,
@@ -173,7 +154,7 @@ struct CollectionTargetRegistration {
                                                     core::OpenContext &context)
     -> core::Result<core::AnySegment>;
 
-inline constexpr std::array<CollectionTargetRegistration, 6> kCollectionTargetRegistrations{
+inline constexpr std::array<CollectionTargetRegistration, 5> kCollectionTargetRegistrations{
     CollectionTargetRegistration{core::algorithm::flat,
                                  "disk_flat_segment",
                                  "flat",
@@ -192,12 +173,6 @@ inline constexpr std::array<CollectionTargetRegistration, 6> kCollectionTargetRe
                                  qg_target_support,
                                  build_qg_collection_target,
                                  open_qg_collection_target},
-    CollectionTargetRegistration{core::algorithm::vamana,
-                                 "disk_vamana_segment",
-                                 "vamana",
-                                 vamana_target_support,
-                                 build_vamana_collection_target,
-                                 open_vamana_collection_target},
     CollectionTargetRegistration{core::algorithm::laser,
                                  "disk_laser_segment",
                                  "laser",
@@ -245,16 +220,6 @@ inline constexpr std::array<CollectionTargetRegistration, 6> kCollectionTargetRe
                                                      const CollectionTargetBuildParams &)
     -> TargetSupport {
   return TargetSupport::unsupported;
-}
-
-[[nodiscard]] inline auto vamana_target_support(const CollectionSchema &schema,
-                                                core::RowCount row_count,
-                                                const CollectionTargetBuildParams &)
-    -> TargetSupport {
-  return schema.metric == core::Metric::l2 && schema.scalar_type == core::ScalarType::float32 &&
-                 row_count >= 2
-             ? TargetSupport::supported
-             : TargetSupport::unsupported;
 }
 
 [[nodiscard]] inline auto hnsw_target_support(const CollectionSchema &schema,
@@ -386,26 +351,6 @@ template <typename SearchSpace, typename BuildSpace>
 [[nodiscard]] inline auto disk_flat_publication_from_collection(
     const CollectionTargetPublication &publication) -> ::alaya::disk::DiskFlatPublicationOptions {
   ::alaya::disk::DiskFlatPublicationOptions translated;
-  translated.collection_root = publication.collection_root;
-  translated.segment_id = publication.segment_id;
-  translated.segment_generation = publication.segment_generation;
-  translated.manifest_generation = publication.manifest_generation;
-  translated.publication_parent = publication.publication_parent;
-  translated.metadata_epoch = publication.metadata_epoch;
-  translated.metadata_checkpoint = publication.metadata_checkpoint;
-  translated.wal_cut = publication.wal_cut;
-  translated.row_versions = publication.row_versions;
-  translated.id_map_checkpoint = publication.id_map_checkpoint;
-  translated.collection_features = publication.collection_features;
-  translated.abort_policy = publication.abort_policy;
-  translated.fail_point = publication.fail_point;
-  translated.base_manifest = publication.base_manifest;
-  return translated;
-}
-
-[[nodiscard]] inline auto disk_vamana_publication_from_collection(
-    const CollectionTargetPublication &publication) -> ::alaya::disk::DiskVamanaPublicationOptions {
-  ::alaya::disk::DiskVamanaPublicationOptions translated;
   translated.collection_root = publication.collection_root;
   translated.segment_id = publication.segment_id;
   translated.segment_generation = publication.segment_generation;
@@ -662,87 +607,6 @@ template <typename SearchSpace, typename BuildSpace>
                              "Collection target builder is not enabled in this rollout phase");
 }
 
-[[nodiscard]] inline auto build_vamana_collection_target(
-    const CollectionSchema &schema,
-    std::span<const RegisteredRow> rows,
-    const CollectionTargetBuildParams &params,
-    const CollectionTargetPublication &publication,
-    core::BuildContext &context) -> core::Result<CollectionTargetBuildResult> {
-  std::vector<float> vectors;
-  std::vector<std::uint64_t> row_ids;
-  for (const auto &row : rows) {
-    if (row.state != VersionState::live) {
-      continue;
-    }
-    if (!row.payload.vector.has_value()) {
-      return core::Status::error(core::StatusCode::resource_exhausted,
-                                 core::OperationStage::build,
-                                 core::StatusDetail::budget_denied,
-                                 "Vamana seal target requires every live source vector");
-    }
-    auto status = vector_as_float(*row.payload.vector, vectors);
-    if (!status.ok()) {
-      return status;
-    }
-    row_ids.push_back(static_cast<std::uint64_t>(row.row_id));
-  }
-
-  ::alaya::disk::DiskVamanaBuildInput input(core::TypedTensorView::contiguous(vectors.data(),
-                                                                              row_ids.size(),
-                                                                              schema.dim),
-                                            row_ids);
-  ::alaya::disk::VamanaSegmentBuildParams vparams;
-  vparams.R = params.max_neighbors;
-  vparams.L = params.ef_construction;
-  vparams.alpha = params.alpha;
-  vparams.num_threads = params.thread_count;
-  vparams.seed = params.seed;
-  auto translated = disk_vamana_publication_from_collection(publication);
-  auto built = ::alaya::disk::DiskVamanaSegmentFactory::build(input,
-                                                              schema.metric,
-                                                              vparams,
-                                                              translated,
-                                                              context);
-  if (!built.ok()) {
-    return built.status();
-  }
-  auto erased = ::alaya::disk::DiskVamanaSegment::into_any(std::move(built).value());
-  if (!erased.ok()) {
-    return erased.status();
-  }
-
-  std::uint64_t bytes{};
-  const auto manifest = load_manifest_v2_if_present(publication.collection_root);
-  if (!manifest.ok()) {
-    return manifest.status();
-  }
-  if (manifest.value().has_value()) {
-    const auto found = std::ranges::find_if(manifest.value()->segments, [&](const auto &entry) {
-      return entry.segment_id == publication.segment_id &&
-             entry.generation == publication.segment_generation;
-    });
-    if (found != manifest.value()->segments.end()) {
-      for (const auto &artifact : found->artifacts) {
-        if (!core::checked_add(bytes, artifact.size_bytes, bytes)) {
-          bytes = std::numeric_limits<std::uint64_t>::max();
-          break;
-        }
-      }
-    }
-  }
-
-  const auto *registration = find_collection_target_registration(core::algorithm::vamana);
-  CollectionTargetBuildResult result;
-  result.segment = std::move(erased).value();
-  result.requested_algorithm = core::algorithm::vamana;
-  result.built_algorithm = core::algorithm::vamana;
-  result.implementation_key = registration->implementation_key;
-  result.factory_key = registration->factory_key;
-  result.artifact_bytes = bytes;
-  result.effective_ef_construction = params.ef_construction;
-  return result;
-}
-
 [[nodiscard]] inline auto open_flat_collection_target(const std::filesystem::path &root,
                                                       const SegmentEntryV2 &entry,
                                                       const CollectionSchema &schema,
@@ -760,58 +624,6 @@ template <typename SearchSpace, typename BuildSpace>
                              core::OperationStage::open,
                              core::StatusDetail::operation_slot_absent,
                              "Collection target opener is not enabled in this rollout phase");
-}
-
-[[nodiscard]] inline auto open_vamana_collection_target(const std::filesystem::path &root,
-                                                        const SegmentEntryV2 &entry,
-                                                        const CollectionSchema &,
-                                                        core::OpenContext &context)
-    -> core::Result<core::AnySegment> {
-  if (entry.algorithm_id != core::algorithm::vamana ||
-      entry.lifecycle == SegmentLifecycleV2::retired) {
-    return core::Status::error(core::StatusCode::not_supported,
-                               core::OperationStage::open,
-                               core::StatusDetail::operation_slot_absent,
-                               "Collection Vamana opener received an incompatible segment entry");
-  }
-
-  std::array<std::string, 4> paths{};
-  for (const auto &artifact : entry.artifacts) {
-    if (artifact.logical_name == ::alaya::disk::DiskVamanaSegment::kManifestArtifactName) {
-      paths[0] = (root / artifact.relative_path).string();
-    } else if (artifact.logical_name == ::alaya::disk::DiskVamanaSegment::kIdsArtifactName) {
-      paths[1] = (root / artifact.relative_path).string();
-    } else if (artifact.logical_name == ::alaya::disk::DiskVamanaSegment::kVectorsArtifactName) {
-      paths[2] = (root / artifact.relative_path).string();
-    } else if (artifact.logical_name == ::alaya::disk::DiskVamanaSegment::kGraphArtifactName ||
-               artifact.logical_name == "x_graph_file") {
-      paths[3] = (root / artifact.relative_path).string();
-    }
-  }
-  if (std::ranges::any_of(paths, [](const auto &path) {
-        return path.empty();
-      })) {
-    return core::Status::error(core::StatusCode::corruption,
-                               core::OperationStage::open,
-                               core::StatusDetail::malformed_struct,
-                               "Vamana replacement manifest is missing a native artifact");
-  }
-  const std::array<core::ArtifactLocation, 4>
-      locations{core::ArtifactLocation(::alaya::disk::DiskVamanaSegment::kManifestArtifactName,
-                                       paths[0]),
-                core::ArtifactLocation(::alaya::disk::DiskVamanaSegment::kIdsArtifactName,
-                                       paths[1]),
-                core::ArtifactLocation(::alaya::disk::DiskVamanaSegment::kVectorsArtifactName,
-                                       paths[2]),
-                core::ArtifactLocation(::alaya::disk::DiskVamanaSegment::kGraphArtifactName,
-                                       paths[3])};
-  auto opened = ::alaya::disk::DiskVamanaSegmentFactory::open(core::ArtifactView(locations),
-                                                              core::OpenOptions{},
-                                                              context);
-  if (!opened.ok()) {
-    return opened.status();
-  }
-  return ::alaya::disk::DiskVamanaSegment::into_any(std::move(opened).value());
 }
 
 struct PersistedMemoryGraphTarget {

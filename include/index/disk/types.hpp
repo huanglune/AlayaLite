@@ -14,7 +14,6 @@ namespace alaya::disk {
 
 enum class DiskIndexType {
   Flat,
-  Vamana,
   Laser,
 };
 
@@ -69,8 +68,6 @@ constexpr auto index_type_to_string(DiskIndexType t) noexcept -> std::string_vie
   switch (t) {
     case DiskIndexType::Flat:
       return "disk_flat";
-    case DiskIndexType::Vamana:
-      return "disk_vamana";
     case DiskIndexType::Laser:
       return "disk_laser";
   }
@@ -80,9 +77,6 @@ constexpr auto index_type_to_string(DiskIndexType t) noexcept -> std::string_vie
 inline auto index_type_from_string(std::string_view s) -> DiskIndexType {
   if (s == "disk_flat") {
     return DiskIndexType::Flat;
-  }
-  if (s == "disk_vamana") {
-    return DiskIndexType::Vamana;
   }
   if (s == "disk_laser") {
     return DiskIndexType::Laser;

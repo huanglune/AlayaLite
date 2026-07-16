@@ -13,11 +13,9 @@ namespace alaya::disk {
 
 TEST(DiskTypesRoundTrip, EnumStringRoundTrip) {
   EXPECT_EQ(index_type_to_string(DiskIndexType::Flat), "disk_flat");
-  EXPECT_EQ(index_type_to_string(DiskIndexType::Vamana), "disk_vamana");
   EXPECT_EQ(index_type_to_string(DiskIndexType::Laser), "disk_laser");
 
   EXPECT_EQ(index_type_from_string("disk_flat"), DiskIndexType::Flat);
-  EXPECT_EQ(index_type_from_string("disk_vamana"), DiskIndexType::Vamana);
   EXPECT_EQ(index_type_from_string("disk_laser"), DiskIndexType::Laser);
 }
 
