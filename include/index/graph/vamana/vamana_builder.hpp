@@ -114,6 +114,7 @@ class VamanaBuilder {
 
   const std::vector<std::vector<uint32_t>> &graph() const { return graph_; }
   uint32_t medoid() const { return medoid_; }
+  uint32_t max_degree() const { return params_.R; }
 
   // Transfer the completed adjacency without copying its edge storage. The
   // builder remains destructible but its graph is empty after this call.

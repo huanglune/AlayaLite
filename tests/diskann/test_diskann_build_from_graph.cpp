@@ -101,7 +101,7 @@ TEST_F(DiskANNBuildFromGraphTest, MatchesDefaultBuildDirectoryByteForByte) {
                                        static_cast<std::uint32_t>(kDim),
                                        vamana_params);
   builder.build();
-  auto snapshot = alaya::FrozenGraphSnapshot::from_vamana(std::move(builder), kDegree);
+  auto snapshot = alaya::FrozenGraphSnapshot::from_vamana(std::move(builder));
 
   alaya::diskann::DiskANNMaterializeParams materialize_params;
   materialize_params.pq_n_chunks = build_params.pq_n_chunks;

@@ -28,12 +28,10 @@ FrozenGraphSnapshot(Adjacency adjacency,
                     std::uint32_t max_degree,
                     std::uint64_t frozen_pts = 0);
 
-FrozenGraphSnapshot(vamana::VamanaBuilder &&builder,
-                    std::uint32_t max_degree,
-                    std::uint64_t frozen_pts = 0);
+explicit FrozenGraphSnapshot(vamana::VamanaBuilder &&builder,
+                             std::uint64_t frozen_pts = 0);
 
 static FrozenGraphSnapshot from_vamana(vamana::VamanaBuilder &&builder,
-                                       std::uint32_t max_degree,
                                        std::uint64_t frozen_pts = 0);
 static FrozenGraphSnapshot load(const std::filesystem::path &path);
 
@@ -49,8 +47,10 @@ self-loops. `save()` reuses `vamana::save_graph`; `load()` consumes the same
 `frozen_pts` is preserved by snapshot save/load.
 
 `VamanaBuilder::release_graph() &&` transfers the outer adjacency vector and all
-per-node edge buffers. The builder is left with an empty graph, avoiding a second
-copy of a large edge set.
+per-node edge buffers. The snapshot derives its degree bound from the builder's
+new read-only `max_degree()` accessor, so callers cannot repeat an inconsistent
+R. The builder is left with an empty graph, avoiding a second copy of a large
+edge set.
 
 DiskANN adds the topology-independent artifact parameters and entry point:
 

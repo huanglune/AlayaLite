@@ -87,10 +87,11 @@ TEST_F(FrozenGraphSnapshotTest, VamanaConstructionTransfersAdjacencyOwnership) {
   builder.build();
   const auto medoid = builder.medoid();
 
-  auto snapshot = alaya::FrozenGraphSnapshot::from_vamana(std::move(builder), kDegree);
+  auto snapshot = alaya::FrozenGraphSnapshot::from_vamana(std::move(builder));
   EXPECT_TRUE(builder.graph().empty());
   EXPECT_EQ(snapshot.entry_point(), medoid);
   EXPECT_EQ(snapshot.num_points(), kRows);
+  EXPECT_EQ(snapshot.max_degree(), kDegree);
   EXPECT_NO_THROW(snapshot.validate());
 
   static_assert(!std::is_copy_constructible_v<alaya::FrozenGraphSnapshot>);

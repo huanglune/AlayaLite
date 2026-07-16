@@ -36,10 +36,8 @@ class FrozenGraphSnapshot {
 
   // Moving the outer adjacency vector transfers all per-node edge buffers in
   // constant time; no edge list is copied.
-  FrozenGraphSnapshot(vamana::VamanaBuilder &&builder,
-                      std::uint32_t max_degree,
-                      std::uint64_t frozen_pts = 0)
-      : entry_point_(builder.medoid()), max_degree_(max_degree), frozen_pts_(frozen_pts) {
+  explicit FrozenGraphSnapshot(vamana::VamanaBuilder &&builder, std::uint64_t frozen_pts = 0)
+      : entry_point_(builder.medoid()), max_degree_(builder.max_degree()), frozen_pts_(frozen_pts) {
     adjacency_ = std::move(builder).release_graph();
   }
 
@@ -49,9 +47,8 @@ class FrozenGraphSnapshot {
   auto operator=(FrozenGraphSnapshot &&) noexcept -> FrozenGraphSnapshot & = default;
 
   [[nodiscard]] static auto from_vamana(vamana::VamanaBuilder &&builder,
-                                        std::uint32_t max_degree,
                                         std::uint64_t frozen_pts = 0) -> FrozenGraphSnapshot {
-    return FrozenGraphSnapshot(std::move(builder), max_degree, frozen_pts);
+    return FrozenGraphSnapshot(std::move(builder), frozen_pts);
   }
 
   [[nodiscard]] auto adjacency() const noexcept -> const Adjacency & { return adjacency_; }
