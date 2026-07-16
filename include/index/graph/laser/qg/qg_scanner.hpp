@@ -63,6 +63,111 @@ inline void fused_scan_batch_generic(size_t padded_dim,
 
 #ifdef ALAYA_ARCH_X86
 
+ALAYA_TARGET_AVX512 ALAYA_ALWAYS_INLINE void estimate_sixteen_avx512(
+    __m256i accumulated_u16,
+    __m512i sumq,
+    __m512 sqr_y,
+    __m512 vl,
+    __m512 width,
+    __m512 sqr_qr,
+    const float *ALAYA_RESTRICT triple_x,
+    const float *ALAYA_RESTRICT fac_dq,
+    const float *ALAYA_RESTRICT fac_vq,
+    float *ALAYA_RESTRICT appro_dist) {
+  __m512i accumulated_i32 = _mm512_cvtepu16_epi32(accumulated_u16);
+  accumulated_i32 = _mm512_sub_epi32(_mm512_slli_epi32(accumulated_i32, 1), sumq);
+  const __m512 accumulated = _mm512_cvtepi32_ps(accumulated_i32);
+
+  #ifdef __FAST_MATH__
+  // Match the legacy AVX-512 estimator after -Ofast contraction:
+  // dq * width + (vq * vl + triple_x + sqr_y + sqr_qr).
+  const __m512 dq = _mm512_mul_ps(_mm512_loadu_ps(fac_dq), accumulated);
+  __m512 base = _mm512_add_ps(_mm512_loadu_ps(triple_x), sqr_y);
+  base = _mm512_fmadd_ps(_mm512_loadu_ps(fac_vq), vl, base);
+  base = _mm512_add_ps(base, sqr_qr);
+  _mm512_storeu_ps(appro_dist, _mm512_fmadd_ps(dq, width, base));
+  #else
+  // Without -ffast-math the legacy kernel retains its source-level order.
+  const __m512 dq = _mm512_mul_ps(_mm512_mul_ps(_mm512_loadu_ps(fac_dq), width), accumulated);
+  __m512 base = _mm512_add_ps(_mm512_loadu_ps(triple_x), sqr_y);
+  base = _mm512_fmadd_ps(_mm512_loadu_ps(fac_vq), vl, base);
+  base = _mm512_add_ps(dq, base);
+  _mm512_storeu_ps(appro_dist, _mm512_add_ps(base, sqr_qr));
+  #endif
+}
+
+ALAYA_TARGET_AVX512 inline void fused_scan_batch_avx512(size_t padded_dim,
+                                                        const uint8_t *ALAYA_RESTRICT packed_code,
+                                                        const uint8_t *ALAYA_RESTRICT lut_table,
+                                                        float sqr_y,
+                                                        float vl,
+                                                        float width,
+                                                        float sqr_qr,
+                                                        int32_t sumq,
+                                                        const float *ALAYA_RESTRICT triple_x,
+                                                        const float *ALAYA_RESTRICT fac_dq,
+                                                        const float *ALAYA_RESTRICT fac_vq,
+                                                        float *ALAYA_RESTRICT appro_dist) {
+  const size_t code_length = padded_dim << 2;
+  const __m512i low_mask = _mm512_set1_epi8(0x0f);
+  __m512i accu0 = _mm512_setzero_si512();
+  __m512i accu1 = _mm512_setzero_si512();
+  __m512i accu2 = _mm512_setzero_si512();
+  __m512i accu3 = _mm512_setzero_si512();
+
+  for (size_t i = 0; i < code_length; i += 64) {
+    const __m512i codes = _mm512_loadu_si512(&packed_code[i]);
+    const __m512i lut = _mm512_loadu_si512(&lut_table[i]);
+    const __m512i lo = _mm512_and_si512(codes, low_mask);
+    const __m512i hi = _mm512_and_si512(_mm512_srli_epi16(codes, 4), low_mask);
+    const __m512i res_lo = _mm512_shuffle_epi8(lut, lo);
+    const __m512i res_hi = _mm512_shuffle_epi8(lut, hi);
+
+    accu0 = _mm512_add_epi16(accu0, res_lo);
+    accu1 = _mm512_add_epi16(accu1, _mm512_srli_epi16(res_lo, 8));
+    accu2 = _mm512_add_epi16(accu2, res_hi);
+    accu3 = _mm512_add_epi16(accu3, _mm512_srli_epi16(res_hi, 8));
+  }
+
+  accu0 = _mm512_sub_epi16(accu0, _mm512_slli_epi16(accu1, 8));
+  accu2 = _mm512_sub_epi16(accu2, _mm512_slli_epi16(accu3, 8));
+
+  const __m512i ret1 = _mm512_add_epi16(_mm512_mask_blend_epi64(0b11110000, accu0, accu1),
+                                        _mm512_shuffle_i64x2(accu0, accu1, 0b01001110));
+  const __m512i ret2 = _mm512_add_epi16(_mm512_mask_blend_epi64(0b11110000, accu2, accu3),
+                                        _mm512_shuffle_i64x2(accu2, accu3, 0b01001110));
+  __m512i accumulated = _mm512_setzero_si512();
+  accumulated = _mm512_add_epi16(accumulated, _mm512_shuffle_i64x2(ret1, ret2, 0b10001000));
+  accumulated = _mm512_add_epi16(accumulated, _mm512_shuffle_i64x2(ret1, ret2, 0b11011101));
+
+  const __m512i sumq_simd = _mm512_set1_epi32(sumq);
+  const __m512 sqr_y_simd = _mm512_set1_ps(sqr_y);
+  const __m512 vl_simd = _mm512_set1_ps(vl);
+  const __m512 width_simd = _mm512_set1_ps(width);
+  const __m512 sqr_qr_simd = _mm512_set1_ps(sqr_qr);
+
+  estimate_sixteen_avx512(_mm512_castsi512_si256(accumulated),
+                          sumq_simd,
+                          sqr_y_simd,
+                          vl_simd,
+                          width_simd,
+                          sqr_qr_simd,
+                          triple_x,
+                          fac_dq,
+                          fac_vq,
+                          appro_dist);
+  estimate_sixteen_avx512(_mm512_extracti64x4_epi64(accumulated, 1),
+                          sumq_simd,
+                          sqr_y_simd,
+                          vl_simd,
+                          width_simd,
+                          sqr_qr_simd,
+                          triple_x + 16,
+                          fac_dq + 16,
+                          fac_vq + 16,
+                          appro_dist + 16);
+}
+
 template <bool kMatchAvx512Arithmetic>
 ALAYA_TARGET_AVX2 inline void estimate_eight_avx2(__m128i accumulated_u16,
                                                   __m256i sumq,
@@ -219,9 +324,7 @@ inline auto get_fused_scan_batch_func() -> FusedScanBatchFn {
 #ifdef ALAYA_ARCH_X86
   switch (simd::get_laser_simd_level()) {
     case simd::LaserSimdLevel::kAvx512:
-      // Zen4 executes AVX-512 as two 256-bit pumps. Use the AVX2 accumulator,
-      // but preserve the legacy AVX-512 estimator's contracted arithmetic.
-      return fused_scan_batch_avx2<true>;
+      return fused_scan_batch_avx512;
     case simd::LaserSimdLevel::kAvx2:
       return fused_scan_batch_avx2<false>;
     case simd::LaserSimdLevel::kGeneric:

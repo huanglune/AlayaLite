@@ -31,6 +31,20 @@ TEST(QGScannerFusedTest, RandomRowsAndQueriesMatchThreePassReferenceBitwise) {
   std::uniform_real_distribution<float> scale_dist(0.0001F, 2.0F);
   std::uniform_real_distribution<float> lower_dist(-8.0F, 8.0F);
 #ifdef ALAYA_ARCH_X86
+  const auto &features = ::alaya::simd::get_cpu_features();
+  const bool has_avx512_bw = features.avx512f_ && features.avx512bw_;
+  if (has_avx512_bw) {
+    ASSERT_EQ(qg_scanner_detail::get_fused_scan_batch_func(),
+              qg_scanner_detail::fused_scan_batch_avx512);
+  } else {
+    ASSERT_EQ(qg_scanner_detail::get_fused_scan_batch_func(),
+              qg_scanner_detail::fused_scan_batch_avx2<false>);
+  }
+  simd::AccumulateFn volatile avx512_accumulate = simd::detail::accumulate_impl_avx512;
+  simd::ConvertAccumFn volatile avx512_convert = simd::detail::convert_accum_to_float_avx512;
+  simd::AppDistFn volatile avx512_estimate = simd::detail::appro_dist_impl_avx512;
+  qg_scanner_detail::FusedScanBatchFn volatile avx512_fused_scan =
+      qg_scanner_detail::fused_scan_batch_avx512;
   simd::AccumulateFn volatile avx2_accumulate = simd::detail::accumulate_impl_avx2;
   simd::ConvertAccumFn volatile avx2_convert = simd::detail::convert_accum_to_float_avx2;
   simd::AppDistFn volatile avx2_estimate = simd::detail::appro_dist_impl_avx2;
@@ -50,6 +64,10 @@ TEST(QGScannerFusedTest, RandomRowsAndQueriesMatchThreePassReferenceBitwise) {
       std::vector<float> fused(degree_bound);
       std::vector<float> reference(degree_bound);
 #ifdef ALAYA_ARCH_X86
+      alignas(64) std::array<uint16_t, kBatchSize> avx512_accumulated{};
+      alignas(64) std::array<float, kBatchSize> avx512_converted{};
+      alignas(64) std::array<float, kBatchSize> avx512_fused{};
+      alignas(64) std::array<float, kBatchSize> avx512_reference{};
       alignas(64) std::array<uint16_t, kBatchSize> avx2_accumulated{};
       alignas(64) std::array<float, kBatchSize> avx2_converted{};
       alignas(64) std::array<float, kBatchSize> avx2_fused{};
@@ -105,9 +123,8 @@ TEST(QGScannerFusedTest, RandomRowsAndQueriesMatchThreePassReferenceBitwise) {
         }
 
 #ifdef ALAYA_ARCH_X86
-        // The deployment CPU selects the legacy AVX-512 arithmetic oracle,
-        // while the fused accumulator itself is intentionally AVX2. Exercise
-        // the AVX2-only dispatch mode explicitly as well.
+        // Force both x86 dispatch modes through indirect calls so the compiler
+        // cannot inline and reassociate either side of the legacy comparison.
         const float *triple_x = factors.data();
         const float *fac_dq = triple_x + degree_bound;
         const float *fac_vq = fac_dq + degree_bound;
@@ -145,6 +162,39 @@ TEST(QGScannerFusedTest, RandomRowsAndQueriesMatchThreePassReferenceBitwise) {
                       std::bit_cast<uint32_t>(avx2_reference[lane]))
                 << "AVX2 degree_bound=" << degree_bound << " padded_dim=" << padded_dim
                 << " trial=" << trial << " batch=" << batch << " lane=" << lane;
+          }
+
+          if (has_avx512_bw) {
+            avx512_accumulate(padded_dim, batch_codes, lut.data(), avx512_accumulated.data());
+            avx512_convert(kBatchSize, avx512_accumulated.data(), sumq, avx512_converted.data());
+            avx512_estimate(kBatchSize,
+                            sqr_y,
+                            width,
+                            vl,
+                            sqr_qr,
+                            avx512_converted.data(),
+                            triple_x + batch,
+                            fac_dq + batch,
+                            fac_vq + batch,
+                            avx512_reference.data());
+            avx512_fused_scan(padded_dim,
+                              batch_codes,
+                              lut.data(),
+                              sqr_y,
+                              vl,
+                              width,
+                              sqr_qr,
+                              sumq,
+                              triple_x + batch,
+                              fac_dq + batch,
+                              fac_vq + batch,
+                              avx512_fused.data());
+            for (size_t lane = 0; lane < kBatchSize; ++lane) {
+              ASSERT_EQ(std::bit_cast<uint32_t>(avx512_fused[lane]),
+                        std::bit_cast<uint32_t>(avx512_reference[lane]))
+                  << "AVX512 degree_bound=" << degree_bound << " padded_dim=" << padded_dim
+                  << " trial=" << trial << " batch=" << batch << " lane=" << lane;
+            }
           }
         }
 #endif
