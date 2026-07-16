@@ -17,7 +17,9 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 #include "index/graph/laser/quantization/fastscan_impl.hpp"
@@ -33,6 +35,12 @@ namespace alaya::laser {
  */
 class QGScanner {
  private:
+  // Scratch upper bound: rows are packed at degree_bound edges (R64 is the
+  // largest shipped config). Keeping the accumulator on the stack matters —
+  // scan_neighbors runs once per pop, and a heap-allocated scratch pair per
+  // pop showed up as a large share of the kernel-section audit's scan gap.
+  static constexpr size_t kMaxDegreeBound = 64;
+
   size_t padded_dim_ = 0;
   size_t degree_bound_ = 0;
   simd::AccumulateFn accumulate_ = nullptr;
@@ -47,7 +55,11 @@ class QGScanner {
         degree_bound_(degree_bound),
         accumulate_(simd::get_accumulate_func()),
         convert_(simd::get_convert_func()),
-        compute_appro_dist_(simd::get_appro_dist_func()) {}
+        compute_appro_dist_(simd::get_appro_dist_func()) {
+    if (degree_bound_ > kMaxDegreeBound) {
+      throw std::invalid_argument("QGScanner: degree_bound exceeds kMaxDegreeBound scratch");
+    }
+  }
 
   void pack_lut(const uint8_t *ALAYA_RESTRICT byte_query, uint8_t *ALAYA_RESTRICT LUT) const {
     pack_lut_impl(padded_dim_, byte_query, LUT);
@@ -62,7 +74,7 @@ class QGScanner {
                       int32_t sumq,
                       const uint8_t *packed_code,
                       const float *factor) const {
-    std::vector<uint16_t> result(degree_bound_);
+    alignas(64) std::array<uint16_t, kMaxDegreeBound> result;
 
     /* Compute block by block */
     for (size_t i = 0; i < degree_bound_; i += kBatchSize) {
@@ -71,7 +83,7 @@ class QGScanner {
     }
 
     /* Cast to float, multiply by 2, subtract sumq. */
-    std::vector<float> result_float(degree_bound_);
+    alignas(64) std::array<float, kMaxDegreeBound> result_float;
     convert_(degree_bound_, result.data(), sumq, result_float.data());
     const float *triple_x = factor;
     const float *fac_dq = &triple_x[degree_bound_];
