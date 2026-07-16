@@ -44,13 +44,13 @@
 #include <unordered_set>
 #include <vector>
 
+#include "coro/coro_gate.hpp"
 #include "coro/sync_wait.hpp"
 #include "coro/task.hpp"
 #include "coro/thread_pool.hpp"
 #include "coro/when_all.hpp"
 #include "index/graph/diskann/beam_search.hpp"
 #include "index/graph/diskann/beam_search_async.hpp"
-#include "index/graph/diskann/detail/coro_gate.hpp"
 #include "index/graph/diskann/disk_layout.hpp"
 #include "index/graph/diskann/disk_page_io.hpp"
 #include "index/graph/diskann/disk_update_context.hpp"
