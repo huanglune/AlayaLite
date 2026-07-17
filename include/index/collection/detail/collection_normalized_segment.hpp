@@ -205,13 +205,22 @@ class L2NormalizedQuerySegment {
 [[nodiscard]] inline auto make_l2_normalized_query_segment(core::AnySegment inner)
     -> core::Result<core::AnySegment> {
   const auto descriptor = inner.descriptor();
+  // `none` covers HNSW's raw (unquantized) cosine path; `engine_quantized`
+  // covers QG, which always RaBitQ-quantizes internally regardless of metric
+  // (see QgSegment::descriptor()) -- that internal quantization is orthogonal
+  // to whether this external l2-normalization wrap has already been applied.
+  // The only state that must never be re-wrapped is l2_normalized itself
+  // (double-normalizing queries would be wrong).
+  const auto inner_not_yet_normalized =
+      descriptor.preprocessing == core::MetricPreprocessing::none ||
+      descriptor.preprocessing == core::MetricPreprocessing::engine_quantized;
   if (descriptor.metric != core::Metric::cosine ||
-      descriptor.stored_scalar_type != core::ScalarType::float32 ||
-      descriptor.preprocessing != core::MetricPreprocessing::none) {
+      descriptor.stored_scalar_type != core::ScalarType::float32 || !inner_not_yet_normalized) {
     return core::Status::error(core::StatusCode::invalid_argument,
                                core::OperationStage::admission,
                                core::StatusDetail::malformed_struct,
-                               "L2-normalized query adapter requires a raw float32 cosine segment");
+                               "L2-normalized query adapter requires an unwrapped float32 cosine "
+                               "segment");
   }
   const auto inner_capabilities = inner.capabilities();
   if (!inner_capabilities.supports(core::OperationCapability::search) ||

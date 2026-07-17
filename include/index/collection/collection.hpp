@@ -717,9 +717,6 @@ class Collection {
     } else if (requested_algorithm == core::algorithm::qg && live_row_count <= 32) {
       resolution.fallback_reason = "qg requires >32 live rows; built Flat instead";
     } else if (requested_algorithm == core::algorithm::qg &&
-               schema.metric == core::Metric::cosine) {
-      resolution.fallback_reason = "qg cosine is not enabled for RaBitQ; built Flat instead";
-    } else if (requested_algorithm == core::algorithm::qg &&
                schema.scalar_type != core::ScalarType::float32) {
       resolution.fallback_reason = "qg requires float32 vectors; built Flat instead";
     } else {

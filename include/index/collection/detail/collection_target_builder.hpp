@@ -274,8 +274,15 @@ inline constexpr std::array<CollectionTargetRegistration, 4> kCollectionTargetRe
                                             core::RowCount row_count,
                                             const CollectionTargetBuildParams &params)
     -> TargetSupport {
-  const auto metric_supported =
-      schema.metric == core::Metric::l2 || schema.metric == core::Metric::inner_product;
+  // Cosine reuses the same L2NormalizedQuerySegment adapter HNSW's cosine
+  // path uses (see collection_normalized_segment.hpp): normalize rows before
+  // RaBitQ fit()/quantize, then wrap queries at the boundary. RaBitQSpace
+  // itself already treats cosine as an alias for the IP kernel (see
+  // rabitq_space.hpp's set_metric_function()/metric()), so this is the only
+  // gate that needs to change to light it up.
+  const auto metric_supported = schema.metric == core::Metric::l2 ||
+                                schema.metric == core::Metric::inner_product ||
+                                schema.metric == core::Metric::cosine;
   constexpr std::uint8_t kRaBitQQuantization = 3;
   return static_cast<std::uint8_t>(params.quantization) == kRaBitQQuantization &&
                  schema.scalar_type == core::ScalarType::float32 && metric_supported &&
@@ -600,6 +607,12 @@ template <typename SearchSpace, typename BuildSpace>
     return harvested.status();
   }
   auto vectors = std::move(harvested).value();
+  if (schema.metric == core::Metric::cosine) {
+    auto status = l2_normalize_float_rows(vectors, schema.dim, core::OperationStage::build);
+    if (!status.ok()) {
+      return status;
+    }
+  }
   core::AnySegment erased;
   try {
     const auto count = static_cast<std::uint32_t>(vectors.size() / schema.dim);
@@ -621,6 +634,17 @@ template <typename SearchSpace, typename BuildSpace>
   } catch (...) {
     return core::status_from_exception(core::OperationStage::build);
   }
+  if (schema.metric == core::Metric::cosine) {
+    // QgSegment::descriptor() always reports engine_quantized (RaBitQ is the
+    // only quantization QG has), so the wrap below relies on
+    // make_l2_normalized_query_segment() accepting engine_quantized inner
+    // segments, not just none -- see collection_normalized_segment.hpp.
+    auto normalized = make_l2_normalized_query_segment(std::move(erased));
+    if (!normalized.ok()) {
+      return normalized.status();
+    }
+    erased = std::move(normalized).value();
+  }
 
   const auto *registration = find_collection_target_registration(core::algorithm::qg);
   MemoryCollectionTargetDefinition definition;
@@ -628,7 +652,9 @@ template <typename SearchSpace, typename BuildSpace>
   definition.implementation_key = registration->implementation_key;
   definition.factory_key = registration->factory_key;
   definition.format_version = Segment::kFormatVersion;
-  definition.preprocessing = core::MetricPreprocessing::engine_quantized;
+  definition.preprocessing = schema.metric == core::Metric::cosine
+                                 ? core::MetricPreprocessing::l2_normalized
+                                 : core::MetricPreprocessing::engine_quantized;
   definition.entry_extensions.emplace("quantization", "rabitq");
   definition.entry_extensions.emplace("ef_build", std::to_string(params.ef_construction));
   definition.entry_extensions.emplace("thread_count", std::to_string(params.thread_count));
@@ -1111,7 +1137,8 @@ template <typename Segment>
       entry.format_version != Segment::kFormatVersion ||
       entry.lifecycle == SegmentLifecycleV2::retired ||
       schema.scalar_type != core::ScalarType::float32 ||
-      (schema.metric != core::Metric::l2 && schema.metric != core::Metric::inner_product)) {
+      (schema.metric != core::Metric::l2 && schema.metric != core::Metric::inner_product &&
+       schema.metric != core::Metric::cosine)) {
     return core::Status::error(core::StatusCode::not_supported,
                                core::OperationStage::open,
                                core::StatusDetail::operation_slot_absent,
@@ -1121,8 +1148,14 @@ template <typename Segment>
   const auto scalar = entry.extensions.find("stored_scalar_type");
   const auto preprocessing = entry.extensions.find("preprocessing");
   const auto quantization = entry.extensions.find("quantization");
+  // QG always RaBitQ-quantizes internally, so unlike HNSW's three-way
+  // preprocessing split, only cosine (external l2 normalization on top of
+  // that internal quantization) needs to diverge from the plain
+  // engine_quantized tag -- mirrors build_qg_collection_target()'s write side.
+  const auto expected_preprocessing =
+      schema.metric == core::Metric::cosine ? "l2_normalized" : "engine_quantized";
   if (scalar == entry.extensions.end() || scalar->second != "float32" ||
-      preprocessing == entry.extensions.end() || preprocessing->second != "engine_quantized" ||
+      preprocessing == entry.extensions.end() || preprocessing->second != expected_preprocessing ||
       quantization == entry.extensions.end() || quantization->second != "rabitq") {
     return core::Status::error(core::StatusCode::corruption,
                                core::OperationStage::open,
@@ -1157,7 +1190,11 @@ template <typename Segment>
                                  core::StatusDetail::malformed_struct,
                                  "QG replacement descriptor disagrees with the Collection schema");
     }
-    return Segment::into_any(std::move(opened));
+    auto erased_result = Segment::into_any(std::move(opened));
+    if (!erased_result.ok() || schema.metric != core::Metric::cosine) {
+      return erased_result;
+    }
+    return make_l2_normalized_query_segment(std::move(erased_result).value());
   } catch (...) {
     return core::status_from_exception(core::OperationStage::open);
   }

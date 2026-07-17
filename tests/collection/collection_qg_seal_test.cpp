@@ -90,6 +90,18 @@ struct Dataset {
   return result;
 }
 
+[[nodiscard]] auto make_cosine_dataset(core::RowCount rows) -> Dataset<float> {
+  auto result = make_float_dataset(rows);
+  for (core::RowCount row = 0; row < rows; ++row) {
+    const auto scale = 0.25F + static_cast<float>((row * 17U) % 29U);
+    for (std::uint32_t column = 0; column < kDim; ++column) {
+      result.vectors[static_cast<std::size_t>(row * kDim + column)] *= scale;
+    }
+  }
+  std::fill_n(result.vectors.begin(), kDim, 0.0F);
+  return result;
+}
+
 [[nodiscard]] auto make_int8_dataset(core::RowCount rows) -> Dataset<std::int8_t> {
   Dataset<std::int8_t> result;
   result.vectors.resize(static_cast<std::size_t>(rows * kDim));
@@ -123,6 +135,23 @@ struct Dataset {
     }
   }
   return result;
+}
+
+[[nodiscard]] auto make_cosine_queries(const Dataset<float> &dataset, core::RowCount query_count)
+    -> std::vector<float> {
+  std::vector<float> queries(static_cast<std::size_t>(query_count * kDim));
+  for (core::RowCount query = 0; query < query_count; ++query) {
+    const auto source = (query * 23U + 7U) % dataset.ids.size();
+    const auto query_scale = 0.5F + static_cast<float>((query * 11U) % 13U);
+    for (std::uint32_t column = 0; column < kDim; ++column) {
+      const auto perturbation =
+          static_cast<float>(static_cast<int>((query + column) % 7U) - 3) * 0.002F;
+      queries[static_cast<std::size_t>(query * kDim + column)] =
+          (dataset.vectors[static_cast<std::size_t>(source * kDim + column)] + perturbation) *
+          query_scale;
+    }
+  }
+  return queries;
 }
 
 [[nodiscard]] auto make_options(const std::filesystem::path &root,
@@ -163,14 +192,27 @@ void insert_dataset(Collection &collection, const Dataset<T> &dataset) {
     -> float {
   double l2{};
   double dot{};
+  double query_norm{};
+  double candidate_norm{};
   for (std::uint32_t column = 0; column < kDim; ++column) {
     const auto lhs = static_cast<double>(query[column]);
     const auto rhs = static_cast<double>(candidate[column]);
     const auto difference = lhs - rhs;
     l2 += difference * difference;
     dot += lhs * rhs;
+    query_norm += lhs * lhs;
+    candidate_norm += rhs * rhs;
   }
-  return metric == core::Metric::l2 ? static_cast<float>(l2) : static_cast<float>(-dot);
+  if (metric == core::Metric::l2) {
+    return static_cast<float>(l2);
+  }
+  if (metric == core::Metric::inner_product) {
+    return static_cast<float>(-dot);
+  }
+  if (query_norm == 0 || candidate_norm == 0) {
+    return 0.0F;
+  }
+  return static_cast<float>(-dot / std::sqrt(query_norm * candidate_norm));
 }
 
 [[nodiscard]] auto exact_oracle(const Dataset<float> &dataset,
@@ -260,7 +302,8 @@ void expect_response_ids(const CollectionSearchResponse &response,
   }
 }
 
-void expect_qg_manifest(const std::filesystem::path &root) {
+void expect_qg_manifest(const std::filesystem::path &root,
+                        std::string_view preprocessing = "engine_quantized") {
   const auto manifest = internal::collection::ArtifactManifestV2::load(
       root / internal::collection::kCollectionManifestFilename);
   const auto target = std::ranges::find_if(manifest.segments, [](const auto &entry) {
@@ -272,7 +315,7 @@ void expect_qg_manifest(const std::filesystem::path &root) {
   EXPECT_EQ(target->reader_compatibility.required_features,
             (std::vector<std::string>{"qg_segment"}));
   EXPECT_EQ(target->extensions.at("stored_scalar_type"), "float32");
-  EXPECT_EQ(target->extensions.at("preprocessing"), "engine_quantized");
+  EXPECT_EQ(target->extensions.at("preprocessing"), preprocessing);
   EXPECT_EQ(target->extensions.at("quantization"), "rabitq");
 
   std::set<std::string> artifact_names;
@@ -465,6 +508,141 @@ INSTANTIATE_TEST_SUITE_P(QgFloat32,
                            return info.param == core::Metric::l2 ? "L2" : "InnerProduct";
                          });
 
+TEST(CollectionQgCosineSeal, NormalizesRecallsReopensHandlesZeroAndMergesWithActiveFlat) {
+  TemporaryDirectory temporary("cosine");
+  const auto dataset = make_cosine_dataset(kRows);
+  const auto queries = make_cosine_queries(dataset, kQueryCount);
+  const auto oracle = exact_oracle(dataset,
+                                   std::span<const float>(queries),
+                                   kQueryCount,
+                                   kTopK,
+                                   core::Metric::cosine);
+
+  auto created = Collection::create(make_options(temporary.path(), core::Metric::cosine));
+  ASSERT_TRUE(created.ok()) << created.status().diagnostic();
+  auto collection = std::move(created).value();
+  insert_dataset(*collection, dataset);
+
+  auto sealed = collection->seal();
+  ASSERT_TRUE(sealed.ok()) << sealed.status().diagnostic();
+  EXPECT_EQ(sealed.value().built_algorithm, core::algorithm::qg);
+  EXPECT_FALSE(sealed.value().flat_fallback);
+  EXPECT_TRUE(sealed.value().fallback_reason.empty());
+  EXPECT_GT(sealed.value().sealed_bytes, 0U);
+  expect_qg_manifest(temporary.path(), "l2_normalized");
+
+  const auto manifest = internal::collection::ArtifactManifestV2::load(
+      temporary.path() / internal::collection::kCollectionManifestFilename);
+  const auto target = std::ranges::find_if(manifest.segments, [](const auto &entry) {
+    return entry.lifecycle == internal::collection::SegmentLifecycleV2::sealed;
+  });
+  ASSERT_NE(target, manifest.segments.end());
+  core::OpenContext open_context;
+  const internal::collection::CollectionSchema schema{kDim,
+                                                      core::Metric::cosine,
+                                                      core::ScalarType::float32};
+  auto opened = internal::collection::detail::open_qg_collection_target(temporary.path(),
+                                                                        *target,
+                                                                        schema,
+                                                                        open_context);
+  ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
+  const auto descriptor = opened.value().descriptor();
+  EXPECT_EQ(descriptor.algorithm_id, core::algorithm::qg);
+  EXPECT_EQ(descriptor.metric, core::Metric::cosine);
+  EXPECT_EQ(descriptor.stored_scalar_type, core::ScalarType::float32);
+  EXPECT_EQ(descriptor.preprocessing, core::MetricPreprocessing::l2_normalized);
+
+  auto before =
+      collection->batch_search(core::TypedTensorView::contiguous(queries.data(), kQueryCount, kDim),
+                               kTopK);
+  ASSERT_TRUE(before.ok()) << before.status().diagnostic();
+  ASSERT_EQ(before.value().valid_counts,
+            std::vector<core::RowCount>(static_cast<std::size_t>(kQueryCount), kTopK));
+  const auto recall = recall_at_k(before.value(), oracle);
+  std::cout << "measured_qg_cosine_recall_at_10=" << std::fixed << std::setprecision(4) << recall
+            << '\n';
+  EXPECT_GE(recall, 0.95);
+
+  std::vector<float> zero_query(kDim, 0.0F);
+  const auto zero_oracle =
+      exact_oracle(dataset, std::span<const float>(zero_query), 1, kRows, core::Metric::cosine);
+  auto zero_before =
+      collection->search(core::TypedTensorView::contiguous(zero_query.data(), 1, kDim), kRows);
+  ASSERT_TRUE(zero_before.ok()) << zero_before.status().diagnostic();
+  ASSERT_EQ(zero_before.value().valid_counts, (std::vector<core::RowCount>{kRows}));
+  expect_response_ids(zero_before.value(), zero_oracle);
+  for (const auto score : zero_before.value().distances) {
+    EXPECT_FLOAT_EQ(score, 0.0F);
+  }
+
+  auto retained = collection->get_by_id(dataset.ids[1], CollectionProjection::vector);
+  ASSERT_TRUE(retained.ok()) << retained.status().diagnostic();
+  ASSERT_TRUE(retained.value().vector.has_value());
+  const auto retained_view = retained.value().vector->view();
+  for (std::uint32_t column = 0; column < kDim; ++column) {
+    EXPECT_FLOAT_EQ(retained_view.row<float>(0)[column], dataset.vectors[kDim + column]);
+  }
+
+  ASSERT_TRUE(collection->close().ok());
+  collection.reset();
+  auto reopened_result = Collection::open(temporary.path());
+  ASSERT_TRUE(reopened_result.ok()) << reopened_result.status().diagnostic();
+  auto reopened = std::move(reopened_result).value();
+  auto after =
+      reopened->batch_search(core::TypedTensorView::contiguous(queries.data(), kQueryCount, kDim),
+                             kTopK);
+  ASSERT_TRUE(after.ok()) << after.status().diagnostic();
+  EXPECT_EQ(after.value().offsets, before.value().offsets);
+  EXPECT_EQ(after.value().valid_counts, before.value().valid_counts);
+  EXPECT_EQ(after.value().ids, before.value().ids);
+  EXPECT_EQ(after.value().distances, before.value().distances);
+  EXPECT_GE(recall_at_k(after.value(), oracle), 0.95);
+
+  auto zero_after =
+      reopened->search(core::TypedTensorView::contiguous(zero_query.data(), 1, kDim), kRows);
+  ASSERT_TRUE(zero_after.ok()) << zero_after.status().diagnostic();
+  EXPECT_EQ(zero_after.value().ids, zero_before.value().ids);
+  EXPECT_EQ(zero_after.value().distances, zero_before.value().distances);
+
+  auto retained_after = reopened->get_by_id(dataset.ids[1], CollectionProjection::vector);
+  ASSERT_TRUE(retained_after.ok()) << retained_after.status().diagnostic();
+  ASSERT_TRUE(retained_after.value().vector.has_value());
+  const auto retained_after_view = retained_after.value().vector->view();
+  for (std::uint32_t column = 0; column < kDim; ++column) {
+    EXPECT_FLOAT_EQ(retained_after_view.row<float>(0)[column], dataset.vectors[kDim + column]);
+  }
+
+  std::vector<float> active_vector(queries.begin(), queries.begin() + kDim);
+  CollectionItem active;
+  active.logical_id = core::LogicalId::from_utf8("active-best");
+  active.vector = core::TypedTensorView::contiguous(active_vector.data(), 1, kDim);
+  auto added = reopened->add(std::move(active));
+  ASSERT_TRUE(added.ok()) << added.status().diagnostic();
+  auto mixed =
+      reopened->search(core::TypedTensorView::contiguous(active_vector.data(), 1, kDim), 5);
+  ASSERT_TRUE(mixed.ok()) << mixed.status().diagnostic();
+  ASSERT_EQ(mixed.value().valid_counts, (std::vector<core::RowCount>{5}));
+  ASSERT_EQ(mixed.value().ids.front(), core::LogicalId::from_utf8("active-best"));
+  EXPECT_NEAR(mixed.value().distances.front(), -1.0F, 1.0e-5F);
+  const auto sealed_oracle =
+      exact_oracle(dataset, std::span<const float>(active_vector), 1, 4, core::Metric::cosine);
+  for (std::size_t rank = 0; rank < sealed_oracle.front().size(); ++rank) {
+    EXPECT_EQ(mixed.value().ids[rank + 1], sealed_oracle.front()[rank]);
+  }
+  for (std::size_t index = 1; index < mixed.value().distances.size(); ++index) {
+    EXPECT_LE(mixed.value().distances[index - 1], mixed.value().distances[index]);
+    const auto found = std::ranges::find(dataset.ids, mixed.value().ids[index]);
+    ASSERT_NE(found, dataset.ids.end());
+    const auto row = static_cast<std::size_t>(std::distance(dataset.ids.begin(), found));
+    EXPECT_NEAR(mixed.value().distances[index],
+                exact_score(active_vector.data(),
+                            dataset.vectors.data() + row * kDim,
+                            core::Metric::cosine),
+                1.0e-4F);
+  }
+  ASSERT_TRUE(reopened->close().ok());
+}
+
 TEST(CollectionQgFallback, RejectsForeignRabitqAndHonestlyFallsBackForUnsupportedQgSchemas) {
   {
     TemporaryDirectory temporary("foreign-rabitq-hnsw");
@@ -486,7 +664,8 @@ TEST(CollectionQgFallback, RejectsForeignRabitqAndHonestlyFallsBackForUnsupporte
     auto rejected = Collection::create(options);
     ASSERT_FALSE(rejected.ok());
     EXPECT_EQ(rejected.status().code(), core::StatusCode::not_supported);
-    EXPECT_NE(rejected.status().diagnostic().find("target algorithm is unsupported"), std::string::npos);
+    EXPECT_NE(rejected.status().diagnostic().find("target algorithm is unsupported"),
+              std::string::npos);
   }
 
   {
@@ -506,21 +685,9 @@ TEST(CollectionQgFallback, RejectsForeignRabitqAndHonestlyFallsBackForUnsupporte
     ASSERT_TRUE(collection->close().ok());
   }
 
-  {
-    TemporaryDirectory temporary("cosine-fallback");
-    const auto dataset = make_float_dataset(kRows);
-    auto created = Collection::create(make_options(temporary.path(), core::Metric::cosine));
-    ASSERT_TRUE(created.ok()) << created.status().diagnostic();
-    auto collection = std::move(created).value();
-    insert_dataset(*collection, dataset);
-    auto sealed = collection->seal();
-    ASSERT_TRUE(sealed.ok()) << sealed.status().diagnostic();
-    EXPECT_EQ(sealed.value().built_algorithm, core::algorithm::flat);
-    EXPECT_TRUE(sealed.value().flat_fallback);
-    EXPECT_NE(sealed.value().fallback_reason.find("cosine"), std::string::npos);
-    expect_flat_manifest(temporary.path());
-    ASSERT_TRUE(collection->close().ok());
-  }
+  // Cosine used to be a qg fallback-to-flat trigger; it is now a supported
+  // qg target (see CollectionQgCosineSeal), so that scenario moved out of
+  // this "honest fallback" test and is no longer exercised here.
 
   {
     TemporaryDirectory temporary("small-fallback");
