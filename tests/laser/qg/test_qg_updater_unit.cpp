@@ -583,6 +583,90 @@ TEST(QGSuperblockSelector, FailsClosedOnUnsupportedNewerSlot) {
   }
 }
 
+// BLOCKER-3: the extended fail-closed matrix. Structural validity is magic+checksum ONLY, so
+// a checksum-legal FUTURE outer version is picked as highest-gen then rejected (-2) instead of
+// downgraded; v2/v3 canonical-zero, inactive-state, and activation ordering are enforced.
+namespace {
+QGSuperblockV2 make_future_version_slot(uint64_t gen, uint32_t outer_version) {
+  QGSuperblockV2 sb{};
+  sb.magic = kQGSuperblockMagic;
+  sb.format_version = outer_version;  // e.g. 4: a format this build does not know
+  sb.generation = gen;
+  sb.free_list_head = kPidMax;
+  sb.checksum = qg_superblock_checksum(sb);  // checksum-legal, so structurally valid
+  return sb;
+}
+QGSuperblockV2 make_v3_full(uint64_t gen, uint32_t required, uint64_t maint_gen, uint64_t pid_gen,
+                            uint32_t max_gen, uint32_t nz) {
+  QGSuperblockV2 sb{};
+  sb.magic = kQGSuperblockMagic;
+  sb.format_version = kQGFormatVersionV3;
+  sb.generation = gen;
+  sb.free_list_head = kPidMax;
+  auto *b = sb.reserved.data() + kWal2cReservedOffset;
+  const uint64_t magic = kWal2cMagic;
+  std::memcpy(b + 0, &magic, 8);
+  const uint32_t layout = kWal2cLayoutVersion;
+  std::memcpy(b + 8, &layout, 4);
+  std::memcpy(b + 12, &required, 4);
+  std::memcpy(b + 24, &maint_gen, 8);
+  std::memcpy(b + 32, &pid_gen, 8);
+  std::memcpy(b + 40, &max_gen, 4);
+  std::memcpy(b + 44, &nz, 4);
+  sb.checksum = qg_superblock_checksum(sb);
+  return sb;
+}
+}  // namespace
+
+TEST(QGSuperblockSelector, FailsClosedOnFutureVersionAndCraftedReservedState) {
+  QGSuperblockV2 out{};
+  constexpr uint32_t kMaintPair = kQgFeatMaintenanceTxV1 | kQgFeatPostRedoFreeListV1;
+  constexpr uint32_t kPidTriple =
+      kQgFeatPidGenerationV1 | kQgFeatCanonicalPrebindV1 | kQgFeatMutableLabelSlotV1;
+
+  // A checksum-legal FUTURE outer version (v4) in the newer slot rejects the WHOLE file --
+  // NOT a silent downgrade to the older v2 (the BLOCKER-3 core: structural validity ignores
+  // the version so the newest slot is the one the support gate judges).
+  {
+    const auto header = pack_header(make_v2_slot(10), make_future_version_slot(11, 4));
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kQgSupportedRequiredFeatures), -2);
+  }
+  // A v2 whose 2C reserved region is NOT canonical-zero (a stray activation generation at
+  // reserved[80]) is rejected -- a forged v2 cannot smuggle 2C state.
+  {
+    auto dirty = make_v2_slot(11);
+    const uint64_t stray = 7;
+    std::memcpy(dirty.reserved.data() + kWal2cReservedOffset + 24, &stray, 8);
+    dirty.checksum = qg_superblock_checksum(dirty);
+    const auto header = pack_header(make_v2_slot(10), dirty);
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kQgSupportedRequiredFeatures), -2);
+  }
+  // A maintenance-only v3 (no pid triple) MUST have zero pid activation gen + summary; a stray
+  // pid_reuse_activation_gen is an inactive-state violation -> reject.
+  {
+    const auto bad = make_v3_full(11, kMaintPair, /*maint_gen=*/5, /*pid_gen=*/6,
+                                  /*max_gen=*/0, /*nz=*/0);
+    const auto header = pack_header(make_v2_slot(10), bad);
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kQgSupportedRequiredFeatures), -2);
+  }
+  // A full pid-triple v3 whose pid activation generation PRECEDES maintenance activation is an
+  // impossible ordering -> reject.
+  {
+    const auto bad = make_v3_full(11, kMaintPair | kPidTriple, /*maint_gen=*/5, /*pid_gen=*/3,
+                                  /*max_gen=*/1, /*nz=*/1);
+    const auto header = pack_header(make_v2_slot(10), bad);
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kQgSupportedRequiredFeatures), -2);
+  }
+  // A well-formed pid-triple v3 (pid_gen >= maint_gen, summary present) is accepted.
+  {
+    const auto ok = make_v3_full(11, kMaintPair | kPidTriple, /*maint_gen=*/5, /*pid_gen=*/5,
+                                 /*max_gen=*/2, /*nz=*/1);
+    const auto header = pack_header(make_v2_slot(10), ok);
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kQgSupportedRequiredFeatures), 1);
+    EXPECT_EQ(out.format_version, kQGFormatVersionV3);
+  }
+}
+
 TEST_F(QGUpdaterIndexTest, MigratesV1DegreesAndPreservesSearchExactly) {
   const std::string prefix = (tiny_->dir / "migrate").string();
   copy_index_artifact(tiny_->v1_prefix, prefix);

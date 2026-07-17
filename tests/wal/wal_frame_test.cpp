@@ -351,5 +351,38 @@ TEST(WalFileStreamingApi, StructureStreamingScanMatchesEagerScan) {
   std::filesystem::remove_all(root);
 }
 
+// wal-2c MAJOR-4: truncate_to() on a stream-recovery WalFile must re-scan the tail with the
+// PAYLOAD-FREE streaming scan (not the eager scan_path that retains every frame). Otherwise a
+// torn canonical/maintenance tail truncation on a multi-GiB log would reintroduce O(WAL bytes)
+// recovery memory. A default (eager) WalFile keeps the old behavior (frames retained).
+TEST(WalFileStreamingApi, StreamTruncateToDoesNotRetainPayload) {
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("wal_frame_streamtrunc_" + std::to_string(::getpid()));
+  std::filesystem::create_directories(root);
+  const auto path = root / "seg.opwal";
+  std::vector<FrameLocation> locs;
+  {
+    WalFile wal(path, /*stream_recovery=*/true);
+    for (unsigned i = 0; i < 8; ++i) {
+      locs.push_back(wal.append(/*type=*/5, 0, i, i, bytes_of({i, 0xAA, 0xBB, 0xCC}),
+                                WalFile::Sync::fsync));
+    }
+    // Truncate back to the 4th frame boundary (as a torn-tail semantic truncation would).
+    wal.truncate_to(locs[4].offset);
+    EXPECT_EQ(wal.recovery_scan().valid_bytes, locs[4].offset);
+    EXPECT_TRUE(wal.recovery_scan().frames.empty())
+        << "stream-mode truncate_to must not retain frame payloads";
+  }
+  // An eager (default) WalFile truncated to the same boundary DOES retain the frames -- proves
+  // the streaming path is the one that changed, and the wire/behavior of the default is intact.
+  {
+    WalFile wal(path, /*stream_recovery=*/false);  // reopens at the truncated boundary (4 frames)
+    EXPECT_EQ(wal.recovery_scan().frames.size(), 4U);
+    wal.truncate_to(locs[2].offset);
+    EXPECT_EQ(wal.recovery_scan().frames.size(), 2U) << "eager truncate_to retains frames";
+  }
+  std::filesystem::remove_all(root);
+}
+
 }  // namespace
 }  // namespace alaya::wal

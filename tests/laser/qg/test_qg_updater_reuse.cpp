@@ -743,6 +743,81 @@ TEST(QgUpdaterReuse, CanonicalFinalTrailerFreePoisonsOnReopen) {
 }
 
 // ---------------------------------------------------------------------------
+// BLOCKER-5: a NEW (non-absorbed) canonical bundle written at a generation OTHER than the
+// replay cursor (here base_generation + 1) must poison -- a CRC-legal cross-generation
+// bundle can no longer be applied at the wrong generation.
+// ---------------------------------------------------------------------------
+TEST(QgUpdaterReuse, CrossGenerationCanonicalBundlePoisonsOnReopen) {
+  const auto dir = scratch_dir("poison_xgen");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/88);
+  uint64_t seg_uid = 0;
+  uint64_t base_gen = 0;
+  uint64_t old_hwm = 0;
+  {
+    ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);
+    const auto v = waltest::make_data(1, kDim, 1);
+    const uint64_t l = 5;
+    s.upd->commit_physical_bundle(1, 1, v.data(), &l, 1);  // activate v3 pid
+    s.upd->checkpoint();
+    seg_uid = s.upd->segment_uid();
+    base_gen = s.upd->generation();
+    old_hwm = s.upd->num_points();
+  }
+  const std::string wal_path = base.prefix + waltest::index_suffix() + ".opwal";
+  {
+    alaya::wal::WalFile wal(wal_path);
+    const uint64_t txid = 2;
+    const uint64_t wrong_gen = base_gen + 1;  // a generation the base was never checkpointed at
+    wal.append(kSegmentOpRecordType, 0, 1, txid,
+               encode_label_bind(seg_uid, wrong_gen, txid, 0, static_cast<uint32_t>(old_hwm),
+                                 /*gen=*/0, /*label=*/6),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType, 0, 2, txid,
+               encode_tx_publish(seg_uid, wrong_gen, txid, old_hwm + 1, 1, 1),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  EXPECT_THROW(
+      { ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true); }, std::exception)
+      << "a canonical bundle at a non-cursor generation must poison (BLOCKER-5)";
+  std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// BLOCKER-5: a canonical bind carrying the reserved sentinel PID (kPidMax) is range-rejected
+// BEFORE the narrowing cast, so it can never slip past the reuse/append bound checks.
+// ---------------------------------------------------------------------------
+TEST(QgUpdaterReuse, CanonicalSentinelPidPoisonsOnReopen) {
+  const auto dir = scratch_dir("poison_pidmax");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/89);
+  uint64_t seg_uid = 0;
+  uint64_t base_gen = 0;
+  {
+    ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);
+    const auto v = waltest::make_data(1, kDim, 1);
+    const uint64_t l = 5;
+    s.upd->commit_physical_bundle(1, 1, v.data(), &l, 1);
+    s.upd->checkpoint();
+    seg_uid = s.upd->segment_uid();
+    base_gen = s.upd->generation();
+  }
+  const std::string wal_path = base.prefix + waltest::index_suffix() + ".opwal";
+  {
+    alaya::wal::WalFile wal(wal_path);
+    const uint64_t txid = 2;
+    wal.append(kSegmentOpRecordType, 0, 1, txid,
+               encode_label_bind(seg_uid, base_gen, txid, 0, static_cast<uint32_t>(kPidMax),
+                                 /*gen=*/0, /*label=*/6),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  EXPECT_THROW(
+      { ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true); }, std::exception)
+      << "a canonical bind with the sentinel PID must poison (BLOCKER-5 range check)";
+  std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
 // BLOCKER-2: any exception AFTER the reservation is published must fail the handle closed,
 // even a NON-std::exception thrown by a failpoint hook (throw 7) and an OOM in the reason
 // path. The atomic poison latch -- not the reason string -- is authoritative.
@@ -815,6 +890,59 @@ TEST(QgUpdaterReuse, DurableFlipThenExceptionPoisonsHandle) {
   EXPECT_THROW(upd.checkpoint(), std::exception)
       << "a durable-flip exception must latch the handle (no second flip)";
   EXPECT_THROW(upd.commit_physical_bundle(1, 1, v.data(), &l, 1), std::exception);
+  std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// BLOCKER-6: a no-reuse (enable_pid_reuse=false) FullPrune bundle stays on the legacy 2A
+// path with the writer-visible floor INERT (bundle_ctx_ == null => full_reverse_recompute
+// uses committed_ exactly, byte-for-byte the pre-2C behavior). Verify the segment never
+// activates (stays v2) and the produced graph is fully deterministic clean vs a replay/
+// checkpoint reopen (the floor leaking would change the FullPrune candidate set + payload).
+// ---------------------------------------------------------------------------
+TEST(QgUpdaterReuse, LegacyFullPruneBundleStaysV2AndByteStable) {
+  const auto dir = scratch_dir("legacy_fullprune");
+  std::filesystem::remove_all(dir);
+  const size_t small_n = 40;
+  auto base = WalTinyIndex::build(dir, small_n, /*seed=*/33);
+  const size_t append_n = 6;
+  const auto vecs = waltest::make_data(append_n, kDim, /*seed=*/34);
+  std::vector<uint64_t> labels(append_n);
+  for (size_t i = 0; i < append_n; ++i) labels[i] = 22000 + i;
+
+  struct Holder {
+    QuantizedGraph qg;
+    std::unique_ptr<QGUpdater> upd;
+    Holder(const std::string &prefix, size_t base_n) : qg(base_n, kDeg, kDim, kDim) {
+      qg.load_disk_index(prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+      qg.set_params(64, 1, 1);
+      UpdateParams params;
+      params.enable_wal = true;
+      params.enable_pid_reuse = false;  // legacy 2A path
+      params.ef_insert = 64;
+      params.max_points = 4 * base_n;
+      params.backlink_mode = UpdateParams::Backlink::kFullPrune;  // the floor-sensitive mode
+      upd = std::make_unique<QGUpdater>(qg, params);
+    }
+  };
+  std::string clean_fp;
+  {
+    Holder h(base.prefix, small_n);
+    h.upd->commit_physical_bundle(1, 1, vecs.data(), labels.data(), append_n);
+    EXPECT_EQ(h.upd->superblock_format_version(), kQGFormatVersion)
+        << "a no-reuse FullPrune bundle must NOT activate a v3 base";
+    clean_fp = full_fp(*h.upd);
+  }
+  {
+    Holder h(base.prefix, small_n);  // WAL replay
+    EXPECT_EQ(full_fp(*h.upd), clean_fp) << "legacy FullPrune replay diverged (floor leaked?)";
+    h.upd->checkpoint();
+  }
+  {
+    Holder h(base.prefix, small_n);  // checkpoint reopen
+    EXPECT_EQ(full_fp(*h.upd), clean_fp) << "legacy FullPrune checkpoint reopen diverged";
+    EXPECT_EQ(h.upd->superblock_format_version(), kQGFormatVersion);
+  }
   std::filesystem::remove_all(dir);
 }
 
