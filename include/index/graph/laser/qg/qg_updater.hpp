@@ -1888,6 +1888,7 @@ class QGUpdater {
       const auto w2c = read_superblock_wal2c_state(next);
       last_completed_consolidate_epoch_ = w2c.last_completed_consolidate_epoch;
       maintenance_activation_gen_ = w2c.maintenance_activation_sb_generation;
+      pid_reuse_activation_gen_ = w2c.pid_reuse_activation_sb_generation;
       if (next.format_version == kQGFormatVersionV3) {
         maintenance_activated_ = true;
       }
@@ -5067,6 +5068,7 @@ class QGUpdater {
     pid_generation_activated_ = sb.format_version == kQGFormatVersionV3 &&
                                 (w2c.required_feature_flags & kQgFeatPidGenerationV1) != 0;
     maintenance_activation_gen_ = w2c.maintenance_activation_sb_generation;
+    pid_reuse_activation_gen_ = w2c.pid_reuse_activation_sb_generation;
     last_committed_txid_ = tx.last_committed_txid;
     applied_collection_op_id_ = tx.applied_collection_op_id;
     base_committed_txid_ = tx.last_committed_txid;
@@ -5232,6 +5234,233 @@ class QGUpdater {
     precreate_label_slots();
   }
 
+  // Canonical PID-reuse bundle replay staging (design 3.5 / codex B.5). Unlike the 2A
+  // LabelBindStage, a canonical bind carries the reused-incarnation generation (0 for a
+  // dense append). Preimage/final page refs are FrameLocations (re-read + re-CRC'd via
+  // WalFile::read_frame at kind=8) so recovery memory stays O(touched pages).
+  struct CanonicalBind {
+    uint64_t row_op_id = 0;
+    PID pid = 0;
+    uint32_t pid_generation = 0;
+    uint64_t label = 0;
+  };
+  struct CanonicalBundleStage {
+    uint64_t txid = 0;
+    uint64_t segment_generation = 0;
+    uint64_t begin_offset = 0;
+    bool saw_row_patch = false;  // once a kind=1 is seen, any further kind=7 poisons
+    std::vector<CanonicalBind> binds;
+    std::map<size_t, alaya::wal::FrameLocation> preimage_refs;  // page -> FIRST kind=1 (pre-tx FREE)
+    std::map<size_t, alaya::wal::FrameLocation> latest_refs;    // page -> LAST kind=1 (final image)
+  };
+  // True once PID reuse is activated (design 7.2) AND this frame's generation is at or
+  // after the reuse activation generation. Dormant pre-activation (activation gen 0 =>
+  // always false => every kind=7 takes the legacy 2A staging path unchanged).
+  [[nodiscard]] bool is_canonical_generation(uint64_t seg_generation) const {
+    return pid_reuse_activation_gen_ != 0 && seg_generation >= pid_reuse_activation_gen_;
+  }
+
+  // Extract the trailer for `pid`'s slot from a decoded whole-page row_patch after-image.
+  [[nodiscard]] QGRowTrailer canonical_page_trailer(const SegmentOp &op, PID pid) {
+    if (op.bytes.size() != page_size_) {
+      poison("op-WAL canonical page after-image is not a whole page");
+    }
+    return qg_read_page_trailer(reinterpret_cast<const char *>(op.bytes.data()), page_size_, npp_,
+                                static_cast<size_t>(pid) % npp_);
+  }
+
+  // Open a canonical bundle lane on the first kind=7 of a reuse-generation transaction.
+  void canonical_open_lane(CanonicalBundleStage &st, const SegmentOp &op,
+                           const alaya::wal::ScannedFrame &frame, bool &in_canonical_bundle) {
+    if (frame.batch_id != op.tx_id) {
+      poison("op-WAL canonical label_bind frame batch_id != payload tx_id");
+    }
+    st = CanonicalBundleStage{};
+    st.txid = op.tx_id;
+    st.segment_generation = op.segment_generation;
+    st.begin_offset = frame.offset;
+    st.binds.push_back({op.row_op_id, static_cast<PID>(op.pid), op.pid_generation, op.label});
+    in_canonical_bundle = true;
+  }
+
+  // One frame inside an open canonical lane. Legal frames: consecutive same-txid kind=7
+  // (only before the first kind=1), reuse-preimage + final kind=1, the matching kind=8;
+  // anything else poisons (design 3.5 / codex B.5).
+  void canonical_lane_step(CanonicalBundleStage &st, const SegmentOp &op,
+                           const alaya::wal::ScannedFrame &frame, bool &in_canonical_bundle,
+                           uint64_t &committed_watermark) {
+    switch (op.kind) {
+      case SegmentOpKind::label_bind: {
+        if (st.saw_row_patch) {
+          poison("op-WAL canonical bundle has a kind=7 after a kind=1");
+        }
+        if (op.tx_id != st.txid) {
+          poison("op-WAL canonical bundle mixes tx_ids across its kind=7 frames");
+        }
+        if (op.segment_generation != st.segment_generation) {
+          poison("op-WAL canonical bundle kind=7 generation != the bundle generation");
+        }
+        if (frame.batch_id != op.tx_id) {
+          poison("op-WAL canonical label_bind frame batch_id != payload tx_id");
+        }
+        st.binds.push_back({op.row_op_id, static_cast<PID>(op.pid), op.pid_generation, op.label});
+        break;
+      }
+      case SegmentOpKind::row_patch: {
+        if (op.segment_generation != st.segment_generation) {
+          poison("op-WAL canonical bundle row_patch generation != the bundle generation");
+        }
+        const size_t page = replay_validate_row_patch_geometry(op);
+        st.saw_row_patch = true;
+        st.preimage_refs.try_emplace(page,
+                                     alaya::wal::FrameLocation{frame.offset, frame.size});  // first
+        st.latest_refs[page] = alaya::wal::FrameLocation{frame.offset, frame.size};         // last
+        break;
+      }
+      case SegmentOpKind::tx_publish: {
+        if (op.tx_id != st.txid) {
+          poison("op-WAL canonical tx_publish tx_id != the bundle tx_id");
+        }
+        if (frame.batch_id != op.tx_id) {
+          poison("op-WAL canonical tx_publish frame batch_id != payload tx_id");
+        }
+        canonical_finalize_bundle(st, op, committed_watermark);
+        in_canonical_bundle = false;
+        break;
+      }
+      default:
+        poison("op-WAL canonical bundle contains an unexpected op kind (only 7/1/8 are legal)");
+    }
+  }
+
+  // Validate a canonical bundle at its kind=8 and, for a NEW transaction, apply its final
+  // pages + promote bindings (design 3.4/3.5, B-2C-02). Any inconsistency poisons. An
+  // already-absorbed prefix (txid <= base) is validate-only and never re-applied.
+  void canonical_finalize_bundle(CanonicalBundleStage &st, const SegmentOp &op,
+                                 uint64_t &committed_watermark) {
+    if (op.binding_count == 0) {
+      poison("op-WAL canonical tx_publish binding_count must be >= 1");
+    }
+    if (st.binds.size() != op.binding_count) {
+      poison("op-WAL canonical staged bind count != binding_count");
+    }
+    const bool absorbed = op.tx_id <= base_committed_txid_;
+    // Structural set validation (both paths): row_op_id is exactly {0..count-1} and
+    // unique; pids are globally unique. Split the binds into append (gen 0) and reuse.
+    std::vector<uint8_t> row_seen(static_cast<size_t>(op.binding_count), 0);
+    std::unordered_set<uint64_t> pid_seen;
+    pid_seen.reserve(st.binds.size() * 2);
+    uint64_t append_count = 0;
+    for (const auto &b : st.binds) {
+      if (b.row_op_id >= op.binding_count || row_seen[static_cast<size_t>(b.row_op_id)] != 0) {
+        poison("op-WAL canonical bundle row_op_id set is not exactly {0..count-1}");
+      }
+      row_seen[static_cast<size_t>(b.row_op_id)] = 1;
+      if (!pid_seen.insert(static_cast<uint64_t>(b.pid)).second) {
+        poison("op-WAL canonical bundle has a duplicate pid");
+      }
+      if (b.pid_generation == 0) {
+        ++append_count;
+      }
+    }
+    // HWM algebra + generation chain (design 3.4). For an absorbed prefix the running
+    // watermark is already the POST-absorbed base, so the pre-transaction algebra cannot
+    // be reconstructed here without the retained-kind=6 model (JC-22): skip the algebra +
+    // page apply, keeping the base's durable effect. A NEW bundle validates + applies.
+    if (!absorbed) {
+      const uint64_t old_hwm = committed_watermark;
+      const uint64_t new_hwm = op.new_pid_watermark;
+      if (op.tx_id <= last_committed_txid_) {
+        poison("op-WAL canonical tx_publish tx_id is not strictly increasing");
+      }
+      if (op.applied_collection_op_id < applied_collection_op_id_) {
+        poison("op-WAL canonical tx_publish applied_collection_op_id regressed");
+      }
+      if (new_hwm != old_hwm + append_count) {
+        poison("op-WAL canonical tx_publish new_pid_watermark != old_hwm + append_count");
+      }
+      if (new_hwm > static_cast<uint64_t>(kPidMax) || new_hwm > row_generations_.size()) {
+        poison("op-WAL canonical tx_publish new_pid_watermark exceeds the PID capacity");
+      }
+      std::vector<uint8_t> append_seen(static_cast<size_t>(append_count), 0);
+      for (const auto &b : st.binds) {
+        const uint64_t pid = static_cast<uint64_t>(b.pid);
+        if (b.pid_generation == 0) {
+          if (pid < old_hwm || pid >= new_hwm) {
+            poison("op-WAL canonical append pid outside [old_hwm, new_hwm)");
+          }
+          append_seen[static_cast<size_t>(pid - old_hwm)] = 1;
+        } else {
+          if (pid >= old_hwm) {
+            poison("op-WAL canonical reused pid is not below old_hwm");
+          }
+          uint32_t old_gen = 0;
+          const auto it = label_working_.find(static_cast<PID>(pid));
+          if (it != label_working_.end()) {
+            old_gen = it->second.pid_generation;
+          }
+          if (old_gen == (std::numeric_limits<uint32_t>::max)()) {
+            poison("op-WAL canonical reuse of a saturated (UINT32_MAX) generation pid");
+          }
+          if (b.pid_generation != old_gen + 1) {
+            poison("op-WAL canonical reused pid generation is not old_gen + 1");
+          }
+          const size_t page = page_index(static_cast<PID>(pid));
+          const auto pit = st.preimage_refs.find(page);
+          if (pit == st.preimage_refs.end()) {
+            poison("op-WAL canonical reused pid has no pre-transaction FREE preimage page");
+          }
+          const auto preimg = alaya::wal::WalFile::read_frame(op_wal_->path(), pit->second);
+          const SegmentOp pop = decode_segment_op(preimg.payload);
+          const QGRowTrailer ptr = canonical_page_trailer(pop, static_cast<PID>(pid));
+          if ((ptr.flags & (kQGRowTombstone | kQGRowFree)) != (kQGRowTombstone | kQGRowFree)) {
+            poison("op-WAL canonical reused pid preimage trailer is not TOMBSTONE|FREE");
+          }
+        }
+      }
+      for (uint8_t seen : append_seen) {
+        if (seen == 0) {
+          poison("op-WAL canonical append pids do not densely cover [old_hwm, new_hwm)");
+        }
+      }
+    }
+    // B-2C-02 (both paths): every bound pid has a final page whose trailer is live.
+    for (const auto &b : st.binds) {
+      const size_t page = page_index(b.pid);
+      const auto lit = st.latest_refs.find(page);
+      if (lit == st.latest_refs.end()) {
+        poison("op-WAL canonical bound pid has no final page after-image (B-2C-02)");
+      }
+      const auto finalf = alaya::wal::WalFile::read_frame(op_wal_->path(), lit->second);
+      const SegmentOp fop = decode_segment_op(finalf.payload);
+      const QGRowTrailer ftr = canonical_page_trailer(fop, b.pid);
+      if (ftr.valid_degree > deg_) {
+        poison("op-WAL canonical final trailer valid_degree exceeds the graph degree");
+      }
+      if ((ftr.flags & (kQGRowTombstone | kQGRowFree)) != 0) {
+        poison("op-WAL canonical bound pid final trailer is not live (B-2C-02)");
+      }
+    }
+    if (absorbed) {
+      return;  // JC-22: validate-only; the selected base already holds this bundle's effect.
+    }
+    // Apply the final pages in page order, then promote {generation,label} and advance
+    // the watermarks (design 3.5 apply order: pages -> bindings -> HWM/txid/applied).
+    for (const auto &[page, ref] : st.latest_refs) {
+      (void)page;
+      const auto finalf = alaya::wal::WalFile::read_frame(op_wal_->path(), ref);
+      const SegmentOp fop = decode_segment_op(finalf.payload);
+      write_at(fop.offset, reinterpret_cast<const char *>(fop.bytes.data()), fop.bytes.size());
+    }
+    for (const auto &b : st.binds) {
+      label_working_.insert_or_assign(b.pid, PidBinding{b.pid_generation, b.label});
+    }
+    ++label_content_revision_;
+    committed_watermark = op.new_pid_watermark;
+    last_committed_txid_ = op.tx_id;
+    applied_collection_op_id_ = op.applied_collection_op_id;
+  }
+
   void replay_and_rebuild() {
     replaying_ = true;
     uint64_t committed_watermark = committed_.load(std::memory_order_acquire);
@@ -5245,6 +5474,10 @@ class QGUpdater {
     uint64_t epoch_generation = 0;  // wal-2c BLOCKER-5: the generation the epoch was written at
     uint64_t epoch_begin_offset = 0;
     std::unordered_map<size_t, std::vector<std::byte>> epoch_pages;  // page_index -> latest bytes
+    // Canonical PID-reuse bundle lane (design 3.5): mutually exclusive with the
+    // maintenance epoch above; dormant until reuse is activated (is_canonical_generation).
+    bool in_canonical_bundle = false;
+    CanonicalBundleStage cstage;
     // wal-2c BLOCKER-3: stream the op-WAL one frame at a time (O(max frame), not O(WAL bytes)).
     alaya::wal::WalFile::visit_frames(
         op_wal_->path(), [&](const alaya::wal::ScannedFrame &frame) -> bool {
@@ -5312,6 +5545,10 @@ class QGUpdater {
         }
         return true;
       }
+      if (in_canonical_bundle) {
+        canonical_lane_step(cstage, op, frame, in_canonical_bundle, committed_watermark);
+        return true;
+      }
       switch (op.kind) {
         case SegmentOpKind::row_patch:
           replay_row_patch(op);
@@ -5334,9 +5571,17 @@ class QGUpdater {
           replay_flip(op);
           break;
         case SegmentOpKind::label_bind:
-          replay_label_bind(op, frame.batch_id);
+          if (is_canonical_generation(op.segment_generation)) {
+            canonical_open_lane(cstage, op, frame, in_canonical_bundle);
+          } else {
+            replay_label_bind(op, frame.batch_id);
+          }
           break;
         case SegmentOpKind::tx_publish:
+          if (is_canonical_generation(op.segment_generation)) {
+            replaying_ = false;
+            poison("op-WAL canonical tx_publish with no open bundle (missing kind=7 prefix)");
+          }
           replay_tx_publish(op, frame.batch_id, committed_watermark);
           break;
         case SegmentOpKind::consolidate_begin: {
@@ -5380,6 +5625,18 @@ class QGUpdater {
       } catch (const std::exception &error) {
         replaying_ = false;
         poison(std::string("op-WAL semantic truncation of an unmatched BEGIN failed: ") +
+               error.what());
+      }
+    }
+    if (in_canonical_bundle) {
+      // Torn canonical bundle: no durable kind=8, and kind=1 was only staged (never
+      // applied), so the index is still S_old. Discard the staged refs/binds and truncate
+      // the WAL back to the first kind=7 so the next append starts clean (design 3.5 / R1).
+      try {
+        op_wal_->truncate_to(cstage.begin_offset);
+      } catch (const std::exception &error) {
+        replaying_ = false;
+        poison(std::string("op-WAL semantic truncation of a torn canonical bundle failed: ") +
                error.what());
       }
     }
@@ -5828,6 +6085,7 @@ class QGUpdater {
   bool maintenance_activated_ = false;             // v3 maintenance features activated in the base
   bool pid_generation_activated_ = false;          // v3 pid-reuse feature activated (W2c)
   uint64_t maintenance_activation_gen_ = 0;        // superblock generation of the activation checkpoint
+  uint64_t pid_reuse_activation_gen_ = 0;          // superblock gen when PID reuse activated (0 = never)
   // Private overlay: page_index -> resident bytes; and evicted pages -> latest kind=1
   // frame location (reload via WalFile::read_frame). Union = every touched page.
   std::unordered_map<size_t, std::vector<char>> maint_pages_;
