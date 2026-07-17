@@ -1772,6 +1772,19 @@ class QGUpdater {
         throw std::logic_error(
             "QGUpdater::checkpoint requires no active maintenance epoch (design section 1.4)");
       }
+      // Reuse admission (design 1.4 / codex B.6): an active/reserved bundle -- including
+      // an all-reuse reservation whose HWM never moves -- and an unfinished free-chain
+      // rebuild must block a checkpoint so a half-built bundle is never absorbed as a
+      // kind=6 base. (allocated==committed above cannot see an all-reuse reservation.)
+      if (bundle_state_ != BundleState::kIdle) {
+        throw std::logic_error("QGUpdater::checkpoint requires no active bundle reservation");
+      }
+      if (reservation_count_ != 0) {
+        throw std::logic_error("QGUpdater::checkpoint requires no reserved reuse PIDs");
+      }
+      if (!free_chain_rebuild_complete_) {
+        throw std::logic_error("QGUpdater::checkpoint requires a rebuilt free chain");
+      }
     }
     drain_staged_edges(1);
     flush_dirty(1);  // forces the WAL prefix first under enable_wal
@@ -2694,6 +2707,69 @@ class QGUpdater {
       free_count_.fetch_sub(1, std::memory_order_acq_rel);
       return head;
     }
+  }
+
+  // Reserve n PIDs for a canonical reuse bundle (design 3.6 / codex B.2): pop the
+  // canonical (ascending) free chain head for the reuse prefix, dense-append the rest.
+  // Publishes bundle_state_/reservation_count_ BEFORE the first pop so a concurrent
+  // checkpoint is refused even for an all-reuse reservation whose HWM does not move
+  // (B-2C-06/B.6). Any failure after the state is published keeps the state and poisons
+  // -- reopen rebuilds the free chain from the on-disk FREE trailers (the popped PIDs
+  // are still FREE on disk, so R0 recovers the old free set). Dormant until the canonical
+  // writer (step 5) calls it under checkpoint_mutex_.
+  PhysicalBundleResult reserve_bundle_pids(size_t n, bool allow_reuse) {
+    if (bundle_state_ != BundleState::kIdle) {
+      throw std::logic_error("reserve_bundle_pids: a bundle reservation is already active");
+    }
+    if (!free_chain_rebuild_complete_) {
+      throw std::logic_error("reserve_bundle_pids: the free chain is not rebuilt yet");
+    }
+    const uint64_t old = committed_.load(std::memory_order_acquire);
+    if (old != allocated_points()) {
+      throw std::logic_error("reserve_bundle_pids requires allocated == committed");
+    }
+    if (has_staged_edges()) {
+      throw std::logic_error("reserve_bundle_pids requires no staged backlinks");
+    }
+    const uint64_t free_now = free_count_.load(std::memory_order_acquire);
+    const size_t reuse_n =
+        allow_reuse ? static_cast<size_t>((std::min<uint64_t>)(n, free_now)) : 0;
+    const size_t append_n = n - reuse_n;
+    // Capacity check BEFORE the first pop (design B.2): a dense-append overflow is a
+    // caller error, never a mid-reservation poison.
+    const uint64_t new_hwm = old + append_n;
+    if (new_hwm > static_cast<uint64_t>(kPidMax) || new_hwm > row_generations_.size()) {
+      throw std::invalid_argument("reserve_bundle_pids: PID capacity exceeded");
+    }
+    // Publish the reservation state before the first pop (checkpoint admission B.6).
+    bundle_state_ = BundleState::kReserving;
+    reservation_count_ = n;
+    PhysicalBundleResult out;
+    out.old_hwm = old;
+    out.rows.reserve(n);
+    const auto snap = load_label_snapshot();
+    std::unordered_set<uint64_t> popped;
+    popped.reserve(reuse_n * 2);
+    for (size_t i = 0; i < reuse_n; ++i) {
+      const PID pid = pop_free_slot();
+      if (pid == kPidMax || static_cast<uint64_t>(pid) >= old ||
+          !popped.insert(static_cast<uint64_t>(pid)).second) {
+        poison("reserve_bundle_pids: corrupt canonical free-list reservation");
+      }
+      const auto *b = snap->find_binding(pid);
+      const uint32_t old_gen = b != nullptr ? b->pid_generation : 0;
+      if (old_gen == (std::numeric_limits<uint32_t>::max)()) {
+        poison("reserve_bundle_pids: PID generation would wrap (UINT32_MAX)");
+      }
+      out.rows.push_back(PidToken{pid, old_gen + 1});
+    }
+    for (size_t i = 0; i < append_n; ++i) {
+      out.rows.push_back(PidToken{static_cast<PID>(old + i), 0});
+    }
+    out.new_hwm = new_hwm;
+    note_allocated(new_hwm);
+    bundle_state_ = BundleState::kBuilding;
+    return out;
   }
 
   /**
@@ -5463,6 +5539,7 @@ class QGUpdater {
 
   void replay_and_rebuild() {
     replaying_ = true;
+    free_chain_rebuild_complete_ = false;  // set true again only after the canonical rebuild below
     uint64_t committed_watermark = committed_.load(std::memory_order_acquire);
     // Maintenance epoch state machine (design section 1.3): row_patch frames between
     // a durable BEGIN and END stage a latest-per-page after-image but do NOT touch
@@ -5980,6 +6057,7 @@ class QGUpdater {
     }
     repair_routing_roots(kPidMax);
     refresh_routing_snapshot();
+    free_chain_rebuild_complete_ = true;  // the free chain is now canonical (design B.2)
   }
 
   QuantizedGraph &qg_;
@@ -6079,6 +6157,15 @@ class QGUpdater {
   // serial path is the minimal-viable-correct W1). maintenance_active_ routes every
   // maintenance page RMW/read into a PRIVATE overlay so a concurrent search keeps
   // reading the committed state until the END-driven, seqlock-guarded install.
+  // PID-reuse bundle reservation state (design 3.6 / codex B.2, checkpoint admission
+  // B.6). kIdle outside a bundle; kReserving once the first FREE PID is popped; kBuilding
+  // once the token set is fixed. checkpoint() admits only kIdle -- an all-reuse bundle
+  // leaves the HWM unchanged, so allocated==committed no longer implies quiescent.
+  // Dormant until the writer (step 5) calls reserve_bundle_pids.
+  enum class BundleState { kIdle, kReserving, kBuilding };
+  BundleState bundle_state_ = BundleState::kIdle;
+  uint64_t reservation_count_ = 0;
+  bool free_chain_rebuild_complete_ = true;  // false only mid-recovery; gates reserve_bundle_pids
   bool maintenance_active_ = false;
   bool maintenance_activating_ = false;            // an activation checkpoint is in flight (emit v3)
   uint64_t last_completed_consolidate_epoch_ = 0;  // adopted from base; advanced at END
