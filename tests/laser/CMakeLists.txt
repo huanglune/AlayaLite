@@ -303,3 +303,19 @@ alaya_add_test(
   TARGET laser_ip_oracle_test
   LABELS laser rabitq space
 )
+
+# W1 skeleton for the LASER IP kernel (ip.hpp). Validates the LASER-convention
+# IP factor derivation (REPORT section 3) against the W0 oracle base via
+# estimate-level equivalence. Becomes the real W1 unit test when ip.hpp lands
+# (swap the inline reference for the include). Core-space only.
+alaya_cc_target(
+  laser_ip_kernel_test
+  GTEST
+  SRCS space/ip_kernel_test.cpp
+  OPTS -O3 -DNDEBUG -Wall -Wextra
+)
+alaya_add_test(
+  NAME laser_test_ip_kernel
+  TARGET laser_ip_kernel_test
+  LABELS laser rabitq space
+)
