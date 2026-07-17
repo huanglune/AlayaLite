@@ -11,8 +11,6 @@ def test_artifact_baseline_covers_every_current_family():
     assert set(baseline["artifacts"]) == {
         "disk_flat_segment",
         "laser_fixture",
-        "memory_hnsw_none",
-        "memory_hnsw_sq8",
         "memory_qg",
     }
     for artifact in baseline["artifacts"].values():

@@ -752,7 +752,6 @@ class Collection {
                    "canonical Collection metric/quantization schema is invalid");
     }
     const auto algorithm_valid = options.target_algorithm == core::algorithm::flat ||
-                                 options.target_algorithm == core::algorithm::hnsw ||
                                  options.target_algorithm == core::algorithm::qg ||
                                  options.target_algorithm == core::algorithm::laser;
     if (!algorithm_valid) {

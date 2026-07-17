@@ -644,20 +644,13 @@ TEST(CollectionQgCosineSeal, NormalizesRecallsReopensHandlesZeroAndMergesWithAct
 }
 
 TEST(CollectionQgFallback, RejectsForeignRabitqAndHonestlyFallsBackForUnsupportedQgSchemas) {
-  {
-    TemporaryDirectory temporary("foreign-rabitq-hnsw");
-    auto options = make_options(temporary.path(), core::Metric::l2);
-    options.target_algorithm = core::algorithm::hnsw;
-    auto rejected = Collection::create(options);
-    ASSERT_FALSE(rejected.ok());
-    EXPECT_EQ(rejected.status().code(), core::StatusCode::invalid_argument);
-    EXPECT_NE(rejected.status().diagnostic().find("explicit index_type=qg"), std::string::npos);
-  }
-
-  // NSG and Fusion are retired: their algorithm ids stay reserved (never
-  // reused) but are no longer accepted at all, so the capability gate
+  // HNSW, NSG, and Fusion are all retired: their algorithm ids stay reserved
+  // (never reused) but are no longer accepted at all, so the capability gate
   // rejects them outright instead of reaching the rabitq/qg cross-check.
-  for (const auto algorithm : {core::algorithm::nsg, core::algorithm::fusion}) {
+  // (HNSW+rabitq used to be the invalid_argument "explicit index_type=qg"
+  // cross-check case; now it -- like nsg/fusion -- never reaches that check.)
+  for (const auto algorithm :
+       {core::algorithm::hnsw, core::algorithm::nsg, core::algorithm::fusion}) {
     TemporaryDirectory temporary("retired-algorithm-" + std::to_string(algorithm));
     auto options = make_options(temporary.path(), core::Metric::l2);
     options.target_algorithm = algorithm;

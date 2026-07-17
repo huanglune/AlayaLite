@@ -1,17 +1,15 @@
 // SPDX-FileCopyrightText: 2026 AlayaDB.AI
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// HNSW-vs-QG recall parity baseline (U4-preflight IP audit item 3: parity-
-// test infrastructure for the HNSW retirement wave's acceptance criteria). For the same dataset (l2
-// and inner_product, unit and non-unit norm), builds one HNSW segment Collection and one QG segment
-// Collection, scores each against the same metric-aware exact oracle
-// (tests/include/utils/evaluate.hpp's find_exact_gt, extended by this same
-// preflight wave to be metric-aware), and asserts recall parity: the two
-// engines' result sets need not match candidate-for-candidate, but neither
-// should be meaningfully worse than the other. cosine is intentionally out of
-// scope here (Collection rejects QG+cosine and falls back to flat --
-// collection_qg_seal_test.cpp:509-523 -- wiring cosine into QG is explicitly
-// deferred to the HNSW-retirement wave, not this preflight).
+// QG recall floor lock (HNSW retirement wave, decision 4). This file used to
+// build one HNSW segment Collection and one QG segment Collection side by
+// side and assert recall parity between them (see git history for
+// collection_hnsw_qg_parity_test.cpp, and REPORT-u4-preflight.md item 3, for
+// the original HNSW-vs-QG numbers). HNSW is retired in this same wave, so
+// this is now a QG-only absolute-floor lock: each case's floor is derived
+// from what this exact fixture measured at HEAD of this wave (l2_unit
+// qg=0.9900, l2_nonunit qg=0.8650, ip_unit qg=0.9950, ip_nonunit qg=0.9650)
+// minus a margin generous enough to absorb ordinary build/platform noise.
 
 #include <algorithm>
 #include <cmath>
@@ -22,7 +20,6 @@
 #include <iostream>
 #include <string>
 #include <string_view>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -46,7 +43,7 @@ class TemporaryDirectory {
   explicit TemporaryDirectory(std::string_view name) {
     static std::uint64_t serial{};
     path_ = std::filesystem::temp_directory_path() /
-            ("alaya-collection-hnsw-qg-parity-" + std::string(name) + "-" +
+            ("alaya-collection-qg-recall-floor-" + std::string(name) + "-" +
              std::to_string(platform::get_pid()) + "-" + std::to_string(++serial));
     std::filesystem::remove_all(path_);
   }
@@ -76,7 +73,7 @@ struct Dataset {
 }
 
 // Unit-norm dataset, same recipe as collection_qg_seal_test.cpp's
-// make_float_dataset and collection_hnsw_seal_test.cpp's make_float_dataset.
+// make_float_dataset.
 [[nodiscard]] auto make_unit_dataset(core::RowCount rows, std::uint64_t seed) -> Dataset {
   Dataset result;
   result.vectors.resize(static_cast<std::size_t>(rows * kDim));
@@ -99,7 +96,7 @@ struct Dataset {
   return result;
 }
 
-// hnsw_seal's make_cosine_dataset:91-101 style: unit vectors with a
+// hnsw_seal's (now retired) make_cosine_dataset style: unit vectors with a
 // deliberately-varying per-row magnitude (0.25x .. 28.25x), fed under l2 or
 // inner_product (neither of which Collection normalizes away, unlike
 // cosine) so the norm variation actually reaches the index.
@@ -137,17 +134,15 @@ struct Dataset {
   return queries;
 }
 
-[[nodiscard]] auto make_options(const std::filesystem::path &root,
-                                core::Metric metric,
-                                core::AlgorithmId target_algorithm) -> CollectionOptions {
+[[nodiscard]] auto make_options(const std::filesystem::path &root, core::Metric metric)
+    -> CollectionOptions {
   CollectionOptions options;
   options.root = root;
   options.dim = kDim;
   options.metric = metric;
   options.scalar_type = core::ScalarType::float32;
-  options.target_algorithm = target_algorithm;
-  options.quantization = target_algorithm == core::algorithm::qg ? CollectionQuantization::rabitq
-                                                                 : CollectionQuantization::none;
+  options.target_algorithm = core::algorithm::qg;
+  options.quantization = CollectionQuantization::rabitq;
   options.build_threads = 1;
   options.ef_construction = 400;
   return options;
@@ -170,9 +165,8 @@ void insert_dataset(Collection &collection, const Dataset &dataset) {
   ASSERT_EQ(added.value().rows.size(), dataset.ids.size());
 }
 
-// Metric-aware exact ground truth, built via the shared (this preflight wave
-// extended it to be metric-aware) tests/include/utils/evaluate.hpp
-// find_exact_gt, then mapped from row-index space to Collection LogicalIds.
+// Metric-aware exact ground truth, via tests/include/utils/evaluate.hpp's
+// find_exact_gt, mapped from row-index space to Collection LogicalIds.
 [[nodiscard]] auto exact_oracle_ids(const Dataset &dataset,
                                     const std::vector<float> &queries,
                                     core::Metric metric) -> std::vector<uint32_t> {
@@ -203,16 +197,15 @@ void insert_dataset(Collection &collection, const Dataset &dataset) {
   return static_cast<double>(matches) / static_cast<double>(kQueryCount * kTopK);
 }
 
-// Builds a Collection targeting `target_algorithm`, seals it, searches with
-// `queries`, and returns recall@kTopK against `oracle_row_ids`.
-[[nodiscard]] auto measure_recall(std::string_view name,
-                                  core::Metric metric,
-                                  core::AlgorithmId target_algorithm,
-                                  const Dataset &dataset,
-                                  const std::vector<float> &queries,
-                                  const std::vector<uint32_t> &oracle_row_ids) -> double {
+// Builds a QG-target Collection, seals it, searches with `queries`, and
+// returns recall@kTopK against `oracle_row_ids`.
+[[nodiscard]] auto measure_qg_recall(std::string_view name,
+                                     core::Metric metric,
+                                     const Dataset &dataset,
+                                     const std::vector<float> &queries,
+                                     const std::vector<uint32_t> &oracle_row_ids) -> double {
   TemporaryDirectory temporary(name);
-  auto created = Collection::create(make_options(temporary.path(), metric, target_algorithm));
+  auto created = Collection::create(make_options(temporary.path(), metric));
   if (!created.ok()) {
     ADD_FAILURE() << name << ": Collection::create failed: " << created.status().diagnostic();
     return 0.0;
@@ -225,8 +218,8 @@ void insert_dataset(Collection &collection, const Dataset &dataset) {
     ADD_FAILURE() << name << ": seal() failed: " << sealed.status().diagnostic();
     return 0.0;
   }
-  EXPECT_EQ(sealed.value().built_algorithm, target_algorithm)
-      << name << ": expected a real segment, not a flat fallback ("
+  EXPECT_EQ(sealed.value().built_algorithm, core::algorithm::qg)
+      << name << ": expected a real qg segment, not a flat fallback ("
       << sealed.value().fallback_reason << ")";
   EXPECT_FALSE(sealed.value().flat_fallback) << name << ": " << sealed.value().fallback_reason;
 
@@ -243,21 +236,25 @@ void insert_dataset(Collection &collection, const Dataset &dataset) {
   return recall;
 }
 
-struct ParityCase {
+struct RecallFloorCase {
   core::Metric metric;
   bool unit_norm;
+  // Measured qg recall@10 minus a margin generous enough to absorb ordinary
+  // build/platform noise (see file header comment for the raw numbers this
+  // wave measured them from).
+  double floor;
 };
 
-[[nodiscard]] auto case_name(const ParityCase &c) -> std::string {
+[[nodiscard]] auto case_name(const RecallFloorCase &c) -> std::string {
   // Underscore-separated: this doubles as the GTest parameterized test-case
   // name, which rejects dashes.
   return std::string(c.metric == core::Metric::l2 ? "l2" : "ip") + "_" +
          (c.unit_norm ? "unit" : "nonunit");
 }
 
-class CollectionHnswQgParityTest : public ::testing::TestWithParam<ParityCase> {};
+class CollectionQgRecallFloorTest : public ::testing::TestWithParam<RecallFloorCase> {};
 
-TEST_P(CollectionHnswQgParityTest, RecallParityBetweenHnswAndQgSegments) {
+TEST_P(CollectionQgRecallFloorTest, QgRecallStaysAboveFloor) {
   const auto param = GetParam();
   const auto name = case_name(param);
   constexpr std::uint64_t kSeed = 0xA11A2026'0716'7A01ULL;
@@ -267,47 +264,24 @@ TEST_P(CollectionHnswQgParityTest, RecallParityBetweenHnswAndQgSegments) {
   const auto queries = make_queries(dataset, kQueryCount, /*normalize=*/param.unit_norm);
   const auto oracle_row_ids = exact_oracle_ids(dataset, queries, param.metric);
 
-  const auto hnsw_recall = measure_recall(name + "-hnsw",
-                                          param.metric,
-                                          core::algorithm::hnsw,
-                                          dataset,
-                                          queries,
-                                          oracle_row_ids);
-  const auto qg_recall = measure_recall(name + "-qg",
-                                        param.metric,
-                                        core::algorithm::qg,
-                                        dataset,
-                                        queries,
-                                        oracle_row_ids);
+  const auto qg_recall = measure_qg_recall(name, param.metric, dataset, queries, oracle_row_ids);
 
-  std::cout << "measured_parity_" << name << "_hnsw_recall_at_10=" << std::fixed
-            << std::setprecision(4) << hnsw_recall << std::endl;
-  std::cout << "measured_parity_" << name << "_qg_recall_at_10=" << std::fixed
+  std::cout << "measured_qg_recall_floor_" << name << "_recall_at_10=" << std::fixed
             << std::setprecision(4) << qg_recall << std::endl;
 
-  // Both engines individually should be well above random-choice recall
-  // (kTopK/kRows here is tiny, so this floor is conservative).
-  EXPECT_GE(hnsw_recall, 0.70) << name;
-  EXPECT_GE(qg_recall, 0.55) << name;
-
-  // Parity: the two engines' result sets need not match candidate-for-
-  // candidate (HNSW here runs unquantized/exact per-edge distances; QG runs
-  // 1-bit RaBitQ quantized fastscan estimates, so some inherent gap is
-  // expected), but QG must not be *meaningfully* worse than HNSW. This is the
-  // acceptance baseline the HNSW-retirement wave is expected to hold QG to.
-  EXPECT_GE(qg_recall, hnsw_recall - 0.25)
-      << name << ": hnsw=" << hnsw_recall << " qg=" << qg_recall;
+  EXPECT_GE(qg_recall, param.floor) << name;
 }
 
-INSTANTIATE_TEST_SUITE_P(L2AndInnerProductUnitAndNonUnit,
-                         CollectionHnswQgParityTest,
-                         ::testing::Values(ParityCase{core::Metric::l2, true},
-                                           ParityCase{core::Metric::l2, false},
-                                           ParityCase{core::Metric::inner_product, true},
-                                           ParityCase{core::Metric::inner_product, false}),
-                         [](const ::testing::TestParamInfo<ParityCase> &info) {
-                           return case_name(info.param);
-                         });
+INSTANTIATE_TEST_SUITE_P(
+    L2AndInnerProductUnitAndNonUnit,
+    CollectionQgRecallFloorTest,
+    ::testing::Values(RecallFloorCase{core::Metric::l2, true, 0.85},
+                      RecallFloorCase{core::Metric::l2, false, 0.75},
+                      RecallFloorCase{core::Metric::inner_product, true, 0.85},
+                      RecallFloorCase{core::Metric::inner_product, false, 0.80}),
+    [](const ::testing::TestParamInfo<RecallFloorCase> &info) {
+      return case_name(info.param);
+    });
 
 }  // namespace
 }  // namespace alaya

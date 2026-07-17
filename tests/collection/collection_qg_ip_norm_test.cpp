@@ -105,11 +105,10 @@ struct Dataset {
   return result;
 }
 
-// hnsw_seal's make_cosine_dataset:91-101 style: start from unit vectors, then
-// deliberately vary magnitude per row (0.25x to 28.25x) -- unlike hnsw's
-// cosine path, this is fed to QG under inner_product, so the varying norm is
-// NOT normalized away anywhere in the pipeline (Collection does not
-// L2-normalize for inner_product, only for cosine).
+// Start from unit vectors, then deliberately vary magnitude per row (0.25x
+// to 28.25x). This is fed to QG under inner_product, so the varying norm is
+// NOT normalized away anywhere in the pipeline (Collection only
+// L2-normalizes for cosine, not inner_product).
 [[nodiscard]] auto make_nonunit_dataset(core::RowCount rows, std::uint64_t seed) -> Dataset {
   auto result = make_unit_dataset(rows, seed);
   for (core::RowCount row = 0; row < rows; ++row) {

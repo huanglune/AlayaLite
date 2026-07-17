@@ -12,8 +12,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-import numpy as np
-
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BASELINE = ROOT / "tests/golden/artifact-baseline.json"
 
@@ -57,26 +55,6 @@ def _inventory(root: Path) -> dict[str, object]:
             entry["header"] = _header(path)
         files[rel] = entry
     return {"files": files}
-
-
-def _vectors(rows: int, dim: int) -> np.ndarray:
-    rng = np.random.default_rng(20260712)
-    return rng.standard_normal((rows, dim)).astype(np.float32)
-
-
-def _generate_memory_graph_artifacts(out: Path, build_dir: Path) -> None:
-    generator = build_dir / "tests/golden/artifact_memory_graph_generator"
-    if not generator.is_file():
-        raise RuntimeError(f"build the artifact_memory_graph_generator target first: {generator}")
-    vectors_path = out / ".memory-graph-vectors.fbin"
-    vectors = _vectors(80, 8)
-    with vectors_path.open("wb") as stream:
-        np.array(vectors.shape, dtype=np.int32).tofile(stream)
-        vectors.tofile(stream)
-    try:
-        subprocess.run([str(generator), str(out), str(vectors_path)], check=True)
-    finally:
-        vectors_path.unlink(missing_ok=True)
 
 
 def _build_tree_extension(build_dir: Path) -> Path | None:
@@ -123,7 +101,6 @@ def _generate_laser_fixture(out: Path, build_dir: Path) -> None:
 def generate(build_dir: Path) -> dict[str, object]:
     with tempfile.TemporaryDirectory(prefix="alaya-artifact-golden-") as temp:
         out = Path(temp)
-        _generate_memory_graph_artifacts(out, build_dir)
         disk_flat_segment_generator = build_dir / "tests/golden/artifact_disk_flat_segment_generator"
         if not disk_flat_segment_generator.is_file():
             raise RuntimeError(

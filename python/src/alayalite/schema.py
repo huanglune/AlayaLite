@@ -71,14 +71,15 @@ class IndexParams:
                 # quantization request.
                 self.index_type = "qg"
             elif is_float32:
-                # An explicit sq8/sq4/none quantization_type still needs
-                # hnsw's raw or scalar-quantized float32 support: qg is
-                # rabitq-only and flat never quantizes, so hnsw is the only
-                # engine that can honor a non-rabitq request here.
-                self.index_type = "hnsw"
+                # An explicit sq8/sq4/none quantization_type has no ANN
+                # engine left that can honor it: qg is rabitq-only and flat
+                # never quantizes (it silently ignores a non-none
+                # quantization_type and always searches exactly) -- so this
+                # honestly downgrades to exact flat search rather than a
+                # quantized ANN engine.
+                self.index_type = "flat"
             else:
-                # qg is physically float32-only, and hnsw's non-float32
-                # support is narrower than flat's; anything non-float32
+                # qg is physically float32-only; anything non-float32
                 # honestly falls back to exact flat search rather than
                 # silently downgrading accuracy on an unsupported engine.
                 self.index_type = "flat"

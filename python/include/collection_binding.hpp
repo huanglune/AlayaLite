@@ -209,21 +209,16 @@ inline void register_exceptions(py::module_ &module) {
   if (value == "flat") {
     return core::algorithm::flat;
   }
-  if (value == "hnsw") {
-    return core::algorithm::hnsw;
-  }
   if (value == "qg") {
     return core::algorithm::qg;
   }
-  throw py::value_error("canonical Collection index_type must be flat, hnsw, or qg");
+  throw py::value_error("canonical Collection index_type must be flat or qg");
 }
 
 [[nodiscard]] inline auto algorithm_name(core::AlgorithmId value) -> std::string {
   switch (value) {
     case core::algorithm::flat:
       return "flat";
-    case core::algorithm::hnsw:
-      return "hnsw";
     case core::algorithm::qg:
       return "qg";
     default:

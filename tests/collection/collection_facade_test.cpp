@@ -61,7 +61,8 @@ class TemporaryDirectory {
   result.dim = 2;
   result.metric = core::Metric::l2;
   result.scalar_type = core::ScalarType::float32;
-  result.target_algorithm = core::algorithm::hnsw;
+  result.target_algorithm = core::algorithm::qg;
+  result.quantization = CollectionQuantization::rabitq;
   result.build_threads = 3;
   return result;
 }
@@ -69,6 +70,7 @@ class TemporaryDirectory {
 [[nodiscard]] auto flat_options(const std::filesystem::path &root) -> CollectionOptions {
   auto result = options(root);
   result.target_algorithm = core::algorithm::flat;
+  result.quantization = CollectionQuantization::none;
   return result;
 }
 
@@ -94,9 +96,9 @@ TEST(CollectionFacade, CanonicalResultsReceiptsStatsCheckpointAndReopen) {
   auto created = Collection::create(options(temporary.path()));
   ASSERT_TRUE(created.ok()) << created.status().diagnostic();
   auto collection = std::move(created).value();
-  EXPECT_EQ(collection->target_algorithm(), core::algorithm::hnsw);
+  EXPECT_EQ(collection->target_algorithm(), core::algorithm::qg);
   EXPECT_EQ(collection->active_algorithm(), core::algorithm::flat);
-  EXPECT_EQ(collection->target_implementation_key(), "hnsw_segment");
+  EXPECT_EQ(collection->target_implementation_key(), "qg_segment");
   EXPECT_EQ(collection->options().build_threads, 3U);
 
   const std::array<float, 2> first{0.0F, 0.0F};
@@ -198,6 +200,9 @@ TEST(CollectionFacade, BatchModesHaveStableStatusesAndNeverSilentlyDowngrade) {
 TEST(CollectionFacade, RabitqRequiresExplicitQg) {
   TemporaryDirectory first;
   auto invalid = options(first.path());
+  // options()'s own default is already qg+rabitq; force flat here so this
+  // half of the test actually exercises an invalid combination.
+  invalid.target_algorithm = core::algorithm::flat;
   invalid.quantization = CollectionQuantization::rabitq;
   auto rejected = Collection::create(invalid);
   ASSERT_FALSE(rejected.ok());
@@ -435,8 +440,8 @@ TEST(CollectionFacade, SealFourPointSigkillRecoveryRollsBackOrForward) {
                          CollectionSealFailPoint::after_successor_switch,
                          CollectionSealFailPoint::during_export_build,
                          CollectionSealFailPoint::after_manifest_publish};
-  auto battery_root = test::tmp_root() /
-                      ("alaya-g10-seal-crash-" + std::to_string(platform::get_pid()));
+  auto battery_root =
+      test::tmp_root() / ("alaya-g10-seal-crash-" + std::to_string(platform::get_pid()));
   std::filesystem::remove_all(battery_root);
   std::filesystem::create_directories(battery_root);
 

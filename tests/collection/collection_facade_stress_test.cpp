@@ -52,7 +52,9 @@ TEST(CollectionFacadeStress, ConcurrentSearchAddAndCheckpointRemainConsistent) {
   options.dim = 4;
   options.metric = core::Metric::l2;
   options.scalar_type = core::ScalarType::float32;
-  options.target_algorithm = core::algorithm::hnsw;
+  // Never sealed in this test, so the target algorithm is inert
+  // configuration; flat needs no quantization pairing.
+  options.target_algorithm = core::algorithm::flat;
   auto created = Collection::create(options);
   ASSERT_TRUE(created.ok()) << created.status().diagnostic();
   auto collection = std::move(created).value();
