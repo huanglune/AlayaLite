@@ -309,7 +309,7 @@ class WalFile {
   // vector, and the caller replays via visit_frames(). Default false keeps the eager
   // full scan (small logs / unit tests / other op families) byte-for-byte unchanged.
   explicit WalFile(std::filesystem::path path, bool stream_recovery = false)
-      : path_(std::move(path)) {
+      : path_(std::move(path)), stream_recovery_(stream_recovery) {
     std::filesystem::create_directories(path_.parent_path());
     if (!std::filesystem::exists(path_)) {
       std::ofstream create(path_, std::ios::binary | std::ios::trunc);
@@ -427,7 +427,11 @@ class WalFile {
     std::filesystem::resize_file(path_, offset);
     platform::sync_file_or_throw(path_);
     platform::sync_directory_or_throw(path_.parent_path());
-    recovery_scan_ = scan_path(path_);
+    // MAJOR-4: in stream-recovery mode a torn canonical/maintenance tail truncation
+    // must NOT eagerly re-scan the (potentially huge) retained WAL payload -- that
+    // would reintroduce the O(WAL bytes) recovery memory the streaming scan removed.
+    // Use the same structural (payload-free) scan the constructor used.
+    recovery_scan_ = stream_recovery_ ? scan_structure_streaming(path_) : scan_path(path_);
     append_offset_ = offset;
     open_stream();
   }
@@ -644,6 +648,7 @@ class WalFile {
   }
 
   std::filesystem::path path_{};
+  bool stream_recovery_{false};  // MAJOR-4: truncate_to must re-scan payload-free too
   ScanResult recovery_scan_{};
   std::uint64_t append_offset_{};  // byte offset of the next append (B-2C-04 locations)
   std::array<char, 1U << 20U> write_buffer_{};
