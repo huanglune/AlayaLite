@@ -719,6 +719,15 @@ class Collection {
     } else if (requested_algorithm == core::algorithm::qg &&
                schema.scalar_type != core::ScalarType::float32) {
       resolution.fallback_reason = "qg requires float32 vectors; built Flat instead";
+    } else if (requested_algorithm == core::algorithm::laser && live_row_count <= 32) {
+      resolution.fallback_reason = "laser requires >32 live rows; built Flat instead";
+    } else if (requested_algorithm == core::algorithm::laser &&
+               schema.metric != core::Metric::l2) {
+      resolution.fallback_reason = "laser requires l2 metric; built Flat instead";
+    } else if (requested_algorithm == core::algorithm::laser &&
+               (schema.dim < 128 || (schema.dim & (schema.dim - 1)) != 0)) {
+      resolution.fallback_reason =
+          "laser requires a power-of-two dim >= 128; built Flat instead";
     } else {
       resolution.fallback_reason = "requested Collection target '" +
                                    std::string(registration->factory_key) +
