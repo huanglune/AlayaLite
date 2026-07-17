@@ -322,6 +322,47 @@ TEST(QgUpdaterWalLabels, CheckpointedTxidAndAppliedOpGatePreconditions) {
   std::filesystem::remove_all(dir);
 }
 
+// A same-txid retry after a torn bundle whose earlier binds survived in the OS page
+// cache (process crash on a large bundle) recovers idempotently: the orphan kind=7
+// binds are de-duped against the retry's identical binds instead of over-staging
+// into a false count mismatch. (The conflicting-label branch is covered by the B-04
+// duplicate_row_op_id case.)
+TEST(QgUpdaterWalLabels, OrphanBindsFromTornBundleAreDedupedOnRetry) {
+  const auto dir = scratch_dir("orphan_dedup");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, 505);
+  const std::string wal_path = base.prefix + waltest::index_suffix() + ".opwal";
+  uint64_t uid = 0;
+  {
+    Session s(base.prefix, kBaseN + 64);
+    uid = s.upd->segment_uid();
+  }
+  const auto v = labeled_vecs(3, 0x6006);
+  const std::vector<uint64_t> labels = {45000, 45001, 45002};
+  // Plant an orphan kind=7 for tx=1 (row 0, pid=base, label identical to the retry).
+  {
+    alaya::wal::WalFile wal(wal_path);
+    wal.append(kSegmentOpRecordType, 0, 500, 1,
+               encode_label_bind(uid, 1, 1, 0, static_cast<uint32_t>(kBaseN), 0, labels[0]),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  {
+    Session s(base.prefix, kBaseN + 64);
+    EXPECT_EQ(s.upd->num_points(), kBaseN) << "the orphan bind alone is not committed";
+    auto r = s.upd->commit_physical_bundle(1, 1, v.data(), labels.data(), labels.size());
+    EXPECT_EQ(r.first, static_cast<PID>(kBaseN));
+  }
+  {
+    Session s(base.prefix, kBaseN + 64);
+    EXPECT_EQ(s.upd->num_points(), kBaseN + 3) << "retry recovers despite the orphan bind";
+    const auto snap = s.upd->label_snapshot();
+    ASSERT_NE(snap->find(static_cast<PID>(kBaseN)), nullptr);
+    EXPECT_EQ(*snap->find(static_cast<PID>(kBaseN)), 45000U);
+    EXPECT_EQ(s.upd->last_committed_txid(), 1U);
+  }
+  std::filesystem::remove_all(dir);
+}
+
 // --- B-04 divergence family: malformed kind=7/8 WALs must poison on replay. ---
 using FrameList = std::vector<std::vector<std::byte>>;
 struct BadBundle {

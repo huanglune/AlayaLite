@@ -4661,8 +4661,22 @@ class QGUpdater {
     if (frame_batch_id != op.tx_id) {
       poison("op-WAL label_bind frame batch_id != payload tx_id");
     }
-    staged_binds_[op.tx_id].push_back(
-        LabelBindStage{op.row_op_id, static_cast<PID>(op.pid), op.label});
+    // Idempotent de-dup by (tx_id, row_op_id): a same-txid retry after a torn bundle
+    // whose earlier binds survived in the OS page cache (process crash on a bundle
+    // larger than the WAL userspace buffer) re-appends identical binds. Collapse
+    // them (same pid+label == idempotent; differing == poison) so a legal retry is
+    // not falsely rejected by the count check. Torn power-loss states never expose
+    // this (the forced WAL ends at the last fsync, before any bind).
+    auto &staged = staged_binds_[op.tx_id];
+    for (const auto &existing : staged) {
+      if (existing.row_op_id == op.row_op_id) {
+        if (existing.pid != static_cast<PID>(op.pid) || existing.label != op.label) {
+          poison("op-WAL label_bind conflicting re-bind of the same (tx_id, row_op_id)");
+        }
+        return;  // idempotent duplicate
+      }
+    }
+    staged.push_back(LabelBindStage{op.row_op_id, static_cast<PID>(op.pid), op.label});
   }
 
   // Promote or idempotently verify a tx_publish (B-04, semantics 4). Splits on the
