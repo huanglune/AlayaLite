@@ -86,8 +86,8 @@ def test_native_status_maps_to_versioned_python_exception(tmp_path):
     collection = Collection(
         "bad-qg",
         IndexParams(
-            index_type="hnsw",
-            quantization_type="rabitq",
+            index_type="qg",
+            quantization_type="none",
             storage_path=str(tmp_path / "bad-qg" / "storage"),
         ),
     )

@@ -63,9 +63,9 @@ from alayalite import Client
 client = Client()
 index = client.create_index(
     name="ann_demo",
-    index_type="hnsw",
+    index_type="qg",
     metric="l2",
-    quantization_type="none",
+    quantization_type="rabitq",
     capacity=10_000,
 )
 
@@ -694,9 +694,9 @@ These parameters can be passed to `create_index` or `create_collection`:
 ```python
 client.create_collection(
     name="docs",
-    index_type="hnsw",
+    index_type="qg",
     metric="cosine",
-    quantization_type="sq8",
+    quantization_type="rabitq",
     data_type=np.float32,
     id_type=np.uint32,
     capacity=1_000_000,
@@ -708,7 +708,7 @@ client.create_collection(
 
 Common values:
 
-- `index_type`: `"flat"`, `"hnsw"`, `"qg"`.
+- `index_type`: `"flat"`, `"qg"`.
 - `metric`: `"l2"`, `"euclidean"`, `"ip"`, `"cosine"`, `"cos"`.
 - `quantization_type`: `"none"`, `"sq8"`, `"sq4"`, `"rabitq"`.
 - `data_type`: `np.float32`, `np.int8`, `np.uint8`.

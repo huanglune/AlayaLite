@@ -14,7 +14,8 @@ using AlgorithmId = std::uint64_t;
 // in index/compat.hpp and must never be pulled back into this header.
 namespace algorithm {
 inline constexpr AlgorithmId flat = 1;
-inline constexpr AlgorithmId hnsw = 2;
+inline constexpr AlgorithmId hnsw =
+    2;  // retired engine — id reserved, never reuse (capability gate rejects)
 inline constexpr AlgorithmId nsg =
     3;  // retired engine — id reserved, never reuse (capability gate rejects)
 inline constexpr AlgorithmId fusion =

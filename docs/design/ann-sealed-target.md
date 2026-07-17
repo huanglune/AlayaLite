@@ -6,6 +6,13 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 # ANN sealed-segment build cutover (`target_algorithm` → real ANN)
 
+> **Superseded / historical (2026-07-17).** This record predates two later
+> waves: HNSW (one of this document's two target engines) was retired
+> entirely, and `CollectionOptions.target_algorithm`'s default flipped from
+> `hnsw` to `qg`. Statements below about the default being `hnsw` and about
+> HNSW as a live target no longer hold. See `CHANGELOG.md`'s `[Unreleased]`
+> entry for the current state.
+
 Status: design approved, implementation in progress. Target release: **1.1.0**.
 
 ## Problem

@@ -90,11 +90,27 @@ class TestClient(unittest.TestCase):  # pylint: disable=missing-class-docstring
         ]
         first = self.client.create_collection("col1")
         first.insert(items)
-        self.assertEqual(first.get_index_params().quantization_type, "none")
+        # float32 with no explicit index_type/quantization_type now defaults
+        # to qg+rabitq (HNSW retirement wave, see CHANGELOG).
+        self.assertEqual(first.get_index_params().index_type, "qg")
+        self.assertEqual(first.get_index_params().quantization_type, "rabitq")
 
         second = self.client.create_collection("col2", quantization_type="sq8")
         second.insert(items)
         self.assertEqual(second.get_index_params().quantization_type, "sq8")
+
+    def test_default_dtype_dispatch_int8_collection_uses_flat(self):
+        # Non-float32 dtypes honestly default to flat (exact search): qg is
+        # physically float32-only, so there is no approximate engine left to
+        # default to once hnsw is retired (HNSW retirement wave).
+        items = [
+            (1, "Document 1", np.array([1, 2, 3], dtype=np.int8), {}),
+            (2, "Document 2", np.array([4, 5, 6], dtype=np.int8), {}),
+        ]
+        collection = self.client.create_collection("int8_default")
+        collection.insert(items)
+        self.assertEqual(collection.get_index_params().index_type, "flat")
+        self.assertEqual(collection.get_index_params().quantization_type, "none")
 
     def test_collection_ann_build_kwargs_reach_native_and_validate(self):
         items = [

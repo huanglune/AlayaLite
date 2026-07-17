@@ -8,10 +8,8 @@ repos:
   rev: v0.12.2
   hooks:
   - id: ruff-format
-    exclude: ^python/tests/client/_dispatch_matrix_params\.py$
   - id: ruff-check
     args: [--fix]
-    exclude: ^python/tests/client/_dispatch_matrix_params\.py$
 
 #===========================================================================
 #                            PYTHON LINT HOOK
@@ -23,7 +21,6 @@ repos:
     args:
     - --rcfile=python/.pylintrc
     files: ^(examples|python/src/alayalite|python/tests)/.*\.py$
-    exclude: ^python/tests/client/_dispatch_matrix_params\.py$
 
 
 #===========================================================================

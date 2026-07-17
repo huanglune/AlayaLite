@@ -357,10 +357,9 @@ TEST(RaBitQSpaceIpNormTest, NonUnitNormRecallDoesNotCollapse) {
         return 1.0F;
       });
 
-  // Per-point/per-query scale in [0.5, 3.0]; deliberately non-unit and varies
-  // across candidates (matching hnsw_seal's make_cosine_dataset:91-101 style
-  // of "deliberately vary magnitude"), unlike every pre-existing rabitq test
-  // which only ever fed unit vectors (collection_qg_seal_test's
+  // Per-point/per-query scale in [0.5, 3.0]; deliberately non-unit and
+  // varies across candidates, unlike every pre-existing rabitq test which
+  // only ever fed unit vectors (collection_qg_seal_test's
   // make_float_dataset:85-88 always normalizes).
   const auto scale_fn = [](size_t i) {
     return 0.5F + (2.5F * static_cast<float>(i % 5) / 4.0F);

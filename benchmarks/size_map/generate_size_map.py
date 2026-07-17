@@ -8,8 +8,6 @@ import json
 import subprocess
 from pathlib import Path
 
-import yaml
-
 ROOT = Path(__file__).resolve().parents[2]
 LEGACY_SYMBOL_PATTERNS = (
     "alaya::BasePyIndex",
@@ -33,11 +31,6 @@ def _demangled_symbols(binary: Path) -> list[str]:
     return [line.split(maxsplit=2)[-1] for line in output.splitlines() if line.strip()]
 
 
-def _identity_rows() -> int:
-    config = yaml.safe_load((ROOT / "tools/codegen/dispatch.yaml").read_text(encoding="utf-8"))
-    return len(config["combinations"])
-
-
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--build-dir", type=Path, default=ROOT / "build/Release")
@@ -57,7 +50,10 @@ def main() -> int:
         "schema_version": 2,
         "measurement": "GNU size + demangled symbol absence audit",
         "build_type": "Release",
-        "canonical_identity_rows": _identity_rows(),
+        # Retired along with the hnsw-keyed dispatch codegen matrix
+        # (HNSW retirement wave): there is no longer a canonical identity
+        # row count to track, same as legacy_dispatch_rows_linked below.
+        "canonical_identity_rows": 0,
         "legacy_dispatch_rows_linked": 0,
         "legacy_symbol_matches": 0,
         "pybind_object": {"bytes": obj.stat().st_size, "text_bytes": _text_bytes(obj)},

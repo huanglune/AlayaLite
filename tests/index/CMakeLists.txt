@@ -8,11 +8,6 @@ alaya_cc_target(
   SRCS graph_test.cpp
 )
 alaya_cc_target(
-  hnsw_test
-  GTEST
-  SRCS hnsw_test.cpp
-)
-alaya_cc_target(
   qg_segment_test
   GTEST
   SRCS qg_segment_test.cpp
@@ -46,11 +41,6 @@ alaya_cc_target(
 alaya_add_test(
   NAME index_test_graph
   TARGET graph_test
-  LABELS unit
-)
-alaya_add_test(
-  NAME index_test_hnsw
-  TARGET hnsw_test
   LABELS unit
 )
 alaya_add_test(

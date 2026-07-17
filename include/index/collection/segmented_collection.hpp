@@ -29,7 +29,6 @@
 
 #include "index/collection/collection_checkpoint.hpp"
 #include "index/collection/experimental_snapshot_writer.hpp"
-#include "index/graph/hnsw/hnsw_segment.hpp"
 #include "index/graph/qg/qg_segment.hpp"
 
 namespace alaya::internal::collection {
@@ -1504,22 +1503,20 @@ class SegmentedCollection {
             segment_extensions.push_back(extension);
           }
         }
-        const auto is_memory_graph = descriptor.algorithm_id == core::algorithm::hnsw ||
-                                     descriptor.algorithm_id == core::algorithm::qg;
+        const auto is_memory_graph = descriptor.algorithm_id == core::algorithm::qg;
         // Declared at this scope (one per segment-loop iteration), not
-        // inside the `if` below: make_hnsw_search_extension() and
-        // make_qg_search_extension() store payload = std::addressof(their
-        // argument), and the resulting AlgorithmSearchExtension is read
-        // through segment_extensions well past that `if` block's closing
-        // brace (segment_request.options.extensions below, and again
-        // inside entry->segment.search()). A narrower scope for these two
-        // is a dangling-pointer bug -- caught here because an unrelated
-        // local added a few lines down (segment_filter_storage) perturbed
-        // the stack layout enough to turn latent UB into a real failure
-        // (HNSW rejecting its own synthesized effort extension as
-        // corrupt). Pre-existing, unrelated to the admission contract;
-        // fixed in passing since it now reproduces deterministically.
-        ::alaya::HnswSearchExtension hnsw_effort;
+        // inside the `if` below: make_qg_search_extension() stores
+        // payload = std::addressof(its argument), and the resulting
+        // AlgorithmSearchExtension is read through segment_extensions well
+        // past that `if` block's closing brace (segment_request.options.
+        // extensions below, and again inside entry->segment.search()). A
+        // narrower scope here is a dangling-pointer bug -- caught here
+        // because an unrelated local added a few lines down
+        // (segment_filter_storage) perturbed the stack layout enough to
+        // turn latent UB into a real failure (a memory graph segment
+        // rejecting its own synthesized effort extension as corrupt).
+        // Pre-existing, unrelated to the admission contract; fixed in
+        // passing since it now reproduces deterministically.
         ::alaya::QgSearchExtension qg_effort;
         if (is_memory_graph) {
           if (candidate_limit > std::numeric_limits<std::uint32_t>::max()) {
@@ -1543,15 +1540,9 @@ class SegmentedCollection {
             }
             segment_extensions.push_back(make(effective));
           };  // NOLINT(readability/braces)
-          if (descriptor.algorithm_id == core::algorithm::hnsw) {
-            synthesize_effort(hnsw_effort, [](const auto &extension) {
-              return ::alaya::make_hnsw_search_extension(extension);
-            });
-          } else {
-            synthesize_effort(qg_effort, [](const auto &extension) {
-              return ::alaya::make_qg_search_extension(extension);
-            });
-          }
+          synthesize_effort(qg_effort, [](const auto &extension) {
+            return ::alaya::make_qg_search_extension(extension);
+          });
         }
         core::SearchRequest segment_request;
         segment_request.queries = request.queries;
@@ -1635,7 +1626,7 @@ class SegmentedCollection {
             request.filter.active() && segment_status.code() == core::StatusCode::not_supported &&
             request.options.filter_policy == core::FilterPolicy::automatic) {
           // This segment cannot execute the bitmap filter it was just
-          // handed (qg/hnsw/disk_flat all still reject any non-none
+          // handed (qg/disk_flat all still reject any non-none
           // filter kind). Re-planning the whole query would cost a
           // second selectivity pass; instead retry just this segment
           // unfiltered -- the per-hit re-verify a few lines down (already

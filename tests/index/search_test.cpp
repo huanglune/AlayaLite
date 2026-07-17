@@ -11,24 +11,20 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "core/log.hpp"
 #include "index/graph/detail/search_runtime/graph_search_job.hpp"
+#include "index/graph/detail/timer.hpp"
 #include "index/graph/graph.hpp"
-#include "index/graph/hnsw/detail/hnsw_segment_bridge.hpp"
-#include "index/graph/hnsw/hnsw_segment.hpp"
 #include "index/graph/qg/detail/qg_builder_kernel.hpp"
 #include "space/rabitq_space.hpp"
 #include "space/raw_space.hpp"
 #include "space/sq8_space.hpp"
 #include "utils/dataset_utils.hpp"
 #include "utils/evaluate.hpp"
-#include "core/log.hpp"
-#include "index/graph/detail/thread_config.hpp"
-#include "index/graph/detail/timer.hpp"
 
 namespace alaya {
 namespace {
 
-constexpr size_t kHnswM = 64;
 constexpr uint32_t kDefaultTopk = 10;
 constexpr uint32_t kDefaultEf = 100;
 constexpr uint32_t kSparseTailCount = 50;
@@ -37,9 +33,6 @@ using RawSpaceType = RawSpace<>;
 using GraphType = Graph<>;
 using SQ8SpaceType = SQ8Space<>;
 using test::Dataset;
-
-auto max_thread_num() -> uint32_t { return configured_thread_limit(); }
-
 
 auto make_raw_space(const Dataset &ds) -> std::shared_ptr<RawSpaceType> {
   auto space = std::make_shared<RawSpaceType>(ds.data_num, ds.dim, core::Metric::l2);
@@ -66,7 +59,6 @@ auto make_one_dim_sq8_space(const std::vector<float> &values) -> std::shared_ptr
   space->fit(values.data(), static_cast<uint32_t>(values.size()));
   return space;
 }
-
 
 auto make_graph_from_edges(const std::vector<std::vector<uint32_t>> &adjacency)
     -> std::shared_ptr<GraphType> {
@@ -99,18 +91,31 @@ auto sparse_id_threshold(const Dataset &ds) -> int64_t {
   return static_cast<int64_t>(ds.data_num - tail_count);
 }
 
-auto build_hnsw_graph(const Dataset &ds, const std::shared_ptr<RawSpaceType> &space)
+// Manually built via brute-force k-NN (each node's edges are its true
+// nearest neighbors under the space's own distance), so this fixture does
+// not depend on any specific graph-building engine -- it just needs a
+// reasonably well-connected graph to exercise GraphSearchJob against.
+auto build_knn_graph(const Dataset &ds, const std::shared_ptr<RawSpaceType> &space, uint32_t k)
     -> std::shared_ptr<GraphType> {
-  core::BuildContext build_context;
-  auto segment =
-      HnswSegment<RawSpaceType>::build({core::TypedTensorView::contiguous(ds.data.data(),
-                                                                          ds.data_num,
-                                                                          ds.dim),
-                                        space,
-                                        space},
-                                       {.thread_count = max_thread_num()},
-                                       build_context);
-  return detail::HnswSegmentBridge<RawSpaceType, RawSpaceType>::graph(*segment);
+  auto graph = std::make_shared<GraphType>(ds.data_num, k);
+  graph->eps_.push_back(0);
+  std::vector<std::pair<float, uint32_t>> ranked;
+  ranked.reserve(ds.data_num);
+  for (uint32_t node = 0; node < ds.data_num; ++node) {
+    ranked.clear();
+    for (uint32_t other = 0; other < ds.data_num; ++other) {
+      if (other == node) {
+        continue;
+      }
+      ranked.emplace_back(space->get_distance(node, other), other);
+    }
+    const auto neighbor_count = std::min<uint32_t>(k, static_cast<uint32_t>(ranked.size()));
+    std::partial_sort(ranked.begin(), ranked.begin() + neighbor_count, ranked.end());
+    for (uint32_t idx = 0; idx < neighbor_count; ++idx) {
+      graph->at(node, idx) = ranked[idx].second;
+    }
+  }
+  return graph;
 }
 
 template <typename SearchJobPtr>
@@ -154,19 +159,22 @@ auto run_parallel_search(SearchJobPtr &search_job, Dataset &ds, uint32_t topk, u
 struct BaseSearchResources {
   Dataset ds_;
   std::shared_ptr<RawSpaceType> raw_space_;
-  std::shared_ptr<GraphType> hnsw_graph_;
+  std::shared_ptr<GraphType> knn_graph_;
+
+  // 32 edges/node: enough for FullGraphTest's >=90% in-degree-coverage
+  // check to hold comfortably over a random dataset.
+  static constexpr uint32_t kKnnDegree = 32;
 
   BaseSearchResources()
       : ds_(test::random_dataset()),
         raw_space_(make_raw_space(ds_)),
-        hnsw_graph_(build_hnsw_graph(ds_, raw_space_)) {}
+        knn_graph_(build_knn_graph(ds_, raw_space_, kKnnDegree)) {}
 };
 
 auto base_search_resources() -> BaseSearchResources & {
   static BaseSearchResources resources;
   return resources;
 }
-
 
 class SearchTest : public ::testing::Test {
  protected:
@@ -181,7 +189,7 @@ class SearchTest : public ::testing::Test {
   }
 
   static auto graph() -> const std::shared_ptr<GraphType> & {
-    return base_search_resources().hnsw_graph_;
+    return base_search_resources().knn_graph_;
   }
 
   static auto sq_space() -> const std::shared_ptr<SQ8SpaceType> & { return sq_space_; }
@@ -224,7 +232,7 @@ TEST_F(SearchTest, FullGraphTest) {
   EXPECT_EQ(zero_outpoint_cnt, dataset.data_num);
 }
 
-TEST_F(SearchTest, SearchHNSWTest) {
+TEST_F(SearchTest, SearchGraphTest) {
   auto &dataset = ds();
   auto search_job = std::make_unique<GraphSearchJob<RawSpaceType>>(raw_space(), graph());
 
@@ -238,7 +246,7 @@ TEST_F(SearchTest, SearchHNSWTest) {
   EXPECT_GE(recall, 0.5);
 }
 
-TEST_F(SearchTest, SearchHNSWTestSQSpace) {
+TEST_F(SearchTest, SearchGraphTestSQSpace) {
   auto &dataset = ds();
   auto search_job = std::make_unique<GraphSearchJob<SQ8SpaceType, RawSpaceType>>(sq_space(),
                                                                                  graph(),

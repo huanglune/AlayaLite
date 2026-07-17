@@ -5,6 +5,13 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 # Memory graph to Segment migration pattern
 
+> **Superseded / historical (2026-07-17).** HNSW itself was retired in the
+> HNSW-retirement wave (`include/index/graph/hnsw/` deleted; QG is now the
+> sole in-memory graph engine). The Segment-API migration pattern this
+> document records is still the one QG and later producers followed, but the
+> "HNSW result" section below describes source that no longer exists. See
+> `CHANGELOG.md`'s `[Unreleased]` entry for the current state.
+
 HNSW is the reference migration for Gate 0 and the first producer adapted to
 the frozen [core contract v3](contract-v3.md) in Gate 2. The pattern is a direct
 C++ API replacement: a public builder plus public `Graph` is not kept in

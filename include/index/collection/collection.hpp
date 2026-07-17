@@ -67,7 +67,7 @@ struct CollectionOptions {
   std::uint32_t dim{};
   core::Metric metric{core::Metric::l2};
   core::ScalarType scalar_type{core::ScalarType::float32};
-  core::AlgorithmId target_algorithm{core::algorithm::hnsw};
+  core::AlgorithmId target_algorithm{core::algorithm::qg};
   CollectionQuantization quantization{CollectionQuantization::none};
   std::uint32_t build_threads{1};
   std::uint32_t max_neighbors{32};
@@ -717,9 +717,6 @@ class Collection {
     } else if (requested_algorithm == core::algorithm::qg && live_row_count <= 32) {
       resolution.fallback_reason = "qg requires >32 live rows; built Flat instead";
     } else if (requested_algorithm == core::algorithm::qg &&
-               schema.metric == core::Metric::cosine) {
-      resolution.fallback_reason = "qg cosine is not enabled for RaBitQ; built Flat instead";
-    } else if (requested_algorithm == core::algorithm::qg &&
                schema.scalar_type != core::ScalarType::float32) {
       resolution.fallback_reason = "qg requires float32 vectors; built Flat instead";
     } else {
@@ -755,7 +752,6 @@ class Collection {
                    "canonical Collection metric/quantization schema is invalid");
     }
     const auto algorithm_valid = options.target_algorithm == core::algorithm::flat ||
-                                 options.target_algorithm == core::algorithm::hnsw ||
                                  options.target_algorithm == core::algorithm::qg ||
                                  options.target_algorithm == core::algorithm::laser;
     if (!algorithm_valid) {

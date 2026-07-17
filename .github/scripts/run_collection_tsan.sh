@@ -17,8 +17,5 @@ cmake --build --preset tsan --target \
 
 export TSAN_OPTIONS=${TSAN_OPTIONS:-halt_on_error=1:history_size=7}
 setarch "$ARCH" -R "$ROOT/build/TSan/tests/collection/segmented_collection_stress_test"
-# The retained HNSW construction kernel has a known lock-order cycle in
-# fixture construction. No invocation below currently needs to work around
-# it, but keep this note for future test authors who add one.
 setarch "$ARCH" -R "$ROOT/build/TSan/tests/index/qg_segment_test" \
   --gtest_filter=QgSegmentTest.ConcurrentSearchOnlyIsReentrant

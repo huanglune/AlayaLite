@@ -43,11 +43,11 @@ def _named_step(steps: list[dict], name: str) -> dict:
 
 
 def test_python_only_jobs_do_not_use_conan_cache_action() -> None:
-    # Python-only jobs must not restore the C++ Conan cache. Ruff/pylint linting now
-    # lives in precommit-checker's `pre-commit` job (the old code-checker py-lint-check
-    # was folded into it); codegen-drift-check is the remaining uv-only job here.
+    # Python-only jobs must not restore the C++ Conan cache. Ruff/pylint linting
+    # lives in precommit-checker's `pre-commit` job (the old code-checker
+    # py-lint-check was folded into it; code-checker's other former uv-only job,
+    # codegen-drift-check, was retired along with the codegen it checked).
     assert not _uses(_steps("precommit-checker.yaml", "pre-commit"), "./.github/actions/cache-restore")
-    assert not _uses(_steps("code-checker.yaml", "codegen-drift-check"), "./.github/actions/cache-restore")
 
 
 def test_precommit_has_dedicated_hook_environment_cache() -> None:

@@ -5,6 +5,14 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 # Memory QG legacy dispatch contract
 
+> **Superseded / historical (2026-07-17).** The HNSW-retirement wave removed
+> `"hnsw"` as a valid `index_type` string end to end (Python `common.py`'s
+> valid-index-type set, the native `algorithm()` parser, and the codegen
+> matrix this contract was generated from are all gone), so the "declared
+> `hnsw`, actually builds QG" compatibility identity this document records is
+> no longer reachable. See `CHANGELOG.md`'s `[Unreleased]` entry for the
+> current state.
+
 The legacy Python `Index` entry treats `quantization_type="rabitq"` as the
 decisive engine selection. The requested `index_type` is retained as the
 declared compatibility identity, but all three legal rows build and open the
