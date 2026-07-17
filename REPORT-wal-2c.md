@@ -14,6 +14,7 @@
 - **W1 补账完成并 commit**(续程,2e85883):完整 C0-C11 SIGKILL 崩溃矩阵(13 格,含 tiny-cap 强制 spill 的 C4/C5)+ consolidate 掉电族 roll-forward 测试(END durable → S_new over 全丢/全留 install);`(reclaim×bloom×r_target)` 5 格与非 WAL oracle 的 live-row 逐字节 + tombstone/free 集合一致;statvfs 精确上界(design §1.3,取代 JC-10);write_at BUILD-phase steal 断言("END 前 index/arena 维护写=0")。
 - **W2/W3**:未开始(见"遗留")。**W2 前须按纪律发起 codex 对抗审查。**
 - 相关 ctest(laser/collection/wal/crash 标签)40/40 绿;新增测试:frame 三 API、fail-closed 选择器、kind=7/8 golden、consolidate 三功能测试、consolidate SIGKILL C0-C11(13 格)、consolidate 掉电 roll-forward、oracle 等价 5 格。
+- **W1 codex 复审补账完成并 commit(续程,本波第三程)**:codex 复用核审查报告(`wal2c-w2-codex-report.md`)A 部分的 5 BLOCKER + 5 MAJOR,除 MAJOR-10(activation-ready 洞,codex 明令随激活原子组落地)外全部落地;详见"八、Step 1 状态映射"与 JC-16..JC-21。40/40 laser/collection/wal/crash 绿(crash 36 例含强化的 S_old/S_new 指纹族)。
 
 ---
 
@@ -62,6 +63,29 @@
 - **JC-13**(W1 补账,取代 JC-10):`maint_statvfs_preflight(reclaim_slots)` 用 design §1.3 精确上界。推导:repair/reclaim 各按页序处理、完成页本相位内不再触碰,故每页每相位至多 log 一次 ⇒ kind=1 帧数 ≤ repair_pages + reclaim_pages(混合页计两次=其至多两 log)。每页帧 overhead = WAL7(kHeaderBytes 36 + kTrailerBytes 4) + SEGMENT_OP 头 19 + row_patch 定长 20 = 79;marker 帧 = 40+19+8 = 67;另加 CoW 文件系统每装入页 ×page_size 的保守项 + max(16MiB, base/20) 余量。全程 saturating 乘加(溢出即 UINT64_MAX 拒绝)。repair_upper=reclaim_upper=committed_pages 是安全上界(bloom 模式候选页 ≤ committed_pages)。
 - **JC-14**(W1 补账,量化 JC-9 内存验收缺口):全流式 replay 仍**deferred**。量化依据:单个未 checkpoint 的维护 epoch 其 WAL 帧数 ≤ repair_pages+reclaim_pages ≤ 2×committed_pages(见 JC-13),故 `recovery_scan()` 峰值 ≈ 2× 索引 live 页字节(与加载索引同阶,非无界);epoch 状态机的 `epoch_pages`(latest-per-page)独立地 ≤ committed_pages×page_size(不随 spill 次数 S 涨)。真正的 O(WAL 字节)只在"多 epoch 长期不 checkpoint"下累积,而 checkpoint 的 WAL reset 在实践中封顶。将 `recovery_scan()` 改为 `visit_frames` 驱动(API 已建、已用于 overlay 溢写重载)可把 replay 峰值降到 O(max-frame + touched×page)——因动全部恢复/崩溃路径,风险大,列为 deferred 优化。"END 前维护写=0" 由 write_at 的 BUILD-phase 硬断言直接保证(任何隐蔽 steal 即 poison,C0-C7 崩溃格与 oracle 测试全绿即其反证)。
 - **JC-15**(战略停点,接续 W2a 绿边界):W2 复用核=B-2C-01 writer-private 可见性 + canonical prebind 重写 + staged-replay + B-2C-02 恢复完整性 + §3.4 mixed-HWM 代数 + checkpoint 准入 + v3 pid 激活 + 2B adapter token 化 + R0-R11,≈800 行本波最高风险协议,且**必须 runtime+replay 原子同落**(备忘 §3.5:交错 reuse 的 torn bundle 会覆盖 <committed 的真实地址⇒corruption;无更小正确切片)。因剩余预算须覆盖强制 codex 对抗审查 + W3,不冒"按测试绿但协议不成立"(手册设 codex 中审的正因)之险 rush 落地。裁决:代码停在 W2a 绿边界(前程先例=W0/W1 后停并诚报),把复用核作 runway 冻结进本 REPORT §七 + 后台 codex 参考实现(brief/report 在 job tmp:wal2c-w2-codex-brief.md / wal2c-w2-codex-report.md),供续程按 runway 直接落地。已验证前提:robust_prune/patch_reverse_edge_impl/full_reverse_recompute 均写者独占(公开 search 走 FastScan 不经它们)⇒writer-private `bundle_reveal_` 判据成立。
+- **JC-16**(MAJOR-10 缓落定位):W2a generation 门控的 activation-ready 待补洞(loader 核对 `max_pid_generation/nonzero_pid_generation_count`、absorbed replay 比 generation、promotion `insert_or_assign` 换 incarnation、`replay_label_bind` 放开非零 generation、checkpoint 以 content-revision/dirty 判 slot、`PidToken` 默认 `kPidMax`)——codex A.10 明令"必须在扩 `kQgSupportedRequiredFeatures` 的同一原子落地组内完成",故不在 Step 1 落地,随 Step 6 激活组。清单已在此 REPORT §七 + codex 报告 §A.10 固化。
+- **JC-17**(MAJOR-9 分割):slot loader `pid < num_points` 已在 QG loader 落地(fail-closed 拒越界 binding);codex A.9 的"未激活时 base PID 不得有 binding / `pid<base_count`⇒`gen>0`"部分依赖 segment 层 `base_count`(reuse 模型),随 Step 7 adapter/effective_label 组落地。
+- **JC-18**(BLOCKER-1 范围):落地"当前页 pin"(`maint_spill_over_cap(pin_pi)` 绝不驱逐正在 RMW 的页),直接消除 codex 反例(cap=1 下溢写选中刚开始的活跃页⇒下一行重载重记的无界放大)。完整"物理页分批"帧数上界仍是并行 lane 的 deferred 设计(JC-8);残余(小 cap 下邻居跨行重触发的再溢写)由 preflight 余量 + pin 有界,近满盘极端下仍可能超 preflight——与 JC-8 串行-lane-最小可行同范围。
+- **JC-19**(BLOCKER-3 落地,取代 JC-9/JC-14 的 deferred):流式恢复经 `WalFile` 新增 opt-in `stream_recovery` ctor 旗标(default false⇒既有 caller 与 `wal_frame_test` 红线逐字节不变)+ `scan_structure_streaming`(单帧内存、不留 payload)+ QG replay/fresh-probe 全走 `visit_frames`。行为等价(同帧序、同 epoch 状态机),恢复内存 O(max frame + touched pages) 非 O(WAL 字节)。`truncate_to` 仍是流式恢复语义截断,非第四 API 滥用。
+- **JC-20**(BLOCKER-4):`maint_install_all` 的 page seqlock 在 `write_at` 抛出时经 try/catch 补齐 even(关闭 seqlock 对),并发 reader 不再永久自旋;句柄同抛即 poison,撕裂页在 poison 下无 post-commit 内容保证,仅保 reader liveness。
+- **JC-21**(MAJOR-8):no-steal 审计统一为 `assert_no_maintenance_steal(what)`,覆盖 `write_at`(pwrite+arena)/bloom-scan `ftruncate`/`write_superblock`(直接 pwrite)三口;replaying_ 与 pre-BEGIN 激活 checkpoint 下为 no-op。codex 建议的"observer 正向计数证明 END 前维护写=0"被 poison 守卫 + 现已精确的 S_old 指纹(BLOCKER-2,任何 build 期 index 变更泄漏进 S_old 即被指纹比对逮住)双重涵盖,故不新增计数器(冗余)。
+
+## 八、Step 1 状态映射(codex 复用核报告 A 部分:最小正确落地顺序步 1)
+
+| 项 | 类型 | 状态 | commit | 落地 |
+|---|---|---|---|---|
+| BLOCKER-1 statvfs/spill | 代码 | **落地**(pin) | 9653693 | `maint_spill_over_cap(pin_pi)` 钉活跃页;全上界=JC-18 deferred |
+| BLOCKER-2 C 矩阵 oracle | 测试 | **落地** | 96ce92a | S_old/S_new 全指纹(页内容+PID 集+free chain+routing+epoch)+ SIGKILL 断言 + 二次 replay 重开首恢复输出 |
+| BLOCKER-3 流式 replay | 代码 | **落地** | c3e3306 | `stream_recovery` ctor + `scan_structure_streaming` + `visit_frames` 驱动 replay(JC-19) |
+| BLOCKER-4 seqlock scope guard | 代码 | **落地** | 6e7f008 | install `write_at` 抛出时补 even(JC-20) |
+| BLOCKER-5 replay generation/epoch | 代码 | **落地** | 6e7f008 | BEGIN 绑 cursor generation,kind=1/END 同 generation 否则 poison |
+| MAJOR-6 C7 真 torn-END | 测试 | **落地** | 96ce92a | 显式物化 truncated/bad-CRC END⇒S_old,完整 END⇒S_new roll-forward |
+| MAJOR-7 oracle 等价补全 | 测试 | **落地** | 96ce92a | 补 trailer `valid_degree` + canonical free chain(head=min/升序/kPidMax/len==free_count/集合相等) |
+| MAJOR-8 steal guard 统一 | 代码 | **落地** | 6e7f008 | `assert_no_maintenance_steal` 覆盖 write_at/ftruncate/write_superblock(JC-21) |
+| MAJOR-9 slot loader 验证 | 代码 | **部分落地** | 6415aba | QG loader `pid<num_points`;base-region shadowing 随 Step 7(JC-17) |
+| MAJOR-10 W2a activation-ready 洞 | 代码 | **随激活组(Step 6)** | — | codex A.10 明令原子同落;清单=JC-16 + §七 |
+
+Step 2-8(不激活类型/API → reader → reserve/checkpoint 准入 → canonical writer → activation 原子组 → adapter token 化 → R0-R11 全矩阵)未开始:复用核须 runtime+replay 原子同落(JC-15/codex §5 坑 1),剩余预算不足以覆盖 ≈800 行最高风险协议 + 强制 codex 中审 + 全矩阵,故停在 Step 1 完整绿边界并诚报(前两程 W0/W1、W2a 停点先例)。
 
 ## 四、边界清单
 
