@@ -704,6 +704,12 @@ class QGUpdater {
     return free_list_head_.load(std::memory_order_acquire);
   }
 
+  // wal-2c BLOCKER-2: the highest maintenance epoch whose consolidate transaction is
+  // durably committed (0 == none). Part of the crash-matrix S_old/S_new fingerprint.
+  [[nodiscard]] uint64_t last_completed_consolidate_epoch() const {
+    return last_completed_consolidate_epoch_;
+  }
+
   [[nodiscard]] uint64_t generation() const { return superblock_.generation; }
   [[nodiscard]] uint64_t segment_uid() const { return segment_uid_; }
 

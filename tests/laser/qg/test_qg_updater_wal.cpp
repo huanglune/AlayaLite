@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -311,6 +312,7 @@ TEST_P(QgUpdaterWalOracle, WalConsolidateMatchesNonWalOracle) {
   // --- non-WAL oracle: tombstone + consolidate + checkpoint, then snapshot ---
   std::vector<std::vector<char>> oracle_rows(kBaseN);
   std::vector<uint16_t> oracle_flags(kBaseN, 0);
+  std::vector<uint16_t> oracle_degree(kBaseN, 0);  // wal-2c MAJOR-7: full-trailer compare
   uint64_t oracle_free = 0;
   uint64_t oracle_live = 0;
   {
@@ -326,7 +328,9 @@ TEST_P(QgUpdaterWalOracle, WalConsolidateMatchesNonWalOracle) {
     upd.consolidate(1, param.r_target, param.reclaim, param.bloom);
     upd.checkpoint();
     for (PID id = 0; id < static_cast<PID>(kBaseN); ++id) {
-      oracle_flags[id] = upd.trailer(id).flags;
+      const auto tr = upd.trailer(id);
+      oracle_flags[id] = tr.flags;
+      oracle_degree[id] = tr.valid_degree;
       if ((oracle_flags[id] & (kQGRowTombstone | kQGRowFree)) == 0) {
         oracle_rows[id] = upd.debug_read_row(id);
       }
@@ -345,14 +349,44 @@ TEST_P(QgUpdaterWalOracle, WalConsolidateMatchesNonWalOracle) {
     EXPECT_EQ(s.upd->free_count(), oracle_free) << "free set size differs from the oracle";
     EXPECT_EQ(s.upd->live_count(), oracle_live) << "live count differs from the oracle";
     for (PID id = 0; id < static_cast<PID>(kBaseN); ++id) {
-      const uint16_t flags = s.upd->trailer(id).flags;
+      const auto tr = s.upd->trailer(id);
+      const uint16_t flags = tr.flags;
       const uint16_t mask = kQGRowTombstone | kQGRowFree;
       ASSERT_EQ(flags & mask, oracle_flags[id] & mask)
           << "pid " << id << " tombstone/free disagrees with the oracle";
+      // wal-2c MAJOR-7: valid_degree lives in the page trailer, outside debug_read_row's
+      // node_len_ window -- a live row with correct bytes but a wrong degree would slip by.
+      EXPECT_EQ(tr.valid_degree, oracle_degree[id])
+          << "pid " << id << " valid_degree disagrees with the oracle";
       if ((flags & mask) == 0) {
         EXPECT_EQ(s.upd->debug_read_row(id), oracle_rows[id])
             << "live row " << id << " bytes differ from the non-WAL oracle";
       }
+    }
+    // wal-2c MAJOR-7: the WAL path must publish the CANONICAL free chain (recovery
+    // byte-stability, clause 11): head == min(FREE set), strictly ascending, next(last)
+    // == kPidMax, exactly free_count() links, and the linked set == the FREE trailer set.
+    if (param.reclaim) {
+      std::vector<PID> free_set;
+      for (PID id = 0; id < static_cast<PID>(kBaseN); ++id) {
+        if ((s.upd->trailer(id).flags & kQGRowFree) != 0) free_set.push_back(id);
+      }
+      std::vector<PID> chain;
+      PID cur = s.upd->free_list_head();
+      while (cur != kPidMax && chain.size() <= free_set.size()) {
+        chain.push_back(cur);
+        const auto row = s.upd->debug_read_row(cur);
+        ASSERT_GE(row.size(), sizeof(uint64_t));
+        uint64_t next = 0;
+        std::memcpy(&next, row.data(), sizeof(next));
+        cur = static_cast<PID>(next);
+      }
+      EXPECT_EQ(cur, kPidMax) << "free chain did not terminate at kPidMax (cycle/overrun)";
+      EXPECT_EQ(chain.size(), s.upd->free_count()) << "free chain length != free_count";
+      std::vector<PID> sorted_free = free_set;
+      std::sort(sorted_free.begin(), sorted_free.end());
+      EXPECT_EQ(chain, sorted_free)
+          << "free chain is not the ascending canonical order of the FREE set";
     }
   }
   std::filesystem::remove_all(root);
