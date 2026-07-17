@@ -78,6 +78,15 @@ enum class SegmentOpFailPoint : std::uint8_t {
   before_tx_publish_append,        // snapshot pre-built, immediately before the kind=8 append
   after_tx_publish_fsync,          // kind=8 durable, before the snapshot swap + committed store
   label_slot_written_before_flip,  // inactive label slot durable, before the checkpoint flip frame
+  // 2C consolidate-transaction cuts (design section 6.1; appended so every prior
+  // value is preserved). C0-C11 map onto these + the whole-page install loop.
+  after_consolidate_begin_append,          // kind=3 begin buffered, before its fsync
+  after_consolidate_begin_fsync,           // begin durable, before any page mutation
+  after_consolidate_spill_flush,           // an overlay page spilled (kind=1) + flushed
+  before_consolidate_end_append,           // all pages staged, immediately before kind=4
+  after_consolidate_end_fsync,             // kind=4 durable (the commit point), before install
+  after_consolidate_install_page,          // one index page installed post-commit
+  after_consolidate_install_before_publish,  // all pages installed, before free-list/epoch publish
 };
 
 // Test-only observer for the persistence-model (power-loss) crash layer. It is

@@ -8,6 +8,7 @@
 // collection layer's loud rejection of a foreign record type.
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <array>
 #include <cstddef>
@@ -236,6 +237,77 @@ TEST(CollectionScanCrossFamily, TornTailStillTruncatesToVerifiedBoundary) {
   const auto opened = CollectionLogicalWal::open(root);
   ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
   EXPECT_EQ(slurp(wal_path).size(), clean_size) << "torn tail should be healed to the boundary";
+  std::filesystem::remove_all(root);
+}
+
+// B-2C-04: append() reports each frame's FrameLocation, visit_frames streams them
+// back one at a time (bounded memory), and read_frame re-reads exactly one frame
+// with full CRC re-validation. Wire is unchanged (the golden test above still
+// pins make_frame).
+TEST(WalFileStreamingApi, AppendLocationsVisitAndReadFrame) {
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("wal_frame_stream_" + std::to_string(::getpid()));
+  std::filesystem::create_directories(root);
+  const auto path = root / "seg.opwal";
+  std::vector<FrameLocation> locations;
+  std::vector<std::vector<std::byte>> payloads;
+  {
+    WalFile wal(path);
+    for (unsigned i = 0; i < 5; ++i) {
+      auto payload = bytes_of({i, static_cast<unsigned>(i * 7 + 1), 0xAB, 0xCD});
+      const auto loc = wal.append(/*type=*/5, /*flags=*/0, /*op_id=*/i, /*batch_id=*/i * 2,
+                                  payload, WalFile::Sync::flush);
+      locations.push_back(loc);
+      payloads.push_back(std::move(payload));
+    }
+  }
+  // Locations are contiguous and ascending.
+  EXPECT_EQ(locations.front().offset, 0U);
+  for (std::size_t i = 1; i < locations.size(); ++i) {
+    EXPECT_EQ(locations[i].offset, locations[i - 1].offset + locations[i - 1].size);
+  }
+  // visit_frames streams every frame in order; stop early on demand.
+  std::vector<ScannedFrame> visited;
+  WalFile::visit_frames(path, [&](const ScannedFrame &f) {
+    visited.push_back(f);
+    return true;
+  });
+  ASSERT_EQ(visited.size(), payloads.size());
+  for (std::size_t i = 0; i < visited.size(); ++i) {
+    EXPECT_EQ(visited[i].op_id, i);
+    EXPECT_EQ(visited[i].batch_id, i * 2);
+    EXPECT_EQ(visited[i].offset, locations[i].offset);
+    EXPECT_EQ(visited[i].size, locations[i].size);
+    EXPECT_EQ(visited[i].payload, payloads[i]);
+  }
+  std::size_t seen = 0;
+  WalFile::visit_frames(path, [&](const ScannedFrame &) {
+    ++seen;
+    return seen < 2;  // ask to stop after the second frame
+  });
+  EXPECT_EQ(seen, 2U);
+  // read_frame re-reads exactly one frame at its location, CRC-validated.
+  for (std::size_t i = 0; i < locations.size(); ++i) {
+    const auto f = WalFile::read_frame(path, locations[i]);
+    EXPECT_EQ(f.op_id, i);
+    EXPECT_EQ(f.payload, payloads[i]);
+  }
+  // A mangled location fails closed (wrong size / off-boundary offset).
+  EXPECT_THROW((void)WalFile::read_frame(path, FrameLocation{locations[1].offset + 1,
+                                                             locations[1].size}),
+               std::exception);
+  EXPECT_THROW((void)WalFile::read_frame(path, FrameLocation{locations[1].offset, 3}),
+               std::exception);
+  // Re-open continues appending after the recovered boundary (append cursor is
+  // restored from the last verified frame).
+  {
+    WalFile wal(path);
+    auto payload = bytes_of({0xEE});
+    const auto loc = wal.append(6, 0, 99, 0, payload, WalFile::Sync::fsync);
+    EXPECT_EQ(loc.offset, locations.back().offset + locations.back().size);
+    const auto f = WalFile::read_frame(path, loc);
+    EXPECT_EQ(f.op_id, 99U);
+  }
   std::filesystem::remove_all(root);
 }
 

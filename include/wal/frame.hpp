@@ -153,6 +153,16 @@ struct ScanResult {
   bool stopped_at_corrupt_or_torn_tail{};
 };
 
+// Byte location of one frame within a WAL file: start offset + complete length.
+// Returned by WalFile::append and consumed by WalFile::read_frame, so a caller
+// (the W1 maintenance overlay spill) can re-read exactly one frame later without
+// loading the whole file (codex B-2C-04). Wire is unchanged: this is a pure
+// bookkeeping value, never serialized.
+struct FrameLocation {
+  std::uint64_t offset{};
+  std::uint64_t size{};
+};
+
 // Prefix-safe structural scan. A frame is accepted iff its magic, version,
 // lengths, trailer, and CRC are consistent and its record type is non-zero.
 // Semantic validation of the type (which family, which op) belongs to the
@@ -306,6 +316,10 @@ class WalFile {
       std::filesystem::resize_file(path_, recovery_scan_.valid_bytes);
       platform::sync_file_or_throw(path_);
     }
+    // The append cursor starts at the last verified frame boundary (== the file
+    // size after any torn-tail truncation), so append() can report accurate frame
+    // locations (B-2C-04).
+    append_offset_ = recovery_scan_.valid_bytes;
     open_stream();
   }
 
@@ -323,13 +337,17 @@ class WalFile {
   [[nodiscard]] auto recovery_scan() const -> const ScanResult & { return recovery_scan_; }
   [[nodiscard]] auto path() const -> const std::filesystem::path & { return path_; }
 
-  void append(std::uint8_t type,
-              std::uint8_t flags,
-              std::uint64_t op_id,
-              std::uint64_t batch_id,
-              std::span<const std::byte> payload,
-              Sync sync) {
+  // Returns the FrameLocation (offset + size) of the appended frame (B-2C-04) so a
+  // caller can re-read exactly this frame later via read_frame(). Existing callers
+  // that ignore the return value are unaffected.
+  FrameLocation append(std::uint8_t type,
+                       std::uint8_t flags,
+                       std::uint64_t op_id,
+                       std::uint64_t batch_id,
+                       std::span<const std::byte> payload,
+                       Sync sync) {
     const auto frame = make_frame(type, flags, op_id, batch_id, payload);
+    const FrameLocation location{append_offset_, static_cast<std::uint64_t>(frame.size())};
     stream_.write(reinterpret_cast<const char *>(frame.data()),
                   static_cast<std::streamsize>(frame.size()));
     if (!stream_) {
@@ -344,6 +362,8 @@ class WalFile {
     if (sync == Sync::fsync) {
       platform::sync_file_or_throw(path_);
     }
+    append_offset_ += frame.size();
+    return location;
   }
 
   // Force the currently-buffered prefix durable without appending a frame. Used
@@ -384,7 +404,127 @@ class WalFile {
     platform::atomic_replace(temporary, path_);
     platform::sync_directory_or_throw(path_.parent_path());
     recovery_scan_ = scan_path(path_);
+    append_offset_ = recovery_scan_.valid_bytes;
     open_stream();
+  }
+
+  // Streaming structural scan (B-2C-04): invoke visitor(const ScannedFrame&) for
+  // each verified frame in file order, holding at most one frame in memory
+  // (O(max frame), not O(file)). Stops at the first torn/corrupt frame -- never
+  // resynchronizes past damage -- or when the visitor returns false. This lets QG
+  // recovery replay a large op-WAL without loading it whole. visitor returns bool.
+  template <typename Visitor>
+  static void visit_frames(const std::filesystem::path &path, Visitor &&visitor) {
+    if (!std::filesystem::exists(path)) {
+      return;
+    }
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+      throw std::runtime_error("WalFile: cannot read " + path.string());
+    }
+    std::uint64_t offset = 0;
+    std::vector<std::byte> frame;
+    for (;;) {
+      std::array<std::byte, kHeaderBytes> header{};
+      input.read(reinterpret_cast<char *>(header.data()), kHeaderBytes);
+      if (input.gcount() != static_cast<std::streamsize>(kHeaderBytes)) {
+        break;
+      }
+      const auto magic = get_u32(header, 0);
+      const auto version = get_u16(header, 4);
+      const auto type = std::to_integer<std::uint8_t>(header[6]);
+      const auto flags = std::to_integer<std::uint8_t>(header[7]);
+      const auto frame_bytes = get_u32(header, 8);
+      const auto payload_bytes = get_u32(header, 12);
+      if (magic != kFrameMagic || version != kFormatVersion || type == 0 ||
+          payload_bytes > kMaximumPayloadBytes ||
+          frame_bytes != kHeaderBytes + payload_bytes + kTrailerBytes) {
+        break;
+      }
+      frame.resize(frame_bytes);
+      std::copy(header.begin(), header.end(), frame.begin());
+      input.read(reinterpret_cast<char *>(frame.data()) + kHeaderBytes,
+                 static_cast<std::streamsize>(frame_bytes - kHeaderBytes));
+      if (input.gcount() != static_cast<std::streamsize>(frame_bytes - kHeaderBytes)) {
+        break;
+      }
+      if (get_u32(frame, frame_bytes - 4) != kTrailerMagic) {
+        break;
+      }
+      const auto expected = get_u32(frame, kChecksumOffset);
+      std::vector<std::byte> checksum_input(frame.begin(), frame.end());
+      std::fill_n(checksum_input.begin() + static_cast<std::ptrdiff_t>(kChecksumOffset),
+                  4,
+                  std::byte{});
+      if (crc32(checksum_input) != expected) {
+        break;
+      }
+      ScannedFrame decoded;
+      decoded.type = type;
+      decoded.flags = flags;
+      decoded.op_id = get_u64(frame, 16);
+      decoded.batch_id = get_u64(frame, 24);
+      decoded.payload.assign(frame.begin() + kHeaderBytes, frame.end() - kTrailerBytes);
+      decoded.offset = offset;
+      decoded.size = frame_bytes;
+      if (!visitor(static_cast<const ScannedFrame &>(decoded))) {
+        return;
+      }
+      offset += frame_bytes;
+    }
+  }
+
+  // Read exactly the frame at `location` and re-validate header/length/trailer/CRC
+  // (B-2C-04). Throws on any mismatch, so a stale/torn location fails closed.
+  [[nodiscard]] static auto read_frame(const std::filesystem::path &path, FrameLocation location)
+      -> ScannedFrame {
+    if (location.size < kHeaderBytes + kTrailerBytes ||
+        location.size > static_cast<std::uint64_t>(kHeaderBytes) + kMaximumPayloadBytes +
+                            kTrailerBytes) {
+      throw std::invalid_argument("WalFile::read_frame: implausible frame size");
+    }
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+      throw std::runtime_error("WalFile: cannot read " + path.string());
+    }
+    input.seekg(static_cast<std::streamoff>(location.offset));
+    std::vector<std::byte> frame(static_cast<std::size_t>(location.size));
+    input.read(reinterpret_cast<char *>(frame.data()),
+               static_cast<std::streamsize>(frame.size()));
+    if (static_cast<std::uint64_t>(input.gcount()) != location.size) {
+      throw std::runtime_error("WalFile::read_frame: short read");
+    }
+    const auto magic = get_u32(frame, 0);
+    const auto version = get_u16(frame, 4);
+    const auto type = std::to_integer<std::uint8_t>(frame[6]);
+    const auto flags = std::to_integer<std::uint8_t>(frame[7]);
+    const auto frame_bytes = get_u32(frame, 8);
+    const auto payload_bytes = get_u32(frame, 12);
+    if (magic != kFrameMagic || version != kFormatVersion || type == 0 ||
+        frame_bytes != location.size ||
+        frame_bytes != kHeaderBytes + payload_bytes + kTrailerBytes) {
+      throw std::runtime_error("WalFile::read_frame: header/length mismatch");
+    }
+    if (get_u32(frame, frame_bytes - 4) != kTrailerMagic) {
+      throw std::runtime_error("WalFile::read_frame: bad trailer");
+    }
+    const auto expected = get_u32(frame, kChecksumOffset);
+    std::vector<std::byte> checksum_input(frame.begin(), frame.end());
+    std::fill_n(checksum_input.begin() + static_cast<std::ptrdiff_t>(kChecksumOffset),
+                4,
+                std::byte{});
+    if (crc32(checksum_input) != expected) {
+      throw std::runtime_error("WalFile::read_frame: CRC mismatch");
+    }
+    ScannedFrame decoded;
+    decoded.type = type;
+    decoded.flags = flags;
+    decoded.op_id = get_u64(frame, 16);
+    decoded.batch_id = get_u64(frame, 24);
+    decoded.payload.assign(frame.begin() + kHeaderBytes, frame.end() - kTrailerBytes);
+    decoded.offset = location.offset;
+    decoded.size = frame_bytes;
+    return decoded;
   }
 
   [[nodiscard]] static auto scan_path(const std::filesystem::path &path) -> ScanResult {
@@ -416,6 +556,7 @@ class WalFile {
 
   std::filesystem::path path_{};
   ScanResult recovery_scan_{};
+  std::uint64_t append_offset_{};  // byte offset of the next append (B-2C-04 locations)
   std::array<char, 1U << 20U> write_buffer_{};
   std::ofstream stream_{};
 };
