@@ -70,6 +70,53 @@ struct RaBitQCore {
       };
     }
 
+    // Inner-product / cosine branch (metric != l2; shared by both since
+    // Collection today never actually routes cosine into QG -- it rejects and
+    // falls back to flat, see tests/collection/collection_qg_seal_test.cpp:
+    // 509-523 -- but this space-level formula has to stay correct for any
+    // future or direct caller that feeds pre-normalized cosine vectors too).
+    //
+    // Derivation: g_add = ip_sqr(query, centroid) = -<q,c> is computed exactly
+    // by RaBitQSpace::QueryComputer (rabitq_space.hpp), and the fastscan LUT
+    // estimates <half_signed, q_rot> (q rotated, *not* q-c -- unlike the L2
+    // branch above, IP does not need the q-c expansion). Substituting the same
+    // one-factor estimator <r,q> ~= K * <half_signed,q> that the L2 branch
+    // above relies on (K = residual_l2_sqr / residual_dot_half_signed) into
+    // est = base + rescale * <half_signed,q_rot> + g_add, with base and
+    // rescale as returned below, reduces algebraically to the *exact* identity
+    //   est(q, o) = 1 - <q, o>
+    // The leading "1" is a constant that does not depend on the candidate o
+    // (or on q) at all: it shifts every candidate's estimate by the same
+    // amount under a fixed centroid c. Nearest-neighbor ranking only ever
+    // compares estimates against each other for one fixed query, so this
+    // constant is invisible to the ranking -- minimizing 1-<q,o> is exactly
+    // equivalent to maximizing <q,o>, for *any* ||o||, not just unit vectors.
+    // This is NOT an implicit "||o||=1" assumption, despite resembling half
+    // the squared L2 distance between unit vectors (1-<q,o> = ||q-o||^2 / 2
+    // when ||q||=||o||=1) -- that resemblance is exactly why cosine (unit
+    // vectors) can reuse this same branch.
+    //
+    // Do not "fix" this by replacing the literal 1 with a data-driven norm
+    // term such as dot_product(data,data,dim) (||o||^2): that changes the
+    // target to ||o||^2 - <q,o>, which is NOT order-preserving across
+    // candidates with different norms and would corrupt inner_product ranking
+    // for non-unit data. (This was seriously considered and rejected during
+    // the U4-preflight IP audit -- tests/space/rabitq_space_test.cpp's
+    // RaBitQCoreTest.InnerProductBranchLocksToOneMinusDot pins this exact
+    // formula shape via a q=c construction where the K-estimator's own
+    // approximation error is algebraically zero, so a "||o||=1 bug" and a
+    // "candidate-independent constant" are exactly distinguishable.)
+    // Calibrating the *value* to the true -<q,o> would need K=0 here instead
+    // of K=1, but nothing downstream needs that: search only needs order, and
+    // QG re-ranks returned candidates with an exact score before it reaches
+    // the caller (index/graph/laser/qg/qg_segment.hpp's response path).
+    //
+    // K=1 (this literal) is the upstream RaBitQ-Library convention, not
+    // something introduced by this port: the reference implementation's
+    // one_bit_code_with_factor(), METRIC_IP branch (baselines/RaBitQ-Library/
+    // include/rabitqlib/quantization/rabitq_impl.hpp, cloned read-only
+    // alongside this repo) computes the byte-for-byte identical
+    // `f_add = 1 - dot_product(residual, centroid) + ...`.
     auto residual_dot_centroid = dot_product<DataType>(residual_arr.data(), centroid, dim);
     return {
         1 - residual_dot_centroid +
