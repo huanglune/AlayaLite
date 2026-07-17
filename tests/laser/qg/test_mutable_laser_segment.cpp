@@ -11,10 +11,12 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "index/disk/mutable_laser_segment.hpp"
@@ -160,6 +162,57 @@ TEST(MutableLaserSegment, BatchAddPublishesUnderOneWatermark) {
   EXPECT_EQ(base_pid, static_cast<laser::PID>(kBaseN));
   EXPECT_EQ(seg.size(), kBaseN + n);
   seg.checkpoint();
+  std::filesystem::remove_all(dir);
+}
+
+// W0: the single-writer handle mutex serializes add/checkpoint against each other
+// while search stays lock-free (poison read gate only). Run concurrent searches
+// against a stream of add+checkpoint rounds and assert a race-free convergence.
+TEST(MutableLaserSegment, ConcurrentWritesAndSearchesAreRaceFree) {
+  const auto dir = scratch("concurrent");
+  std::filesystem::remove_all(dir);
+  build_segment(dir, 2024);
+  constexpr size_t kRounds = 8;
+  constexpr size_t kPerRound = 8;
+  const auto adds = waltest::make_data(kRounds * kPerRound, kDim, 0xC0DE);
+  const auto query = waltest::make_data(1, kDim, 0x5EED);
+
+  std::atomic<size_t> searches{0};
+  {
+    laser::UpdateParams params;
+    params.ef_insert = 64;
+    params.max_points = kBaseN + 256;
+    MutableLaserSegment seg(dir, params, ResidencyMode::kPagedPool);
+
+    std::atomic<bool> stop{false};
+    std::thread reader([&] {
+      while (!stop.load(std::memory_order_acquire)) {
+        auto hits = seg.search(query.data(), DiskSearchOptions{/*top_k=*/5});
+        EXPECT_LE(hits.size(), 5U);
+        searches.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+
+    for (size_t r = 0; r < kRounds; ++r) {
+      for (size_t i = 0; i < kPerRound; ++i) {
+        (void)seg.add(adds.data() + (r * kPerRound + i) * kDim);
+      }
+      seg.checkpoint();  // serialized against add by the handle mutex
+    }
+    stop.store(true, std::memory_order_release);
+    reader.join();
+
+    EXPECT_EQ(seg.size(), kBaseN + kRounds * kPerRound);
+  }  // seg destroyed here -> writer lease released before the reopen below
+  EXPECT_GT(searches.load(), 0U);
+
+  // Reopen (recovery) converges to the same committed count.
+  {
+    laser::UpdateParams reopen;
+    reopen.max_points = kBaseN + 256;
+    MutableLaserSegment seg2(dir, reopen, ResidencyMode::kPagedPool);
+    EXPECT_EQ(seg2.size(), kBaseN + kRounds * kPerRound);
+  }
   std::filesystem::remove_all(dir);
 }
 

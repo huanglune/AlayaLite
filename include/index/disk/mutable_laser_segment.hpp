@@ -31,6 +31,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -111,6 +112,7 @@ class MutableLaserSegment {
 
   // Append one row and publish it durably. Returns the new PID (== its label).
   auto add(const float *vec) -> laser::PID {
+    const std::lock_guard<std::mutex> guard(mutex_);  // single-writer handle mutex (W0)
     const auto id = updater_->allocate_and_insert(vec);
     updater_->publish(updater_->allocated_points());
     return id;
@@ -119,6 +121,7 @@ class MutableLaserSegment {
   // Append a dense batch under one publish (three-phase batch contract). Returns
   // the base PID; labels are base .. base+n-1.
   auto add_batch(const float *vecs, size_t n) -> laser::PID {
+    const std::lock_guard<std::mutex> guard(mutex_);  // single-writer handle mutex (W0)
     const auto base = static_cast<laser::PID>(updater_->allocated_points());
     for (size_t i = 0; i < n; ++i) {
       (void)updater_->allocate_and_insert(vecs + i * dim_);
@@ -129,18 +132,26 @@ class MutableLaserSegment {
 
   // Mark a row deleted and force the tombstone durable (its own next fsync).
   void tombstone(laser::PID id) {
+    const std::lock_guard<std::mutex> guard(mutex_);  // single-writer handle mutex (W0)
     updater_->tombstone(id);
     updater_->publish(updater_->num_points());  // group-commit the tombstone
   }
 
-  void flush() { updater_->writeback(1); }  // persist dirty pages + mirror the arena
-  void checkpoint() { updater_->checkpoint(); }
+  void flush() {
+    const std::lock_guard<std::mutex> guard(mutex_);  // single-writer handle mutex (W0)
+    updater_->writeback(1);  // persist dirty pages + mirror the arena
+  }
+  void checkpoint() {
+    const std::lock_guard<std::mutex> guard(mutex_);  // single-writer handle mutex (W0)
+    updater_->checkpoint();
+  }
 
   [[nodiscard]] auto search(const float *query, const DiskSearchOptions &opts)
       -> std::vector<DiskSearchHit> {
     if (opts.top_k == 0) {
       throw std::invalid_argument("MutableLaserSegment: top_k must be > 0");
     }
+    updater_->ensure_readable();  // entry poison gate (B-02); lock-free
     const size_t ef = std::max<size_t>(opts.ef, opts.top_k);
     const auto pids = updater_->search(query, opts.top_k, ef);
     std::vector<DiskSearchHit> out;
@@ -148,6 +159,7 @@ class MutableLaserSegment {
     for (const auto pid : pids) {
       out.push_back(DiskSearchHit{label_for(pid), std::numeric_limits<float>::quiet_NaN()});
     }
+    updater_->ensure_readable();  // exit poison gate (B-02)
     return out;
   }
 
@@ -155,11 +167,13 @@ class MutableLaserSegment {
                                   uint32_t num_queries,
                                   const DiskSearchOptions &opts)
       -> std::vector<std::vector<DiskSearchHit>> {
+    updater_->ensure_readable();  // entry poison gate (B-02)
     std::vector<std::vector<DiskSearchHit>> out;
     out.reserve(num_queries);
     for (uint32_t q = 0; q < num_queries; ++q) {
       out.push_back(search(queries + static_cast<size_t>(q) * dim_, opts));
     }
+    updater_->ensure_readable();  // exit poison gate (B-02)
     return out;
   }
 
@@ -223,6 +237,10 @@ class MutableLaserSegment {
   alaya::storage::MMapFile ids_mmap_;
   const uint64_t *ids_view_ = nullptr;
   int wal_lock_fd_ = -1;
+  // Single-writer handle mutex (W0): every public mutating method holds it, so
+  // add/add_batch/tombstone/flush/checkpoint/commit_physical_bundle never race
+  // each other. search/batch_search stay lock-free and use the poison read gate.
+  std::mutex mutex_;
 };
 
 }  // namespace alaya::disk

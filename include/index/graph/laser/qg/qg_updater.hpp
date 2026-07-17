@@ -616,6 +616,16 @@ class QGUpdater {
 
   [[nodiscard]] size_t num_points() const { return committed_.load(std::memory_order_acquire); }
 
+  // Read-path poison gate (B-02): search/label translation never take the handle
+  // write mutex, so they check this lock-free atomic latch at entry and exit. A
+  // poisoned handle requires recovery — reads must fail closed rather than serve a
+  // half-published or torn state.
+  void ensure_readable() const {
+    if (poisoned_.load(std::memory_order_acquire)) {
+      throw std::runtime_error("QGUpdater op-WAL handle is poisoned (recovery required)");
+    }
+  }
+
   [[nodiscard]] size_t allocated_points() const {
     return allocated_points_.load(std::memory_order_acquire);
   }
@@ -4078,6 +4088,10 @@ class QGUpdater {
   }
 
   [[noreturn]] void poison(const std::string &reason) {
+    // Set the lock-free poison latch first so a concurrent search (which never
+    // takes the handle write mutex) observes the poisoned handle via the atomic,
+    // without racing on the poison_reason_ std::string (write-path only).
+    poisoned_.store(true, std::memory_order_release);
     if (poison_reason_.empty()) {
       poison_reason_ = reason;
     }
@@ -4379,6 +4393,7 @@ class QGUpdater {
   std::unique_ptr<alaya::wal::WalFile> op_wal_;  // <index>.opwal, present iff enable_wal_
   bool replaying_ = false;                       // set during recovery redo: suppress log + force
   std::string poison_reason_;                    // non-empty => writer permanently poisoned
+  std::atomic<bool> poisoned_{false};            // lock-free latch mirroring poison_reason_ for reads
   uint64_t segment_uid_ = 0;                     // durable lineage id (superblock reserved[0..8))
   uint64_t wal_op_id_ = 0;                       // monotone frame op-id (informational/diagnostic)
   SegmentIoObserver *io_observer_ = nullptr;     // persistence-model harness hook (test only)
