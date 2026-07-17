@@ -268,7 +268,7 @@ TEST(LaserSegment, DifferentialRankOnlyManifestGateCollectionRejectionAndPerform
   EXPECT_TRUE(segment->publish_reference(publication, publication_context).ok());
   EXPECT_FALSE(std::filesystem::exists(segment_directory / "READY"));
   EXPECT_FALSE(std::filesystem::exists(segment_directory / "ARTIFACTS.v2"));
-  EXPECT_EQ(platform::read_file_prefix(root / "collection_manifest.txt", 9), "version=1");
+  EXPECT_FALSE(std::filesystem::exists(root / "collection_manifest.txt"));
   EXPECT_EQ(native_digests(segment_directory), before_publication);
 
   publication.collection_features.manifest_v2_writer = true;
@@ -278,7 +278,7 @@ TEST(LaserSegment, DifferentialRankOnlyManifestGateCollectionRejectionAndPerform
   ASSERT_FALSE(interrupted.ok());
   EXPECT_FALSE(std::filesystem::exists(segment_directory / "READY"));
   EXPECT_FALSE(std::filesystem::exists(segment_directory / "ARTIFACTS.v2"));
-  EXPECT_EQ(platform::read_file_prefix(root / "collection_manifest.txt", 9), "version=1");
+  EXPECT_FALSE(std::filesystem::exists(root / "collection_manifest.txt"));
   EXPECT_EQ(native_digests(segment_directory), before_publication);
 
   publication.fail_point = internal::collection::ArtifactTransactionFailPoint::none;
