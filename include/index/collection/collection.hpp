@@ -27,6 +27,9 @@
 #include "index/collection/detail/canonical_flat_segment.hpp"
 #include "index/collection/detail/collection_segment_factory.hpp"
 #include "index/collection/detail/collection_target_builder.hpp"
+#if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER != 0
+#include "index/collection/detail/mutable_laser_collection_adapter.hpp"
+#endif
 #include "index/collection/segmented_collection.hpp"
 #include "index/collection/sha256.hpp"
 #include "platform/fs.hpp"
@@ -68,6 +71,10 @@ struct CollectionOptions {
   core::Metric metric{core::Metric::l2};
   core::ScalarType scalar_type{core::ScalarType::float32};
   core::AlgorithmId target_algorithm{core::algorithm::qg};
+  // 2B: the active (writable) generation engine. flat = the in-memory exact table
+  // (default, byte-compatible with pre-2B); laser = the durable on-disk mutable
+  // RaBitQ graph (persisted in the facade schema; reopen restores it).
+  core::AlgorithmId active_engine{core::algorithm::flat};
   CollectionQuantization quantization{CollectionQuantization::none};
   std::uint32_t build_threads{1};
   std::uint32_t max_neighbors{32};
@@ -240,6 +247,14 @@ class Collection {
       status = internal::collection::CollectionControlStore::save(options.root, state);
       if (!status.ok()) {
         return status;
+      }
+      // 2B: materialize the empty active LASER segment directory before open so
+      // make_active_registration can open it (create never re-creates on reopen).
+      if (options.active_engine == core::algorithm::laser) {
+        status = create_active_laser_segment(options, kActiveSegmentId, kActiveSegmentGeneration);
+        if (!status.ok()) {
+          return status;
+        }
       }
       auto opened = open_segmented(options, state);
       if (!opened.ok()) {
@@ -645,7 +660,7 @@ class Collection {
     return options_.target_algorithm;
   }
   [[nodiscard]] auto active_algorithm() const noexcept -> core::AlgorithmId {
-    return core::algorithm::flat;
+    return options_.active_engine;
   }
   [[nodiscard]] auto target_implementation_key() const -> std::string_view {
     const auto *registration = internal::collection::detail::find_collection_target_registration(
@@ -796,17 +811,159 @@ class Collection {
                    core::StatusDetail::unsupported_scalar_type,
                    "canonical Collection quantization requires float32 vectors");
     }
+    // 2B active engine (ruling 7 / B-08). Default flat is always valid. The on-disk
+    // mutable LASER active engine constrains the schema hard: L2 + float32 + rabitq +
+    // a power-of-two dim >= 128 + FastScan-legal max_neighbors in {32,64} (32-slot
+    // block packing, QGScanner cap 64) + target_algorithm=laser (v1 single engine).
+    if (options.active_engine != core::algorithm::flat &&
+        options.active_engine != core::algorithm::laser) {
+      return error(core::StatusCode::not_supported,
+                   stage,
+                   core::StatusDetail::operation_slot_absent,
+                   "canonical Collection active engine is unsupported");
+    }
+    if (options.active_engine == core::algorithm::laser) {
+      const bool power_of_two = options.dim >= 128 && (options.dim & (options.dim - 1)) == 0;
+      if (options.metric != core::Metric::l2 ||
+          options.scalar_type != core::ScalarType::float32 ||
+          options.quantization != CollectionQuantization::rabitq || !power_of_two ||
+          (options.max_neighbors != 32 && options.max_neighbors != 64) ||
+          options.target_algorithm != core::algorithm::laser) {
+        return error(core::StatusCode::invalid_argument,
+                     stage,
+                     core::StatusDetail::malformed_struct,
+                     "active LASER engine requires metric=l2, float32, quantization=rabitq, a "
+                     "power-of-two dim>=128, max_neighbors in {32,64}, target_algorithm=laser");
+      }
+    }
     return core::Status::success();
   }
 
+  static auto active_laser_dir(const std::filesystem::path &root,
+                               std::uint64_t segment_id,
+                               std::uint64_t generation) -> std::filesystem::path {
+    return root / ".alaya_internal" / "active_laser" /
+           (internal::collection::detail::collection_segment_name(segment_id) + "_g" +
+            std::to_string(generation));
+  }
+
+  // B-09 orphan reclamation. On open, any directory under active_laser/ that is not
+  // the current active generation is unreferenced: either an old generation left
+  // behind by a completed seal/rotate (its rows now live in a sealed manifest
+  // segment) or an unrouted successor from a rotate that crashed before routing. A
+  // fresh open holds no writer flock on those, so removing them is safe. Idempotent
+  // and crash-safe (re-running the sweep is always sound), so it subsumes the
+  // pending-list / cut_pending-successor leaks without a STATE format change.
+  static void sweep_orphan_active_laser_dirs(const std::filesystem::path &root,
+                                             std::uint64_t current_segment_id,
+                                             std::uint64_t current_generation) {
+    std::error_code error;
+    const auto active_root = root / ".alaya_internal" / "active_laser";
+    if (!std::filesystem::is_directory(active_root, error)) {
+      return;
+    }
+    const auto keep =
+        active_laser_dir(root, current_segment_id, current_generation).filename();
+    std::vector<std::filesystem::path> orphans;
+    for (const auto &entry : std::filesystem::directory_iterator(active_root, error)) {
+      if (entry.is_directory(error) && entry.path().filename() != keep) {
+        orphans.push_back(entry.path());
+      }
+    }
+    for (const auto &orphan : orphans) {
+      std::filesystem::remove_all(orphan, error);
+    }
+    if (!orphans.empty()) {
+      try {
+        platform::sync_directory_or_throw(active_root);
+      } catch (...) {  // NOLINT(bugprone-empty-catch): durability of the unlink is
+        // best-effort; a crash before the parent fsync just re-sweeps on next open.
+      }
+    }
+  }
+
+  // Ruling 12: physical row capacity of the active LASER segment. Default 4096; when
+  // auto_seal_rows is set, keep the capacity strictly above it (churn headroom) so
+  // the auto-seal threshold can never exceed the physical capacity.
+  static auto active_laser_capacity(const CollectionOptions &options) -> std::size_t {
+    if (options.auto_seal_rows == 0) {
+      return 4096;
+    }
+    return static_cast<std::size_t>(options.auto_seal_rows) * 2 + 4096;
+  }
+
+  // Materialize a fresh empty active LASER segment directory (create-time / rotate).
+  [[nodiscard]] static auto create_active_laser_segment(const CollectionOptions &options,
+                                                        std::uint64_t segment_id,
+                                                        std::uint64_t generation) -> core::Status {
+#if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER != 0
+    try {
+      ::alaya::disk::MutableLaserSegment::create_empty(
+          active_laser_dir(options.root, segment_id, generation),
+          internal::collection::detail::collection_segment_name(segment_id),
+          options.dim,
+          options.dim,
+          options.max_neighbors,
+          options.metric);
+      return core::Status::success();
+    } catch (...) {
+      return core::status_from_exception(core::OperationStage::build);
+    }
+#else
+    (void)options;
+    (void)segment_id;
+    (void)generation;
+    return error(core::StatusCode::not_supported,
+                 core::OperationStage::build,
+                 core::StatusDetail::operation_slot_absent,
+                 "active LASER engine requires a build with ALAYA_ENABLE_LASER");
+#endif
+  }
+
+  // Build the active-mutable registration for the configured active engine. flat is
+  // an in-memory exact table; laser OPENS its existing on-disk directory (created at
+  // Collection::create / rotate) -- a missing directory on open is corruption, never
+  // a silent re-create that would drop committed rows.
   [[nodiscard]] static auto make_active_registration(
-      const internal::collection::CollectionSchema &schema,
+      const CollectionOptions &options,
       std::uint64_t segment_id = kActiveSegmentId,
       std::uint64_t generation = kActiveSegmentGeneration)
       -> core::Result<internal::collection::SegmentRegistration> {
-    return internal::collection::detail::make_canonical_flat_registration(schema,
+    const internal::collection::CollectionSchema schema{options.dim,
+                                                        options.metric,
+                                                        options.scalar_type,
+                                                        options.max_logical_id_bytes};
+    if (options.active_engine != core::algorithm::laser) {
+      return internal::collection::detail::make_canonical_flat_registration(schema,
+                                                                            segment_id,
+                                                                            generation);
+    }
+#if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER != 0
+    const auto dir = active_laser_dir(options.root, segment_id, generation);
+    if (!std::filesystem::exists(dir / "manifest.txt")) {
+      return error(core::StatusCode::corruption,
+                   core::OperationStage::open,
+                   core::StatusDetail::malformed_struct,
+                   "active LASER segment directory is missing: " + dir.string());
+    }
+    try {
+      laser::UpdateParams params;
+      params.max_points = active_laser_capacity(options);
+      auto segment = std::make_shared<::alaya::disk::MutableLaserSegment>(
+          dir, params, laser::ResidencyMode::kPagedPool, /*allow_empty=*/true);
+      return internal::collection::detail::make_active_laser_registration(std::move(segment),
+                                                                          schema,
                                                                           segment_id,
                                                                           generation);
+    } catch (...) {
+      return core::status_from_exception(core::OperationStage::open);
+    }
+#else
+    return error(core::StatusCode::not_supported,
+                 core::OperationStage::open,
+                 core::StatusDetail::operation_slot_absent,
+                 "active LASER engine requires a build with ALAYA_ENABLE_LASER");
+#endif
   }
 
   [[nodiscard]] static auto numeric_segment_id(std::string_view segment_id) -> std::uint64_t {
@@ -865,7 +1022,7 @@ class Collection {
           continue;
         }
         auto source_registration =
-            make_active_registration(schema, source.segment_id, source.generation);
+            make_active_registration(options, source.segment_id, source.generation);
         if (!source_registration.ok()) {
           return source_registration.status();
         }
@@ -874,7 +1031,12 @@ class Collection {
       }
     }
 
-    auto active = make_active_registration(schema,
+    if (options.active_engine == core::algorithm::laser) {
+      sweep_orphan_active_laser_dirs(options.root,
+                                     control_state.active_segment_id,
+                                     control_state.active_generation);
+    }
+    auto active = make_active_registration(options,
                                            control_state.active_segment_id,
                                            control_state.active_generation);
     if (!active.ok()) {
@@ -1296,11 +1458,15 @@ class Collection {
       }
       fire_seal_failpoint(options, CollectionSealFailPoint::after_cut_before_successor);
 
-      internal::collection::CollectionSchema schema{options_.dim,
-                                                    options_.metric,
-                                                    options_.scalar_type,
-                                                    options_.max_logical_id_bytes};
-      auto successor = make_active_registration(schema,
+      if (options_.active_engine == core::algorithm::laser) {
+        auto created = create_active_laser_segment(options_,
+                                                   control_state_.successor_segment_id,
+                                                   control_state_.successor_generation);
+        if (!created.ok()) {
+          return created;
+        }
+      }
+      auto successor = make_active_registration(options_,
                                                 control_state_.successor_segment_id,
                                                 control_state_.successor_generation);
       if (!successor.ok()) {
@@ -2081,7 +2247,7 @@ class Collection {
   }
 
   [[nodiscard]] static auto schema_prefix(const CollectionOptions &options) -> std::string {
-    return "format=1\npublic_version=" + std::string(kCollectionPublicVersion) +
+    std::string prefix = "format=1\npublic_version=" + std::string(kCollectionPublicVersion) +
            "\ndim=" + std::to_string(options.dim) +
            "\nmetric=" + std::to_string(static_cast<unsigned>(options.metric)) +
            "\nscalar_type=" + std::to_string(static_cast<unsigned>(options.scalar_type)) +
@@ -2093,6 +2259,13 @@ class Collection {
            "\nmax_logical_id_bytes=" + std::to_string(options.max_logical_id_bytes) +
            "\nactive_segment_id=" + std::to_string(kActiveSegmentId) +
            "\nactive_generation=" + std::to_string(kActiveSegmentGeneration) + "\n";
+    // B-08: only a non-default active engine widens the schema to 15 fields, so a
+    // flat collection stays byte-compatible with pre-2B readers while a laser
+    // collection makes an old binary fail-closed on the strict field count.
+    if (options.active_engine != core::algorithm::flat) {
+      prefix += "active_engine=" + std::to_string(options.active_engine) + "\n";
+    }
+    return prefix;
   }
 
   [[nodiscard]] static auto write_facade_schema(const CollectionOptions &options) -> core::Status {
@@ -2162,7 +2335,7 @@ class Collection {
         }
         return found->second;
       };
-      if (fields.size() != 14 || required("format") != "1" ||
+      if ((fields.size() != 14 && fields.size() != 15) || required("format") != "1" ||
           required("public_version") != kCollectionPublicVersion ||
           required("checksum") != internal::collection::sha256(prefix).hex() ||
           parse_u64(required("active_segment_id")) != kActiveSegmentId ||
@@ -2181,6 +2354,13 @@ class Collection {
       options.max_neighbors = static_cast<std::uint32_t>(parse_u64(required("max_neighbors")));
       options.ef_construction = static_cast<std::uint32_t>(parse_u64(required("ef_construction")));
       options.max_logical_id_bytes = parse_u64(required("max_logical_id_bytes"));
+      // B-08: 14 fields = pre-2B / flat active (default flat); 15 fields carries the
+      // explicit active engine. An old binary rejects the 15th field on the strict
+      // count above, so a laser collection fails-closed rather than silently
+      // reverting to flat.
+      options.active_engine = fields.size() == 15
+                                  ? parse_u64(required("active_engine"))
+                                  : core::algorithm::flat;
       auto status = validate_options(options, core::OperationStage::open);
       if (!status.ok()) {
         return status;

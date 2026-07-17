@@ -1117,15 +1117,36 @@ class QGUpdater {
     if (new_hwm > static_cast<size_t>(kPidMax) || new_hwm > row_generations_.size()) {
       throw std::invalid_argument("commit_physical_bundle: PID capacity exceeded");
     }
+    // B-07: capture the pre-bundle live population so we can switch the entry point
+    // to the first new PID on an empty->non-empty transition (fresh segment or all
+    // rows previously tombstoned) after the bundle commits.
+    const bool was_empty_of_live = live_count_.load(std::memory_order_acquire) == 0;
     // Mutating section (B-04 hardening): past this point allocated may exceed
     // committed, so ANY failure -- including an exception that does not itself
     // poison (e.g. std::bad_alloc while pre-building the snapshot) -- must poison
     // the handle. Otherwise a later add() would kind=5-publish over the allocation
     // gap and commit the failed bundle's rows WITHOUT bindings (identity labels).
     try {
+      // (0) B-07 empty->non-empty entry-point switch: when no rows were live before
+      // this bundle (fresh segment, or every prior row tombstoned), the persisted/
+      // default entry point is dead and sits in a disconnected hidden component, so
+      // search_for_insert would seed that stale component and leave every new row
+      // edgeless. Point the entry at the first row of THIS bundle and publish the
+      // routing snapshot BEFORE inserting, so rows 1..n-1 seed from row 0 (via the
+      // bundle-internal visibility floor) and form a connected component. Concurrent
+      // search never seeds it early (it gates entry_point < committed_, still old
+      // here); a torn bundle re-derives it on reopen via rebuild_state_after_replay
+      // -> repair_routing_roots.
+      if (was_empty_of_live) {
+        qg_.entry_point_ = static_cast<PID>(old_hwm);
+        refresh_routing_snapshot();
+      }
       // (1) allocate + insert each row and append its kind=7 bind (buffered). Row
       // after-images buffer too; the kind=8 fsync forces the whole group durable.
       for (size_t i = 0; i < n; ++i) {
+        // B-07 bundle-internal visibility: expose rows 0..i-1 of THIS bundle to
+        // row i's search_for_insert (old_hwm base rows + i already-appended rows).
+        insert_visible_override_ = old_hwm + i;
         const PID pid = allocate_and_insert(vecs + i * dim_);
         if (static_cast<size_t>(pid) != old_hwm + i) {
           poison("commit_physical_bundle: append produced a non-dense PID");
@@ -1140,6 +1161,7 @@ class QGUpdater {
                    alaya::wal::WalFile::Sync::buffered,
                    txid);
       }
+      insert_visible_override_ = 0;  // B-07: bundle window closed
       wal_failpoint(SegmentOpFailPoint::after_label_bind_append);
       // Reverse edges must be materialized inline before the commit (B-03/clause B):
       // a staged (deferred) backlink would let kind=8 commit a row whose only routing
@@ -1173,8 +1195,15 @@ class QGUpdater {
       });
       last_committed_txid_ = txid;
       applied_collection_op_id_ = applied_op_id;
+      // (5) B-07: republish the routing snapshot after the committed watermark
+      // advanced (ruling 6: refresh after publish) so search now seeds the switched
+      // entry point that is finally < committed_.
+      if (was_empty_of_live) {
+        refresh_routing_snapshot();
+      }
       return {static_cast<PID>(old_hwm), static_cast<PID>(new_hwm)};
     } catch (const std::exception &error) {
+      insert_visible_override_ = 0;
       // poison() re-throws (preserving the first reason if already poisoned).
       poison(std::string("commit_physical_bundle failed mid-transaction: ") + error.what());
     }
@@ -3340,7 +3369,8 @@ class QGUpdater {
                          std::vector<CapturedNode> &pool,
                          size_t ef_override = 0,
                          size_t cap_override = 0) {
-    const size_t snapshot = committed_.load(std::memory_order_acquire);
+    const size_t snapshot =
+        std::max(committed_.load(std::memory_order_acquire), insert_visible_override_);
     QGQuery q_obj(tvec, pd_);
     q_obj.query_prepare(qg_.rotator_, qg_.scanner_);
     const float *res_query = tvec + dim_;
@@ -4922,6 +4952,13 @@ class QGUpdater {
   bool direct_io_ = false;  // wfd_ opened successfully and writes routed to it
   std::atomic<size_t> committed_;
   std::atomic<size_t> allocated_points_;
+  // Bundle-internal visibility floor (B-07): during commit_physical_bundle's
+  // serial insert loop, search_for_insert must see rows already appended earlier
+  // in the SAME bundle (not only committed_), so an empty-graph first bundle of
+  // N>1 forms a connected seed graph instead of N-1 unreachable singletons.
+  // Writer-only (single-writer insert path), 0 outside a bundle, never read by
+  // the concurrent search() path (which reads committed_).
+  size_t insert_visible_override_ = 0;
   std::atomic<PID> next_append_id_;
   std::atomic<uint64_t> live_count_;
   std::atomic<PID> free_list_head_{kPidMax};

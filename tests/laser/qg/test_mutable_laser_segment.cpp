@@ -16,6 +16,7 @@
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -65,6 +66,24 @@ WalTinyIndex build_segment(const std::filesystem::path &dir, uint32_t seed) {
 std::filesystem::path scratch(const std::string &name) {
   return std::filesystem::temp_directory_path() /
          ("mutable_seg_" + name + "_" + std::to_string(::getpid()));
+}
+
+// Search from every row's own vector and return the union of returned labels. On a
+// connected graph with top_k>=n this covers all live rows; if the first bundle left
+// rows unreachable (pre-B-07) or the entry point is dead, the union is a strict
+// subset -- the exact discriminator the B-07 seed protocol repairs.
+std::set<uint64_t> reachable_labels(MutableLaserSegment &seg, const std::vector<float> &vecs,
+                                    size_t n, size_t top_k) {
+  std::set<uint64_t> found;
+  DiskSearchOptions opts;
+  opts.top_k = static_cast<uint32_t>(top_k);
+  opts.ef = 128;
+  for (size_t i = 0; i < n; ++i) {
+    for (const auto &hit : seg.search(vecs.data() + i * kDim, opts)) {
+      found.insert(hit.label);
+    }
+  }
+  return found;
 }
 
 class MutableLaserSegmentResidency : public ::testing::TestWithParam<ResidencyMode> {};
@@ -442,6 +461,99 @@ TEST(MutableLaserSegmentLabels, LegacyIdentityConflictFailsBijectionOnReopen) {
   reopen.max_points = kBaseN + 32;
   EXPECT_THROW((void)MutableLaserSegment(dir, reopen, ResidencyMode::kPagedPool), std::runtime_error)
       << "legacy-identity conflict must fail the global bijection on reopen";
+  std::filesystem::remove_all(dir);
+}
+
+// --- W0 empty (count=0) active LASER segment seed protocol (ruling 5/6, B-06/B-07) ---
+
+TEST(EmptyActiveLaserSegment, CreateOpenAndSearchEmpty) {
+  const auto dir = scratch("empty_open");
+  std::filesystem::remove_all(dir);
+  MutableLaserSegment::create_empty(dir, "seg_00000009", kDim, kDim, kDeg, core::Metric::l2);
+  laser::UpdateParams params;
+  params.max_points = 4096;
+  MutableLaserSegment seg(dir, params, ResidencyMode::kPagedPool, /*allow_empty=*/true);
+  EXPECT_EQ(seg.size(), 0U);
+  EXPECT_EQ(seg.live_count(), 0U);
+  EXPECT_EQ(seg.base_count(), 0U);
+  DiskSearchOptions opts;
+  opts.top_k = 5;
+  const std::vector<float> query(kDim, 0.25F);
+  EXPECT_TRUE(seg.search(query.data(), opts).empty());
+  std::filesystem::remove_all(dir);
+}
+
+TEST(EmptyActiveLaserSegment, FirstMultiRowBundleAllSearchableAcrossReopen) {
+  const auto dir = scratch("empty_first_bundle");
+  std::filesystem::remove_all(dir);
+  MutableLaserSegment::create_empty(dir, "seg_00000009", kDim, kDim, kDeg, core::Metric::l2);
+  constexpr size_t kN = 6;
+  const auto vecs = waltest::make_data(kN, kDim, 0x51EED);
+  std::vector<uint64_t> labels(kN);
+  for (size_t i = 0; i < kN; ++i) {
+    labels[i] = 7000 + i;
+  }
+  const std::set<uint64_t> expected(labels.begin(), labels.end());
+  laser::UpdateParams params;
+  params.max_points = 4096;
+  params.ef_insert = 64;
+  {
+    MutableLaserSegment seg(dir, params, ResidencyMode::kPagedPool, /*allow_empty=*/true);
+    (void)seg.commit_physical_bundle(1, kN, vecs.data(), labels.data(), kN);
+    EXPECT_EQ(seg.live_count(), kN);
+    EXPECT_EQ(reachable_labels(seg, vecs, kN, kN), expected)
+        << "B-07: every row of the first multi-row bundle must be searchable";
+    seg.checkpoint();
+  }
+  MutableLaserSegment reopened(dir, params, ResidencyMode::kPagedPool, /*allow_empty=*/true);
+  EXPECT_EQ(reopened.live_count(), kN);
+  EXPECT_EQ(reachable_labels(reopened, vecs, kN, kN), expected)
+      << "B-07: first-bundle connectivity must survive reopen";
+  std::filesystem::remove_all(dir);
+}
+
+TEST(EmptyActiveLaserSegment, DeleteAllThenRewriteReachableAndReopen) {
+  const auto dir = scratch("empty_delete_rewrite");
+  std::filesystem::remove_all(dir);
+  MutableLaserSegment::create_empty(dir, "seg_00000009", kDim, kDim, kDeg, core::Metric::l2);
+  constexpr size_t kN = 4;
+  constexpr size_t kM = 5;
+  const auto vecs_n = waltest::make_data(kN, kDim, 0xAAA1);
+  const auto vecs_m = waltest::make_data(kM, kDim, 0xBBB2);
+  std::vector<uint64_t> labels_n(kN);
+  std::vector<uint64_t> labels_m(kM);
+  for (size_t i = 0; i < kN; ++i) {
+    labels_n[i] = 100 + i;
+  }
+  for (size_t i = 0; i < kM; ++i) {
+    labels_m[i] = 200 + i;
+  }
+  const std::set<uint64_t> expected_m(labels_m.begin(), labels_m.end());
+  laser::UpdateParams params;
+  params.max_points = 4096;
+  params.ef_insert = 64;
+  {
+    MutableLaserSegment seg(dir, params, ResidencyMode::kPagedPool, /*allow_empty=*/true);
+    (void)seg.commit_physical_bundle(1, kN, vecs_n.data(), labels_n.data(), kN);
+    for (const auto label : labels_n) {
+      const auto pid = seg.pid_for_label(label);
+      ASSERT_TRUE(pid.has_value());
+      seg.tombstone(*pid);
+    }
+    EXPECT_EQ(seg.live_count(), 0U);
+    (void)seg.commit_physical_bundle(2, kN + kM, vecs_m.data(), labels_m.data(), kM);
+    EXPECT_EQ(seg.live_count(), kM);
+    EXPECT_EQ(reachable_labels(seg, vecs_m, kM, kM), expected_m)
+        << "B-07: after delete-all the entry point must switch so new rows are reachable";
+    for (const auto label : labels_n) {
+      EXPECT_FALSE(seg.pid_for_label(label).has_value()) << "deleted label must not resolve";
+    }
+    seg.checkpoint();
+  }
+  MutableLaserSegment reopened(dir, params, ResidencyMode::kPagedPool, /*allow_empty=*/true);
+  EXPECT_EQ(reopened.live_count(), kM);
+  EXPECT_EQ(reachable_labels(reopened, vecs_m, kM, kM), expected_m)
+      << "B-07: delete-all-then-rewrite reachability must survive reopen";
   std::filesystem::remove_all(dir);
 }
 

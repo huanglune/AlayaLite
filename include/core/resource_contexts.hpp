@@ -209,7 +209,17 @@ struct MutationContext {
   CancellationToken cancellation{};
   RuntimeLane lane{};
   const void *transaction_token{};
-  std::uint64_t reserved[4]{};
+  // 2B (codex B-01/B-02): the physical transaction id -- the real logical-WAL txid
+  // the LASER adapter hands to commit_physical_bundle (the atomic-batch WAL frame
+  // id, or the row op_id for single/per-row) -- and the maximum row op_id of the
+  // transaction (the idempotency basis, compared against the segment's persisted
+  // applied_collection_op_id). Collection sets both explicitly at its three dispatch
+  // sites; the adapter must NOT re-derive them from the token or the payload
+  // batch_op_id (a per-row batch shares one batch_op_id, so guessing drops writes).
+  // Carved from the former reserved[4] so sizeof(MutationContext) is unchanged.
+  std::uint64_t transaction_id{};
+  std::uint64_t max_row_op_id{};
+  std::uint64_t reserved[2]{};
 
   MutationContext() : header(current_struct_header<MutationContext>()) {}
 };

@@ -206,4 +206,28 @@ if(ALAYA_ENABLE_LASER)
     LABELS integration collection laser
     TIMEOUT 300
   )
+
+  # Compile-time capability-surface proof for the active LASER Collection adapter
+  # (codex B-10): links LASER so the AIO page-reader symbols resolve.
+  alaya_cc_target(mutable_laser_adapter_header_closure LASER SRCS mutable_laser_adapter_header_closure.cpp)
+
+  # Adapter-in-isolation coverage: explicit-txid idempotency (B-01/B-02), previous
+  # tombstoning (B-05), and the post-commit failure latch (B-04).
+  alaya_cc_target(mutable_laser_adapter_test GTEST LASER SRCS mutable_laser_adapter_test.cpp)
+  alaya_add_test(
+    NAME mutable_laser_adapter_test
+    TARGET mutable_laser_adapter_test
+    LABELS unit collection laser
+    TIMEOUT 120
+  )
+
+  # End-to-end active LASER engine: create/write/search/remove/close/reopen through
+  # the public Collection facade (B-08 config persistence + B-01 reopen restore).
+  alaya_cc_target(collection_active_laser_test GTEST LASER SRCS collection_active_laser_test.cpp)
+  alaya_add_test(
+    NAME collection_active_laser_test
+    TARGET collection_active_laser_test
+    LABELS integration collection laser
+    TIMEOUT 180
+  )
 endif()

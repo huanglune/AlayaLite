@@ -229,6 +229,22 @@ struct SegmentManifest {
   }
 
   static auto load(const std::filesystem::path &path) -> SegmentManifest {
+    return load_impl(path, /*allow_empty_count=*/false);
+  }
+
+  // Mutable-active only (W0 / codex B-06): identical to load() except a count of
+  // zero is permitted. The freshly-created empty active LASER segment keeps all
+  // of its rows in the op-WAL, so its manifest carries count=0. Never use this on
+  // sealed / importer / read-only paths -- those must keep rejecting count=0. The
+  // normal load() count>0 contract and its SegmentManifestNegativeInvalidValue
+  // negative test are unchanged (load() still delegates with allow_empty=false).
+  static auto load_allow_empty(const std::filesystem::path &path) -> SegmentManifest {
+    return load_impl(path, /*allow_empty_count=*/true);
+  }
+
+ private:
+  static auto load_impl(const std::filesystem::path &path, bool allow_empty_count)
+      -> SegmentManifest {
     auto body = detail::read_manifest_file(path);
     auto pairs = detail::parse_kv_lines(body);
 
@@ -298,7 +314,7 @@ struct SegmentManifest {
       throw std::invalid_argument("manifest dim must be > 0");
     }
     m.count = detail::parse_uint64(kv["count"], "count");
-    if (m.count == 0) {
+    if (m.count == 0 && !allow_empty_count) {
       throw std::invalid_argument("manifest count must be > 0");
     }
 
