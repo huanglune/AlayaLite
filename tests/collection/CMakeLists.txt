@@ -190,4 +190,20 @@ if(ALAYA_ENABLE_LASER)
     LABELS integration collection laser
     TIMEOUT 180
   )
+
+  # LASER recall floor lock (D-lite manifest W2): mirrors
+  # collection_qg_recall_floor_test.cpp for the LASER on-disk QG target, which had no recall regression guard before
+  # this file. l2 unit/nonunit tiers plus a resident_arena residency tier, each asserting engine identity against the
+  # persisted sealed-segment manifest (not Collection::target_implementation_key() -- see the test file header for why).
+  alaya_cc_target(
+    collection_laser_recall_floor_test
+    GTEST LASER
+    SRCS collection_laser_recall_floor_test.cpp
+  )
+  alaya_add_test(
+    NAME collection_laser_recall_floor_test
+    TARGET collection_laser_recall_floor_test
+    LABELS integration collection laser
+    TIMEOUT 300
+  )
 endif()
