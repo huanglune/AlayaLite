@@ -20,7 +20,7 @@
 #include <vector>
 
 #include "index/graph/laser/common.hpp"
-#include "index/graph/laser/utils/memory.hpp"
+#include "utils/memory.hpp"
 
 namespace alaya::laser::buffer {
 
@@ -32,7 +32,7 @@ namespace alaya::laser::buffer {
  */
 class SearchBuffer {
  private:
-  std::vector<Candidate<float>, memory::AlignedAllocator<Candidate<float>>> data_;
+  std::vector<Candidate<float>, ::alaya::AlignedAlloc<Candidate<float>>> data_;
   size_t size_ = 0, cur_ = 0, capacity_;
 
   [[nodiscard]] auto binary_search(float dist) const {
@@ -94,7 +94,7 @@ class SearchBuffer {
   void resize(size_t new_size) {
     this->capacity_ = new_size;
     data_ =
-        std::vector<Candidate<float>, memory::AlignedAllocator<Candidate<float>>>(capacity_ + 1);
+        std::vector<Candidate<float>, ::alaya::AlignedAlloc<Candidate<float>>>(capacity_ + 1);
   }
 };
 
@@ -120,13 +120,13 @@ class ResultBuffer {
 
   [[nodiscard]] auto is_full() const -> bool { return size_ == capacity_; }
 
-  const std::vector<PID, memory::AlignedAllocator<PID>> &ids() { return ids_; }
+  const std::vector<PID, ::alaya::AlignedAlloc<PID>> &ids() { return ids_; }
 
   void copy_results(PID *knn) const { std::copy(ids_.begin(), ids_.end() - 1, knn); }
 
  private:
-  std::vector<PID, memory::AlignedAllocator<PID>> ids_;
-  std::vector<float, memory::AlignedAllocator<float>> distances_;
+  std::vector<PID, ::alaya::AlignedAlloc<PID>> ids_;
+  std::vector<float, ::alaya::AlignedAlloc<float>> distances_;
   size_t size_ = 0, capacity_;
 
   [[nodiscard]] auto binary_search(float dist) const -> size_t {

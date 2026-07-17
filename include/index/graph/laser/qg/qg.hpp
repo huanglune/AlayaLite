@@ -53,6 +53,7 @@
 #include "index/graph/laser/utils/memory.hpp"
 #include "index/graph/laser/utils/pca_transform.hpp"
 #include "index/graph/laser/utils/rotator.hpp"
+#include "index/graph/laser/utils/tools.hpp"
 #include "platform/detect.hpp"
 #include "third_party/ngt/hashset.hpp"
 #include "utils/kernel_section_profile.hpp"
@@ -247,12 +248,12 @@ class QuantizedGraph {
   size_t padded_dim_ = 0;  // padded dimension
   PID entry_point_ = 0;    // Entry point of graph
 
-  data::Array<float,
-              std::vector<size_t>,
-              memory::AlignedAllocator<float,
-                                       1 << 22,
-                                       true>>
-      data_;  // vectors + graph + quantization codes
+  // Dead field: grep confirms no other reference to `data_` in this class
+  // (see REPORT-allocator-merge.md W1 audit). AlignedAlloc's 2MB tier is
+  // THP-sufficient -- Linux's transparent-hugepage granule is 2MB, so the
+  // previous 4MB alignment bought nothing over it -- replaced here anyway
+  // for allocator-merge parity with every other call site in this file.
+  data::Array<float, std::vector<size_t>, ::alaya::AlignedAlloc<float>> data_;
   QGScanner scanner_;
   FHTRotator rotator_;
   PCATransform pca_transform_;  // PCA transform for online query transformation

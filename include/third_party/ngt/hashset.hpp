@@ -24,14 +24,14 @@
 #include <unordered_set>
 
 #include "index/graph/laser/common.hpp"
-#include "index/graph/laser/utils/memory.hpp"
+#include "utils/memory.hpp"
 
 namespace alaya::laser {
 class HashBasedBooleanSet {
  private:
   size_t table_size_ = 0;
   PID mask_ = 0;
-  std::vector<PID, memory::AlignedAllocator<PID>> table_;
+  std::vector<PID, ::alaya::AlignedAlloc<PID>> table_;
   std::unordered_set<PID> stl_hash_;
 
   [[nodiscard]] auto hash1(const PID value) const { return value & mask_; }
@@ -78,7 +78,7 @@ class HashBasedBooleanSet {
       std::cerr << "[WARN] table size is not 2^N :  " << table_size << '\n';
     }
 
-    table_ = std::vector<PID, memory::AlignedAllocator<PID>>(table_size);
+    table_ = std::vector<PID, ::alaya::AlignedAlloc<PID>>(table_size);
     std::fill(table_.begin(), table_.end(), kPidMax);
     stl_hash_.clear();
   }
