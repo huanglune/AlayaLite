@@ -138,8 +138,7 @@ inline void put_bytes(std::vector<std::byte> &out, std::span<const std::byte> va
 [[nodiscard]] inline auto encode_consolidate_marker(std::uint64_t segment_id,
                                                     std::uint64_t segment_generation,
                                                     SegmentOpKind kind,
-                                                    std::uint64_t epoch)
-    -> std::vector<std::byte> {
+                                                    std::uint64_t epoch) -> std::vector<std::byte> {
   if (kind != SegmentOpKind::consolidate_begin && kind != SegmentOpKind::consolidate_end) {
     throw std::invalid_argument("encode_consolidate_marker: kind must be a consolidate barrier");
   }
@@ -168,8 +167,10 @@ inline void put_bytes(std::vector<std::byte> &out, std::span<const std::byte> va
   }
   std::vector<std::byte> out;
   out.reserve(29 + 1 + 4 + kSegmentSuperblockImageBytes);
-  segment_op_detail::put_header(
-      out, segment_id, segment_generation, SegmentOpKind::superblock_flip);
+  segment_op_detail::put_header(out,
+                                segment_id,
+                                segment_generation,
+                                SegmentOpKind::superblock_flip);
   out.push_back(static_cast<std::byte>(target_slot));
   segment_op_detail::put_bytes(out, superblock_image);
   return out;

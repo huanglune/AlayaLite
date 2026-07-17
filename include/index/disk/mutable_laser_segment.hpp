@@ -151,7 +151,8 @@ class MutableLaserSegment {
     return out;
   }
 
-  [[nodiscard]] auto batch_search(const float *queries, uint32_t num_queries,
+  [[nodiscard]] auto batch_search(const float *queries,
+                                  uint32_t num_queries,
                                   const DiskSearchOptions &opts)
       -> std::vector<std::vector<DiskSearchHit>> {
     std::vector<std::vector<DiskSearchHit>> out;
@@ -167,7 +168,8 @@ class MutableLaserSegment {
   [[nodiscard]] auto base_count() const -> uint64_t { return base_count_; }
 
  private:
-  static auto require_extra(const SegmentManifest &manifest, const char *key,
+  static auto require_extra(const SegmentManifest &manifest,
+                            const char *key,
                             const std::filesystem::path &seg_dir) -> const std::string & {
     const auto it = manifest.x_extras.find(key);
     if (it == manifest.x_extras.end() || it->second.empty()) {
@@ -176,7 +178,8 @@ class MutableLaserSegment {
     }
     return it->second;
   }
-  static auto parse_u32(const SegmentManifest &manifest, const char *key,
+  static auto parse_u32(const SegmentManifest &manifest,
+                        const char *key,
                         const std::filesystem::path &seg_dir) -> uint32_t {
     const auto &value = require_extra(manifest, key, seg_dir);
     const auto parsed = std::stoull(value);

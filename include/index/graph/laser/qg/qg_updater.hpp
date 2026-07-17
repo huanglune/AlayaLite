@@ -1561,8 +1561,10 @@ class QGUpdater {
       // pwrite+fsync (index) -> reset WAL. Each boundary is a crash-matrix cut.
       const auto image =
           std::span<const std::byte>(reinterpret_cast<const std::byte *>(&next), sizeof(next));
-      const auto flip = encode_superblock_flip(
-          segment_uid_, next.generation, static_cast<uint8_t>(next_slot), image);
+      const auto flip = encode_superblock_flip(segment_uid_,
+                                               next.generation,
+                                               static_cast<uint8_t>(next_slot),
+                                               image);
       wal_append(flip, alaya::wal::WalFile::Sync::fsync);
       wal_failpoint(SegmentOpFailPoint::after_flip_append_before_superblock_write);
       if (::ftruncate(fd_, static_cast<off_t>(file_size)) != 0) {
@@ -4144,9 +4146,13 @@ class QGUpdater {
   void log_page_after_image(PID pid_in_page, const char *page_bytes) {
     const uint64_t offset = page_offset(pid_in_page);
     const auto first_pid = static_cast<uint64_t>(page_index(pid_in_page) * npp_);
-    auto payload = encode_row_patch(
-        segment_uid_, superblock_.generation, first_pid, offset,
-        std::span<const std::byte>(reinterpret_cast<const std::byte *>(page_bytes), page_size_));
+    auto payload =
+        encode_row_patch(segment_uid_,
+                         superblock_.generation,
+                         first_pid,
+                         offset,
+                         std::span<const std::byte>(reinterpret_cast<const std::byte *>(page_bytes),
+                                                    page_size_));
     wal_append(payload, alaya::wal::WalFile::Sync::buffered);
   }
 
@@ -4369,13 +4375,13 @@ class QGUpdater {
   std::atomic<const RoutingSnapshot *> routing_snapshot_{nullptr};
 
   // --- op-WAL (durable in-place updates, G1) ---
-  bool enable_wal_ = false;                     // mirrors params_.enable_wal; the WAL is live
+  bool enable_wal_ = false;                      // mirrors params_.enable_wal; the WAL is live
   std::unique_ptr<alaya::wal::WalFile> op_wal_;  // <index>.opwal, present iff enable_wal_
   bool replaying_ = false;                       // set during recovery redo: suppress log + force
   std::string poison_reason_;                    // non-empty => writer permanently poisoned
   uint64_t segment_uid_ = 0;                     // durable lineage id (superblock reserved[0..8))
-  uint64_t wal_op_id_ = 0;                        // monotone frame op-id (informational/diagnostic)
-  SegmentIoObserver *io_observer_ = nullptr;      // persistence-model harness hook (test only)
+  uint64_t wal_op_id_ = 0;                       // monotone frame op-id (informational/diagnostic)
+  SegmentIoObserver *io_observer_ = nullptr;     // persistence-model harness hook (test only)
 };
 
 }  // namespace alaya::laser
