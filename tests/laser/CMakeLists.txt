@@ -152,6 +152,22 @@ alaya_add_test(
   LABELS laser
 )
 
+# RowAdmission (segment admission contract v1): the bitmap POD view + its
+# factories (bitmap payload wrap, sorted-rows materialization, exclude-set
+# complement, AND composition). Pure kernel-level unit test -- no
+# QuantizedGraph/disk index needed, so this target links nothing beyond gtest.
+alaya_cc_target(
+  test_row_admission
+  BARE GTEST
+  SRCS qg/test_row_admission.cpp
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_row_admission
+  TARGET test_row_admission
+  LABELS laser unit
+)
+
 # Bench-only fbin mmap view used by update modes under cgroup RAM caps.
 alaya_cc_target(
   test_bench_laser_update_sift_support

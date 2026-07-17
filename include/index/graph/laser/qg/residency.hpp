@@ -51,13 +51,22 @@ class ResidencyProvider {
   // against concurrent searches.
   virtual void prepare(QuantizedGraph &qg) = 0;
 
-  virtual void search(QuantizedGraph &qg, const float *query, uint32_t knn, uint32_t *results) = 0;
+  // `admission` is an optional per-call row filter (segment admission
+  // contract, docs/design/segment-admission-contract.md). nullptr keeps
+  // today's behavior byte-identical; both providers are thin pass-throughs
+  // to the matching QuantizedGraph kernel entry, which owns the admit test.
+  virtual void search(QuantizedGraph &qg,
+                      const float *query,
+                      uint32_t knn,
+                      uint32_t *results,
+                      const RowAdmission *admission = nullptr) = 0;
 
   virtual void batch_search(QuantizedGraph &qg,
                             const float *queries,
                             uint32_t knn,
                             uint32_t *results,
-                            size_t num_queries) = 0;
+                            size_t num_queries,
+                            const RowAdmission *admission = nullptr) = 0;
 };
 
 class PagedPoolProvider final : public ResidencyProvider {
@@ -69,16 +78,21 @@ class PagedPoolProvider final : public ResidencyProvider {
   // load_disk_index() already staged the partial cache and the AIO pool.
   void prepare(QuantizedGraph & /*qg*/) override {}
 
-  void search(QuantizedGraph &qg, const float *query, uint32_t knn, uint32_t *results) override {
-    qg.search(query, knn, results);
+  void search(QuantizedGraph &qg,
+              const float *query,
+              uint32_t knn,
+              uint32_t *results,
+              const RowAdmission *admission) override {
+    qg.search(query, knn, results, admission);
   }
 
   void batch_search(QuantizedGraph &qg,
                     const float *queries,
                     uint32_t knn,
                     uint32_t *results,
-                    size_t num_queries) override {
-    qg.batch_search(queries, knn, results, num_queries);
+                    size_t num_queries,
+                    const RowAdmission *admission) override {
+    qg.batch_search(queries, knn, results, num_queries, admission);
   }
 };
 
@@ -99,16 +113,21 @@ class ResidentArenaProvider final : public ResidencyProvider {
     qg.ensure_resident_arena();
   }
 
-  void search(QuantizedGraph &qg, const float *query, uint32_t knn, uint32_t *results) override {
-    qg.arena_search_qg(query, knn, results);
+  void search(QuantizedGraph &qg,
+              const float *query,
+              uint32_t knn,
+              uint32_t *results,
+              const RowAdmission *admission) override {
+    qg.arena_search_qg(query, knn, results, admission);
   }
 
   void batch_search(QuantizedGraph &qg,
                     const float *queries,
                     uint32_t knn,
                     uint32_t *results,
-                    size_t num_queries) override {
-    qg.arena_batch_search(queries, knn, results, num_queries);
+                    size_t num_queries,
+                    const RowAdmission *admission) override {
+    qg.arena_batch_search(queries, knn, results, num_queries, admission);
   }
 
  private:
