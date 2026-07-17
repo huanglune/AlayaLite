@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Durable in-place updates for the LASER on-disk quantized graph (op-WAL, the
+  G1 gate). `QGUpdater` gains an opt-in after-image write-ahead log
+  (`UpdateParams::enable_wal`, off by default) that rides in the shared
+  Physical WAL v1 envelope as the `SEGMENT_OP` record family. A no-steal page
+  cache logs a whole-page after-image before installing it, `publish()`
+  group-commits a batch before it becomes visible, and `checkpoint()` commits an
+  A/B superblock flip; reopen runs a dedicated recovery path with a durable
+  segment lineage id and a fail-closed poisoned-writer contract. The two-layer
+  crash matrix (SIGKILL kill points + a power-loss persistence model) is green.
+  A new `MutableLaserSegment` handle exposes this as a single-writer (flock)
+  mutable segment. The G1 minimal scope excludes PID reuse/reclaim, consolidate,
+  and gardening under the WAL; those transaction formats are a later wave.
+- A shared bottom-layer `wal/frame.hpp` module owns the Physical WAL v1 framing
+  (WAL7 envelope, CRC, scan, `WalFile`, byte `Decoder`) for both the collection
+  logical WAL and the segment op-WAL — one frame format, no divergence.
+
 ### Removed
 
 - The NSG and Fusion memory graph engines (`nsg_segment`/`fusion_segment`),

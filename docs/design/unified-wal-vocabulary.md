@@ -91,6 +91,19 @@ Encoding them in the WAL as well would create a second source of truth —
 forbidden. The WAL may only *reference* control state (e.g. a
 `CHECKPOINT` cut after a rotation), never restate it.
 
+### 6a. Physical file boundaries and cross-family ordering (clause J, U2-a)
+
+The collection logical WAL and each segment op-WAL are **physically separate
+files** (`collection_wal_v1/logical.wal`; `<index>.opwal`, one per segment).
+The single *envelope* is shared, but there is deliberately **no cross-file
+total order**: a byte offset only orders frames *within one file*. Causality
+between the two families is mediated by durable control records and
+checkpoints (a collection `CHECKPOINT`/manifest cut references a segment state;
+a segment `superblock_flip` is a durable base), never by a global WAL sequence.
+A single append-only stream that interleaves both families is therefore a
+framework-scan property, not a runtime layout — the runtime never writes both
+families into one file.
+
 ### 7. G1 gate, restated
 
 No durable in-place mutation claim ships until `SEGMENT_OP` WAL replay
@@ -105,5 +118,10 @@ alone is a consistency device, not a durability claim.
    is byte-stable (double-replay test).
 2. Superblock/WAL equivalence: recovery via WAL replay and recovery via
    the surviving A/B superblock agree wherever both are defined.
-3. Mixed-family log: interleaved logical transactions and segment ops
-   replay in log order and match the pre-crash observable state.
+3. One envelope, two families (revised per clause J, U2-a — the two families
+   live in separate files, so there is no single cross-file replay order to
+   assert): (a) the framework scan reads an interleaved type-1..4 / type-5
+   stream back in byte order without interpreting the type, and (b) the
+   collection layer is fail-closed on a foreign (`SEGMENT_OP`) record type — it
+   raises a typed semantic error and leaves the WAL byte-identical, never
+   silently truncating it.

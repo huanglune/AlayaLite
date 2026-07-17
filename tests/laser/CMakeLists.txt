@@ -137,6 +137,64 @@ alaya_add_test(
   LABELS laser
 )
 
+# SEGMENT_OP op-WAL payload codec (segment_op_wal.hpp): round-trip + validation.
+alaya_cc_target(
+  test_segment_op_wal
+  BARE GTEST
+  SRCS qg/test_segment_op_wal.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_segment_op_wal
+  TARGET test_segment_op_wal
+  LABELS laser wal persistence
+)
+
+# QGUpdater op-WAL functional durability (enable_wal): reopen/recovery round-trips.
+alaya_cc_target(
+  test_qg_updater_wal
+  BARE GTEST
+  SRCS qg/test_qg_updater_wal.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_qg_updater_wal
+  TARGET test_qg_updater_wal
+  LABELS laser wal persistence
+)
+
+# G1 crash matrix: SIGKILL/failpoint cuts + a power-loss persistence model.
+alaya_cc_target(
+  test_segment_op_wal_crash
+  BARE GTEST
+  SRCS qg/test_segment_op_wal_crash.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_segment_op_wal_crash
+  TARGET test_segment_op_wal_crash
+  LABELS laser wal persistence crash
+  TIMEOUT 120
+)
+
+# MutableLaserSegment: durable single-writer mutable segment handle (W3).
+alaya_cc_target(
+  test_mutable_laser_segment
+  BARE GTEST
+  SRCS qg/test_mutable_laser_segment.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_mutable_laser_segment
+  TARGET test_mutable_laser_segment
+  LABELS laser wal disk persistence
+  TIMEOUT 120
+)
+
 # Residency seams behind UnifiedLaserSegment: prefetch budget default, ResidencyProvider dispatch, ensure_resident_arena
 # file materialization, and the QGUpdater write_at -> arena mirror.
 alaya_cc_target(
