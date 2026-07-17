@@ -1,6 +1,7 @@
 add_subdirectory(disk)
 add_subdirectory(core)
 add_subdirectory(collection)
+add_subdirectory(wal)
 add_subdirectory(golden)
 add_subdirectory(index)
 add_subdirectory(simd)

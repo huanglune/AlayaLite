@@ -24,6 +24,7 @@
 
 #include "core/status.hpp"
 #include "platform/fs.hpp"
+#include "wal/frame.hpp"
 
 namespace alaya::internal::collection {
 
@@ -64,69 +65,26 @@ struct LogicalWalScan {
 
 namespace logical_wal_detail {
 
-inline constexpr std::uint32_t kFrameMagic = 0x374C4157U;    // "WAL7" in little endian.
-inline constexpr std::uint32_t kTrailerMagic = 0x37444E45U;  // "END7" in little endian.
-inline constexpr std::uint16_t kFormatVersion = 1;
-inline constexpr std::uint32_t kHeaderBytes = 36;
-inline constexpr std::uint32_t kTrailerBytes = 4;
-inline constexpr std::uint32_t kMaximumPayloadBytes = 64U << 20U;
-inline constexpr std::size_t kChecksumOffset = 32;
+// Physical WAL v1 framing now lives in the bottom-layer `wal/` module
+// (unified-wal-vocabulary.md). These names delegate to it so the collection
+// codec, the checkpoint image codec, and CollectionLogicalWal keep their
+// existing spellings while the byte format has exactly one owner. The frame
+// byte sequence is unchanged (locked by tests/wal/wal_frame_test.cpp).
+inline constexpr std::uint32_t kFrameMagic = alaya::wal::kFrameMagic;
+inline constexpr std::uint32_t kTrailerMagic = alaya::wal::kTrailerMagic;
+inline constexpr std::uint16_t kFormatVersion = alaya::wal::kFormatVersion;
+inline constexpr std::uint32_t kHeaderBytes = alaya::wal::kHeaderBytes;
+inline constexpr std::uint32_t kTrailerBytes = alaya::wal::kTrailerBytes;
+inline constexpr std::uint32_t kMaximumPayloadBytes = alaya::wal::kMaximumPayloadBytes;
+inline constexpr std::size_t kChecksumOffset = alaya::wal::kChecksumOffset;
 
-inline void put_u16(std::vector<std::byte> &output, std::uint16_t value) {
-  for (unsigned shift = 0; shift < 16; shift += 8) {
-    output.push_back(static_cast<std::byte>((value >> shift) & 0xffU));
-  }
-}
-
-inline void put_u32(std::vector<std::byte> &output, std::uint32_t value) {
-  for (unsigned shift = 0; shift < 32; shift += 8) {
-    output.push_back(static_cast<std::byte>((value >> shift) & 0xffU));
-  }
-}
-
-inline void put_u64(std::vector<std::byte> &output, std::uint64_t value) {
-  for (unsigned shift = 0; shift < 64; shift += 8) {
-    output.push_back(static_cast<std::byte>((value >> shift) & 0xffU));
-  }
-}
-
-[[nodiscard]] inline auto get_u16(std::span<const std::byte> input, std::size_t offset)
-    -> std::uint16_t {
-  return static_cast<std::uint16_t>(std::to_integer<unsigned>(input[offset])) |
-         static_cast<std::uint16_t>(std::to_integer<unsigned>(input[offset + 1]) << 8U);
-}
-
-[[nodiscard]] inline auto get_u32(std::span<const std::byte> input, std::size_t offset)
-    -> std::uint32_t {
-  std::uint32_t value{};
-  for (unsigned index = 0; index < 4; ++index) {
-    value |= static_cast<std::uint32_t>(std::to_integer<unsigned>(input[offset + index]))
-             << (index * 8U);
-  }
-  return value;
-}
-
-[[nodiscard]] inline auto get_u64(std::span<const std::byte> input, std::size_t offset)
-    -> std::uint64_t {
-  std::uint64_t value{};
-  for (unsigned index = 0; index < 8; ++index) {
-    value |= static_cast<std::uint64_t>(std::to_integer<unsigned>(input[offset + index]))
-             << (index * 8U);
-  }
-  return value;
-}
-
-[[nodiscard]] inline auto crc32(std::span<const std::byte> bytes) noexcept -> std::uint32_t {
-  std::uint32_t crc = 0xffffffffU;
-  for (const auto byte : bytes) {
-    crc ^= std::to_integer<std::uint8_t>(byte);
-    for (unsigned bit = 0; bit < 8; ++bit) {
-      const auto mask = static_cast<std::uint32_t>(-(static_cast<std::int32_t>(crc & 1U)));
-      crc = (crc >> 1U) ^ (0xedb88320U & mask);
-    }
-  }
-  return ~crc;
-}
+using alaya::wal::crc32;
+using alaya::wal::get_u16;
+using alaya::wal::get_u32;
+using alaya::wal::get_u64;
+using alaya::wal::put_u16;
+using alaya::wal::put_u32;
+using alaya::wal::put_u64;
 
 [[nodiscard]] inline auto parse_record_type(std::uint8_t raw)
     -> std::optional<LogicalWalRecordType> {
@@ -149,30 +107,7 @@ inline void put_u64(std::vector<std::byte> &output, std::uint64_t value) {
                                      std::uint64_t op_id,
                                      std::uint64_t batch_id,
                                      std::span<const std::byte> payload) -> std::vector<std::byte> {
-  if (payload.size() > kMaximumPayloadBytes ||
-      payload.size() > std::numeric_limits<std::uint32_t>::max()) {
-    throw std::invalid_argument("collection WAL payload exceeds the format limit");
-  }
-  const auto frame_bytes =
-      static_cast<std::uint32_t>(kHeaderBytes + payload.size() + kTrailerBytes);
-  std::vector<std::byte> output;
-  output.reserve(frame_bytes);
-  put_u32(output, kFrameMagic);
-  put_u16(output, kFormatVersion);
-  output.push_back(static_cast<std::byte>(type));
-  output.push_back(static_cast<std::byte>(flags));
-  put_u32(output, frame_bytes);
-  put_u32(output, static_cast<std::uint32_t>(payload.size()));
-  put_u64(output, op_id);
-  put_u64(output, batch_id);
-  put_u32(output, 0);
-  output.insert(output.end(), payload.begin(), payload.end());
-  put_u32(output, kTrailerMagic);
-  const auto checksum = crc32(output);
-  for (unsigned index = 0; index < 4; ++index) {
-    output[kChecksumOffset + index] = static_cast<std::byte>((checksum >> (index * 8U)) & 0xffU);
-  }
-  return output;
+  return alaya::wal::make_frame(static_cast<std::uint8_t>(type), flags, op_id, batch_id, payload);
 }
 
 [[nodiscard]] inline auto io_error(core::OperationStage stage, std::string message)
@@ -320,80 +255,36 @@ class CollectionLogicalWal {
   [[nodiscard]] auto path() const -> const std::filesystem::path & { return path_; }
   [[nodiscard]] auto directory() const -> const std::filesystem::path & { return directory_; }
 
+  // Structural scanning is delegated to the framework layer; the collection
+  // layer adds the record-type semantics on top. A structurally valid frame
+  // whose type is not 1-4 (for example a SEGMENT_OP type-5 frame) is a
+  // cross-family contamination and fails loudly instead of being silently
+  // truncated as a torn tail — no committed data is dropped without notice.
   [[nodiscard]] static auto scan_file(const std::filesystem::path &path)
       -> core::Result<LogicalWalScan> {
     try {
+      auto raw = alaya::wal::WalFile::scan_path(path);
       LogicalWalScan result;
-      if (!std::filesystem::exists(path)) {
-        return result;
-      }
-      const auto file_size = std::filesystem::file_size(path);
-      if (file_size > std::numeric_limits<std::size_t>::max()) {
-        return core::Status::error(core::StatusCode::corruption,
-                                   core::OperationStage::mutation_replay,
-                                   core::StatusDetail::arithmetic_overflow,
-                                   "collection WAL is too large for this process");
-      }
-      std::vector<std::byte> bytes(static_cast<std::size_t>(file_size));
-      if (!bytes.empty()) {
-        std::ifstream input(path, std::ios::binary);
-        input.read(reinterpret_cast<char *>(bytes.data()),
-                   static_cast<std::streamsize>(bytes.size()));
-        if (!input) {
-          return logical_wal_detail::io_error(core::OperationStage::mutation_replay,
-                                              "cannot read collection logical WAL");
-        }
-      }
-      std::size_t offset{};
-      while (offset < bytes.size()) {
-        const auto remaining = bytes.size() - offset;
-        if (remaining < logical_wal_detail::kHeaderBytes) {
-          result.stopped_at_corrupt_or_torn_tail = true;
-          break;
-        }
-        const auto input = std::span<const std::byte>(bytes).subspan(offset);
-        const auto magic = logical_wal_detail::get_u32(input, 0);
-        const auto version = logical_wal_detail::get_u16(input, 4);
-        const auto type =
-            logical_wal_detail::parse_record_type(std::to_integer<std::uint8_t>(input[6]));
-        const auto flags = std::to_integer<std::uint8_t>(input[7]);
-        const auto frame_bytes = logical_wal_detail::get_u32(input, 8);
-        const auto payload_bytes = logical_wal_detail::get_u32(input, 12);
-        if (magic != logical_wal_detail::kFrameMagic ||
-            version != logical_wal_detail::kFormatVersion || !type.has_value() ||
-            payload_bytes > logical_wal_detail::kMaximumPayloadBytes ||
-            frame_bytes != logical_wal_detail::kHeaderBytes + payload_bytes +
-                               logical_wal_detail::kTrailerBytes ||
-            frame_bytes > remaining) {
-          result.stopped_at_corrupt_or_torn_tail = true;
-          break;
-        }
-        const auto frame = input.first(frame_bytes);
-        if (logical_wal_detail::get_u32(frame, frame_bytes - 4) !=
-            logical_wal_detail::kTrailerMagic) {
-          result.stopped_at_corrupt_or_torn_tail = true;
-          break;
-        }
-        auto checksum_input = std::vector<std::byte>(frame.begin(), frame.end());
-        const auto expected =
-            logical_wal_detail::get_u32(frame, logical_wal_detail::kChecksumOffset);
-        std::fill_n(checksum_input.begin() + logical_wal_detail::kChecksumOffset, 4, std::byte{});
-        if (logical_wal_detail::crc32(checksum_input) != expected) {
-          result.stopped_at_corrupt_or_torn_tail = true;
-          break;
+      result.valid_bytes = raw.valid_bytes;
+      result.stopped_at_corrupt_or_torn_tail = raw.stopped_at_corrupt_or_torn_tail;
+      result.frames.reserve(raw.frames.size());
+      for (auto &frame : raw.frames) {
+        const auto type = logical_wal_detail::parse_record_type(frame.type);
+        if (!type.has_value()) {
+          return core::Status::error(core::StatusCode::corruption,
+                                     core::OperationStage::mutation_replay,
+                                     core::StatusDetail::malformed_struct,
+                                     "collection WAL contains an unknown record type");
         }
         LogicalWalFrame decoded;
         decoded.type = *type;
-        decoded.flags = flags;
-        decoded.op_id = logical_wal_detail::get_u64(frame, 16);
-        decoded.batch_id = logical_wal_detail::get_u64(frame, 24);
-        decoded.payload.assign(frame.begin() + logical_wal_detail::kHeaderBytes,
-                               frame.end() - logical_wal_detail::kTrailerBytes);
-        decoded.offset = offset;
-        decoded.size = frame_bytes;
+        decoded.flags = frame.flags;
+        decoded.op_id = frame.op_id;
+        decoded.batch_id = frame.batch_id;
+        decoded.payload = std::move(frame.payload);
+        decoded.offset = frame.offset;
+        decoded.size = frame.size;
         result.frames.push_back(std::move(decoded));
-        offset += frame_bytes;
-        result.valid_bytes = offset;
       }
       return result;
     } catch (const std::exception &error) {
