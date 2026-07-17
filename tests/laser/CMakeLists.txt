@@ -285,11 +285,18 @@ alaya_cc_target(
 # while compiling them as one translation unit, as the original single-source target did.
 set_target_properties(bench_laser_update_sift PROPERTIES UNITY_BUILD ON)
 
-# laser-ip: W0 oracle base for the LASER IP kernel. Pins ground truth from the
-# immutable official RaBitQ-Library METRIC_IP fixture (generated offline by
-# space/tools/gen_ip_official_fixture.cpp), the in-repo memqg path and brute-force
-# exact, plus the one-bit bound and degenerate-input contract. Fixture is read-only
-# here (hard fail if missing/bad); ALAYA_IP_FIXTURE_DIR points at the source tree.
+# laser-ip: LASER inner-product (IP) distance kernel tests. Appended by branch
+# feat/laser-ip-kernel; integrate as an append-only region on top of 2C's file.
+# Both targets read the immutable official fixture ip_official_fixture.tsv, located
+# via the ALAYA_IP_FIXTURE_DIR compile-def (source tree, so it is committable and
+# read-only in CI). Core-space only -- no LASER-internal link is needed; the
+# dormant include/index/graph/laser/space/ip.hpp is header-only over core space.
+
+# W0 oracle base for the LASER IP kernel: pins ground truth from the immutable
+# official RaBitQ-Library METRIC_IP fixture (generated offline by
+# space/tools/gen_ip_official_fixture.cpp), the in-repo memqg RaBitQCore/RaBitQSpace
+# path, and brute-force exact, plus the one-bit error bound and degenerate-input
+# contract. The fixture is read-only here; a missing/bad fixture is a hard failure.
 alaya_cc_target(
   laser_ip_oracle_test
   GTEST
@@ -303,14 +310,15 @@ alaya_add_test(
   LABELS laser rabitq space
 )
 
-# W1 skeleton for the LASER IP kernel (ip.hpp). Validates the LASER-convention
-# IP factor derivation (REPORT section 3) against the W0 oracle base via
-# estimate-level equivalence. Becomes the real W1 unit test when ip.hpp lands
-# (swap the inline reference for the include). Core-space only.
+# W1 unit test for the dormant LASER IP kernel (include/index/graph/laser/space/
+# ip.hpp): full-sign factor estimate equivalence, the factor_dq == official
+# f_rescale/2 lock (incl. the 1-D counterexample) against the fixture, factor_vq
+# mapping, the NaN-free zero-residual policy, and generic/AVX2/AVX-512 coverage.
 alaya_cc_target(
   laser_ip_kernel_test
   GTEST
   SRCS space/ip_kernel_test.cpp
+  DEFS ALAYA_IP_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/space"
   OPTS -O3 -DNDEBUG -Wall -Wextra
 )
 alaya_add_test(
