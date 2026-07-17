@@ -124,8 +124,8 @@ class UnifiedLaserSegmentSearcher : public SegmentSearcher {
     auto &graph = legacy_.graph();
     const auto effective_top_k =
         static_cast<uint32_t>(std::min<uint64_t>(static_cast<uint64_t>(opts.top_k), size()));
-    const size_t batch_threads = std::max<size_t>(
-        1, std::min<size_t>(num_queries, std::thread::hardware_concurrency()));
+    const size_t batch_threads =
+        std::max<size_t>(1, std::min<size_t>(num_queries, std::thread::hardware_concurrency()));
     const LastSetParams requested{
         static_cast<size_t>(std::max(opts.ef, effective_top_k)),
         batch_threads,

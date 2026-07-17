@@ -118,11 +118,11 @@ inline void prefetch_row_l2(const char *ptr, size_t num_lines) {
 // Candidate-row prefetch depth for the resident-arena kernel, in 64B lines.
 // The memory QG kernel issues mem_prefetch_l2(next candidate, 10 lines) after
 // every pool insert; the arena kernel historically issued none, which showed
-// up as +19.5% LLC misses at the same ef. E1 (fullcache-adjudication 附4):
+// up as +19.5% LLC misses at the same ef. E1 (fullcache-adjudication appendix 4):
 // the win saturates at a fixed in-flight budget of ~20 lines (~1.3KB); short
 // rows want the whole row. Default = min(row_lines, 20); ALAYA_ARENA_PF_LINES
 // overrides (0 disables — A/B control).
-inline size_t arena_prefetch_default(size_t row_lines, long env_lines) {
+inline size_t arena_prefetch_default(size_t row_lines, int64_t env_lines) {
   if (env_lines >= 0) {
     return static_cast<size_t>(env_lines);
   }
@@ -131,9 +131,9 @@ inline size_t arena_prefetch_default(size_t row_lines, long env_lines) {
 }
 
 inline size_t arena_prefetch_lines(size_t row_lines) {
-  static const long kEnvLines = [] {
+  static const int64_t kEnvLines = [] {
     const char *v = std::getenv("ALAYA_ARENA_PF_LINES");
-    return v == nullptr ? -1L : static_cast<long>(std::strtoul(v, nullptr, 10));
+    return v == nullptr ? int64_t{-1} : static_cast<int64_t>(std::strtoul(v, nullptr, 10));
   }();
   return arena_prefetch_default(row_lines, kEnvLines);
 }
@@ -143,8 +143,7 @@ inline QGPageGeometry qg_page_geometry(size_t node_len) {
     throw std::invalid_argument("qg_page_geometry: node_len must be > 0");
   }
   size_t node_per_page = std::max<size_t>(1, kSectorLen / node_len);
-  size_t page_size =
-      (node_per_page * node_len + kSectorLen - 1) / kSectorLen * kSectorLen;
+  size_t page_size = (node_per_page * node_len + kSectorLen - 1) / kSectorLen * kSectorLen;
   while (node_per_page > 1 &&
          page_size - node_per_page * node_len < node_per_page * kQGRowTrailerSize) {
     --node_per_page;
@@ -1294,8 +1293,7 @@ inline void QuantizedGraph::load_disk_index(const char *filename, float search_D
 
     const size_t loaded_npp = static_cast<size_t>(metas[4]);
     const size_t page_count = (num_points_ + loaded_npp - 1) / loaded_npp;
-    if (page_count == 0 || file_size < kSectorLen ||
-        (file_size - kSectorLen) % page_count != 0) {
+    if (page_count == 0 || file_size < kSectorLen || (file_size - kSectorLen) % page_count != 0) {
       throw std::runtime_error("QuantizedGraph::load_disk_index: invalid v1 file geometry");
     }
     const size_t loaded_page_size = static_cast<size_t>((file_size - kSectorLen) / page_count);
@@ -1303,12 +1301,11 @@ inline void QuantizedGraph::load_disk_index(const char *filename, float search_D
     const size_t legacy_npp = std::max<size_t>(1, kSectorLen / node_len_);
     const size_t legacy_page_size =
         (legacy_npp * node_len_ + kSectorLen - 1) / kSectorLen * kSectorLen;
-    const bool is_new_geometry = loaded_npp == new_geometry.node_per_page &&
-                                 loaded_page_size == new_geometry.page_size;
+    const bool is_new_geometry =
+        loaded_npp == new_geometry.node_per_page && loaded_page_size == new_geometry.page_size;
     const bool is_legacy_geometry =
         loaded_npp == legacy_npp && loaded_page_size == legacy_page_size;
-    if (loaded_page_size % kSectorLen != 0 ||
-        loaded_npp * node_len_ > loaded_page_size ||
+    if (loaded_page_size % kSectorLen != 0 || loaded_npp * node_len_ > loaded_page_size ||
         (!is_new_geometry && !is_legacy_geometry)) {
       throw std::runtime_error("QuantizedGraph::load_disk_index: unsupported v1 page geometry");
     }

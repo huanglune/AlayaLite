@@ -51,10 +51,7 @@ class ResidencyProvider {
   // against concurrent searches.
   virtual void prepare(QuantizedGraph &qg) = 0;
 
-  virtual void search(QuantizedGraph &qg,
-                      const float *query,
-                      uint32_t knn,
-                      uint32_t *results) = 0;
+  virtual void search(QuantizedGraph &qg, const float *query, uint32_t knn, uint32_t *results) = 0;
 
   virtual void batch_search(QuantizedGraph &qg,
                             const float *queries,
@@ -72,10 +69,7 @@ class PagedPoolProvider final : public ResidencyProvider {
   // load_disk_index() already staged the partial cache and the AIO pool.
   void prepare(QuantizedGraph & /*qg*/) override {}
 
-  void search(QuantizedGraph &qg,
-              const float *query,
-              uint32_t knn,
-              uint32_t *results) override {
+  void search(QuantizedGraph &qg, const float *query, uint32_t knn, uint32_t *results) override {
     qg.search(query, knn, results);
   }
 
@@ -105,10 +99,7 @@ class ResidentArenaProvider final : public ResidencyProvider {
     qg.ensure_resident_arena();
   }
 
-  void search(QuantizedGraph &qg,
-              const float *query,
-              uint32_t knn,
-              uint32_t *results) override {
+  void search(QuantizedGraph &qg, const float *query, uint32_t knn, uint32_t *results) override {
     qg.arena_search_qg(query, knn, results);
   }
 

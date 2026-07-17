@@ -90,13 +90,13 @@
 #include <utility>
 #include <vector>
 
-#include "simd/fastscan.hpp"
 #include "index/graph/laser/common.hpp"
 #include "index/graph/laser/qg/qg.hpp"
 #include "index/graph/laser/qg/qg_query.hpp"
 #include "index/graph/laser/quantization/fastscan_impl.hpp"
 #include "index/graph/laser/quantization/rabitq.hpp"
 #include "index/graph/laser/space/l2.hpp"
+#include "simd/fastscan.hpp"
 
 namespace alaya::laser {
 
@@ -1316,11 +1316,11 @@ class QGUpdater {
         return std::chrono::duration<double, std::milli>(duration).count();
       };
       std::cout << "[consolidate] bloom: build="
-                << milliseconds(bloom_build_end - bloom_build_begin) << "ms scan="
-                << milliseconds(bloom_scan_end - bloom_scan_begin) << "ms (passed="
-                << bloom_passed_rows << "/" << n << ") repair="
-                << milliseconds(bloom_repair_duration) << "ms total="
-                << milliseconds(consolidate_end - consolidate_begin) << "ms\n";
+                << milliseconds(bloom_build_end - bloom_build_begin)
+                << "ms scan=" << milliseconds(bloom_scan_end - bloom_scan_begin)
+                << "ms (passed=" << bloom_passed_rows << "/" << n
+                << ") repair=" << milliseconds(bloom_repair_duration)
+                << "ms total=" << milliseconds(consolidate_end - consolidate_begin) << "ms\n";
     }
   }
 
@@ -2502,9 +2502,9 @@ class QGUpdater {
     const auto *ids = reinterpret_cast<const PID *>(row + neighbor_off_bytes());
     const size_t degree = row_trailer(page, id).valid_degree;
     for (size_t slot = 0; slot < degree; ++slot) {
-      // Confirm Bloom hits against the exact hidden bitmap. At ~1% element
-      // FPR, an unconfirmed 32-neighbor row test would otherwise send roughly
-      // a quarter of clean rows through the expensive write path.
+      // Confirm Bloom hits against the exact hidden bitmap. At a ~1% per-element
+      // false-positive rate, an unconfirmed 32-neighbor row test would otherwise
+      // send roughly a quarter of clean rows through the expensive write path.
       if (bloom.maybe_contains(ids[slot]) && is_hidden(ids[slot])) return true;
     }
     return false;
@@ -3232,8 +3232,8 @@ class QGUpdater {
         if (params_.backlink_mode == UpdateParams::Backlink::kEvict &&
             params_.evict_telemetry > 0) {
           thread_local std::mt19937_64 tel_rng(
-              static_cast<uint64_t>(std::random_device{}()) ^
-              static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id())));
+              static_cast<uint64_t>(std::random_device()()) ^
+              static_cast<uint64_t>(std::hash<std::thread::id>()(std::this_thread::get_id())));
           sample = params_.evict_telemetry >= 1 ||
                    std::generate_canonical<double, 53>(tel_rng) < params_.evict_telemetry;
         }

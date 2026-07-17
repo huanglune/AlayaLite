@@ -13,7 +13,6 @@ import sys
 import time
 
 import numpy as np
-
 from alayalite import Index
 from alayalite.schema import IndexParams
 

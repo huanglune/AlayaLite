@@ -2,7 +2,9 @@
 # exclude file list
 # cmake/vendor/ holds pinned third-party files (conan_provider.cmake); keep them
 # byte-identical to upstream, typos included.
-extend-exclude = ["cmake/vendor/"]
+# docs/LASER_UPDATE_EXPLORATION.md is a migrated research ledger; its experiment
+# arm labels (fill-only and friends, abbreviated) are data, not prose.
+extend-exclude = ["cmake/vendor/", "docs/LASER_UPDATE_EXPLORATION.md"]
 
 [default.extend-words]
 secon = "secon" # keep don't change it

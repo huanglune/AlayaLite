@@ -1508,8 +1508,8 @@ class Collection {
     target.segment = std::move(prepared.built_target.segment);
     target.rows = prepared.build_data.rows;
     auto status = implementation_->install_segment_replacement(control_state_.sources,
-                                                                std::move(target),
-                                                                prepared.build_data.replacements);
+                                                               std::move(target),
+                                                               prepared.build_data.replacements);
     if (!status.ok()) {
       return status;
     }

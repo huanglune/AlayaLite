@@ -17,11 +17,11 @@
 
 #ifdef ALAYA_KERNEL_SECTION_PROFILE
 
-#include <x86intrin.h>
+  #include <x86intrin.h>
 
-#include <cinttypes>
-#include <cstdint>
-#include <cstdio>
+  #include <cinttypes>
+  #include <cstdint>
+  #include <cstdio>
 
 namespace alaya::ksp {
 
@@ -36,6 +36,8 @@ struct Stats {
 
 inline Stats g_stats;  // NOLINT
 
+// The memqg build path shares the instrumented kernel (find_candidates does
+// ~N*ef_build pops); benches must reset right before the search sweep.
 inline void reset() { g_stats = Stats{}; }
 
 inline void report(const char *tag) {
@@ -44,7 +46,8 @@ inline void report(const char *tag) {
     return;
   }
   const auto q = static_cast<double>(s.queries);
-  std::printf("ksp,%s,queries,%" PRIu64 ",pops_per_q,%.1f,cyc_per_q,prep,%.0f,exact,%.0f,scan,%.0f,pool,%.0f\n",
+  std::printf("ksp,%s,queries,%" PRIu64
+              ",pops_per_q,%.1f,cyc_per_q,prep,%.0f,exact,%.0f,scan,%.0f,pool,%.0f\n",
               tag,
               s.queries,
               static_cast<double>(s.pops) / q,
@@ -58,20 +61,18 @@ inline void report(const char *tag) {
 
 }  // namespace alaya::ksp
 
-#define ALAYA_KSP_BEGIN(sec) const std::uint64_t alaya_ksp_b_##sec = __rdtsc()
-#define ALAYA_KSP_END(sec) ::alaya::ksp::g_stats.sec += __rdtsc() - alaya_ksp_b_##sec
-#define ALAYA_KSP_COUNT(field) ++::alaya::ksp::g_stats.field
-#define ALAYA_KSP_REPORT(tag) ::alaya::ksp::report(tag)
-// The memqg build path shares the instrumented kernel (find_candidates does
-// ~N*ef_build pops); benches must reset right before the search sweep.
-#define ALAYA_KSP_RESET() ::alaya::ksp::reset()
+  #define ALAYA_KSP_BEGIN(sec) const std::uint64_t alaya_ksp_b_##sec = __rdtsc()
+  #define ALAYA_KSP_END(sec) ::alaya::ksp::g_stats.sec += __rdtsc() - alaya_ksp_b_##sec
+  #define ALAYA_KSP_COUNT(field) ++::alaya::ksp::g_stats.field
+  #define ALAYA_KSP_REPORT(tag) ::alaya::ksp::report(tag)
+  #define ALAYA_KSP_RESET() ::alaya::ksp::reset()
 
 #else
 
-#define ALAYA_KSP_BEGIN(sec)
-#define ALAYA_KSP_END(sec)
-#define ALAYA_KSP_COUNT(field)
-#define ALAYA_KSP_REPORT(tag)
-#define ALAYA_KSP_RESET()
+  #define ALAYA_KSP_BEGIN(sec)
+  #define ALAYA_KSP_END(sec)
+  #define ALAYA_KSP_COUNT(field)
+  #define ALAYA_KSP_REPORT(tag)
+  #define ALAYA_KSP_RESET()
 
 #endif  // ALAYA_KERNEL_SECTION_PROFILE

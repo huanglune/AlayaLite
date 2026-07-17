@@ -122,8 +122,8 @@ alaya_add_test(
   LABELS laser rabitq contract
 )
 
-# Streaming-update research prototype (qg_updater.hpp): patch primitives,
-# builder byte-equality, insert/tombstone end-to-end on a tiny index.
+# Streaming-update research prototype (qg_updater.hpp): patch primitives, builder byte-equality, insert/tombstone
+# end-to-end on a tiny index.
 alaya_cc_target(
   test_qg_updater_unit
   BARE GTEST
@@ -137,9 +137,8 @@ alaya_add_test(
   LABELS laser
 )
 
-# Residency seams behind UnifiedLaserSegment: prefetch budget default,
-# ResidencyProvider dispatch, ensure_resident_arena file materialization,
-# and the QGUpdater write_at -> arena mirror.
+# Residency seams behind UnifiedLaserSegment: prefetch budget default, ResidencyProvider dispatch, ensure_resident_arena
+# file materialization, and the QGUpdater write_at -> arena mirror.
 alaya_cc_target(
   test_unified_residency
   BARE GTEST
@@ -167,8 +166,8 @@ alaya_add_test(
   LABELS laser
 )
 
-# SIFT-scale update experiment harness (build / insert / delete / eval modes).
-# Not a ctest — run manually; see the usage string in the source.
+# SIFT-scale update experiment harness (build / insert / delete / eval modes). Not a ctest — run manually; see the usage
+# string in the source.
 alaya_cc_target(
   bench_laser_update_sift
   BARE
@@ -176,7 +175,6 @@ alaya_cc_target(
   LIBS alaya_laser
   OPTS ${_laser_test_opts}
 )
-# The vendored FFHT header contains non-inline helper definitions. Keep the
-# bench's split source files maintainable while compiling them as one translation
-# unit, as the original single-source target did.
+# The vendored FFHT header contains non-inline helper definitions. Keep the bench's split source files maintainable
+# while compiling them as one translation unit, as the original single-source target did.
 set_target_properties(bench_laser_update_sift PROPERTIES UNITY_BUILD ON)

@@ -41,8 +41,9 @@ def matrix_memmap(path: Path, dtype: np.dtype) -> tuple[np.memmap, int, int]:
     return np.memmap(path, dtype=dt, mode="r", offset=8, shape=(n, dim)), n, dim
 
 
-def write_matrix(path: Path, source: np.ndarray, perm: np.ndarray | None,
-                 dtype: np.dtype, rows_per_block: int = 32768) -> None:
+def write_matrix(
+    path: Path, source: np.ndarray, perm: np.ndarray | None, dtype: np.dtype, rows_per_block: int = 32768
+) -> None:
     n, dim = source.shape
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as f:
@@ -68,8 +69,7 @@ def md5(path: Path, block_bytes: int = 8 << 20) -> str:
     return digest.hexdigest()
 
 
-def assign_clusters(base: np.ndarray, model: MiniBatchKMeans,
-                    block_rows: int) -> np.ndarray:
+def assign_clusters(base: np.ndarray, model: MiniBatchKMeans, block_rows: int) -> np.ndarray:
     labels = np.empty(base.shape[0], dtype=np.int16)
     for start in range(0, base.shape[0], block_rows):
         stop = min(base.shape[0], start + block_rows)
@@ -77,8 +77,9 @@ def assign_clusters(base: np.ndarray, model: MiniBatchKMeans,
     return labels
 
 
-def select_heldout(order_desc: np.ndarray, sizes: np.ndarray,
-                   lower: int, upper: int) -> tuple[np.ndarray, int, list[int]]:
+def select_heldout(
+    order_desc: np.ndarray, sizes: np.ndarray, lower: int, upper: int
+) -> tuple[np.ndarray, int, list[int]]:
     total = 0
     chosen: list[int] = []
     skipped: list[int] = []
@@ -94,8 +95,7 @@ def select_heldout(order_desc: np.ndarray, sizes: np.ndarray,
     raise RuntimeError(f"could not reach held-out lower bound {lower}")
 
 
-def drift_permutation(labels: np.ndarray, heldout: np.ndarray,
-                      center_dist: np.ndarray, seed: int) -> np.ndarray:
+def drift_permutation(labels: np.ndarray, heldout: np.ndarray, center_dist: np.ndarray, seed: int) -> np.ndarray:
     held_mask = np.isin(labels, heldout)
     build_ids = np.flatnonzero(~held_mask).astype(np.uint32)
     rng = np.random.default_rng(seed)
@@ -107,8 +107,9 @@ def drift_permutation(labels: np.ndarray, heldout: np.ndarray,
     return np.concatenate([build_ids, *stream_parts])
 
 
-def exact_gt(base: np.ndarray, query: np.ndarray, topk: int,
-             query_block: int, base_block: int, label: str) -> np.ndarray:
+def exact_gt(
+    base: np.ndarray, query: np.ndarray, topk: int, query_block: int, base_block: int, label: str
+) -> np.ndarray:
     """Exact squared-L2 top-k using block GEMM, returning row-sorted IDs."""
     nq, nb = query.shape[0], base.shape[0]
     result = np.empty((nq, topk), dtype=np.uint32)
@@ -144,12 +145,10 @@ def exact_gt(base: np.ndarray, query: np.ndarray, topk: int,
     return result
 
 
-def write_groups(path: Path, gt: np.ndarray, n_build: int,
-                 new_threshold: float) -> dict[str, int]:
+def write_groups(path: Path, gt: np.ndarray, n_build: int, new_threshold: float) -> dict[str, int]:
     frac = np.mean(gt[:, :10] >= n_build, axis=1)
     groups = np.where(frac == 0.0, 0, np.where(frac >= new_threshold, 2, 1))
-    counts = {"old": int(np.sum(groups == 0)), "mixed": int(np.sum(groups == 1)),
-              "new": int(np.sum(groups == 2))}
+    counts = {"old": int(np.sum(groups == 0)), "mixed": int(np.sum(groups == 1)), "new": int(np.sum(groups == 2))}
     with path.open("w", encoding="utf-8") as f:
         f.write(f"# n_build={n_build} groups: old={counts['old']} mixed={counts['mixed']} new={counts['new']}\n")
         for group, value in zip(groups, frac, strict=True):
@@ -157,14 +156,14 @@ def write_groups(path: Path, gt: np.ndarray, n_build: int,
     return counts
 
 
-def overlap_sanity(gt_new: np.ndarray, perm: np.ndarray,
-                   original_gt: np.ndarray) -> dict[str, object]:
+def overlap_sanity(gt_new: np.ndarray, perm: np.ndarray, original_gt: np.ndarray) -> dict[str, object]:
     mapped = perm[gt_new].astype(np.uint32)
     overlaps = np.empty(mapped.shape[0], dtype=np.float64)
     for i in range(mapped.shape[0]):
         overlaps[i] = len(set(mapped[i].tolist()) & set(original_gt[i, :100].tolist())) / 100.0
     return {
-        "mean": float(overlaps.mean()), "min": float(overlaps.min()),
+        "mean": float(overlaps.mean()),
+        "min": float(overlaps.min()),
         "p01": float(np.quantile(overlaps, 0.01)),
         "p05": float(np.quantile(overlaps, 0.05)),
         "p50": float(np.quantile(overlaps, 0.50)),
@@ -174,23 +173,25 @@ def overlap_sanity(gt_new: np.ndarray, perm: np.ndarray,
     }
 
 
-def coordinate_sum_sanity(original: np.ndarray, reordered: np.ndarray,
-                          block_rows: int) -> dict[str, object]:
+def coordinate_sum_sanity(original: np.ndarray, reordered: np.ndarray, block_rows: int) -> dict[str, object]:
     sums = []
     for matrix in (original, reordered):
         total = np.zeros(matrix.shape[1], dtype=np.float64)
         for start in range(0, matrix.shape[0], block_rows):
-            total += np.sum(matrix[start:start + block_rows], axis=0, dtype=np.float64)
+            total += np.sum(matrix[start : start + block_rows], axis=0, dtype=np.float64)
         sums.append(total)
     denom = np.maximum(np.abs(sums[0]), np.finfo(np.float64).tiny)
     rel = np.abs(sums[1] - sums[0]) / denom
-    return {"max_coordinate_relative_error": float(rel.max()),
-            "max_coordinate_absolute_error": float(np.max(np.abs(sums[1] - sums[0]))),
-            "passed": bool(rel.max() <= 1e-3)}
+    return {
+        "max_coordinate_relative_error": float(rel.max()),
+        "max_coordinate_absolute_error": float(np.max(np.abs(sums[1] - sums[0]))),
+        "passed": bool(rel.max() <= 1e-3),
+    }
 
 
-def sampled_nn_mean(base: np.ndarray, query_ids: np.ndarray, ref_end: int,
-                    query_block: int, base_block: int, exclude_self: bool) -> float:
+def sampled_nn_mean(
+    base: np.ndarray, query_ids: np.ndarray, ref_end: int, query_block: int, base_block: int, exclude_self: bool
+) -> float:
     values: list[np.ndarray] = []
     ref_norm = np.empty(ref_end, dtype=np.float32)
     for bs in range(0, ref_end, base_block):
@@ -198,7 +199,7 @@ def sampled_nn_mean(base: np.ndarray, query_ids: np.ndarray, ref_end: int,
         x = np.asarray(base[bs:be], dtype=np.float32)
         ref_norm[bs:be] = np.einsum("ij,ij->i", x, x, dtype=np.float32)
     for qs in range(0, len(query_ids), query_block):
-        ids = query_ids[qs:qs + query_block]
+        ids = query_ids[qs : qs + query_block]
         q = np.asarray(base[ids], dtype=np.float32)
         qnorm = np.einsum("ij,ij->i", q, q, dtype=np.float32)[:, None]
         best = np.full(len(ids), np.inf, dtype=np.float32)
@@ -251,20 +252,16 @@ def main() -> None:
     sample_ids = np.sort(rng.choice(n, size=a.fit_sample, replace=False))
     # Only k and seed are prescribed. Keep sklearn's remaining parameters at
     # their version-recorded defaults instead of silently defining a variant.
-    model = MiniBatchKMeans(n_clusters=a.k, random_state=a.seed).fit(
-        np.asarray(base[sample_ids])
-    )
+    model = MiniBatchKMeans(n_clusters=a.k, random_state=a.seed).fit(np.asarray(base[sample_ids]))
     labels = assign_clusters(base, model, a.base_block)
     sizes = np.bincount(labels, minlength=a.k)
     global_mean = np.zeros(dim, dtype=np.float64)
     for start in range(0, n, a.base_block):
-        global_mean += np.sum(base[start:start + a.base_block], axis=0, dtype=np.float64)
+        global_mean += np.sum(base[start : start + a.base_block], axis=0, dtype=np.float64)
     global_mean /= n
     center_dist = np.linalg.norm(model.cluster_centers_.astype(np.float64) - global_mean, axis=1)
     order_desc = np.lexsort((np.arange(a.k), -center_dist))
-    heldout, heldout_n, skipped_clusters = select_heldout(
-        order_desc, sizes, a.heldout_min, a.heldout_max
-    )
+    heldout, heldout_n, skipped_clusters = select_heldout(order_desc, sizes, a.heldout_min, a.heldout_max)
     perm = drift_permutation(labels, heldout, center_dist, a.seed)
     n_build = n - heldout_n
     if len(np.unique(perm)) != n:
@@ -301,38 +298,51 @@ def main() -> None:
     coord = coordinate_sum_sanity(base, drift_base, a.base_block)
     coord["header_matches"] = bool((dn, ddim) == (n, dim))
     overlap = overlap_sanity(drift_gt, perm, original_gt)
-    nondegenerate = {"new_at_least_300": drift_groups["new"] >= 300,
-                     "old_at_least_3000": drift_groups["old"] >= 3000,
-                     "threshold": a.new_threshold}
+    nondegenerate = {
+        "new_at_least_300": drift_groups["new"] >= 300,
+        "old_at_least_3000": drift_groups["old"] >= 3000,
+        "threshold": a.new_threshold,
+    }
     if not all(nondegenerate[k] for k in ("new_at_least_300", "old_at_least_3000")):
         raise RuntimeError(f"query grouping is degenerate at threshold {a.new_threshold}: {drift_groups}")
 
     nn_rng = np.random.default_rng(a.seed)
     build_sample = np.sort(nn_rng.choice(n_build, size=min(a.nn_sample, n_build), replace=False))
-    held_sample = np.sort(nn_rng.choice(np.arange(n_build, n),
-                                        size=min(a.nn_sample, heldout_n), replace=False))
-    build_nn = sampled_nn_mean(drift_base, build_sample, n_build, a.query_block,
-                               a.base_block, exclude_self=True)
-    held_nn = sampled_nn_mean(drift_base, held_sample, n_build, a.query_block,
-                              a.base_block, exclude_self=False)
-    nn_sanity = {"sample_per_side": int(len(build_sample)),
-                 "build_internal_mean_l2": build_nn,
-                 "heldout_to_build_mean_l2": held_nn,
-                 "ratio": held_nn / build_nn, "method": "exact NN for fixed sampled queries"}
+    held_sample = np.sort(nn_rng.choice(np.arange(n_build, n), size=min(a.nn_sample, heldout_n), replace=False))
+    build_nn = sampled_nn_mean(drift_base, build_sample, n_build, a.query_block, a.base_block, exclude_self=True)
+    held_nn = sampled_nn_mean(drift_base, held_sample, n_build, a.query_block, a.base_block, exclude_self=False)
+    nn_sanity = {
+        "sample_per_side": int(len(build_sample)),
+        "build_internal_mean_l2": build_nn,
+        "heldout_to_build_mean_l2": held_nn,
+        "ratio": held_nn / build_nn,
+        "method": "exact NN for fixed sampled queries",
+    }
 
-    paths = [drift_base_path, drift_gt_path, drift_groups_path, perm_path,
-             ctrl_base_path, ctrl_gt_path, ctrl_groups_path]
+    paths = [
+        drift_base_path,
+        drift_gt_path,
+        drift_groups_path,
+        perm_path,
+        ctrl_base_path,
+        ctrl_gt_path,
+        ctrl_groups_path,
+    ]
     artifacts = {p.name: {"bytes": p.stat().st_size, "md5": md5(p)} for p in paths}
     centroid_artifacts = {
         "centroids": {
-            "filename": centroids_path.name, "bytes": centroids_path.stat().st_size,
-            "md5": md5(centroids_path), "dtype": "float32",
+            "filename": centroids_path.name,
+            "bytes": centroids_path.stat().st_size,
+            "md5": md5(centroids_path),
+            "dtype": "float32",
             "byte_order": "little-endian",
             "layout": "fbin int32 n,dim header followed by row-major coordinates",
         },
         "labels": {
-            "filename": labels_path.name, "bytes": labels_path.stat().st_size,
-            "md5": md5(labels_path), "dtype": "uint16",
+            "filename": labels_path.name,
+            "bytes": labels_path.stat().st_size,
+            "md5": md5(labels_path),
+            "dtype": "uint16",
             "byte_order": "little-endian",
             "layout": "headerless labels in original base row order",
         },
@@ -341,25 +351,38 @@ def main() -> None:
         "sklearn_version": sklearn_version,
         "verification_summary": "same-run centers, labels, sizes, selection, and permutation derive from one fitted model",
     }
-    held_profiles = [{"cluster_id": int(c), "size": int(sizes[c]),
-                      "center_distance_to_global_mean": float(center_dist[c])}
-                     for c in sorted(heldout.tolist(), key=lambda x: (-center_dist[x], x))]
+    held_profiles = [
+        {"cluster_id": int(c), "size": int(sizes[c]), "center_distance_to_global_mean": float(center_dist[c])}
+        for c in sorted(heldout.tolist(), key=lambda x: (-center_dist[x], x))
+    ]
     manifest = {
-        "format_version": 1, "k": a.k, "seed": a.seed, "control_seed": a.ctrl_seed,
+        "format_version": 1,
+        "k": a.k,
+        "seed": a.seed,
+        "control_seed": a.ctrl_seed,
         "minibatch_kmeans_params": model.get_params(),
-        "fit_sample": a.fit_sample, "n": n, "dim": dim, "n_query": nq,
-        "n_build": n_build, "n_heldout": heldout_n,
+        "fit_sample": a.fit_sample,
+        "n": n,
+        "dim": dim,
+        "n_query": nq,
+        "n_build": n_build,
+        "n_heldout": heldout_n,
         "heldout_cluster_ids_outermost_first": [int(x) for x in heldout],
         "selection_skipped_clusters_due_to_upper_bound": [int(x) for x in skipped_clusters],
-        "heldout_clusters": held_profiles, "cluster_sizes": [int(x) for x in sizes],
+        "heldout_clusters": held_profiles,
+        "cluster_sizes": [int(x) for x in sizes],
         "cluster_center_distances_to_global_mean": [float(x) for x in center_dist],
-        "group_thresholds": {"old": "frac == 0", "new": f"frac >= {a.new_threshold}",
-                             "mixed": "otherwise"},
+        "group_thresholds": {"old": "frac == 0", "new": f"frac >= {a.new_threshold}", "mixed": "otherwise"},
         "groups": {"drift": drift_groups, "control": ctrl_groups},
-        "sanity": {"coordinate_sum": coord, "gt_overlap": overlap,
-                   "group_nondegenerate": nondegenerate, "nearest_neighbor": nn_sanity},
+        "sanity": {
+            "coordinate_sum": coord,
+            "gt_overlap": overlap,
+            "group_nondegenerate": nondegenerate,
+            "nearest_neighbor": nn_sanity,
+        },
         "control": {"method": "numpy default_rng(seed=43) permutation; first n_build is build"},
-        "artifacts": artifacts, "centroid_artifacts": centroid_artifacts,
+        "artifacts": artifacts,
+        "centroid_artifacts": centroid_artifacts,
     }
     manifest_path = a.out_dir / "manifest.json"
     # The manifest cannot truthfully contain its own MD5; all other deliverables are included.
@@ -382,15 +405,15 @@ def main() -> None:
 ## Partition and query groups
 
 - Build: {n_build}; held-out stream: {heldout_n}; total: {n}
-- Drift groups: old={drift_groups['old']}, mixed={drift_groups['mixed']}, new={drift_groups['new']}
-- Control groups: old={ctrl_groups['old']}, mixed={ctrl_groups['mixed']}, new={ctrl_groups['new']}
+- Drift groups: old={drift_groups["old"]}, mixed={drift_groups["mixed"]}, new={drift_groups["new"]}
+- Control groups: old={ctrl_groups["old"]}, mixed={ctrl_groups["mixed"]}, new={ctrl_groups["new"]}
 - Group thresholds: old iff frac=0, new iff frac>={a.new_threshold}, mixed otherwise.
 
 ## Sanity checks
 
-1. Permutation/header: header match={coord['header_matches']}; maximum per-coordinate sum relative error={coord['max_coordinate_relative_error']:.3e} (limit 1e-3); pass={coord['passed']}.
-2. GT overlap after mapping to original IDs: mean={overlap['mean']:.6f}, min={overlap['min']:.2f}, p01={overlap['p01']:.2f}, p05={overlap['p05']:.2f}, median={overlap['p50']:.2f}, p95={overlap['p95']:.2f}, p99={overlap['p99']:.2f}, perfect={overlap['perfect_queries']}/{nq}; pass={overlap['mean'] >= 0.99}.
-3. Non-degenerate groups: old>=3000 is {nondegenerate['old_at_least_3000']}; new>=300 is {nondegenerate['new_at_least_300']}.
+1. Permutation/header: header match={coord["header_matches"]}; maximum per-coordinate sum relative error={coord["max_coordinate_relative_error"]:.3e} (limit 1e-3); pass={coord["passed"]}.
+2. GT overlap after mapping to original IDs: mean={overlap["mean"]:.6f}, min={overlap["min"]:.2f}, p01={overlap["p01"]:.2f}, p05={overlap["p05"]:.2f}, median={overlap["p50"]:.2f}, p95={overlap["p95"]:.2f}, p99={overlap["p99"]:.2f}, perfect={overlap["perfect_queries"]}/{nq}; pass={overlap["mean"] >= 0.99}.
+3. Non-degenerate groups: old>=3000 is {nondegenerate["old_at_least_3000"]}; new>=300 is {nondegenerate["new_at_least_300"]}.
 4. Peripheral separation (fixed seed sample, {len(build_sample)} queries per side, exact against the entire build set): held-out-to-build mean L2={held_nn:.6f}; build-internal mean NN L2={build_nn:.6f}; ratio={held_nn / build_nn:.6f}.
 
 ## Held-out cluster profile (outermost first)

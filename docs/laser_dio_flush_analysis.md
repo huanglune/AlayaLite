@@ -196,4 +196,3 @@ writer:             version++ -> odd; pwrite/memcpy; version++ -> even(new)
 **P0.2 flush 使用 b：buffered pwrite（每唯一脏页一次）+ 批末 `sync_file_range(SYNC_FILE_RANGE_WRITE)` 异步下发；pwrite 全部返回后即可 publish，只有 `finalize()` 才等待 `fsync()`。**
 
 这是当前“buffered 搜索读 + 同 inode 高频随机页更新 + 无批级崩溃一致性要求 + eval 仅在 finalize 后启动”约束下的明确最优选择。a 被同步 completion和 cache invalidation拖累；d 只改善提交/等待形态、不消除同样的 coherence 税；c 缺少长期 dirty backlog控制。
-
