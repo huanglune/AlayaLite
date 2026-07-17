@@ -559,6 +559,16 @@ class QGUpdater {
           "QGUpdater: enable_wal is incompatible with direct_io (O_DIRECT bypasses the "
           "write-ahead ordering between the WAL and the index)");
     }
+    // No-steal (clause B): with write_cache off, modify_node_page writes each page
+    // through immediately (force_wal + pwrite), making an uncommitted after-image
+    // durable BEFORE the commit fsync. A torn bundle then leaves a durable backlink
+    // patch whose tentative PID is re-appended by the next transaction => a stale
+    // edge. enable_wal therefore requires the no-steal page cache.
+    if (enable_wal_ && !params_.write_cache) {
+      throw std::invalid_argument(
+          "QGUpdater: enable_wal requires write_cache (the no-steal page cache; a write-through "
+          "cache would make uncommitted after-images durable before the commit fsync)");
+    }
     for (auto &word : hidden_words_) word.store(0, std::memory_order_relaxed);
     for (auto &generation : row_generations_) generation.store(0, std::memory_order_relaxed);
     // Reads stay buffered: the OS page cache serves the ~ef_insert row reads
@@ -1107,38 +1117,54 @@ class QGUpdater {
     if (new_hwm > static_cast<size_t>(kPidMax) || new_hwm > row_generations_.size()) {
       throw std::invalid_argument("commit_physical_bundle: PID capacity exceeded");
     }
-    // (1) allocate + insert each row and append its kind=7 bind (buffered). Row
-    // after-images buffer too; the kind=8 fsync forces the whole group durable.
-    for (size_t i = 0; i < n; ++i) {
-      const PID pid = allocate_and_insert(vecs + i * dim_);
-      if (static_cast<size_t>(pid) != old_hwm + i) {
-        poison("commit_physical_bundle: append produced a non-dense PID");
+    // Mutating section (B-04 hardening): past this point allocated may exceed
+    // committed, so ANY failure -- including an exception that does not itself
+    // poison (e.g. std::bad_alloc while pre-building the snapshot) -- must poison
+    // the handle. Otherwise a later add() would kind=5-publish over the allocation
+    // gap and commit the failed bundle's rows WITHOUT bindings (identity labels).
+    try {
+      // (1) allocate + insert each row and append its kind=7 bind (buffered). Row
+      // after-images buffer too; the kind=8 fsync forces the whole group durable.
+      for (size_t i = 0; i < n; ++i) {
+        const PID pid = allocate_and_insert(vecs + i * dim_);
+        if (static_cast<size_t>(pid) != old_hwm + i) {
+          poison("commit_physical_bundle: append produced a non-dense PID");
+        }
+        wal_append(encode_label_bind(segment_uid_, superblock_.generation, txid,
+                                     static_cast<uint64_t>(i), pid, /*pid_generation=*/0, labels[i]),
+                   alaya::wal::WalFile::Sync::buffered, txid);
       }
-      wal_append(encode_label_bind(segment_uid_, superblock_.generation, txid,
-                                   static_cast<uint64_t>(i), pid, /*pid_generation=*/0, labels[i]),
-                 alaya::wal::WalFile::Sync::buffered, txid);
+      wal_failpoint(SegmentOpFailPoint::after_label_bind_append);
+      // Reverse edges must be materialized inline before the commit (B-03/clause B):
+      // a staged (deferred) backlink would let kind=8 commit a row whose only routing
+      // edges live in RAM and vanish on a crash, leaving it permanently unreachable.
+      if (has_staged_edges()) {
+        poison("commit_physical_bundle: staged backlinks must be drained (inline patching "
+               "is required under enable_wal)");
+      }
+      // (2) pre-build the new immutable snapshot (zero allocation / no failure after
+      // this point on the publish path).
+      auto next = std::make_shared<LabelBindings>(*load_label_snapshot());
+      for (size_t i = 0; i < n; ++i) {
+        next->bindings.emplace(static_cast<PID>(old_hwm + i), labels[i]);
+      }
+      std::shared_ptr<const LabelBindings> published = std::move(next);
+      // (3) append kind=8 + fsync: the single durable commit point of the bundle.
+      wal_failpoint(SegmentOpFailPoint::before_tx_publish_append);
+      wal_append(encode_tx_publish(segment_uid_, superblock_.generation, txid,
+                                   static_cast<uint64_t>(new_hwm), static_cast<uint64_t>(n),
+                                   applied_op_id),
+                 alaya::wal::WalFile::Sync::fsync, txid);
+      wal_failpoint(SegmentOpFailPoint::after_tx_publish_fsync);
+      // (4) publish snapshot (release) THEN committed (release), via the shared core.
+      publish_common(new_hwm, [&] { store_label_snapshot(published); });
+      last_committed_txid_ = txid;
+      applied_collection_op_id_ = applied_op_id;
+      return {static_cast<PID>(old_hwm), static_cast<PID>(new_hwm)};
+    } catch (const std::exception &error) {
+      // poison() re-throws (preserving the first reason if already poisoned).
+      poison(std::string("commit_physical_bundle failed mid-transaction: ") + error.what());
     }
-    wal_failpoint(SegmentOpFailPoint::after_label_bind_append);
-    // (2) pre-build the new immutable snapshot (zero allocation / no failure after
-    // this point on the publish path).
-    auto next = std::make_shared<LabelBindings>(*load_label_snapshot());
-    for (size_t i = 0; i < n; ++i) {
-      next->bindings.emplace(static_cast<PID>(old_hwm + i), labels[i]);
-    }
-    std::shared_ptr<const LabelBindings> published = std::move(next);
-    // (3) append kind=8 + fsync: the single durable commit point of the bundle.
-    wal_failpoint(SegmentOpFailPoint::before_tx_publish_append);
-    wal_append(encode_tx_publish(segment_uid_, superblock_.generation, txid,
-                                 static_cast<uint64_t>(new_hwm), static_cast<uint64_t>(n),
-                                 applied_op_id),
-               alaya::wal::WalFile::Sync::fsync, txid);
-    wal_failpoint(SegmentOpFailPoint::after_tx_publish_fsync);
-    // (4) publish snapshot (release) THEN committed (release), via the shared core.
-    publish_common(new_hwm,
-                   [&] { store_label_snapshot(published); });
-    last_committed_txid_ = txid;
-    applied_collection_op_id_ = applied_op_id;
-    return {static_cast<PID>(old_hwm), static_cast<PID>(new_hwm)};
   }
 
   /**
@@ -4560,11 +4586,26 @@ class QGUpdater {
     op_wal_ = std::make_unique<alaya::wal::WalFile>(qg_.index_file_name_ + ".opwal");
     const auto &scanned = op_wal_->recovery_scan();
     if (fresh_lineage) {
-      if (!scanned.frames.empty()) {
-        poison("enable_wal on an unstamped superblock but the .opwal already has frames");
+      // A non-empty .opwal on an UNSTAMPED (uid==0) superblock is the legal
+      // fresh-enable crash window: a fresh checkpoint fsynced its flip frame but
+      // crashed before the superblock write, so the base is still unstamped yet the
+      // WAL holds an orphan flip. No committed op-WAL data can exist on an unstamped
+      // base, so the orphan is discardable -- checkpoint() below overwrites the WAL
+      // via reset_to_single_frame. Guard: only flip frames are legal here; anything
+      // else is unexpected (data on an unstamped base) and poisons (fail-closed).
+      for (const auto &frame : scanned.frames) {
+        SegmentOp probe;
+        try {
+          probe = decode_segment_op(frame.payload);
+        } catch (const std::exception &) {
+          poison("enable_wal on an unstamped superblock but the .opwal has an undecodable frame");
+        }
+        if (probe.kind != SegmentOpKind::superblock_flip) {
+          poison("enable_wal on an unstamped superblock but the .opwal has committed op frames");
+        }
       }
       label_working_.clear();
-      checkpoint();              // stamps uid + canonical label/tx tuple; resets the WAL
+      checkpoint();              // stamps uid + canonical label/tx tuple; overwrites the WAL
       publish_label_snapshot();  // empty snapshot
       precreate_label_slots();   // B-05: both slots + parent dir durable before any content flip
       return;

@@ -464,5 +464,66 @@ INSTANTIATE_TEST_SUITE_P(
                   }}),
     [](const ::testing::TestParamInfo<BadBundle> &info) { return info.param.name; });
 
+// codex BLOCKER (staged backlinks): a bundle with deferred reverse edges poisons
+// BEFORE commit, so kind=8 never commits a row whose only routing edges live in RAM
+// and would vanish on a crash (leaving the row permanently unreachable).
+TEST(QgUpdaterWalLabels, StagedBacklinksPoisonBundle) {
+  const auto dir = scratch_dir("staged_poison");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, 606);
+  QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+  qg.load_disk_index(base.prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+  qg.set_params(64, 1, 1);
+  UpdateParams params;
+  params.enable_wal = true;
+  params.ef_insert = 64;
+  params.max_points = kBaseN + 64;
+  params.stage_backlinks = true;  // deferred reverse edges: illegal under enable_wal
+  QGUpdater upd(qg, params);
+  const auto v = labeled_vecs(2, 0x7007);
+  const std::vector<uint64_t> labels = {33000, 33001};
+  EXPECT_THROW((void)upd.commit_physical_bundle(1, 1, v.data(), labels.data(), 2),
+               std::runtime_error)
+      << "staged backlinks must poison the bundle before commit";
+  std::filesystem::remove_all(dir);
+}
+
+// codex BLOCKER (internal failure mid-bundle): an exception that does not itself
+// poison (simulated via a throwing failpoint) still poisons the handle, so a later
+// operation cannot kind=5-publish over the allocation gap and commit the failed
+// rows as identity-labeled. On reopen the failed bundle is not committed.
+TEST(QgUpdaterWalLabels, InternalFailureMidBundlePoisonsAndDoesNotLeak) {
+  const auto dir = scratch_dir("mid_fail");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, 707);
+  const auto v = labeled_vecs(3, 0x8008);
+  const std::vector<uint64_t> labels = {34000, 34001, 34002};
+  {
+    QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+    qg.load_disk_index(base.prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+    qg.set_params(64, 1, 1);
+    UpdateParams params;
+    params.enable_wal = true;
+    params.ef_insert = 64;
+    params.max_points = kBaseN + 64;
+    params.failpoint_hook = [](SegmentOpFailPoint fp) {
+      if (fp == SegmentOpFailPoint::after_label_bind_append) {
+        throw std::runtime_error("injected mid-bundle failure");  // e.g. std::bad_alloc
+      }
+    };
+    QGUpdater upd(qg, params);
+    EXPECT_THROW((void)upd.commit_physical_bundle(5, 3, v.data(), labels.data(), 3),
+                 std::runtime_error);
+    EXPECT_THROW((void)upd.publish(upd.allocated_points()), std::runtime_error)
+        << "the handle must be poisoned after a mid-bundle failure";
+  }
+  {
+    Session s(base.prefix, kBaseN + 64);
+    EXPECT_EQ(s.upd->num_points(), kBaseN) << "the failed bundle must not be committed";
+    EXPECT_EQ(s.upd->last_committed_txid(), 0U) << "no identity-labeled rows leaked";
+  }
+  std::filesystem::remove_all(dir);
+}
+
 }  // namespace
 }  // namespace alaya::laser

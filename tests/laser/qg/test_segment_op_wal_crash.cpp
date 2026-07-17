@@ -716,5 +716,53 @@ TEST(SegmentOpWalDamage, ResidualResetTmpIsHarmless) {
   std::filesystem::remove_all(root);
 }
 
+// codex BLOCKER (fresh-enable crash window): a fresh WAL enable that SIGKILLs after
+// the flip fsync but before the superblock write leaves an unstamped superblock and
+// an orphan flip in the .opwal. Reopen must DISCARD the orphan and re-stamp -- a
+// legal, recoverable window -- not poison.
+TEST(SegmentOpWalPowerLoss, FreshEnableCrashAfterFlipIsRecoverable) {
+  const auto root = battery_root("fresh_crash");
+  std::filesystem::remove_all(root);
+  const auto template_dir = root / "template";
+  auto base = WalTinyIndex::build(template_dir, kBaseN, 9753);  // uid still 0 (no prepare_wal_base)
+  const size_t max_points = kBaseN + kInsert + 16;
+  const auto case_dir = root / "case";
+  copy_tree(template_dir, case_dir);
+  const std::string case_prefix = (case_dir / "wal_base").string();
+
+  const auto child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    try {
+      QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+      qg.load_disk_index(case_prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+      qg.set_params(64, 1, 1);
+      UpdateParams params;
+      params.enable_wal = true;
+      params.max_points = max_points;
+      params.failpoint_hook = [](SegmentOpFailPoint fp) {
+        if (fp == SegmentOpFailPoint::after_flip_append_before_superblock_write) {
+          ::kill(::getpid(), SIGKILL);
+          ::_exit(99);
+        }
+      };
+      QGUpdater upd(qg, params);  // the fresh-enable checkpoint fires the failpoint
+    } catch (...) {
+      ::_exit(70);
+    }
+    ::_exit(0);
+  }
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+
+  const auto first = recover(case_prefix, max_points);
+  EXPECT_FALSE(first.poisoned) << "fresh-enable crash window must be recoverable, not poison";
+  EXPECT_EQ(first.num_points, kBaseN);
+  const auto second = recover(case_prefix, max_points);  // now stamped: ordinary recovery
+  EXPECT_FALSE(second.poisoned);
+  EXPECT_EQ(second.num_points, kBaseN);
+  std::filesystem::remove_all(root);
+}
+
 }  // namespace
 }  // namespace alaya::laser
