@@ -20,6 +20,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -61,6 +62,17 @@ enum class SegmentOpFailPoint : std::uint8_t {
   after_publish_fsync,
   after_flip_append_before_superblock_write,
   after_superblock_write_before_wal_reset,
+  after_wal_reset,
+};
+
+// Test-only observer for the persistence-model (power-loss) crash layer. It is
+// notified right after each durable fsync of the index fd and of the op-WAL, so
+// a harness can snapshot the "forced" content of each file and later materialize
+// the possible power-loss disk states (retain/drop the unforced tail of each
+// stream independently). Null in production — zero overhead.
+struct SegmentIoObserver {
+  std::function<void()> on_index_fsync{};
+  std::function<void()> on_wal_fsync{};
 };
 
 // One decoded SEGMENT_OP. Only the body fields matching `kind` are meaningful.

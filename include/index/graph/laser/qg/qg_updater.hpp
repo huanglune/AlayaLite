@@ -51,9 +51,28 @@
  * update headroom) when no candidate exists.
  *
  * Format v2 stores authoritative per-row valid_degree/flags trailers and A/B
- * CRC-protected superblocks. It is not production ready: there is no WAL or
- * torn-page recovery yet; the legacy ghost heuristic exists only in the one-
- * time v1 migration scan.
+ * CRC-protected superblocks.
+ *
+ * Durability (UpdateParams::enable_wal, off by default): when enabled the
+ * updater keeps a per-segment after-image op-WAL (`<index>.opwal`, the SEGMENT_OP
+ * family of the shared WAL7 envelope, see segment_op_wal.hpp /
+ * docs/design/unified-wal-vocabulary.md). A no-steal page cache appends a
+ * whole-page after-image before the page is installed, publish() group-commits
+ * the batch (fsync) before advancing the watermark, and checkpoint() commits an
+ * A/B superblock flip. Reopen runs a dedicated recovery path (read-only base ->
+ * WAL redo under a replaying_ guard -> one authoritative trailer scan that
+ * rebuilds committed/allocated/next/live/hidden/deleted and the physical length
+ * -> routing repair). A durable segment lineage uid in the superblock reserved
+ * area rejects a stale/foreign .opwal, and any WAL/critical-index error poisons
+ * the writer (fail closed). The G1 minimal safe scope forbids PID reuse/reclaim,
+ * consolidate/garden, and bloom under enable_wal — those paths throw and their
+ * WAL transaction formats are a later wave. Remaining caller contracts: phase
+ * separation (tombstone/consolidate vs inserts) still applies, the labels
+ * sidecar is not covered by the op-WAL, and a single writer per segment must be
+ * enforced above (W3 handle: exclusive flock + checkpoint/mutation lane).
+ *
+ * With enable_wal off the paths below are byte-for-byte unchanged; the legacy
+ * ghost heuristic exists only in the one-time v1 migration scan.
  */
 
 #pragma once
@@ -76,6 +95,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -93,10 +113,12 @@
 #include "index/graph/laser/common.hpp"
 #include "index/graph/laser/qg/qg.hpp"
 #include "index/graph/laser/qg/qg_query.hpp"
+#include "index/graph/laser/qg/segment_op_wal.hpp"
 #include "index/graph/laser/quantization/fastscan_impl.hpp"
 #include "index/graph/laser/quantization/rabitq.hpp"
 #include "index/graph/laser/space/l2.hpp"
 #include "simd/fastscan.hpp"
+#include "wal/frame.hpp"
 
 namespace alaya::laser {
 
@@ -454,6 +476,17 @@ struct UpdateParams {
                                            // accumulated churn (tombstones + inserts) since the
                                            // last garden reaches threshold * committed.
                                            // 0 = garden every call (legacy behavior).
+
+  // --- durable in-place updates: segment op-WAL (G1) ---
+  // Off by default so every existing test/bench is byte-for-byte unchanged.
+  // When true, the updater logs an after-image WAL and recovers on reopen; the
+  // G1 minimal safe scope forbids PID reuse/reclaim/consolidate/garden/bloom
+  // (unified-wal-vocabulary.md clause A) — those paths throw under enable_wal.
+  bool enable_wal = false;
+  // Crash-matrix injection: invoked at labelled lifecycle points; empty in prod.
+  std::function<void(SegmentOpFailPoint)> failpoint_hook{};
+  // Persistence-model (power-loss) harness hook; null in prod (zero overhead).
+  SegmentIoObserver *io_observer = nullptr;
 };
 
 class QGUpdater {
@@ -502,6 +535,13 @@ class QGUpdater {
       throw std::invalid_argument(
           "QGUpdater: page has insufficient slack for format-v2 row trailers");
     }
+    enable_wal_ = params_.enable_wal;
+    io_observer_ = params_.io_observer;
+    if (enable_wal_ && params_.direct_io) {
+      throw std::invalid_argument(
+          "QGUpdater: enable_wal is incompatible with direct_io (O_DIRECT bypasses the "
+          "write-ahead ordering between the WAL and the index)");
+    }
     for (auto &word : hidden_words_) word.store(0, std::memory_order_relaxed);
     for (auto &generation : row_generations_) generation.store(0, std::memory_order_relaxed);
     // Reads stay buffered: the OS page cache serves the ~ef_insert row reads
@@ -543,6 +583,19 @@ class QGUpdater {
       qg_.arena_reserve_rows(row_generations_.size());
     }
     qg_.set_result_filter(&deleted_);
+    if (enable_wal_) {
+      try {
+        open_op_wal_and_recover();
+      } catch (...) {
+        qg_.set_result_filter(nullptr);
+        op_wal_.reset();
+        if (wfd_ >= 0) ::close(wfd_);
+        if (fd_ >= 0) ::close(fd_);
+        wfd_ = -1;
+        fd_ = -1;
+        throw;
+      }
+    }
   }
 
   QGUpdater(const QGUpdater &) = delete;
@@ -857,9 +910,17 @@ class QGUpdater {
     }
     // This is the deletion visibility point. A racing reader that still has
     // the old row may route through it, but can no longer return the PID.
+    if (enable_wal_) ensure_writable();
     if (!mark_hidden(id)) return;
     churn_since_garden_.fetch_add(1, std::memory_order_relaxed);
     mirror_deleted_insert(id);
+    if (enable_wal_ && !replaying_) {
+      // Durability of a tombstone is the next publish/checkpoint/flush fsync; the
+      // trailer flag itself is captured by the modify_node_page after-image below.
+      wal_append(encode_tombstone(segment_uid_, superblock_.generation, id),
+                 alaya::wal::WalFile::Sync::buffered);
+      wal_failpoint(SegmentOpFailPoint::after_wal_append_before_apply);
+    }
     repair_routing_roots(id);
     const std::lock_guard<std::mutex> guard(page_lock(id));
     modify_node_page(id, [&](char *page) {
@@ -882,7 +943,10 @@ class QGUpdater {
 
   /** Allocate a reclaimed PID when available, otherwise append a new PID. */
   PID allocate_and_insert(const float *vec) {
-    PID id = pop_free_slot();
+    if (enable_wal_) ensure_writable();
+    // PID reuse/reclaim is out of the G1 scope (clause A): under enable_wal every
+    // allocation is a pure append.
+    PID id = enable_wal_ ? kPidMax : pop_free_slot();
     const bool reused = id != kPidMax;
     if (!reused) {
       id = next_append_id_.fetch_add(1, std::memory_order_acq_rel);
@@ -906,6 +970,7 @@ class QGUpdater {
    * and backlinks for ids below `new_committed` must already be written.
    */
   void publish(size_t new_committed) {
+    if (enable_wal_) ensure_writable();
     const size_t old_committed = committed_.load(std::memory_order_acquire);
     if (new_committed < old_committed || new_committed > allocated_points()) {
       throw std::invalid_argument("QGUpdater::publish invalid committed watermark");
@@ -915,6 +980,9 @@ class QGUpdater {
     {
       const std::lock_guard<std::mutex> guard(pending_reused_mutex_);
       reused.swap(pending_reused_);
+    }
+    if (enable_wal_ && !reused.empty()) {
+      poison("PID reuse is disabled under enable_wal (clause A)");
     }
     // A reused id is below the existing watermark.  Its trailer is made live
     // first, then the result-filter tombstone is erased; that erase is the
@@ -933,6 +1001,19 @@ class QGUpdater {
       // state therefore keeps the row dark (safe-side false negative).
       mirror_deleted_erase(id);
       clear_hidden(id);
+    }
+    // Group commit (clause B): every buffered after-image for the batch and the
+    // publish record are forced together before the watermark advances. All
+    // backlink after-images must already exist, so staged (deferred) backlinks
+    // are rejected under enable_wal — the mutable segment patches inline.
+    if (enable_wal_ && !replaying_) {
+      if (has_staged_edges()) {
+        poison("staged backlinks must be drained before publish under enable_wal");
+      }
+      wal_failpoint(SegmentOpFailPoint::after_apply_before_publish_fsync);
+      wal_append(encode_publish(segment_uid_, superblock_.generation, new_committed),
+                 alaya::wal::WalFile::Sync::fsync);
+      wal_failpoint(SegmentOpFailPoint::after_publish_fsync);
     }
     live_count_.fetch_add(reused.size() + (new_committed - old_committed),
                           std::memory_order_acq_rel);
@@ -1135,6 +1216,11 @@ class QGUpdater {
                    size_t r_target = 0,
                    bool reclaim_slots = true,
                    bool bloom_consolidate = false) {
+    if (enable_wal_) {
+      throw std::logic_error(
+          "QGUpdater::consolidate is out of the G1 op-WAL scope (clause A): reclaim/reuse and "
+          "consolidate need their own WAL transaction format (next wave)");
+    }
     const auto consolidate_begin = std::chrono::steady_clock::now();
     const size_t n = committed_.load(std::memory_order_acquire);
     const size_t target = r_target == 0 ? deg_ : std::min(r_target, deg_);
@@ -1326,6 +1412,11 @@ class QGUpdater {
 
   /** Refresh a deterministic budget of live rows; phase-separated from updates. */
   void garden(size_t num_threads, const GardenParams &gp) {
+    if (enable_wal_) {
+      throw std::logic_error(
+          "QGUpdater::garden is out of the G1 op-WAL scope (clause A): its page rewrites need a "
+          "consolidate-style WAL transaction (next wave)");
+    }
     if (!params_.maintain_indegree) {
       throw std::logic_error("QGUpdater::garden requires maintain_indegree");
     }
@@ -1431,14 +1522,25 @@ class QGUpdater {
   /** Persist dirty pages and atomically advance the alternate A/B superblock. */
   void checkpoint() {
     const std::lock_guard<std::mutex> checkpoint_guard(checkpoint_mutex_);
+    if (enable_wal_ && !replaying_) {
+      ensure_writable();
+      // Admission (clause D): no in-flight allocation gap and no staged edges, so
+      // the superblock image is built from committed state only (never publishes
+      // dark rows). W3 enforces mutation x checkpoint exclusion at the handle.
+      if (allocated_points_.load(std::memory_order_acquire) !=
+          committed_.load(std::memory_order_acquire)) {
+        throw std::logic_error(
+            "QGUpdater::checkpoint requires allocated == committed (publish the batch first)");
+      }
+      if (has_staged_edges()) {
+        throw std::logic_error("QGUpdater::checkpoint requires no staged backlinks");
+      }
+    }
     drain_staged_edges(1);
-    flush_dirty(1);
+    flush_dirty(1);  // forces the WAL prefix first under enable_wal
     const size_t n = allocated_points_.load(std::memory_order_acquire);
     const size_t page_num = (n + npp_ - 1) / npp_;
     const uint64_t file_size = kSectorLen + page_num * page_size_;
-    if (::ftruncate(fd_, static_cast<off_t>(file_size)) != 0) {
-      throw std::runtime_error("QGUpdater: ftruncate failed");
-    }
     QGSuperblockV2 next = superblock_;
     next.magic = kQGSuperblockMagic;
     next.format_version = kQGFormatVersion;
@@ -1449,9 +1551,41 @@ class QGUpdater {
     next.free_count = free_count_.load(std::memory_order_acquire);
     next.entry_point = qg_.entry_point_;
     next.file_size = file_size;
+    if (enable_wal_) {
+      write_superblock_uid(next, segment_uid_);  // carry the lineage forward
+    }
     next.checksum = qg_superblock_checksum(next);
     const int next_slot = active_superblock_slot_ == 0 ? 1 : 0;
-    write_superblock(next_slot, next);
+    if (enable_wal_ && !replaying_) {
+      // Sequence (clause D): flip frame append+fsync (WAL) -> ftruncate + superblock
+      // pwrite+fsync (index) -> reset WAL. Each boundary is a crash-matrix cut.
+      const auto image =
+          std::span<const std::byte>(reinterpret_cast<const std::byte *>(&next), sizeof(next));
+      const auto flip = encode_superblock_flip(
+          segment_uid_, next.generation, static_cast<uint8_t>(next_slot), image);
+      wal_append(flip, alaya::wal::WalFile::Sync::fsync);
+      wal_failpoint(SegmentOpFailPoint::after_flip_append_before_superblock_write);
+      if (::ftruncate(fd_, static_cast<off_t>(file_size)) != 0) {
+        poison("checkpoint ftruncate failed");
+      }
+      write_superblock(next_slot, next);  // pwrite + fsync (index durable)
+      wal_failpoint(SegmentOpFailPoint::after_superblock_write_before_wal_reset);
+      // Retain exactly one flip marker as the new base; a crash after the durable
+      // superblock but before this reset is a safe roll-forward (old WAL suffices).
+      try {
+        op_wal_->reset_to_single_frame(kSegmentOpRecordType, 0, ++wal_op_id_, 0, flip);
+      } catch (const std::exception &error) {
+        poison(std::string("checkpoint WAL reset failed (superblock durable; roll-forward): ") +
+               error.what());
+      }
+      notify_wal_fsync();
+      wal_failpoint(SegmentOpFailPoint::after_wal_reset);
+    } else {
+      if (::ftruncate(fd_, static_cast<off_t>(file_size)) != 0) {
+        throw std::runtime_error("QGUpdater: ftruncate failed");
+      }
+      write_superblock(next_slot, next);
+    }
     superblock_ = next;
     active_superblock_slot_ = next_slot;
     qg_.num_points_ = committed_.load(std::memory_order_acquire);
@@ -1878,6 +2012,7 @@ class QGUpdater {
     if (::fsync(fd_) != 0) {
       throw std::runtime_error("QGUpdater: superblock fsync failed");
     }
+    notify_index_fsync();
   }
 
   size_t compact_v1_row(char *row) {
@@ -2017,7 +2152,7 @@ class QGUpdater {
     free_count_.store(free_ids.size(), std::memory_order_release);
   }
 
-  void load_v2_state(const QGSuperblockV2 &sb) {
+  void load_v2_state(const QGSuperblockV2 &sb, bool wal_mode = false) {
     const size_t n = static_cast<size_t>(sb.num_points);
     if (n > kPidMax || sb.node_len != node_len_ || sb.node_per_page != npp_ ||
         sb.page_size != page_size_ || sb.dimension != dim_) {
@@ -2055,6 +2190,14 @@ class QGUpdater {
     }
     live_count_.store(n - deleted_snapshot().size(), std::memory_order_release);
 
+    if (wal_mode) {
+      // Recovery base load (clause C): read-only, no free-chain rebuild/flush.
+      // PID reuse is disabled under enable_wal, so there is no free list; the
+      // authoritative state (including hidden/deleted) is rebuilt after redo.
+      free_list_head_.store(kPidMax, std::memory_order_release);
+      free_count_.store(0, std::memory_order_release);
+      return;
+    }
     bool chain_ok = sb.free_count == free_ids.size();
     std::vector<uint8_t> seen(n, 0);
     PID cur = sb.free_list_head;
@@ -2105,12 +2248,19 @@ class QGUpdater {
     if (slot >= 0) {
       superblock_ = sb;
       active_superblock_slot_ = slot;
-      load_v2_state(sb);
+      load_v2_state(sb, enable_wal_);
       repair_routing_roots(kPidMax);
       return;
     }
     if (qg_header_has_v2_magic(header.data())) {
       throw std::runtime_error("QGUpdater: both v2 superblocks have invalid checksums");
+    }
+    if (enable_wal_) {
+      // Migration mutates every page; a WAL lineage must start from a clean
+      // checkpoint (clause C). Migrate without the WAL and checkpoint first.
+      throw std::logic_error(
+          "QGUpdater: enable_wal requires an already-checkpointed v2 index; run the v1->v2 "
+          "migration without the WAL first");
     }
     migrate_v1(header.data());
   }
@@ -2287,6 +2437,61 @@ class QGUpdater {
   template <typename Fn>
   bool modify_node_page(PID id, Fn &&fn) {
     const size_t pi = page_index(id);
+    if (pi >= page_versions_.size()) {
+      throw std::runtime_error("QGUpdater: id exceeds max_points capacity");
+    }
+    // No-steal RMW (clause B): with the WAL live, the callback runs on a private
+    // scratch page, its full-page after-image is appended, and only then is the
+    // page installed (cache) / written (no cache). On WAL append failure the
+    // writer is poisoned and nothing is installed (fail closed).
+    if (enable_wal_ && !replaying_) {
+      ensure_writable();
+      AlignedBuf scratch(page_size_);
+      if (!params_.write_cache) {
+        read_at(page_offset(id), scratch.data(), page_size_);
+        stats_.patch_page_reads++;
+        if (!fn(scratch.data())) {
+          return false;
+        }
+        log_page_after_image(id, scratch.data());
+        stats_.logical_row_writes++;
+        write_node_page(id, scratch.data());  // force_wal() then pwrite
+        return true;
+      }
+      auto &shard = write_cache_.shard(pi);
+      PageWriteCache::CachedPage *cached = nullptr;
+      {
+        const std::lock_guard<std::mutex> cache_guard(shard.mutex);
+        auto [it, inserted] = shard.pages.try_emplace(pi);
+        if (inserted) {
+          it->second = std::make_unique<PageWriteCache::CachedPage>(page_size_);
+          read_at(kSectorLen + pi * page_size_, it->second->bytes.data(), page_size_);
+          stats_.patch_page_reads++;
+          write_cache_.note_insert();
+        }
+        cached = it->second.get();
+      }
+      {
+        const std::lock_guard<std::mutex> bytes_guard(cached->bytes_mutex);
+        std::memcpy(scratch.data(), cached->bytes.data(), page_size_);
+      }
+      if (!fn(scratch.data())) {
+        return false;
+      }
+      log_page_after_image(id, scratch.data());  // appended before the install
+      {
+        const std::lock_guard<std::mutex> bytes_guard(cached->bytes_mutex);
+        page_versions_[pi].fetch_add(1, std::memory_order_acq_rel);
+        std::memcpy(cached->bytes.data(), scratch.data(), page_size_);
+        page_versions_[pi].fetch_add(1, std::memory_order_release);
+      }
+      {
+        const std::lock_guard<std::mutex> cache_guard(shard.mutex);
+        cached->dirty = true;
+      }
+      stats_.logical_row_writes++;
+      return true;
+    }
     if (!params_.write_cache) {
       AlignedBuf page(page_size_);
       read_at(page_offset(id), page.data(), page_size_);
@@ -2316,9 +2521,6 @@ class QGUpdater {
     // and holding two shard locks would introduce cross-page lock cycles.
     // The seqlock covers the in-cache mutation: overlay readers (searches read
     // through the pool) validate the page version exactly like disk readers.
-    if (pi >= page_versions_.size()) {
-      throw std::runtime_error("QGUpdater: id exceeds max_points capacity");
-    }
     bool changed = false;
     {
       const std::lock_guard<std::mutex> bytes_guard(cached->bytes_mutex);
@@ -2408,6 +2610,9 @@ class QGUpdater {
     const size_t pi = page_index(id);
     if (pi >= page_versions_.size()) {
       throw std::runtime_error("QGUpdater: id exceeds max_points capacity");
+    }
+    if (enable_wal_ && !replaying_) {
+      force_wal();  // the page after-image must be durable before the index pwrite
     }
     page_versions_[pi].fetch_add(1, std::memory_order_acq_rel);  // -> odd
     write_at(page_offset(id), page, page_size_);
@@ -2787,6 +2992,9 @@ class QGUpdater {
 
   void flush_dirty(size_t num_threads) {
     if (!params_.write_cache) return;
+    if (enable_wal_ && !replaying_) {
+      force_wal();  // group-commit the WAL prefix before any index writeback
+    }
     struct DirtyPage {
       size_t index;
       char *data;
@@ -3849,6 +4057,277 @@ class QGUpdater {
     }
   }
 
+  // ===================== op-WAL: durable in-place updates (G1) ================
+  // Design: unified-wal-vocabulary.md + its amendment. no-steal page cache with
+  // force-before-writeback (clause B), a durable segment lineage uid in the
+  // superblock reserved area (clause F), a dedicated recovery open + full state
+  // rebuild (clause C), a flip-frame generation state machine (clause E), and a
+  // fail-closed writer that poisons on any WAL/critical-index error (clause I).
+
+  // segment_uid occupies the first 8 bytes of QGSuperblockV2::reserved.
+  static constexpr size_t kUidReservedOffset = 0;
+  [[nodiscard]] static uint64_t read_superblock_uid(const QGSuperblockV2 &sb) {
+    uint64_t uid = 0;
+    std::memcpy(&uid, sb.reserved.data() + kUidReservedOffset, sizeof(uid));
+    return uid;
+  }
+  static void write_superblock_uid(QGSuperblockV2 &sb, uint64_t uid) {
+    std::memcpy(sb.reserved.data() + kUidReservedOffset, &uid, sizeof(uid));
+  }
+
+  [[noreturn]] void poison(const std::string &reason) {
+    if (poison_reason_.empty()) {
+      poison_reason_ = reason;
+    }
+    throw std::runtime_error("QGUpdater op-WAL writer poisoned: " + poison_reason_);
+  }
+  void ensure_writable() const {
+    if (!poison_reason_.empty()) {
+      throw std::runtime_error("QGUpdater op-WAL writer is poisoned: " + poison_reason_);
+    }
+  }
+  void wal_failpoint(SegmentOpFailPoint fp) {
+    if (params_.failpoint_hook) {
+      params_.failpoint_hook(fp);
+    }
+  }
+  void notify_wal_fsync() {
+    if (io_observer_ != nullptr && !replaying_ && io_observer_->on_wal_fsync) {
+      io_observer_->on_wal_fsync();
+    }
+  }
+  void notify_index_fsync() {
+    if (io_observer_ != nullptr && !replaying_ && io_observer_->on_index_fsync) {
+      io_observer_->on_index_fsync();
+    }
+  }
+
+  [[nodiscard]] bool has_staged_edges() {
+    for (auto &stripe : staged_) {
+      const std::lock_guard<std::mutex> guard(stripe.mutex);
+      if (!stripe.by_target.empty()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Append one SEGMENT_OP frame; poison the writer on any WAL error.
+  void wal_append(const std::vector<std::byte> &payload, alaya::wal::WalFile::Sync sync) {
+    try {
+      op_wal_->append(kSegmentOpRecordType, 0, ++wal_op_id_, 0, payload, sync);
+    } catch (const std::exception &error) {
+      poison(std::string("WAL append failed: ") + error.what());
+    }
+    if (sync == alaya::wal::WalFile::Sync::fsync) {
+      notify_wal_fsync();
+    }
+  }
+
+  // Force the buffered WAL prefix durable (group commit / force-before-writeback).
+  void force_wal() {
+    if (!enable_wal_ || replaying_ || op_wal_ == nullptr) {
+      return;
+    }
+    ensure_writable();
+    try {
+      op_wal_->fsync();
+    } catch (const std::exception &error) {
+      poison(std::string("WAL force failed: ") + error.what());
+    }
+    notify_wal_fsync();
+  }
+
+  // Append a whole-page after-image (row_patch). `pid_in_page` is any PID on the
+  // page; the recorded pid is the page's first PID (informational — replay
+  // rewrites purely by absolute offset).
+  void log_page_after_image(PID pid_in_page, const char *page_bytes) {
+    const uint64_t offset = page_offset(pid_in_page);
+    const auto first_pid = static_cast<uint64_t>(page_index(pid_in_page) * npp_);
+    auto payload = encode_row_patch(
+        segment_uid_, superblock_.generation, first_pid, offset,
+        std::span<const std::byte>(reinterpret_cast<const std::byte *>(page_bytes), page_size_));
+    wal_append(payload, alaya::wal::WalFile::Sync::buffered);
+  }
+
+  // Establish lineage and open the WAL at ctor time; run recovery if non-empty.
+  void open_op_wal_and_recover() {
+    segment_uid_ = read_superblock_uid(superblock_);
+    const bool fresh_lineage = segment_uid_ == 0;
+    if (fresh_lineage) {
+      std::random_device rd;
+      segment_uid_ = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+      if (segment_uid_ == 0) {
+        segment_uid_ = 0x9E3779B97F4A7C15ULL;
+      }
+    }
+    op_wal_ = std::make_unique<alaya::wal::WalFile>(qg_.index_file_name_ + ".opwal");
+    const auto &scanned = op_wal_->recovery_scan();
+    if (fresh_lineage) {
+      if (!scanned.frames.empty()) {
+        poison("enable_wal on an unstamped superblock but the .opwal already has frames");
+      }
+      checkpoint();  // stamps the uid into a fresh durable base and resets the WAL
+      return;
+    }
+    if (!scanned.frames.empty()) {
+      replay_and_rebuild(scanned);
+    }
+  }
+
+  void replay_and_rebuild(const alaya::wal::ScanResult &scanned) {
+    replaying_ = true;
+    uint64_t committed_watermark = committed_.load(std::memory_order_acquire);
+    for (const auto &frame : scanned.frames) {
+      if (frame.type != kSegmentOpRecordType) {
+        replaying_ = false;
+        poison("op-WAL contains a non-SEGMENT_OP record type");
+      }
+      SegmentOp op;
+      try {
+        op = decode_segment_op(frame.payload);
+      } catch (const std::exception &error) {
+        replaying_ = false;
+        poison(std::string("op-WAL frame decode failed: ") + error.what());
+      }
+      if (op.segment_id != segment_uid_) {
+        replaying_ = false;
+        poison("op-WAL lineage mismatch (stale or foreign .opwal)");
+      }
+      switch (op.kind) {
+        case SegmentOpKind::row_patch:
+          replay_row_patch(op);
+          break;
+        case SegmentOpKind::tombstone:
+          if (op.pid < row_generations_.size()) {
+            mark_hidden(static_cast<PID>(op.pid));
+            mirror_deleted_insert(static_cast<PID>(op.pid));
+          }
+          break;
+        case SegmentOpKind::publish:
+          committed_watermark = std::max(committed_watermark, op.watermark);
+          break;
+        case SegmentOpKind::superblock_flip:
+          replay_flip(op);
+          break;
+        case SegmentOpKind::consolidate_begin:
+        case SegmentOpKind::consolidate_end:
+          replaying_ = false;
+          poison("op-WAL consolidate frames are out of the G1 scope");
+      }
+    }
+    committed_.store(committed_watermark, std::memory_order_release);
+    replaying_ = false;
+    rebuild_state_after_replay(committed_watermark);
+  }
+
+  void replay_row_patch(const SegmentOp &op) {
+    // Patch validation (clause F): metadata-sector exclusion, size, geometry.
+    if (op.offset < kSectorLen) {
+      poison("row_patch offset overlaps the A/B metadata sector");
+    }
+    if (op.bytes.size() != page_size_) {
+      poison("row_patch is not a whole-page after-image");
+    }
+    const uint64_t relative = op.offset - kSectorLen;
+    if (relative % page_size_ != 0) {
+      poison("row_patch offset is not page-aligned");
+    }
+    const size_t page = static_cast<size_t>(relative / page_size_);
+    if (page >= page_versions_.size()) {
+      poison("row_patch page exceeds the configured capacity");
+    }
+    if (op.pid != static_cast<uint64_t>(page) * npp_) {
+      poison("row_patch pid/offset geometry mismatch");
+    }
+    write_at(op.offset, reinterpret_cast<const char *>(op.bytes.data()), op.bytes.size());
+  }
+
+  void replay_flip(const SegmentOp &op) {
+    if (op.bytes.size() != kSegmentSuperblockImageBytes) {
+      poison("flip image is not 512 bytes");
+    }
+    QGSuperblockV2 image;
+    std::memcpy(&image, op.bytes.data(), sizeof(image));
+    if (!qg_superblock_valid(image)) {
+      poison("flip image checksum invalid");
+    }
+    if (read_superblock_uid(image) != segment_uid_) {
+      poison("flip image lineage mismatch");
+    }
+    const uint64_t disk_generation = superblock_.generation;
+    const uint64_t image_generation = image.generation;
+    if (image_generation < disk_generation) {
+      return;  // stale retained marker: it is an old base, replay only the tail
+    }
+    if (image_generation == disk_generation) {
+      // Same generation must be byte-identical (idempotent re-adopt of the base).
+      if (std::memcmp(&image, &superblock_, sizeof(image)) != 0) {
+        poison("flip same-generation image differs from the selected superblock");
+      }
+      return;
+    }
+    if (image_generation != disk_generation + 1) {
+      poison("flip generation transition is not the next legal step");
+    }
+    // Apply the next legal base: rewrite its slot and set the file length.
+    const auto next_slot = static_cast<int>(op.target_slot);
+    write_superblock(next_slot, image);
+    if (::ftruncate(fd_, static_cast<off_t>(image.file_size)) != 0) {
+      poison("flip replay ftruncate failed");
+    }
+    superblock_ = image;
+    active_superblock_slot_ = next_slot;
+    qg_.entry_point_ = static_cast<PID>(image.entry_point);
+    committed_.store(image.num_points, std::memory_order_release);
+  }
+
+  // The single authoritative post-replay pass (clause C): derive the whole
+  // runtime state tuple from the recovered on-disk trailers and set the physical
+  // length. Under enable_wal there is no PID reuse, so the free list is empty.
+  void rebuild_state_after_replay(uint64_t committed) {
+    allocated_points_.store(committed, std::memory_order_release);
+    next_append_id_.store(static_cast<PID>(committed), std::memory_order_release);
+    qg_.num_points_ = committed;
+    free_list_head_.store(kPidMax, std::memory_order_release);
+    free_count_.store(0, std::memory_order_release);
+    {
+      const std::lock_guard<std::mutex> guard(deleted_mutex_);
+      deleted_.clear();
+    }
+    reset_hidden();
+    uint64_t live = 0;
+    const size_t pages = committed == 0 ? 0 : (committed + npp_ - 1) / npp_;
+    AlignedBuf page(page_size_);
+    for (size_t pi = 0; pi < pages; ++pi) {
+      read_at(kSectorLen + pi * page_size_, page.data(), page_size_);
+      for (size_t slot = 0; slot < npp_; ++slot) {
+        const size_t raw = pi * npp_ + slot;
+        if (raw >= committed) {
+          break;
+        }
+        const auto id = static_cast<PID>(raw);
+        const QGRowTrailer trailer = qg_read_page_trailer(page.data(), page_size_, npp_, slot);
+        if ((trailer.flags & (kQGRowTombstone | kQGRowFree)) != 0) {
+          mark_hidden(id);
+          mirror_deleted_insert(id);
+        } else {
+          ++live;
+        }
+      }
+    }
+    live_count_.store(live, std::memory_order_release);
+    for (size_t id = 0; id < row_generations_.size(); ++id) {
+      row_generations_[id].store(id < committed ? 1 : 0, std::memory_order_relaxed);
+    }
+    const uint64_t file_size = kSectorLen + pages * page_size_;
+    if (::ftruncate(fd_, static_cast<off_t>(file_size)) != 0) {
+      poison("recovery ftruncate failed");
+    }
+    repair_routing_roots(kPidMax);
+    refresh_routing_snapshot();
+  }
+
   QuantizedGraph &qg_;
   UpdateParams params_;
   int fd_ = -1;             // buffered fd: all reads (page-cache served) + fallback writes
@@ -3888,6 +4367,15 @@ class QGUpdater {
   std::mutex routing_snapshot_mutex_;
   std::vector<std::unique_ptr<RoutingSnapshot>> routing_snapshots_;
   std::atomic<const RoutingSnapshot *> routing_snapshot_{nullptr};
+
+  // --- op-WAL (durable in-place updates, G1) ---
+  bool enable_wal_ = false;                     // mirrors params_.enable_wal; the WAL is live
+  std::unique_ptr<alaya::wal::WalFile> op_wal_;  // <index>.opwal, present iff enable_wal_
+  bool replaying_ = false;                       // set during recovery redo: suppress log + force
+  std::string poison_reason_;                    // non-empty => writer permanently poisoned
+  uint64_t segment_uid_ = 0;                     // durable lineage id (superblock reserved[0..8))
+  uint64_t wal_op_id_ = 0;                        // monotone frame op-id (informational/diagnostic)
+  SegmentIoObserver *io_observer_ = nullptr;      // persistence-model harness hook (test only)
 };
 
 }  // namespace alaya::laser

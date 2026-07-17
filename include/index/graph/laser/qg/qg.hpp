@@ -386,7 +386,12 @@ class QuantizedGraph {
 
   void set_result_filter(const std::unordered_set<PID> *filter) { result_filter_ = filter; }
 
-  void load_disk_index(const char *, float);
+  // recovery_mode skips the exact file_size superblock check: a crash between a
+  // checkpoint's ftruncate and its superblock write can leave the file longer
+  // than the selected superblock claims, and op-WAL replay reconciles the length
+  // afterward (unified-wal-vocabulary.md clause C/E). Ordinary readers keep the
+  // strict check.
+  void load_disk_index(const char *, float, bool recovery_mode = false);
 
   void set_params(size_t ef_search, size_t num_threads, int beam_width);
 
@@ -1251,7 +1256,9 @@ inline void QuantizedGraph::update_qg_out_of_memory(
   }
 }
 
-inline void QuantizedGraph::load_disk_index(const char *filename, float search_DRAM_budget) {
+inline void QuantizedGraph::load_disk_index(const char *filename,
+                                            float search_DRAM_budget,
+                                            bool recovery_mode) {
   index_file_name_ = gen_index_path(filename);
   if (!std::filesystem::exists(index_file_name_)) {
     throw std::runtime_error("QuantizedGraph::load_disk_index: file not found: " +
@@ -1273,7 +1280,7 @@ inline void QuantizedGraph::load_disk_index(const char *filename, float search_D
         sb.node_per_page != node_per_page_ || sb.page_size != page_size_) {
       throw std::runtime_error("QuantizedGraph::load_disk_index: v2 geometry mismatch");
     }
-    if (sb.file_size != std::filesystem::file_size(index_file_name_)) {
+    if (!recovery_mode && sb.file_size != std::filesystem::file_size(index_file_name_)) {
       throw std::runtime_error("QuantizedGraph::load_disk_index: v2 file-size mismatch");
     }
     num_points_ = static_cast<size_t>(sb.num_points);

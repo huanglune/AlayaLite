@@ -346,6 +346,17 @@ class WalFile {
     }
   }
 
+  // Force the currently-buffered prefix durable without appending a frame. Used
+  // as a group-commit / force-before-writeback barrier by callers that must make
+  // earlier buffered frames durable before releasing dependent state to disk.
+  void fsync() {
+    stream_.flush();
+    if (!stream_) {
+      throw std::runtime_error("WalFile: cannot flush " + path_.string());
+    }
+    platform::sync_file_or_throw(path_);
+  }
+
   // Atomically replace the file with exactly one durable frame. Mirrors the
   // collection checkpoint cut: a temp file is written, fsynced, atomically
   // renamed over the target, and the directory is fsynced, so every crash

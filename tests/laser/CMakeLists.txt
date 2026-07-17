@@ -151,6 +151,20 @@ alaya_add_test(
   LABELS laser wal persistence
 )
 
+# QGUpdater op-WAL functional durability (enable_wal): reopen/recovery round-trips.
+alaya_cc_target(
+  test_qg_updater_wal
+  BARE GTEST
+  SRCS qg/test_qg_updater_wal.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_qg_updater_wal
+  TARGET test_qg_updater_wal
+  LABELS laser wal persistence
+)
+
 # Residency seams behind UnifiedLaserSegment: prefetch budget default, ResidencyProvider dispatch, ensure_resident_arena
 # file materialization, and the QGUpdater write_at -> arena mirror.
 alaya_cc_target(
