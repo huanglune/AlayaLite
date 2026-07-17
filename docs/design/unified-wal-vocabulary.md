@@ -69,6 +69,41 @@ u64 segment_id     u64 segment_generation     u8 op kind     op body
 Gardening is not an op kind: a garden pass is a sequence of `row_patch`
 records (plus `publish`), nothing more.
 
+#### 3a. `consolidate` as a maintenance transaction (2C / W1)
+
+Under `enable_wal`, `consolidate()` is a single maintenance transaction bracketed
+by a durable `consolidate_begin(epoch)` … `consolidate_end(epoch)` pair (kinds 3/4).
+Its body is whole-page `row_patch` (kind 1) after-images produced in a **private
+overlay** that may spill to the *same* op-WAL when it exceeds the page-cache cap;
+nothing touches the index or the resident arena before the transaction commits.
+
+- **No-steal.** Between the durable `begin` and the durable `end` no index/arena
+  write may happen — the only durable maintenance store is the overlay → op-WAL.
+  A last-line guard in the index write path poisons on any violation.
+- **Commit point.** The `end` fsync is the single commit point. Only after it does
+  the transaction install every touched page's final image into the index (under a
+  per-page seqlock so a concurrent search never copies a half-installed page).
+- **Incomplete epoch ⇒ rollback (S_old).** No durable `end` ⇒ recovery discards the
+  epoch and semantically truncates the op-WAL back to the `begin` boundary; the index
+  is untouched, so the segment is exactly its pre-consolidate state.
+- **Complete epoch ⇒ roll-forward (S_new).** A durable `end` makes `begin` + every
+  after-image + `end` a durable prefix; recovery redoes all latest-per-page images
+  over an index that may hold any old / new / half / partial subset of the pages
+  (whole-page redo repairs it). The install index writes are themselves unforced.
+- **Free-list.** Reclaimed rows carry `FREE | TOMBSTONE` trailers inside the kind-1
+  after-images. Recovery re-derives the free set from the final trailers and rebuilds
+  the canonical (ascending-PID) free chain once, in the single post-replay convergence
+  point — byte-stable across repeated recovery, and identical whether or not a reopen
+  intervened.
+- **Epoch state machine.** A `consolidate_begin`/`consolidate_end` epoch and a
+  canonical label bundle form mutually-exclusive replay lanes; any other op kind
+  inside an open epoch poisons.
+
+`garden()` still throws under `enable_wal` (it is *not* a kind 3/4 epoch — see §5.1 of
+the 2C design). PID reuse is likewise gated: the `label_bind.pid_generation` field is
+reserved and is currently always written 0 (every WAL insert appends a fresh PID);
+bundle-only reuse over a v3 `pid_generation` base is designed but not yet enabled.
+
 ### 4. Idempotency invariant
 
 Every `SEGMENT_OP` must replay idempotently. Recovery = scan forward from
