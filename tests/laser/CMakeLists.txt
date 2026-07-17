@@ -137,6 +137,20 @@ alaya_add_test(
   LABELS laser
 )
 
+# SEGMENT_OP op-WAL payload codec (segment_op_wal.hpp): round-trip + validation.
+alaya_cc_target(
+  test_segment_op_wal
+  BARE GTEST
+  SRCS qg/test_segment_op_wal.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_segment_op_wal
+  TARGET test_segment_op_wal
+  LABELS laser wal persistence
+)
+
 # Residency seams behind UnifiedLaserSegment: prefetch budget default, ResidencyProvider dispatch, ensure_resident_arena
 # file materialization, and the QGUpdater write_at -> arena mirror.
 alaya_cc_target(
