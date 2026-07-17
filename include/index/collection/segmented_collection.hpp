@@ -1506,6 +1506,21 @@ class SegmentedCollection {
         }
         const auto is_memory_graph = descriptor.algorithm_id == core::algorithm::hnsw ||
                                      descriptor.algorithm_id == core::algorithm::qg;
+        // Declared at this scope (one per segment-loop iteration), not
+        // inside the `if` below: make_hnsw_search_extension() and
+        // make_qg_search_extension() store payload = std::addressof(their
+        // argument), and the resulting AlgorithmSearchExtension is read
+        // through segment_extensions well past that `if` block's closing
+        // brace (segment_request.options.extensions below, and again
+        // inside entry->segment.search()). A narrower scope for these two
+        // is a dangling-pointer bug -- caught here because an unrelated
+        // local added a few lines down (segment_filter_storage) perturbed
+        // the stack layout enough to turn latent UB into a real failure
+        // (HNSW rejecting its own synthesized effort extension as
+        // corrupt). Pre-existing, unrelated to the admission contract;
+        // fixed in passing since it now reproduces deterministically.
+        ::alaya::HnswSearchExtension hnsw_effort;
+        ::alaya::QgSearchExtension qg_effort;
         if (is_memory_graph) {
           if (candidate_limit > std::numeric_limits<std::uint32_t>::max()) {
             return core::Status::error(core::StatusCode::invalid_argument,
@@ -1528,8 +1543,6 @@ class SegmentedCollection {
             }
             segment_extensions.push_back(make(effective));
           };  // NOLINT(readability/braces)
-          ::alaya::HnswSearchExtension hnsw_effort;
-          ::alaya::QgSearchExtension qg_effort;
           if (descriptor.algorithm_id == core::algorithm::hnsw) {
             synthesize_effort(hnsw_effort, [](const auto &extension) {
               return ::alaya::make_hnsw_search_extension(extension);
@@ -1545,12 +1558,41 @@ class SegmentedCollection {
         segment_request.options = request.options;
         segment_request.options.top_k = candidate_limit;
         segment_request.options.extensions = segment_extensions;
+        // segment_filter_storage must outlive the segment.search() call
+        // below (segment_request.filter.payload points into it); declaring
+        // it in this scope, alongside segment_request, guarantees that.
+        std::vector<std::uint64_t> segment_filter_storage;
         if (execution == core::FilterExecution::traversal && request.filter.active()) {
-          segment_request.filter.kind = core::SegmentFilterKind::predicate;
+          // No segment type evaluates a LogicalFilter itself (all four
+          // reject any non-none/non-bitmap filter kind), so Collection
+          // precompiles admission here against its own logical registry,
+          // in this segment's row space, and sends kind=bitmap rather
+          // than kind=predicate. Segment admission contract section 3
+          // (docs/design/segment-admission-contract.md).
+          segment_filter_storage.assign((known_rows + 63) / 64, std::uint64_t{0});
+          for (const auto &[logical_id, version] : snapshot->versions) {
+            if (version.address.segment_id != entry->segment_id ||
+                version.address.generation != entry->generation ||
+                version.state != VersionState::live ||
+                version.upsert_sequence > snapshot->visibility_watermark) {
+              continue;
+            }
+            const auto row = static_cast<std::uint64_t>(version.address.row_id);
+            if (row >= known_rows) {
+              continue;  // defensive: outside this bitmap's capacity
+            }
+            if (request.filter.matches(logical_id,
+                                       version.payload.metadata,
+                                       version.payload.document)) {
+              segment_filter_storage[row >> 6U] |= (std::uint64_t{1} << (row & 63U));
+            }
+          }
+          segment_request.filter.kind = core::SegmentFilterKind::bitmap;
           segment_request.filter.exact = false;
           segment_request.filter.metadata_epoch = snapshot->metadata_epoch;
-          segment_request.filter.payload = std::addressof(request.filter);
-          segment_request.filter.payload_size = sizeof(LogicalFilter);
+          segment_request.filter.payload = segment_filter_storage.data();
+          segment_request.filter.payload_size =
+              segment_filter_storage.size() * sizeof(std::uint64_t);
           segment_request.filter.selectivity_hint =
               request.filter.selectivity_estimate().value_or(1.0);
         }
@@ -1588,6 +1630,37 @@ class SegmentedCollection {
         } else {
           std::unique_lock operation_lock(entry->operation_mutex);
           segment_status = entry->segment.search(std::move(segment_request));
+        }
+        if (!segment_status.ok() && execution == core::FilterExecution::traversal &&
+            request.filter.active() && segment_status.code() == core::StatusCode::not_supported &&
+            request.options.filter_policy == core::FilterPolicy::automatic) {
+          // This segment cannot execute the bitmap filter it was just
+          // handed (qg/hnsw/disk_flat all still reject any non-none
+          // filter kind). Re-planning the whole query would cost a
+          // second selectivity pass; instead retry just this segment
+          // unfiltered -- the per-hit re-verify a few lines down (already
+          // unconditional whenever execution == traversal &&
+          // request.filter.active(), independent of whether *this*
+          // segment's own request carried a filter) weeds out
+          // non-matching rows, and the existing overfetch/incomplete
+          // machinery covers any resulting shortfall. strict policy is
+          // deliberately excluded: it keeps today's fail-fast semantics
+          // (a strong-consistency request must not silently degrade).
+          core::SearchRequest retry_request;
+          retry_request.queries = request.queries;
+          retry_request.options = request.options;
+          retry_request.options.top_k = candidate_limit;
+          retry_request.options.extensions = segment_extensions;
+          retry_request.context = request.context;
+          retry_request.response = &storage.response;
+          retry_request.lifetime_pin = std::const_pointer_cast<RoutingSnapshot>(snapshot);
+          if (capabilities.concurrency.reentrant_search) {
+            std::shared_lock operation_lock(entry->operation_mutex);
+            segment_status = entry->segment.search(std::move(retry_request));
+          } else {
+            std::unique_lock operation_lock(entry->operation_mutex);
+            segment_status = entry->segment.search(std::move(retry_request));
+          }
         }
         if (!segment_status.ok()) {
           if (request.options.filter_policy != core::FilterPolicy::allow_partial) {

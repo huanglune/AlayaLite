@@ -10,6 +10,8 @@
 #include <string_view>
 #include <vector>
 
+#include "core/value_types.hpp"
+
 namespace alaya::disk {
 
 enum class DiskIndexType {
@@ -22,6 +24,12 @@ struct DiskSearchOptions {
   uint32_t ef = 100;
   uint32_t beam_width = 4;
   bool exact_rerank = true;
+  // Segment admission contract (docs/design/segment-admission-contract.md):
+  // a value-copied view, not an owner. `filter.payload` (when kind !=
+  // none) must stay valid for the duration of the search/batch_search
+  // call this DiskSearchOptions is passed to -- it does not outlive one
+  // call. Default kind=none keeps every existing caller byte-identical.
+  core::SegmentFilterView filter{};
 };
 
 // Distance contract by metric (smaller-is-better in all three):

@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -28,6 +29,7 @@
 #include "index/disk/laser_segment_searcher.hpp"
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/segment_manifest.hpp"
+#include "index/graph/laser/qg/row_admission.hpp"
 
 #if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER != 0
   #define ALAYA_DISK_LASER_SEGMENT_SUPPORTED 1
@@ -537,9 +539,62 @@ class LaserSegment {
     return core::Status::success();
   }
 
-  [[nodiscard]] auto resolve_search_options(const core::SearchOptions &options) const
+  // `filter` is the request's compiled view (already validated to be
+  // kind=none or kind=bitmap by validate_search_request()). `pid_storage`
+  // is caller-owned scratch that must outlive the DiskSearchOptions this
+  // returns -- one request's worth of searcher_->search() calls.
+  [[nodiscard]] auto resolve_search_options(const core::SearchOptions &options,
+                                            const core::SegmentFilterView &filter,
+                                            std::vector<std::uint64_t> &pid_storage) const
       -> core::Result<DiskSearchOptions> {
     DiskSearchOptions resolved;
+    if (filter.kind == core::SegmentFilterKind::bitmap) {
+      if (filter.payload == nullptr) {
+        return core::Status::error(core::StatusCode::invalid_argument,
+                                   core::OperationStage::validation,
+                                   core::StatusDetail::malformed_struct,
+                                   "LaserSegment bitmap filter payload is null");
+      }
+      if (reinterpret_cast<std::uintptr_t>(filter.payload) % alignof(std::uint64_t) != 0) {
+        return core::Status::error(core::StatusCode::invalid_argument,
+                                   core::OperationStage::validation,
+                                   core::StatusDetail::malformed_struct,
+                                   "LaserSegment bitmap filter payload is not word-aligned");
+      }
+#if ALAYA_DISK_LASER_SEGMENT_SUPPORTED
+      // PID/row space note: Collection's SegmentRowId for a LASER segment
+      // is the external label, not the internal PID -- see the
+      // SegmentRowId(label) hit construction in execute_search() below.
+      // PIDs are a private LASER implementation detail (never exposed past
+      // this file), so a bitmap arriving from Collection is indexed by
+      // label. This re-derives a dense PID-indexed bitmap from it via this
+      // segment's own PID->label map (searcher_->labels()), at O(size())
+      // -- paid once per request setup, never per candidate.
+      const std::uint64_t row_capacity_bits = filter.payload_size * 8;
+      const auto *label_bits = static_cast<const std::uint64_t *>(filter.payload);
+      const std::uint64_t *labels = searcher_->labels();
+      pid_storage.assign(laser::admission_words_for_capacity(searcher_->size()), std::uint64_t{0});
+      for (std::uint64_t pid = 0; pid < searcher_->size(); ++pid) {
+        const std::uint64_t label = labels[pid];
+        if (label >= row_capacity_bits) {
+          continue;
+        }
+        if (((label_bits[label >> 6U] >> (label & 63U)) & 1ULL) != 0ULL) {
+          pid_storage[pid >> 6U] |= (std::uint64_t{1} << (pid & 63U));
+        }
+      }
+      resolved.filter.kind = core::SegmentFilterKind::bitmap;
+      resolved.filter.payload = pid_storage.data();
+      resolved.filter.payload_size = pid_storage.size() * sizeof(std::uint64_t);
+#else
+      // Unreachable: LaserSegment::open() refuses to construct a segment
+      // (and therefore searcher_) without LASER support, so this method
+      // never actually runs in that configuration. Kept branch-compatible
+      // only so the translation above can call the LASER-only
+      // searcher_->labels() without an extra searcher_ specialization.
+      (void)pid_storage;
+#endif
+    }
     const auto default_ef = native_.x_extras.find("x_default_ef");
     const auto default_beam = native_.x_extras.find("x_default_beam_width");
     if (default_ef != native_.x_extras.end()) {
@@ -620,9 +675,10 @@ class LaserSegment {
     if (!status.ok()) {
       return status;
     }
-    if (request.filter.kind != core::SegmentFilterKind::none) {
+    if (request.filter.kind != core::SegmentFilterKind::none &&
+        request.filter.kind != core::SegmentFilterKind::bitmap) {
       return unavailable(core::OperationStage::validation,
-                         "LaserSegment has no engine-local metadata filter");
+                         "LaserSegment only accepts a compiled bitmap filter view");
     }
     if (request.options.top_k > std::numeric_limits<std::uint32_t>::max()) {
       return core::Status::error(core::StatusCode::invalid_argument,
@@ -630,7 +686,8 @@ class LaserSegment {
                                  core::StatusDetail::arithmetic_overflow,
                                  "LaserSegment top_k exceeds uint32");
     }
-    auto resolved = resolve_search_options(request.options);
+    std::vector<std::uint64_t> validation_pid_storage;
+    auto resolved = resolve_search_options(request.options, request.filter, validation_pid_storage);
     if (!resolved.ok()) {
       return resolved.status();
     }
@@ -680,10 +737,14 @@ class LaserSegment {
     if (!status.ok()) {
       return status;
     }
+    const bool admission_active = request.filter.kind != core::SegmentFilterKind::none;
+    const auto hit_flags = admission_active
+                               ? (core::ResultFlag::approximate | core::ResultFlag::filtered)
+                               : core::ResultFlag::approximate;
     auto &response = *request.response;
     response.score_kind = core::ScoreKind::rank_only;
     response.comparable_metric = core::Metric::l2;
-    response.result_flags = core::ResultFlag::approximate;
+    response.result_flags = hit_flags;
     if (request.options.top_k == 0 || request.queries.rows == 0) {
       core::initialize_empty_response(response,
                                       request.queries.rows,
@@ -692,7 +753,8 @@ class LaserSegment {
                                           : core::SearchCompleteness::eligible_exhausted);
       return core::Status::success();
     }
-    auto resolved = resolve_search_options(request.options);
+    std::vector<std::uint64_t> pid_admission_storage;
+    auto resolved = resolve_search_options(request.options, request.filter, pid_admission_storage);
     if (!resolved.ok()) {
       return resolved.status();
     }
@@ -718,14 +780,14 @@ class LaserSegment {
         return request.queries.rows == 1 ? control : core::Status::success();
       }
       try {
-        const auto hits = searcher_->search(request.queries.row<float>(row), options);
+        const auto hits = admission_aware_search(request.queries.row<float>(row), options);
         for (std::size_t index = 0; index < hits.size(); ++index) {
           response.hits[static_cast<std::size_t>(cursor + index)] =
               core::SearchHit(core::SegmentRowId(hits[index].label),
                               hits[index].distance,
                               core::ScoreKind::rank_only,
                               core::Metric::l2,
-                              core::ResultFlag::approximate);
+                              hit_flags);
         }
         if (direct_results != nullptr) {
           (*direct_results)[static_cast<std::size_t>(row)] = hits;
@@ -762,6 +824,82 @@ class LaserSegment {
       request.context->stats->io_bytes += artifact_bytes_ * request.queries.rows;
     }
     return core::Status::success();
+  }
+
+  // Unified-segment seam analog (see UnifiedLaserSegmentSearcher, decision
+  // 5 of the U2-b manifest): LaserSegmentSearcher::search() itself is never
+  // modified and never reads DiskSearchOptions.filter, so a non-none filter
+  // bypasses it and drives the kernel through searcher_->graph() directly
+  // -- the same lock + set_params-if-different discipline
+  // LaserSegmentSearcher::search() uses internally, reimplemented here
+  // since that discipline lives behind a private member this class cannot
+  // reach. kind=none keeps calling searcher_->search() untouched (byte-
+  // identical to before this contract landed).
+  //
+  // Concurrency note: this uses a mutex private to LaserSegment, disjoint
+  // from LaserSegmentSearcher's own search_mutex_ that the kind=none path
+  // still goes through. A single LaserSegment instance receiving a genuine
+  // concurrent mix of kind=none and an active-filter request, with
+  // different ef/beam_width between them, has a narrow race window around
+  // QuantizedGraph::set_params() -- the same shape of hazard
+  // UnifiedLaserSegmentSearcher's kPagedPool/kResidentArena split already
+  // carries (each mode's branch also serializes through its own mutex).
+  // Workloads that hold ef/beam_width constant per collection (the common
+  // case) call set_params() at most once and never hit it.
+  [[nodiscard]] auto admission_aware_search(const float *query,
+                                            const DiskSearchOptions &options) const
+      -> std::vector<DiskSearchHit> {
+    if (options.filter.kind == core::SegmentFilterKind::none) {
+      return searcher_->search(query, options);
+    }
+#if ALAYA_DISK_LASER_SEGMENT_SUPPORTED
+    const std::lock_guard<std::mutex> lock(admission_search_mutex_);
+    auto &graph = searcher_->graph();
+    const auto effective_top_k = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(static_cast<std::uint64_t>(options.top_k), searcher_->size()));
+    const AdmissionLastSetParams requested{
+        static_cast<std::size_t>(std::max(options.ef, effective_top_k)),
+        1,
+        static_cast<int>(options.beam_width),
+    };
+    if (requested != admission_last_set_params_) {
+      graph.set_params(requested.ef_search, requested.num_threads, requested.beam_width);
+      admission_last_set_params_ = requested;
+    }
+
+    laser::RowAdmission admission_value{};
+    const laser::RowAdmission *admission = nullptr;
+    if (options.filter.kind == core::SegmentFilterKind::bitmap) {
+      // Already PID-indexed: resolve_search_options() performed the
+      // label->PID translation before storing this filter.
+      admission_value = laser::admission_from_bitmap_payload(options.filter.payload,
+                                                             options.filter.payload_size,
+                                                             searcher_->size());
+      admission = &admission_value;
+    }
+
+    std::vector<std::uint32_t> pid_buf(effective_top_k);
+    graph.search(query, effective_top_k, pid_buf.data(), admission);
+
+    const std::uint64_t *labels = searcher_->labels();
+    std::vector<DiskSearchHit> out;
+    out.reserve(effective_top_k);
+    for (std::uint32_t pid : pid_buf) {
+      if (pid >= searcher_->size()) {
+        throw std::runtime_error("LaserSegment: QuantizedGraph returned PID " +
+                                 std::to_string(pid) + " outside segment count " +
+                                 std::to_string(searcher_->size()));
+      }
+      out.push_back(DiskSearchHit{labels[pid], std::numeric_limits<float>::quiet_NaN()});
+    }
+    return out;
+#else
+    // Unreachable: LaserSegment::open() refuses to construct a segment (and
+    // therefore searcher_) without LASER support, so this branch never
+    // actually runs in that configuration. searcher_->graph()/labels() are
+    // LASER-only members the stub SegmentSearcher does not declare.
+    return searcher_->search(query, options);
+#endif
   }
 
   [[nodiscard]] static auto make_segment_entry(const LaserSegmentReferenceOptions &options)
@@ -835,10 +973,21 @@ class LaserSegment {
     return manifest;
   }
 
+  struct AdmissionLastSetParams {
+    std::size_t ef_search{};
+    std::size_t num_threads{};
+    int beam_width{};
+
+    friend auto operator==(const AdmissionLastSetParams &, const AdmissionLastSetParams &)
+        -> bool = default;
+  };
+
   std::shared_ptr<LaserSegmentSearcher> searcher_{};
   SegmentManifest native_{};
   std::filesystem::path directory_{};
   std::uint64_t artifact_bytes_{};
+  mutable std::mutex admission_search_mutex_{};
+  mutable AdmissionLastSetParams admission_last_set_params_{};
 };
 
 class LaserSegmentFactory {

@@ -20,6 +20,7 @@
 
 #if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER != 0
   #include "index/graph/laser/qg/residency.hpp"
+  #include "index/graph/laser/qg/row_admission.hpp"
 #endif
 
 namespace alaya::disk {
@@ -52,8 +53,14 @@ class UnifiedLaserSegmentSearcher : public SegmentSearcher {
 
   auto search(const float *query, const DiskSearchOptions &opts) const
       -> std::vector<DiskSearchHit> override {
-    if (provider_->mode() == laser::ResidencyMode::kPagedPool) {
-      // Legacy path owns its own lock and set_params cache.
+    if (provider_->mode() == laser::ResidencyMode::kPagedPool &&
+        opts.filter.kind == core::SegmentFilterKind::none) {
+      // Legacy path owns its own lock and set_params cache. Only the
+      // kind=none path still reaches it -- byte-identical to before the
+      // admission contract landed. A non-none filter falls through to the
+      // shared path below, which drives the kernel through legacy_.graph()
+      // (the unified seam) instead of legacy_.search() itself: the legacy
+      // searcher's own search() semantics are not touched.
       return legacy_.search(query, opts);
     }
     if (opts.top_k == 0) {
@@ -84,8 +91,17 @@ class UnifiedLaserSegmentSearcher : public SegmentSearcher {
       last_set_params_ = requested;
     }
 
+    std::vector<uint64_t> admission_storage;
+    laser::RowAdmission admission_value{};
+    const laser::RowAdmission *admission =
+        compile_admission(opts.filter, size(), admission_storage, admission_value);
+
+    // provider_->search() is a pure pass-through to the matching kernel
+    // entry (paged: QuantizedGraph::search, arena: arena_search_qg) --
+    // using it here regardless of residency mode keeps this one call site
+    // in sync with whichever kernel the provider was constructed for.
     std::vector<uint32_t> pid_buf(effective_top_k);
-    provider_->search(graph, query, effective_top_k, pid_buf.data());
+    provider_->search(graph, query, effective_top_k, pid_buf.data(), admission);
 
     const uint64_t *labels = legacy_.labels();
     std::vector<DiskSearchHit> out;
@@ -137,8 +153,14 @@ class UnifiedLaserSegmentSearcher : public SegmentSearcher {
       last_set_params_ = requested;
     }
 
+    std::vector<uint64_t> admission_storage;
+    laser::RowAdmission admission_value{};
+    const laser::RowAdmission *admission =
+        compile_admission(opts.filter, size(), admission_storage, admission_value);
+
     std::vector<uint32_t> pid_buf(static_cast<size_t>(num_queries) * effective_top_k);
-    provider_->batch_search(graph, queries, effective_top_k, pid_buf.data(), num_queries);
+    provider_
+        ->batch_search(graph, queries, effective_top_k, pid_buf.data(), num_queries, admission);
 
     const uint64_t *labels = legacy_.labels();
     std::vector<std::vector<DiskSearchHit>> out;
@@ -182,6 +204,63 @@ class UnifiedLaserSegmentSearcher : public SegmentSearcher {
 
     friend auto operator==(const LastSetParams &, const LastSetParams &) -> bool = default;
   };
+
+  // Compile a core::SegmentFilterView into the RowAdmission the kernel
+  // wants. `capacity` is this segment's PID space (size()). `storage` and
+  // `value` are caller-owned scratch that must outlive the returned
+  // pointer -- exactly one query's worth of kernel calls.
+  //
+  // kind=none -> nullptr (today's behavior, zero cost).
+  // kind=bitmap -> zero-copy wrap of the caller's payload (validated:
+  //   word-aligned, and payload_size*8 >= capacity).
+  // kind=sorted_rows -> materialized into `storage`.
+  // kind=predicate/composite -> not representable at this layer; the
+  //   Collection is responsible for pre-compiling those into a bitmap
+  //   against its logical registry before it reaches a disk segment.
+  [[nodiscard]] static auto compile_admission(const core::SegmentFilterView &filter,
+                                              uint64_t capacity,
+                                              std::vector<uint64_t> &storage,
+                                              laser::RowAdmission &value)
+      -> const laser::RowAdmission * {
+    switch (filter.kind) {
+      case core::SegmentFilterKind::none:
+        return nullptr;
+      case core::SegmentFilterKind::bitmap: {
+        if (filter.payload == nullptr) {
+          throw std::invalid_argument("UnifiedLaserSegmentSearcher: bitmap filter payload is null");
+        }
+        if (reinterpret_cast<uintptr_t>(filter.payload) % alignof(uint64_t) != 0) {
+          throw std::invalid_argument(
+              "UnifiedLaserSegmentSearcher: bitmap filter payload is not word-aligned");
+        }
+        if (filter.payload_size % sizeof(uint64_t) != 0 || filter.payload_size * 8 < capacity) {
+          throw std::invalid_argument(
+              "UnifiedLaserSegmentSearcher: bitmap filter payload is too small for this segment");
+        }
+        value = laser::admission_from_bitmap_payload(filter.payload, filter.payload_size, capacity);
+        return &value;
+      }
+      case core::SegmentFilterKind::sorted_rows: {
+        if (filter.payload == nullptr && filter.payload_size != 0) {
+          throw std::invalid_argument(
+              "UnifiedLaserSegmentSearcher: sorted_rows filter payload is null");
+        }
+        if (filter.payload_size % sizeof(uint64_t) != 0) {
+          throw std::invalid_argument(
+              "UnifiedLaserSegmentSearcher: sorted_rows filter payload size is not a multiple of "
+              "8");
+        }
+        const auto *rows = static_cast<const uint64_t *>(filter.payload);
+        const uint64_t n = filter.payload_size / sizeof(uint64_t);
+        value = laser::admission_from_sorted_rows(rows, n, capacity, storage);
+        return &value;
+      }
+      case core::SegmentFilterKind::predicate:
+      case core::SegmentFilterKind::composite:
+      default:
+        throw std::runtime_error("Collection must pre-compile predicate views");
+    }
+  }
 
   mutable LaserSegmentSearcher legacy_;
   std::unique_ptr<laser::ResidencyProvider> provider_;
