@@ -2083,10 +2083,18 @@ class QGUpdater {
     size_t capacity_ = 0;
   };
 
-  /** Shared file view used by PID scanning and cache-miss consolidation RMWs. */
+  /** Read-only shared file view used by the Bloom PID scan (design section 4.1:
+   * the MAP_SHARED writable path is removed -- the kernel could write back an
+   * uncommitted page ahead of the maintenance commit, and it forked paged vs
+   * resident-arena state. All Bloom RMWs now go through modify_node_page /
+   * write_at like every other write). */
   struct SharedFileMapping {
     SharedFileMapping(int fd, uint64_t offset, size_t len) : len_(len) {
-      p_ = ::mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, static_cast<off_t>(offset));
+      // MAP_SHARED + PROT_READ (not PROT_WRITE): a read-only shared mapping still
+      // reflects the file page cache (so it observes our write_at pwrites), but we
+      // never dirty it, so the kernel can never write an uncommitted page back
+      // through it ahead of the maintenance commit (design section 4).
+      p_ = ::mmap(nullptr, len, PROT_READ, MAP_SHARED, fd, static_cast<off_t>(offset));
       if (p_ == MAP_FAILED) {
         p_ = nullptr;
         throw std::runtime_error("QGUpdater: mmap failed errno=" + std::to_string(errno));
@@ -2098,7 +2106,6 @@ class QGUpdater {
       if (p_ != nullptr) ::munmap(p_, len_);
     }
     [[nodiscard]] const char *data() const { return static_cast<const char *>(p_); }
-    [[nodiscard]] char *mutable_data() const { return static_cast<char *>(p_); }
 
    private:
     void *p_ = nullptr;
@@ -2467,12 +2474,24 @@ class QGUpdater {
     std::array<char, kSectorLen> header{};
     read_at(0, header.data(), header.size());
     QGSuperblockV2 sb;
-    const int slot = select_qg_superblock(header.data(), sb);
+    const int slot =
+        select_qg_superblock_checked(header.data(), sb, kQgSupportedRequiredFeatures);
+    if (slot == -2) {
+      // Fail closed (codex B-2C-06): the highest-generation valid superblock is a
+      // newer format this build cannot support; never downgrade to an older slot.
+      throw std::runtime_error(
+          "QGUpdater: superblock is a newer format this build does not support (fail closed)");
+    }
     if (slot >= 0) {
       superblock_ = sb;
       active_superblock_slot_ = slot;
       load_v2_state(sb, enable_wal_);
-      repair_routing_roots(kPidMax);
+      // WAL mode defers ALL derived-state repair (routing/free/hidden) to the single
+      // convergence point rebuild_state_after_replay, run under the replaying_ guard
+      // after redo (design section 2.1). Non-WAL keeps the eager repair.
+      if (!enable_wal_) {
+        repair_routing_roots(kPidMax);
+      }
       return;
     }
     if (qg_header_has_v2_magic(header.data())) {
@@ -2763,35 +2782,15 @@ class QGUpdater {
   }
 
   /**
-   * Bloom path RMW: preserve any resident overlay page, but mutate a cache
-   * miss through the shared file mapping instead of admitting it to the write
-   * pool. The caller holds page_lock(id), exactly as for modify_node_page().
+   * Bloom path RMW (design section 4.1): the writable MAP_SHARED direct-write is
+   * removed -- every Bloom candidate RMW now goes through the ordinary
+   * modify_node_page / write_at path (admitting the page to the write pool),
+   * which keeps paged and resident-arena state identical, respects the no-steal
+   * WAL ordering, and honors the page seqlock. The caller holds page_lock(id).
    */
   template <typename Fn>
   bool modify_bloom_node_page(PID id, Fn &&fn) {
-    if (!params_.write_cache || direct_io_ || pid_scan_mapping_ == nullptr) {
-      return modify_node_page(id, std::forward<Fn>(fn));
-    }
-    const size_t pi = page_index(id);
-    if (pi >= page_versions_.size()) {
-      throw std::runtime_error("QGUpdater: id exceeds max_points capacity");
-    }
-    bool cached = false;
-    {
-      auto &shard = write_cache_.shard(pi);
-      const std::lock_guard<std::mutex> cache_guard(shard.mutex);
-      cached = shard.pages.find(pi) != shard.pages.end();
-    }
-    if (cached) return modify_node_page(id, std::forward<Fn>(fn));
-
-    char *page = pid_scan_mapping_->mutable_data() + pi * page_size_;
-    page_versions_[pi].fetch_add(1, std::memory_order_acq_rel);
-    const bool changed = fn(page);
-    page_versions_[pi].fetch_add(1, std::memory_order_release);
-    if (changed) {
-      stats_.logical_row_writes++;
-    }
-    return changed;
+    return modify_node_page(id, std::forward<Fn>(fn));
   }
 
   [[nodiscard]] const float *cached_raw(PID id) {
@@ -3271,49 +3270,12 @@ class QGUpdater {
   }
 
   /**
-   * Merge resident dirty overlays into the MAP_SHARED file pages without one
-   * pwrite syscall per page. Used only by the buffered Bloom path; fsync at
-   * checkpoint remains the durability barrier.
+   * Design section 4.1: the MAP_SHARED merge path is retired. Dirty overlays are
+   * now flushed to the index via the ordinary write_at path (which mirrors the
+   * resident arena), so there is no second, forking writeback route. Kept as a
+   * thin alias so the existing Bloom call sites need no rewire.
    */
-  void merge_dirty_into_mapping(size_t num_threads) {
-    if (!params_.write_cache || direct_io_ || pid_scan_mapping_ == nullptr) {
-      flush_dirty(num_threads);
-      return;
-    }
-    struct DirtyPage {
-      size_t index;
-      char *data;
-    };
-    std::vector<DirtyPage> dirty;
-    for (size_t si = 0; si < PageWriteCache::kShards; ++si) {
-      auto &shard = write_cache_.shard(si);
-      const std::lock_guard<std::mutex> guard(shard.mutex);
-      for (auto &[pi, page] : shard.pages) {
-        if (page->dirty) dirty.push_back({pi, page->bytes.data()});
-      }
-    }
-    stats_.flush_unique_pages.fetch_add(dirty.size(), std::memory_order_relaxed);
-#if defined(__SANITIZE_THREAD__)
-    (void)num_threads;
-    const int nt = 1;
-#else
-    const int nt = static_cast<int>(std::max<size_t>(1, num_threads));
-#endif
-#pragma omp parallel for num_threads(nt) schedule(static)
-    for (int64_t i = 0; i < static_cast<int64_t>(dirty.size()); ++i) {
-      const auto &page = dirty[static_cast<size_t>(i)];
-      page_versions_[page.index].fetch_add(1, std::memory_order_acq_rel);
-      std::memcpy(pid_scan_mapping_->mutable_data() + page.index * page_size_,
-                  page.data,
-                  page_size_);
-      page_versions_[page.index].fetch_add(1, std::memory_order_release);
-    }
-    for (size_t si = 0; si < PageWriteCache::kShards; ++si) {
-      auto &shard = write_cache_.shard(si);
-      const std::lock_guard<std::mutex> guard(shard.mutex);
-      for (auto &[pi, page] : shard.pages) page->dirty = false;
-    }
-  }
+  void merge_dirty_into_mapping(size_t num_threads) { flush_dirty(num_threads); }
 
   /** Record a maintenance-batch peak and report whether high was reached. */
   bool note_maintenance_pool_and_test_high() {
@@ -4655,9 +4617,10 @@ class QGUpdater {
       return;
     }
     adopt_label_state(superblock_);  // load persisted bindings + tx watermarks from the base
-    if (!scanned.frames.empty()) {
-      replay_and_rebuild(scanned);  // promotes staged bundles into label_working_ (W3)
-    }
+    // Always converge through the full recovery pass (design section 2.1): even an
+    // empty op-WAL must reach rebuild_state_after_replay so routing/free/hidden are
+    // derived once from the on-disk trailers under the replaying_ guard.
+    replay_and_rebuild(scanned);  // promotes staged bundles into label_working_ (W3)
     publish_label_snapshot();  // seal the recovered label state (tail convergence)
     precreate_label_slots();
   }
@@ -4689,6 +4652,11 @@ class QGUpdater {
           if (op.pid < row_generations_.size()) {
             mark_hidden(static_cast<PID>(op.pid));
             mirror_deleted_insert(static_cast<PID>(op.pid));
+            // Idempotently persist the trailer tombstone bit straight to disk so a
+            // torn/lost following row_patch cannot drop the tombstone at the final
+            // authoritative trailer scan (design section 3.7). rebuild_state_after_replay
+            // ftruncates back to the committed page count, so a stray pid is harmless.
+            replay_persist_tombstone_trailer(static_cast<PID>(op.pid));
           }
           break;
         case SegmentOpKind::publish:
@@ -4710,8 +4678,11 @@ class QGUpdater {
       }
     }
     committed_.store(committed_watermark, std::memory_order_release);
-    replaying_ = false;
+    // replaying_ stays true through the entire rebuild so no derived-state repair
+    // (routing/free/indegree) re-enters the WAL write path (design section 2.1 /
+    // execution note 3). Cleared only after the single convergence point returns.
     rebuild_state_after_replay(committed_watermark);
+    replaying_ = false;
   }
 
   void replay_row_patch(const SegmentOp &op) {
@@ -4734,6 +4705,26 @@ class QGUpdater {
       poison("row_patch pid/offset geometry mismatch");
     }
     write_at(op.offset, reinterpret_cast<const char *>(op.bytes.data()), op.bytes.size());
+  }
+
+  // Idempotently set the on-disk trailer tombstone bit for one row during replay
+  // (design section 3.7). A direct disk RMW: the authoritative trailer scan in
+  // rebuild_state_after_replay reads from disk, and replay_row_patch also writes
+  // straight through, so this stays consistent with any later whole-page after-image.
+  void replay_persist_tombstone_trailer(PID id) {
+    const size_t pi = page_index(id);
+    if (pi >= page_versions_.size()) {
+      return;
+    }
+    AlignedBuf page(page_size_);
+    read_at(page_offset(id), page.data(), page_size_);
+    QGRowTrailer trailer = qg_read_page_trailer(page.data(), page_size_, npp_, id % npp_);
+    if ((trailer.flags & kQGRowTombstone) != 0) {
+      return;  // already tombstoned on disk: idempotent
+    }
+    trailer.flags |= kQGRowTombstone;
+    qg_write_page_trailer(page.data(), page_size_, npp_, id % npp_, trailer);
+    write_at(page_offset(id), page.data(), page_size_);
   }
 
   // Stage a label_bind by tx_id (B-04): pid_generation must be 0 and the frame
@@ -4915,6 +4906,11 @@ class QGUpdater {
     reset_hidden();
     uint64_t live = 0;
     const size_t pages = committed == 0 ? 0 : (committed + npp_ - 1) / npp_;
+    // FREE reference integrity (design section 2.3). Collect the final free set so
+    // the post-scan pass can reject a "pseudo-complete" recovery that would hand a
+    // still-referenced row to the reuser. Under W0 no row is ever FREE (reuse is
+    // gated), so free_pid stays empty and the adjacency pass is skipped.
+    std::vector<uint8_t> free_pid(committed == 0 ? 0 : static_cast<size_t>(committed), 0);
     AlignedBuf page(page_size_);
     for (size_t pi = 0; pi < pages; ++pi) {
       read_at(kSectorLen + pi * page_size_, page.data(), page_size_);
@@ -4925,11 +4921,50 @@ class QGUpdater {
         }
         const auto id = static_cast<PID>(raw);
         const QGRowTrailer trailer = qg_read_page_trailer(page.data(), page_size_, npp_, slot);
+        if ((trailer.flags & kQGRowFree) != 0 && (trailer.flags & kQGRowTombstone) == 0) {
+          poison("recovery: a FREE row is missing the TOMBSTONE flag");
+        }
         if ((trailer.flags & (kQGRowTombstone | kQGRowFree)) != 0) {
           mark_hidden(id);
           mirror_deleted_insert(id);
+          if ((trailer.flags & kQGRowFree) != 0) {
+            free_pid[static_cast<size_t>(id)] = 1;
+          }
         } else {
           ++live;
+        }
+      }
+    }
+    // A live row's valid adjacency prefix must never point at a FREE PID: such an
+    // edge would let the reuser overwrite a row that is still referenced (design
+    // section 2.3). Only runs when the segment actually has free rows.
+    bool any_free = false;
+    for (uint8_t f : free_pid) {
+      if (f != 0) {
+        any_free = true;
+        break;
+      }
+    }
+    if (any_free) {
+      for (size_t pi = 0; pi < pages; ++pi) {
+        read_at(kSectorLen + pi * page_size_, page.data(), page_size_);
+        for (size_t slot = 0; slot < npp_; ++slot) {
+          const size_t raw = pi * npp_ + slot;
+          if (raw >= committed) {
+            break;
+          }
+          const auto id = static_cast<PID>(raw);
+          const QGRowTrailer trailer = qg_read_page_trailer(page.data(), page_size_, npp_, slot);
+          if ((trailer.flags & (kQGRowTombstone | kQGRowFree)) != 0) {
+            continue;  // hidden rows are not searchable; their edges never route
+          }
+          const char *row = page.data() + slot * node_len_;
+          const auto *ids = reinterpret_cast<const PID *>(row + neighbor_off_bytes());
+          for (size_t j = 0; j < trailer.valid_degree; ++j) {
+            if (ids[j] < committed && free_pid[static_cast<size_t>(ids[j])] != 0) {
+              poison("recovery: a live row's edge still targets a FREE PID");
+            }
+          }
         }
       }
     }

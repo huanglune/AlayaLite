@@ -489,6 +489,91 @@ class QGUpdaterIndexTest : public ::testing::Test {
 };
 TinyIndex *QGUpdaterIndexTest::tiny_ = nullptr;
 
+// codex B-2C-06: the fail-closed A/B superblock selector. A checksum-corrupt newer
+// slot is skippable (fall back to the older valid slot); a checksum-VALID but
+// UNSUPPORTED newer slot (unknown required feature bits / newer format) rejects the
+// whole file (-2) rather than silently downgrading to the older supported slot.
+namespace {
+QGSuperblockV2 make_v2_slot(uint64_t gen) {
+  QGSuperblockV2 sb{};
+  sb.magic = kQGSuperblockMagic;
+  sb.format_version = kQGFormatVersion;
+  sb.generation = gen;
+  sb.free_list_head = kPidMax;
+  sb.checksum = qg_superblock_checksum(sb);
+  return sb;
+}
+QGSuperblockV2 make_v3_slot(uint64_t gen, uint32_t required) {
+  QGSuperblockV2 sb{};
+  sb.magic = kQGSuperblockMagic;
+  sb.format_version = kQGFormatVersionV3;
+  sb.generation = gen;
+  sb.free_list_head = kPidMax;
+  const uint64_t magic = kWal2cMagic;
+  std::memcpy(sb.reserved.data() + kWal2cReservedOffset, &magic, 8);
+  const uint32_t layout = kWal2cLayoutVersion;
+  std::memcpy(sb.reserved.data() + kWal2cReservedOffset + 8, &layout, 4);
+  std::memcpy(sb.reserved.data() + kWal2cReservedOffset + 12, &required, 4);
+  sb.checksum = qg_superblock_checksum(sb);
+  return sb;
+}
+std::array<char, 2 * kQGSuperblockSize> pack_header(const QGSuperblockV2 &a, const QGSuperblockV2 &b) {
+  std::array<char, 2 * kQGSuperblockSize> header{};
+  std::memcpy(header.data(), &a, sizeof(a));
+  std::memcpy(header.data() + kQGSuperblockSize, &b, sizeof(b));
+  return header;
+}
+}  // namespace
+
+TEST(QGSuperblockSelector, FailsClosedOnUnsupportedNewerSlot) {
+  QGSuperblockV2 out{};
+  // Two valid v2 slots: highest generation wins (unchanged legacy behavior).
+  {
+    const auto header = pack_header(make_v2_slot(1), make_v2_slot(2));
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kQgSupportedRequiredFeatures), 1);
+    EXPECT_EQ(out.generation, 2U);
+    EXPECT_EQ(select_qg_superblock(header.data(), out), 1);  // legacy path agrees on v2
+  }
+  // Corrupt newer slot: fall back to the older VALID slot (corruption is skippable).
+  {
+    auto b = make_v2_slot(9);
+    b.checksum ^= 0x1U;  // break B's checksum
+    const auto header = pack_header(make_v2_slot(5), b);
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kQgSupportedRequiredFeatures), 0);
+    EXPECT_EQ(out.generation, 5U);
+  }
+  // Highest-gen slot is a checksum-VALID v3 with an unsupported required bit: reject
+  // the whole file (-2), never downgrade to the older v2 (the core fail-closed rule).
+  {
+    const auto header = pack_header(make_v2_slot(10), make_v3_slot(11, kQgFeatMaintenanceTxV1));
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, /*supported=*/0U), -2);
+  }
+  // A v3 whose required bits ARE supported is selected normally.
+  {
+    const auto header = pack_header(make_v2_slot(10), make_v3_slot(11, kQgFeatMaintenanceTxV1));
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kQgFeatMaintenanceTxV1), 1);
+    EXPECT_EQ(out.format_version, kQGFormatVersionV3);
+  }
+  // A v3 requiring pid_generation WITHOUT its canonical_prebind + mutable_label_slot
+  // dependencies is self-inconsistent -> unsupported -> fail closed even if the
+  // caller nominally supports the pid_generation bit.
+  {
+    const auto header = pack_header(make_v2_slot(10), make_v3_slot(11, kQgFeatPidGenerationV1));
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, 0xFFFFFFFFU), -2);
+  }
+  // Both slots unsupported v3: fail closed (the two-v3 old-reader case).
+  {
+    const auto header = pack_header(make_v3_slot(11, kQgFeatMaintenanceTxV1),
+                                    make_v3_slot(12, kQgFeatMaintenanceTxV1));
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, 0U), -2);
+  }
+  // Neither slot structurally valid: -1 (distinct from the -2 fail-closed signal).
+  {
+    const auto header = pack_header(QGSuperblockV2{}, QGSuperblockV2{});
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kQgSupportedRequiredFeatures), -1);
+  }
+}
+
 TEST_F(QGUpdaterIndexTest, MigratesV1DegreesAndPreservesSearchExactly) {
   const std::string prefix = (tiny_->dir / "migrate").string();
   copy_index_artifact(tiny_->v1_prefix, prefix);

@@ -173,6 +173,37 @@ TEST(SegmentOpCodec, Kind1Through6GoldenBytesAreFrozen) {
                                        0x00, 0x02, 0x00, 0x00}));
 }
 
+// Frozen wire for the 2A label ops kind=7/8 (W0 acceptance: kind=1..8 golden are
+// frozen). The pid_generation field is exercised with a NON-zero value to lock its
+// byte position -- the codec wire is unchanged across 2C even after generation is
+// activated in W2 (only the replay-time semantics change, never the layout).
+TEST(SegmentOpCodec, Kind7And8GoldenBytesAreFrozen) {
+  constexpr std::uint64_t sid = 0x0102030405060708ULL;
+  constexpr std::uint64_t gen = 0x1112131415161718ULL;
+  auto to_u8 = [](const std::vector<std::byte> &v) {
+    std::vector<std::uint8_t> out(v.size());
+    for (std::size_t i = 0; i < v.size(); ++i) out[i] = std::to_integer<std::uint8_t>(v[i]);
+    return out;
+  };
+  EXPECT_EQ(to_u8(encode_label_bind(sid, gen, /*tx_id=*/0x4142434445464748ULL,
+                                    /*row_op_id=*/0x5152535455565758ULL, /*pid=*/0x61626364U,
+                                    /*pid_generation=*/0x71727374U, /*label=*/0x8182838485868788ULL)),
+            (std::vector<std::uint8_t>{
+                0x01, 0x00, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x18, 0x17, 0x16,
+                0x15, 0x14, 0x13, 0x12, 0x11, 0x07, 0x48, 0x47, 0x46, 0x45, 0x44, 0x43, 0x42,
+                0x41, 0x58, 0x57, 0x56, 0x55, 0x54, 0x53, 0x52, 0x51, 0x64, 0x63, 0x62, 0x61,
+                0x74, 0x73, 0x72, 0x71, 0x88, 0x87, 0x86, 0x85, 0x84, 0x83, 0x82, 0x81}));
+  EXPECT_EQ(to_u8(encode_tx_publish(sid, gen, /*tx_id=*/0x4142434445464748ULL,
+                                    /*new_pid_watermark=*/0x5152535455565758ULL,
+                                    /*binding_count=*/0x6162636465666768ULL,
+                                    /*applied_collection_op_id=*/0x7172737475767778ULL)),
+            (std::vector<std::uint8_t>{
+                0x01, 0x00, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x18, 0x17, 0x16,
+                0x15, 0x14, 0x13, 0x12, 0x11, 0x08, 0x48, 0x47, 0x46, 0x45, 0x44, 0x43, 0x42,
+                0x41, 0x58, 0x57, 0x56, 0x55, 0x54, 0x53, 0x52, 0x51, 0x68, 0x67, 0x66, 0x65,
+                0x64, 0x63, 0x62, 0x61, 0x78, 0x77, 0x76, 0x75, 0x74, 0x73, 0x72, 0x71}));
+}
+
 TEST(SegmentOpCodec, LabelBindRoundTrip) {
   const auto encoded = encode_label_bind(kSegId, kGen, /*tx_id=*/0xABCDEF01ULL, /*row_op_id=*/3,
                                          /*pid=*/0x1234U, /*pid_generation=*/0,
