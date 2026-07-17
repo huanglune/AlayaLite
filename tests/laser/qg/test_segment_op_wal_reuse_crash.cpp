@@ -57,12 +57,14 @@ std::vector<char> read_file(const std::filesystem::path &path) {
 }
 
 UpdateParams reuse_params(size_t max_points,
-                          std::function<void(SegmentOpFailPoint)> hook = {}) {
+                          std::function<void(SegmentOpFailPoint)> hook = {},
+                          size_t cache_cap = 0) {
   UpdateParams params;
   params.enable_wal = true;
   params.enable_pid_reuse = true;
   params.max_points = max_points;
   params.ef_insert = 64;
+  if (cache_cap != 0) params.cache_cap_pages = cache_cap;  // tiny cap forces overlay spill
   params.failpoint_hook = std::move(hook);
   return params;
 }
@@ -201,7 +203,8 @@ const Refs &refs() {
 struct ReuseKill {
   const char *name;
   SegmentOpFailPoint point;
-  bool expect_new;  // cut at/after the kind=8 fsync -> roll forward (S_new)
+  bool expect_new;      // cut at/after the kind=8 fsync -> roll forward (S_new)
+  size_t cache_cap = 0;  // 0 = default (no spill); tiny cap forces overlay spill mid-build
 };
 
 class ReuseCrash : public ::testing::TestWithParam<ReuseKill> {};
@@ -227,12 +230,14 @@ TEST_P(ReuseCrash, ReopenLandsOnSoldOrSnewAndDoubleReplayStable) {
       qg.load_disk_index(case_prefix.c_str(), 0.0F, /*recovery_mode=*/true);
       qg.set_params(64, 1, 1);
       const SegmentOpFailPoint target = param.point;
-      QGUpdater upd(qg, reuse_params(ref.max_points, [target](SegmentOpFailPoint fp) {
-                      if (fp == target) {
-                        ::kill(::getpid(), SIGKILL);
-                        ::_exit(99);
-                      }
-                    }));
+      QGUpdater upd(qg, reuse_params(ref.max_points,
+                                     [target](SegmentOpFailPoint fp) {
+                                       if (fp == target) {
+                                         ::kill(::getpid(), SIGKILL);
+                                         ::_exit(99);
+                                       }
+                                     },
+                                     param.cache_cap));
       const auto labels = bundle_labels();
       (void)upd.commit_physical_bundle(2, 2, bundle_vecs().data(), labels.data(), kFree);
     } catch (...) {
@@ -275,7 +280,12 @@ INSTANTIATE_TEST_SUITE_P(
         ReuseKill{"R5_end_unforced", SegmentOpFailPoint::after_reuse_tx_publish_append_before_fsync,
                   false},
         // R6-R8: kind=8 forced durable, before/at the install + publish -> roll forward.
-        ReuseKill{"R6_after_fsync", SegmentOpFailPoint::after_tx_publish_fsync, true}),
+        ReuseKill{"R6_after_fsync", SegmentOpFailPoint::after_tx_publish_fsync, true},
+        // R4 with a tiny cache cap: the build spills overlay pages (Sync::flush, survives
+        // SIGKILL), but the FIRST spill forces the kind=7 lane durable, so a surviving spill
+        // is staged inside the (durable) lane and discarded at EOF -> S_old (never applied as
+        // an orphan legacy row_patch). Exercises the spill-orphan guard.
+        ReuseKill{"R4_spill", SegmentOpFailPoint::before_tx_publish_append, false, /*cap=*/1}),
     [](const ::testing::TestParamInfo<ReuseKill> &info) { return info.param.name; });
 
 // Power-loss (R5 drop): the unforced WAL tail is lost. Run the bundle to its

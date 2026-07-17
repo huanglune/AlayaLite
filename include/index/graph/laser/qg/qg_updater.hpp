@@ -3882,6 +3882,18 @@ class QGUpdater {
         ++it;
         continue;
       }
+      // Before the FIRST flush-spill, force the lane-opening kind=7 binds + FREE preimages
+      // durable. A spill is flushed (Sync::flush -> OS page cache, survives a process crash),
+      // but the kind=7 are only buffered (userspace, lost on SIGKILL). Without this force a
+      // surviving spilled kind=1 could ORPHAN a lost kind=7, and recovery would apply that
+      // canonical page as a legacy row_patch (line ~replay_row_patch), mis-installing a torn
+      // bundle. Forcing here makes the lane durable so a surviving spill is staged inside it
+      // and discarded at EOF (S_old) -- the same guarantee consolidate gets by forcing BEGIN
+      // before its spills. (The net WAL bytes are unchanged; only durability timing moves.)
+      if (!bundle_ctx_->binds_durable) {
+        force_wal();
+        bundle_ctx_->binds_durable = true;
+      }
       const auto loc = bundle_log_page(it->first, it->second.data(), alaya::wal::WalFile::Sync::flush);
       bundle_ctx_->spilled[it->first] = loc;
       it = bundle_ctx_->pages.erase(it);
@@ -6857,6 +6869,7 @@ class QGUpdater {
     std::unordered_map<size_t, std::vector<char>> pages;  // page_index -> resident overlay bytes
     std::unordered_set<size_t> dirty;                     // pages modified (final kind=1 + install)
     std::unordered_map<size_t, alaya::wal::FrameLocation> spilled;  // evicted page -> latest kind=1
+    bool binds_durable = false;  // the kind=7 lane has been forced durable (before the 1st spill)
   };
   BundleInsertContext *bundle_ctx_ = nullptr;
   bool free_chain_rebuild_complete_ = true;  // false only mid-recovery; gates reserve_bundle_pids
