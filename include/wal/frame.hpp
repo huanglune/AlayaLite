@@ -408,6 +408,22 @@ class WalFile {
     open_stream();
   }
 
+  // Semantic truncation to a frame boundary (B-2C-04): drop everything at/after
+  // `offset` (e.g. an unmatched maintenance BEGIN discovered during recovery),
+  // fsync, and reopen the append stream so the next append starts clean at the new
+  // boundary. `offset` must be a verified frame boundary chosen by the caller.
+  void truncate_to(std::uint64_t offset) {
+    if (stream_.is_open()) {
+      stream_.close();
+    }
+    std::filesystem::resize_file(path_, offset);
+    platform::sync_file_or_throw(path_);
+    platform::sync_directory_or_throw(path_.parent_path());
+    recovery_scan_ = scan_path(path_);
+    append_offset_ = offset;
+    open_stream();
+  }
+
   // Streaming structural scan (B-2C-04): invoke visitor(const ScannedFrame&) for
   // each verified frame in file order, holding at most one frame in memory
   // (O(max frame), not O(file)). Stops at the first torn/corrupt frame -- never

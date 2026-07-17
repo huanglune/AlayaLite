@@ -190,10 +190,10 @@ constexpr uint32_t kQgFeatCanonicalPrebindV1 = 1U << 3U;
 constexpr uint32_t kQgFeatMutableLabelSlotV1 = 1U << 4U;
 
 // The required-feature bitmask THIS build understands. It grows per 2C phase:
-// W0 supports no 2C feature (consolidate/reuse still throw), so a real v3
-// superblock (which always carries >=1 required bit from its activation) is
-// UNSUPPORTED here and fails closed at the selector. W1/W2 add their bits.
-constexpr uint32_t kQgSupportedRequiredFeatures = 0U;
+// W1 understands the maintenance-transaction features (consolidate under WAL).
+// A v3 base carrying only these bits is readable here; a v3 base that also
+// requires W2's pid_generation bits fails closed until W2 adds them.
+constexpr uint32_t kQgSupportedRequiredFeatures = kQgFeatMaintenanceTxV1 | kQgFeatPostRedoFreeListV1;
 
 struct QGSuperblockV2 {
   uint64_t magic = 0;

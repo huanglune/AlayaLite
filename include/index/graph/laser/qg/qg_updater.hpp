@@ -81,6 +81,7 @@
 #include <omp.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -1405,9 +1406,9 @@ class QGUpdater {
                    bool reclaim_slots = true,
                    bool bloom_consolidate = false) {
     if (enable_wal_) {
-      throw std::logic_error(
-          "QGUpdater::consolidate is out of the G1 op-WAL scope (clause A): reclaim/reuse and "
-          "consolidate need their own WAL transaction format (next wave)");
+      // 2C: consolidate is now a real maintenance transaction (design section 1).
+      consolidate_wal_transaction(num_threads, r_target, reclaim_slots, bloom_consolidate);
+      return;
     }
     const auto consolidate_begin = std::chrono::steady_clock::now();
     const size_t n = committed_.load(std::memory_order_acquire);
@@ -1723,6 +1724,10 @@ class QGUpdater {
       if (has_staged_edges()) {
         throw std::logic_error("QGUpdater::checkpoint requires no staged backlinks");
       }
+      if (maintenance_active_) {
+        throw std::logic_error(
+            "QGUpdater::checkpoint requires no active maintenance epoch (design section 1.4)");
+      }
     }
     drain_staged_edges(1);
     flush_dirty(1);  // forces the WAL prefix first under enable_wal
@@ -1767,6 +1772,26 @@ class QGUpdater {
       write_superblock_label_state(next, next_label);
       write_superblock_tx_state(next,
                                 TxWatermarkState{last_committed_txid_, applied_collection_op_id_});
+      // 2C activation (design section 7.2): once maintenance is activated (or an
+      // activation checkpoint is in flight), the base becomes v3 and carries the
+      // maintenance feature bits + last_completed_consolidate_epoch. create_empty /
+      // the immutable producer never take this path, so they stay v2.
+      if (maintenance_activated_ || maintenance_activating_) {
+        next.format_version = kQGFormatVersionV3;
+        // Carry an existing v3 state forward; when activating from a v2 base start
+        // from a zeroed state (never reinterpret v2's reserved bytes as v3 state).
+        Wal2cState w2c = superblock_.format_version == kQGFormatVersionV3
+                             ? read_superblock_wal2c_state(superblock_)
+                             : Wal2cState{};
+        w2c.magic = kWal2cMagic;
+        w2c.layout_version = kWal2cLayoutVersion;
+        w2c.required_feature_flags |= kQgFeatMaintenanceTxV1 | kQgFeatPostRedoFreeListV1;
+        w2c.last_completed_consolidate_epoch = last_completed_consolidate_epoch_;
+        if (w2c.maintenance_activation_sb_generation == 0) {
+          w2c.maintenance_activation_sb_generation = next.generation;
+        }
+        write_superblock_wal2c_state(next, w2c);
+      }
     }
     next.checksum = qg_superblock_checksum(next);
     const int next_slot = active_superblock_slot_ == 0 ? 1 : 0;
@@ -1811,6 +1836,12 @@ class QGUpdater {
       label_generation_ = ls.generation;
       label_count_ = ls.count;
       label_checksum_ = ls.checksum;
+      const auto w2c = read_superblock_wal2c_state(next);
+      last_completed_consolidate_epoch_ = w2c.last_completed_consolidate_epoch;
+      maintenance_activation_gen_ = w2c.maintenance_activation_sb_generation;
+      if (next.format_version == kQGFormatVersionV3) {
+        maintenance_activated_ = true;
+      }
     }
   }
 
@@ -2682,6 +2713,22 @@ class QGUpdater {
     if (pi >= page_versions_.size()) {
       throw std::runtime_error("QGUpdater: id exceeds max_points capacity");
     }
+    // 2C maintenance transaction (design section 1.2): route the RMW into the
+    // PRIVATE overlay. No inline WAL log, no index write, no seqlock bump -- a
+    // concurrent search keeps reading the committed state (disk) until the
+    // END-durable install. The kind=1 after-image is appended at spill / finalize
+    // (serial maintenance lane). unordered_map reference stability keeps the page
+    // pointer valid across nested overlay materializations inside fn.
+    if (enable_wal_ && !replaying_ && maintenance_active_) {
+      char *page = maint_overlay_page(pi);
+      const bool changed = fn(page);
+      if (changed) {
+        maint_dirty_.insert(pi);
+        stats_.logical_row_writes++;
+        maint_spill_over_cap();
+      }
+      return changed;
+    }
     // No-steal RMW (clause B): with the WAL live, the callback runs on a private
     // scratch page, its full-page after-image is appended, and only then is the
     // page installed (cache) / written (no cache). On WAL append failure the
@@ -2794,6 +2841,10 @@ class QGUpdater {
   }
 
   [[nodiscard]] const float *cached_raw(PID id) {
+    if (enable_wal_ && !replaying_ && maintenance_active_) {
+      return reinterpret_cast<const float *>(maint_overlay_page(page_index(id)) +
+                                             node_offset_in_page(id));
+    }
     const size_t pi = page_index(id);
     if (params_.write_cache) {
       auto &shard = write_cache_.shard(pi);
@@ -2808,6 +2859,10 @@ class QGUpdater {
 
   /** @brief Page read for update-side dependencies; unlike search, sees dirty RMW state. */
   void read_rmw_page(PID id, char *out) {
+    if (enable_wal_ && !replaying_ && maintenance_active_) {
+      std::memcpy(out, maint_overlay_page(page_index(id)), page_size_);
+      return;
+    }
     const size_t pi = page_index(id);
     if (params_.write_cache) {
       auto &shard = write_cache_.shard(pi);
@@ -3019,6 +3074,9 @@ class QGUpdater {
    * hidden row, and raw-vector bytes in live rows are immutable.
    */
   [[nodiscard]] const char *bloom_dependency_page(PID id) {
+    if (enable_wal_ && !replaying_ && maintenance_active_) {
+      return maint_overlay_page(page_index(id));
+    }
     const size_t pi = page_index(id);
     if (params_.write_cache) {
       auto &shard = write_cache_.shard(pi);
@@ -3061,6 +3119,338 @@ class QGUpdater {
     }
     qg_.arena_mirror_write(off, buf, len);
     stats_.page_writes++;
+  }
+
+  // ===================== 2C maintenance overlay (design section 1.2) ===========
+  // Materialize page pi in the private maintenance overlay: reuse a resident copy,
+  // reload a spilled one from its kind=1 frame, or copy the committed image from
+  // disk on first touch. Single-threaded within an epoch. unordered_map guarantees
+  // reference stability, so a char* returned here stays valid across later inserts
+  // (only maint_spill_over_cap, run after the caller's fn returns, ever erases).
+  char *maint_overlay_page(size_t pi) {
+    auto it = maint_pages_.find(pi);
+    if (it != maint_pages_.end()) {
+      return it->second.data();
+    }
+    std::vector<char> bytes(page_size_);
+    auto sp = maint_spilled_.find(pi);
+    if (sp != maint_spilled_.end()) {
+      const auto frame = alaya::wal::WalFile::read_frame(op_wal_->path(), sp->second);
+      SegmentOp op;
+      try {
+        op = decode_segment_op(frame.payload);
+      } catch (const std::exception &error) {
+        poison(std::string("maintenance overlay reload decode failed: ") + error.what());
+      }
+      if (op.kind != SegmentOpKind::row_patch || op.bytes.size() != page_size_) {
+        poison("maintenance overlay reload got a non-page frame");
+      }
+      std::memcpy(bytes.data(), op.bytes.data(), page_size_);
+      maint_spilled_.erase(sp);
+    } else {
+      read_at(kSectorLen + pi * page_size_, bytes.data(), page_size_);
+    }
+    auto [ins, unused] = maint_pages_.emplace(pi, std::move(bytes));
+    (void)unused;
+    return ins->second.data();
+  }
+
+  // Append one kind=1 whole-page after-image for the overlay page (maintenance
+  // lane; serial). Returns its FrameLocation so a spilled page can be reloaded.
+  alaya::wal::FrameLocation maint_log_page(size_t pi,
+                                          const char *bytes,
+                                          alaya::wal::WalFile::Sync sync) {
+    const uint64_t offset = kSectorLen + pi * page_size_;
+    const auto first_pid = static_cast<uint64_t>(pi * npp_);
+    auto payload = encode_row_patch(
+        segment_uid_,
+        superblock_.generation,
+        first_pid,
+        offset,
+        std::span<const std::byte>(reinterpret_cast<const std::byte *>(bytes), page_size_));
+    try {
+      return op_wal_->append(kSegmentOpRecordType, 0, ++wal_op_id_, 0, payload, sync);
+    } catch (const std::exception &error) {
+      poison(std::string("maintenance WAL append failed: ") + error.what());
+    }
+  }
+
+  // Spill resident overlay pages (logging each latest kind=1, flushed so read_frame
+  // can reload it) until the overlay is back under cap. Called only after a modify
+  // fn returns, so no live char* into maint_pages_ can dangle.
+  void maint_spill_over_cap() {
+    const size_t cap = std::max<size_t>(1, params_.cache_cap_pages);
+    // Clean (dependency-only) pages re-materialize from committed disk, so drop them
+    // for free before spending WAL bytes on a dirty spill.
+    for (auto it = maint_pages_.begin();
+         it != maint_pages_.end() && maint_pages_.size() > cap;) {
+      if (maint_dirty_.count(it->first) == 0) {
+        it = maint_pages_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    // Then spill dirty pages: log the latest kind=1 (flushed so read_frame can
+    // reload it), record its location, and release the page memory.
+    for (auto it = maint_pages_.begin();
+         it != maint_pages_.end() && maint_pages_.size() > cap;) {
+      const size_t pi = it->first;
+      const auto loc = maint_log_page(pi, it->second.data(), alaya::wal::WalFile::Sync::flush);
+      maint_spilled_[pi] = loc;
+      wal_failpoint(SegmentOpFailPoint::after_consolidate_spill_flush);
+      it = maint_pages_.erase(it);
+    }
+  }
+
+  // Transaction-local free push (reclaim): set the row's trailer FREE + next pointer
+  // in the overlay, advancing the LOCAL free head/count. Published globally only
+  // after END is durable and every page is installed.
+  void maint_push_free_slot(PID id) {
+    char *page = maint_overlay_page(page_index(id));
+    QGRowTrailer trailer = qg_read_page_trailer(page, page_size_, npp_, id % npp_);
+    if ((trailer.flags & kQGRowTombstone) == 0 || (trailer.flags & kQGRowFree) != 0) {
+      return;  // only tombstoned, not-yet-free rows are eligible
+    }
+    char *row = page + node_offset_in_page(id);
+    const uint64_t next64 = maint_local_free_head_;
+    std::memcpy(row, &next64, sizeof(next64));
+    trailer.valid_degree = 0;
+    trailer.flags |= kQGRowFree;
+    qg_write_page_trailer(page, page_size_, npp_, id % npp_, trailer);
+    maint_dirty_.insert(page_index(id));  // the FREE trailer must be logged + installed
+    maint_local_free_head_ = id;
+    ++maint_local_free_count_;
+    stats_.freed_slots++;
+  }
+
+  // END-durable install (design section 1.2 step 6): write every touched page's
+  // final image to the index under the page seqlock (odd -> write_at/arena mirror
+  // -> even) so a concurrent search never copies a half-installed page. Honors the
+  // after_consolidate_install_page failpoint after each page.
+  void maint_install_all() {
+    std::vector<size_t> pages;
+    pages.reserve(maint_pages_.size() + maint_spilled_.size());
+    for (const auto &[pi, unused] : maint_pages_) {
+      (void)unused;
+      if (maint_dirty_.count(pi) != 0) {
+        pages.push_back(pi);  // spilled pages are always dirty (only dirty pages spill)
+      }
+    }
+    for (const auto &[pi, unused] : maint_spilled_) {
+      (void)unused;
+      pages.push_back(pi);
+    }
+    std::sort(pages.begin(), pages.end());
+    for (size_t pi : pages) {
+      std::vector<char> reload;
+      const char *bytes = nullptr;
+      auto it = maint_pages_.find(pi);
+      if (it != maint_pages_.end()) {
+        bytes = it->second.data();
+      } else {
+        const auto frame = alaya::wal::WalFile::read_frame(op_wal_->path(), maint_spilled_[pi]);
+        const auto op = decode_segment_op(frame.payload);
+        if (op.kind != SegmentOpKind::row_patch || op.bytes.size() != page_size_) {
+          poison("maintenance install reload got a non-page frame");
+        }
+        reload.assign(reinterpret_cast<const char *>(op.bytes.data()),
+                      reinterpret_cast<const char *>(op.bytes.data()) + page_size_);
+        bytes = reload.data();
+      }
+      const PID first_pid = static_cast<PID>(pi * npp_);
+      const std::lock_guard<std::mutex> guard(page_lock(first_pid));
+      page_versions_[pi].fetch_add(1, std::memory_order_acq_rel);  // -> odd
+      write_at(kSectorLen + pi * page_size_, bytes, page_size_);
+      page_versions_[pi].fetch_add(1, std::memory_order_release);  // -> even
+      wal_failpoint(SegmentOpFailPoint::after_consolidate_install_page);
+    }
+  }
+
+  void maint_reset_overlay() {
+    maint_pages_.clear();
+    maint_spilled_.clear();
+    maint_dirty_.clear();
+    maint_local_free_head_ = kPidMax;
+    maint_local_free_count_ = 0;
+  }
+
+  // Ensure the base is a v3 maintenance-activated superblock before starting a
+  // consolidate epoch (design section 7.2): the first WAL consolidate does an
+  // activation checkpoint that flips a v3 base carrying the maintenance feature
+  // bits. Maintenance never starts on a v2 base.
+  void ensure_maintenance_activated() {
+    if (maintenance_activated_) {
+      return;
+    }
+    const auto st = read_superblock_wal2c_state(superblock_);
+    if (superblock_.format_version == kQGFormatVersionV3 &&
+        (st.required_feature_flags & kQgFeatMaintenanceTxV1) != 0) {
+      maintenance_activated_ = true;
+      maintenance_activation_gen_ = st.maintenance_activation_sb_generation;
+      return;
+    }
+    maintenance_activating_ = true;
+    try {
+      checkpoint();  // emits a v3 base (checkpoint sees maintenance_activating_)
+    } catch (...) {
+      maintenance_activating_ = false;
+      throw;
+    }
+    maintenance_activating_ = false;
+    maintenance_activated_ = true;
+  }
+
+  // BEGIN-time headroom preflight (design section 1.2): a maintenance epoch may
+  // spill up to ~2x the touched page set to the .opwal. A shortfall is an ordinary
+  // pre-transaction error (the epoch has not started, so nothing to roll back).
+  void maint_statvfs_preflight() {
+    struct statvfs vfs {};
+    if (::statvfs(op_wal_->path().c_str(), &vfs) != 0) {
+      throw std::runtime_error("QGUpdater::consolidate: statvfs failed errno=" +
+                               std::to_string(errno));
+    }
+    const uint64_t available = static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize;
+    const uint64_t needed =
+        static_cast<uint64_t>(file_pages()) * page_size_ * 2 + (uint64_t{1} << 20U);
+    if (available < needed) {
+      throw std::runtime_error(
+          "QGUpdater::consolidate: insufficient free space for the maintenance WAL");
+    }
+  }
+
+  // The single-threaded maintenance row phase over the private overlay.
+  void consolidate_row_phase(size_t r_target, bool bloom_consolidate) {
+    const size_t n = committed_.load(std::memory_order_acquire);
+    const size_t target = r_target == 0 ? deg_ : std::min(r_target, deg_);
+    if (bloom_consolidate) {
+      std::vector<PID> dead;
+      for (size_t p = 0; p < n; ++p) {
+        if (is_hidden(static_cast<PID>(p))) {
+          dead.push_back(static_cast<PID>(p));
+        }
+      }
+      if (!dead.empty()) {
+        DeadPIDBloom bloom(dead.size());
+        for (PID pid : dead) {
+          bloom.insert(pid);
+        }
+        // The scan reads the committed disk image (the overlay is private and the
+        // shared cache was emptied at admission), so it finds candidates against
+        // the pre-epoch state -- exactly what consolidate must purge.
+        const auto rows = bloom_consolidation_rows(n, bloom, 1);
+        for (PID u : rows) {
+          consolidate_row(u, n, target, /*bloom_prefiltered=*/true);
+        }
+      }
+    } else {
+      for (size_t u = 0; u < n; ++u) {
+        if (!is_hidden(static_cast<PID>(u))) {
+          consolidate_row(static_cast<PID>(u), n, target);
+        }
+      }
+    }
+  }
+
+  // Reclaim: transaction-local free push of eligible tombstoned rows onto the
+  // overlay, chained above the current global free head. Published at END.
+  void maint_reclaim_phase() {
+    const size_t n = committed_.load(std::memory_order_acquire);
+    std::vector<PID> eligible = deleted_snapshot();
+    eligible.erase(std::remove_if(eligible.begin(),
+                                  eligible.end(),
+                                  [n](PID id) { return id >= n; }),
+                   eligible.end());
+    std::sort(eligible.begin(), eligible.end());
+    // Push largest-first so the resulting LIFO chain is ascending (head = smallest
+    // PID), byte-identical to the recovery canonical chain (clause 11): a reopen
+    // then never rewrites the free chain.
+    for (auto it = eligible.rbegin(); it != eligible.rend(); ++it) {
+      maint_push_free_slot(*it);
+    }
+  }
+
+  // consolidate() under enable_wal: one maintenance transaction (design section 1).
+  void consolidate_wal_transaction(size_t num_threads,
+                                   size_t r_target,
+                                   bool reclaim_slots,
+                                   bool bloom_consolidate) {
+    (void)num_threads;  // maintenance runs single-threaded (serial WAL lane; B-2C-05
+                        // parallel page workers are documented follow-on hardening).
+    ensure_writable();
+    if (allocated_points_.load(std::memory_order_acquire) !=
+        committed_.load(std::memory_order_acquire)) {
+      throw std::logic_error("QGUpdater::consolidate requires allocated == committed");
+    }
+    if (has_staged_edges()) {
+      throw std::logic_error("QGUpdater::consolidate requires no staged backlinks");
+    }
+    if (maintenance_active_) {
+      throw std::logic_error("QGUpdater::consolidate is already in progress");
+    }
+    ensure_maintenance_activated();  // may checkpoint (takes checkpoint_mutex_) -> BEFORE the guard
+    const std::lock_guard<std::mutex> checkpoint_guard(checkpoint_mutex_);
+    // Baseline normalization (design section 1.2 step 2): flush committed dirty
+    // pages, then empty the shared cache so a concurrent search reads only committed
+    // disk state during the epoch and the private overlay is the sole mutation store.
+    // (has_staged_edges() above already guaranteed no staged edges to drain.)
+    flush_dirty(1);
+    evict_clean(0);
+    pid_scan_mapping_.reset();  // a stale bloom mapping from a prior epoch is unsafe
+    if (write_cache_.total_pages() != 0) {
+      poison("consolidate baseline cache did not drain to zero");
+    }
+    maint_statvfs_preflight();
+    const uint64_t epoch = last_completed_consolidate_epoch_ + 1;
+    maint_epoch_ = epoch;
+    maint_reset_overlay();
+    maint_local_free_head_ = free_list_head_.load(std::memory_order_acquire);
+    maint_local_free_count_ = free_count_.load(std::memory_order_acquire);
+    try {
+      wal_append(encode_consolidate_marker(segment_uid_,
+                                           superblock_.generation,
+                                           SegmentOpKind::consolidate_begin,
+                                           epoch),
+                 alaya::wal::WalFile::Sync::buffered);
+      wal_failpoint(SegmentOpFailPoint::after_consolidate_begin_append);
+      force_wal();  // BEGIN durable before any page mutation
+      wal_failpoint(SegmentOpFailPoint::after_consolidate_begin_fsync);
+      maintenance_active_ = true;
+      consolidate_row_phase(r_target, bloom_consolidate);
+      if (reclaim_slots) {
+        maint_reclaim_phase();
+      }
+      // Finalize: log every remaining resident DIRTY page (buffered; the END fsync
+      // forces the whole group, including earlier spills, durable).
+      wal_failpoint(SegmentOpFailPoint::before_consolidate_end_append);
+      for (auto &[pi, bytes] : maint_pages_) {
+        if (maint_dirty_.count(pi) != 0) {
+          maint_log_page(pi, bytes.data(), alaya::wal::WalFile::Sync::buffered);
+        }
+      }
+      // END + fsync: the single durable commit point.
+      wal_append(encode_consolidate_marker(segment_uid_,
+                                           superblock_.generation,
+                                           SegmentOpKind::consolidate_end,
+                                           epoch),
+                 alaya::wal::WalFile::Sync::fsync);
+      wal_failpoint(SegmentOpFailPoint::after_consolidate_end_fsync);
+      // Commit point passed: install every touched page (no more steal risk).
+      maint_install_all();
+      wal_failpoint(SegmentOpFailPoint::after_consolidate_install_before_publish);
+      if (reclaim_slots) {
+        free_list_head_.store(maint_local_free_head_, std::memory_order_release);
+        free_count_.store(maint_local_free_count_, std::memory_order_release);
+      }
+      last_completed_consolidate_epoch_ = epoch;
+      maintenance_active_ = false;
+      maint_reset_overlay();
+    } catch (const std::exception &error) {
+      // Design/checkpoint-admission ruling: a failure past BEGIN keeps the epoch
+      // state and overlay intact and poisons the handle -- recovery rebuilds from
+      // the WAL (an unmatched BEGIN is semantically truncated; a post-END failure
+      // rolls forward). Never clean up and pretend to continue on this handle.
+      poison(std::string("consolidate failed mid-transaction: ") + error.what());
+    }
   }
 
   void stage_edge(StagedEdge edge) {
@@ -4310,6 +4700,48 @@ class QGUpdater {
     std::memcpy(base + 8, &s.applied_collection_op_id, 8);
   }
 
+  // --- 2C maintenance/reuse state (superblock reserved[56..104), design 7.1) ---
+  // reserved-relative: magic@56(u64) layout@64(u32) required@68(u32)
+  //   last_completed_consolidate_epoch@72(u64) maintenance_activation_gen@80(u64)
+  //   pid_reuse_activation_gen@88(u64) max_pid_generation@96(u32) nz_gen_count@100(u32)
+  static constexpr size_t kWal2cStateReservedOffset = 56;
+  static_assert(kWal2cStateReservedOffset == kWal2cReservedOffset,
+                "qg.hpp and qg_updater.hpp disagree on the 2C reserved offset");
+  struct Wal2cState {
+    uint64_t magic = 0;
+    uint32_t layout_version = 0;
+    uint32_t required_feature_flags = 0;
+    uint64_t last_completed_consolidate_epoch = 0;
+    uint64_t maintenance_activation_sb_generation = 0;
+    uint64_t pid_reuse_activation_sb_generation = 0;
+    uint32_t max_pid_generation = 0;
+    uint32_t nonzero_pid_generation_count = 0;
+  };
+  [[nodiscard]] static Wal2cState read_superblock_wal2c_state(const QGSuperblockV2 &sb) {
+    Wal2cState s;
+    const auto *b = sb.reserved.data() + kWal2cStateReservedOffset;
+    std::memcpy(&s.magic, b + 0, 8);
+    std::memcpy(&s.layout_version, b + 8, 4);
+    std::memcpy(&s.required_feature_flags, b + 12, 4);
+    std::memcpy(&s.last_completed_consolidate_epoch, b + 16, 8);
+    std::memcpy(&s.maintenance_activation_sb_generation, b + 24, 8);
+    std::memcpy(&s.pid_reuse_activation_sb_generation, b + 32, 8);
+    std::memcpy(&s.max_pid_generation, b + 40, 4);
+    std::memcpy(&s.nonzero_pid_generation_count, b + 44, 4);
+    return s;
+  }
+  static void write_superblock_wal2c_state(QGSuperblockV2 &sb, const Wal2cState &s) {
+    auto *b = sb.reserved.data() + kWal2cStateReservedOffset;
+    std::memcpy(b + 0, &s.magic, 8);
+    std::memcpy(b + 8, &s.layout_version, 4);
+    std::memcpy(b + 12, &s.required_feature_flags, 4);
+    std::memcpy(b + 16, &s.last_completed_consolidate_epoch, 8);
+    std::memcpy(b + 24, &s.maintenance_activation_sb_generation, 8);
+    std::memcpy(b + 32, &s.pid_reuse_activation_sb_generation, 8);
+    std::memcpy(b + 40, &s.max_pid_generation, 4);
+    std::memcpy(b + 44, &s.nonzero_pid_generation_count, 4);
+  }
+
   // --- 2A label slot serialization + durable double-buffered slot files ---
   // Slot body = explicit little-endian {pid u32, pid_generation u32, label u64}
   // per binding, ascending pid (std::map order). Checksum = crc32 of that body.
@@ -4466,6 +4898,12 @@ class QGUpdater {
   void adopt_label_state(const QGSuperblockV2 &sb) {
     const auto ls = read_superblock_label_state(sb);
     const auto tx = read_superblock_tx_state(sb);
+    // 2C maintenance state travels with every base (recovery start + flip re-adopt).
+    const auto w2c = read_superblock_wal2c_state(sb);
+    last_completed_consolidate_epoch_ = w2c.last_completed_consolidate_epoch;
+    maintenance_activated_ = sb.format_version == kQGFormatVersionV3 &&
+                             (w2c.required_feature_flags & kQgFeatMaintenanceTxV1) != 0;
+    maintenance_activation_gen_ = w2c.maintenance_activation_sb_generation;
     last_committed_txid_ = tx.last_committed_txid;
     applied_collection_op_id_ = tx.applied_collection_op_id;
     base_committed_txid_ = tx.last_committed_txid;
@@ -4628,6 +5066,15 @@ class QGUpdater {
   void replay_and_rebuild(const alaya::wal::ScanResult &scanned) {
     replaying_ = true;
     uint64_t committed_watermark = committed_.load(std::memory_order_acquire);
+    // Maintenance epoch state machine (design section 1.3): row_patch frames between
+    // a durable BEGIN and END stage a latest-per-page after-image but do NOT touch
+    // the index; END redoes them all; an unmatched BEGIN (EOF) is discarded and the
+    // WAL is semantically truncated back to the BEGIN boundary.
+    bool in_epoch = false;
+    bool epoch_apply = false;  // false => absorbed-by-base prefix: validate order, do not re-apply
+    uint64_t epoch_id = 0;
+    uint64_t epoch_begin_offset = 0;
+    std::unordered_map<size_t, std::vector<std::byte>> epoch_pages;  // page_index -> latest bytes
     for (const auto &frame : scanned.frames) {
       if (frame.type != kSegmentOpRecordType) {
         replaying_ = false;
@@ -4643,6 +5090,47 @@ class QGUpdater {
       if (op.segment_id != segment_uid_) {
         replaying_ = false;
         poison("op-WAL lineage mismatch (stale or foreign .opwal)");
+      }
+      // kind=1..6 frames always carry batch_id 0 (clause 11 / REPORT-wal-2a); only
+      // the label ops (7/8) carry a tx_id. Reject a producer that violates this.
+      if (op.kind != SegmentOpKind::label_bind && op.kind != SegmentOpKind::tx_publish &&
+          frame.batch_id != 0) {
+        replaying_ = false;
+        poison("op-WAL kind=1..6 frame has a non-zero batch_id");
+      }
+      if (in_epoch) {
+        switch (op.kind) {
+          case SegmentOpKind::row_patch: {
+            const size_t page = replay_validate_row_patch_geometry(op);
+            epoch_pages[page].assign(op.bytes.begin(), op.bytes.end());  // latest wins
+            break;
+          }
+          case SegmentOpKind::consolidate_end: {
+            if (op.epoch != epoch_id) {
+              replaying_ = false;
+              poison("op-WAL consolidate_end epoch does not match its begin");
+            }
+            // Only a NEW epoch (> the base's last_completed) is applied; an
+            // absorbed-by-base prefix (E <= base epoch) is validated for order but
+            // NOT re-applied, so a stale image can never clobber a higher base
+            // generation (codex B-2C-05 pitfall 5).
+            if (epoch_apply) {
+              for (const auto &[page, bytes] : epoch_pages) {
+                write_at(kSectorLen + page * page_size_,
+                         reinterpret_cast<const char *>(bytes.data()),
+                         page_size_);
+              }
+              last_completed_consolidate_epoch_ = epoch_id;
+            }
+            in_epoch = false;
+            epoch_pages.clear();
+            break;
+          }
+          default:
+            replaying_ = false;
+            poison("op-WAL maintenance epoch contains an unexpected op kind");
+        }
+        continue;
       }
       switch (op.kind) {
         case SegmentOpKind::row_patch:
@@ -4671,10 +5159,36 @@ class QGUpdater {
         case SegmentOpKind::tx_publish:
           replay_tx_publish(op, frame.batch_id, committed_watermark);
           break;
-        case SegmentOpKind::consolidate_begin:
+        case SegmentOpKind::consolidate_begin: {
+          if (op.epoch == 0 || op.epoch > last_completed_consolidate_epoch_ + 1) {
+            replaying_ = false;
+            poison("op-WAL consolidate epoch is not the next legal step");
+          }
+          // op.epoch <= last_completed => absorbed-by-base prefix (a checkpoint flip
+          // already carried it); the redo below is byte-identical and idempotent.
+          in_epoch = true;
+          epoch_apply = op.epoch > last_completed_consolidate_epoch_;
+          epoch_id = op.epoch;
+          epoch_begin_offset = frame.offset;
+          epoch_pages.clear();
+          break;
+        }
         case SegmentOpKind::consolidate_end:
           replaying_ = false;
-          poison("op-WAL consolidate frames are out of the G1 scope");
+          poison("op-WAL consolidate_end without a matching begin");
+      }
+    }
+    // Unmatched BEGIN at EOF: discard the incomplete epoch (nothing was installed --
+    // END was never durable, so the index is still S_old) and truncate the WAL back
+    // to the BEGIN boundary so the next append starts clean (design section 1.3).
+    if (in_epoch) {
+      epoch_pages.clear();
+      try {
+        op_wal_->truncate_to(epoch_begin_offset);
+      } catch (const std::exception &error) {
+        replaying_ = false;
+        poison(std::string("op-WAL semantic truncation of an unmatched BEGIN failed: ") +
+               error.what());
       }
     }
     committed_.store(committed_watermark, std::memory_order_release);
@@ -4685,8 +5199,9 @@ class QGUpdater {
     replaying_ = false;
   }
 
-  void replay_row_patch(const SegmentOp &op) {
-    // Patch validation (clause F): metadata-sector exclusion, size, geometry.
+  // Validate a row_patch's whole-page geometry (clause F) and return its page
+  // index. Shared by the immediate-apply path and the maintenance-epoch staging.
+  size_t replay_validate_row_patch_geometry(const SegmentOp &op) {
     if (op.offset < kSectorLen) {
       poison("row_patch offset overlaps the A/B metadata sector");
     }
@@ -4704,6 +5219,11 @@ class QGUpdater {
     if (op.pid != static_cast<uint64_t>(page) * npp_) {
       poison("row_patch pid/offset geometry mismatch");
     }
+    return page;
+  }
+
+  void replay_row_patch(const SegmentOp &op) {
+    (void)replay_validate_row_patch_geometry(op);
     write_at(op.offset, reinterpret_cast<const char *>(op.bytes.data()), op.bytes.size());
   }
 
@@ -4968,6 +5488,31 @@ class QGUpdater {
         }
       }
     }
+    // Post-redo free-list convergence (design section 2.1/2.2): derive the final free
+    // set from the recovered trailers and canonicalize its chain in ascending PID
+    // order, writing each free row's next-free pointer straight to disk. This is
+    // byte-stable across repeated recovery and matches the runtime reclaim chain.
+    if (any_free) {
+      std::vector<PID> free_ids;
+      free_ids.reserve(free_pid.size());
+      for (size_t id = 0; id < static_cast<size_t>(committed); ++id) {
+        if (free_pid[id] != 0) {
+          free_ids.push_back(static_cast<PID>(id));
+        }
+      }
+      PID head = kPidMax;
+      AlignedBuf fpage(page_size_);
+      for (auto it = free_ids.rbegin(); it != free_ids.rend(); ++it) {
+        const PID id = *it;
+        read_at(page_offset(id), fpage.data(), page_size_);
+        const uint64_t next64 = head;
+        std::memcpy(fpage.data() + node_offset_in_page(id), &next64, sizeof(next64));
+        write_at(page_offset(id), fpage.data(), page_size_);
+        head = id;
+      }
+      free_list_head_.store(head, std::memory_order_release);
+      free_count_.store(free_ids.size(), std::memory_order_release);
+    }
     live_count_.store(live, std::memory_order_release);
     for (size_t id = 0; id < row_generations_.size(); ++id) {
       row_generations_[id].store(id < committed ? 1 : 0, std::memory_order_relaxed);
@@ -5062,6 +5607,26 @@ class QGUpdater {
     uint64_t label = 0;
   };
   std::unordered_map<uint64_t, std::vector<LabelBindStage>> staged_binds_;
+
+  // --- 2C maintenance transaction (consolidate under enable_wal) ---
+  // A consolidate epoch runs single-threaded (design/manual: parallel page workers
+  // + the B-2C-05 concurrency protocol are documented follow-on hardening; the
+  // serial path is the minimal-viable-correct W1). maintenance_active_ routes every
+  // maintenance page RMW/read into a PRIVATE overlay so a concurrent search keeps
+  // reading the committed state until the END-driven, seqlock-guarded install.
+  bool maintenance_active_ = false;
+  bool maintenance_activating_ = false;            // an activation checkpoint is in flight (emit v3)
+  uint64_t last_completed_consolidate_epoch_ = 0;  // adopted from base; advanced at END
+  bool maintenance_activated_ = false;             // v3 maintenance features activated in the base
+  uint64_t maintenance_activation_gen_ = 0;        // superblock generation of the activation checkpoint
+  // Private overlay: page_index -> resident bytes; and evicted pages -> latest kind=1
+  // frame location (reload via WalFile::read_frame). Union = every touched page.
+  std::unordered_map<size_t, std::vector<char>> maint_pages_;
+  std::unordered_set<size_t> maint_dirty_;  // overlay pages actually modified (need install)
+  std::unordered_map<size_t, alaya::wal::FrameLocation> maint_spilled_;
+  uint64_t maint_epoch_ = 0;                        // the in-flight epoch id
+  PID maint_local_free_head_ = kPidMax;             // transaction-local free head (published at END)
+  uint64_t maint_local_free_count_ = 0;
 };
 
 }  // namespace alaya::laser

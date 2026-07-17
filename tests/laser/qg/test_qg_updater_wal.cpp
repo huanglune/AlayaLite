@@ -200,13 +200,81 @@ TEST(QgUpdaterWal, ForeignLineageIsRejected) {
   std::filesystem::remove_all(dir);
 }
 
-TEST(QgUpdaterWal, ReclaimAndConsolidateAreRejectedUnderWal) {
+// W1: consolidate is now a real maintenance transaction under enable_wal (four
+// parameters unblocked). garden stays gated (its page rewrites still need their own
+// transaction). The old "both rejected" scope test becomes "consolidate runs,
+// garden still throws".
+TEST(QgUpdaterWal, ConsolidateRunsButGardenStillRejectedUnderWal) {
   const auto dir = scratch_dir("scope");
   std::filesystem::remove_all(dir);
   auto base = WalTinyIndex::build(dir, kBaseN, 66);
   Session s(base.prefix, kBaseN + kInsert + 16);
-  EXPECT_THROW(s.upd->consolidate(1), std::logic_error);
+  for (PID id = 0; id < static_cast<PID>(kTomb); ++id) {
+    s.upd->tombstone(id);
+  }
+  EXPECT_NO_THROW(s.upd->consolidate(1, /*r_target=*/0, /*reclaim_slots=*/false,
+                                     /*bloom_consolidate=*/false));
   EXPECT_THROW(s.upd->garden(1, GardenParams{}), std::logic_error);
+  std::filesystem::remove_all(dir);
+}
+
+// W1 reclaim: a consolidate epoch with reclaim frees every tombstoned row, and a
+// reopen with NO checkpoint recovers the whole transaction by op-WAL replay alone
+// (the epoch state machine redoes the final after-image). The four consolidate
+// parameter combinations all commit as one transaction.
+TEST(QgUpdaterWal, ConsolidateReclaimTransactionRecoversByReplay) {
+  const auto dir = scratch_dir("consolidate_reclaim");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, 77);
+  {
+    Session s(base.prefix, kBaseN + 64);
+    for (PID id = 0; id < static_cast<PID>(kTomb); ++id) {
+      s.upd->tombstone(id);
+    }
+    s.upd->consolidate(1, /*r_target=*/0, /*reclaim_slots=*/true, /*bloom_consolidate=*/false);
+    EXPECT_EQ(s.upd->free_count(), kTomb) << "every tombstoned row reclaimed";
+    EXPECT_EQ(s.upd->live_count(), kBaseN - kTomb);
+    // A live search still returns results (routing survived the purge).
+    const auto q = waltest::make_data(1, kDim, 0x321);
+    const auto hits = s.upd->search(q.data(), 10, 64);
+    EXPECT_FALSE(hits.empty());
+    // NO checkpoint: the transaction lives purely in the op-WAL tail.
+  }
+  {
+    Session s(base.prefix, kBaseN + 64);
+    EXPECT_EQ(s.upd->live_count(), kBaseN - kTomb) << "epoch redone from the WAL";
+    EXPECT_EQ(s.upd->free_count(), kTomb) << "free set derived from recovered trailers";
+    for (PID id = 0; id < static_cast<PID>(kTomb); ++id) {
+      EXPECT_FALSE(row_is_live(*s.upd, id));
+    }
+    const auto q = waltest::make_data(1, kDim, 0x321);
+    EXPECT_FALSE(s.upd->search(q.data(), 10, 64).empty());
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// W1 checkpoint absorbs a consolidate epoch into a v3 base and resets the WAL; a
+// subsequent reopen sees the v3 superblock and an empty (single-flip) WAL.
+TEST(QgUpdaterWal, ConsolidateThenCheckpointFlipsV3AndReopens) {
+  const auto dir = scratch_dir("consolidate_ckpt");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, 88);
+  {
+    Session s(base.prefix, kBaseN + 64);
+    for (PID id = 0; id < static_cast<PID>(kTomb); ++id) {
+      s.upd->tombstone(id);
+    }
+    s.upd->consolidate(1, 0, true, true);  // bloom + reclaim
+    s.upd->checkpoint();
+    EXPECT_EQ(s.upd->live_count(), kBaseN - kTomb);
+  }
+  {
+    Session s(base.prefix, kBaseN + 64);
+    EXPECT_EQ(s.upd->live_count(), kBaseN - kTomb);
+    EXPECT_EQ(s.upd->free_count(), kTomb);
+    const auto q = waltest::make_data(1, kDim, 0x654);
+    EXPECT_FALSE(s.upd->search(q.data(), 10, 64).empty());
+  }
   std::filesystem::remove_all(dir);
 }
 

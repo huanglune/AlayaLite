@@ -80,6 +80,7 @@ struct Recovered {
   bool poisoned = false;
   size_t num_points = 0;
   uint64_t live_count = 0;
+  uint64_t free_count = 0;
   uint64_t last_txid = 0;
   uint64_t applied_op = 0;
   std::optional<uint64_t> appended_label;  // label of pid == kBaseN, when committed
@@ -100,6 +101,7 @@ Recovered recover(const std::string &prefix, size_t max_points) {
     QGUpdater upd(qg, params);
     r.num_points = upd.num_points();
     r.live_count = upd.live_count();
+    r.free_count = upd.free_count();
     r.last_txid = upd.last_committed_txid();
     r.applied_op = upd.applied_collection_op_id();
     if (upd.num_points() > kBaseN) {
@@ -206,6 +208,96 @@ INSTANTIATE_TEST_SUITE_P(
                  SegmentOpFailPoint::after_superblock_write_before_wal_reset, true, true},
         KillCase{"after_wal_reset", SegmentOpFailPoint::after_wal_reset, true, true}),
     [](const ::testing::TestParamInfo<KillCase> &info) { return info.param.name; });
+
+// ---------------------------------------------------------------------------
+// Layer 1 (consolidate transaction, W1): SIGKILL at the maintenance-epoch cuts.
+// The op is tombstone(kTomb rows) + consolidate(reclaim). The activation
+// checkpoint (which makes the tombstones + the v3 base durable) runs BEFORE any
+// consolidate failpoint, so live_count is always kBaseN-kTomb after recovery; the
+// distinguishing field is free_count: 0 until the END fsync commits the epoch,
+// then kTomb (roll-forward). No cut may poison; double replay is byte-stable.
+// ---------------------------------------------------------------------------
+constexpr size_t kConsolTomb = 4;
+
+struct ConsolidateKillCase {
+  const char *name;
+  SegmentOpFailPoint point;
+  bool expect_reclaimed;  // after recovery the free-list holds the kConsolTomb rows
+};
+
+class SegmentOpWalConsolidateSigkill : public ::testing::TestWithParam<ConsolidateKillCase> {};
+
+TEST_P(SegmentOpWalConsolidateSigkill, ReopenIsPrefixReachableAndDoubleReplayStable) {
+  const auto param = GetParam();
+  const auto root = battery_root(std::string("consol_") + param.name);
+  std::filesystem::remove_all(root);
+  const auto template_dir = root / "template";
+  auto base = WalTinyIndex::build(template_dir, kBaseN, 4343);
+  const size_t max_points = kBaseN + kInsert + 16;
+  prepare_wal_base(base.prefix, max_points);
+
+  const auto case_dir = root / "case";
+  copy_tree(template_dir, case_dir);
+  const std::string case_prefix = (case_dir / "wal_base").string();
+
+  const auto child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    try {
+      QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+      qg.load_disk_index(case_prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+      qg.set_params(64, 1, 1);
+      UpdateParams params;
+      params.enable_wal = true;
+      params.max_points = max_points;
+      const SegmentOpFailPoint target = param.point;
+      params.failpoint_hook = [target](SegmentOpFailPoint fp) {
+        if (fp == target) {
+          ::kill(::getpid(), SIGKILL);
+          ::_exit(99);
+        }
+      };
+      QGUpdater upd(qg, params);
+      for (PID id = 0; id < static_cast<PID>(kConsolTomb); ++id) upd.tombstone(id);
+      upd.consolidate(1, /*r_target=*/0, /*reclaim_slots=*/true, /*bloom_consolidate=*/false);
+    } catch (...) {
+      ::_exit(70);
+    }
+    ::_exit(0);
+  }
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+
+  const auto first = recover(case_prefix, max_points);
+  ASSERT_FALSE(first.poisoned) << "recovery of " << param.name << " must not poison";
+  EXPECT_EQ(first.num_points, kBaseN) << param.name << " HWM is unchanged by consolidate";
+  EXPECT_EQ(first.live_count, kBaseN - kConsolTomb)
+      << param.name << " tombstones durable via the activation checkpoint";
+  EXPECT_EQ(first.free_count, param.expect_reclaimed ? kConsolTomb : 0U)
+      << param.name << " free-list reflects the epoch commit point";
+  const auto second = recover(case_prefix, max_points);
+  EXPECT_EQ(first.num_points, second.num_points);
+  EXPECT_EQ(first.live_count, second.live_count);
+  EXPECT_EQ(first.free_count, second.free_count);
+  EXPECT_EQ(first.index_bytes, second.index_bytes) << param.name << " index not byte-stable";
+  EXPECT_EQ(first.wal_bytes, second.wal_bytes) << param.name << " wal not byte-stable";
+
+  std::filesystem::remove_all(root);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    ConsolidateKillPoints, SegmentOpWalConsolidateSigkill,
+    ::testing::Values(
+        ConsolidateKillCase{"begin_fsync", SegmentOpFailPoint::after_consolidate_begin_fsync,
+                            false},
+        ConsolidateKillCase{"before_end_append",
+                            SegmentOpFailPoint::before_consolidate_end_append, false},
+        ConsolidateKillCase{"end_fsync", SegmentOpFailPoint::after_consolidate_end_fsync, true},
+        ConsolidateKillCase{"install_page", SegmentOpFailPoint::after_consolidate_install_page,
+                            true},
+        ConsolidateKillCase{"install_before_publish",
+                            SegmentOpFailPoint::after_consolidate_install_before_publish, true}),
+    [](const ::testing::TestParamInfo<ConsolidateKillCase> &info) { return info.param.name; });
 
 // Layer 1 (label transaction, B-07): SIGKILL at the four new bundle/checkpoint
 // cuts. A torn bundle (kill before the kind=8 fsync) loses its whole buffered
