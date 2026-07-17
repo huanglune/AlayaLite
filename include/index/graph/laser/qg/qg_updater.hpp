@@ -1495,10 +1495,13 @@ class QGUpdater {
       bundle_state_ = BundleState::kIdle;
       reservation_count_ = 0;
       return result;
-    } catch (const std::exception &error) {
+    } catch (...) {
+      // BLOCKER-2: reservation state is kBuilding here, so ANY exception -- including a
+      // non-std::exception failpoint throw or a bad_alloc while composing a diagnostic --
+      // must fail the handle closed. Latch first (noexcept), then rethrow the original.
       insert_visible_override_ = 0;
       bundle_ctx_ = nullptr;  // stop routing into a half-built overlay
-      poison(std::string("canonical bundle failed mid-transaction: ") + error.what());
+      poison_current_exception("canonical bundle failed mid-transaction");
     }
   }
 
@@ -2138,6 +2141,31 @@ class QGUpdater {
     }
     next.checksum = qg_superblock_checksum(next);
     const int next_slot = active_superblock_slot_ == 0 ? 1 : 0;
+    // In-memory adoption of the just-written base, shared by both branches. Runs AFTER
+    // the durable superblock/flip on the enable_wal path (inside the poison guard below).
+    const auto adopt_in_memory = [&] {
+      superblock_ = next;
+      active_superblock_slot_ = next_slot;
+      qg_.num_points_ = committed_.load(std::memory_order_acquire);
+      if (enable_wal_) {
+        const auto ls = read_superblock_label_state(next);
+        active_label_slot_ = static_cast<int>(ls.slot);
+        label_generation_ = ls.generation;
+        label_count_ = ls.count;
+        label_checksum_ = ls.checksum;
+        persisted_label_content_revision_ = label_content_revision_;  // slot now matches revision
+        const auto w2c = read_superblock_wal2c_state(next);
+        last_completed_consolidate_epoch_ = w2c.last_completed_consolidate_epoch;
+        maintenance_activation_gen_ = w2c.maintenance_activation_sb_generation;
+        pid_reuse_activation_gen_ = w2c.pid_reuse_activation_sb_generation;
+        if (next.format_version == kQGFormatVersionV3) {
+          maintenance_activated_ = true;
+          if ((w2c.required_feature_flags & kQgFeatPidGenerationV1) != 0) {
+            pid_generation_activated_ = true;
+          }
+        }
+      }
+    };
     if (enable_wal_ && !replaying_) {
       // Sequence (clause D): flip frame append+fsync (WAL) -> ftruncate + superblock
       // pwrite+fsync (index) -> reset WAL. Each boundary is a crash-matrix cut.
@@ -2148,48 +2176,35 @@ class QGUpdater {
                                                static_cast<uint8_t>(next_slot),
                                                image);
       wal_append(flip, alaya::wal::WalFile::Sync::fsync);
-      wal_failpoint(SegmentOpFailPoint::after_flip_append_before_superblock_write);
-      if (::ftruncate(fd_, static_cast<off_t>(file_size)) != 0) {
-        poison("checkpoint ftruncate failed");
-      }
-      write_superblock(next_slot, next);  // pwrite + fsync (index durable)
-      wal_failpoint(SegmentOpFailPoint::after_superblock_write_before_wal_reset);
-      // Retain exactly one flip marker as the new base; a crash after the durable
-      // superblock but before this reset is a safe roll-forward (old WAL suffices).
+      // BLOCKER-4: from the instant the flip is durable through the in-memory adoption,
+      // ANY exception (superblock pwrite/fsync, WAL reset, a post-flip observer/failpoint,
+      // or an allocation inside the adoption) must poison this handle. A durable G+1 flip
+      // already exists in the WAL; a surviving handle that threw WITHOUT poisoning could
+      // retry checkpoint() and write a SECOND, different G+1 flip that replay cannot
+      // reconcile ("same generation image differs"). A process crash still rolls forward
+      // (replay applies the single durable flip); only a live handle must stop here.
       try {
+        wal_failpoint(SegmentOpFailPoint::after_flip_append_before_superblock_write);
+        if (::ftruncate(fd_, static_cast<off_t>(file_size)) != 0) {
+          poison("checkpoint ftruncate failed");
+        }
+        write_superblock(next_slot, next);  // pwrite + fsync (index durable)
+        wal_failpoint(SegmentOpFailPoint::after_superblock_write_before_wal_reset);
+        // Retain exactly one flip marker as the new base; a crash after the durable
+        // superblock but before this reset is a safe roll-forward (old WAL suffices).
         op_wal_->reset_to_single_frame(kSegmentOpRecordType, 0, ++wal_op_id_, 0, flip);
-      } catch (const std::exception &error) {
-        poison(std::string("checkpoint WAL reset failed (superblock durable; roll-forward): ") +
-               error.what());
+        notify_wal_fsync();
+        wal_failpoint(SegmentOpFailPoint::after_wal_reset);
+        adopt_in_memory();
+      } catch (...) {
+        poison_current_exception("checkpoint failed after the flip became durable (roll-forward on reopen)");
       }
-      notify_wal_fsync();
-      wal_failpoint(SegmentOpFailPoint::after_wal_reset);
     } else {
       if (::ftruncate(fd_, static_cast<off_t>(file_size)) != 0) {
         throw std::runtime_error("QGUpdater: ftruncate failed");
       }
       write_superblock(next_slot, next);
-    }
-    superblock_ = next;
-    active_superblock_slot_ = next_slot;
-    qg_.num_points_ = committed_.load(std::memory_order_acquire);
-    if (enable_wal_) {
-      const auto ls = read_superblock_label_state(next);
-      active_label_slot_ = static_cast<int>(ls.slot);
-      label_generation_ = ls.generation;
-      label_count_ = ls.count;
-      label_checksum_ = ls.checksum;
-      persisted_label_content_revision_ = label_content_revision_;  // slot now matches revision
-      const auto w2c = read_superblock_wal2c_state(next);
-      last_completed_consolidate_epoch_ = w2c.last_completed_consolidate_epoch;
-      maintenance_activation_gen_ = w2c.maintenance_activation_sb_generation;
-      pid_reuse_activation_gen_ = w2c.pid_reuse_activation_sb_generation;
-      if (next.format_version == kQGFormatVersionV3) {
-        maintenance_activated_ = true;
-        if ((w2c.required_feature_flags & kQgFeatPidGenerationV1) != 0) {
-          pid_generation_activated_ = true;
-        }
-      }
+      adopt_in_memory();
     }
   }
 
@@ -3073,9 +3088,10 @@ class QGUpdater {
       note_allocated(new_hwm);
       bundle_state_ = BundleState::kBuilding;
       return out;
-    } catch (const std::exception &error) {
-      poison(std::string("reserve_bundle_pids failed after publishing reservation state: ") +
-             error.what());
+    } catch (...) {
+      // BLOCKER-2/3: reservation state is published (kReserving); a non-std::exception or
+      // an allocation failure past this point must still fail the handle closed.
+      poison_current_exception("reserve_bundle_pids failed after publishing reservation state");
     }
   }
 
@@ -4280,12 +4296,13 @@ class QGUpdater {
       maintenance_active_ = false;
       maint_reset_overlay();
       wal_failpoint(SegmentOpFailPoint::after_consolidate_publish);                  // C11
-    } catch (const std::exception &error) {
+    } catch (...) {
       // Design/checkpoint-admission ruling: a failure past BEGIN keeps the epoch
       // state and overlay intact and poisons the handle -- recovery rebuilds from
       // the WAL (an unmatched BEGIN is semantically truncated; a post-END failure
       // rolls forward). Never clean up and pretend to continue on this handle.
-      poison(std::string("consolidate failed mid-transaction: ") + error.what());
+      // BLOCKER-2: catch-all so a non-std::exception / bad_alloc past BEGIN still latches.
+      poison_current_exception("consolidate failed mid-transaction");
     }
   }
 
@@ -5843,20 +5860,55 @@ class QGUpdater {
     label_working_ = std::move(lb.bindings);
   }
 
+  // Set the lock-free poison latch with NO allocation (BLOCKER-2/3): the atomic is the
+  // authoritative fail-closed signal, so it must be settable even while the process is
+  // out of memory (e.g. inside a catch handling a std::bad_alloc). The reason string is
+  // a best-effort diagnostic that may fail to allocate; ensure_writable() reads the
+  // atomic first so a reason-less poison still fails every subsequent writable check.
+  void poison_latch() noexcept { poisoned_.store(true, std::memory_order_release); }
   [[noreturn]] void poison(const std::string &reason) {
-    // Set the lock-free poison latch first so a concurrent search (which never
-    // takes the handle write mutex) observes the poisoned handle via the atomic,
-    // without racing on the poison_reason_ std::string (write-path only).
-    poisoned_.store(true, std::memory_order_release);
-    if (poison_reason_.empty()) {
-      poison_reason_ = reason;
+    // Latch first (noexcept) so a concurrent search (which never takes the handle write
+    // mutex) observes the poison via the atomic without racing the std::string; and so a
+    // bad_alloc while building the reason/throw message below still leaves the handle
+    // permanently fail-closed.
+    poison_latch();
+    try {
+      if (poison_reason_.empty()) {
+        poison_reason_ = reason;
+      }
+    } catch (...) {
+      // The latch is set; a missing diagnostic never un-poisons the handle.
     }
-    throw std::runtime_error("QGUpdater op-WAL writer poisoned: " + poison_reason_);
+    throw std::runtime_error(poison_reason_.empty()
+                                 ? std::string("QGUpdater op-WAL writer poisoned")
+                                 : "QGUpdater op-WAL writer poisoned: " + poison_reason_);
   }
   void ensure_writable() const {
-    if (!poison_reason_.empty()) {
-      throw std::runtime_error("QGUpdater op-WAL writer is poisoned: " + poison_reason_);
+    // BLOCKER-2: check the atomic latch FIRST. A poison() that could not allocate its
+    // reason string still set the atomic; reading only poison_reason_ would then let a
+    // writer keep going (the bad_alloc-in-catch bypass). The reason is appended only as
+    // a diagnostic when it is present.
+    if (poisoned_.load(std::memory_order_acquire)) {
+      throw std::runtime_error(poison_reason_.empty()
+                                   ? std::string("QGUpdater op-WAL writer is poisoned")
+                                   : "QGUpdater op-WAL writer is poisoned: " + poison_reason_);
     }
+  }
+  // BLOCKER-2: catch-all poison used by every mutating region past a durable/reservation
+  // boundary. Latches (noexcept) BEFORE any allocation so a non-std::exception failpoint
+  // throw (e.g. `throw 7`) or a bad_alloc cannot escape a still-non-idle handle without
+  // fail-closing it, then rethrows the ORIGINAL exception (preserving its type). Must be
+  // called only from inside a catch clause (uses `throw;`).
+  [[noreturn]] void poison_current_exception(const char *fallback_reason) {
+    poison_latch();
+    try {
+      if (poison_reason_.empty()) {
+        poison_reason_ = fallback_reason;
+      }
+    } catch (...) {
+      // The latch is set; a missing diagnostic never un-poisons the handle.
+    }
+    throw;  // rethrow the exception currently being handled
   }
   void wal_failpoint(SegmentOpFailPoint fp) {
     if (params_.failpoint_hook) {
