@@ -391,11 +391,19 @@ class MutableLaserSegment {
   [[nodiscard]] auto effective_label(laser::PID pid,
                                      const std::shared_ptr<const laser::LabelBindings> &snap) const
       -> uint64_t {
+    // W2 (design section 3.2): an explicit binding is the override for ALL PIDs, not
+    // just appended ones -- a reused base PID carries a fresh binding that supersedes
+    // its immutable-sidecar label. Order: explicit binding, then base sidecar, then
+    // identity. (Before pid-reuse activation no base PID has a binding, so this is a
+    // no-op vs the old base-first order.)
+    const uint64_t *bound = snap ? snap->find(pid) : nullptr;
+    if (bound != nullptr) {
+      return *bound;
+    }
     if (static_cast<uint64_t>(pid) < base_count_) {
       return ids_view_[pid];
     }
-    const uint64_t *bound = snap ? snap->find(pid) : nullptr;
-    return bound != nullptr ? *bound : static_cast<uint64_t>(pid);
+    return static_cast<uint64_t>(pid);
   }
 
   // B-06: over ALL committed live PIDs, the effective label (base sidecar U legacy

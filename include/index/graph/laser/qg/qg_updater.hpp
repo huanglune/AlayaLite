@@ -444,10 +444,33 @@ struct GardenParams {
 // at the segment layer. Published via std::atomic<shared_ptr> and never mutated
 // after publish, so lock-free search translates labels off a consistent snapshot.
 // The map is ordered so slot serialization is deterministic (ascending pid).
-struct LabelBindings {
-  std::map<PID, uint64_t> bindings;  // pid -> label, appended PIDs only
+// A PID's durable incarnation: pid_generation (0 for a never-reused / append-only
+// PID, else strictly old+1 per reuse) plus its logical label. The 16-byte label
+// slot wire already carries {pid u32, pid_generation u32, label u64} (2A wrote the
+// generation as 0 and rejected non-zero); W2 activates it (design section 3.1).
+struct PidBinding {
+  uint32_t pid_generation = 0;
+  uint64_t label = 0;
+};
 
+// The reuse-safe identity of a committed row: (pid, pid_generation). commit returns
+// these so the caller (2B adapter) binds label->token instead of guessing a dense
+// range, and tombstone(token) can reject a stale incarnation via an ABA check.
+struct PidToken {
+  PID pid = 0;
+  uint32_t pid_generation = 0;
+};
+
+struct LabelBindings {
+  std::map<PID, PidBinding> bindings;  // pid -> {generation, label}
+
+  // Label-only lookup (the historical API): a pointer to the binding's label, or
+  // null. Consumers that need the incarnation use find_binding().
   [[nodiscard]] const uint64_t *find(PID pid) const {
+    const auto it = bindings.find(pid);
+    return it == bindings.end() ? nullptr : &it->second.label;
+  }
+  [[nodiscard]] const PidBinding *find_binding(PID pid) const {
     const auto it = bindings.find(pid);
     return it == bindings.end() ? nullptr : &it->second;
   }
@@ -1176,7 +1199,7 @@ class QGUpdater {
       // this point on the publish path).
       auto next = std::make_shared<LabelBindings>(*load_label_snapshot());
       for (size_t i = 0; i < n; ++i) {
-        next->bindings.emplace(static_cast<PID>(old_hwm + i), labels[i]);
+        next->bindings.emplace(static_cast<PID>(old_hwm + i), PidBinding{0, labels[i]});
       }
       std::shared_ptr<const LabelBindings> published = std::move(next);
       // (3) append kind=8 + fsync: the single durable commit point of the bundle.
@@ -4811,10 +4834,10 @@ class QGUpdater {
   [[nodiscard]] static std::vector<std::byte> serialize_label_slot(const LabelBindings &lb) {
     std::vector<std::byte> out;
     out.reserve(lb.bindings.size() * 16);
-    for (const auto &[pid, label] : lb.bindings) {
+    for (const auto &[pid, binding] : lb.bindings) {
       alaya::wal::put_u32(out, static_cast<std::uint32_t>(pid));
-      alaya::wal::put_u32(out, 0);  // pid_generation is always 0 in 2A
-      alaya::wal::put_u64(out, label);
+      alaya::wal::put_u32(out, binding.pid_generation);  // W2: real per-PID incarnation
+      alaya::wal::put_u64(out, binding.label);
     }
     return out;
   }
@@ -4864,15 +4887,17 @@ class QGUpdater {
       const auto pid = alaya::wal::get_u32(bytes, off);
       const auto gen = alaya::wal::get_u32(bytes, off + 4);
       const auto label = alaya::wal::get_u64(bytes, off + 8);
-      if (gen != 0) {
-        poison("label slot entry has a non-zero generation");
+      // W2c relaxes this once pid_generation_v1 is activated; until then (append-only)
+      // every slot entry must carry generation 0 (fail-closed on a forged non-zero).
+      if (gen != 0 && !pid_generation_activated_) {
+        poison("label slot entry has a non-zero generation before pid-reuse activation");
       }
       if (!first && pid <= prev_pid) {
         poison("label slot entries are not strictly ascending by pid");
       }
       first = false;
       prev_pid = pid;
-      lb.bindings.emplace(static_cast<PID>(pid), label);
+      lb.bindings.emplace(static_cast<PID>(pid), PidBinding{gen, label});
     }
     return lb;
   }
@@ -4966,6 +4991,8 @@ class QGUpdater {
     last_completed_consolidate_epoch_ = w2c.last_completed_consolidate_epoch;
     maintenance_activated_ = sb.format_version == kQGFormatVersionV3 &&
                              (w2c.required_feature_flags & kQgFeatMaintenanceTxV1) != 0;
+    pid_generation_activated_ = sb.format_version == kQGFormatVersionV3 &&
+                                (w2c.required_feature_flags & kQgFeatPidGenerationV1) != 0;
     maintenance_activation_gen_ = w2c.maintenance_activation_sb_generation;
     last_committed_txid_ = tx.last_committed_txid;
     applied_collection_op_id_ = tx.applied_collection_op_id;
@@ -5371,7 +5398,7 @@ class QGUpdater {
           poison("op-WAL absorbed tx_publish row_op_id out of range");
         }
         const auto found = label_working_.find(bind.pid);
-        if (found == label_working_.end() || found->second != bind.label) {
+        if (found == label_working_.end() || found->second.label != bind.label) {
           poison("op-WAL absorbed tx_publish binding disagrees with the persisted slot");
         }
       }
@@ -5419,8 +5446,8 @@ class QGUpdater {
     }
     // Promote: install the bindings, advance committed + both tx watermarks.
     for (const auto &bind : staged) {
-      const auto inserted = label_working_.emplace(bind.pid, bind.label);
-      if (!inserted.second && inserted.first->second != bind.label) {
+      const auto inserted = label_working_.emplace(bind.pid, PidBinding{0, bind.label});
+      if (!inserted.second && inserted.first->second.label != bind.label) {
         poison("op-WAL tx_publish rebinds an existing pid to a different label");
       }
     }
@@ -5652,7 +5679,7 @@ class QGUpdater {
   // release/acquire plus search's committed acquire. Never null post-recovery.
   mutable std::mutex label_snapshot_mutex_;
   std::shared_ptr<const LabelBindings> label_snapshot_;
-  std::map<PID, uint64_t> label_working_;  // recovery-only scratch (slot load + promotions)
+  std::map<PID, PidBinding> label_working_;  // recovery-only scratch (slot load + promotions)
   std::string label_slot_path_[2];         // <index>.labels.slot0 / .slot1
   int active_label_slot_ = 0;              // slot holding the persisted bindings
   uint64_t label_generation_ = 0;     // persisted-slot generation (bumped on content checkpoint)
@@ -5681,6 +5708,7 @@ class QGUpdater {
   bool maintenance_activating_ = false;            // an activation checkpoint is in flight (emit v3)
   uint64_t last_completed_consolidate_epoch_ = 0;  // adopted from base; advanced at END
   bool maintenance_activated_ = false;             // v3 maintenance features activated in the base
+  bool pid_generation_activated_ = false;          // v3 pid-reuse feature activated (W2c)
   uint64_t maintenance_activation_gen_ = 0;        // superblock generation of the activation checkpoint
   // Private overlay: page_index -> resident bytes; and evicted pages -> latest kind=1
   // frame location (reload via WalFile::read_frame). Union = every touched page.
