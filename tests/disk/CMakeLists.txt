@@ -127,6 +127,7 @@ if(ALAYA_ENABLE_LASER)
       laser_segment_test.cpp
       laser_segment_stress_test.cpp
       rabitq_format_separation_test.cpp
+      test_unified_laser_admission.cpp
   )
   set(ALAYA_LASER_SEGMENT_TEST_TARGETS)
   foreach(laser_segment_test_source IN LISTS ALAYA_LASER_SEGMENT_TEST_CANDIDATES)

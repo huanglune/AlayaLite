@@ -168,6 +168,23 @@ alaya_add_test(
   LABELS laser unit
 )
 
+# Segment admission contract kernel-level tests: tombstone parity between the
+# legacy result_filter_ exclude-set path and the RowAdmission bitmap path
+# (contract acceptance #2), bitmap-filter correctness, and the admission vs.
+# exclude-set performance A/B (contract acceptance #4).
+alaya_cc_target(
+  test_admission_contract
+  BARE GTEST
+  SRCS qg/test_admission_contract.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_admission_contract
+  TARGET test_admission_contract
+  LABELS laser
+)
+
 # Bench-only fbin mmap view used by update modes under cgroup RAM caps.
 alaya_cc_target(
   test_bench_laser_update_sift_support
