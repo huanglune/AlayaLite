@@ -101,10 +101,10 @@ TEST(SegmentOpCodec, RejectsBadVersionKindAndTruncation) {
     encoded[0] = static_cast<std::byte>(2);  // bump payload_version low byte
     EXPECT_THROW((void)decode_segment_op(encoded), std::invalid_argument);
   }
-  // Unknown kind byte (0 and 7 are out of range).
+  // Unknown kind byte (0 and 9 are out of range; 7/8 are now valid label ops).
   {
     auto encoded = encode_publish(kSegId, kGen, 1);
-    encoded[18] = static_cast<std::byte>(7);  // kind byte is right after version(2)+2*u64(16)
+    encoded[18] = static_cast<std::byte>(9);  // kind byte is right after version(2)+2*u64(16)
     EXPECT_THROW((void)decode_segment_op(encoded), std::invalid_argument);
     encoded[18] = static_cast<std::byte>(0);
     EXPECT_THROW((void)decode_segment_op(encoded), std::invalid_argument);
@@ -120,6 +120,99 @@ TEST(SegmentOpCodec, RejectsBadVersionKindAndTruncation) {
     auto encoded = encode_tombstone(kSegId, kGen, 5);
     encoded.push_back(std::byte{0});
     EXPECT_THROW((void)decode_segment_op(encoded), std::invalid_argument);
+  }
+}
+
+// Frozen wire format for kinds 1-6: a byte-for-byte golden captured from the
+// current codec. It guards the kind=5 emit path against the W3 publish_with_record
+// refactor and any future codec drift. Fixed inputs (see the golden generator).
+TEST(SegmentOpCodec, Kind1Through6GoldenBytesAreFrozen) {
+  constexpr std::uint64_t sid = 0x0102030405060708ULL;
+  constexpr std::uint64_t gen = 0x1112131415161718ULL;
+  auto to_u8 = [](const std::vector<std::byte> &v) {
+    std::vector<std::uint8_t> out(v.size());
+    for (std::size_t i = 0; i < v.size(); ++i) out[i] = std::to_integer<std::uint8_t>(v[i]);
+    return out;
+  };
+  const std::vector<std::byte> rp_bytes = {std::byte{0xAA}, std::byte{0xBB}, std::byte{0xCC},
+                                           std::byte{0xDD}};
+  EXPECT_EQ(
+      to_u8(encode_row_patch(sid, gen, 0x2122232425262728ULL, 0x0000000000001800ULL, rp_bytes)),
+      (std::vector<std::uint8_t>{0x01, 0x00, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x18,
+                                 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x01, 0x28, 0x27, 0x26,
+                                 0x25, 0x24, 0x23, 0x22, 0x21, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00,
+                                 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0xaa, 0xbb, 0xcc, 0xdd}));
+  EXPECT_EQ(to_u8(encode_tombstone(sid, gen, 0x3132333435363738ULL)),
+            (std::vector<std::uint8_t>{0x01, 0x00, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02,
+                                       0x01, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
+                                       0x02, 0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31}));
+  EXPECT_EQ(to_u8(encode_consolidate_marker(sid, gen, SegmentOpKind::consolidate_begin,
+                                            0x4142434445464748ULL)),
+            (std::vector<std::uint8_t>{0x01, 0x00, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02,
+                                       0x01, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
+                                       0x03, 0x48, 0x47, 0x46, 0x45, 0x44, 0x43, 0x42, 0x41}));
+  EXPECT_EQ(to_u8(encode_consolidate_marker(sid, gen, SegmentOpKind::consolidate_end,
+                                            0x5152535455565758ULL)),
+            (std::vector<std::uint8_t>{0x01, 0x00, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02,
+                                       0x01, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
+                                       0x04, 0x58, 0x57, 0x56, 0x55, 0x54, 0x53, 0x52, 0x51}));
+  EXPECT_EQ(to_u8(encode_publish(sid, gen, 0x6162636465666768ULL)),
+            (std::vector<std::uint8_t>{0x01, 0x00, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02,
+                                       0x01, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
+                                       0x05, 0x68, 0x67, 0x66, 0x65, 0x64, 0x63, 0x62, 0x61}));
+  // superblock_flip: the 512-byte image is opaque passthrough (roundtrip covers
+  // it); freeze the 24-byte header/slot/length prefix and the framing size.
+  std::vector<std::byte> img(kSegmentSuperblockImageBytes);
+  for (std::size_t i = 0; i < img.size(); ++i) img[i] = static_cast<std::byte>((i * 7 + 3) & 0xFF);
+  const auto flip = to_u8(encode_superblock_flip(sid, gen, 1, img));
+  ASSERT_EQ(flip.size(), 19U + 1U + 4U + kSegmentSuperblockImageBytes);
+  const std::vector<std::uint8_t> flip_prefix(flip.begin(), flip.begin() + 24);
+  EXPECT_EQ(flip_prefix,
+            (std::vector<std::uint8_t>{0x01, 0x00, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+                                       0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x06, 0x01,
+                                       0x00, 0x02, 0x00, 0x00}));
+}
+
+TEST(SegmentOpCodec, LabelBindRoundTrip) {
+  const auto encoded = encode_label_bind(kSegId, kGen, /*tx_id=*/0xABCDEF01ULL, /*row_op_id=*/3,
+                                         /*pid=*/0x1234U, /*pid_generation=*/0,
+                                         /*label=*/0xFEEDFACEULL);
+  const auto op = decode_segment_op(encoded);
+  EXPECT_EQ(op.kind, SegmentOpKind::label_bind);
+  EXPECT_EQ(op.tx_id, 0xABCDEF01ULL);
+  EXPECT_EQ(op.row_op_id, 3U);
+  EXPECT_EQ(op.pid, 0x1234U);
+  EXPECT_EQ(op.pid_generation, 0U);
+  EXPECT_EQ(op.label, 0xFEEDFACEULL);
+}
+
+TEST(SegmentOpCodec, TxPublishRoundTrip) {
+  const auto encoded = encode_tx_publish(kSegId, kGen, /*tx_id=*/7, /*new_pid_watermark=*/210,
+                                         /*binding_count=*/10, /*applied_collection_op_id=*/99);
+  const auto op = decode_segment_op(encoded);
+  EXPECT_EQ(op.kind, SegmentOpKind::tx_publish);
+  EXPECT_EQ(op.tx_id, 7U);
+  EXPECT_EQ(op.new_pid_watermark, 210U);
+  EXPECT_EQ(op.binding_count, 10U);
+  EXPECT_EQ(op.applied_collection_op_id, 99U);
+}
+
+TEST(SegmentOpCodec, LabelOpsRejectTruncationAndTrailing) {
+  {
+    auto e = encode_label_bind(kSegId, kGen, 1, 0, 5, 0, 7);
+    e.pop_back();
+    EXPECT_THROW((void)decode_segment_op(e), std::invalid_argument);
+    auto t = encode_label_bind(kSegId, kGen, 1, 0, 5, 0, 7);
+    t.push_back(std::byte{0});
+    EXPECT_THROW((void)decode_segment_op(t), std::invalid_argument);
+  }
+  {
+    auto e = encode_tx_publish(kSegId, kGen, 1, 2, 3, 4);
+    e.pop_back();
+    EXPECT_THROW((void)decode_segment_op(e), std::invalid_argument);
+    auto t = encode_tx_publish(kSegId, kGen, 1, 2, 3, 4);
+    t.push_back(std::byte{0});
+    EXPECT_THROW((void)decode_segment_op(t), std::invalid_argument);
   }
 }
 

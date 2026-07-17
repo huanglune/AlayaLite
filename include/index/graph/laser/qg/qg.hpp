@@ -183,6 +183,10 @@ struct QGSuperblockV2 {
   uint64_t node_per_page = 0;
   uint64_t page_size = 0;
   uint64_t file_size = 0;
+  // reserved[] carries the op-WAL lineage + 2A label/tx state as a host-endian
+  // sub-layout (see QGUpdater kUidReservedOffset / kLabelStateReservedOffset /
+  // kTxStateReservedOffset): [0..8) segment_uid, [8..40) label slot/gen/count/
+  // checksum, [40..56) last_committed_txid/applied_collection_op_id, [56..408) 2C.
   std::array<uint8_t, 408> reserved{};
 };
 static_assert(sizeof(QGSuperblockV2) == kQGSuperblockSize);

@@ -4076,8 +4076,29 @@ class QGUpdater {
   // rebuild (clause C), a flip-frame generation state machine (clause E), and a
   // fail-closed writer that poisons on any WAL/critical-index error (clause I).
 
-  // segment_uid occupies the first 8 bytes of QGSuperblockV2::reserved.
+  // QGSuperblockV2::reserved[408] sub-layout (host-endian, mirroring the uid
+  // convention). 512B superblock size is unchanged; see qg.hpp for the map.
+  //   [0..8)   segment_uid
+  //   [8..40)  label state: slot | generation | count | checksum (4x u64)
+  //   [40..56) tx state: last_committed_txid | applied_collection_op_id (2x u64)
+  //   [56..408) reserved for 2C.
   static constexpr size_t kUidReservedOffset = 0;
+  static constexpr size_t kLabelStateReservedOffset = 8;
+  static constexpr size_t kTxStateReservedOffset = 40;
+  static_assert(kTxStateReservedOffset + 16 <= 408,
+                "superblock reserved sub-layout overflows QGSuperblockV2::reserved[]");
+
+  struct LabelSlotState {
+    uint64_t slot = 0;
+    uint64_t generation = 0;
+    uint64_t count = 0;
+    uint64_t checksum = 0;  // low 32 bits = crc32 of the sorted slot body; high 32 must be 0
+  };
+  struct TxWatermarkState {
+    uint64_t last_committed_txid = 0;
+    uint64_t applied_collection_op_id = 0;
+  };
+
   [[nodiscard]] static uint64_t read_superblock_uid(const QGSuperblockV2 &sb) {
     uint64_t uid = 0;
     std::memcpy(&uid, sb.reserved.data() + kUidReservedOffset, sizeof(uid));
@@ -4085,6 +4106,34 @@ class QGUpdater {
   }
   static void write_superblock_uid(QGSuperblockV2 &sb, uint64_t uid) {
     std::memcpy(sb.reserved.data() + kUidReservedOffset, &uid, sizeof(uid));
+  }
+  [[nodiscard]] static LabelSlotState read_superblock_label_state(const QGSuperblockV2 &sb) {
+    LabelSlotState s;
+    const auto *base = sb.reserved.data() + kLabelStateReservedOffset;
+    std::memcpy(&s.slot, base + 0, 8);
+    std::memcpy(&s.generation, base + 8, 8);
+    std::memcpy(&s.count, base + 16, 8);
+    std::memcpy(&s.checksum, base + 24, 8);
+    return s;
+  }
+  static void write_superblock_label_state(QGSuperblockV2 &sb, const LabelSlotState &s) {
+    auto *base = sb.reserved.data() + kLabelStateReservedOffset;
+    std::memcpy(base + 0, &s.slot, 8);
+    std::memcpy(base + 8, &s.generation, 8);
+    std::memcpy(base + 16, &s.count, 8);
+    std::memcpy(base + 24, &s.checksum, 8);
+  }
+  [[nodiscard]] static TxWatermarkState read_superblock_tx_state(const QGSuperblockV2 &sb) {
+    TxWatermarkState s;
+    const auto *base = sb.reserved.data() + kTxStateReservedOffset;
+    std::memcpy(&s.last_committed_txid, base + 0, 8);
+    std::memcpy(&s.applied_collection_op_id, base + 8, 8);
+    return s;
+  }
+  static void write_superblock_tx_state(QGSuperblockV2 &sb, const TxWatermarkState &s) {
+    auto *base = sb.reserved.data() + kTxStateReservedOffset;
+    std::memcpy(base + 0, &s.last_committed_txid, 8);
+    std::memcpy(base + 8, &s.applied_collection_op_id, 8);
   }
 
   [[noreturn]] void poison(const std::string &reason) {
@@ -4230,6 +4279,12 @@ class QGUpdater {
         case SegmentOpKind::superblock_flip:
           replay_flip(op);
           break;
+        case SegmentOpKind::label_bind:
+        case SegmentOpKind::tx_publish:
+          // W1 wire stub: fail-closed. W3 replaces this with the staging/promotion
+          // state machine (label_bind stages by tx_id; tx_publish promotes).
+          replaying_ = false;
+          poison("op-WAL label transaction replay is not yet wired (W3)");
         case SegmentOpKind::consolidate_begin:
         case SegmentOpKind::consolidate_end:
           replaying_ = false;
