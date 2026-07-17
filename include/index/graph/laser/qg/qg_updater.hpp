@@ -451,14 +451,28 @@ struct GardenParams {
 struct PidBinding {
   uint32_t pid_generation = 0;
   uint64_t label = 0;
+  bool operator==(const PidBinding &) const = default;
 };
 
 // The reuse-safe identity of a committed row: (pid, pid_generation). commit returns
 // these so the caller (2B adapter) binds label->token instead of guessing a dense
 // range, and tombstone(token) can reject a stale incarnation via an ABA check.
 struct PidToken {
-  PID pid = 0;
+  PID pid = kPidMax;  // W2c: kPidMax sentinel -- 0 is a valid PID, so a default token
+                      // must not alias PID 0 (design 3.3 / codex B.1 / JC-16).
   uint32_t pid_generation = 0;
+  bool operator==(const PidToken &) const = default;
+};
+
+// The result of commit_physical_bundle once PID reuse is active (design 3.3): the
+// per-row (pid, pid_generation) tokens in row_op order plus the append high-water
+// marks. The 2B adapter binds label->token from `rows` instead of guessing a dense
+// [old_hwm, new_hwm) range (mixed / all-reuse bundles are not dense). Dormant until
+// the reuse writer lands (steps 4-7); the append path still returns a pair today.
+struct PhysicalBundleResult {
+  std::vector<PidToken> rows;  // one per input row, in row_op_id order
+  uint64_t old_hwm = 0;
+  uint64_t new_hwm = 0;
 };
 
 struct LabelBindings {
@@ -1223,6 +1237,7 @@ class QGUpdater {
       publish_common(new_hwm, [&] {
         store_label_snapshot(published);
       });
+      ++label_content_revision_;  // published bindings changed (design 3.1 slot-dirty tracking)
       last_committed_txid_ = txid;
       applied_collection_op_id_ = applied_op_id;
       // (5) B-07: republish the routing snapshot after the committed watermark
@@ -1783,7 +1798,11 @@ class QGUpdater {
       const auto snap = load_label_snapshot();
       const uint64_t current_count = snap->bindings.size();
       LabelSlotState next_label;
-      if (current_count > label_count_) {
+      // Dirty when the key count grew (append) OR the content revision moved without a
+      // count change (design 3.1: a same-count reuse rebind). In append-only mode the
+      // two coincide, so the OR is byte-identical to the historical count gate.
+      if (current_count > label_count_ ||
+          label_content_revision_ != persisted_label_content_revision_) {
         const int inactive_label_slot = active_label_slot_ == 0 ? 1 : 0;
         const auto body = serialize_label_slot(*snap);
         write_label_slot_file(inactive_label_slot, body);  // pwrite + fsync (slot durable)
@@ -1865,6 +1884,7 @@ class QGUpdater {
       label_generation_ = ls.generation;
       label_count_ = ls.count;
       label_checksum_ = ls.checksum;
+      persisted_label_content_revision_ = label_content_revision_;  // slot now matches revision
       const auto w2c = read_superblock_wal2c_state(next);
       last_completed_consolidate_epoch_ = w2c.last_completed_consolidate_epoch;
       maintenance_activation_gen_ = w2c.maintenance_activation_sb_generation;
@@ -3468,9 +3488,20 @@ class QGUpdater {
   void maint_reclaim_phase() {
     const size_t n = committed_.load(std::memory_order_acquire);
     std::vector<PID> eligible = deleted_snapshot();
+    // A PID whose durable generation is already saturated (UINT32_MAX) must never
+    // re-enter the free list: reuse would wrap its incarnation (design 2.2 / 3.1). It
+    // stays a permanent tombstone. Dormant until reuse is active (append-only PIDs are
+    // all generation 0, so the predicate never trips today).
+    const auto reclaim_snap = load_label_snapshot();
     eligible.erase(std::remove_if(eligible.begin(),
                                   eligible.end(),
-                                  [n](PID id) { return id >= n; }),
+                                  [&](PID id) {
+                                    if (id >= n) return true;
+                                    const auto *b = reclaim_snap->find_binding(id);
+                                    return b != nullptr &&
+                                           b->pid_generation ==
+                                               (std::numeric_limits<uint32_t>::max)();
+                                  }),
                    eligible.end());
     std::sort(eligible.begin(), eligible.end());
     // Push largest-first so the resulting LIFO chain is ascending (head = smallest
@@ -5044,6 +5075,7 @@ class QGUpdater {
     label_generation_ = ls.generation;
     label_count_ = ls.count;
     label_checksum_ = ls.checksum;
+    persisted_label_content_revision_ = label_content_revision_;  // the just-loaded slot is clean
     staged_binds_.clear();
     if (ls.generation == 0 && ls.count == 0 && ls.checksum == 0) {
       active_label_slot_ = ls.slot <= 1 ? static_cast<int>(ls.slot) : 0;
@@ -5521,6 +5553,7 @@ class QGUpdater {
         poison("op-WAL tx_publish rebinds an existing pid to a different label");
       }
     }
+    ++label_content_revision_;  // replay promoted new bindings (design 3.1 slot-dirty tracking)
     committed_watermark = new_hwm;
     last_committed_txid_ = op.tx_id;
     applied_collection_op_id_ = op.applied_collection_op_id;
@@ -5657,6 +5690,13 @@ class QGUpdater {
       free_ids.reserve(free_pid.size());
       for (size_t id = 0; id < static_cast<size_t>(committed); ++id) {
         if (free_pid[id] != 0) {
+          // A FREE PID whose durable generation is already saturated is a crafted /
+          // corrupt state: it must have stayed a permanent tombstone (design 2.3).
+          const auto it = label_working_.find(static_cast<PID>(id));
+          if (it != label_working_.end() &&
+              it->second.pid_generation == (std::numeric_limits<uint32_t>::max)()) {
+            poison("recovery: a FREE PID has a saturated (UINT32_MAX) generation");
+          }
           free_ids.push_back(static_cast<PID>(id));
         }
       }
@@ -5755,6 +5795,14 @@ class QGUpdater {
   uint64_t label_generation_ = 0;     // persisted-slot generation (bumped on content checkpoint)
   uint64_t label_count_ = 0;          // persisted-slot binding count (== superblock label_count)
   uint64_t label_checksum_ = 0;       // persisted-slot checksum (low 32 = crc32, high 32 = 0)
+  // Label-slot content revision (design 3.1 / execution pitfall 2): PID reuse rebinds
+  // {generation,label} at an UNCHANGED key count, so "count grew" no longer implies
+  // "slot dirty". Bump on every published binding-set mutation (bundle commit, replay
+  // promotion); checkpoint writes the inactive slot whenever it differs from the
+  // persisted revision. In append-only mode a bump coincides with a count increase, so
+  // this stays byte-identical to the old count gate (golden / 2A / 2B unchanged).
+  uint64_t label_content_revision_ = 0;
+  uint64_t persisted_label_content_revision_ = 0;
   uint64_t last_committed_txid_ = 0;  // running: strictly increases per committed bundle
   uint64_t applied_collection_op_id_ = 0;  // running: caller op watermark (2B idempotency basis)
   uint64_t base_committed_txid_ = 0;       // adopted base's persisted txid (case (a)/(b) split)
