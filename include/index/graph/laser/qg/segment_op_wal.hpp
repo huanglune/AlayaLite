@@ -95,6 +95,9 @@ enum class SegmentOpFailPoint : std::uint8_t {
   after_consolidate_live_repair_before_free_image,  // C6: live repair done, before any FREE image
   after_consolidate_end_append_before_fsync,     // C7: kind=4 buffered, before its force (torn END)
   after_consolidate_publish,                     // C11: free-list/epoch/idle all published
+  // 2C W2 canonical PID-reuse bundle cuts (appended so every prior value is preserved).
+  after_reuse_reserve_before_binds,               // R0: tokens reserved (free popped), before kind=7
+  after_reuse_tx_publish_append_before_fsync,     // R5: kind=8 buffered, before its force (torn END)
 };
 
 // Test-only observer for the persistence-model (power-loss) crash layer. It is

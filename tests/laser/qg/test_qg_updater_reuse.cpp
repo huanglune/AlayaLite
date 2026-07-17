@@ -285,6 +285,88 @@ TEST(QgUpdaterReuse, SamePidGenerationChain0To2) {
 }
 
 // ---------------------------------------------------------------------------
+// BLOCKER-1/2 regression: delete-all -> all-reuse N>1 under kFullPrune with a tiny
+// prune pool (a later row's full-recompute would otherwise rewrite an earlier spine
+// edge, and the persisted dead entry is reused). The FINAL bidirectional spine + the
+// repair_routing_roots entry rule must keep EVERY reused row reachable both in-process
+// and after a replay reopen AND a checkpoint reopen -- the two must agree.
+// ---------------------------------------------------------------------------
+TEST(QgUpdaterReuse, DeleteAllAllReuseFullPruneStaysReachableCleanAndReplay) {
+  const auto dir = scratch_dir("fullprune");
+  std::filesystem::remove_all(dir);
+  const size_t small_n = 20;
+  auto base = WalTinyIndex::build(dir, small_n, /*seed=*/37);
+  const size_t reuse_n = 6;
+  const auto vecs = waltest::make_data(reuse_n, kDim, /*seed=*/44);
+  std::vector<uint64_t> labels(reuse_n);
+  for (size_t i = 0; i < reuse_n; ++i) labels[i] = 61000 + i;
+
+  // Holder: the QuantizedGraph must outlive the QGUpdater (which keeps a reference).
+  struct Holder {
+    QuantizedGraph qg;
+    std::unique_ptr<QGUpdater> upd;
+    Holder(const std::string &prefix, size_t base_n) : qg(base_n, kDeg, kDim, kDim) {
+      qg.load_disk_index(prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+      qg.set_params(64, 1, 1);
+      UpdateParams params;
+      params.enable_wal = true;
+      params.enable_pid_reuse = true;
+      params.ef_insert = 64;
+      params.max_points = 4 * base_n;
+      params.backlink_mode = UpdateParams::Backlink::kFullPrune;  // the clobber-prone mode
+      params.prune_pool_cap = 1;                                  // maximal spine pressure
+      upd = std::make_unique<QGUpdater>(qg, params);
+    }
+  };
+  auto open = [&](bool) { return std::make_unique<Holder>(base.prefix, small_n); };
+  const auto all_labels_found = [&](QGUpdater &upd) {
+    size_t found = 0;
+    for (size_t i = 0; i < reuse_n; ++i) {
+      const auto res = upd.search(vecs.data() + i * kDim, 8, 64);
+      for (PID p : res) {
+        if (label_of(upd, p) == labels[i]) {
+          ++found;
+          break;
+        }
+      }
+    }
+    return found;
+  };
+
+  {
+    auto h = open(true);
+    for (size_t i = 0; i < small_n; ++i) h->upd->tombstone(static_cast<PID>(i));
+    h->upd->consolidate(1, 0, true, false);
+    EXPECT_EQ(h->upd->live_count(), 0U);
+    h->upd->commit_physical_bundle(1, 1, vecs.data(), labels.data(), reuse_n);
+    EXPECT_EQ(all_labels_found(*h->upd), reuse_n) << "in-process: a bundle row is unreachable";
+    // Do NOT checkpoint: the next reopen is a pure WAL replay.
+  }
+  {
+    auto h = open(true);
+    EXPECT_EQ(all_labels_found(*h->upd), reuse_n) << "replay reopen: a bundle row is unreachable";
+    h->upd->checkpoint();  // seal, hand to the checkpoint-reopen below
+  }
+  {
+    auto h = open(true);
+    EXPECT_EQ(all_labels_found(*h->upd), reuse_n) << "checkpoint reopen: a bundle row is unreachable";
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// garden() stays gated under reuse (it is still not a WAL maintenance transaction).
+// ---------------------------------------------------------------------------
+TEST(QgUpdaterReuse, GardenStillThrowsUnderReuse) {
+  const auto dir = scratch_dir("garden");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/71);
+  ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);
+  EXPECT_THROW(s.upd->garden(1, GardenParams{}), std::logic_error);
+  std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
 // Byte-invariance guard: with enable_pid_reuse=false a fresh base never
 // activates (stays v2), and an ordinary append bundle takes the legacy 2A path.
 // ---------------------------------------------------------------------------

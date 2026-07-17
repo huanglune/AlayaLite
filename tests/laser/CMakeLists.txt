@@ -314,3 +314,18 @@ alaya_add_test(
   TARGET test_mutable_laser_segment_reuse
   LABELS laser wal persistence
 )
+
+# wal-2c: W2 step 8 canonical PID-reuse R0-R11 SIGKILL/power-loss crash matrix.
+alaya_cc_target(
+  test_segment_op_wal_reuse_crash
+  BARE GTEST
+  SRCS qg/test_segment_op_wal_reuse_crash.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_segment_op_wal_reuse_crash
+  TARGET test_segment_op_wal_reuse_crash
+  LABELS laser wal persistence crash
+  TIMEOUT 120
+)

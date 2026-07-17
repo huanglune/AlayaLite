@@ -273,13 +273,22 @@ inline uint32_t qg_read_required_feature_flags(const QGSuperblockV2 &sb) {
   return v;
 }
 
-// Feature-dependency invariant (design section 7.1): pid_generation implies
-// canonical_prebind AND mutable_label_slot.
+// Feature-dependency invariant (design section 7.1, codex BLOCKER-5): the maintenance
+// pair (maintenance_tx + post_redo_free_list) is all-or-none; the pid-reuse triple
+// (pid_generation + canonical_prebind + mutable_label_slot) is all-or-none AND depends
+// on the maintenance pair. A partial set (e.g. pid without maintenance) is a forged /
+// corrupt v3 base -- accepting it would let a reader treat the base as pid-active but
+// maintenance-inactive, whose next checkpoint would revert to a v2 image carrying stale
+// non-zero 2C reserved bytes and self-lock the file on the following open.
 inline bool qg_required_features_self_consistent(uint32_t required) {
-  if ((required & kQgFeatPidGenerationV1) != 0) {
-    return (required & kQgFeatCanonicalPrebindV1) != 0 &&
-           (required & kQgFeatMutableLabelSlotV1) != 0;
-  }
+  const bool maint = (required & kQgFeatMaintenanceTxV1) != 0;
+  const bool postredo = (required & kQgFeatPostRedoFreeListV1) != 0;
+  const bool pid = (required & kQgFeatPidGenerationV1) != 0;
+  const bool canonical = (required & kQgFeatCanonicalPrebindV1) != 0;
+  const bool mutable_label = (required & kQgFeatMutableLabelSlotV1) != 0;
+  if (maint != postredo) return false;                        // maintenance pair all-or-none
+  if (pid != canonical || pid != mutable_label) return false;  // pid triple all-or-none
+  if (pid && !maint) return false;                            // pid depends on the maintenance pair
   return true;
 }
 
@@ -299,6 +308,11 @@ inline bool qg_superblock_supported(const QGSuperblockV2 &sb, uint32_t supported
     }
     const uint32_t required = qg_read_required_feature_flags(sb);
     if (!qg_required_features_self_consistent(required)) return false;
+    // BLOCKER-5: a v3 base is only ever produced by an activation checkpoint, which always
+    // carries the maintenance pair. A v3 image lacking it is forged; rejecting it here keeps
+    // maintenance_activated_ true for every accepted v3 base (so a checkpoint never reverts
+    // to a v2 image carrying stale 2C reserved bytes).
+    if ((required & kQgFeatMaintenanceTxV1) == 0) return false;
     return (required & ~supported_mask) == 0;
   }
   return false;
