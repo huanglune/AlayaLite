@@ -180,6 +180,21 @@ alaya_add_test(
   TIMEOUT 120
 )
 
+# MutableLaserSegment: durable single-writer mutable segment handle (W3).
+alaya_cc_target(
+  test_mutable_laser_segment
+  BARE GTEST
+  SRCS qg/test_mutable_laser_segment.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_mutable_laser_segment
+  TARGET test_mutable_laser_segment
+  LABELS laser wal disk persistence
+  TIMEOUT 120
+)
+
 # Residency seams behind UnifiedLaserSegment: prefetch budget default, ResidencyProvider dispatch, ensure_resident_arena
 # file materialization, and the QGUpdater write_at -> arena mirror.
 alaya_cc_target(
