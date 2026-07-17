@@ -284,3 +284,19 @@ alaya_cc_target(
 # The vendored FFHT header contains non-inline helper definitions. Keep the bench's split source files maintainable
 # while compiling them as one translation unit, as the original single-source target did.
 set_target_properties(bench_laser_update_sift PROPERTIES UNITY_BUILD ON)
+
+# wal-2c: W2 canonical PID-reuse writer functional tests (activation, all-reuse,
+# mixed, generation chain, no-reuse byte-invariance). The R0-R11 SIGKILL matrix
+# is test_segment_op_wal_reuse_crash.cpp (registered below in the same section).
+alaya_cc_target(
+  test_qg_updater_reuse
+  BARE GTEST
+  SRCS qg/test_qg_updater_reuse.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_qg_updater_reuse
+  TARGET test_qg_updater_reuse
+  LABELS laser wal persistence
+)

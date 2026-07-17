@@ -190,10 +190,16 @@ constexpr uint32_t kQgFeatCanonicalPrebindV1 = 1U << 3U;
 constexpr uint32_t kQgFeatMutableLabelSlotV1 = 1U << 4U;
 
 // The required-feature bitmask THIS build understands. It grows per 2C phase:
-// W1 understands the maintenance-transaction features (consolidate under WAL).
-// A v3 base carrying only these bits is readable here; a v3 base that also
-// requires W2's pid_generation bits fails closed until W2 adds them.
-constexpr uint32_t kQgSupportedRequiredFeatures = kQgFeatMaintenanceTxV1 | kQgFeatPostRedoFreeListV1;
+// W1 understands the maintenance-transaction features (consolidate under WAL); W2
+// adds the pid-reuse triple (pid_generation + canonical_prebind + mutable_label).
+// This mask MUST grow in the SAME commit that lands the canonical writer (step 5)
+// AND the canonical replay lane (step 3) -- extending it before the recovery path
+// exists would let a new binary open a v3 pid base it cannot actually recover
+// (design B.1 / codex risk 1). A v3 base requiring a bit outside this mask (a future
+// phase) still fails closed.
+constexpr uint32_t kQgSupportedRequiredFeatures = kQgFeatMaintenanceTxV1 | kQgFeatPostRedoFreeListV1 |
+                                                  kQgFeatPidGenerationV1 | kQgFeatCanonicalPrebindV1 |
+                                                  kQgFeatMutableLabelSlotV1;
 
 struct QGSuperblockV2 {
   uint64_t magic = 0;

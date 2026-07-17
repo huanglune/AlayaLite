@@ -738,6 +738,10 @@ class QGUpdater {
   }
 
   [[nodiscard]] uint64_t generation() const { return superblock_.generation; }
+  // Test/diagnostic: the on-disk base format version (v2 legacy vs v3 2C-activated).
+  [[nodiscard]] uint32_t superblock_format_version() const { return superblock_.format_version; }
+  // Test/diagnostic: true once the v3 pid-reuse feature is active in the base.
+  [[nodiscard]] bool pid_generation_activated() const { return pid_generation_activated_; }
   [[nodiscard]] uint64_t segment_uid() const { return segment_uid_; }
 
   [[nodiscard]] int active_superblock_slot() const { return active_superblock_slot_; }
@@ -2051,6 +2055,21 @@ class QGUpdater {
           if (w2c.pid_reuse_activation_sb_generation == 0) {
             w2c.pid_reuse_activation_sb_generation = next.generation;
           }
+          // Activation summary (design 7.1 / JC-16): the max non-zero generation and the
+          // count of reused (generation>0) bindings in the slot being persisted. Recovery
+          // recomputes both from the loaded slot and fails closed on a mismatch, so a
+          // forged slot cannot silently under/over-report its reuse population.
+          uint32_t max_gen = 0;
+          uint32_t nz_count = 0;
+          for (const auto &[pid, binding] : snap->bindings) {
+            (void)pid;
+            if (binding.pid_generation != 0) {
+              ++nz_count;
+              max_gen = (std::max)(max_gen, binding.pid_generation);
+            }
+          }
+          w2c.max_pid_generation = max_gen;
+          w2c.nonzero_pid_generation_count = nz_count;
         }
         write_superblock_wal2c_state(next, w2c);
       }
@@ -5618,6 +5637,17 @@ class QGUpdater {
                                 (w2c.required_feature_flags & kQgFeatPidGenerationV1) != 0;
     maintenance_activation_gen_ = w2c.maintenance_activation_sb_generation;
     pid_reuse_activation_gen_ = w2c.pid_reuse_activation_sb_generation;
+    // Fail-closed activation-generation bounds (design 7.1 / JC-16): an activated base
+    // must stamp a non-zero activation generation no newer than its own superblock
+    // generation. A zero or future generation is a forged / corrupt v3 base.
+    if (maintenance_activated_ &&
+        (maintenance_activation_gen_ == 0 || maintenance_activation_gen_ > sb.generation)) {
+      poison("v3 base has an out-of-range maintenance activation generation");
+    }
+    if (pid_generation_activated_ &&
+        (pid_reuse_activation_gen_ == 0 || pid_reuse_activation_gen_ > sb.generation)) {
+      poison("v3 base has an out-of-range pid-reuse activation generation");
+    }
     last_committed_txid_ = tx.last_committed_txid;
     applied_collection_op_id_ = tx.applied_collection_op_id;
     base_committed_txid_ = tx.last_committed_txid;
@@ -5639,6 +5669,25 @@ class QGUpdater {
     active_label_slot_ = static_cast<int>(ls.slot);
     auto lb = load_label_slot_bindings(label_slot_path_[ls.slot], ls.count, ls.checksum,
                                        sb.num_points);
+    // Activation summary cross-check (design 7.1 / JC-16, sixth fail-closed condition):
+    // the slot's actual max non-zero generation and reuse-binding count must equal the
+    // summary the writing checkpoint stamped. A mismatch means a slot swapped out from
+    // under its superblock summary -> fail closed. Only meaningful once pid reuse is
+    // activated (before activation every generation is 0, so both sides are 0).
+    if (pid_generation_activated_) {
+      uint32_t max_gen = 0;
+      uint32_t nz_count = 0;
+      for (const auto &[pid, binding] : lb.bindings) {
+        (void)pid;
+        if (binding.pid_generation != 0) {
+          ++nz_count;
+          max_gen = (std::max)(max_gen, binding.pid_generation);
+        }
+      }
+      if (max_gen != w2c.max_pid_generation || nz_count != w2c.nonzero_pid_generation_count) {
+        poison("label slot pid-generation summary does not match the superblock");
+      }
+    }
     label_working_ = std::move(lb.bindings);
   }
 
