@@ -2,16 +2,19 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// W2 step 8: the R0-R11 crash matrix for the canonical PID-reuse writer.
+// W2 step 8 / BLOCKER-7: the R0-R11 crash matrix for the canonical PID-reuse writer.
 //
-// A forked child self-SIGKILLs at each cut of one all-reuse bundle over a
-// pre-activated v3 pid base with K free PIDs. The parent reopens (recovery),
-// asserts the recovered GRAPH fingerprint equals exactly S_old (every cut
-// before the kind=8 fsync -> the whole bundle is discarded, the freed PIDs stay
-// FREE) or S_new (every cut at/after the kind=8 fsync -> roll forward), reopens
-// the FIRST recovery's output a SECOND time for double-replay byte stability,
-// and a power-loss variant drops the unforced WAL tail to prove the buffered-END
-// window recovers S_old. Complements the QGUpdater / segment functional families.
+// A forked child self-SIGKILLs at each cut of one all-reuse bundle over a pre-activated
+// v3 pid base with K free PIDs. The parent asserts the child died of SIGKILL (never a
+// false-green where the failpoint was skipped and the child committed normally), reopens
+// (recovery), and asserts the recovered FULL fingerprint -- counts, applied-op/epoch,
+// entry point, medoid set, per-PID trailer + hidden bit + full row bytes (live AND dead),
+// the walked free chain, and the label bindings -- equals exactly S_old (every cut before
+// the kind=8 fsync) or S_new (every cut at/after it). It reopens the FIRST recovery's
+// OUTPUT a SECOND time for double-replay byte stability. A power-loss family materializes
+// the three R5 states directly on the WAL bytes: a complete END rolls forward to S_new; a
+// torn END (last frame cut mid-write -- a real power-loss) and an absent END both recover
+// S_old. Complements the QGUpdater / segment functional families.
 
 #include <gtest/gtest.h>
 
@@ -80,9 +83,9 @@ std::vector<uint64_t> bundle_labels() {
   return l;
 }
 
-// Build a durable, pre-activated v3 pid template: activate via a 1-row append
-// bundle, tombstone K base rows, reclaim them into the free-list, checkpoint. The
-// result has K free PIDs ready for one all-reuse bundle. No failpoint/observer.
+// Build a durable, pre-activated v3 pid template: activate via a 1-row append bundle,
+// tombstone K base rows, reclaim them into the free-list, checkpoint. The result has K
+// free PIDs ready for one all-reuse bundle. No failpoint/observer.
 void prepare_reuse_template(const std::string &prefix, size_t max_points) {
   QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
   qg.load_disk_index(prefix.c_str(), 0.0F, /*recovery_mode=*/true);
@@ -96,25 +99,33 @@ void prepare_reuse_template(const std::string &prefix, size_t max_points) {
   upd.checkpoint();  // durable v3 pid base with kFree free PIDs
 }
 
-// A generation-aware graph fingerprint: counts, per-PID trailer + live-row bytes,
-// the walked free chain, and the sorted label bindings (pid -> gen -> label). Two
-// recovered states are the SAME iff their fingerprints match.
+// A generation-aware graph fingerprint: counts, all running watermarks, the routing
+// entry + medoid set, every PID's trailer + hidden bit + FULL row bytes (live AND dead --
+// captures the free-chain next pointer, reused incarnations, and stale dead-row content),
+// the walked free chain, and the sorted label bindings (pid -> gen -> label). Two recovered
+// states are the SAME iff their fingerprints match. This is deliberately over-complete so
+// a routing/medoid/dead-row divergence the earlier fingerprint missed cannot pass.
 std::string capture_fp(QGUpdater &upd) {
   std::string fp;
   auto put = [&](uint64_t v) { fp.append(reinterpret_cast<const char *>(&v), sizeof(v)); };
   const auto n = static_cast<PID>(upd.num_points());
   put(upd.num_points());
+  put(upd.allocated_points());
   put(upd.live_count());
   put(upd.free_count());
   put(upd.last_committed_txid());
+  put(upd.applied_collection_op_id());
+  put(upd.last_completed_consolidate_epoch());
+  put(static_cast<uint64_t>(upd.entry_point()));
+  put(upd.medoids().size());
+  for (PID m : upd.medoids()) put(static_cast<uint64_t>(m));
   for (PID id = 0; id < n; ++id) {
     const auto tr = upd.trailer(id);
     put(tr.flags);
     put(tr.valid_degree);
-    if ((tr.flags & (kQGRowTombstone | kQGRowFree)) == 0) {
-      const auto row = upd.debug_read_row(id);
-      fp.append(row.data(), row.size());
-    }
+    put(upd.row_hidden(id) ? 1U : 0U);
+    const auto row = upd.debug_read_row(id);  // full node bytes: live rows AND dead rows
+    fp.append(row.data(), row.size());
   }
   PID cur = upd.free_list_head();
   size_t guard = 0;
@@ -162,8 +173,8 @@ Recovered recover(const std::string &prefix, size_t max_points) {
   return r;
 }
 
-// S_old = the template (bundle never applied); S_new = template + the all-reuse
-// bundle. Built once from a pristine copy of the SAME template each case uses.
+// S_old = the template (bundle never applied); S_new = template + the all-reuse bundle.
+// Built once from a pristine copy of the SAME template each case uses.
 struct Refs {
   std::string s_old;
   std::string s_new;
@@ -178,11 +189,9 @@ const Refs &refs() {
     const auto tmpl = root / "template";
     auto base = WalTinyIndex::build(tmpl, kBaseN, 4242);
     prepare_reuse_template(base.prefix, out.max_points);
-    // S_old: recover the untouched template.
     const auto old_dir = root / "old";
     copy_tree(tmpl, old_dir);
     out.s_old = recover((old_dir / "wal_base").string(), out.max_points).fp;
-    // S_new: run the all-reuse bundle to its committed END, then recover.
     const auto new_dir = root / "new";
     copy_tree(tmpl, new_dir);
     {
@@ -203,7 +212,7 @@ const Refs &refs() {
 struct ReuseKill {
   const char *name;
   SegmentOpFailPoint point;
-  bool expect_new;      // cut at/after the kind=8 fsync -> roll forward (S_new)
+  bool expect_new;       // cut at/after the kind=8 fsync -> roll forward (S_new)
   size_t cache_cap = 0;  // 0 = default (no spill); tiny cap forces overlay spill mid-build
 };
 
@@ -247,8 +256,11 @@ TEST_P(ReuseCrash, ReopenLandsOnSoldOrSnewAndDoubleReplayStable) {
   }
   int status = 0;
   ASSERT_EQ(::waitpid(child, &status, 0), child);
-  ASSERT_FALSE(WIFEXITED(status) && WEXITSTATUS(status) == 70)
-      << param.name << " child threw before reaching the cut";
+  // BLOCKER-7: the child MUST have died of the injected SIGKILL. A normal exit (0) means the
+  // failpoint was never reached, so an S_new expectation would false-green on a clean commit;
+  // exit 70 means it threw before the cut. Either invalidates the case.
+  ASSERT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+      << param.name << " child did not die of SIGKILL at the cut (status=" << status << ")";
 
   const auto first = recover(case_prefix, ref.max_points);
   ASSERT_FALSE(first.poisoned) << param.name << " recovery must not poison";
@@ -268,40 +280,50 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::Values(
         // R0: tokens reserved, before any kind=7 -> whole bundle dropped.
         ReuseKill{"R0_reserve", SegmentOpFailPoint::after_reuse_reserve_before_binds, false},
-        // R1: all kind=7 buffered, no kind=1/kind=8 -> canonical lane EOF discards.
-        ReuseKill{"R1_after_binds", SegmentOpFailPoint::after_label_bind_append, false},
+        // R1a: exactly ONE kind=7 bind buffered (a PARTIAL bind set) -> no kind=8 -> dropped.
+        ReuseKill{"R1a_partial_bind", SegmentOpFailPoint::after_reuse_first_bind_append, false},
+        // R1b: all kind=7 buffered, no kind=1/kind=8 -> canonical lane EOF discards.
+        ReuseKill{"R1b_all_binds", SegmentOpFailPoint::after_label_bind_append, false},
         // R2-R4: preimage + final kind=1 all buffered, before the kind=8 append.
         ReuseKill{"R4_before_publish", SegmentOpFailPoint::before_tx_publish_append, false},
-        // R5: kind=8 appended into the WAL's USERSPACE buffer but before its force. The
-        // whole bundle (kind=7 + kind=1 + kind=8) is still buffered, so a SIGKILL drops
-        // the userspace buffer -> no durable canonical frame -> the bundle is discarded
-        // (S_old). force_wal() is the single durable commit point (the power-loss variant
-        // below drops the same unforced tail and also recovers S_old).
-        ReuseKill{"R5_end_unforced", SegmentOpFailPoint::after_reuse_tx_publish_append_before_fsync,
-                  false},
-        // R6-R8: kind=8 forced durable, before/at the install + publish -> roll forward.
-        ReuseKill{"R6_after_fsync", SegmentOpFailPoint::after_tx_publish_fsync, true},
         // R4 with a tiny cache cap: the build spills overlay pages (Sync::flush, survives
         // SIGKILL), but the FIRST spill forces the kind=7 lane durable, so a surviving spill
         // is staged inside the (durable) lane and discarded at EOF -> S_old (never applied as
         // an orphan legacy row_patch). Exercises the spill-orphan guard.
-        ReuseKill{"R4_spill", SegmentOpFailPoint::before_tx_publish_append, false, /*cap=*/1}),
+        ReuseKill{"R4_spill", SegmentOpFailPoint::before_tx_publish_append, false, /*cap=*/1},
+        // R5: kind=8 appended into the WAL's USERSPACE buffer but before its force. A SIGKILL
+        // drops the userspace buffer -> no durable canonical frame -> S_old.
+        ReuseKill{"R5_end_unforced", SegmentOpFailPoint::after_reuse_tx_publish_append_before_fsync,
+                  false},
+        // R6: kind=8 forced durable, before install/snapshot -> roll forward.
+        ReuseKill{"R6_after_fsync", SegmentOpFailPoint::after_tx_publish_fsync, true},
+        // R6b: kind=8 durable + pages installed into the cache (lost on crash), before the
+        // snapshot swap -> reopen re-derives S_new from the durable WAL.
+        ReuseKill{"R6b_after_install", SegmentOpFailPoint::after_reuse_install_before_snapshot, true},
+        // R7: snapshot + routing published, before the reused hidden bits are cleared -> S_new.
+        ReuseKill{"R7_after_routing", SegmentOpFailPoint::after_reuse_routing_before_hidden_clear, true},
+        // R8: the first reused hidden bit cleared, before the committed watermark store -> S_new
+        // (the durable kind=8 makes the whole bundle roll forward regardless of the in-memory
+        // publish progress, which is not itself durable).
+        ReuseKill{"R8_hidden_partial", SegmentOpFailPoint::after_reuse_hidden_clear_partial_before_commit,
+                  true}),
     [](const ::testing::TestParamInfo<ReuseKill> &info) { return info.param.name; });
 
-// Power-loss (R5 drop): the unforced WAL tail is lost. Run the bundle to its
-// committed END, then truncate the WAL back to the post-template length (before any
-// canonical frame) and recover -- the whole bundle is discarded (S_old).
-TEST(ReuseCrashPowerLoss, DroppedUnforcedEndRecoversSold) {
+// R5 three states materialized directly on the committed WAL bytes (no invalid "delete an
+// fsync'd tx" model). Run the bundle to its committed END, then:
+//   (1) leave the complete END      -> recovery rolls forward   -> S_new
+//   (2) cut the last frame mid-write -> a real torn power-loss   -> S_old
+//   (3) drop the whole END frame     -> the lane sees no kind=8   -> S_old
+class ReuseEndTail : public ::testing::TestWithParam<int> {};
+
+TEST_P(ReuseEndTail, PowerLossEndStates) {
+  const int cut = GetParam();  // 0 = keep complete, >0 = bytes to cut off the tail
   const auto &ref = refs();
-  const auto root = battery_root("powerloss");
+  const auto root = battery_root("endtail" + std::to_string(cut));
   std::filesystem::remove_all(root);
   const auto tmpl = root / "template";
   auto base = WalTinyIndex::build(tmpl, kBaseN, 4242);
   prepare_reuse_template(base.prefix, ref.max_points);
-  const std::string tmpl_prefix = (tmpl / "wal_base").string();
-  const std::string wal_path = tmpl_prefix + waltest::index_suffix() + ".opwal";
-  const auto base_wal_len = static_cast<std::streamoff>(read_file(wal_path).size());
-
   const auto case_dir = root / "case";
   copy_tree(tmpl, case_dir);
   const std::string case_prefix = (case_dir / "wal_base").string();
@@ -314,13 +336,25 @@ TEST(ReuseCrashPowerLoss, DroppedUnforcedEndRecoversSold) {
     const auto labels = bundle_labels();
     (void)upd.commit_physical_bundle(2, 2, bundle_vecs().data(), labels.data(), kFree);
   }
-  // Drop the unforced tail: truncate back to the single-flip template WAL length.
-  std::filesystem::resize_file(case_wal, static_cast<std::uintmax_t>(base_wal_len));
+  const auto full_len = static_cast<std::uintmax_t>(read_file(case_wal).size());
+  if (cut > 0) {
+    ASSERT_GT(full_len, static_cast<std::uintmax_t>(cut));
+    std::filesystem::resize_file(case_wal, full_len - static_cast<std::uintmax_t>(cut));
+  }
   const auto rec = recover(case_prefix, ref.max_points);
-  ASSERT_FALSE(rec.poisoned);
-  EXPECT_EQ(rec.fp, ref.s_old) << "a dropped unforced END must recover S_old";
+  ASSERT_FALSE(rec.poisoned) << "power-loss recovery must not poison (cut=" << cut << ")";
+  EXPECT_EQ(rec.fp, cut == 0 ? ref.s_new : ref.s_old)
+      << "cut=" << cut << " landed on the wrong graph";
   std::filesystem::remove_all(root);
 }
+
+INSTANTIATE_TEST_SUITE_P(EndStates, ReuseEndTail,
+                         // 0 = complete END (S_new); 4 = last frame trailer cut (torn -> S_old);
+                         // 40 = whole END frame dropped (absent -> S_old).
+                         ::testing::Values(0, 4, 40),
+                         [](const ::testing::TestParamInfo<int> &info) {
+                           return "cut" + std::to_string(info.param);
+                         });
 
 }  // namespace
 }  // namespace alaya::laser

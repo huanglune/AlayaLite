@@ -753,6 +753,13 @@ class QGUpdater {
   // Test/diagnostic: true once the v3 pid-reuse feature is active in the base.
   [[nodiscard]] bool pid_generation_activated() const { return pid_generation_activated_; }
   [[nodiscard]] uint64_t segment_uid() const { return segment_uid_; }
+  // Debug/test read-only accessors for the crash-matrix fingerprint (routing + medoid +
+  // hidden state), so a recovered state can be compared to S_old/S_new bit-for-bit.
+  [[nodiscard]] PID entry_point() const { return qg_.entry_point_; }
+  [[nodiscard]] const std::vector<PID> &medoids() const { return qg_.medoids_; }
+  [[nodiscard]] bool row_hidden(PID id) const { return is_hidden(id); }
+  [[nodiscard]] uint32_t maintenance_activation_gen() const { return static_cast<uint32_t>(maintenance_activation_gen_); }
+  [[nodiscard]] uint32_t pid_reuse_activation_gen() const { return static_cast<uint32_t>(pid_reuse_activation_gen_); }
 
   [[nodiscard]] int active_superblock_slot() const { return active_superblock_slot_; }
 
@@ -1396,6 +1403,9 @@ class QGUpdater {
                                      static_cast<uint64_t>(i), result.rows[i].pid,
                                      result.rows[i].pid_generation, labels[i]),
                    alaya::wal::WalFile::Sync::buffered, txid);
+        if (i == 0) {
+          wal_failpoint(SegmentOpFailPoint::after_reuse_first_bind_append);  // R1a: partial bind
+        }
       }
       wal_failpoint(SegmentOpFailPoint::after_label_bind_append);
       // Route the writer's page RMW/dependency reads into the private overlay from here.
@@ -1488,6 +1498,7 @@ class QGUpdater {
       // past the kind=8 fsync poisons (never rolls back; reopen rolls forward).
       bundle_install_to_cache();  // final pages -> shared write cache (seqlock, mark dirty)
       bundle_ctx_ = nullptr;      // overlay consumed; RMWs take the normal path again
+      wal_failpoint(SegmentOpFailPoint::after_reuse_install_before_snapshot);  // R6b
       // Fixed publish order (design B.4 / BLOCKER-1): snapshot -> routing -> hidden ->
       // committed. Nothing is published to the query face until routing is set, and the
       // committed watermark (which makes new rows visible to a concurrent query) is LAST.
@@ -1506,13 +1517,19 @@ class QGUpdater {
         bundle_live.insert(tok.pid);
       }
       repair_routing_roots_seeded(superblock_.entry_point, new_hwm, &bundle_live);
+      wal_failpoint(SegmentOpFailPoint::after_reuse_routing_before_hidden_clear);  // R7
       // (c) hidden: reveal reused rows to the query face -- trailers are already live in the
       // cache, so clear the result-filter tombstone then the hidden bit (its release is the
       // visibility point). The routing entry published above is now backed by a live row.
+      bool cleared_one = false;
       for (const auto &tok : result.rows) {
         if (tok.pid_generation != 0) {
           mirror_deleted_erase(tok.pid);
           clear_hidden(tok.pid);
+          if (!cleared_one) {
+            cleared_one = true;
+            wal_failpoint(SegmentOpFailPoint::after_reuse_hidden_clear_partial_before_commit);  // R8
+          }
         }
       }
       // (d) committed: appended rows become visible to a concurrent query only now.

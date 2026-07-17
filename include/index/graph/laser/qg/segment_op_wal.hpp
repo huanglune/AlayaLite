@@ -97,7 +97,11 @@ enum class SegmentOpFailPoint : std::uint8_t {
   after_consolidate_publish,                     // C11: free-list/epoch/idle all published
   // 2C W2 canonical PID-reuse bundle cuts (appended so every prior value is preserved).
   after_reuse_reserve_before_binds,               // R0: tokens reserved (free popped), before kind=7
+  after_reuse_first_bind_append,                  // R1a: exactly ONE kind=7 bind buffered (partial)
   after_reuse_tx_publish_append_before_fsync,     // R5: kind=8 buffered, before its force (torn END)
+  after_reuse_install_before_snapshot,            // R6b: kind=8 durable + pages installed, pre-snapshot
+  after_reuse_routing_before_hidden_clear,        // R7: snapshot+routing published, before hidden clear
+  after_reuse_hidden_clear_partial_before_commit,  // R8: first reused hidden cleared, before committed
 };
 
 // Test-only observer for the persistence-model (power-loss) crash layer. It is
