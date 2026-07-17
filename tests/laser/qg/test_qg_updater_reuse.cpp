@@ -355,6 +355,49 @@ TEST(QgUpdaterReuse, DeleteAllAllReuseFullPruneStaysReachableCleanAndReplay) {
 }
 
 // ---------------------------------------------------------------------------
+// canonical prebind recovery integrity (B-2C-02): a crafted WAL with kind=7 binds
+// and a kind=8 tx_publish but NO row_patch (no final page for the bound PID) must
+// poison on reopen -- recovery never promotes a binding whose page is missing.
+// ---------------------------------------------------------------------------
+TEST(QgUpdaterReuse, CanonicalBindWithoutRowPatchPoisonsOnReopen) {
+  const auto dir = scratch_dir("poison_no_rowpatch");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/83);
+  uint64_t seg_uid = 0;
+  uint64_t gen = 0;
+  uint64_t old_hwm = 0;
+  {
+    ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);
+    const auto v = waltest::make_data(1, kDim, 1);
+    const uint64_t l = 5;
+    s.upd->commit_physical_bundle(1, 1, v.data(), &l, 1);  // activate v3 pid
+    s.upd->checkpoint();
+    seg_uid = s.upd->segment_uid();
+    gen = s.upd->generation();
+    old_hwm = s.upd->num_points();
+  }
+  // Append a canonical bundle (kind=7 append bind + kind=8) with no row_patch.
+  const std::string wal_path = base.prefix + waltest::index_suffix() + ".opwal";
+  {
+    alaya::wal::WalFile wal(wal_path);  // scans the flip frame, then appends
+    const uint64_t txid = 2;
+    wal.append(kSegmentOpRecordType, 0, 1, txid,
+               encode_label_bind(seg_uid, gen, txid, /*row_op=*/0,
+                                 static_cast<uint32_t>(old_hwm), /*gen=*/0, /*label=*/6),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType, 0, 2, txid,
+               encode_tx_publish(seg_uid, gen, txid, /*new_hwm=*/old_hwm + 1,
+                                 /*binding_count=*/1, /*applied=*/1),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  EXPECT_THROW(
+      { ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true); },
+      std::exception)
+      << "a canonical bundle with no final page for its bound PID must poison";
+  std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
 // garden() stays gated under reuse (it is still not a WAL maintenance transaction).
 // ---------------------------------------------------------------------------
 TEST(QgUpdaterReuse, GardenStillThrowsUnderReuse) {

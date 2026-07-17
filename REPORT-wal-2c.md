@@ -121,7 +121,7 @@
 ## 六、遗留 / 未开始
 
 - **W1 deferred 硬化**(续程后现状):完整 C0-C11 崩溃矩阵 ✅、掉电 roll-forward 族 ✅、statvfs 精确上界 ✅(JC-13)、`(reclaim×bloom×r_target)` 非 WAL oracle 等价 ✅、"END 前维护写=0" write_at 硬断言 ✅。**仍 deferred**:并行 OpenMP 维护 page workers + barrier-外 spill(JC-8,单线程串行 lane 是 minimal-viable-correct);全流式 replay via visit_frames(JC-9/JC-14,已量化内存上界);TSan 覆盖维护并行(单线程下无并发维护写,tsan preset 亦 ALAYA_ENABLE_LASER=OFF,记录实况)。
-- **W2**:PID generation + bundle-only reuse(writer-private seed B-2C-01、canonical prebind 恢复完整性 B-2C-02、checkpoint 准入 all-reuse 窗口、effective_label override、2B adapter token 化、v3 PID activation、R0-R11、B-2C-07 硬验收)。**须 codex 对抗审查后进 W3。**
+- **W2 完成(step 1-8 全落地)**:PID generation + bundle-only reuse 全链——writer-private seed B-2C-01 ✅、canonical prebind 恢复完整性 B-2C-02 ✅、checkpoint 准入 all-reuse 窗口 ✅、effective_label override ✅、2B adapter token 化 ✅、v3 PID activation ✅、R0-R11 SIGKILL 矩阵 ✅、B-2C-07 W2 部分 ✅。**codex 对抗中审已做**(5 BLOCKER+4 MAJOR,8 修 1 挂账 JC-22/27)。**W2 残余硬族(code-covered/结构保证,未单测)**:并发 public query 隔离(codex 结构验证 query_read 短路)、all-reuse×并发 checkpoint(checkpoint_mutex_ 结构保证+admission)、canonical poison 2/3(页几何依赖;poison 1=bind-无-rowpatch 已测)、三 PID 来源(base 已测,legacy/explicit 部分)、saturated-FREE(step2 code+recovery poison,未单测)——列 W3/后续补测。
 - **W3**:Collection maintenance hook + 门禁链 B-2C-03、activation checkpoint 全套 + A/B 混合槽 seal 前双 v3 门禁、四携带项(B-03 failpoint/durability 三模式/B-09 SIGKILL keep-set/边界 7 rerank 回归)、非 goal 三条(已在上)、consolidate×active write/checkpoint/seal-rotate 交错矩阵、search×END 安装断言、statvfs/ENOSPC 两测试、四文件时间线 + 文档 `unified-wal-vocabulary.md`、TSan。
 
 ---

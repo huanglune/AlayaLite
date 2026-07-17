@@ -542,17 +542,26 @@ TEST(QGSuperblockSelector, FailsClosedOnUnsupportedNewerSlot) {
     EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kQgSupportedRequiredFeatures), 0);
     EXPECT_EQ(out.generation, 5U);
   }
-  // Highest-gen slot is a checksum-VALID v3 with an unsupported required bit: reject
+  // The maintenance pair (maintenance_tx + post_redo_free_list) travels together on every
+  // real v3 base, so a self-consistent v3 requires BOTH (wal-2c BLOCKER-5).
+  constexpr uint32_t kMaintPair = kQgFeatMaintenanceTxV1 | kQgFeatPostRedoFreeListV1;
+  // Highest-gen slot is a checksum-VALID v3 with an unsupported required set: reject
   // the whole file (-2), never downgrade to the older v2 (the core fail-closed rule).
   {
-    const auto header = pack_header(make_v2_slot(10), make_v3_slot(11, kQgFeatMaintenanceTxV1));
+    const auto header = pack_header(make_v2_slot(10), make_v3_slot(11, kMaintPair));
     EXPECT_EQ(select_qg_superblock_checked(header.data(), out, /*supported=*/0U), -2);
   }
   // A v3 whose required bits ARE supported is selected normally.
   {
-    const auto header = pack_header(make_v2_slot(10), make_v3_slot(11, kQgFeatMaintenanceTxV1));
-    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kQgFeatMaintenanceTxV1), 1);
+    const auto header = pack_header(make_v2_slot(10), make_v3_slot(11, kMaintPair));
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kMaintPair), 1);
     EXPECT_EQ(out.format_version, kQGFormatVersionV3);
+  }
+  // A v3 carrying only maintenance_tx WITHOUT its post_redo_free_list pair is
+  // self-inconsistent -> unsupported -> fail closed even if that bit is nominally supported.
+  {
+    const auto header = pack_header(make_v2_slot(10), make_v3_slot(11, kQgFeatMaintenanceTxV1));
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, 0xFFFFFFFFU), -2);
   }
   // A v3 requiring pid_generation WITHOUT its canonical_prebind + mutable_label_slot
   // dependencies is self-inconsistent -> unsupported -> fail closed even if the
@@ -563,8 +572,8 @@ TEST(QGSuperblockSelector, FailsClosedOnUnsupportedNewerSlot) {
   }
   // Both slots unsupported v3: fail closed (the two-v3 old-reader case).
   {
-    const auto header = pack_header(make_v3_slot(11, kQgFeatMaintenanceTxV1),
-                                    make_v3_slot(12, kQgFeatMaintenanceTxV1));
+    const auto header =
+        pack_header(make_v3_slot(11, kMaintPair), make_v3_slot(12, kMaintPair));
     EXPECT_EQ(select_qg_superblock_checked(header.data(), out, 0U), -2);
   }
   // Neither slot structurally valid: -1 (distinct from the -2 fail-closed signal).
