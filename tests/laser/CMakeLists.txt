@@ -241,6 +241,25 @@ alaya_add_test(
   LABELS laser
 )
 
+# Regression test for a data-dependent heap overflow in QGBuilder's
+# out-of-core build path (init_from_vamana() reading unclamped per-node
+# degrees; see qg_builder.hpp and the test source for the full root-cause
+# chain). Builds several tiny indices back-to-back in one process, which used
+# to crash intermittently pre-fix.
+alaya_cc_target(
+  test_qg_builder_oom_regression
+  BARE GTEST
+  SRCS qg/test_qg_builder_oom_regression.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_qg_builder_oom_regression
+  TARGET test_qg_builder_oom_regression
+  LABELS laser
+  TIMEOUT 120
+)
+
 # Bench-only fbin mmap view used by update modes under cgroup RAM caps.
 alaya_cc_target(
   test_bench_laser_update_sift_support

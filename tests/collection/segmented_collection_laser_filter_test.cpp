@@ -37,6 +37,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -65,6 +66,20 @@ std::vector<float> make_data(std::uint64_t n, std::uint32_t dim, std::uint32_t s
   return data;
 }
 
+// QGBuilder::build() requires "{filename}_pca_base.fbin" to already exist --
+// its own doc comment says so, and it is the raw float32 vector data PHASE 1
+// streams through. Matches the two-int32-header fbin layout every other
+// LASER test fixture in this tree writes (e.g.
+// tests/laser/qg/qg_wal_test_support.hpp's write_fbin()).
+void write_fbin(const std::string &path, const float *data, std::int32_t n, std::int32_t dim) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  out.write(reinterpret_cast<const char *>(&n), 4);
+  out.write(reinterpret_cast<const char *>(&dim), 4);
+  out.write(reinterpret_cast<const char *>(data),
+            static_cast<std::streamsize>(sizeof(float) * static_cast<std::size_t>(n) *
+                                         static_cast<std::size_t>(dim)));
+}
+
 // ~30% pass rate, matching the selectivity hint the tests below use --
 // lands the Gate10 planner in the traversal band (0.15, 0.60].
 [[nodiscard]] auto selected_for_row(std::uint64_t row) -> bool { return (row % 10) < 3; }
@@ -88,13 +103,17 @@ std::vector<float> make_data(std::uint64_t n, std::uint32_t dim, std::uint32_t s
       /*selectivity_estimate=*/0.30);
 }
 
-// The on-disk LASER segment is built once per process: QGBuilder::build()'s
-// out-of-memory patch path has a pre-existing, data-dependent crash
-// unrelated to this change (see tests/laser/qg/test_admission_contract.cpp
-// and tests/disk/test_unified_laser_admission.cpp for the gdb-confirmed
-// root cause: a memmove inside QuantizedGraph::update_qg_out_of_memory,
-// reached only through the build path) when several small indices are
-// built back to back in one process; building once avoids it.
+// The on-disk LASER segment is built once per process, matching
+// tests/laser/qg/test_admission_contract.cpp and
+// tests/disk/test_unified_laser_admission.cpp's shape. QGBuilder::build()'s
+// out-of-memory patch path used to have a data-dependent heap overflow,
+// unrelated to this change (gdb-confirmed root cause: a memmove inside
+// QuantizedGraph::update_qg_out_of_memory, reached only through the build
+// path), when several small indices were built back to back in one
+// process. Fixed in qg_builder.hpp; see
+// tests/laser/qg/test_qg_builder_oom_regression.cpp for the regression
+// test. This file keeps its shared-once-per-process fixture shape because
+// it is simpler and faster, not because the constraint still applies.
 struct LaserFixture {
   std::filesystem::path root;
   std::filesystem::path seg_dir;
@@ -131,6 +150,8 @@ struct LaserFixture {
     const auto raw_dir = fx->root / "raw";
     std::filesystem::create_directories(raw_dir);
     const std::string raw_prefix = (raw_dir / "dsqg_seg_00000001").string();
+    write_fbin(raw_prefix + "_pca_base.fbin", fx->data.data(),
+               static_cast<std::int32_t>(kLaserCount), static_cast<std::int32_t>(kDim));
 
     alaya::vamana::VamanaBuildParams vp;
     vp.R = kR;

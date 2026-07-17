@@ -18,12 +18,15 @@
 //     translation, not just its identity-permutation special case.
 //
 // The on-disk segment is built once per process (see AdmissionDiskTest
-// below) for the same reason tests/laser/qg/test_admission_contract.cpp
-// builds its kernel-level index once: QGBuilder::build()'s out-of-memory
-// patch path has a pre-existing, data-dependent crash unrelated to this
-// change when several small indices are built back-to-back in one process
-// (confirmed via gdb backtrace pointing at
-// QuantizedGraph::update_qg_out_of_memory, never touched by this change).
+// below), matching tests/laser/qg/test_admission_contract.cpp's shape.
+// QGBuilder::build()'s out-of-memory patch path used to have a
+// data-dependent heap overflow, unrelated to this change, when several
+// small indices were built back-to-back in one process (confirmed via gdb:
+// SIGSEGV inside a memmove in QuantizedGraph::update_qg_out_of_memory).
+// Fixed in qg_builder.hpp; see
+// tests/laser/qg/test_qg_builder_oom_regression.cpp for the regression
+// test. This file keeps its shared-once-per-process fixture shape because
+// it is simpler and faster, not because the constraint still applies.
 
 #include "index/disk/laser_segment.hpp"
 #include "index/disk/laser_segment_importer.hpp"
@@ -38,6 +41,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -67,6 +71,20 @@ std::vector<float> make_data(std::uint64_t n, std::uint32_t dim, std::uint32_t s
     v = dist(gen);
   }
   return data;
+}
+
+// QGBuilder::build() requires "{filename}_pca_base.fbin" to already exist --
+// its own doc comment says so, and it is the raw float32 vector data PHASE 1
+// streams through. Matches the two-int32-header fbin layout every other
+// LASER test fixture in this tree writes (e.g.
+// tests/laser/qg/qg_wal_test_support.hpp's write_fbin()).
+void write_fbin(const std::string &path, const float *data, std::int32_t n, std::int32_t dim) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  out.write(reinterpret_cast<const char *>(&n), 4);
+  out.write(reinterpret_cast<const char *>(&dim), 4);
+  out.write(reinterpret_cast<const char *>(data),
+            static_cast<std::streamsize>(sizeof(float) * static_cast<std::size_t>(n) *
+                                         static_cast<std::size_t>(dim)));
 }
 
 struct SegmentFixture {
@@ -111,6 +129,8 @@ struct SegmentFixture {
     const auto raw_dir = fx->root / "raw";
     std::filesystem::create_directories(raw_dir);
     const std::string raw_prefix = (raw_dir / "dsqg_seg_00000001").string();
+    write_fbin(raw_prefix + "_pca_base.fbin", fx->data.data(), static_cast<std::int32_t>(kCount),
+               static_cast<std::int32_t>(kDim));
 
     alaya::vamana::VamanaBuildParams vp;
     vp.R = kR;
