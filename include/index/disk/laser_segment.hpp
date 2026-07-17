@@ -872,8 +872,9 @@ class LaserSegment {
     if (options.filter.kind == core::SegmentFilterKind::bitmap) {
       // Already PID-indexed: resolve_search_options() performed the
       // label->PID translation before storing this filter.
-      admission_value = laser::admission_from_bitmap_payload(
-          options.filter.payload, options.filter.payload_size, searcher_->size());
+      admission_value = laser::admission_from_bitmap_payload(options.filter.payload,
+                                                             options.filter.payload_size,
+                                                             searcher_->size());
       admission = &admission_value;
     }
 

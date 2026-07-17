@@ -152,10 +152,9 @@ alaya_add_test(
   LABELS laser
 )
 
-# RowAdmission (segment admission contract v1): the bitmap POD view + its
-# factories (bitmap payload wrap, sorted-rows materialization, exclude-set
-# complement, AND composition). Pure kernel-level unit test -- no
-# QuantizedGraph/disk index needed, so this target links nothing beyond gtest.
+# RowAdmission (segment admission contract v1): the bitmap POD view + its factories (bitmap payload wrap, sorted-rows
+# materialization, exclude-set complement, AND composition). Pure kernel-level unit test -- no QuantizedGraph/disk index
+# needed, so this target links nothing beyond gtest.
 alaya_cc_target(
   test_row_admission
   BARE GTEST
@@ -168,10 +167,9 @@ alaya_add_test(
   LABELS laser unit
 )
 
-# Segment admission contract kernel-level tests: tombstone parity between the
-# legacy result_filter_ exclude-set path and the RowAdmission bitmap path
-# (contract acceptance #2), bitmap-filter correctness, and the admission vs.
-# exclude-set performance A/B (contract acceptance #4).
+# Segment admission contract kernel-level tests: tombstone parity between the legacy result_filter_ exclude-set path and
+# the RowAdmission bitmap path (contract acceptance #2), bitmap-filter correctness, and the admission vs. exclude-set
+# performance A/B (contract acceptance #4).
 alaya_cc_target(
   test_admission_contract
   BARE GTEST

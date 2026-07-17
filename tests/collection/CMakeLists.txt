@@ -148,10 +148,9 @@ alaya_add_test(
   TIMEOUT 180
 )
 
-# Collection-level end-to-end tests for the segment admission contract
-# (docs/design/segment-admission-contract.md): a real LASER segment
-# executing a bitmap traversal filter, and the auto-policy fallback when a
-# qg memory segment in the same collection still rejects the filter kind.
+# Collection-level end-to-end tests for the segment admission contract (docs/design/segment-admission-contract.md): a
+# real LASER segment executing a bitmap traversal filter, and the auto-policy fallback when a qg memory segment in the
+# same collection still rejects the filter kind.
 if(ALAYA_ENABLE_LASER)
   alaya_cc_target(
     segmented_collection_laser_filter_test

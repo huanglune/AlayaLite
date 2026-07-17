@@ -402,9 +402,9 @@ class QuantizedGraph {
 
   /* search and copy results to KNN */
   void search(const float *ALAYA_RESTRICT query,
-             uint32_t knn,
-             uint32_t *ALAYA_RESTRICT results,
-             const RowAdmission *admission = nullptr);
+              uint32_t knn,
+              uint32_t *ALAYA_RESTRICT results,
+              const RowAdmission *admission = nullptr);
 
   // Full-cache probe: same scan_neighbors kernel on a resident arena — direct
   // pid*node_len addressing over cache_nodes_, no beam/AIO orchestration.
@@ -599,7 +599,10 @@ inline void QuantizedGraph::batch_search(const float *ALAYA_RESTRICT query,
 #pragma omp parallel for schedule(dynamic) num_threads(nthreads_signed)
   for (int64_t ii = 0; ii < num_queries_signed; ++ii) {
     const size_t i = static_cast<size_t>(ii);
-    disk_search_qg(query + i * (dimension_ + residual_dimension_), knn, results + i * knn, admission);
+    disk_search_qg(query + i * (dimension_ + residual_dimension_),
+                   knn,
+                   results + i * knn,
+                   admission);
   }
 }
 

@@ -49,7 +49,7 @@ struct RowAdmission {
 }
 
 [[nodiscard]] inline auto admission_popcount_words(const uint64_t *words,
-                                                    uint64_t num_words) noexcept -> uint64_t {
+                                                   uint64_t num_words) noexcept -> uint64_t {
   uint64_t total = 0;
   for (uint64_t i = 0; i < num_words; ++i) {
     total += static_cast<uint64_t>(std::popcount(words[i]));
@@ -75,8 +75,8 @@ inline void admission_clear_tail_bits(std::vector<uint64_t> &storage, uint64_t c
 // factory trusts the precondition and only clamps the popcount scan so a
 // short buffer cannot be read out of bounds.
 [[nodiscard]] inline auto admission_from_bitmap_payload(const void *payload,
-                                                         uint64_t payload_size,
-                                                         uint64_t capacity) -> RowAdmission {
+                                                        uint64_t payload_size,
+                                                        uint64_t capacity) -> RowAdmission {
   const auto *words = static_cast<const uint64_t *>(payload);
   const uint64_t needed_words = admission_words_for_capacity(capacity);
   const uint64_t available_words = payload_size / sizeof(uint64_t);
@@ -92,9 +92,9 @@ inline void admission_clear_tail_bits(std::vector<uint64_t> &storage, uint64_t c
 // implicitly: setting the same bit twice does not double-count popcount).
 // `storage` is caller-owned and must outlive the returned view.
 [[nodiscard]] inline auto admission_from_sorted_rows(const uint64_t *rows,
-                                                      uint64_t n,
-                                                      uint64_t capacity,
-                                                      std::vector<uint64_t> &storage)
+                                                     uint64_t n,
+                                                     uint64_t capacity,
+                                                     std::vector<uint64_t> &storage)
     -> RowAdmission {
   storage.assign(admission_words_for_capacity(capacity), uint64_t{0});
   uint64_t set_count = 0;
@@ -126,8 +126,8 @@ inline void admission_clear_tail_bits(std::vector<uint64_t> &storage, uint64_t c
 // instead.
 template <typename T>
 [[nodiscard]] inline auto admission_from_exclude_set(const std::unordered_set<T> &excluded,
-                                                      uint64_t capacity,
-                                                      std::vector<uint64_t> &storage)
+                                                     uint64_t capacity,
+                                                     std::vector<uint64_t> &storage)
     -> RowAdmission {
   storage.assign(admission_words_for_capacity(capacity), ~uint64_t{0});
   admission_clear_tail_bits(storage, capacity);
