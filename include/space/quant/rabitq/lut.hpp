@@ -19,10 +19,12 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 #include <vector>
 
 #include "./defines.hpp"
 #include "./fastscan.hpp"
+#include "space/quant/rabitq/dispatch.hpp"
 
 namespace alaya {
 
@@ -50,30 +52,21 @@ inline void scalar_quantize_normal(
   res = ((v0 - lo) * one_over_delta).round().template cast<uint8_t>();
 }
 
+// Runtime-dispatched for T=float (generic/AVX-512; see
+// space/quant/rabitq/dispatch.hpp). Non-float T (never instantiated today,
+// Lut<T> only throws-or-accepts floating point) always takes the portable
+// Eigen-based path below, matching the dispatcher's own generic tier exactly.
 template <typename T>
 inline void scalar_quantize_optimized(uint8_t *ALAYA_RESTRICT result,
                                       const T *ALAYA_RESTRICT vec0,
                                       size_t dim,
                                       T lo,
                                       T delta) {
-#if defined(__AVX512F__)
-  size_t mul16 = dim - (dim & 0b1111);
-  size_t i = 0;
-  T one_over_delta = 1 / delta;
-  auto lo512 = _mm512_set1_ps(lo);
-  auto od512 = _mm512_set1_ps(one_over_delta);
-  for (; i < mul16; i += 16) {
-    auto cur = _mm512_loadu_ps(&vec0[i]);
-    cur = _mm512_mul_ps(_mm512_sub_ps(cur, lo512), od512);  // NOLINT
-    auto i8 = _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(cur));
-    _mm_storeu_epi8(&result[i], i8);
+  if constexpr (std::is_same_v<T, float>) {
+    rabitq_simd::get_scalar_quantize_optimized_func()(result, vec0, dim, lo, delta);
+  } else {
+    scalar_quantize_normal(result, vec0, dim, lo, delta);
   }
-  for (; i < dim; ++i) {
-    result[i] = static_cast<uint8_t>(std::round((vec0[i] - lo) * one_over_delta));
-  }
-#else
-  scalar_quantize_normal(result, vec0, dim, lo, delta);
-#endif
 }
 
 template <typename T>

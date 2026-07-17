@@ -28,6 +28,7 @@
 #include "core/log.hpp"
 #include "defines.hpp"
 #include "simd/fht.hpp"
+#include "space/quant/rabitq/dispatch.hpp"
 #include "utils/math.hpp"
 
 namespace alaya {
@@ -143,54 +144,9 @@ class MatrixRotator : public Rotator<T> {
   }
 };
 
+// Runtime-dispatched (generic/AVX-512); see space/quant/rabitq/dispatch.hpp.
 static inline void flip_sign(const uint8_t *flip, float *data, size_t dim) {
-#if defined(__AVX512F__)
-  constexpr size_t kFloatsPerChunk = 64;  // Process 64 floats per iteration
-  // constexpr size_t bits_per_chunk = floats_per_chunk;  // 64 bits = 8 bytes
-
-  static_assert(kFloatsPerChunk % 16 == 0,
-                "floats_per_chunk must be divisible by AVX512 register width");
-  for (size_t i = 0; i < dim; i += kFloatsPerChunk) {
-    // Load 64 bits (8 bytes) from the bit sequence
-    uint64_t mask_bits;
-    std::memcpy(&mask_bits, &flip[i / 8], sizeof(mask_bits));
-
-    // Split into four 16-bit mask segments
-    const __mmask16 mask0 = _cvtu32_mask16(static_cast<uint32_t>(mask_bits & 0xFFFF));
-    const __mmask16 mask1 = _cvtu32_mask16(static_cast<uint32_t>((mask_bits >> 16) & 0xFFFF));
-    const __mmask16 mask2 = _cvtu32_mask16(static_cast<uint32_t>((mask_bits >> 32) & 0xFFFF));
-    const __mmask16 mask3 = _cvtu32_mask16(static_cast<uint32_t>((mask_bits >> 48) & 0xFFFF));
-
-    // Prepare sign-flip constant
-    const __m512 sign_flip = _mm512_castsi512_ps(_mm512_set1_epi32(0x80000000));
-
-    // Process 16 floats at a time with each mask segment
-    __m512 vec0 = _mm512_loadu_ps(&data[i]);
-    vec0 = _mm512_mask_xor_ps(vec0, mask0, vec0, sign_flip);
-    _mm512_storeu_ps(&data[i], vec0);
-
-    __m512 vec1 = _mm512_loadu_ps(&data[i + 16]);
-    vec1 = _mm512_mask_xor_ps(vec1, mask1, vec1, sign_flip);
-    _mm512_storeu_ps(&data[i + 16], vec1);
-
-    __m512 vec2 = _mm512_loadu_ps(&data[i + 32]);
-    vec2 = _mm512_mask_xor_ps(vec2, mask2, vec2, sign_flip);
-    _mm512_storeu_ps(&data[i + 32], vec2);
-
-    __m512 vec3 = _mm512_loadu_ps(&data[i + 48]);
-    vec3 = _mm512_mask_xor_ps(vec3, mask3, vec3, sign_flip);
-    _mm512_storeu_ps(&data[i + 48], vec3);
-  }
-#else
-  log_rotator_fallback_once();
-  for (size_t i = 0; i < dim; ++i) {
-    const auto byte = flip[i / 8];
-    const auto bit = static_cast<uint8_t>((byte >> (i % 8)) & 0x1U);
-    if (bit != 0U) {
-      data[i] = -data[i];
-    }
-  }
-#endif
+  rabitq_simd::get_flip_sign_func()(flip, data, dim);
 }
 
 template <typename T>
@@ -273,29 +229,8 @@ class FhtKacRotator : public Rotator<float> {
     return *this;
   }
 
-  static void kacs_walk(float *data, size_t len) {
-#if defined(__AVX512F__)
-    // ! len % 32 == 0;
-    for (size_t i = 0; i < len / 2; i += 16) {
-      __m512 x = _mm512_loadu_ps(&data[i]);
-      __m512 y = _mm512_loadu_ps(&data[i + (len / 2)]);
-
-      __m512 new_x = _mm512_add_ps(x, y);
-      __m512 new_y = _mm512_sub_ps(x, y);
-
-      _mm512_storeu_ps(&data[i], new_x);
-      _mm512_storeu_ps(&data[i + (len / 2)], new_y);
-    }
-#else
-    log_rotator_fallback_once();
-    for (size_t i = 0; i < len / 2; ++i) {
-      const float x = data[i];
-      const float y = data[i + (len / 2)];
-      data[i] = x + y;
-      data[i + (len / 2)] = x - y;
-    }
-#endif
-  }
+  // Runtime-dispatched (generic/AVX-512); see space/quant/rabitq/dispatch.hpp.
+  static void kacs_walk(float *data, size_t len) { rabitq_simd::get_kacs_walk_func()(data, len); }
 
   void rotate(const float *data, float *rotated_vec) const override {
     std::memcpy(rotated_vec, data, sizeof(float) * dim_);
