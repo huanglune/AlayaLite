@@ -34,6 +34,8 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "index/disk/segment_manifest.hpp"
@@ -103,6 +105,15 @@ class MutableLaserSegment {
                                seg_dir.string());
     }
     ids_view_ = ids_mmap_.as<uint64_t>();
+
+    // B-06 global bijection check (segment layer, after both the updater recovery
+    // and the ids sidecar mmap, so the base labels are visible): fail closed.
+    try {
+      verify_label_bijection();
+    } catch (...) {
+      release_writer_lock();
+      throw;
+    }
   }
 
   ~MutableLaserSegment() { release_writer_lock(); }
@@ -130,6 +141,22 @@ class MutableLaserSegment {
     return base;
   }
 
+  // Commit a physical label bundle (2A): n rows carrying n explicit labels under a
+  // single durable transaction (kind=7 binds + kind=8 tx_publish). Returns the
+  // appended PID range [base, base+n). Preconditions throw (caller error); any I/O
+  // failure poisons the handle. 2A is the physical base: label-uniqueness at the
+  // logical layer is the caller's (2B's) responsibility; the construction-time
+  // bijection check is defense-in-depth.
+  auto commit_physical_bundle(uint64_t txid, uint64_t applied_collection_op_id, const float *vecs,
+                              const uint64_t *labels, size_t n)
+      -> std::pair<laser::PID, laser::PID> {
+    const std::lock_guard<std::mutex> guard(mutex_);  // single-writer handle mutex (W0)
+    if (n == 0) {
+      throw std::invalid_argument("MutableLaserSegment::commit_physical_bundle: empty bundle");
+    }
+    return updater_->commit_physical_bundle(txid, applied_collection_op_id, vecs, labels, n);
+  }
+
   // Mark a row deleted and force the tombstone durable (its own next fsync).
   void tombstone(laser::PID id) {
     const std::lock_guard<std::mutex> guard(mutex_);  // single-writer handle mutex (W0)
@@ -154,10 +181,15 @@ class MutableLaserSegment {
     updater_->ensure_readable();  // entry poison gate (B-02); lock-free
     const size_t ef = std::max<size_t>(opts.ef, opts.top_k);
     const auto pids = updater_->search(query, opts.top_k, ef);
+    // Acquire the label snapshot AFTER search took its committed watermark: the
+    // snapshot is published before committed, so it covers every committed PID's
+    // binding, and identity fallback never fires spuriously (B-02).
+    const auto snap = updater_->label_snapshot();
     std::vector<DiskSearchHit> out;
     out.reserve(pids.size());
     for (const auto pid : pids) {
-      out.push_back(DiskSearchHit{label_for(pid), std::numeric_limits<float>::quiet_NaN()});
+      out.push_back(
+          DiskSearchHit{effective_label(pid, snap), std::numeric_limits<float>::quiet_NaN()});
     }
     updater_->ensure_readable();  // exit poison gate (B-02)
     return out;
@@ -204,8 +236,41 @@ class MutableLaserSegment {
     return static_cast<uint32_t>(parsed);
   }
 
-  [[nodiscard]] auto label_for(laser::PID pid) const -> uint64_t {
-    return static_cast<uint64_t>(pid) < base_count_ ? ids_view_[pid] : static_cast<uint64_t>(pid);
+  // Effective label of a committed PID: base rows map through the immutable ids
+  // sidecar; appended rows use an explicit binding from the snapshot, else fall
+  // back to identity (U2-a legacy appends carry no binding).
+  [[nodiscard]] auto effective_label(laser::PID pid,
+                                     const std::shared_ptr<const laser::LabelBindings> &snap) const
+      -> uint64_t {
+    if (static_cast<uint64_t>(pid) < base_count_) {
+      return ids_view_[pid];
+    }
+    const uint64_t *bound = snap ? snap->find(pid) : nullptr;
+    return bound != nullptr ? *bound : static_cast<uint64_t>(pid);
+  }
+
+  // B-06: over ALL committed live PIDs, the effective label (base sidecar U legacy
+  // identity U explicit appended) must be injective. A label owned by two live PIDs
+  // is an ambiguous mapping, so construction fails (fail-closed). Tombstoned/free
+  // rows keep their forward pid->label binding but do not occupy the live domain.
+  void verify_label_bijection() const {
+    const auto snap = updater_->label_snapshot();
+    const size_t committed = updater_->num_points();
+    std::unordered_map<uint64_t, laser::PID> owner;
+    owner.reserve(committed);
+    for (size_t p = 0; p < committed; ++p) {
+      const auto pid = static_cast<laser::PID>(p);
+      if (!updater_->row_is_live(pid)) {
+        continue;
+      }
+      const uint64_t lbl = effective_label(pid, snap);
+      const auto [it, inserted] = owner.emplace(lbl, pid);
+      if (!inserted) {
+        throw std::runtime_error("MutableLaserSegment: label " + std::to_string(lbl) +
+                                 " maps to two live PIDs (" + std::to_string(it->second) + " and " +
+                                 std::to_string(pid) + ")");
+      }
+    }
   }
 
   void acquire_writer_lock(const std::filesystem::path &lock_path) {

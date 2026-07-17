@@ -14,6 +14,7 @@
 #include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <string>
 #include <thread>
@@ -213,6 +214,234 @@ TEST(MutableLaserSegment, ConcurrentWritesAndSearchesAreRaceFree) {
     MutableLaserSegment seg2(dir, reopen, ResidencyMode::kPagedPool);
     EXPECT_EQ(seg2.size(), kBaseN + kRounds * kPerRound);
   }
+  std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// W2: appended-label transactions (commit_physical_bundle) + slot durability +
+// the global bijection check.
+// ---------------------------------------------------------------------------
+
+std::vector<char> read_bytes(const std::filesystem::path &p) {
+  std::ifstream in(p, std::ios::binary);
+  return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+void write_bytes(const std::filesystem::path &p, const std::vector<char> &b) {
+  std::ofstream out(p, std::ios::binary | std::ios::trunc);
+  out.write(b.data(), static_cast<std::streamsize>(b.size()));
+}
+// The active label slot is the non-empty one after a content checkpoint (the
+// inactive slot is pre-created empty).
+std::filesystem::path active_slot_path(const std::filesystem::path &dir) {
+  const auto idx = dir / ("wal_base" + waltest::index_suffix());
+  for (int s = 0; s < 2; ++s) {
+    const auto p = std::filesystem::path(idx.string() + ".labels.slot" + std::to_string(s));
+    std::error_code ec;
+    if (std::filesystem::exists(p, ec) && std::filesystem::file_size(p, ec) > 0) return p;
+  }
+  return std::filesystem::path(idx.string() + ".labels.slot1");
+}
+
+// A committed bundle's explicit labels are searchable in-session and survive a
+// checkpoint + reopen (loaded from the durable slot; the WAL was reset).
+TEST(MutableLaserSegmentLabels, ExplicitBundleLabelsSurviveReopen) {
+  const auto dir = scratch("explicit");
+  std::filesystem::remove_all(dir);
+  auto base = build_segment(dir, 3131);
+  const size_t n = 6;
+  const auto vecs = waltest::make_data(n, kDim, 0x9001);
+  std::vector<uint64_t> labels;
+  for (size_t i = 0; i < n; ++i) labels.push_back(90000 + i);  // disjoint from base 5000..
+  {
+    laser::UpdateParams params;
+    params.ef_insert = 64;
+    params.max_points = kBaseN + 64;
+    MutableLaserSegment seg(dir, params, ResidencyMode::kPagedPool);
+    const auto range = seg.commit_physical_bundle(/*txid=*/1, /*applied=*/1, vecs.data(),
+                                                  labels.data(), n);
+    EXPECT_EQ(range.first, static_cast<laser::PID>(kBaseN));
+    EXPECT_EQ(range.second, static_cast<laser::PID>(kBaseN + n));
+    EXPECT_EQ(seg.size(), kBaseN + n);
+    auto hits = seg.search(vecs.data(), DiskSearchOptions{/*top_k=*/5});
+    ASSERT_FALSE(hits.empty());
+    EXPECT_EQ(hits[0].label, labels[0]) << "explicit bundle label visible in-session";
+    seg.checkpoint();
+  }
+  {
+    laser::UpdateParams params;
+    params.max_points = kBaseN + 64;
+    MutableLaserSegment seg(dir, params, ResidencyMode::kPagedPool);
+    EXPECT_EQ(seg.size(), kBaseN + n);
+    auto hits = seg.search(vecs.data(), DiskSearchOptions{/*top_k=*/5});
+    ASSERT_FALSE(hits.empty());
+    EXPECT_EQ(hits[0].label, labels[0]) << "explicit label reloaded from the slot";
+    auto base_hits = seg.search(base.data.data(), DiskSearchOptions{/*top_k=*/5});
+    ASSERT_FALSE(base_hits.empty());
+    EXPECT_EQ(base_hits[0].label, kLabelBase + 0) << "base label still via the sidecar";
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// Base (sidecar) + legacy appended (identity) + explicit appended (bundle) all
+// translate correctly, in-session and after reopen.
+TEST(MutableLaserSegmentLabels, MixedLabelDomainsTranslate) {
+  const auto dir = scratch("mixed");
+  std::filesystem::remove_all(dir);
+  auto base = build_segment(dir, 5252);
+  const auto legacy = waltest::make_data(1, kDim, 0xAAAA);
+  const auto expl = waltest::make_data(3, kDim, 0xBBBB);
+  const std::vector<uint64_t> labels = {70001, 70002, 70003};
+  {
+    laser::UpdateParams params;
+    params.ef_insert = 64;
+    params.max_points = kBaseN + 64;
+    MutableLaserSegment seg(dir, params, ResidencyMode::kPagedPool);
+    const auto legacy_pid = seg.add(legacy.data());  // identity label == pid
+    EXPECT_EQ(legacy_pid, static_cast<laser::PID>(kBaseN));
+    const auto range = seg.commit_physical_bundle(1, 1, expl.data(), labels.data(), labels.size());
+    EXPECT_EQ(range.first, static_cast<laser::PID>(kBaseN + 1));
+    seg.checkpoint();
+  }
+  {
+    laser::UpdateParams params;
+    params.max_points = kBaseN + 64;
+    MutableLaserSegment seg(dir, params, ResidencyMode::kPagedPool);
+    auto legacy_hits = seg.search(legacy.data(), DiskSearchOptions{/*top_k=*/5});
+    ASSERT_FALSE(legacy_hits.empty());
+    EXPECT_EQ(legacy_hits[0].label, static_cast<uint64_t>(kBaseN)) << "legacy appended = identity";
+    auto expl_hits = seg.search(expl.data(), DiskSearchOptions{/*top_k=*/5});
+    ASSERT_FALSE(expl_hits.empty());
+    EXPECT_EQ(expl_hits[0].label, labels[0]) << "explicit appended = bound label";
+    auto base_hits = seg.search(base.data.data(), DiskSearchOptions{/*top_k=*/5});
+    ASSERT_FALSE(base_hits.empty());
+    EXPECT_EQ(base_hits[0].label, kLabelBase + 0) << "base = sidecar";
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// Commit a bundle + checkpoint (writes a durable slot), then corrupt it: the
+// reopen must fail closed at slot load. Parameterized over damage kinds.
+struct SlotDamage {
+  const char *name;
+  std::function<void(const std::filesystem::path &)> apply;
+};
+class MutableLaserSegmentSlotDamage : public ::testing::TestWithParam<SlotDamage> {};
+
+TEST_P(MutableLaserSegmentSlotDamage, CorruptSlotPoisonsReopen) {
+  const auto dir = scratch(std::string("slotdmg_") + GetParam().name);
+  std::filesystem::remove_all(dir);
+  build_segment(dir, 6161);
+  const auto vecs = waltest::make_data(4, kDim, 0x9009);
+  const std::vector<uint64_t> labels = {80000, 80001, 80002, 80003};
+  {
+    laser::UpdateParams params;
+    params.ef_insert = 64;
+    params.max_points = kBaseN + 64;
+    MutableLaserSegment seg(dir, params, ResidencyMode::kPagedPool);
+    (void)seg.commit_physical_bundle(1, 1, vecs.data(), labels.data(), labels.size());
+    seg.checkpoint();
+  }
+  GetParam().apply(active_slot_path(dir));
+  laser::UpdateParams reopen;
+  reopen.max_points = kBaseN + 64;
+  EXPECT_THROW((void)MutableLaserSegment(dir, reopen, ResidencyMode::kPagedPool), std::runtime_error)
+      << "corrupt slot (" << GetParam().name << ") must fail closed on reopen";
+  std::filesystem::remove_all(dir);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Damage, MutableLaserSegmentSlotDamage,
+    ::testing::Values(
+        SlotDamage{"checksum", [](const std::filesystem::path &p) {
+                     auto b = read_bytes(p);
+                     ASSERT_FALSE(b.empty());
+                     b[0] = static_cast<char>(b[0] ^ 0xFF);
+                     write_bytes(p, b);
+                   }},
+        SlotDamage{"truncate", [](const std::filesystem::path &p) {
+                     auto b = read_bytes(p);
+                     ASSERT_GT(b.size(), 16U);
+                     b.resize(b.size() - 8);  // no longer count*16
+                     write_bytes(p, b);
+                   }},
+        SlotDamage{"trailing", [](const std::filesystem::path &p) {
+                     auto b = read_bytes(p);
+                     b.resize(b.size() + 16);  // extra entry beyond count
+                     write_bytes(p, b);
+                   }},
+        SlotDamage{"missing", [](const std::filesystem::path &p) {
+                     std::filesystem::remove(p);
+                   }}),
+    [](const ::testing::TestParamInfo<SlotDamage> &info) { return info.param.name; });
+
+// A canonical-empty label tuple (no bundle ever committed) tolerates absent slot
+// files: reopen re-creates them and succeeds.
+TEST(MutableLaserSegmentLabels, CanonicalEmptyToleratesMissingSlots) {
+  const auto dir = scratch("canon_empty");
+  std::filesystem::remove_all(dir);
+  build_segment(dir, 7272);
+  const auto extra = waltest::make_data(1, kDim, 0xF11E);
+  {
+    laser::UpdateParams params;
+    params.max_points = kBaseN + 32;
+    MutableLaserSegment seg(dir, params, ResidencyMode::kPagedPool);
+    (void)seg.add(extra.data());  // identity append only: no explicit bindings
+    seg.checkpoint();             // canonical-empty label tuple (count == 0)
+  }
+  const auto idx = dir / ("wal_base" + waltest::index_suffix());
+  std::filesystem::remove(std::filesystem::path(idx.string() + ".labels.slot0"));
+  std::filesystem::remove(std::filesystem::path(idx.string() + ".labels.slot1"));
+  laser::UpdateParams reopen;
+  reopen.max_points = kBaseN + 32;
+  EXPECT_NO_THROW((void)MutableLaserSegment(dir, reopen, ResidencyMode::kPagedPool));
+  std::filesystem::remove_all(dir);
+}
+
+// B-06: an explicit binding that collides with an existing base (sidecar) label
+// leaves two live PIDs owning one label -> reopen construction fails closed.
+TEST(MutableLaserSegmentLabels, BaseLabelConflictFailsBijectionOnReopen) {
+  const auto dir = scratch("bij_base");
+  std::filesystem::remove_all(dir);
+  build_segment(dir, 8383);
+  const auto v = waltest::make_data(1, kDim, 0xC0C0);
+  const std::vector<uint64_t> labels = {kLabelBase + 0};  // collides with base row 0's label
+  {
+    laser::UpdateParams params;
+    params.ef_insert = 64;
+    params.max_points = kBaseN + 32;
+    MutableLaserSegment seg(dir, params, ResidencyMode::kPagedPool);
+    (void)seg.commit_physical_bundle(1, 1, v.data(), labels.data(), 1);  // no in-session check
+    seg.checkpoint();
+  }
+  laser::UpdateParams reopen;
+  reopen.max_points = kBaseN + 32;
+  EXPECT_THROW((void)MutableLaserSegment(dir, reopen, ResidencyMode::kPagedPool), std::runtime_error)
+      << "base-label conflict must fail the global bijection on reopen";
+  std::filesystem::remove_all(dir);
+}
+
+// B-06: an explicit binding equal to a legacy appended PID's implicit identity
+// label also collides -> reopen construction fails closed.
+TEST(MutableLaserSegmentLabels, LegacyIdentityConflictFailsBijectionOnReopen) {
+  const auto dir = scratch("bij_legacy");
+  std::filesystem::remove_all(dir);
+  build_segment(dir, 9494);
+  const auto legacy = waltest::make_data(1, kDim, 0xD0D0);
+  const auto v = waltest::make_data(1, kDim, 0xE0E0);
+  const std::vector<uint64_t> labels = {static_cast<uint64_t>(kBaseN)};  // == legacy pid's identity
+  {
+    laser::UpdateParams params;
+    params.ef_insert = 64;
+    params.max_points = kBaseN + 32;
+    MutableLaserSegment seg(dir, params, ResidencyMode::kPagedPool);
+    (void)seg.add(legacy.data());  // pid kBaseN, implicit identity label kBaseN
+    (void)seg.commit_physical_bundle(1, 1, v.data(), labels.data(), 1);  // pid kBaseN+1, label kBaseN
+    seg.checkpoint();
+  }
+  laser::UpdateParams reopen;
+  reopen.max_points = kBaseN + 32;
+  EXPECT_THROW((void)MutableLaserSegment(dir, reopen, ResidencyMode::kPagedPool), std::runtime_error)
+      << "legacy-identity conflict must fail the global bijection on reopen";
   std::filesystem::remove_all(dir);
 }
 
