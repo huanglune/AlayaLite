@@ -10,8 +10,11 @@
 #include <stdexcept>
 #include <vector>
 
-#include "space/quant/rabitq/lut.hpp"
 #include "index/graph/detail/search_runtime/buffer.hpp"
+#include "platform/detect.hpp"
+#include "simd/cpu_features.hpp"
+#include "space/quant/rabitq/dispatch.hpp"
+#include "space/quant/rabitq/lut.hpp"
 
 namespace alaya {
 
@@ -53,7 +56,15 @@ TEST(LutTest, ScalarFastScanAccumulatesUnsignedLookupValues) {
   }
 }
 
-#if !defined(__AVX512F__)
+// These two tests used to be gated behind `#if !defined(__AVX512F__)`, because
+// pre-dispatch, fastscan::estimate_distances/accumulate_and_estimate_distances
+// were compile-time gated to the AVX-512 branch on an AVX-512 build, with no
+// way to force the portable path in the same binary to check it against these
+// hand-computed expected values. Now that both tiers are runtime-dispatched
+// (space/quant/rabitq/dispatch.hpp) and live in the same translation unit
+// unconditionally, we call the generic tier directly (so the expected values
+// hold on every host) and add a differential check against the AVX-512 tier
+// when the host supports it.
 TEST(LutTest, FastScanFallbackEstimatesDistances) {
   alignas(64) std::array<uint16_t, fastscan::kBatchSize> nth_segments{};
   alignas(64) std::array<float, fastscan::kBatchSize> f_add{};
@@ -66,20 +77,45 @@ TEST(LutTest, FastScanFallbackEstimatesDistances) {
     f_rescale[i] = 2.0F;
   }
 
-  fastscan::estimate_distances(nth_segments.data(),
-                               f_add.data(),
-                               f_rescale.data(),
-                               3.0F,
-                               0.5F,
-                               1.0F,
-                               result.data());
+  rabitq_simd::detail::estimate_distances_generic(nth_segments.data(),
+                                                  f_add.data(),
+                                                  f_rescale.data(),
+                                                  3.0F,
+                                                  0.5F,
+                                                  1.0F,
+                                                  result.data());
 
   for (size_t i = 0; i < fastscan::kBatchSize; ++i) {
     EXPECT_FLOAT_EQ(result[i], static_cast<float>(i) + 7.0F);
   }
+
+#ifdef ALAYA_ARCH_X86
+  const auto &features = simd::get_cpu_features();
+  if (features.avx512f_ && features.avx512bw_) {
+    alignas(64) std::array<float, fastscan::kBatchSize> avx512_result{};
+    rabitq_simd::detail::estimate_distances_avx512(nth_segments.data(),
+                                                   f_add.data(),
+                                                   f_rescale.data(),
+                                                   3.0F,
+                                                   0.5F,
+                                                   1.0F,
+                                                   avx512_result.data());
+    for (size_t i = 0; i < fastscan::kBatchSize; ++i) {
+      EXPECT_NEAR(avx512_result[i], result[i], 1.0e-4F) << "i=" << i;
+    }
+  }
+#endif
 }
 
 TEST(LutTest, FastScanFallbackAccumulatesAndEstimatesDistances) {
+  // dim=8 is not a multiple of 16, so this exercises
+  // fastscan::accumulate_and_estimate_distances' dim-misalignment fallback
+  // (unrelated to CPU-tier dispatch: that guard runs before any SIMD tier is
+  // selected, both pre- and post-refactor) rather than the fused AVX-512
+  // kernel, which requires dim % 16 == 0 as a precondition. Differential
+  // coverage between the generic and AVX-512 tiers of the fused kernel itself
+  // (valid, aligned dims) lives in rabitq_dispatch_test.cpp's
+  // AccumulateAndEstimateDistancesDifferentialFuzz.
   alignas(64) std::array<uint8_t, fastscan::kBatchSize> codes{};
   alignas(64) std::array<uint8_t, fastscan::kBatchSize> lookup_table{};
   alignas(64) std::array<float, fastscan::kBatchSize> f_add{};
@@ -92,6 +128,31 @@ TEST(LutTest, FastScanFallbackAccumulatesAndEstimatesDistances) {
     f_rescale[i] = 0.5F;
   }
 
+  // Composed by hand exactly like the dim-misalignment fallback branch of
+  // fastscan::accumulate_and_estimate_distances does (accumulate_scalar, which
+  // always calls accumulate_generic, followed by the dispatched
+  // estimate_distances), so this is independent of which tier the dispatcher
+  // itself would select on this host for the estimate step.
+  std::array<uint16_t, fastscan::kBatchSize> accumulated{};
+  ::alaya::simd::fastscan::accumulate_generic(8,
+                                              codes.data(),
+                                              lookup_table.data(),
+                                              accumulated.data());
+  rabitq_simd::detail::estimate_distances_generic(accumulated.data(),
+                                                  f_add.data(),
+                                                  f_rescale.data(),
+                                                  1.0F,
+                                                  2.0F,
+                                                  3.0F,
+                                                  result.data());
+
+  for (const auto value : result) {
+    EXPECT_FLOAT_EQ(value, 12.5F);
+  }
+
+  // Differential: the public (dispatched) API must agree with the hand-composed
+  // generic oracle above when it takes the same dim-misalignment path.
+  alignas(64) std::array<float, fastscan::kBatchSize> dispatched_result{};
   fastscan::accumulate_and_estimate_distances(codes.data(),
                                               lookup_table.data(),
                                               f_add.data(),
@@ -99,14 +160,12 @@ TEST(LutTest, FastScanFallbackAccumulatesAndEstimatesDistances) {
                                               1.0F,
                                               2.0F,
                                               3.0F,
-                                              result.data(),
+                                              dispatched_result.data(),
                                               8);
-
-  for (const auto value : result) {
-    EXPECT_FLOAT_EQ(value, 12.5F);
+  for (size_t i = 0; i < fastscan::kBatchSize; ++i) {
+    EXPECT_NEAR(dispatched_result[i], result[i], 1.0e-4F) << "i=" << i;
   }
 }
-#endif
 
 TEST(SearchBufferTest, HandlesEmptyResizeAndSortedInsertion) {
   SearchBuffer<float> buffer;

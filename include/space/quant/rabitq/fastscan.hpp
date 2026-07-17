@@ -25,6 +25,7 @@
 #include "core/log.hpp"
 #include "simd/fastscan.hpp"
 #include "space/quant/rabitq/defines.hpp"
+#include "space/quant/rabitq/dispatch.hpp"
 
 namespace alaya::fastscan {
 using ::alaya::simd::fastscan::kBatchSize;
@@ -61,7 +62,10 @@ inline void pack_codes(size_t padded_dim,
   ::alaya::simd::fastscan::pack_codes_bytes<false>(padded_dim, quantization_code, num, blocks);
 }
 
-//  use fast scan to accumulate one block, dim % 16 == 0
+//  use fast scan to accumulate one block, dim % 16 == 0.
+//  Runtime-dispatched across scalar/AVX2/AVX-512 SIMD tiers; see
+//  space/quant/rabitq/dispatch.hpp (reuses simd::fastscan's own three kernels
+//  directly instead of re-implementing them here).
 inline void accumulate(const uint8_t *ALAYA_RESTRICT codes,
                        const uint8_t *ALAYA_RESTRICT lp_table,
                        uint16_t *ALAYA_RESTRICT result,
@@ -72,118 +76,10 @@ inline void accumulate(const uint8_t *ALAYA_RESTRICT codes,
     return;
   }
 
-#if defined(__AVX512F__)
-  size_t code_length = dim << 2;
-  __m512i c;
-  __m512i lo;
-  __m512i hi;
-  __m512i lut;
-  __m512i res_lo;
-  __m512i res_hi;
-
-  const __m512i lo_mask = _mm512_set1_epi8(0x0f);
-  __m512i accu0 = _mm512_setzero_si512();
-  __m512i accu1 = _mm512_setzero_si512();
-  __m512i accu2 = _mm512_setzero_si512();
-  __m512i accu3 = _mm512_setzero_si512();
-
-  // ! here, we assume the code_length is a multiple of 64, thus the dim must be a
-  // ! multiple of 16
-  for (size_t i = 0; i < code_length; i += 64) {
-    c = _mm512_loadu_si512(&codes[i]);
-    lut = _mm512_loadu_si512(&lp_table[i]);
-    lo = _mm512_and_si512(c, lo_mask);                        // code of vector 0 to 15
-    hi = _mm512_and_si512(_mm512_srli_epi16(c, 4), lo_mask);  // code of vector 16 to 31
-
-    res_lo = _mm512_shuffle_epi8(lut, lo);  // get the target value in lookup table
-    res_hi = _mm512_shuffle_epi8(lut, hi);
-
-    // since values in lookup table are represented as i8, we add them as i16 to avoid
-    // overflow. Since the data order is 0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14,
-    // 7, 15, accu0 accumulates for vec 8 to 15 (the upper 8 bits need to be updated
-    // since they stored useless info of vec 0 to 7) accu1 accumulates for vec 0 to 7
-    // similar for accu2 and accu3
-    accu0 = _mm512_add_epi16(accu0, res_lo);
-    accu1 = _mm512_add_epi16(accu1, _mm512_srli_epi16(res_lo, 8));
-    accu2 = _mm512_add_epi16(accu2, res_hi);
-    accu3 = _mm512_add_epi16(accu3, _mm512_srli_epi16(res_hi, 8));
-  }
-  // remove the influence of upper 8 bits for accu0 and accu2
-  accu0 = _mm512_sub_epi16(accu0, _mm512_slli_epi16(accu1, 8));
-  accu2 = _mm512_sub_epi16(accu2, _mm512_slli_epi16(accu3, 8));
-
-  // At this point, we already have the correct accumulating result (accu0: 8-15, accu1:
-  // 0-7, accu2: 16-23, accu3: 24-31), but we still need to write them back to RAM. Also,
-  // each accu contains 4 lines of __m128i and we need to sum them together to get the
-  // final results. 512/16=32, so we can use one __m512i to contain all results. The
-  // following codes are designed for this purpose. For detailed information, please check
-  // the SIMD documentation.
-  __m512i ret1 = _mm512_add_epi16(_mm512_mask_blend_epi64(0b11110000, accu0, accu1),
-                                  _mm512_shuffle_i64x2(accu0, accu1, 0b01001110));
-  __m512i ret2 = _mm512_add_epi16(_mm512_mask_blend_epi64(0b11110000, accu2, accu3),
-                                  _mm512_shuffle_i64x2(accu2, accu3, 0b01001110));
-  __m512i ret = _mm512_setzero_si512();
-
-  ret = _mm512_add_epi16(ret, _mm512_shuffle_i64x2(ret1, ret2, 0b10001000));
-  ret = _mm512_add_epi16(ret, _mm512_shuffle_i64x2(ret1, ret2, 0b11011101));
-
-  _mm512_storeu_si512(result, ret);
-
-#elif defined(__AVX2__)
-  size_t code_length = dim << 2;
-  __m256i c, lo, hi, lut, res_lo, res_hi;
-
-  __m256i low_mask = _mm256_set1_epi8(0xf);
-  __m256i accu0 = _mm256_setzero_si256();
-  __m256i accu1 = _mm256_setzero_si256();
-  __m256i accu2 = _mm256_setzero_si256();
-  __m256i accu3 = _mm256_setzero_si256();
-
-  for (size_t i = 0; i < code_length; i += 64) {
-    c = _mm256_loadu_si256((__m256i *)&codes[i]);       // NOLINT(readability/casting)
-    lut = _mm256_loadu_si256((__m256i *)&lp_table[i]);  // NOLINT(readability/casting)
-    lo = _mm256_and_si256(c, low_mask);
-    hi = _mm256_and_si256(_mm256_srli_epi16(c, 4), low_mask);
-
-    res_lo = _mm256_shuffle_epi8(lut, lo);
-    res_hi = _mm256_shuffle_epi8(lut, hi);
-
-    accu0 = _mm256_add_epi16(accu0, res_lo);
-    accu1 = _mm256_add_epi16(accu1, _mm256_srli_epi16(res_lo, 8));
-    accu2 = _mm256_add_epi16(accu2, res_hi);
-    accu3 = _mm256_add_epi16(accu3, _mm256_srli_epi16(res_hi, 8));
-
-    c = _mm256_loadu_si256((__m256i *)&codes[i + 32]);       // NOLINT(readability/casting)
-    lut = _mm256_loadu_si256((__m256i *)&lp_table[i + 32]);  // NOLINT(readability/casting)
-    lo = _mm256_and_si256(c, low_mask);
-    hi = _mm256_and_si256(_mm256_srli_epi16(c, 4), low_mask);
-
-    res_lo = _mm256_shuffle_epi8(lut, lo);
-    res_hi = _mm256_shuffle_epi8(lut, hi);
-
-    accu0 = _mm256_add_epi16(accu0, res_lo);
-    accu1 = _mm256_add_epi16(accu1, _mm256_srli_epi16(res_lo, 8));
-    accu2 = _mm256_add_epi16(accu2, res_hi);
-    accu3 = _mm256_add_epi16(accu3, _mm256_srli_epi16(res_hi, 8));
-  }
-
-  accu0 = _mm256_sub_epi16(accu0, _mm256_slli_epi16(accu1, 8));
-  __m256i dis0 = _mm256_add_epi16(_mm256_permute2f128_si256(accu0, accu1, 0x21),
-                                  _mm256_blend_epi32(accu0, accu1, 0xF0));
-  _mm256_storeu_si256((__m256i *)result, dis0);  // NOLINT(readability/casting)
-
-  accu2 = _mm256_sub_epi16(accu2, _mm256_slli_epi16(accu3, 8));
-  __m256i dis1 = _mm256_add_epi16(_mm256_permute2f128_si256(accu2, accu3, 0x21),
-                                  _mm256_blend_epi32(accu2, accu3, 0xF0));
-  _mm256_storeu_si256((__m256i *)&result[16], dis1);  // NOLINT(readability/casting)
-#else
-  // Scalar fallback for non-x86 architectures (ARM, etc.)
-  // This implementation is slower but functionally equivalent to the SIMD versions
-  log_scalar_fastscan_fallback();
-  detail::accumulate_scalar(codes, lp_table, result, dim);
-#endif
+  rabitq_simd::get_accumulate_func()(dim, codes, lp_table, result);
 }
 
+// Runtime-dispatched (generic/AVX-512); see space/quant/rabitq/dispatch.hpp.
 template <typename T>
 inline void estimate_distances(const uint16_t *ALAYA_RESTRICT nth_segments,
                                const T *ALAYA_RESTRICT f_add,
@@ -193,31 +89,13 @@ inline void estimate_distances(const uint16_t *ALAYA_RESTRICT nth_segments,
                                T lut_bias,
                                T *ALAYA_RESTRICT result) {
   static_assert(std::is_same_v<T, float>, "fastscan::estimate_distances only supports float.");
-#if defined(__AVX512F__)
-  const __m512 v_delta = _mm512_set1_ps(lut_delta);
-  const __m512 v_bias = _mm512_set1_ps(lut_bias);
-  const __m512 v_gadd = _mm512_set1_ps(g_add);
-
-  for (size_t off = 0; off < kBatchSize; off += 16) {
-    const __m256i nth_u16 =
-        _mm256_load_si256(reinterpret_cast<const __m256i *>(nth_segments + off));
-    const __m512 nth_f = _mm512_cvtepi32_ps(_mm512_cvtepu16_epi32(nth_u16));
-
-    const __m512 f_add_v = _mm512_loadu_ps(f_add + off);
-    const __m512 f_rescale_v = _mm512_loadu_ps(f_rescale + off);
-
-    const __m512 inner = _mm512_fmadd_ps(v_delta, nth_f, v_bias);
-    const __m512 est = _mm512_fmadd_ps(f_rescale_v, inner, _mm512_add_ps(f_add_v, v_gadd));
-
-    _mm512_storeu_ps(result + off, est);
-  }
-#else
-  log_scalar_fastscan_fallback();
-  for (size_t off = 0; off < kBatchSize; ++off) {
-    const auto inner = static_cast<T>(nth_segments[off]) * lut_delta + lut_bias;
-    result[off] = f_rescale[off] * inner + f_add[off] + g_add;
-  }
-#endif
+  rabitq_simd::get_estimate_distances_func()(nth_segments,
+                                             f_add,
+                                             f_rescale,
+                                             g_add,
+                                             lut_delta,
+                                             lut_bias,
+                                             result);
 }
 
 template <typename T>
@@ -234,6 +112,7 @@ inline void accumulate_and_estimate_distances(const uint8_t *ALAYA_RESTRICT code
   // accumulate -> convert -> distance pipeline.  Sharing the standalone integer
   // accumulate kernel does not justify adding an intermediate store/load here;
   // the two consumers intentionally retain their individually optimized pipelines.
+  // Runtime-dispatched (generic/AVX-512); see space/quant/rabitq/dispatch.hpp.
   static_assert(std::is_same_v<T, float>,
                 "fastscan::accumulate_and_estimate_distances only supports float.");
   if ((dim & 0x0FU) != 0U) {
@@ -244,74 +123,15 @@ inline void accumulate_and_estimate_distances(const uint8_t *ALAYA_RESTRICT code
     return;
   }
 
-#if defined(__AVX512F__)
-  size_t code_length = dim << 2;
-  __m512i c;
-  __m512i lo;
-  __m512i hi;
-  __m512i lut;
-  __m512i res_lo;
-  __m512i res_hi;
-
-  const __m512i lo_mask = _mm512_set1_epi8(0x0f);
-  __m512i accu0 = _mm512_setzero_si512();
-  __m512i accu1 = _mm512_setzero_si512();
-  __m512i accu2 = _mm512_setzero_si512();
-  __m512i accu3 = _mm512_setzero_si512();
-
-  for (size_t i = 0; i < code_length; i += 64) {
-    c = _mm512_loadu_si512(&codes[i]);
-    lut = _mm512_loadu_si512(&lp_table[i]);
-    lo = _mm512_and_si512(c, lo_mask);
-    hi = _mm512_and_si512(_mm512_srli_epi16(c, 4), lo_mask);
-
-    res_lo = _mm512_shuffle_epi8(lut, lo);
-    res_hi = _mm512_shuffle_epi8(lut, hi);
-
-    accu0 = _mm512_add_epi16(accu0, res_lo);
-    accu1 = _mm512_add_epi16(accu1, _mm512_srli_epi16(res_lo, 8));
-    accu2 = _mm512_add_epi16(accu2, res_hi);
-    accu3 = _mm512_add_epi16(accu3, _mm512_srli_epi16(res_hi, 8));
-  }
-
-  accu0 = _mm512_sub_epi16(accu0, _mm512_slli_epi16(accu1, 8));
-  accu2 = _mm512_sub_epi16(accu2, _mm512_slli_epi16(accu3, 8));
-
-  const __m512i ret1 = _mm512_add_epi16(_mm512_mask_blend_epi64(0b11110000, accu0, accu1),
-                                        _mm512_shuffle_i64x2(accu0, accu1, 0b01001110));
-  const __m512i ret2 = _mm512_add_epi16(_mm512_mask_blend_epi64(0b11110000, accu2, accu3),
-                                        _mm512_shuffle_i64x2(accu2, accu3, 0b01001110));
-  __m512i ret = _mm512_setzero_si512();
-
-  ret = _mm512_add_epi16(ret, _mm512_shuffle_i64x2(ret1, ret2, 0b10001000));
-  ret = _mm512_add_epi16(ret, _mm512_shuffle_i64x2(ret1, ret2, 0b11011101));
-
-  const __m512 v_delta = _mm512_set1_ps(lut_delta);
-  const __m512 v_bias = _mm512_set1_ps(lut_bias);
-  const __m512 v_gadd = _mm512_set1_ps(g_add);
-
-  const __m256i nth_u16_lo = _mm512_castsi512_si256(ret);
-  const __m256i nth_u16_hi = _mm512_extracti64x4_epi64(ret, 1);
-
-  const __m512 nth_f_lo = _mm512_cvtepi32_ps(_mm512_cvtepu16_epi32(nth_u16_lo));
-  const __m512 f_add_lo = _mm512_loadu_ps(f_add);
-  const __m512 f_rescale_lo = _mm512_loadu_ps(f_rescale);
-  const __m512 inner_lo = _mm512_fmadd_ps(v_delta, nth_f_lo, v_bias);
-  const __m512 est_lo = _mm512_fmadd_ps(f_rescale_lo, inner_lo, _mm512_add_ps(f_add_lo, v_gadd));
-  _mm512_storeu_ps(result, est_lo);
-
-  const __m512 nth_f_hi = _mm512_cvtepi32_ps(_mm512_cvtepu16_epi32(nth_u16_hi));
-  const __m512 f_add_hi = _mm512_loadu_ps(f_add + 16);
-  const __m512 f_rescale_hi = _mm512_loadu_ps(f_rescale + 16);
-  const __m512 inner_hi = _mm512_fmadd_ps(v_delta, nth_f_hi, v_bias);
-  const __m512 est_hi = _mm512_fmadd_ps(f_rescale_hi, inner_hi, _mm512_add_ps(f_add_hi, v_gadd));
-  _mm512_storeu_ps(result + 16, est_hi);
-#else
-  log_scalar_fastscan_fallback();
-  alignas(64) std::array<uint16_t, kBatchSize> nth_segments{};
-  accumulate(codes, lp_table, nth_segments.data(), dim);
-  estimate_distances(nth_segments.data(), f_add, f_rescale, g_add, lut_delta, lut_bias, result);
-#endif
+  rabitq_simd::get_accumulate_and_estimate_distances_func()(codes,
+                                                            lp_table,
+                                                            f_add,
+                                                            f_rescale,
+                                                            g_add,
+                                                            lut_delta,
+                                                            lut_bias,
+                                                            result,
+                                                            dim);
 }
 
 // pack lookup table for fastscan, for each 4 dim, we have 16 (2^4) different results
