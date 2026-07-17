@@ -1130,17 +1130,24 @@ class QGUpdater {
         if (static_cast<size_t>(pid) != old_hwm + i) {
           poison("commit_physical_bundle: append produced a non-dense PID");
         }
-        wal_append(encode_label_bind(segment_uid_, superblock_.generation, txid,
-                                     static_cast<uint64_t>(i), pid, /*pid_generation=*/0, labels[i]),
-                   alaya::wal::WalFile::Sync::buffered, txid);
+        wal_append(encode_label_bind(segment_uid_,
+                                     superblock_.generation,
+                                     txid,
+                                     static_cast<uint64_t>(i),
+                                     pid,
+                                     /*pid_generation=*/0,
+                                     labels[i]),
+                   alaya::wal::WalFile::Sync::buffered,
+                   txid);
       }
       wal_failpoint(SegmentOpFailPoint::after_label_bind_append);
       // Reverse edges must be materialized inline before the commit (B-03/clause B):
       // a staged (deferred) backlink would let kind=8 commit a row whose only routing
       // edges live in RAM and vanish on a crash, leaving it permanently unreachable.
       if (has_staged_edges()) {
-        poison("commit_physical_bundle: staged backlinks must be drained (inline patching "
-               "is required under enable_wal)");
+        poison(
+            "commit_physical_bundle: staged backlinks must be drained (inline patching "
+            "is required under enable_wal)");
       }
       // (2) pre-build the new immutable snapshot (zero allocation / no failure after
       // this point on the publish path).
@@ -1151,13 +1158,19 @@ class QGUpdater {
       std::shared_ptr<const LabelBindings> published = std::move(next);
       // (3) append kind=8 + fsync: the single durable commit point of the bundle.
       wal_failpoint(SegmentOpFailPoint::before_tx_publish_append);
-      wal_append(encode_tx_publish(segment_uid_, superblock_.generation, txid,
-                                   static_cast<uint64_t>(new_hwm), static_cast<uint64_t>(n),
+      wal_append(encode_tx_publish(segment_uid_,
+                                   superblock_.generation,
+                                   txid,
+                                   static_cast<uint64_t>(new_hwm),
+                                   static_cast<uint64_t>(n),
                                    applied_op_id),
-                 alaya::wal::WalFile::Sync::fsync, txid);
+                 alaya::wal::WalFile::Sync::fsync,
+                 txid);
       wal_failpoint(SegmentOpFailPoint::after_tx_publish_fsync);
       // (4) publish snapshot (release) THEN committed (release), via the shared core.
-      publish_common(new_hwm, [&] { store_label_snapshot(published); });
+      publish_common(new_hwm, [&] {
+        store_label_snapshot(published);
+      });
       last_committed_txid_ = txid;
       applied_collection_op_id_ = applied_op_id;
       return {static_cast<PID>(old_hwm), static_cast<PID>(new_hwm)};
@@ -4321,7 +4334,8 @@ class QGUpdater {
 
   // Load + fully validate a slot file against the superblock tuple (all failures
   // poison / fail-closed). Caller guarantees a non-canonical-empty tuple.
-  LabelBindings load_label_slot_bindings(const std::string &path, uint64_t count,
+  LabelBindings load_label_slot_bindings(const std::string &path,
+                                         uint64_t count,
                                          uint64_t checksum) {
     if ((checksum >> 32) != 0) {
       poison("label slot checksum high 32 bits must be zero");
@@ -4612,9 +4626,9 @@ class QGUpdater {
     }
     adopt_label_state(superblock_);  // load persisted bindings + tx watermarks from the base
     if (!scanned.frames.empty()) {
-      replay_and_rebuild(scanned);   // promotes staged bundles into label_working_ (W3)
+      replay_and_rebuild(scanned);  // promotes staged bundles into label_working_ (W3)
     }
-    publish_label_snapshot();        // seal the recovered label state (tail convergence)
+    publish_label_snapshot();  // seal the recovered label state (tail convergence)
     precreate_label_slots();
   }
 
@@ -4723,7 +4737,8 @@ class QGUpdater {
   // Promote or idempotently verify a tx_publish (B-04, semantics 4). Splits on the
   // adopted base's persisted txid: (a) a new tx to promote, (b) a tx already
   // absorbed by the base (new superblock flipped, old WAL not yet reset).
-  void replay_tx_publish(const SegmentOp &op, uint64_t frame_batch_id,
+  void replay_tx_publish(const SegmentOp &op,
+                         uint64_t frame_batch_id,
                          uint64_t &committed_watermark) {
     if (frame_batch_id != op.tx_id) {
       poison("op-WAL tx_publish frame batch_id != payload tx_id");
@@ -4783,7 +4798,8 @@ class QGUpdater {
     std::vector<uint8_t> row_seen(static_cast<size_t>(op.binding_count), 0);
     std::vector<uint8_t> pid_seen(static_cast<size_t>(op.binding_count), 0);
     for (const auto &bind : staged) {
-      if (bind.row_op_id >= op.binding_count || row_seen[static_cast<size_t>(bind.row_op_id)] != 0) {
+      if (bind.row_op_id >= op.binding_count ||
+          row_seen[static_cast<size_t>(bind.row_op_id)] != 0) {
         poison("op-WAL tx_publish row_op_id set is not exactly {0..count-1}");
       }
       row_seen[static_cast<size_t>(bind.row_op_id)] = 1;
@@ -4944,10 +4960,10 @@ class QGUpdater {
   std::unique_ptr<alaya::wal::WalFile> op_wal_;  // <index>.opwal, present iff enable_wal_
   bool replaying_ = false;                       // set during recovery redo: suppress log + force
   std::string poison_reason_;                    // non-empty => writer permanently poisoned
-  std::atomic<bool> poisoned_{false};            // lock-free latch mirroring poison_reason_ for reads
-  uint64_t segment_uid_ = 0;                     // durable lineage id (superblock reserved[0..8))
-  uint64_t wal_op_id_ = 0;                       // monotone frame op-id (informational/diagnostic)
-  SegmentIoObserver *io_observer_ = nullptr;     // persistence-model harness hook (test only)
+  std::atomic<bool> poisoned_{false};         // lock-free latch mirroring poison_reason_ for reads
+  uint64_t segment_uid_ = 0;                  // durable lineage id (superblock reserved[0..8))
+  uint64_t wal_op_id_ = 0;                    // monotone frame op-id (informational/diagnostic)
+  SegmentIoObserver *io_observer_ = nullptr;  // persistence-model harness hook (test only)
 
   // --- 2A appended-label transaction state ---
   // Immutable published snapshot (B-02). The single writer swaps the pointer under
@@ -4959,14 +4975,14 @@ class QGUpdater {
   std::map<PID, uint64_t> label_working_;  // recovery-only scratch (slot load + promotions)
   std::string label_slot_path_[2];         // <index>.labels.slot0 / .slot1
   int active_label_slot_ = 0;              // slot holding the persisted bindings
-  uint64_t label_generation_ = 0;          // persisted-slot generation (bumped on content checkpoint)
-  uint64_t label_count_ = 0;               // persisted-slot binding count (== superblock label_count)
-  uint64_t label_checksum_ = 0;            // persisted-slot checksum (low 32 = crc32, high 32 = 0)
-  uint64_t last_committed_txid_ = 0;       // running: strictly increases per committed bundle
+  uint64_t label_generation_ = 0;     // persisted-slot generation (bumped on content checkpoint)
+  uint64_t label_count_ = 0;          // persisted-slot binding count (== superblock label_count)
+  uint64_t label_checksum_ = 0;       // persisted-slot checksum (low 32 = crc32, high 32 = 0)
+  uint64_t last_committed_txid_ = 0;  // running: strictly increases per committed bundle
   uint64_t applied_collection_op_id_ = 0;  // running: caller op watermark (2B idempotency basis)
   uint64_t base_committed_txid_ = 0;       // adopted base's persisted txid (case (a)/(b) split)
   uint64_t base_applied_op_id_ = 0;        // adopted base's persisted applied op id
-  uint64_t base_num_points_ = 0;           // adopted base committed watermark (case (b) bound check)
+  uint64_t base_num_points_ = 0;  // adopted base committed watermark (case (b) bound check)
   // Recovery staging: label_bind frames accumulated per tx_id until tx_publish.
   struct LabelBindStage {
     uint64_t row_op_id = 0;

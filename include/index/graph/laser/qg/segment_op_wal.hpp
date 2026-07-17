@@ -59,8 +59,8 @@ enum class SegmentOpKind : std::uint8_t {
   consolidate_end = 4,    // epoch (phase barrier)
   publish = 5,            // visibility watermark (monotone max on replay)
   superblock_flip = 6,    // target slot + 512-byte superblock image (checkpoint commit point)
-  label_bind = 7,         // 2A: tx_id, row_op_id, pid, pid_generation, label (staged until tx_publish)
-  tx_publish = 8,         // 2A: tx_id, new_pid_watermark, binding_count, applied_collection_op_id
+  label_bind = 7,  // 2A: tx_id, row_op_id, pid, pid_generation, label (staged until tx_publish)
+  tx_publish = 8,  // 2A: tx_id, new_pid_watermark, binding_count, applied_collection_op_id
 };
 
 // Crash-injection points for the G1 crash matrix, ordered along one op's

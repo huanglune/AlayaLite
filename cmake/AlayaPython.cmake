@@ -5,9 +5,9 @@
 # AlayaPython.cmake - single source of truth for Python discovery.
 #
 # Everything in this project resolves Python through CMake's FindPython module (the `Python_*` variable family): the
-# pybind11 module (interpreter + Development.Module) and the LASER test fixture (interpreter). pybind11 is
-# pointed at the same result via PYBIND11_FINDPYTHON=ON, so there is exactly one interpreter per build tree and one hint
-# variable to override it: -DPython_EXECUTABLE=<path>.
+# pybind11 module (interpreter + Development.Module) and the LASER test fixture (interpreter). pybind11 is pointed at
+# the same result via PYBIND11_FINDPYTHON=ON, so there is exactly one interpreter per build tree and one hint variable
+# to override it: -DPython_EXECUTABLE=<path>.
 #
 # Resolution order: 1. An explicit -DPython_EXECUTABLE / -DPython_ROOT_DIR wins (this is also how scikit-build-core
 # drives wheel builds — it passes FindPython hints for the interpreter cibuildwheel selected). 2. -DPython3_EXECUTABLE

@@ -147,9 +147,11 @@ class MutableLaserSegment {
   // failure poisons the handle. 2A is the physical base: label-uniqueness at the
   // logical layer is the caller's (2B's) responsibility; the construction-time
   // bijection check is defense-in-depth.
-  auto commit_physical_bundle(uint64_t txid, uint64_t applied_collection_op_id, const float *vecs,
-                              const uint64_t *labels, size_t n)
-      -> std::pair<laser::PID, laser::PID> {
+  auto commit_physical_bundle(uint64_t txid,
+                              uint64_t applied_collection_op_id,
+                              const float *vecs,
+                              const uint64_t *labels,
+                              size_t n) -> std::pair<laser::PID, laser::PID> {
     const std::lock_guard<std::mutex> guard(mutex_);  // single-writer handle mutex (W0)
     if (n == 0) {
       throw std::invalid_argument("MutableLaserSegment::commit_physical_bundle: empty bundle");
@@ -166,7 +168,7 @@ class MutableLaserSegment {
 
   void flush() {
     const std::lock_guard<std::mutex> guard(mutex_);  // single-writer handle mutex (W0)
-    updater_->writeback(1);  // persist dirty pages + mirror the arena
+    updater_->writeback(1);                           // persist dirty pages + mirror the arena
   }
   void checkpoint() {
     const std::lock_guard<std::mutex> guard(mutex_);  // single-writer handle mutex (W0)
