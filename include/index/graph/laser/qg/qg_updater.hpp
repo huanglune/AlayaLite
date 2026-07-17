@@ -5810,6 +5810,14 @@ class QGUpdater {
     if (pid_generation_activated_ && !maintenance_activated_) {
       poison("v3 base is pid-reuse-active but not maintenance-active (feature dependency)");
     }
+    // BLOCKER-3: pid reuse activates at or after maintenance -- a pid activation generation
+    // BELOW the maintenance activation generation is an impossible / forged ordering. (The
+    // selector's qg_superblock_supported enforces this for the accepted base; assert it here
+    // too so a flip image adopted mid-replay is held to the same ordering.)
+    if (pid_generation_activated_ && maintenance_activated_ &&
+        pid_reuse_activation_gen_ < maintenance_activation_gen_) {
+      poison("v3 base pid-reuse activation generation precedes maintenance activation");
+    }
     last_committed_txid_ = tx.last_committed_txid;
     applied_collection_op_id_ = tx.applied_collection_op_id;
     base_committed_txid_ = tx.last_committed_txid;
@@ -5828,7 +5836,12 @@ class QGUpdater {
       if (w2c.max_pid_generation != 0 || w2c.nonzero_pid_generation_count != 0) {
         poison("empty label slot but the superblock declares a non-zero pid-generation summary");
       }
-      active_label_slot_ = ls.slot <= 1 ? static_cast<int>(ls.slot) : 0;
+      // BLOCKER-3: an out-of-range slot index must fail closed even for the empty tuple --
+      // silently coercing slot>1 to 0 would accept a forged superblock.
+      if (ls.slot > 1) {
+        poison("label slot index out of range in the superblock (empty tuple)");
+      }
+      active_label_slot_ = static_cast<int>(ls.slot);
       label_working_.clear();
       return;  // canonical legacy empty: the slot file may be absent
     }
@@ -6059,7 +6072,21 @@ class QGUpdater {
   // after the reuse activation generation. Dormant pre-activation (activation gen 0 =>
   // always false => every kind=7 takes the legacy 2A staging path unchanged).
   [[nodiscard]] bool is_canonical_generation(uint64_t seg_generation) const {
-    return pid_reuse_activation_gen_ != 0 && seg_generation >= pid_reuse_activation_gen_;
+    // BLOCKER-3: gate on pid_generation_activated_ too. A v2 base whose reserved bytes hold
+    // a stray non-zero pid_reuse_activation_gen_ (now rejected up front, but defense in
+    // depth) must never route a legacy kind=7/8 into the canonical lane.
+    return pid_generation_activated_ && pid_reuse_activation_gen_ != 0 &&
+           seg_generation >= pid_reuse_activation_gen_;
+  }
+
+  // BLOCKER-5: narrow a wire (uint64) PID to PID only after a range check. A wire PID at or
+  // above kPidMax would otherwise wrap to a small in-range value and slip past the later
+  // [old_hwm,new_hwm) / < old_hwm bound checks (reuse of a still-referenced row).
+  [[nodiscard]] PID canonical_checked_pid(uint64_t wire_pid) {
+    if (wire_pid >= static_cast<uint64_t>(kPidMax)) {
+      poison("op-WAL canonical bundle pid is out of range (would wrap the PID width)");
+    }
+    return static_cast<PID>(wire_pid);
   }
 
   // Extract the trailer for `pid`'s slot from a decoded whole-page row_patch after-image.
@@ -6081,7 +6108,7 @@ class QGUpdater {
     st.txid = op.tx_id;
     st.segment_generation = op.segment_generation;
     st.begin_offset = frame.offset;
-    st.binds.push_back({op.row_op_id, static_cast<PID>(op.pid), op.pid_generation, op.label});
+    st.binds.push_back({op.row_op_id, canonical_checked_pid(op.pid), op.pid_generation, op.label});
     in_canonical_bundle = true;
   }
 
@@ -6105,7 +6132,7 @@ class QGUpdater {
         if (frame.batch_id != op.tx_id) {
           poison("op-WAL canonical label_bind frame batch_id != payload tx_id");
         }
-        st.binds.push_back({op.row_op_id, static_cast<PID>(op.pid), op.pid_generation, op.label});
+        st.binds.push_back({op.row_op_id, canonical_checked_pid(op.pid), op.pid_generation, op.label});
         break;
       }
       case SegmentOpKind::row_patch: {
@@ -6176,6 +6203,16 @@ class QGUpdater {
     // be reconstructed here without the retained-kind=6 model (JC-22): skip the algebra +
     // page apply, keeping the base's durable effect. A NEW bundle validates + applies.
     if (!absorbed) {
+      // BLOCKER-5: a NEW (non-absorbed) canonical bundle must have been written at the
+      // current replay-cursor generation (superblock_.generation, advanced by replay_flip).
+      // Otherwise a CRC-legal but cross-generation bundle -- kind7(G+1)/kind1(G+1)/kind8(G+1)
+      // spliced onto a base at generation G -- would be applied at the wrong generation.
+      // (The maintenance epoch binds its BEGIN to the same cursor; canonical had no such
+      // check.) An absorbed prefix legitimately carries an older generation, so it is
+      // exempt -- its historical generation would need the retained-kind=6 model (JC-22).
+      if (st.segment_generation != superblock_.generation) {
+        poison("op-WAL canonical bundle generation != the replay cursor generation");
+      }
       const uint64_t old_hwm = committed_watermark;
       const uint64_t new_hwm = op.new_pid_watermark;
       if (op.tx_id <= last_committed_txid_) {
