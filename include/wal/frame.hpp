@@ -301,7 +301,15 @@ class WalFile {
   // Opens `path`, creating it (and parent directories) if missing, then scans
   // for recovery and truncates any torn/corrupt tail to the last verified
   // frame boundary before the first append.
-  explicit WalFile(std::filesystem::path path) : path_(std::move(path)) {
+  //
+  // stream_recovery (B-2C-04): when true, the constructor uses a STREAMING structural
+  // scan (one frame in memory at a time, O(max frame) not O(file)) to find the last
+  // verified boundary + torn-tail flag WITHOUT retaining any frame payloads;
+  // recovery_scan() then reports valid_bytes + the torn-tail flag with an EMPTY frames
+  // vector, and the caller replays via visit_frames(). Default false keeps the eager
+  // full scan (small logs / unit tests / other op families) byte-for-byte unchanged.
+  explicit WalFile(std::filesystem::path path, bool stream_recovery = false)
+      : path_(std::move(path)) {
     std::filesystem::create_directories(path_.parent_path());
     if (!std::filesystem::exists(path_)) {
       std::ofstream create(path_, std::ios::binary | std::ios::trunc);
@@ -311,7 +319,7 @@ class WalFile {
       create.close();
       platform::sync_directory_or_throw(path_.parent_path());
     }
-    recovery_scan_ = scan_path(path_);
+    recovery_scan_ = stream_recovery ? scan_structure_streaming(path_) : scan_path(path_);
     if (recovery_scan_.stopped_at_corrupt_or_torn_tail) {
       std::filesystem::resize_file(path_, recovery_scan_.valid_bytes);
       platform::sync_file_or_throw(path_);
@@ -558,6 +566,71 @@ class WalFile {
       }
     }
     return scan(bytes);
+  }
+
+  // Streaming structural scan (B-2C-04): compute valid_bytes + the torn/corrupt-tail
+  // flag WITHOUT retaining payloads (holds at most one frame in memory). Applies exactly
+  // the same acceptance rules as scan()/visit_frames -- a frame is valid iff its magic,
+  // version, non-zero type, lengths, trailer, and CRC are all consistent; the first
+  // structurally-broken (or partially-present) trailing frame ends the scan and marks a
+  // torn tail (never resynchronizes past damage). result.frames stays empty by design.
+  [[nodiscard]] static auto scan_structure_streaming(const std::filesystem::path &path)
+      -> ScanResult {
+    ScanResult result;
+    if (!std::filesystem::exists(path)) {
+      return result;
+    }
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+      throw std::runtime_error("WalFile: cannot read " + path.string());
+    }
+    std::vector<std::byte> frame;
+    for (;;) {
+      std::array<std::byte, kHeaderBytes> header{};
+      input.read(reinterpret_cast<char *>(header.data()), kHeaderBytes);
+      const auto got = input.gcount();
+      if (got == 0) {
+        break;  // clean EOF exactly on a frame boundary
+      }
+      if (got != static_cast<std::streamsize>(kHeaderBytes)) {
+        result.stopped_at_corrupt_or_torn_tail = true;  // partial trailing header
+        break;
+      }
+      const auto magic = get_u32(header, 0);
+      const auto version = get_u16(header, 4);
+      const auto type = std::to_integer<std::uint8_t>(header[6]);
+      const auto frame_bytes = get_u32(header, 8);
+      const auto payload_bytes = get_u32(header, 12);
+      if (magic != kFrameMagic || version != kFormatVersion || type == 0 ||
+          payload_bytes > kMaximumPayloadBytes ||
+          frame_bytes != kHeaderBytes + payload_bytes + kTrailerBytes) {
+        result.stopped_at_corrupt_or_torn_tail = true;
+        break;
+      }
+      frame.resize(frame_bytes);
+      std::copy(header.begin(), header.end(), frame.begin());
+      input.read(reinterpret_cast<char *>(frame.data()) + kHeaderBytes,
+                 static_cast<std::streamsize>(frame_bytes - kHeaderBytes));
+      if (input.gcount() != static_cast<std::streamsize>(frame_bytes - kHeaderBytes)) {
+        result.stopped_at_corrupt_or_torn_tail = true;  // partial trailing body
+        break;
+      }
+      if (get_u32(frame, frame_bytes - 4) != kTrailerMagic) {
+        result.stopped_at_corrupt_or_torn_tail = true;
+        break;
+      }
+      const auto expected = get_u32(frame, kChecksumOffset);
+      std::vector<std::byte> checksum_input(frame.begin(), frame.end());
+      std::fill_n(checksum_input.begin() + static_cast<std::ptrdiff_t>(kChecksumOffset),
+                  4,
+                  std::byte{});
+      if (crc32(checksum_input) != expected) {
+        result.stopped_at_corrupt_or_torn_tail = true;
+        break;
+      }
+      result.valid_bytes += frame_bytes;
+    }
+    return result;
   }
 
  private:

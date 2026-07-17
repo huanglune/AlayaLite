@@ -311,5 +311,45 @@ TEST(WalFileStreamingApi, AppendLocationsVisitAndReadFrame) {
   std::filesystem::remove_all(root);
 }
 
+// wal-2c BLOCKER-3: scan_structure_streaming must agree with scan_path on the last
+// verified boundary and the torn-tail flag, while holding at most one frame in memory
+// (it never retains payloads). This is the recovery-open path the QG op-WAL now uses so a
+// multi-GiB log opens in O(max frame) instead of O(file).
+TEST(WalFileStreamingApi, StructureStreamingScanMatchesEagerScan) {
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("wal_frame_streamscan_" + std::to_string(::getpid()));
+  std::filesystem::create_directories(root);
+  const auto path = root / "seg.opwal";
+  {
+    WalFile wal(path);
+    for (unsigned i = 0; i < 7; ++i) {
+      wal.append(/*type=*/5, 0, i, i, bytes_of({i, 0xAA, 0xBB, static_cast<unsigned>(i)}),
+                 WalFile::Sync::fsync);
+    }
+  }
+  // Clean log: streaming and eager agree on valid_bytes; streaming keeps no frames.
+  const auto eager_clean = WalFile::scan_path(path);
+  const auto stream_clean = WalFile::scan_structure_streaming(path);
+  EXPECT_FALSE(eager_clean.stopped_at_corrupt_or_torn_tail);
+  EXPECT_FALSE(stream_clean.stopped_at_corrupt_or_torn_tail);
+  EXPECT_EQ(stream_clean.valid_bytes, eager_clean.valid_bytes);
+  EXPECT_TRUE(stream_clean.frames.empty()) << "streaming scan must not retain payloads";
+  EXPECT_EQ(eager_clean.frames.size(), 7U);
+  // Append a partial (torn) trailing frame: both must stop at the same verified boundary.
+  {
+    std::ofstream out(path, std::ios::binary | std::ios::app);
+    const char junk[9] = {'W', 'A', 'L', '7', 1, 5, 0, 0, 0};
+    out.write(junk, sizeof(junk));
+  }
+  const auto eager_torn = WalFile::scan_path(path);
+  const auto stream_torn = WalFile::scan_structure_streaming(path);
+  EXPECT_TRUE(eager_torn.stopped_at_corrupt_or_torn_tail);
+  EXPECT_TRUE(stream_torn.stopped_at_corrupt_or_torn_tail);
+  EXPECT_EQ(stream_torn.valid_bytes, eager_torn.valid_bytes);
+  EXPECT_EQ(stream_torn.valid_bytes, stream_clean.valid_bytes) << "torn tail heals to the boundary";
+  EXPECT_TRUE(stream_torn.frames.empty());
+  std::filesystem::remove_all(root);
+}
+
 }  // namespace
 }  // namespace alaya::wal

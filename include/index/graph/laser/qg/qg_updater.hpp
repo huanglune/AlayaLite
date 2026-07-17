@@ -5160,8 +5160,10 @@ class QGUpdater {
     label_slot_path_[0] = qg_.index_file_name_ + ".labels.slot0";
     label_slot_path_[1] = qg_.index_file_name_ + ".labels.slot1";
     store_label_snapshot(std::make_shared<const LabelBindings>());
-    op_wal_ = std::make_unique<alaya::wal::WalFile>(qg_.index_file_name_ + ".opwal");
-    const auto &scanned = op_wal_->recovery_scan();
+    // wal-2c BLOCKER-3: stream recovery -- the constructor finds the torn-tail boundary
+    // without loading the whole .opwal, and every replay pass below drives off visit_frames.
+    op_wal_ = std::make_unique<alaya::wal::WalFile>(qg_.index_file_name_ + ".opwal",
+                                                    /*stream_recovery=*/true);
     if (fresh_lineage) {
       // A non-empty .opwal on an UNSTAMPED (uid==0) superblock is the legal
       // fresh-enable crash window: a fresh checkpoint fsynced its flip frame but
@@ -5170,17 +5172,19 @@ class QGUpdater {
       // base, so the orphan is discardable -- checkpoint() below overwrites the WAL
       // via reset_to_single_frame. Guard: only flip frames are legal here; anything
       // else is unexpected (data on an unstamped base) and poisons (fail-closed).
-      for (const auto &frame : scanned.frames) {
-        SegmentOp probe;
-        try {
-          probe = decode_segment_op(frame.payload);
-        } catch (const std::exception &) {
-          poison("enable_wal on an unstamped superblock but the .opwal has an undecodable frame");
-        }
-        if (probe.kind != SegmentOpKind::superblock_flip) {
-          poison("enable_wal on an unstamped superblock but the .opwal has committed op frames");
-        }
-      }
+      alaya::wal::WalFile::visit_frames(
+          op_wal_->path(), [&](const alaya::wal::ScannedFrame &frame) -> bool {
+            SegmentOp probe;
+            try {
+              probe = decode_segment_op(frame.payload);
+            } catch (const std::exception &) {
+              poison("enable_wal on an unstamped superblock but the .opwal has an undecodable frame");
+            }
+            if (probe.kind != SegmentOpKind::superblock_flip) {
+              poison("enable_wal on an unstamped superblock but the .opwal has committed op frames");
+            }
+            return true;
+          });
       label_working_.clear();
       checkpoint();              // stamps uid + canonical label/tx tuple; overwrites the WAL
       publish_label_snapshot();  // empty snapshot
@@ -5191,12 +5195,12 @@ class QGUpdater {
     // Always converge through the full recovery pass (design section 2.1): even an
     // empty op-WAL must reach rebuild_state_after_replay so routing/free/hidden are
     // derived once from the on-disk trailers under the replaying_ guard.
-    replay_and_rebuild(scanned);  // promotes staged bundles into label_working_ (W3)
+    replay_and_rebuild();  // promotes staged bundles into label_working_ (W3)
     publish_label_snapshot();  // seal the recovered label state (tail convergence)
     precreate_label_slots();
   }
 
-  void replay_and_rebuild(const alaya::wal::ScanResult &scanned) {
+  void replay_and_rebuild() {
     replaying_ = true;
     uint64_t committed_watermark = committed_.load(std::memory_order_acquire);
     // Maintenance epoch state machine (design section 1.3): row_patch frames between
@@ -5209,7 +5213,9 @@ class QGUpdater {
     uint64_t epoch_generation = 0;  // wal-2c BLOCKER-5: the generation the epoch was written at
     uint64_t epoch_begin_offset = 0;
     std::unordered_map<size_t, std::vector<std::byte>> epoch_pages;  // page_index -> latest bytes
-    for (const auto &frame : scanned.frames) {
+    // wal-2c BLOCKER-3: stream the op-WAL one frame at a time (O(max frame), not O(WAL bytes)).
+    alaya::wal::WalFile::visit_frames(
+        op_wal_->path(), [&](const alaya::wal::ScannedFrame &frame) -> bool {
       if (frame.type != kSegmentOpRecordType) {
         replaying_ = false;
         poison("op-WAL contains a non-SEGMENT_OP record type");
@@ -5272,7 +5278,7 @@ class QGUpdater {
             replaying_ = false;
             poison("op-WAL maintenance epoch contains an unexpected op kind");
         }
-        continue;
+        return true;
       }
       switch (op.kind) {
         case SegmentOpKind::row_patch:
@@ -5330,7 +5336,8 @@ class QGUpdater {
           replaying_ = false;
           poison("op-WAL consolidate_end without a matching begin");
       }
-    }
+      return true;
+    });
     // Unmatched BEGIN at EOF: discard the incomplete epoch (nothing was installed --
     // END was never durable, so the index is still S_old) and truncate the WAL back
     // to the BEGIN boundary so the next append starts clean (design section 1.3).
