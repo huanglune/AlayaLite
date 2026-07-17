@@ -18,12 +18,28 @@
 // SetUpTestSuite()), each loading its own QuantizedGraph instance(s) from
 // it. QGBuilder::build()'s out-of-memory patch path
 // (QuantizedGraph::update_qg_out_of_memory, reached from the omp-parallel
-// clone of QGBuilder::build()) has a pre-existing, data-dependent buffer
-// overflow independent of this change -- confirmed via gdb (SIGSEGV inside
-// a memmove, single-threaded and multi-threaded alike; reached only through
-// the *build* path, never through anything the admission contract touches)
-// when this file built several tiny indices back-to-back in one process.
-// Building exactly once per process sidesteps it.
+// clone of QGBuilder::build()) used to have a data-dependent heap overflow,
+// independent of this change, when several tiny indices were built
+// back-to-back in one process (confirmed via gdb: SIGSEGV inside a
+// memmove). Fixed in qg_builder.hpp (init_from_vamana()'s per-node degree
+// clamp against degree_bound_, plus build()'s hard vector-file dimension
+// check) -- see tests/laser/qg/test_qg_builder_oom_regression.cpp for the
+// regression test that rebuilds several indices per process. This file
+// still builds its shared index exactly once per process (a plain,
+// deliberate fixture-sharing choice, not a workaround, now that the
+// constraint is lifted) because SetUpTestSuite() sharing it across TEST_Fs
+// remains simpler and faster than rebuilding per test.
+//
+// Separately: this fixture used to call QGBuilder::build() without ever
+// writing "{prefix}_pca_base.fbin" first, even though build() documents
+// that file as a required input -- the missing file left build()'s vector
+// file dimension probe (`int n, d`) reading from a closed/never-opened
+// ifstream, which silently leaves `d` as indeterminate stack garbage
+// instead of an error. That is almost certainly the true trigger behind
+// the historical "~2/5 of runs crash" observation this comment used to
+// describe: build()'s hardened dimension check now turns that into a
+// deterministic, immediate, diagnosable failure instead of undefined
+// behavior, which is what surfaced the missing write_fbin() call below.
 
 #include "index/graph/laser/qg/qg.hpp"
 #include "index/graph/laser/qg/qg_builder.hpp"
@@ -60,6 +76,20 @@ std::vector<float> make_data(size_t n, size_t dim, uint32_t seed) {
     v = dist(gen);
   }
   return data;
+}
+
+// QGBuilder::build() requires "{filename}_pca_base.fbin" to already exist --
+// its own doc comment says so, and it is the raw float32 vector data PHASE 1
+// streams through. Matches the two-int32-header fbin layout every other
+// LASER test fixture in this tree writes (e.g.
+// tests/laser/qg/qg_wal_test_support.hpp's write_fbin()).
+void write_fbin(const std::string &path, const float *data, int32_t n, int32_t dim) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  out.write(reinterpret_cast<const char *>(&n), 4);
+  out.write(reinterpret_cast<const char *>(&dim), 4);
+  out.write(reinterpret_cast<const char *>(data),
+            static_cast<std::streamsize>(sizeof(float) * static_cast<size_t>(n) *
+                                         static_cast<size_t>(dim)));
 }
 
 // Move-only: TinyIndex::build() returns by value, and SetUpTestSuite() below
@@ -104,6 +134,8 @@ struct TinyIndex {
     std::filesystem::create_directories(t.dir);
     t.prefix = (t.dir / "tiny").string();
     t.data = make_data(kN, kDim, seed);
+    write_fbin(t.prefix + "_pca_base.fbin", t.data.data(), static_cast<int32_t>(kN),
+               static_cast<int32_t>(kDim));
 
     alaya::vamana::VamanaBuildParams vp;
     vp.R = kDeg;

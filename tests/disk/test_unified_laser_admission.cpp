@@ -18,12 +18,15 @@
 //     translation, not just its identity-permutation special case.
 //
 // The on-disk segment is built once per process (see AdmissionDiskTest
-// below) for the same reason tests/laser/qg/test_admission_contract.cpp
-// builds its kernel-level index once: QGBuilder::build()'s out-of-memory
-// patch path has a pre-existing, data-dependent crash unrelated to this
-// change when several small indices are built back-to-back in one process
-// (confirmed via gdb backtrace pointing at
-// QuantizedGraph::update_qg_out_of_memory, never touched by this change).
+// below), matching tests/laser/qg/test_admission_contract.cpp's shape.
+// QGBuilder::build()'s out-of-memory patch path used to have a
+// data-dependent heap overflow, unrelated to this change, when several
+// small indices were built back-to-back in one process (confirmed via gdb:
+// SIGSEGV inside a memmove in QuantizedGraph::update_qg_out_of_memory).
+// Fixed in qg_builder.hpp; see
+// tests/laser/qg/test_qg_builder_oom_regression.cpp for the regression
+// test. This file keeps its shared-once-per-process fixture shape because
+// it is simpler and faster, not because the constraint still applies.
 
 #include "index/disk/laser_segment.hpp"
 #include "index/disk/laser_segment_importer.hpp"
@@ -37,7 +40,10 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iostream>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -67,6 +73,20 @@ std::vector<float> make_data(std::uint64_t n, std::uint32_t dim, std::uint32_t s
     v = dist(gen);
   }
   return data;
+}
+
+// QGBuilder::build() requires "{filename}_pca_base.fbin" to already exist --
+// its own doc comment says so, and it is the raw float32 vector data PHASE 1
+// streams through. Matches the two-int32-header fbin layout every other
+// LASER test fixture in this tree writes (e.g.
+// tests/laser/qg/qg_wal_test_support.hpp's write_fbin()).
+void write_fbin(const std::string &path, const float *data, std::int32_t n, std::int32_t dim) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  out.write(reinterpret_cast<const char *>(&n), 4);
+  out.write(reinterpret_cast<const char *>(&dim), 4);
+  out.write(reinterpret_cast<const char *>(data),
+            static_cast<std::streamsize>(sizeof(float) * static_cast<std::size_t>(n) *
+                                         static_cast<std::size_t>(dim)));
 }
 
 struct SegmentFixture {
@@ -111,6 +131,8 @@ struct SegmentFixture {
     const auto raw_dir = fx->root / "raw";
     std::filesystem::create_directories(raw_dir);
     const std::string raw_prefix = (raw_dir / "dsqg_seg_00000001").string();
+    write_fbin(raw_prefix + "_pca_base.fbin", fx->data.data(), static_cast<std::int32_t>(kCount),
+               static_cast<std::int32_t>(kDim));
 
     alaya::vamana::VamanaBuildParams vp;
     vp.R = kR;
@@ -215,13 +237,18 @@ TEST_F(AdmissionDiskTest, KindNonePagedPoolReturnsValidLabels) {
 // a Collection sends, works directly in the segment's row/PID space.
 // ---------------------------------------------------------------------------
 
-auto pid_bitmap_30pct(std::vector<std::uint64_t> &storage) -> laser::RowAdmission {
+auto pid_rows_30pct() -> std::vector<std::uint64_t> {
   std::vector<std::uint64_t> rows;
   for (std::uint64_t pid = 0; pid < kCount; ++pid) {
     if (pid % 10 < 3) {
       rows.push_back(pid);
     }
   }
+  return rows;
+}
+
+auto pid_bitmap_30pct(std::vector<std::uint64_t> &storage) -> laser::RowAdmission {
+  const auto rows = pid_rows_30pct();
   return laser::admission_from_sorted_rows(rows.data(), rows.size(), kCount, storage);
 }
 
@@ -277,6 +304,138 @@ TEST_F(AdmissionDiskTest, BitmapFilterPagedPoolOnlyReturnsAdmissiblePids) {
     }
   }
   EXPECT_EQ(total, 20U * kTopK);
+}
+
+// ---------------------------------------------------------------------------
+// kind=sorted_rows admission (compile_admission()'s sorted_rows branch,
+// unified_laser_segment_searcher.hpp -- the payload is a raw, sorted PID
+// array instead of a pre-materialized bitmap). U2-c manifest, W4: checks
+// results agree with the *same* admission set's kind=bitmap encoding
+// (BitmapFilter*OnlyReturnsAdmissiblePids above), for both residencies and
+// both search()/batch_search().
+//
+// Note on ResultFlag::filtered: DiskSearchHit (returned by search()/
+// batch_search()) is {label, distance} only -- it carries no result-flags
+// field, so "hit carries ResultFlag::filtered" is not representable at this
+// layer at all (that flag is attached one layer up, by
+// LaserSegment::execute_search()'s core::SearchHit construction). It is
+// also not reachable through LaserSegment for sorted_rows specifically:
+// LaserSegmentRejectsSortedRowsAndPredicateFilters above confirms
+// LaserSegment::search() rejects kind=sorted_rows outright (not_supported)
+// -- Collection never sends it (segmented_collection.hpp only ever compiles
+// kind=bitmap). So the admission-contract acceptance criterion this test
+// stands in for is result-set correctness (every hit satisfies the filter,
+// and agrees with the bitmap encoding of the same set) rather than a
+// ResultFlag bit, which nothing currently plumbs to this filter kind.
+// ---------------------------------------------------------------------------
+
+void expect_sorted_rows_matches_bitmap(UnifiedLaserSegmentSearcher &searcher,
+                                       const SegmentFixture &fixture) {
+  const auto rows = pid_rows_30pct();
+  const std::unordered_set<std::uint64_t> admissible(rows.begin(), rows.end());
+
+  std::vector<std::uint64_t> bitmap_storage;
+  (void)pid_bitmap_30pct(bitmap_storage);
+
+  DiskSearchOptions bitmap_opts;
+  bitmap_opts.top_k = kTopK;
+  bitmap_opts.ef = 64;
+  bitmap_opts.beam_width = 4;
+  bitmap_opts.filter.kind = core::SegmentFilterKind::bitmap;
+  bitmap_opts.filter.payload = bitmap_storage.data();
+  bitmap_opts.filter.payload_size = bitmap_storage.size() * sizeof(std::uint64_t);
+
+  DiskSearchOptions sorted_rows_opts;
+  sorted_rows_opts.top_k = kTopK;
+  sorted_rows_opts.ef = 64;
+  sorted_rows_opts.beam_width = 4;
+  sorted_rows_opts.filter.kind = core::SegmentFilterKind::sorted_rows;
+  sorted_rows_opts.filter.payload = rows.data();
+  sorted_rows_opts.filter.payload_size = rows.size() * sizeof(std::uint64_t);
+
+  constexpr std::uint32_t kQueries = 20;
+
+  // Not a byte-identical check between the two filter *encodings*: the
+  // paged-pool kernel's beam search interleaves computation with
+  // asynchronous page-read completions, and its traversal order is not
+  // deterministic run to run for the same query on the same searcher
+  // instance (documented and gdb-confirmed elsewhere in this tree, e.g.
+  // tests/laser/qg/test_admission_contract.cpp) -- two separate calls per
+  // query below (one per encoding) are exactly the shape that can trigger
+  // it (confirmed empirically: batch_search()'s comparison below needs this
+  // same tolerance even though the per-query search() loop rarely shows it
+  // in practice, since paged mode's batch_search() runs all kQueries
+  // bitmap-encoded queries before any sorted_rows-encoded one, widening the
+  // gap between "same query, different encoding" and giving AIO completion
+  // order more room to differ than the tightly-interleaved loop below).
+  // The resident-arena kernel has no async I/O and is fully deterministic,
+  // so it incidentally clears the same floor at or near 100% every time.
+  // Every hit satisfying the admission set, independent of ordering, is
+  // still asserted unconditionally.
+  auto check_overlap = [&](const auto &sorted_rows_hits,
+                           const auto &bitmap_hits,
+                           std::uint32_t qi,
+                           const char *label,
+                           std::size_t &overlap,
+                           std::size_t &total) {
+    ASSERT_EQ(sorted_rows_hits.size(), kTopK) << label << " query " << qi;
+    ASSERT_EQ(bitmap_hits.size(), kTopK) << label << " query " << qi;
+    std::unordered_set<std::uint64_t> bitmap_labels;
+    for (const auto &hit : bitmap_hits) {
+      bitmap_labels.insert(hit.label);
+    }
+    for (const auto &hit : sorted_rows_hits) {
+      const auto pid = fixture.pid_of_label(hit.label);
+      EXPECT_TRUE(admissible.count(pid) > 0)
+          << label << " label " << hit.label << " (pid " << pid << ") fails the sorted_rows filter";
+      ++total;
+      if (bitmap_labels.count(hit.label) > 0) {
+        ++overlap;
+      }
+    }
+  };
+
+  std::size_t search_overlap = 0;
+  std::size_t search_total = 0;
+  for (std::uint32_t qi = 0; qi < kQueries; ++qi) {
+    const float *query = fixture.data.data() + static_cast<std::size_t>(qi) * kDim;
+    const auto bitmap_hits = searcher.search(query, bitmap_opts);
+    const auto sorted_rows_hits = searcher.search(query, sorted_rows_opts);
+    check_overlap(sorted_rows_hits, bitmap_hits, qi, "search()", search_overlap, search_total);
+  }
+  EXPECT_GT(search_overlap, search_total / 2)
+      << "sorted_rows search() should mostly agree with the bitmap encoding of the same set";
+
+  const auto bitmap_batch = searcher.batch_search(fixture.data.data(), kQueries, bitmap_opts);
+  const auto sorted_rows_batch =
+      searcher.batch_search(fixture.data.data(), kQueries, sorted_rows_opts);
+  ASSERT_EQ(sorted_rows_batch.size(), kQueries);
+  ASSERT_EQ(bitmap_batch.size(), kQueries);
+  std::size_t batch_overlap = 0;
+  std::size_t batch_total = 0;
+  for (std::uint32_t qi = 0; qi < kQueries; ++qi) {
+    check_overlap(sorted_rows_batch[qi],
+                  bitmap_batch[qi],
+                  qi,
+                  "batch_search()",
+                  batch_overlap,
+                  batch_total);
+  }
+  EXPECT_GT(batch_overlap, batch_total / 2)
+      << "sorted_rows batch_search() should mostly agree with the bitmap encoding of the same set";
+
+  std::cout << "sorted_rows_vs_bitmap_overlap,search=" << search_overlap << "/" << search_total
+            << ",batch=" << batch_overlap << "/" << batch_total << "\n";
+}
+
+TEST_F(AdmissionDiskTest, SortedRowsFilterMatchesBitmapFilterResidentArena) {
+  UnifiedLaserSegmentSearcher searcher(fixture_->seg_dir, laser::ResidencyMode::kResidentArena);
+  expect_sorted_rows_matches_bitmap(searcher, *fixture_);
+}
+
+TEST_F(AdmissionDiskTest, SortedRowsFilterMatchesBitmapFilterPagedPool) {
+  UnifiedLaserSegmentSearcher searcher(fixture_->seg_dir, laser::ResidencyMode::kPagedPool);
+  expect_sorted_rows_matches_bitmap(searcher, *fixture_);
 }
 
 // ---------------------------------------------------------------------------
@@ -378,6 +537,85 @@ TEST_F(AdmissionDiskTest, LaserSegmentRejectsSortedRowsAndPredicateFilters) {
     const auto status = segment->search(call.request);
     EXPECT_EQ(status.code(), core::StatusCode::not_supported) << "kind " << static_cast<int>(kind);
   }
+}
+
+// ---------------------------------------------------------------------------
+// LaserSegment (AnySegment face): residency selection at open (decision 6,
+// U2-c manifest). fixture_->seg_dir carries no x_laser_residency manifest
+// extra (LaserFixture never sets LaserSegmentImportParams::residency), so
+// ALAYA_LASER_RESIDENCY is the only thing selecting a mode below -- this is
+// the same env-override precedence LaserSegment::open() consults via
+// detail::laser_residency_request() (env > manifest > legacy default).
+// ---------------------------------------------------------------------------
+
+class ScopedResidencyEnv {
+ public:
+  explicit ScopedResidencyEnv(const char *value) { ::setenv("ALAYA_LASER_RESIDENCY", value, 1); }
+  ~ScopedResidencyEnv() { ::unsetenv("ALAYA_LASER_RESIDENCY"); }
+  ScopedResidencyEnv(const ScopedResidencyEnv &) = delete;
+  auto operator=(const ScopedResidencyEnv &) -> ScopedResidencyEnv & = delete;
+  ScopedResidencyEnv(ScopedResidencyEnv &&) = delete;
+  auto operator=(ScopedResidencyEnv &&) -> ScopedResidencyEnv & = delete;
+};
+
+TEST_F(AdmissionDiskTest, OpenDirectoryHonorsResidencyEnvOverrideAndBothModesAgree) {
+  std::unique_ptr<LaserSegment> legacy_segment;
+  {
+    ScopedResidencyEnv env("paged_pool");
+    core::OpenContext context;
+    auto opened = LaserSegment::open_directory(fixture_->seg_dir, core::OpenOptions{}, context);
+    ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
+    legacy_segment = std::move(opened).value();
+  }
+
+  std::unique_ptr<LaserSegment> unified_segment;
+  {
+    ScopedResidencyEnv env("resident_arena");
+    core::OpenContext context;
+    auto opened = LaserSegment::open_directory(fixture_->seg_dir, core::OpenOptions{}, context);
+    ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
+    unified_segment = std::move(opened).value();
+  }
+
+  // Not a byte-identical check, for the same reason
+  // TombstoneParityPagedKernel/BitmapFilterOnlyReturnsAdmissiblePids(Paged)
+  // above are not: legacy_segment routes kind=none through the paged-pool
+  // kernel, whose beam search interleaves computation with asynchronous
+  // page-read completions and can explore the graph in a different order
+  // run to run (documented and gdb-confirmed in
+  // tests/laser/qg/test_admission_contract.cpp). unified_segment's resident-
+  // arena kernel has no async I/O and is fully deterministic on its own, so
+  // this checks a meaningful overlap floor between the two residencies
+  // rather than set equality.
+  std::size_t overlap = 0;
+  std::size_t total = 0;
+  for (std::uint32_t qi = 0; qi < 15; ++qi) {
+    const float *query = fixture_->data.data() + static_cast<std::size_t>(qi) * kDim;
+
+    SegmentSearchCall legacy_call(query);
+    const auto legacy_status = legacy_segment->search(legacy_call.request);
+    ASSERT_TRUE(legacy_status.ok()) << legacy_status.diagnostic();
+    ASSERT_EQ(legacy_call.counts[0], kTopK);
+
+    SegmentSearchCall unified_call(query);
+    const auto unified_status = unified_segment->search(unified_call.request);
+    ASSERT_TRUE(unified_status.ok()) << unified_status.diagnostic();
+    ASSERT_EQ(unified_call.counts[0], kTopK);
+
+    std::unordered_set<std::uint64_t> legacy_ids;
+    for (std::size_t i = 0; i < legacy_call.counts[0]; ++i) {
+      legacy_ids.insert(static_cast<std::uint64_t>(legacy_call.hits[i].row_id));
+    }
+    for (std::size_t i = 0; i < unified_call.counts[0]; ++i) {
+      ++total;
+      if (legacy_ids.count(static_cast<std::uint64_t>(unified_call.hits[i].row_id)) > 0) {
+        ++overlap;
+      }
+    }
+  }
+  std::cout << "residency_open_overlap," << overlap << "/" << total << "\n";
+  EXPECT_GT(overlap, total / 2)
+      << "paged_pool and resident_arena residency should mostly agree on the same query";
 }
 
 }  // namespace

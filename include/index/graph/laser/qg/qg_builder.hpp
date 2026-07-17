@@ -247,7 +247,19 @@ class QGBuilder {
     int n, d;
     vector_input.read(reinterpret_cast<char *>(&n), sizeof(int));
     vector_input.read(reinterpret_cast<char *>(&d), sizeof(int));
-    assert(d == (qg_.dimension_ + qg_.residual_dimension_));
+    // A mismatched dimension means every vector read below is misaligned --
+    // this is not a recoverable/tolerable condition like the degree_bound_
+    // overshoot handled in init_from_vamana(), so it must hard-fail instead of
+    // silently corrupting memory. This used to be assert(...)-only, which
+    // Release/NDEBUG builds compile out entirely (see init_from_vamana() for
+    // the sibling fix).
+    if (d != static_cast<int>(qg_.dimension_ + qg_.residual_dimension_)) {
+      throw std::invalid_argument(
+          "QGBuilder::build: vector file '" + data_path + "' dimension (" + std::to_string(d) +
+          ") does not match configured QuantizedGraph dimension (" +
+          std::to_string(qg_.dimension_ + qg_.residual_dimension_) +
+          "); the vector file is incompatible with this index configuration");
+    }
 
     // Round up vector size to sector boundary for O_DIRECT compatibility
     size_t vector_tmp_page_size = (d * sizeof(float) + kSectorLen - 1) / kSectorLen * kSectorLen;
@@ -492,7 +504,23 @@ inline void QGBuilder::init_from_vamana(const std::string &filename) {
   size_t vamana_metadata_size =
       sizeof(size_t) + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(size_t);
 
-  assert(max_observed_degree == qg_.degree_bound());
+  // The header's max_observed_degree is informational only, not a hard safety
+  // invariant: every per-node neighbour list is independently clamped to
+  // degree_bound() in the read loop below, regardless of what this field
+  // claims. (This used to be assert(max_observed_degree == qg_.degree_bound())
+  // -- a Release/NDEBUG build compiles that out entirely, so a mismatched file
+  // would sail through silently and overflow the fixed-size, degree_bound()-
+  // sized scratch buffers in build()/update_qg_out_of_memory(). The per-node
+  // clamp below is what actually makes that safe now; this is just an
+  // observability warning for the case where the header disagrees.)
+  if (max_observed_degree != qg_.degree_bound()) {
+    std::cerr << "WARNING: QGBuilder::init_from_vamana: " << filename
+              << " header max_observed_degree=" << max_observed_degree
+              << " differs from configured degree_bound=" << qg_.degree_bound()
+              << "; any per-node neighbour list longer than degree_bound will be "
+                 "clamped to its first degree_bound entries."
+              << std::endl;
+  }
 
   qg_.set_ep(start);
 
@@ -507,6 +535,7 @@ inline void QGBuilder::init_from_vamana(const std::string &filename) {
   size_t bytes_read = vamana_metadata_size;
   size_t cc = 0;
   uint32_t nodes_read = 0;
+  size_t clamped_nodes = 0;
   while (bytes_read != expected_file_size) {
     uint32_t k;
     in.read(reinterpret_cast<char *>(&k), sizeof(uint32_t));
@@ -522,7 +551,31 @@ inline void QGBuilder::init_from_vamana(const std::string &filename) {
     in.read(reinterpret_cast<char *>(tmp.data()),
             static_cast<std::streamsize>(k * sizeof(uint32_t)));
 
-    for (PID cur_neigh : tmp) {
+    // Defensive clamp (root cause of a heap overflow previously reachable from
+    // here): the out-of-core builder's per-thread scratch buffers
+    // (neighbor_vector_scratch_, sized degree_bound_ * vector_tmp_page_size in
+    // build() below) and the on-disk node layout (neighbor slots
+    // [neighbor_offset_, neighbor_offset_ + degree_bound_) in
+    // QuantizedGraph::update_qg_out_of_memory()) are both sized for at most
+    // degree_bound_ neighbours per node. Nothing in the vamana file format
+    // guarantees a per-node k <= degree_bound_ (the header's
+    // max_observed_degree is checked above but is advisory only), so without
+    // this clamp a node with k > degree_bound_ would make
+    // update_qg_out_of_memory() write cur_degree entries into a
+    // degree_bound_-sized buffer -- an out-of-bounds write driven directly by
+    // file contents. Keep only the first degree_bound_ entries in file order:
+    // this mirrors robust_prune's top-R semantics, since Vamana writes
+    // candidates in prune-selected order and a degree_bound_-capped prune
+    // would have retained exactly this prefix. We still read all k entries
+    // from the file (into `tmp`) to keep the stream aligned with the next
+    // node's record; only the retained prefix is kept in new_neighbors_/
+    // in_degrees.
+    const uint32_t keep = std::min(k, static_cast<uint32_t>(degree_bound_));
+    if (keep < k) {
+      ++clamped_nodes;
+    }
+    for (uint32_t idx = 0; idx < keep; ++idx) {
+      PID cur_neigh = tmp[idx];
       in_degrees[cur_neigh]++;
       new_neighbors_[nodes_read - 1].emplace_back(cur_neigh,
                                                   0.0);  // Distance will be computed later in
@@ -536,6 +589,12 @@ inline void QGBuilder::init_from_vamana(const std::string &filename) {
     if (k > max_range_of_graph) {
       max_range_of_graph = k;
     }
+  }
+
+  if (clamped_nodes > 0) {
+    std::cerr << "WARNING: QGBuilder::init_from_vamana: clamped " << clamped_nodes
+              << " node(s) whose vamana out-neighbour list exceeded degree_bound=" << degree_bound_
+              << " (max observed in file: " << max_range_of_graph << ")" << std::endl;
   }
 
   qg_.cache_ids_.resize(num_nodes_);

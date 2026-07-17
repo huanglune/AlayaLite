@@ -190,6 +190,15 @@ class UnifiedLaserSegmentSearcher : public SegmentSearcher {
     return provider_->mode();
   }
 
+  // Unified-segment seam: same pid->label view LaserSegmentSearcher exposes
+  // (see its own labels() doc comment), just forwarded from legacy_ -- the
+  // row store (and therefore this map) is identical across both residencies
+  // this class supports. Needed by LaserSegment (the AnySegment face) to
+  // translate a Collection-supplied, label-indexed bitmap into PID space
+  // regardless of which residency it opened with (see decision 6/7, U2-c
+  // manifest).
+  [[nodiscard]] auto labels() const noexcept -> const uint64_t * { return legacy_.labels(); }
+
   // Test-only observer, mirrors LaserSegmentSearcher::set_params_call_count
   // for the arena path (the paged path counts inside legacy_).
   auto set_params_call_count() const noexcept -> uint64_t {

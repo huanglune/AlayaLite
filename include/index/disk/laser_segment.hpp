@@ -8,6 +8,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -29,6 +30,7 @@
 #include "index/disk/laser_segment_searcher.hpp"
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/segment_manifest.hpp"
+#include "index/disk/unified_laser_segment_searcher.hpp"
 #include "index/graph/laser/qg/row_admission.hpp"
 
 #if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER != 0
@@ -38,6 +40,34 @@
 #endif
 
 namespace alaya::disk {
+
+namespace detail {
+
+#if ALAYA_DISK_LASER_SEGMENT_SUPPORTED
+// Residency selection for a Laser segment -- moved here from
+// segment_factory.hpp (that file's load_segment_from_manifest(), the only
+// call site, is dead code: nothing calls it in any production path). This
+// is now the actual production decision point: LaserSegment::open() below
+// consults it to pick which searcher to construct. Explicit request only,
+// so the default load path stays byte-identical to the legacy searcher:
+//   segment manifest x_laser_residency = paged_pool | resident_arena
+//   env ALAYA_LASER_RESIDENCY overrides the manifest (same values)
+// Neither present -> nullopt -> legacy LaserSegmentSearcher.
+inline auto laser_residency_request(const SegmentManifest &sm)
+    -> std::optional<::alaya::laser::ResidencyMode> {
+  const char *env = std::getenv("ALAYA_LASER_RESIDENCY");
+  if (env != nullptr && *env != '\0') {
+    return ::alaya::laser::residency_mode_from_string(env);
+  }
+  const auto it = sm.x_extras.find("x_laser_residency");
+  if (it == sm.x_extras.end() || it->second.empty()) {
+    return std::nullopt;
+  }
+  return ::alaya::laser::residency_mode_from_string(it->second);
+}
+#endif
+
+}  // namespace detail
 
 struct LaserSegmentSearchExtension {
   core::VersionedStructHeader header{};
@@ -165,9 +195,25 @@ class LaserSegment {
       if (!status.ok()) {
         return status;
       }
-      auto searcher = std::make_shared<LaserSegmentSearcher>(directory);
-      return std::unique_ptr<LaserSegment>(
-          new LaserSegment(std::move(searcher), std::move(native), directory, bytes));
+      const auto residency = detail::laser_residency_request(native);
+      if (residency.has_value() && *residency == ::alaya::laser::ResidencyMode::kResidentArena) {
+        auto unified_searcher =
+            std::make_shared<UnifiedLaserSegmentSearcher>(directory, *residency);
+        return std::unique_ptr<LaserSegment>(new LaserSegment(nullptr,
+                                                              std::move(unified_searcher),
+                                                              std::move(native),
+                                                              directory,
+                                                              bytes));
+      }
+      // Default (no residency configured) and an explicit paged_pool
+      // request both land here unchanged: the legacy searcher, exactly as
+      // before residency selection existed.
+      auto legacy_searcher = std::make_shared<LaserSegmentSearcher>(directory);
+      return std::unique_ptr<LaserSegment>(new LaserSegment(std::move(legacy_searcher),
+                                                            nullptr,
+                                                            std::move(native),
+                                                            directory,
+                                                            bytes));
     } catch (const std::invalid_argument &error) {
       return core::Status::error(core::StatusCode::corruption,
                                  core::OperationStage::open,
@@ -280,7 +326,7 @@ class LaserSegment {
     descriptor.algorithm_id = kAlgorithmId;
     descriptor.format_version = kFormatVersion;
     descriptor.factory_version = 1;
-    descriptor.dim = searcher_->dim();
+    descriptor.dim = searcher_dim();
     descriptor.metric = core::Metric::l2;
     descriptor.stored_scalar_type = core::ScalarType::float32;
     descriptor.medium = core::Medium::disk;
@@ -311,8 +357,8 @@ class LaserSegment {
   [[nodiscard]] auto stats(core::SegmentStats &stats) const noexcept -> core::Status {
     stats = core::SegmentStats{};
     stats.snapshot_version = 1;
-    stats.live_rows = searcher_->size();
-    stats.allocated_rows = searcher_->size();
+    stats.live_rows = searcher_size();
+    stats.allocated_rows = searcher_size();
     stats.resident_bytes = artifact_bytes_;
     stats.health = core::SegmentHealth::healthy;
     return core::Status::success();
@@ -391,14 +437,43 @@ class LaserSegment {
   }
 
  private:
-  LaserSegment(std::shared_ptr<LaserSegmentSearcher> searcher,
+  LaserSegment(std::shared_ptr<LaserSegmentSearcher> legacy_searcher,
+               std::shared_ptr<UnifiedLaserSegmentSearcher> unified_searcher,
                SegmentManifest native,
                std::filesystem::path directory,
                std::uint64_t artifact_bytes)
-      : searcher_(std::move(searcher)),
+      : legacy_searcher_(std::move(legacy_searcher)),
+        unified_searcher_(std::move(unified_searcher)),
         native_(std::move(native)),
         directory_(std::move(directory)),
         artifact_bytes_(artifact_bytes) {}
+
+  // Common accessors dispatching to whichever searcher residency selected
+  // (see laser_residency_request() and open()'s branch below) -- exactly
+  // one of legacy_searcher_/unified_searcher_ is non-null. Both
+  // LaserSegmentSearcher and UnifiedLaserSegmentSearcher share dim()/size()
+  // via the SegmentSearcher base, but labels() is a LASER-only "unified
+  // seam" accessor (see laser_segment_searcher.hpp's graph()/labels()
+  // comment) neither exposes through that base, so it needs its own
+  // dispatch here too.
+  [[nodiscard]] auto searcher_dim() const noexcept -> std::uint32_t {
+    return unified_searcher_ ? unified_searcher_->dim() : legacy_searcher_->dim();
+  }
+  [[nodiscard]] auto searcher_size() const noexcept -> std::uint64_t {
+    return unified_searcher_ ? unified_searcher_->size() : legacy_searcher_->size();
+  }
+#if ALAYA_DISK_LASER_SEGMENT_SUPPORTED
+  // Guarded like the rest of the LASER-only surface (see
+  // resolve_search_options()/admission_aware_search() below, its only
+  // callers): the stub LaserSegmentSearcher/UnifiedLaserSegmentSearcher this
+  // header falls back to when a translation unit does not opt into LASER
+  // (see laser_segment_header_closure.cpp) declare only the common
+  // search()/size()/dim()/type() surface, not this LASER-only "unified
+  // seam" accessor.
+  [[nodiscard]] auto searcher_labels() const noexcept -> const std::uint64_t * {
+    return unified_searcher_ ? unified_searcher_->labels() : legacy_searcher_->labels();
+  }
+#endif
 
   [[nodiscard]] static auto adapt_open_searcher(std::shared_ptr<LaserSegmentSearcher> searcher,
                                                 const std::filesystem::path &directory,
@@ -449,8 +524,11 @@ class LaserSegment {
       if (!status.ok()) {
         return status;
       }
+      // This legacy-searcher-only adapter has no production caller today
+      // (see its doc comment); it always builds the legacy path, matching
+      // its pre-residency-wiring behavior exactly.
       return std::unique_ptr<LaserSegment>(
-          new LaserSegment(std::move(searcher), std::move(native), directory, bytes));
+          new LaserSegment(std::move(searcher), nullptr, std::move(native), directory, bytes));
     } catch (...) {
       return core::status_from_exception(core::OperationStage::open);
     }
@@ -542,7 +620,7 @@ class LaserSegment {
   // `filter` is the request's compiled view (already validated to be
   // kind=none or kind=bitmap by validate_search_request()). `pid_storage`
   // is caller-owned scratch that must outlive the DiskSearchOptions this
-  // returns -- one request's worth of searcher_->search() calls.
+  // returns -- one request's worth of admission_aware_search() calls.
   [[nodiscard]] auto resolve_search_options(const core::SearchOptions &options,
                                             const core::SegmentFilterView &filter,
                                             std::vector<std::uint64_t> &pid_storage) const
@@ -568,13 +646,13 @@ class LaserSegment {
       // PIDs are a private LASER implementation detail (never exposed past
       // this file), so a bitmap arriving from Collection is indexed by
       // label. This re-derives a dense PID-indexed bitmap from it via this
-      // segment's own PID->label map (searcher_->labels()), at O(size())
+      // segment's own PID->label map (searcher_labels()), at O(size())
       // -- paid once per request setup, never per candidate.
       const std::uint64_t row_capacity_bits = filter.payload_size * 8;
       const auto *label_bits = static_cast<const std::uint64_t *>(filter.payload);
-      const std::uint64_t *labels = searcher_->labels();
-      pid_storage.assign(laser::admission_words_for_capacity(searcher_->size()), std::uint64_t{0});
-      for (std::uint64_t pid = 0; pid < searcher_->size(); ++pid) {
+      const std::uint64_t *labels = searcher_labels();
+      pid_storage.assign(laser::admission_words_for_capacity(searcher_size()), std::uint64_t{0});
+      for (std::uint64_t pid = 0; pid < searcher_size(); ++pid) {
         const std::uint64_t label = labels[pid];
         if (label >= row_capacity_bits) {
           continue;
@@ -588,10 +666,10 @@ class LaserSegment {
       resolved.filter.payload_size = pid_storage.size() * sizeof(std::uint64_t);
 #else
       // Unreachable: LaserSegment::open() refuses to construct a segment
-      // (and therefore searcher_) without LASER support, so this method
-      // never actually runs in that configuration. Kept branch-compatible
-      // only so the translation above can call the LASER-only
-      // searcher_->labels() without an extra searcher_ specialization.
+      // (and therefore legacy_searcher_/unified_searcher_) without LASER
+      // support, so this method never actually runs in that configuration.
+      // Kept branch-compatible only so the translation above can call the
+      // LASER-only searcher_labels() without an extra specialization.
       (void)pid_storage;
 #endif
     }
@@ -660,7 +738,7 @@ class LaserSegment {
                                  "LaserSegment search request is incomplete or incompatible");
     }
     auto status =
-        core::validate_tensor(request.queries, searcher_->dim(), core::OperationStage::validation);
+        core::validate_tensor(request.queries, searcher_dim(), core::OperationStage::validation);
     if (!status.ok()) {
       return status;
     }
@@ -697,7 +775,7 @@ class LaserSegment {
     if (!status.ok()) {
       return status;
     }
-    const auto result_rows = std::min<std::uint64_t>(request.options.top_k, searcher_->size());
+    const auto result_rows = std::min<std::uint64_t>(request.options.top_k, searcher_size());
     std::uint64_t scratch_per_row{};
     std::uint64_t scratch{};
     if (!core::checked_multiply(result_rows,
@@ -799,7 +877,7 @@ class LaserSegment {
         response.statuses[row] = core::Status::success();
         if (written == request.options.top_k) {
           response.completeness[row] = core::SearchCompleteness::complete_k;
-        } else if (request.options.top_k > searcher_->size() && written == searcher_->size()) {
+        } else if (request.options.top_k > searcher_size() && written == searcher_size()) {
           response.completeness[row] = core::SearchCompleteness::eligible_exhausted;
         } else {
           response.completeness[row] = core::SearchCompleteness::strategy_incomplete;
@@ -817,7 +895,7 @@ class LaserSegment {
     }
     if (request.context->stats != nullptr) {
       const auto visited =
-          std::min<std::uint64_t>(searcher_->size(),
+          std::min<std::uint64_t>(searcher_size(),
                                   std::max<std::uint64_t>(options.ef, options.top_k));
       request.context->stats->visited += visited * request.queries.rows;
       request.context->stats->io_requests += request.queries.rows;
@@ -827,14 +905,22 @@ class LaserSegment {
   }
 
   // Unified-segment seam analog (see UnifiedLaserSegmentSearcher, decision
-  // 5 of the U2-b manifest): LaserSegmentSearcher::search() itself is never
-  // modified and never reads DiskSearchOptions.filter, so a non-none filter
-  // bypasses it and drives the kernel through searcher_->graph() directly
-  // -- the same lock + set_params-if-different discipline
-  // LaserSegmentSearcher::search() uses internally, reimplemented here
-  // since that discipline lives behind a private member this class cannot
-  // reach. kind=none keeps calling searcher_->search() untouched (byte-
-  // identical to before this contract landed).
+  // 5 of the U2-b manifest, and decision 7 of U2-c for the residency split
+  // below). When unified_searcher_ is active (kResidentArena residency),
+  // everything routes through its own search(), which already compiles
+  // admission internally for both residencies it supports -- see the
+  // unified_searcher_ branch at the top of this function. Everything below
+  // this comment is legacy_searcher_-only: LaserSegmentSearcher::search()
+  // itself is never modified and never reads DiskSearchOptions.filter, so a
+  // non-none filter bypasses it and drives the kernel through
+  // legacy_searcher_->graph() directly -- the same lock +
+  // set_params-if-different discipline LaserSegmentSearcher::search() uses
+  // internally, reimplemented here since that discipline lives behind a
+  // private member this class cannot reach. kind=none keeps calling
+  // legacy_searcher_->search() untouched (byte-identical to before the
+  // admission contract landed, and to before residency selection existed:
+  // legacy_searcher_ is populated in exactly the cases searcher_ used to
+  // be populated unconditionally).
   //
   // Concurrency note: this uses a mutex private to LaserSegment, disjoint
   // from LaserSegmentSearcher's own search_mutex_ that the kind=none path
@@ -849,14 +935,26 @@ class LaserSegment {
   [[nodiscard]] auto admission_aware_search(const float *query,
                                             const DiskSearchOptions &options) const
       -> std::vector<DiskSearchHit> {
+    if (unified_searcher_) {
+      // Decision 7 (U2-c manifest): in unified/resident-arena mode, filter
+      // and admission go through UnifiedLaserSegmentSearcher's own
+      // search(), which already compiles admission internally (bitmap and
+      // sorted_rows, see its compile_admission()) for both residencies it
+      // supports, and whose kind=none path is byte-identical to the legacy
+      // one when paged. The manual bypass below exists only because
+      // LaserSegmentSearcher::search() itself never reads
+      // DiskSearchOptions.filter -- that limitation does not apply to
+      // UnifiedLaserSegmentSearcher, so it never needs the bypass.
+      return unified_searcher_->search(query, options);
+    }
     if (options.filter.kind == core::SegmentFilterKind::none) {
-      return searcher_->search(query, options);
+      return legacy_searcher_->search(query, options);
     }
 #if ALAYA_DISK_LASER_SEGMENT_SUPPORTED
     const std::lock_guard<std::mutex> lock(admission_search_mutex_);
-    auto &graph = searcher_->graph();
+    auto &graph = legacy_searcher_->graph();
     const auto effective_top_k = static_cast<std::uint32_t>(
-        std::min<std::uint64_t>(static_cast<std::uint64_t>(options.top_k), searcher_->size()));
+        std::min<std::uint64_t>(static_cast<std::uint64_t>(options.top_k), searcher_size()));
     const AdmissionLastSetParams requested{
         static_cast<std::size_t>(std::max(options.ef, effective_top_k)),
         1,
@@ -874,31 +972,31 @@ class LaserSegment {
       // label->PID translation before storing this filter.
       admission_value = laser::admission_from_bitmap_payload(options.filter.payload,
                                                              options.filter.payload_size,
-                                                             searcher_->size());
+                                                             searcher_size());
       admission = &admission_value;
     }
 
     std::vector<std::uint32_t> pid_buf(effective_top_k);
     graph.search(query, effective_top_k, pid_buf.data(), admission);
 
-    const std::uint64_t *labels = searcher_->labels();
+    const std::uint64_t *labels = searcher_labels();
     std::vector<DiskSearchHit> out;
     out.reserve(effective_top_k);
     for (std::uint32_t pid : pid_buf) {
-      if (pid >= searcher_->size()) {
+      if (pid >= searcher_size()) {
         throw std::runtime_error("LaserSegment: QuantizedGraph returned PID " +
                                  std::to_string(pid) + " outside segment count " +
-                                 std::to_string(searcher_->size()));
+                                 std::to_string(searcher_size()));
       }
       out.push_back(DiskSearchHit{labels[pid], std::numeric_limits<float>::quiet_NaN()});
     }
     return out;
 #else
     // Unreachable: LaserSegment::open() refuses to construct a segment (and
-    // therefore searcher_) without LASER support, so this branch never
-    // actually runs in that configuration. searcher_->graph()/labels() are
-    // LASER-only members the stub SegmentSearcher does not declare.
-    return searcher_->search(query, options);
+    // therefore legacy_searcher_) without LASER support, so this branch
+    // never actually runs in that configuration. legacy_searcher_->graph()
+    // is a LASER-only member the stub SegmentSearcher does not declare.
+    return legacy_searcher_->search(query, options);
 #endif
   }
 
@@ -947,7 +1045,7 @@ class LaserSegment {
       manifest = std::move(opened).value().manifest;
     }
     if (manifest.collection.dim != 0 &&
-        (manifest.collection.dim != searcher_->dim() ||
+        (manifest.collection.dim != searcher_dim() ||
          manifest.collection.metric != core::Metric::l2 ||
          manifest.collection.scalar_type != core::ScalarType::float32)) {
       return core::Status::error(core::StatusCode::invalid_argument,
@@ -955,7 +1053,7 @@ class LaserSegment {
                                  core::StatusDetail::malformed_struct,
                                  "LaserSegment publication disagrees with collection schema");
     }
-    manifest.collection.dim = searcher_->dim();
+    manifest.collection.dim = searcher_dim();
     manifest.collection.metric = core::Metric::l2;
     manifest.collection.scalar_type = core::ScalarType::float32;
     manifest.collection.logical_id_encoding =
@@ -982,7 +1080,14 @@ class LaserSegment {
         -> bool = default;
   };
 
-  std::shared_ptr<LaserSegmentSearcher> searcher_{};
+  // Exactly one of these is non-null, chosen once at construction time by
+  // the residency this segment opened with. legacy_searcher_ is the
+  // default/paged-pool path (byte-identical to pre-residency-wiring
+  // behavior when no residency is configured); unified_searcher_ is
+  // populated only when a manifest/env residency request resolves to
+  // kResidentArena.
+  std::shared_ptr<LaserSegmentSearcher> legacy_searcher_{};
+  std::shared_ptr<UnifiedLaserSegmentSearcher> unified_searcher_{};
   SegmentManifest native_{};
   std::filesystem::path directory_{};
   std::uint64_t artifact_bytes_{};

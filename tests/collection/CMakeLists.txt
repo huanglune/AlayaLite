@@ -163,4 +163,19 @@ if(ALAYA_ENABLE_LASER)
     LABELS integration collection laser segment
     TIMEOUT 120
   )
+
+  # End-to-end coverage for LASER as a Collection target algorithm (U2-c W1):
+  # create/upsert/seal/search/filter-search/close/reopen/rotate_to_successor through the public Collection facade, plus
+  # the metric=inner_product -> flat fallback.
+  alaya_cc_target(
+    collection_laser_target_test
+    GTEST LASER
+    SRCS collection_laser_target_test.cpp
+  )
+  alaya_add_test(
+    NAME collection_laser_target_test
+    TARGET collection_laser_target_test
+    LABELS integration collection laser
+    TIMEOUT 180
+  )
 endif()
