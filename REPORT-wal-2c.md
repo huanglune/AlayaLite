@@ -15,6 +15,7 @@
 - **W2/W3**:未开始(见"遗留")。**W2 前须按纪律发起 codex 对抗审查。**
 - 相关 ctest(laser/collection/wal/crash 标签)40/40 绿;新增测试:frame 三 API、fail-closed 选择器、kind=7/8 golden、consolidate 三功能测试、consolidate SIGKILL C0-C11(13 格)、consolidate 掉电 roll-forward、oracle 等价 5 格。
 - **W1 codex 复审补账完成并 commit(续程,本波第三程)**:codex 复用核审查报告(`wal2c-w2-codex-report.md`)A 部分的 5 BLOCKER + 5 MAJOR,除 MAJOR-10(activation-ready 洞,codex 明令随激活原子组落地)外全部落地;详见"八、Step 1 状态映射"与 JC-16..JC-21。40/40 laser/collection/wal/crash 绿(crash 36 例含强化的 S_old/S_new 指纹族)。
+- **W2 复用核 step 2-4 落地并 commit(本波第四程,dormant 安全推进)**:codex 8 步序的 step 2/3/4——step 2(**caa3287**)不激活类型/API(`PidToken.pid=kPidMax` + `operator==`、`PhysicalBundleResult`、label content revision slot-dirty 追踪、free saturation 双守卫 reclaim skip + recovery poison),step 3(**84bf2f0**)canonical replay reader(BundleStage/lane、FREE preimage first/latest ref 识别、mixed HWM 代数、gen+1 链、B-2C-02 final-live、EOF torn 截断、absorbed validate-only=JC-22),step 4(**f300f6d**)reserve_bundle_pids + reuse checkpoint 准入原子组。**三步全 dormant**:supported mask 未扩、`enable_pid_reuse` 未接线、`pid_reuse_activation_gen_` 恒 0⇒canonical lane 不进/reserve 不被调/准入恒满足⇒2A/2B/golden/crash 逐字节不变,40/40 全绿。**step 5-8 未落**(见"六、遗留");停点=step 4→step 5 组间绿边界(writer 编译耦合 step 6 arming⇒一旦落 writer 即需 activation + R0-R11 全矩阵 + 强制 codex 中审,超本程预算;JC-15 原子同落纪律)。
 
 ---
 
@@ -69,6 +70,8 @@
 - **JC-19**(BLOCKER-3 落地,取代 JC-9/JC-14 的 deferred):流式恢复经 `WalFile` 新增 opt-in `stream_recovery` ctor 旗标(default false⇒既有 caller 与 `wal_frame_test` 红线逐字节不变)+ `scan_structure_streaming`(单帧内存、不留 payload)+ QG replay/fresh-probe 全走 `visit_frames`。行为等价(同帧序、同 epoch 状态机),恢复内存 O(max frame + touched pages) 非 O(WAL 字节)。`truncate_to` 仍是流式恢复语义截断,非第四 API 滥用。
 - **JC-20**(BLOCKER-4):`maint_install_all` 的 page seqlock 在 `write_at` 抛出时经 try/catch 补齐 even(关闭 seqlock 对),并发 reader 不再永久自旋;句柄同抛即 poison,撕裂页在 poison 下无 post-commit 内容保证,仅保 reader liveness。
 - **JC-21**(MAJOR-8):no-steal 审计统一为 `assert_no_maintenance_steal(what)`,覆盖 `write_at`(pwrite+arena)/bloom-scan `ftruncate`/`write_superblock`(直接 pwrite)三口;replaying_ 与 pre-BEGIN 激活 checkpoint 下为 no-op。codex 建议的"observer 正向计数证明 END 前维护写=0"被 poison 守卫 + 现已精确的 S_old 指纹(BLOCKER-2,任何 build 期 index 变更泄漏进 S_old 即被指纹比对逮住)双重涵盖,故不新增计数器(冗余)。
+- **JC-22**(Step 3 canonical replay reader,absorbed-canonical validate-only):canonical replay lane 的 absorbed 前缀(`txid <= base_committed_txid_`)采**保守 validate-only**——跑结构集合验证(row_op {0..count-1} 唯一、pid 全局唯一、binding_count 匹配)+ B-2C-02(每绑定 PID 有 final live trailer),但**跳过** HWM 代数与 gen+1 链校验(此时 running watermark 已是 POST-absorbed base,pre-tx 代数无法在不重建 retained-kind=6 模型下复原)、**不重放**页、不提升绑定、不进 watermark。达成 codex §B.5 目标(不再用"binding 与最终 slot 相等";absorbed 页只验证不重放),但未实现 codex 的完整"从 retained kind=6 建模、顺序执行 absorbed bundle、最终 flip 比对"belt-and-suspenders。理由:该路径仅 R11(checkpoint 吸收后 WAL-reset 前崩溃)可达,且**须 step 5 writer + step 6 activation 才能产出可测的 canonical WAL**;dormant reader 阶段无法端到端验证。裁决:保守版随 step 3 落地(安全——absorbed bundle 已在通过自身 checksum 的 base 内),完整 retained-kind=6 模型作 step 6 携带项(R11 可测时补齐并对抗验)。非翻案(保留 codex 结论:absorbed validate-only、不重放),仅 dormant 路径的实现缩减 + 显式挂账。
+- **JC-23**(Step 4 checkpoint 准入):codex §B.6 的"将 checkpoint() 拆成公开加锁层 + checkpoint_locked(),bundle/consolidate 共用 checkpoint_mutex_"**推迟到 step 5**(canonical writer 才需在 checkpoint_mutex_ 下调 checkpoint/activation)。step 4 仅在现有 checkpoint() 内加三条 reuse 准入(bundle_state==idle、reservation_count==0、free_chain_rebuild_complete),dormant 下恒满足⇒零回归。理由:public/locked 拆分是 writer 集成关注点,无 writer 时拆分是空动作;step 5 落 writer 时一并拆(那里才有跨 checkpoint_mutex_ 的真实 activation 调用)。
 
 ## 八、Step 1 状态映射(codex 复用核报告 A 部分:最小正确落地顺序步 1)
 
@@ -85,7 +88,7 @@
 | MAJOR-9 slot loader 验证 | 代码 | **部分落地** | 6415aba | QG loader `pid<num_points`;base-region shadowing 随 Step 7(JC-17) |
 | MAJOR-10 W2a activation-ready 洞 | 代码 | **随激活组(Step 6)** | — | codex A.10 明令原子同落;清单=JC-16 + §七 |
 
-Step 2-8(不激活类型/API → reader → reserve/checkpoint 准入 → canonical writer → activation 原子组 → adapter token 化 → R0-R11 全矩阵)未开始:复用核须 runtime+replay 原子同落(JC-15/codex §5 坑 1),剩余预算不足以覆盖 ≈800 行最高风险协议 + 强制 codex 中审 + 全矩阵,故停在 Step 1 完整绿边界并诚报(前两程 W0/W1、W2a 停点先例)。
+**Step 2/3/4 落地(本波第四程,commit caa3287/84bf2f0/f300f6d,全 dormant、40/40 绿)**:step 2 不激活类型/API + revision + free saturation;step 3 canonical replay reader(§B.5,含 absorbed validate-only=JC-22);step 4 reserve_bundle_pids + reuse checkpoint 准入(§B.2/§B.6,public/locked 拆分推迟=JC-23)。**Step 5-8 未落**:step 5 canonical writer(§B.4,≈250 行最深水:BundleInsertContext/private overlay/kind=8 后固定发布序/final-live-trailer)与 **step 6 activation**(扩 supported mask + activation checkpoint/summary + JC-16 七洞——**arming 动作**)**编译耦合**(writer 的 canonical 分支调 `ensure_pid_reuse_activated`);一旦落即 arm 协议,须再落 step 7 adapter token 化(JC-17)+ step 8 R0-R11 全矩阵 + 额外硬族 + **强制 codex 对抗中审**方为 sound。剩余预算不足以 sound 落 writer+arming+矩阵+审,故停在 step 4→step 5 组间绿边界并诚报(JC-15 runtime+replay 原子同落、codex §5 坑 1、前三程 W0/W1/W2a+Step1 停点先例)。step 5-8 runway = §七 + codex 报告 §B.4/§B.6/§B.7 + 本程 dormant 地基(reader/reserve/admission 已就位:writer 直接消费 `reserve_bundle_pids` 返回的 `PhysicalBundleResult`,arming 后 reader 即接管 canonical replay)。
 
 ## 四、边界清单
 
