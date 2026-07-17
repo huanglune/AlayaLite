@@ -756,26 +756,32 @@ class Collection {
     }
     const auto algorithm_valid = options.target_algorithm == core::algorithm::flat ||
                                  options.target_algorithm == core::algorithm::hnsw ||
-                                 options.target_algorithm == core::algorithm::qg;
+                                 options.target_algorithm == core::algorithm::qg ||
+                                 options.target_algorithm == core::algorithm::laser;
     if (!algorithm_valid) {
       return error(core::StatusCode::not_supported,
                    stage,
                    core::StatusDetail::operation_slot_absent,
                    "canonical Collection target algorithm is unsupported");
     }
+    // rabitq quantization is the RaBitQ-graph family's native (and only)
+    // format -- both qg (in-memory) and laser (on-disk) always quantize this
+    // way internally, so this cross-check covers both instead of qg alone.
     if (options.quantization == CollectionQuantization::rabitq &&
-        options.target_algorithm != core::algorithm::qg) {
+        options.target_algorithm != core::algorithm::qg &&
+        options.target_algorithm != core::algorithm::laser) {
       return error(core::StatusCode::invalid_argument,
                    stage,
                    core::StatusDetail::malformed_struct,
-                   "canonical Collection requires explicit index_type=qg for rabitq");
+                   "canonical Collection requires explicit index_type=qg or laser for rabitq");
     }
-    if (options.target_algorithm == core::algorithm::qg &&
+    if ((options.target_algorithm == core::algorithm::qg ||
+         options.target_algorithm == core::algorithm::laser) &&
         options.quantization != CollectionQuantization::rabitq) {
       return error(core::StatusCode::invalid_argument,
                    stage,
                    core::StatusDetail::malformed_struct,
-                   "canonical Collection qg requires quantization=rabitq");
+                   "canonical Collection qg/laser requires quantization=rabitq");
     }
     if ((options.quantization == CollectionQuantization::sq8 ||
          options.quantization == CollectionQuantization::sq4) &&
