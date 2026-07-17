@@ -63,6 +63,8 @@ u64 segment_id     u64 segment_generation     u8 op kind     op body
 | 4 | `consolidate_end` | consolidate epoch | an unmatched `begin` at recovery ⇒ the consolidate replays or is discarded **as a unit** |
 | 5 | `publish` | visibility watermark | monotone max on replay |
 | 6 | `superblock_flip` | target A/B slot, superblock CRC | commit point of a segment checkpoint; CRC-guarded |
+| 7 | `label_bind` | txid, row_op_id, pid, pid_generation, label | (2A) stages one explicit pid→label binding under a txid; buffered, promoted atomically by the matching `tx_publish`. Idempotent de-dup on `(txid, row_op_id)` for a torn large-bundle retry. |
+| 8 | `tx_publish` | txid, new_committed_watermark, row_count, applied_collection_op_id | (2A) the single durable (fsync) commit point of a label bundle: advances `committed`, promotes the bundle's staged `label_bind` frames, and carries the collection op watermark that is 2B's idempotency basis. `batch_id == tx_id`; strict-increasing txid; non-regressing applied op. |
 
 Gardening is not an op kind: a garden pass is a sequence of `row_patch`
 records (plus `publish`), nothing more.
@@ -110,6 +112,43 @@ No durable in-place mutation claim ships until `SEGMENT_OP` WAL replay
 **and** a crash matrix (kill-point table per op kind, in the style of the
 Gate 10 "four real-kill recovery cuts") land together. The A/B superblock
 alone is a consistency device, not a durability claim.
+
+### 8. Active engine — the mutable LASER segment as a Collection generation (2B)
+
+A Collection's **active (writable) generation** may be a durable on-disk mutable
+LASER segment (`active_engine=laser`) instead of the in-memory flat table. The
+label-transaction op-WAL (kinds 7/8) is then the physical durability layer; the
+Collection logical WAL (types 1–4) remains the source of truth. The bridge is the
+facade-private `MutableLaserCollectionAdapter`, and the wiring obeys:
+
+- **Physical txid = the real logical-WAL transaction id.** A single or per-row
+  transaction uses the row's own `op_id`; an atomic batch uses its shared WAL frame
+  id (`batch_op_id`). It is **never** the per-row batch's shared `batch_op_id` — a
+  per-row batch is N independent transactions, so sharing it would satisfy
+  `txid <= last_committed` for every row after the first and drop the write. The txid
+  and the transaction's max row `op_id` are passed *typed* through `MutationContext`
+  (set by Collection at its three dispatch sites), never re-derived by the adapter.
+- **Idempotency basis.** A write is skipped iff `max_row_op_id <=
+  applied_collection_op_id` (persisted in the segment superblock, `[40..56)`);
+  otherwise it requires `txid > last_committed_txid`, else it is WAL corruption
+  (poison). Erase/previous-tombstone is convergent by construction (a missing target
+  is an idempotent hit). A checkpoint image is replayed in `op_id`-ascending order so
+  an empty physical segment rebuilt from it never commits a high txid before a low one.
+- **Two-layer fail-closed.** The Collection latches a *recovery-required* state if the
+  post-COMMIT window (L:COMMIT durable → `publish_snapshot`) is exited abnormally
+  (a committed-but-unpublished transaction must not be dropped by a later checkpoint);
+  the adapter independently latches on any failure once physical state may have
+  advanced (e.g. a partial tombstone), gating search/checkpoint until reopen.
+- **Superseded versions.** An upsert's publish plan tombstones every row's
+  same-segment `previous` (deduped) after the write bundle, so a stale version cannot
+  stay live in the graph and shadow the current one.
+- **Config persistence.** `active_engine` rides the facade schema: flat keeps the
+  14-field layout (byte-compatible with pre-2B readers), laser widens it to 15 so an
+  old binary's strict field count fails closed rather than reverting to flat.
+
+Rotation/seal is unchanged control-plane vocabulary (§6): sealing an active LASER
+generation builds an immutable sealed LASER segment into the manifest; the retired
+active directory is reclaimed by an idempotent open-time sweep (no WAL restatement).
 
 ## Acceptance (checked at G1)
 
