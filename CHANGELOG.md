@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Cosine metric support for the in-memory QG engine. QG normalizes rows
+  before RaBitQ quantization at build time and wraps the query boundary with
+  the same `L2NormalizedQuerySegment` adapter HNSW's cosine path used,
+  reusing RaBitQSpace's existing cosine-as-inner-product kernel routing.
+  `qg_target_support`/`build_qg_collection_target`/`open_qg_collection_target`
+  all accept cosine now (float32 + rabitq quantization, same row-count floor
+  as l2/inner_product).
 - Durable in-place updates for the LASER on-disk quantized graph (op-WAL, the
   G1 gate). `QGUpdater` gains an opt-in after-image write-ahead log
   (`UpdateParams::enable_wal`, off by default) that rides in the shared
@@ -25,8 +32,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (WAL7 envelope, CRC, scan, `WalFile`, byte `Decoder`) for both the collection
   logical WAL and the segment op-WAL — one frame format, no divergence.
 
+### Changed
+
+- **Breaking:** the default sealed target algorithm flips from `hnsw` to
+  `qg`. `CollectionOptions::target_algorithm`'s C++ struct default is now
+  `core::algorithm::qg` (every existing call site already set it explicitly,
+  so this only changes bare-default construction). Python's
+  `IndexParams.fill_none_values()` now dispatches on dtype when `index_type`
+  is left unset: float32 with no competing quantization request defaults to
+  `index_type="qg", quantization_type="rabitq"`; float32 with an explicit
+  non-rabitq `quantization_type` (`sq8`/`sq4`/`none`) and any non-float32
+  dtype both honestly default to `index_type="flat"` (exact search) instead
+  of an approximate engine, since qg is rabitq-only and flat never
+  quantizes. Users who relied on the old dtype-independent `hnsw` default
+  for int8/uint8 vectors or for float32 with `sq8`/`sq4` quantization move
+  from approximate HNSW search to exact flat search.
+- Requesting `target_algorithm=hnsw` (or the legacy `index_type="hnsw"`
+  spelling) now fails with `not_supported` ("target algorithm is
+  unsupported") instead of the old `hnsw`+`rabitq` cross-check's
+  `invalid_argument` ("requires explicit index_type=qg"): hnsw's algorithm
+  id is rejected by the capability gate before any cross-check runs, the
+  same as the already-retired nsg/fusion/vamana/diskann ids. At the Python
+  layer, `index_type="hnsw"` is now rejected before ever reaching the native
+  layer at all (`common.py`'s valid `index_type` set dropped `"hnsw"`).
+
 ### Removed
 
+- The HNSW in-memory graph engine (`hnsw_segment`) and its build kernel,
+  including the hand-rolled `hnswlib.hpp` it was built on. `algorithm::hnsw`
+  (id `2`) remains reserved and is rejected by the capability gate, matching
+  nsg/fusion/vamana/diskann; `flat` and `qg` are unaffected. QG is now the
+  only in-memory graph engine (see the cosine-support entry above for how it
+  closes HNSW's one remaining capability gap).
+- The `tools/codegen/dispatch.yaml`-driven canonical identity test matrix
+  and its generator (`tools/codegen/gen.py`, the `alaya_codegen` CMake
+  target, and the generated `python/tests/client/_dispatch_matrix_params.py`).
+  The matrix's "index" dimension was the literal constant `HNSW` for every
+  row (including the one row that actually built qg), so it was entirely
+  hnsw-keyed; retiring hnsw retired the whole matrix, not just some rows.
 - The NSG and Fusion memory graph engines (`nsg_segment`/`fusion_segment`),
   their build kernels, and the NN-Descent kernel they built on. The
   `algorithm::nsg`/`algorithm::fusion` registry ids remain reserved and are
