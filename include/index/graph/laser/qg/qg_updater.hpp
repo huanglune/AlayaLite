@@ -716,6 +716,16 @@ class QGUpdater {
   [[nodiscard]] bool row_is_live(PID pid) const {
     return static_cast<size_t>(pid) < committed_.load(std::memory_order_acquire) && !is_hidden(pid);
   }
+  // The current durable incarnation generation of `pid` (design 3.3 / codex B.7): the
+  // generation of its live label binding, or 0 for a never-reused PID (base identity /
+  // append-only). The 2B adapter's tombstone ABA check compares a captured token's
+  // generation against this: a smaller current generation means the token is from the
+  // future (corruption); a larger one means the PID was reused (the token is stale).
+  [[nodiscard]] uint32_t durable_generation(PID pid) const {
+    const auto snap = label_snapshot();
+    const auto *b = snap ? snap->find_binding(pid) : nullptr;
+    return b != nullptr ? b->pid_generation : 0;
+  }
   [[nodiscard]] uint64_t last_committed_txid() const { return last_committed_txid_; }
   [[nodiscard]] uint64_t applied_collection_op_id() const { return applied_collection_op_id_; }
 
@@ -1146,16 +1156,17 @@ class QGUpdater {
     qg_.num_points_ = new_committed;
   }
 
-  // Commit a physical label bundle (2A, semantics 2/3): append kind=7 per row +
-  // one kind=8 (fsync) as the single durable commit point, atomically swap the
-  // label snapshot, then advance committed via publish_common (snapshot released
-  // before committed). Preconditions throw (caller error, never poison); any I/O
-  // or internal failure poisons. Returns the appended PID range [old_hwm, new_hwm).
-  std::pair<PID, PID> commit_physical_bundle(uint64_t txid,
-                                             uint64_t applied_op_id,
-                                             const float *vecs,
-                                             const uint64_t *labels,
-                                             size_t n) {
+  // Commit a physical label bundle and return per-row (pid, generation) tokens
+  // (design 3.3 / codex B.7). The canonical path returns real reuse tokens; the
+  // legacy 2A path returns dense gen=0 tokens over [old_hwm, new_hwm). The 2B adapter
+  // binds label->token from `rows` instead of guessing a dense range (mixed / all-reuse
+  // bundles are NOT dense). Preconditions throw (caller error, never poison); any I/O
+  // or internal failure poisons.
+  PhysicalBundleResult commit_physical_bundle_tokens(uint64_t txid,
+                                                     uint64_t applied_op_id,
+                                                     const float *vecs,
+                                                     const uint64_t *labels,
+                                                     size_t n) {
     if (!enable_wal_) {
       throw std::logic_error("QGUpdater::commit_physical_bundle requires enable_wal");
     }
@@ -1173,11 +1184,40 @@ class QGUpdater {
     // Canonical prebind branch (design B.4): once PID reuse is activated (v3 pid base)
     // OR opt-in via enable_pid_reuse, every bundle -- append-only, mixed, or all-reuse --
     // takes the append-only canonical writer. A never-activated 2A segment keeps the
-    // legacy interleaved path below byte-for-byte (dormant until step 6 arms activation).
+    // legacy interleaved path byte-for-byte.
     if (pid_generation_activated_ || enable_pid_reuse_) {
-      const auto result = commit_physical_bundle_canonical(txid, applied_op_id, vecs, labels, n);
-      return {static_cast<PID>(result.old_hwm), static_cast<PID>(result.new_hwm)};
+      return commit_physical_bundle_canonical(txid, applied_op_id, vecs, labels, n);
     }
+    const auto range = commit_physical_bundle_legacy_2a(txid, applied_op_id, vecs, labels, n);
+    PhysicalBundleResult out;
+    out.old_hwm = range.first;
+    out.new_hwm = range.second;
+    out.rows.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+      out.rows.push_back(PidToken{static_cast<PID>(range.first + i), 0});
+    }
+    return out;
+  }
+
+  // Back-compat pair entry (existing callers unchanged): the appended PID range
+  // [old_hwm, new_hwm). Prefer commit_physical_bundle_tokens on the reuse path.
+  std::pair<PID, PID> commit_physical_bundle(uint64_t txid,
+                                             uint64_t applied_op_id,
+                                             const float *vecs,
+                                             const uint64_t *labels,
+                                             size_t n) {
+    const auto r = commit_physical_bundle_tokens(txid, applied_op_id, vecs, labels, n);
+    return {static_cast<PID>(r.old_hwm), static_cast<PID>(r.new_hwm)};
+  }
+
+  // Legacy 2A interleaved bundle (append kind=7 per row + one kind=8 fsync as the
+  // single durable commit point, snapshot swap, publish_common). Byte-for-byte the
+  // pre-reuse path; the shared preconditions are validated by the caller.
+  std::pair<PID, PID> commit_physical_bundle_legacy_2a(uint64_t txid,
+                                                       uint64_t applied_op_id,
+                                                       const float *vecs,
+                                                       const uint64_t *labels,
+                                                       size_t n) {
     const size_t old_hwm = committed_.load(std::memory_order_acquire);
     if (old_hwm != allocated_points()) {
       throw std::logic_error("commit_physical_bundle requires allocated == committed");

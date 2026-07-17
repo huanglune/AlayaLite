@@ -300,3 +300,17 @@ alaya_add_test(
   TARGET test_qg_updater_reuse
   LABELS laser wal persistence
 )
+
+# wal-2c: W2 step 7 MutableLaserSegment token-ization + tombstone ABA + base reuse.
+alaya_cc_target(
+  test_mutable_laser_segment_reuse
+  BARE GTEST
+  SRCS qg/test_mutable_laser_segment_reuse.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_mutable_laser_segment_reuse
+  TARGET test_mutable_laser_segment_reuse
+  LABELS laser wal persistence
+)

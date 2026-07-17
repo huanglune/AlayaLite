@@ -481,6 +481,15 @@ class MutableLaserCollectionAdapter {
     }
 
     try {
+      // B-2C-07 / codex B.7: capture every tombstone target's TOKEN (pid, generation)
+      // BEFORE the write bundle rebinds any label, so a same-txid rebind + PID reuse can
+      // never make us tombstone a freshly-written incarnation. The captured token drives
+      // the segment's ABA check (stale token => idempotent no-op; future => corruption).
+      std::vector<std::optional<::alaya::laser::PidToken>> captured;
+      captured.reserve(tombstones.size());
+      for (const std::uint64_t label : tombstones) {
+        captured.push_back(segment_->token_for_label(label));
+      }
       if (!labels.empty()) {
         const std::uint64_t applied = segment_->applied_collection_op_id();
         const std::uint64_t last = segment_->last_committed_txid();
@@ -509,7 +518,7 @@ class MutableLaserCollectionAdapter {
                              "injected active LASER publish failure (post-commit)"));
       }
       int tombstone_index = 0;
-      for (const std::uint64_t label : tombstones) {
+      for (std::size_t i = 0; i < tombstones.size(); ++i) {
         if (!is_replay && fail_tombstone_at_.load(std::memory_order_acquire) == tombstone_index) {
           fail_tombstone_at_.store(-1, std::memory_order_release);
           return latch(failure(core::OperationStage::mutation_publish,
@@ -518,15 +527,16 @@ class MutableLaserCollectionAdapter {
                                "injected active LASER tombstone failure (post-commit)"));
         }
         ++tombstone_index;
-        const auto pid = segment_->pid_for_label(label);
-        if (pid.has_value()) {
-          segment_->tombstone(*pid);
+        if (captured[i].has_value()) {
+          // ABA-safe: the segment no-ops a stale token (the PID was reused by a newer
+          // incarnation) and only erases the reverse map on full-token equality.
+          segment_->tombstone(*captured[i]);
         } else if (!is_replay) {
           // Ruling 10: a runtime previous/erase miss is a high-severity diagnostic,
-          // but the end state is already correct (the label has no live PID), so it
+          // but the end state is already correct (the label has no live token), so it
           // is idempotent success -- do not latch. Replay misses stay silent.
           const std::lock_guard<std::mutex> lock(diag_mutex_);
-          last_runtime_miss_ = label;
+          last_runtime_miss_ = tombstones[i];
         }
       }
     } catch (...) {
