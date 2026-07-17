@@ -43,7 +43,8 @@ struct LaserSegmentImportParams {
   // Optional residency request recorded as manifest extra x_laser_residency
   // ("paged_pool" | "resident_arena"). Empty = no extra; the segment loads
   // through the legacy searcher exactly as before. See
-  // segment_factory.hpp::laser_residency_request for the load-side contract.
+  // laser_segment.hpp::detail::laser_residency_request for the load-side
+  // contract (moved there from segment_factory.hpp; see the U2-c manifest).
   std::string residency{};
 };
 
@@ -378,7 +379,8 @@ struct LaserSegmentImportParams {
   // Optional residency request recorded as manifest extra x_laser_residency
   // ("paged_pool" | "resident_arena"). Empty = no extra; the segment loads
   // through the legacy searcher exactly as before. See
-  // segment_factory.hpp::laser_residency_request for the load-side contract.
+  // laser_segment.hpp::detail::laser_residency_request for the load-side
+  // contract (moved there from segment_factory.hpp; see the U2-c manifest).
   std::string residency{};
 };
 

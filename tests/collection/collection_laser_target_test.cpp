@@ -32,6 +32,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <random>
@@ -44,6 +45,8 @@
 
 #include "alaya/collection.hpp"
 #include "index/collection/artifact_manifest_v2.hpp"
+#include "index/collection/detail/collection_flat_target.hpp"
+#include "index/disk/segment_manifest.hpp"
 #include "platform/detect.hpp"
 
 namespace alaya {
@@ -365,6 +368,71 @@ TEST(CollectionLaserTargetTest, CreateUpsertSealSearchFilterReopenAndRotate) {
   // (the original 384 rows) or the freshly inserted `active` rows above, so
   // this checks against their union, not `dataset` alone.
   expect_well_formed(after_rotate.value(), combined, kQueryCount);
+
+  ASSERT_TRUE(reopened->close().ok());
+}
+
+TEST(CollectionLaserTargetTest, ResidentArenaResidencyViaEnvOverrideThroughCollection) {
+  // Decision 6 (U2-c manifest): ALAYA_LASER_RESIDENCY drives both
+  // build_laser_collection_target()'s manifest hint (what LaserSegmentImportParams::residency
+  // gets persisted as) and LaserSegment::open()'s residency selection (env
+  // overrides the manifest either way) -- this is the "unified arena
+  // through Collection" residency variant of the lifecycle test above,
+  // which never sets this env var and stays on the legacy default path.
+  TemporaryDirectory temporary("resident-arena");
+  const auto dataset = make_dataset(kRows, /*seed=*/271828U);
+  const auto queries = make_queries(dataset, kQueryCount, /*seed=*/17U);
+
+  ::setenv("ALAYA_LASER_RESIDENCY", "resident_arena", 1);
+  struct EnvGuard {
+    ~EnvGuard() { ::unsetenv("ALAYA_LASER_RESIDENCY"); }
+  } env_guard;
+
+  auto created = Collection::create(make_options(temporary.path(), core::Metric::l2));
+  ASSERT_TRUE(created.ok()) << created.status().diagnostic();
+  auto collection = std::move(created).value();
+  insert_dataset(*collection, dataset);
+
+  auto sealed = collection->seal();
+  ASSERT_TRUE(sealed.ok()) << sealed.status().diagnostic();
+  EXPECT_EQ(sealed.value().built_algorithm, core::algorithm::laser);
+  EXPECT_FALSE(sealed.value().flat_fallback);
+
+  // Confirm the native manifest actually recorded resident_arena -- this is
+  // what makes the rest of this test a residency proof rather than "it
+  // happens to pass the same way regardless of residency."
+  const auto seg_dir =
+      temporary.path() / "segments" /
+      internal::collection::detail::collection_segment_name(sealed.value().sealed_segment_id);
+  const auto native_manifest = ::alaya::disk::SegmentManifest::load(seg_dir / "manifest.txt");
+  const auto residency_extra = native_manifest.x_extras.find("x_laser_residency");
+  ASSERT_NE(residency_extra, native_manifest.x_extras.end());
+  EXPECT_EQ(residency_extra->second, "resident_arena");
+
+  auto plain = collection->batch_search(
+      core::TypedTensorView::contiguous(queries.data(), kQueryCount, kDim), kTopK);
+  ASSERT_TRUE(plain.ok()) << plain.status().diagnostic();
+  ASSERT_EQ(plain.value().valid_counts,
+            std::vector<core::RowCount>(static_cast<std::size_t>(kQueryCount), kTopK));
+  expect_well_formed(plain.value(), dataset, kQueryCount);
+
+  ASSERT_TRUE(collection->close().ok());
+  collection.reset();
+  auto opened = Collection::open(temporary.path());
+  ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
+  auto reopened = std::move(opened).value();
+
+  auto after = reopened->batch_search(
+      core::TypedTensorView::contiguous(queries.data(), kQueryCount, kDim), kTopK);
+  ASSERT_TRUE(after.ok()) << after.status().diagnostic();
+  ASSERT_EQ(after.value().valid_counts,
+            std::vector<core::RowCount>(static_cast<std::size_t>(kQueryCount), kTopK));
+  expect_well_formed(after.value(), dataset, kQueryCount);
+  // Unlike the paged-pool default lifecycle test above, the resident-arena
+  // kernel has no async I/O (fully deterministic given the same graph state
+  // and query), so this can assert byte-identical results across the
+  // reopen instead of an overlap floor.
+  EXPECT_EQ(after.value().ids, plain.value().ids);
 
   ASSERT_TRUE(reopened->close().ok());
 }

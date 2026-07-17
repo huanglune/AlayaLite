@@ -40,8 +40,10 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -398,6 +400,85 @@ TEST_F(AdmissionDiskTest, LaserSegmentRejectsSortedRowsAndPredicateFilters) {
     const auto status = segment->search(call.request);
     EXPECT_EQ(status.code(), core::StatusCode::not_supported) << "kind " << static_cast<int>(kind);
   }
+}
+
+// ---------------------------------------------------------------------------
+// LaserSegment (AnySegment face): residency selection at open (decision 6,
+// U2-c manifest). fixture_->seg_dir carries no x_laser_residency manifest
+// extra (LaserFixture never sets LaserSegmentImportParams::residency), so
+// ALAYA_LASER_RESIDENCY is the only thing selecting a mode below -- this is
+// the same env-override precedence LaserSegment::open() consults via
+// detail::laser_residency_request() (env > manifest > legacy default).
+// ---------------------------------------------------------------------------
+
+class ScopedResidencyEnv {
+ public:
+  explicit ScopedResidencyEnv(const char *value) { ::setenv("ALAYA_LASER_RESIDENCY", value, 1); }
+  ~ScopedResidencyEnv() { ::unsetenv("ALAYA_LASER_RESIDENCY"); }
+  ScopedResidencyEnv(const ScopedResidencyEnv &) = delete;
+  auto operator=(const ScopedResidencyEnv &) -> ScopedResidencyEnv & = delete;
+  ScopedResidencyEnv(ScopedResidencyEnv &&) = delete;
+  auto operator=(ScopedResidencyEnv &&) -> ScopedResidencyEnv & = delete;
+};
+
+TEST_F(AdmissionDiskTest, OpenDirectoryHonorsResidencyEnvOverrideAndBothModesAgree) {
+  std::unique_ptr<LaserSegment> legacy_segment;
+  {
+    ScopedResidencyEnv env("paged_pool");
+    core::OpenContext context;
+    auto opened = LaserSegment::open_directory(fixture_->seg_dir, core::OpenOptions{}, context);
+    ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
+    legacy_segment = std::move(opened).value();
+  }
+
+  std::unique_ptr<LaserSegment> unified_segment;
+  {
+    ScopedResidencyEnv env("resident_arena");
+    core::OpenContext context;
+    auto opened = LaserSegment::open_directory(fixture_->seg_dir, core::OpenOptions{}, context);
+    ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
+    unified_segment = std::move(opened).value();
+  }
+
+  // Not a byte-identical check, for the same reason
+  // TombstoneParityPagedKernel/BitmapFilterOnlyReturnsAdmissiblePids(Paged)
+  // above are not: legacy_segment routes kind=none through the paged-pool
+  // kernel, whose beam search interleaves computation with asynchronous
+  // page-read completions and can explore the graph in a different order
+  // run to run (documented and gdb-confirmed in
+  // tests/laser/qg/test_admission_contract.cpp). unified_segment's resident-
+  // arena kernel has no async I/O and is fully deterministic on its own, so
+  // this checks a meaningful overlap floor between the two residencies
+  // rather than set equality.
+  std::size_t overlap = 0;
+  std::size_t total = 0;
+  for (std::uint32_t qi = 0; qi < 15; ++qi) {
+    const float *query = fixture_->data.data() + static_cast<std::size_t>(qi) * kDim;
+
+    SegmentSearchCall legacy_call(query);
+    const auto legacy_status = legacy_segment->search(legacy_call.request);
+    ASSERT_TRUE(legacy_status.ok()) << legacy_status.diagnostic();
+    ASSERT_EQ(legacy_call.counts[0], kTopK);
+
+    SegmentSearchCall unified_call(query);
+    const auto unified_status = unified_segment->search(unified_call.request);
+    ASSERT_TRUE(unified_status.ok()) << unified_status.diagnostic();
+    ASSERT_EQ(unified_call.counts[0], kTopK);
+
+    std::unordered_set<std::uint64_t> legacy_ids;
+    for (std::size_t i = 0; i < legacy_call.counts[0]; ++i) {
+      legacy_ids.insert(static_cast<std::uint64_t>(legacy_call.hits[i].row_id));
+    }
+    for (std::size_t i = 0; i < unified_call.counts[0]; ++i) {
+      ++total;
+      if (legacy_ids.count(static_cast<std::uint64_t>(unified_call.hits[i].row_id)) > 0) {
+        ++overlap;
+      }
+    }
+  }
+  std::cout << "residency_open_overlap," << overlap << "/" << total << "\n";
+  EXPECT_GT(overlap, total / 2)
+      << "paged_pool and resident_arena residency should mostly agree on the same query";
 }
 
 }  // namespace
