@@ -1162,11 +1162,10 @@ class QGUpdater {
   // binds label->token from `rows` instead of guessing a dense range (mixed / all-reuse
   // bundles are NOT dense). Preconditions throw (caller error, never poison); any I/O
   // or internal failure poisons.
-  PhysicalBundleResult commit_physical_bundle_tokens(uint64_t txid,
-                                                     uint64_t applied_op_id,
-                                                     const float *vecs,
-                                                     const uint64_t *labels,
-                                                     size_t n) {
+  // Shared bundle preconditions (caller errors -- validated BEFORE any mutating work, so
+  // they never poison). Kept in one place so the token + pair entries agree exactly.
+  void validate_bundle_preconditions(uint64_t txid, uint64_t applied_op_id, const float *vecs,
+                                     const uint64_t *labels, size_t n) {
     if (!enable_wal_) {
       throw std::logic_error("QGUpdater::commit_physical_bundle requires enable_wal");
     }
@@ -1181,6 +1180,14 @@ class QGUpdater {
       throw std::invalid_argument(
           "commit_physical_bundle: applied_collection_op_id must not regress");
     }
+  }
+
+  PhysicalBundleResult commit_physical_bundle_tokens(uint64_t txid,
+                                                     uint64_t applied_op_id,
+                                                     const float *vecs,
+                                                     const uint64_t *labels,
+                                                     size_t n) {
+    validate_bundle_preconditions(txid, applied_op_id, vecs, labels, n);
     // Canonical prebind branch (design B.4): once PID reuse is activated (v3 pid base)
     // OR opt-in via enable_pid_reuse, every bundle -- append-only, mixed, or all-reuse --
     // takes the append-only canonical writer. A never-activated 2A segment keeps the
@@ -1188,11 +1195,16 @@ class QGUpdater {
     if (pid_generation_activated_ || enable_pid_reuse_) {
       return commit_physical_bundle_canonical(txid, applied_op_id, vecs, labels, n);
     }
-    const auto range = commit_physical_bundle_legacy_2a(txid, applied_op_id, vecs, labels, n);
+    // BLOCKER-6: pre-allocate the token result BEFORE the mutating/commit region. Otherwise a
+    // post-commit std::bad_alloc (out.rows growth) reports failure to the caller while the
+    // legacy transaction is already durably committed AND the handle un-poisoned -- a torn
+    // "committed but reported failed" state the pair callers never had. The legacy body
+    // returns a dense gen-0 range, so reserving n up front means the fill never allocates.
     PhysicalBundleResult out;
+    out.rows.reserve(n);
+    const auto range = commit_physical_bundle_legacy_2a(txid, applied_op_id, vecs, labels, n);
     out.old_hwm = range.first;
     out.new_hwm = range.second;
-    out.rows.reserve(n);
     for (size_t i = 0; i < n; ++i) {
       out.rows.push_back(PidToken{static_cast<PID>(range.first + i), 0});
     }
@@ -1200,14 +1212,19 @@ class QGUpdater {
   }
 
   // Back-compat pair entry (existing callers unchanged): the appended PID range
-  // [old_hwm, new_hwm). Prefer commit_physical_bundle_tokens on the reuse path.
+  // [old_hwm, new_hwm). BLOCKER-6: the legacy path goes STRAIGHT to the legacy body -- there
+  // is no token vector to allocate, so there is no post-commit allocation window at all.
   std::pair<PID, PID> commit_physical_bundle(uint64_t txid,
                                              uint64_t applied_op_id,
                                              const float *vecs,
                                              const uint64_t *labels,
                                              size_t n) {
-    const auto r = commit_physical_bundle_tokens(txid, applied_op_id, vecs, labels, n);
-    return {static_cast<PID>(r.old_hwm), static_cast<PID>(r.new_hwm)};
+    validate_bundle_preconditions(txid, applied_op_id, vecs, labels, n);
+    if (pid_generation_activated_ || enable_pid_reuse_) {
+      const auto r = commit_physical_bundle_canonical(txid, applied_op_id, vecs, labels, n);
+      return {static_cast<PID>(r.old_hwm), static_cast<PID>(r.new_hwm)};
+    }
+    return commit_physical_bundle_legacy_2a(txid, applied_op_id, vecs, labels, n);
   }
 
   // Legacy 2A interleaved bundle (append kind=7 per row + one kind=8 fsync as the
@@ -1428,14 +1445,17 @@ class QGUpdater {
       if (has_staged_edges()) {
         poison("canonical bundle: staged backlinks must be drained (inline patching required)");
       }
-      // (4b) FINAL bidirectional spine (BLOCKER-1 fix): after every ordinary backlink /
-      // full-recompute has run, force rows[i] <-> rows[i+1] so a Hamiltonian path (both
-      // directions) connects the whole bundle. Nothing rewrites these edges afterwards, so
-      // the committed graph is reachable from ANY live bundle row -- which is exactly the
-      // row recovery / repair_routing_roots may select as the entry after a delete-all.
-      for (size_t i = 0; i + 1 < n; ++i) {
-        bundle_force_edge(result.rows[i].pid, result.rows[i + 1].pid, spine_page);
-        bundle_force_edge(result.rows[i + 1].pid, result.rows[i].pid, spine_page);
+      // (4b) FINAL directed Hamiltonian cycle (MAJOR-1 fix): after every ordinary backlink /
+      // full-recompute has run, force rows[i] -> rows[(i+1) % n] so every bundle row has an
+      // outgoing spine edge and the cycle makes ALL bundle rows reachable from ANY one of
+      // them -- exactly the row recovery / repair_routing_roots may select as the entry after
+      // a delete-all. Each row is the `from` of EXACTLY ONE forced edge, so a forced eviction
+      // (when a row is degree-saturated) can never remove a spine edge installed for another
+      // row. The earlier bidirectional pass modified each middle row twice, so the second
+      // forced eviction could drop the just-installed neighbor -- it was not a stable
+      // invariant. Nothing rewrites these edges before finalize.
+      for (size_t i = 0; n >= 2 && i < n; ++i) {
+        bundle_force_edge(result.rows[i].pid, result.rows[(i + 1) % n].pid, spine_page);
       }
       // (5) finalize: append each dirty overlay page's final kind=1 (buffered).
       bundle_finalize_pages();
@@ -3776,27 +3796,6 @@ class QGUpdater {
     }
   }
 
-  // Transaction-local free push (reclaim): set the row's trailer FREE + next pointer
-  // in the overlay, advancing the LOCAL free head/count. Published globally only
-  // after END is durable and every page is installed.
-  void maint_push_free_slot(PID id) {
-    char *page = maint_overlay_page(page_index(id));
-    QGRowTrailer trailer = qg_read_page_trailer(page, page_size_, npp_, id % npp_);
-    if ((trailer.flags & kQGRowTombstone) == 0 || (trailer.flags & kQGRowFree) != 0) {
-      return;  // only tombstoned, not-yet-free rows are eligible
-    }
-    char *row = page + node_offset_in_page(id);
-    const uint64_t next64 = maint_local_free_head_;
-    std::memcpy(row, &next64, sizeof(next64));
-    trailer.valid_degree = 0;
-    trailer.flags |= kQGRowFree;
-    qg_write_page_trailer(page, page_size_, npp_, id % npp_, trailer);
-    maint_dirty_.insert(page_index(id));  // the FREE trailer must be logged + installed
-    maint_local_free_head_ = id;
-    ++maint_local_free_count_;
-    stats_.freed_slots++;
-  }
-
   // END-durable install (design section 1.2 step 6): write every touched page's
   // final image to the index under the page seqlock (odd -> write_at/arena mirror
   // -> even) so a concurrent search never copies a half-installed page. Honors the
@@ -4230,33 +4229,78 @@ class QGUpdater {
     }
   }
 
-  // Reclaim: transaction-local free push of eligible tombstoned rows onto the
-  // overlay, chained above the current global free head. Published at END.
+  // Reclaim (MAJOR-3: runtime free chain must be GLOBALLY canonical, not just the new
+  // set): collect the FULL final free set = the pre-existing chain UNION the newly-freed
+  // rows, then rewrite EVERY free row's next pointer in ascending PID order (head = the
+  // smallest free PID). Prepending the new set onto the old chain produced a runtime order
+  // (e.g. 5 -> 1) that a reopen's ascending rebuild (1 -> 5) contradicts, so the next
+  // bundle would reuse a different PID clean vs after reopen. Published at END.
   void maint_reclaim_phase() {
     const size_t n = committed_.load(std::memory_order_acquire);
-    std::vector<PID> eligible = deleted_snapshot();
-    // A PID whose durable generation is already saturated (UINT32_MAX) must never
-    // re-enter the free list: reuse would wrap its incarnation (design 2.2 / 3.1). It
-    // stays a permanent tombstone. Dormant until reuse is active (append-only PIDs are
-    // all generation 0, so the predicate never trips today).
-    const auto reclaim_snap = load_label_snapshot();
-    eligible.erase(std::remove_if(eligible.begin(),
-                                  eligible.end(),
-                                  [&](PID id) {
-                                    if (id >= n) return true;
-                                    const auto *b = reclaim_snap->find_binding(id);
-                                    return b != nullptr &&
-                                           b->pid_generation ==
-                                               (std::numeric_limits<uint32_t>::max)();
-                                  }),
-                   eligible.end());
-    std::sort(eligible.begin(), eligible.end());
-    // Push largest-first so the resulting LIFO chain is ascending (head = smallest
-    // PID), byte-identical to the recovery canonical chain (clause 11): a reopen
-    // then never rewrites the free chain.
-    for (auto it = eligible.rbegin(); it != eligible.rend(); ++it) {
-      maint_push_free_slot(*it);
+    // 1. Walk the EXISTING free chain (canonical ascending or empty) to collect its PIDs.
+    std::vector<PID> all_free;
+    {
+      std::unordered_set<uint64_t> seen;
+      PID cur = maint_local_free_head_;
+      while (cur != kPidMax) {
+        if (static_cast<uint64_t>(cur) >= n || !seen.insert(static_cast<uint64_t>(cur)).second) {
+          poison("consolidate reclaim: corrupt pre-existing free chain");
+        }
+        all_free.push_back(cur);
+        const char *page = maint_overlay_page(page_index(cur));
+        uint64_t next64 = kPidMax;
+        std::memcpy(&next64, page + node_offset_in_page(cur), sizeof(next64));
+        cur = next64 == kPidMax ? kPidMax : static_cast<PID>(next64);
+      }
     }
+    if (all_free.size() != maint_local_free_count_) {
+      poison("consolidate reclaim: free chain length disagrees with free_count");
+    }
+    // 2. Add newly-eligible reclaimed rows. A PID whose durable generation is already
+    // saturated (UINT32_MAX) must never re-enter the free list -- reuse would wrap its
+    // incarnation (design 2.2 / 3.1); it stays a permanent tombstone.
+    const auto reclaim_snap = load_label_snapshot();
+    std::unordered_set<uint64_t> existing(all_free.size() * 2);
+    for (PID id : all_free) {
+      existing.insert(static_cast<uint64_t>(id));
+    }
+    std::vector<PID> eligible = deleted_snapshot();
+    std::sort(eligible.begin(), eligible.end());
+    for (PID id : eligible) {
+      if (id >= n || existing.count(static_cast<uint64_t>(id)) != 0) {
+        continue;
+      }
+      const auto *b = reclaim_snap->find_binding(id);
+      if (b != nullptr && b->pid_generation == (std::numeric_limits<uint32_t>::max)()) {
+        continue;  // saturated generation: never reclaim
+      }
+      char *page = maint_overlay_page(page_index(id));
+      QGRowTrailer trailer = qg_read_page_trailer(page, page_size_, npp_, id % npp_);
+      if ((trailer.flags & kQGRowTombstone) == 0 || (trailer.flags & kQGRowFree) != 0) {
+        continue;  // only tombstoned, not-yet-free rows are eligible
+      }
+      trailer.valid_degree = 0;
+      trailer.flags |= kQGRowFree;
+      qg_write_page_trailer(page, page_size_, npp_, id % npp_, trailer);
+      maint_dirty_.insert(page_index(id));
+      all_free.push_back(id);
+      stats_.freed_slots++;
+    }
+    // 3. Canonicalize the WHOLE free set ascending -- byte-identical to the recovery
+    // rebuild (rebuild_state_after_replay), so a reopen never re-orders the chain.
+    std::sort(all_free.begin(), all_free.end());
+    all_free.erase(std::unique(all_free.begin(), all_free.end()), all_free.end());
+    PID head = kPidMax;
+    for (auto it = all_free.rbegin(); it != all_free.rend(); ++it) {
+      const PID id = *it;
+      char *page = maint_overlay_page(page_index(id));
+      const uint64_t next64 = head;
+      std::memcpy(page + node_offset_in_page(id), &next64, sizeof(next64));
+      maint_dirty_.insert(page_index(id));  // the rewritten next pointer must be logged + installed
+      head = id;
+    }
+    maint_local_free_head_ = head;
+    maint_local_free_count_ = all_free.size();
   }
 
   // consolidate() under enable_wal: one maintenance transaction (design section 1).
@@ -5044,12 +5088,17 @@ class QGUpdater {
       QGRowTrailer trailer = row_trailer(page, v.id);
       const size_t old_degree = trailer.valid_degree;
 
-      // Use the writer-visible floor during a canonical bundle (BLOCKER-1): otherwise
-      // committed_ (== old_hwm mid-bundle) would filter this bundle's own appended rows
-      // out of the recompute, dropping bundle-internal edges. Outside a bundle this is
-      // exactly committed_ (insert_visible_override_ == 0), so the legacy path is unchanged.
+      // Use the writer-visible floor ONLY inside a canonical bundle (bundle_ctx_ != null):
+      // otherwise committed_ (== old_hwm mid-bundle) would filter this bundle's own appended
+      // rows out of the recompute, dropping bundle-internal edges. BLOCKER-6: the LEGACY 2A
+      // path ALSO raises insert_visible_override_ (for B-07 seeding), so applying the floor
+      // unconditionally changed which candidates a legacy FullPrune recompute considered --
+      // altering the prune result + kind=1 payload vs the pre-2C behavior. Gate on the bundle
+      // context so legacy stays exactly committed_ (byte-for-byte the pre-reuse FullPrune).
       const size_t snapshot =
-          std::max(committed_.load(std::memory_order_acquire), insert_visible_override_);
+          bundle_ctx_ != nullptr
+              ? std::max(committed_.load(std::memory_order_acquire), insert_visible_override_)
+              : committed_.load(std::memory_order_acquire);
 
       // gather live neighbors + the new node as prune candidates
       struct Cand {
