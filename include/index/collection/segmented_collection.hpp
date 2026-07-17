@@ -531,6 +531,9 @@ class SegmentedCollection {
     if (!admission.has_value()) {
       return closed_status(core::OperationStage::checkpoint);
     }
+    if (auto guard = ensure_not_recovery_required(core::OperationStage::checkpoint); !guard.ok()) {
+      return guard;
+    }
     if (!config_.features.wal_coordinator || wal_ == nullptr) {
       return core::Status::error(core::StatusCode::not_supported,
                                  core::OperationStage::checkpoint,
@@ -599,6 +602,9 @@ class SegmentedCollection {
     auto admission = admit();
     if (!admission.has_value()) {
       return closed_status(core::OperationStage::freeze);
+    }
+    if (auto guard = ensure_not_recovery_required(core::OperationStage::freeze); !guard.ok()) {
+      return guard;
     }
     if (!config_.features.wal_coordinator || wal_ == nullptr) {
       return core::Status::error(core::StatusCode::not_supported,
@@ -853,6 +859,32 @@ class SegmentedCollection {
     SegmentedCollection *owner_{};
     RowMutationStatus status_{RowMutationStatus::aborted};
     bool committed_{};
+  };
+
+  // B-03: RAII latch over the post-COMMIT window (L:COMMIT durable .. publish_snapshot
+  // done). If destroyed still armed (any non-termination early return in that window),
+  // it latches a Collection-level recovery-required state; disarm() marks the clean
+  // success path. Engine-agnostic: harmless for an in-memory flat active segment.
+  class RecoveryGuard {
+   public:
+    explicit RecoveryGuard(SegmentedCollection *owner) : owner_(owner) {}
+    RecoveryGuard(const RecoveryGuard &) = delete;
+    auto operator=(const RecoveryGuard &) -> RecoveryGuard & = delete;
+    ~RecoveryGuard() {
+      if (owner_ == nullptr) {
+        return;
+      }
+      owner_->recovery_required_.store(true, std::memory_order_release);
+      const std::lock_guard<std::mutex> lock(owner_->recovery_diag_mutex_);
+      if (owner_->recovery_diagnostic_.empty()) {
+        owner_->recovery_diagnostic_ =
+            "a committed transaction failed to publish (post-COMMIT window)";
+      }
+    }
+    void disarm() { owner_ = nullptr; }
+
+   private:
+    SegmentedCollection *owner_{};
   };
 
   class SearchLeaseGuard {
@@ -2301,7 +2333,8 @@ class SegmentedCollection {
 
   [[nodiscard]] static auto injected_failure(MutationFailPoint point) -> core::Status {
     const auto stage =
-        point == MutationFailPoint::after_commit || point == MutationFailPoint::after_publish
+        point == MutationFailPoint::after_commit || point == MutationFailPoint::after_publish ||
+                point == MutationFailPoint::after_engine_publish_before_snapshot
             ? core::OperationStage::mutation_publish
         : point == MutationFailPoint::after_stage ||
                 point == MutationFailPoint::metadata_stage_failure
@@ -2311,6 +2344,47 @@ class SegmentedCollection {
                                stage,
                                core::StatusDetail::engine_exception,
                                "injected collection mutation failpoint");
+  }
+
+  // B-01: the physical transaction id an engine sees is the REAL logical-WAL txid --
+  // an atomic batch uses its shared frame id (batch_op_id); a single/per-row
+  // transaction uses the row's own op_id (never the per-row batch's shared id).
+  [[nodiscard]] static auto physical_txid(const WalMutationTransaction &transaction)
+      -> std::uint64_t {
+    if (transaction.batch_mode == BatchMutationMode::all_or_nothing &&
+        transaction.rows.size() > 1) {
+      return transaction.batch_op_id;
+    }
+    return transaction.rows.empty() ? transaction.batch_op_id : transaction.rows.front().op_id;
+  }
+  // The idempotency basis: the maximum row op_id of the transaction, compared by the
+  // engine against its persisted applied_collection_op_id.
+  [[nodiscard]] static auto transaction_max_row_op(const WalMutationTransaction &transaction)
+      -> std::uint64_t {
+    std::uint64_t maximum = 0;
+    for (const auto &row : transaction.rows) {
+      maximum = std::max(maximum, row.op_id);
+    }
+    return maximum;
+  }
+
+  // B-03: reject write/erase/checkpoint/seal/rotate once the Collection has latched a
+  // recovery-required state (a post-COMMIT window exited abnormally). Only a reopen
+  // (WAL/checkpoint replay) clears it.
+  [[nodiscard]] auto ensure_not_recovery_required(core::OperationStage stage) const
+      -> core::Status {
+    if (!recovery_required_.load(std::memory_order_acquire)) {
+      return core::Status::success();
+    }
+    std::string diagnostic;
+    {
+      const std::lock_guard<std::mutex> lock(recovery_diag_mutex_);
+      diagnostic = recovery_diagnostic_;
+    }
+    return core::Status::error(core::StatusCode::internal,
+                               stage,
+                               core::StatusDetail::readonly_instance,
+                               "collection requires recovery (reopen to replay): " + diagnostic);
   }
 
   [[nodiscard]] auto make_engine_payloads(const WalMutationTransaction &transaction)
@@ -2367,6 +2441,10 @@ class SegmentedCollection {
                                                 core::MutationContext &context,
                                                 std::uint64_t transaction_id)
       -> core::Result<std::vector<MutationReceipt>> {
+    if (auto guard = ensure_not_recovery_required(core::OperationStage::mutation_prepare);
+        !guard.ok()) {
+      return guard;
+    }
     if (failpoint(MutationFailPoint::before_prepare)) {
       return injected_failure(MutationFailPoint::before_prepare);
     }
@@ -2473,6 +2551,11 @@ class SegmentedCollection {
     opaque.payload_size = bundled ? sizeof(bundle) : sizeof(SegmentMutationPayload);
     core::MutationContext engine_context = context;
     engine_context.transaction_token = &transaction;
+    // B-01 set-point #1 (live write): the physical txid is the caller-supplied
+    // transaction_id (op_id for single/per-row, batch_op_id for an atomic batch),
+    // never the shared batch_op_id; max_row_op_id is the idempotency basis.
+    engine_context.transaction_id = transaction_id;
+    engine_context.max_row_op_id = transaction_max_row_op(transaction);
     PendingGuard pending(this, pending_bytes, transaction.rows.size());
     std::vector<std::unique_ptr<AcceptedGuard>> accepted;
     accepted.reserve(transaction.rows.size());
@@ -2515,6 +2598,12 @@ class SegmentedCollection {
         return status;
       }
     }
+    // B-03: from here (L:COMMIT is durable) until publish_snapshot completes, any
+    // non-termination exit must latch a Collection-level recovery-required state, or
+    // a committed-but-unpublished transaction could be silently dropped by a later
+    // checkpoint that cuts the logical WAL. The RAII guard latches on every early
+    // return in this window; disarm() below marks the clean success path.
+    RecoveryGuard recovery_guard(this);
     if (failpoint(MutationFailPoint::after_commit)) {
       return injected_failure(MutationFailPoint::after_commit);
     }
@@ -2524,7 +2613,11 @@ class SegmentedCollection {
       // here would incorrectly discard a durable transaction.
       return status;
     }
+    if (failpoint(MutationFailPoint::after_engine_publish_before_snapshot)) {
+      return injected_failure(MutationFailPoint::after_engine_publish_before_snapshot);
+    }
     publish_snapshot(std::move(dark).value());
+    recovery_guard.disarm();
     for (auto &guard : accepted) {
       guard->commit();
     }
@@ -2624,6 +2717,11 @@ class SegmentedCollection {
     opaque.payload_size = bundled ? sizeof(bundle) : sizeof(SegmentMutationPayload);
     core::MutationContext context;
     context.transaction_token = &transaction;
+    // B-01 set-point #2 (replay): derive the physical txid from the transaction shape
+    // (atomic batch -> batch_op_id, else the single row's op_id), matching the live
+    // path so a replayed transaction hits the same idempotency decision.
+    context.transaction_id = physical_txid(transaction);
+    context.max_row_op_id = transaction_max_row_op(transaction);
     return target->segment.replay_mutation(opaque, context);
   }
 
@@ -2699,18 +2797,30 @@ class SegmentedCollection {
     // A fresh fake/engine instance rebuilds its current mutable view through
     // the idempotent replay seam; a persistent engine treats this as a no-op.
     load_or_initializing_snapshot_ = snapshot;
-    for (const auto &row : image.state.rows) {
+    // B-01/B-02 set-point #3: an active engine that rebuilds an EMPTY physical
+    // segment from the checkpoint image must replay the synthesized single-row
+    // transactions in op_id-ascending order. Out of order, a fresh physical
+    // watermark would commit a high txid first and then wrongly skip a lower one.
+    std::vector<std::size_t> active_rows;
+    for (std::size_t i = 0; i < image.state.rows.size(); ++i) {
+      const auto &row = image.state.rows[i];
       const auto target = snapshot->find_segment(row.target.segment_id, row.target.generation);
       if (target != nullptr && target->role == SegmentRole::active_mutable) {
-        WalMutationTransaction single;
-        single.batch_op_id = row.op_id;
-        single.batch_mode = BatchMutationMode::per_row_independent;
-        single.durability = WriteDurability::wal_fsync;
-        single.rows.push_back(row);
-        const auto status = replay_engine_transaction(single);
-        if (!status.ok()) {
-          return status;
-        }
+        active_rows.push_back(i);
+      }
+    }
+    std::sort(active_rows.begin(), active_rows.end(), [&](std::size_t lhs, std::size_t rhs) {
+      return image.state.rows[lhs].op_id < image.state.rows[rhs].op_id;
+    });
+    for (const auto index : active_rows) {
+      WalMutationTransaction single;
+      single.batch_op_id = image.state.rows[index].op_id;
+      single.batch_mode = BatchMutationMode::per_row_independent;
+      single.durability = WriteDurability::wal_fsync;
+      single.rows.push_back(image.state.rows[index]);
+      const auto status = replay_engine_transaction(single);
+      if (!status.ok()) {
+        return status;
       }
     }
     return core::Status::success();
@@ -3057,6 +3167,10 @@ class SegmentedCollection {
   LifecycleState lifecycle_{LifecycleState::open};
   bool control_plane_gate_{};
   std::uint64_t inflight_operations_{};
+  // B-03 Collection-level recovery-required latch (set by RecoveryGuard).
+  std::atomic<bool> recovery_required_{false};
+  mutable std::mutex recovery_diag_mutex_{};
+  std::string recovery_diagnostic_{};
   std::mutex drain_mutex_{};
   std::mutex checkpoint_mutex_{};
   std::mutex mutation_mutex_{};

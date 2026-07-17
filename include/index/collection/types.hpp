@@ -384,6 +384,9 @@ enum class MutationFailPoint : std::uint8_t {
   after_commit = 4,
   after_publish = 5,
   metadata_stage_failure = 6,
+  // B-03/B-11 (2B): the C6 window -- the active engine's physical publish has
+  // succeeded but the Collection's logical routing snapshot has NOT been swapped.
+  after_engine_publish_before_snapshot = 7,
 };
 
 struct CheckpointReceipt {

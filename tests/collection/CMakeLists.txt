@@ -204,4 +204,14 @@ if(ALAYA_ENABLE_LASER)
     LABELS unit collection laser
     TIMEOUT 120
   )
+
+  # End-to-end active LASER engine: create/write/search/remove/close/reopen through
+  # the public Collection facade (B-08 config persistence + B-01 reopen restore).
+  alaya_cc_target(collection_active_laser_test GTEST LASER SRCS collection_active_laser_test.cpp)
+  alaya_add_test(
+    NAME collection_active_laser_test
+    TARGET collection_active_laser_test
+    LABELS integration collection laser
+    TIMEOUT 180
+  )
 endif()
