@@ -1468,24 +1468,34 @@ class QGUpdater {
       // past the kind=8 fsync poisons (never rolls back; reopen rolls forward).
       bundle_install_to_cache();  // final pages -> shared write cache (seqlock, mark dirty)
       bundle_ctx_ = nullptr;      // overlay consumed; RMWs take the normal path again
-      store_label_snapshot(published);
-      // Reveal reused rows to the query face FIRST: trailers are already live in the cache,
-      // so clear the result-filter tombstone then the hidden bit (its release is the point).
-      // Do this before the routing repair so a reused entry PID reads as live.
+      // Fixed publish order (design B.4 / BLOCKER-1): snapshot -> routing -> hidden ->
+      // committed. Nothing is published to the query face until routing is set, and the
+      // committed watermark (which makes new rows visible to a concurrent query) is LAST.
+      store_label_snapshot(published);  // (a) snapshot
+      // (b) routing: relocate over the NEW watermark, seeded from the LAST-CHECKPOINT entry
+      // (superblock_.entry_point) so this reproduces recovery's single relocate-from-base --
+      // recovery seeds from the same base entry and repairs once at the end, so both land on
+      // the identical entry (BLOCKER-1: the old repair scanned committed_==old_hwm and left
+      // a dead entry a delete-all->all-append bundle, diverging from replay). The bundle's
+      // rows are force-live even though the reused ones are still hidden here (their trailers
+      // are already live in the cache); a still->committed_ query cannot seed a new row yet
+      // (routing entry gated by < committed_) and skips a hidden reused entry in the beam.
+      std::unordered_set<PID> bundle_live;
+      bundle_live.reserve(result.rows.size() * 2);
+      for (const auto &tok : result.rows) {
+        bundle_live.insert(tok.pid);
+      }
+      repair_routing_roots_seeded(superblock_.entry_point, new_hwm, &bundle_live);
+      // (c) hidden: reveal reused rows to the query face -- trailers are already live in the
+      // cache, so clear the result-filter tombstone then the hidden bit (its release is the
+      // visibility point). The routing entry published above is now backed by a live row.
       for (const auto &tok : result.rows) {
         if (tok.pid_generation != 0) {
           mirror_deleted_erase(tok.pid);
           clear_hidden(tok.pid);
         }
       }
-      // BLOCKER-2 fix: publish the routing entry through repair_routing_roots -- the SAME
-      // deterministic rule recovery's rebuild_state_after_replay applies -- instead of
-      // hard-setting entry=private_entry. A crash+replay of this bundle then converges on
-      // the identical entry (a dead persisted entry is relocated to the first live row; a
-      // reused persisted entry is kept, and the bidirectional spine makes it reach every
-      // bundle row). Without this, a clean checkpoint and a replay would diverge.
-      repair_routing_roots(kPidMax);
-      refresh_routing_snapshot();
+      // (d) committed: appended rows become visible to a concurrent query only now.
       committed_.store(new_hwm, std::memory_order_release);
       qg_.num_points_ = new_hwm;
       live_count_.fetch_add(n, std::memory_order_acq_rel);
@@ -2926,34 +2936,72 @@ class QGUpdater {
     migrate_v1(header.data());
   }
 
+  // The current durable generation of a PID's binding. During recovery the authoritative
+  // source is label_working_ (adopt + promotions); at runtime it is the published snapshot.
+  // Both converge to the same {pid -> generation}, so routing repair reads the right one.
+  [[nodiscard]] uint32_t current_pid_generation(PID id) const {
+    if (replaying_) {
+      const auto it = label_working_.find(id);
+      return it != label_working_.end() ? it->second.pid_generation : 0;
+    }
+    const auto snap = load_label_snapshot();
+    if (snap == nullptr) {
+      return 0;
+    }
+    const auto *b = snap->find_binding(id);
+    return b != nullptr ? b->pid_generation : 0;
+  }
+
+  // Runtime/replay routing repair: relocate a dead entry + drop dead/reused medoids over
+  // the CURRENT committed range, seeded from the current entry. Used by tombstone() and
+  // the post-replay rebuild -- byte-for-byte the historical behavior for 2A/2B (no reuse).
   void repair_routing_roots(PID newly_deleted) {
-    // A reused routing seed is especially dangerous: while dark it cannot be
-    // selected as a live insertion neighbor, so its freshly assembled row can
-    // be isolated.  Remove deleted medoid seeds and relocate the global entry
-    // point before the row becomes free/reusable.
+    repair_routing_roots_seeded(qg_.entry_point_, committed_.load(std::memory_order_acquire),
+                                nullptr, newly_deleted);
+  }
+
+  // Deterministic routing repair (BLOCKER-1 / MAJOR-2). `seed_entry` is the entry the
+  // relocation starts from; a canonical clean publish passes the LAST-CHECKPOINT entry
+  // (superblock_.entry_point) so it reproduces recovery's single relocate-from-base
+  // (recovery seeds from the same base entry and repairs once at the end). `scan_n` is the
+  // range to relocate over (the NEW committed watermark for a bundle -- NOT the stale old
+  // one, which is the B1 divergence). `force_live` (may be null) marks reserved reused rows
+  // as live even while their global hidden bit is still set (their trailers are already
+  // live in the cache). A medoid is kept ONLY if it is live AND never reused (generation 0):
+  // a reused medoid's immutable sidecar vector is stale, so recovery (which reloads it) and
+  // the clean path (which dropped it at tombstone) both drop it -> they converge (MAJOR-2).
+  void repair_routing_roots_seeded(PID seed_entry, uint64_t scan_n,
+                                   const std::unordered_set<PID> *force_live,
+                                   PID newly_deleted = kPidMax) {
+    const auto live = [&](PID id) -> bool {
+      if (id == newly_deleted) return false;
+      if (force_live != nullptr && force_live->count(id) != 0) return true;
+      return !is_hidden(id);
+    };
     bool changed = false;
     for (size_t i = qg_.medoids_.size(); i > 0; --i) {
       const size_t idx = i - 1;
       const PID medoid = qg_.medoids_[idx];
-      if (medoid != newly_deleted && !is_hidden(medoid)) continue;
+      if (live(medoid) && current_pid_generation(medoid) == 0) continue;
       qg_.medoids_.erase(qg_.medoids_.begin() + static_cast<int64_t>(idx));
       const auto first = qg_.medoids_vector_.begin() + static_cast<int64_t>(idx * full_dim_);
       qg_.medoids_vector_.erase(first, first + static_cast<int64_t>(full_dim_));
       changed = true;
     }
-    if (qg_.entry_point_ == newly_deleted || is_hidden(qg_.entry_point_)) {
-      const size_t n = committed_.load(std::memory_order_acquire);
-      if (n != 0) {
-        const size_t start = (static_cast<size_t>(qg_.entry_point_) + 1) % n;
-        for (size_t offset = 0; offset < n; ++offset) {
-          const PID candidate = static_cast<PID>((start + offset) % n);
-          if (!is_hidden(candidate)) {
-            qg_.entry_point_ = candidate;
-            changed = true;
-            break;
-          }
+    PID new_entry = seed_entry;
+    if (!live(seed_entry) && scan_n != 0) {
+      const size_t start = (static_cast<size_t>(seed_entry) + 1) % scan_n;
+      for (size_t offset = 0; offset < scan_n; ++offset) {
+        const PID candidate = static_cast<PID>((start + offset) % scan_n);
+        if (live(candidate)) {
+          new_entry = candidate;
+          break;
         }
       }
+    }
+    if (qg_.entry_point_ != new_entry) {
+      qg_.entry_point_ = new_entry;
+      changed = true;
     }
     if (changed) refresh_routing_snapshot();
   }
