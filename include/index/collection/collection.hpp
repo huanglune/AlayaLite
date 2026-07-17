@@ -838,6 +838,41 @@ class Collection {
             std::to_string(generation));
   }
 
+  // B-09 orphan reclamation. On open, any directory under active_laser/ that is not
+  // the current active generation is unreferenced: either an old generation left
+  // behind by a completed seal/rotate (its rows now live in a sealed manifest
+  // segment) or an unrouted successor from a rotate that crashed before routing. A
+  // fresh open holds no writer flock on those, so removing them is safe. Idempotent
+  // and crash-safe (re-running the sweep is always sound), so it subsumes the
+  // pending-list / cut_pending-successor leaks without a STATE format change.
+  static void sweep_orphan_active_laser_dirs(const std::filesystem::path &root,
+                                             std::uint64_t current_segment_id,
+                                             std::uint64_t current_generation) {
+    std::error_code error;
+    const auto active_root = root / ".alaya_internal" / "active_laser";
+    if (!std::filesystem::is_directory(active_root, error)) {
+      return;
+    }
+    const auto keep =
+        active_laser_dir(root, current_segment_id, current_generation).filename();
+    std::vector<std::filesystem::path> orphans;
+    for (const auto &entry : std::filesystem::directory_iterator(active_root, error)) {
+      if (entry.is_directory(error) && entry.path().filename() != keep) {
+        orphans.push_back(entry.path());
+      }
+    }
+    for (const auto &orphan : orphans) {
+      std::filesystem::remove_all(orphan, error);
+    }
+    if (!orphans.empty()) {
+      try {
+        platform::sync_directory_or_throw(active_root);
+      } catch (...) {  // NOLINT(bugprone-empty-catch): durability of the unlink is
+        // best-effort; a crash before the parent fsync just re-sweeps on next open.
+      }
+    }
+  }
+
   // Ruling 12: physical row capacity of the active LASER segment. Default 4096; when
   // auto_seal_rows is set, keep the capacity strictly above it (churn headroom) so
   // the auto-seal threshold can never exceed the physical capacity.
@@ -987,6 +1022,11 @@ class Collection {
       }
     }
 
+    if (options.active_engine == core::algorithm::laser) {
+      sweep_orphan_active_laser_dirs(options.root,
+                                     control_state.active_segment_id,
+                                     control_state.active_generation);
+    }
     auto active = make_active_registration(options,
                                            control_state.active_segment_id,
                                            control_state.active_generation);

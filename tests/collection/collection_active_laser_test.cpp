@@ -182,5 +182,46 @@ TEST(CollectionActiveLaser, CreateWriteSearchRemoveCloseReopen) {
   }
 }
 
+TEST(CollectionActiveLaser, SealActiveLaserThenSearchAndReopen) {
+  TemporaryDirectory dir("seal");
+  const auto dataset = make_dataset(kRows, /*seed=*/424242U);
+  std::vector<core::RowCount> sample;
+  for (core::RowCount row = 0; row < kRows; row += 20) {
+    sample.push_back(row);
+  }
+  auto created = Collection::create(active_laser_options(dir.path()));
+  ASSERT_TRUE(created.ok()) << created.status().diagnostic();
+  auto collection = std::move(created).value();
+  insert_dataset(*collection, dataset);
+
+  auto sealed = collection->seal();
+  ASSERT_TRUE(sealed.ok()) << sealed.status().diagnostic();
+  EXPECT_EQ(collection->active_algorithm(), core::algorithm::laser);
+  EXPECT_GE(self_recall(*collection, dataset, sample), sample.size() * 6 / 10)
+      << "sealed rows must remain searchable through the sealed segment";
+
+  ASSERT_TRUE(collection->close().ok());
+  collection.reset();
+  auto reopened = Collection::open(dir.path());
+  ASSERT_TRUE(reopened.ok()) << reopened.status().diagnostic();
+  auto restored = std::move(reopened).value();
+  EXPECT_EQ(restored->active_algorithm(), core::algorithm::laser);
+  EXPECT_GE(self_recall(*restored, dataset, sample), sample.size() * 6 / 10);
+
+  // B-09: after seal + reopen the old active generation directory must be reclaimed;
+  // exactly one active_laser directory (the current generation) may remain.
+  const auto active_root = dir.path() / ".alaya_internal" / "active_laser";
+  std::size_t active_dirs = 0;
+  std::error_code error;
+  if (std::filesystem::is_directory(active_root, error)) {
+    for (const auto &entry : std::filesystem::directory_iterator(active_root, error)) {
+      if (entry.is_directory(error)) {
+        ++active_dirs;
+      }
+    }
+  }
+  EXPECT_LE(active_dirs, 1U) << "B-09: seal/rotate must not leak orphan active-laser directories";
+}
+
 }  // namespace
 }  // namespace alaya
