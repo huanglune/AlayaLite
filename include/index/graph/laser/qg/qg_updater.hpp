@@ -671,6 +671,7 @@ class QGUpdater {
   }
 
   [[nodiscard]] uint64_t generation() const { return superblock_.generation; }
+  [[nodiscard]] uint64_t segment_uid() const { return segment_uid_; }
 
   [[nodiscard]] int active_superblock_slot() const { return active_superblock_slot_; }
 
@@ -4612,11 +4613,11 @@ class QGUpdater {
           replay_flip(op);
           break;
         case SegmentOpKind::label_bind:
+          replay_label_bind(op, frame.batch_id);
+          break;
         case SegmentOpKind::tx_publish:
-          // W1 wire stub: fail-closed. W3 replaces this with the staging/promotion
-          // state machine (label_bind stages by tx_id; tx_publish promotes).
-          replaying_ = false;
-          poison("op-WAL label transaction replay is not yet wired (W3)");
+          replay_tx_publish(op, frame.batch_id, committed_watermark);
+          break;
         case SegmentOpKind::consolidate_begin:
         case SegmentOpKind::consolidate_end:
           replaying_ = false;
@@ -4648,6 +4649,110 @@ class QGUpdater {
       poison("row_patch pid/offset geometry mismatch");
     }
     write_at(op.offset, reinterpret_cast<const char *>(op.bytes.data()), op.bytes.size());
+  }
+
+  // Stage a label_bind by tx_id (B-04): pid_generation must be 0 and the frame
+  // batch_id must equal the payload tx_id. Set-level validation happens at
+  // tx_publish; a tx that never reaches tx_publish is silently dropped.
+  void replay_label_bind(const SegmentOp &op, uint64_t frame_batch_id) {
+    if (op.pid_generation != 0) {
+      poison("op-WAL label_bind has a non-zero pid_generation");
+    }
+    if (frame_batch_id != op.tx_id) {
+      poison("op-WAL label_bind frame batch_id != payload tx_id");
+    }
+    staged_binds_[op.tx_id].push_back(
+        LabelBindStage{op.row_op_id, static_cast<PID>(op.pid), op.label});
+  }
+
+  // Promote or idempotently verify a tx_publish (B-04, semantics 4). Splits on the
+  // adopted base's persisted txid: (a) a new tx to promote, (b) a tx already
+  // absorbed by the base (new superblock flipped, old WAL not yet reset).
+  void replay_tx_publish(const SegmentOp &op, uint64_t frame_batch_id,
+                         uint64_t &committed_watermark) {
+    if (frame_batch_id != op.tx_id) {
+      poison("op-WAL tx_publish frame batch_id != payload tx_id");
+    }
+    if (op.binding_count == 0) {
+      poison("op-WAL tx_publish binding_count must be >= 1");
+    }
+    const auto it = staged_binds_.find(op.tx_id);
+    static const std::vector<LabelBindStage> kNoStaged;
+    const std::vector<LabelBindStage> &staged = it != staged_binds_.end() ? it->second : kNoStaged;
+
+    if (op.tx_id <= base_committed_txid_) {
+      // (b) already absorbed by the selected base: verify idempotently and skip.
+      // Do NOT apply new-range checks or re-promote.
+      if (op.new_pid_watermark > base_num_points_) {
+        poison("op-WAL absorbed tx_publish watermark exceeds the base num_points");
+      }
+      if (op.applied_collection_op_id > base_applied_op_id_) {
+        poison("op-WAL absorbed tx_publish applied_op_id exceeds the base");
+      }
+      if (staged.size() != op.binding_count) {
+        poison("op-WAL absorbed tx_publish staged bind count mismatch");
+      }
+      for (const auto &bind : staged) {
+        if (bind.row_op_id >= op.binding_count) {
+          poison("op-WAL absorbed tx_publish row_op_id out of range");
+        }
+        const auto found = label_working_.find(bind.pid);
+        if (found == label_working_.end() || found->second != bind.label) {
+          poison("op-WAL absorbed tx_publish binding disagrees with the persisted slot");
+        }
+      }
+      staged_binds_.erase(op.tx_id);
+      return;
+    }
+
+    // (a) a new transaction to promote. Full B-04 validation set.
+    if (op.tx_id <= last_committed_txid_) {
+      poison("op-WAL tx_publish tx_id is not strictly increasing");
+    }
+    if (op.applied_collection_op_id < applied_collection_op_id_) {
+      poison("op-WAL tx_publish applied_collection_op_id regressed");
+    }
+    const uint64_t old_hwm = committed_watermark;
+    const uint64_t new_hwm = op.new_pid_watermark;
+    if (new_hwm != old_hwm + op.binding_count) {
+      poison("op-WAL tx_publish new_pid_watermark != old_hwm + binding_count");
+    }
+    if (staged.size() != op.binding_count) {
+      poison("op-WAL tx_publish staged bind count != binding_count");
+    }
+    if (new_hwm > static_cast<uint64_t>(kPidMax) || new_hwm > row_generations_.size()) {
+      poison("op-WAL tx_publish new_pid_watermark exceeds the PID capacity");
+    }
+    // Staged set must be exactly row_op_id == {0..count-1} and pid == [old,new),
+    // each unique (counts already match, so covering + unique == a bijection).
+    std::vector<uint8_t> row_seen(static_cast<size_t>(op.binding_count), 0);
+    std::vector<uint8_t> pid_seen(static_cast<size_t>(op.binding_count), 0);
+    for (const auto &bind : staged) {
+      if (bind.row_op_id >= op.binding_count || row_seen[static_cast<size_t>(bind.row_op_id)] != 0) {
+        poison("op-WAL tx_publish row_op_id set is not exactly {0..count-1}");
+      }
+      row_seen[static_cast<size_t>(bind.row_op_id)] = 1;
+      const uint64_t pid_u64 = static_cast<uint64_t>(bind.pid);
+      if (pid_u64 < old_hwm || pid_u64 >= new_hwm) {
+        poison("op-WAL tx_publish pid outside [old_hwm, new_hwm)");
+      }
+      const size_t pidx = static_cast<size_t>(pid_u64 - old_hwm);
+      if (pid_seen[pidx] != 0) {
+        poison("op-WAL tx_publish has a duplicate pid");
+      }
+      pid_seen[pidx] = 1;
+    }
+    // Promote: install the bindings, advance committed + both tx watermarks.
+    for (const auto &bind : staged) {
+      const auto inserted = label_working_.emplace(bind.pid, bind.label);
+      if (!inserted.second && inserted.first->second != bind.label) {
+        poison("op-WAL tx_publish rebinds an existing pid to a different label");
+      }
+    }
+    committed_watermark = new_hwm;
+    last_committed_txid_ = op.tx_id;
+    applied_collection_op_id_ = op.applied_collection_op_id;
+    staged_binds_.erase(op.tx_id);
   }
 
   void replay_flip(const SegmentOp &op) {
