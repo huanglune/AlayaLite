@@ -2332,14 +2332,14 @@ class SegmentedCollection {
   }
 
   [[nodiscard]] static auto injected_failure(MutationFailPoint point) -> core::Status {
-    const auto stage =
-        point == MutationFailPoint::after_commit || point == MutationFailPoint::after_publish ||
-                point == MutationFailPoint::after_engine_publish_before_snapshot
-            ? core::OperationStage::mutation_publish
-        : point == MutationFailPoint::after_stage ||
-                point == MutationFailPoint::metadata_stage_failure
-            ? core::OperationStage::mutation_stage
-            : core::OperationStage::mutation_prepare;
+    const auto stage = point == MutationFailPoint::after_commit ||
+                               point == MutationFailPoint::after_publish ||
+                               point == MutationFailPoint::after_engine_publish_before_snapshot
+                           ? core::OperationStage::mutation_publish
+                       : point == MutationFailPoint::after_stage ||
+                               point == MutationFailPoint::metadata_stage_failure
+                           ? core::OperationStage::mutation_stage
+                           : core::OperationStage::mutation_prepare;
     return core::Status::error(core::StatusCode::internal,
                                stage,
                                core::StatusDetail::engine_exception,

@@ -268,9 +268,7 @@ class MutableLaserCollectionAdapter {
   // a concurrent search/checkpoint against an in-flight publish.
   void gate_next_publish() { publish_gate_.arm(); }
   void release_publish() { publish_gate_.release(); }
-  [[nodiscard]] auto is_latched() const -> bool {
-    return failed_.load(std::memory_order_acquire);
-  }
+  [[nodiscard]] auto is_latched() const -> bool { return failed_.load(std::memory_order_acquire); }
 
  private:
   struct Row {
@@ -301,7 +299,9 @@ class MutableLaserCollectionAdapter {
       if (!armed_) {
         return;
       }
-      changed_.wait(lock, [&] { return released_; });
+      changed_.wait(lock, [&] {
+        return released_;
+      });
       armed_ = false;
     }
     void release() {
@@ -510,8 +510,7 @@ class MutableLaserCollectionAdapter {
       }
       int tombstone_index = 0;
       for (const std::uint64_t label : tombstones) {
-        if (!is_replay &&
-            fail_tombstone_at_.load(std::memory_order_acquire) == tombstone_index) {
+        if (!is_replay && fail_tombstone_at_.load(std::memory_order_acquire) == tombstone_index) {
           fail_tombstone_at_.store(-1, std::memory_order_release);
           return latch(failure(core::OperationStage::mutation_publish,
                                core::StatusCode::internal,
@@ -614,11 +613,11 @@ class MutableLaserCollectionAdapter {
   std::uint64_t segment_id_{};
   std::uint64_t generation_{};
 
-  mutable std::mutex mutex_{};                        // guards transactions_
-  std::map<std::uint64_t, Pending> transactions_{};   // keyed by physical txid
+  mutable std::mutex mutex_{};                       // guards transactions_
+  std::map<std::uint64_t, Pending> transactions_{};  // keyed by physical txid
 
-  std::atomic<bool> failed_{false};                   // B-04 latch (lock-free)
-  mutable std::mutex diag_mutex_{};                   // guards diagnostic strings
+  std::atomic<bool> failed_{false};  // B-04 latch (lock-free)
+  mutable std::mutex diag_mutex_{};  // guards diagnostic strings
   std::string diagnostic_{};
   std::uint64_t last_runtime_miss_{};
 

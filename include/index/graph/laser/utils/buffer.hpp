@@ -93,8 +93,7 @@ class SearchBuffer {
 
   void resize(size_t new_size) {
     this->capacity_ = new_size;
-    data_ =
-        std::vector<Candidate<float>, ::alaya::AlignedAlloc<Candidate<float>>>(capacity_ + 1);
+    data_ = std::vector<Candidate<float>, ::alaya::AlignedAlloc<Candidate<float>>>(capacity_ + 1);
   }
 };
 

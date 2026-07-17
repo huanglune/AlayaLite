@@ -191,10 +191,10 @@ if(ALAYA_ENABLE_LASER)
     TIMEOUT 180
   )
 
-  # LASER recall floor lock (D-lite manifest W2): mirrors
-  # collection_qg_recall_floor_test.cpp for the LASER on-disk QG target, which had no recall regression guard before
-  # this file. l2 unit/nonunit tiers plus a resident_arena residency tier, each asserting engine identity against the
-  # persisted sealed-segment manifest (not Collection::target_implementation_key() -- see the test file header for why).
+  # LASER recall floor lock (D-lite manifest W2): mirrors collection_qg_recall_floor_test.cpp for the LASER on-disk QG
+  # target, which had no recall regression guard before this file. l2 unit/nonunit tiers plus a resident_arena residency
+  # tier, each asserting engine identity against the persisted sealed-segment manifest (not
+  # Collection::target_implementation_key() -- see the test file header for why).
   alaya_cc_target(
     collection_laser_recall_floor_test
     GTEST LASER
@@ -207,13 +207,21 @@ if(ALAYA_ENABLE_LASER)
     TIMEOUT 300
   )
 
-  # Compile-time capability-surface proof for the active LASER Collection adapter
-  # (codex B-10): links LASER so the AIO page-reader symbols resolve.
-  alaya_cc_target(mutable_laser_adapter_header_closure LASER SRCS mutable_laser_adapter_header_closure.cpp)
+  # Compile-time capability-surface proof for the active LASER Collection adapter (codex B-10): links LASER so the AIO
+  # page-reader symbols resolve.
+  alaya_cc_target(
+    mutable_laser_adapter_header_closure
+    LASER
+    SRCS mutable_laser_adapter_header_closure.cpp
+  )
 
-  # Adapter-in-isolation coverage: explicit-txid idempotency (B-01/B-02), previous
-  # tombstoning (B-05), and the post-commit failure latch (B-04).
-  alaya_cc_target(mutable_laser_adapter_test GTEST LASER SRCS mutable_laser_adapter_test.cpp)
+  # Adapter-in-isolation coverage: explicit-txid idempotency (B-01/B-02), previous tombstoning (B-05), and the
+  # post-commit failure latch (B-04).
+  alaya_cc_target(
+    mutable_laser_adapter_test
+    GTEST LASER
+    SRCS mutable_laser_adapter_test.cpp
+  )
   alaya_add_test(
     NAME mutable_laser_adapter_test
     TARGET mutable_laser_adapter_test
@@ -221,9 +229,13 @@ if(ALAYA_ENABLE_LASER)
     TIMEOUT 120
   )
 
-  # End-to-end active LASER engine: create/write/search/remove/close/reopen through
-  # the public Collection facade (B-08 config persistence + B-01 reopen restore).
-  alaya_cc_target(collection_active_laser_test GTEST LASER SRCS collection_active_laser_test.cpp)
+  # End-to-end active LASER engine: create/write/search/remove/close/reopen through the public Collection facade (B-08
+  # config persistence + B-01 reopen restore).
+  alaya_cc_target(
+    collection_active_laser_test
+    GTEST LASER
+    SRCS collection_active_laser_test.cpp
+  )
   alaya_add_test(
     NAME collection_active_laser_test
     TARGET collection_active_laser_test

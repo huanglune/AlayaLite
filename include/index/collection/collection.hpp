@@ -28,7 +28,7 @@
 #include "index/collection/detail/collection_segment_factory.hpp"
 #include "index/collection/detail/collection_target_builder.hpp"
 #if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER != 0
-#include "index/collection/detail/mutable_laser_collection_adapter.hpp"
+  #include "index/collection/detail/mutable_laser_collection_adapter.hpp"
 #endif
 #include "index/collection/segmented_collection.hpp"
 #include "index/collection/sha256.hpp"
@@ -736,13 +736,11 @@ class Collection {
       resolution.fallback_reason = "qg requires float32 vectors; built Flat instead";
     } else if (requested_algorithm == core::algorithm::laser && live_row_count <= 32) {
       resolution.fallback_reason = "laser requires >32 live rows; built Flat instead";
-    } else if (requested_algorithm == core::algorithm::laser &&
-               schema.metric != core::Metric::l2) {
+    } else if (requested_algorithm == core::algorithm::laser && schema.metric != core::Metric::l2) {
       resolution.fallback_reason = "laser requires l2 metric; built Flat instead";
     } else if (requested_algorithm == core::algorithm::laser &&
                (schema.dim < 128 || (schema.dim & (schema.dim - 1)) != 0)) {
-      resolution.fallback_reason =
-          "laser requires a power-of-two dim >= 128; built Flat instead";
+      resolution.fallback_reason = "laser requires a power-of-two dim >= 128; built Flat instead";
     } else {
       resolution.fallback_reason = "requested Collection target '" +
                                    std::string(registration->factory_key) +
@@ -824,8 +822,7 @@ class Collection {
     }
     if (options.active_engine == core::algorithm::laser) {
       const bool power_of_two = options.dim >= 128 && (options.dim & (options.dim - 1)) == 0;
-      if (options.metric != core::Metric::l2 ||
-          options.scalar_type != core::ScalarType::float32 ||
+      if (options.metric != core::Metric::l2 || options.scalar_type != core::ScalarType::float32 ||
           options.quantization != CollectionQuantization::rabitq || !power_of_two ||
           (options.max_neighbors != 32 && options.max_neighbors != 64) ||
           options.target_algorithm != core::algorithm::laser) {
@@ -862,8 +859,7 @@ class Collection {
     if (!std::filesystem::is_directory(active_root, error)) {
       return;
     }
-    const auto keep =
-        active_laser_dir(root, current_segment_id, current_generation).filename();
+    const auto keep = active_laser_dir(root, current_segment_id, current_generation).filename();
     std::vector<std::filesystem::path> orphans;
     for (const auto &entry : std::filesystem::directory_iterator(active_root, error)) {
       if (entry.is_directory(error) && entry.path().filename() != keep) {
@@ -898,13 +894,13 @@ class Collection {
                                                         std::uint64_t generation) -> core::Status {
 #if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER != 0
     try {
-      ::alaya::disk::MutableLaserSegment::create_empty(
-          active_laser_dir(options.root, segment_id, generation),
-          internal::collection::detail::collection_segment_name(segment_id),
-          options.dim,
-          options.dim,
-          options.max_neighbors,
-          options.metric);
+      ::alaya::disk::MutableLaserSegment::
+          create_empty(active_laser_dir(options.root, segment_id, generation),
+                       internal::collection::detail::collection_segment_name(segment_id),
+                       options.dim,
+                       options.dim,
+                       options.max_neighbors,
+                       options.metric);
       return core::Status::success();
     } catch (...) {
       return core::status_from_exception(core::OperationStage::build);
@@ -949,8 +945,11 @@ class Collection {
     try {
       laser::UpdateParams params;
       params.max_points = active_laser_capacity(options);
-      auto segment = std::make_shared<::alaya::disk::MutableLaserSegment>(
-          dir, params, laser::ResidencyMode::kPagedPool, /*allow_empty=*/true);
+      auto segment =
+          std::make_shared<::alaya::disk::MutableLaserSegment>(dir,
+                                                               params,
+                                                               laser::ResidencyMode::kPagedPool,
+                                                               /*allow_empty=*/true);
       return internal::collection::detail::make_active_laser_registration(std::move(segment),
                                                                           schema,
                                                                           segment_id,
@@ -2247,18 +2246,19 @@ class Collection {
   }
 
   [[nodiscard]] static auto schema_prefix(const CollectionOptions &options) -> std::string {
-    std::string prefix = "format=1\npublic_version=" + std::string(kCollectionPublicVersion) +
-           "\ndim=" + std::to_string(options.dim) +
-           "\nmetric=" + std::to_string(static_cast<unsigned>(options.metric)) +
-           "\nscalar_type=" + std::to_string(static_cast<unsigned>(options.scalar_type)) +
-           "\ntarget_algorithm=" + std::to_string(options.target_algorithm) +
-           "\nquantization=" + std::to_string(static_cast<unsigned>(options.quantization)) +
-           "\nbuild_threads=" + std::to_string(options.build_threads) +
-           "\nmax_neighbors=" + std::to_string(options.max_neighbors) +
-           "\nef_construction=" + std::to_string(options.ef_construction) +
-           "\nmax_logical_id_bytes=" + std::to_string(options.max_logical_id_bytes) +
-           "\nactive_segment_id=" + std::to_string(kActiveSegmentId) +
-           "\nactive_generation=" + std::to_string(kActiveSegmentGeneration) + "\n";
+    std::string prefix =
+        "format=1\npublic_version=" + std::string(kCollectionPublicVersion) +
+        "\ndim=" + std::to_string(options.dim) +
+        "\nmetric=" + std::to_string(static_cast<unsigned>(options.metric)) +
+        "\nscalar_type=" + std::to_string(static_cast<unsigned>(options.scalar_type)) +
+        "\ntarget_algorithm=" + std::to_string(options.target_algorithm) +
+        "\nquantization=" + std::to_string(static_cast<unsigned>(options.quantization)) +
+        "\nbuild_threads=" + std::to_string(options.build_threads) +
+        "\nmax_neighbors=" + std::to_string(options.max_neighbors) +
+        "\nef_construction=" + std::to_string(options.ef_construction) +
+        "\nmax_logical_id_bytes=" + std::to_string(options.max_logical_id_bytes) +
+        "\nactive_segment_id=" + std::to_string(kActiveSegmentId) +
+        "\nactive_generation=" + std::to_string(kActiveSegmentGeneration) + "\n";
     // B-08: only a non-default active engine widens the schema to 15 fields, so a
     // flat collection stays byte-compatible with pre-2B readers while a laser
     // collection makes an old binary fail-closed on the strict field count.
@@ -2358,9 +2358,8 @@ class Collection {
       // explicit active engine. An old binary rejects the 15th field on the strict
       // count above, so a laser collection fails-closed rather than silently
       // reverting to flat.
-      options.active_engine = fields.size() == 15
-                                  ? parse_u64(required("active_engine"))
-                                  : core::algorithm::flat;
+      options.active_engine =
+          fields.size() == 15 ? parse_u64(required("active_engine")) : core::algorithm::flat;
       auto status = validate_options(options, core::OperationStage::open);
       if (!status.ok()) {
         return status;

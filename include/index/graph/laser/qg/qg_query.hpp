@@ -18,9 +18,9 @@
 
 #include "index/graph/laser/common.hpp"
 #include "index/graph/laser/qg/qg_scanner.hpp"
-#include "utils/memory.hpp"
 #include "index/graph/laser/utils/rotator.hpp"
 #include "index/graph/laser/utils/scalar_quantize.hpp"
+#include "utils/memory.hpp"
 
 namespace alaya::laser {
 

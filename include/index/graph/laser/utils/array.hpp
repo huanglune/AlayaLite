@@ -28,7 +28,9 @@ namespace alaya::laser::data {
  *
  * Non-copyable (owns raw pointer); move-only.
  */
-template <typename T, typename Dims = std::vector<size_t>, typename Alloc = ::alaya::AlignedAlloc<T>>
+template <typename T,
+          typename Dims = std::vector<size_t>,
+          typename Alloc = ::alaya::AlignedAlloc<T>>
 class Array {
   static_assert(std::is_trivial_v<T>, "alaya::laser::data::Array requires a trivial element type");
 

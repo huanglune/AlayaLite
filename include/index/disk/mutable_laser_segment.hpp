@@ -63,9 +63,8 @@ class MutableLaserSegment {
     // allow-empty manifest policy and permits base_count==0. Sealed / importer /
     // read-only opens keep the strict count>0 contract (allow_empty=false, the
     // default that leaves every existing caller byte-identical).
-    const auto manifest = allow_empty
-                              ? SegmentManifest::load_allow_empty(seg_dir / "manifest.txt")
-                              : SegmentManifest::load(seg_dir / "manifest.txt");
+    const auto manifest = allow_empty ? SegmentManifest::load_allow_empty(seg_dir / "manifest.txt")
+                                      : SegmentManifest::load(seg_dir / "manifest.txt");
     if (manifest.index_type != DiskIndexType::Laser) {
       throw std::runtime_error("MutableLaserSegment: segment is not disk_laser: " +
                                seg_dir.string());
