@@ -2767,7 +2767,7 @@ class QGUpdater {
       if (changed) {
         maint_dirty_.insert(pi);
         stats_.logical_row_writes++;
-        maint_spill_over_cap();
+        maint_spill_over_cap(pi);  // wal-2c BLOCKER-1: pin the page just modified
       }
       return changed;
     }
@@ -3236,13 +3236,20 @@ class QGUpdater {
   // Spill resident overlay pages (logging each latest kind=1, flushed so read_frame
   // can reload it) until the overlay is back under cap. Called only after a modify
   // fn returns, so no live char* into maint_pages_ can dangle.
-  void maint_spill_over_cap() {
+  // Spill resident overlay pages back under cap (see below). `pin_pi` is the page whose RMW
+  // triggered this call: it is NEVER a spill victim (wal-2c BLOCKER-1). Otherwise the eviction
+  // scan (unordered_map order) could pick the page currently being modified, forcing the very
+  // next row on it to reload from the WAL and re-log -- an unbounded reload/respill amplification
+  // that voids the BEGIN-time statvfs bound (repair_pages + reclaim_pages) and can ENOSPC-poison
+  // a committed-past-BEGIN transaction. Pinning the active page removes that pathology; only one
+  // page is ever pinned, so cap (>= 1) is always reachable.
+  void maint_spill_over_cap(size_t pin_pi) {
     const size_t cap = std::max<size_t>(1, params_.cache_cap_pages);
     // Clean (dependency-only) pages re-materialize from committed disk, so drop them
     // for free before spending WAL bytes on a dirty spill.
     for (auto it = maint_pages_.begin();
          it != maint_pages_.end() && maint_pages_.size() > cap;) {
-      if (maint_dirty_.count(it->first) == 0) {
+      if (it->first != pin_pi && maint_dirty_.count(it->first) == 0) {
         it = maint_pages_.erase(it);
       } else {
         ++it;
@@ -3253,6 +3260,10 @@ class QGUpdater {
     for (auto it = maint_pages_.begin();
          it != maint_pages_.end() && maint_pages_.size() > cap;) {
       const size_t pi = it->first;
+      if (pi == pin_pi) {  // never spill the page whose RMW is in progress
+        ++it;
+        continue;
+      }
       wal_failpoint(SegmentOpFailPoint::after_consolidate_overlay_modify_before_spill);  // C4
       const auto loc = maint_log_page(pi, it->second.data(), alaya::wal::WalFile::Sync::flush);
       maint_spilled_[pi] = loc;
