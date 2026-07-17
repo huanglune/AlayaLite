@@ -212,11 +212,12 @@ struct ScanResult {
 
 // --- payload byte decoder --------------------------------------------------
 
-// Generic, bounds-checked little-endian reader over a frame payload. Hoisted
-// out of the collection mutation codec (unified-wal-vocabulary.md section 5):
-// both op families decode their payloads with this one reader — there is no
-// second primitive set. Composite fields (row addresses, logical ids, ...) stay
-// in the owning family's codec and are built from these primitives.
+// Generic, bounds-checked little-endian primitive reader over a frame payload.
+// Hoisted out of the collection mutation codec (unified-wal-vocabulary.md
+// sections 5 + clause J): both op families decode with this one reader. It
+// exposes only scalar reads and raw take(n); length-prefixed byte/string fields,
+// their size limits, and composite types (RowAddress, LogicalId, ...) stay in
+// the owning family's codec, built on top of these primitives.
 class Decoder {
  public:
   explicit Decoder(std::span<const std::byte> input) : input_(input) {}
@@ -247,28 +248,21 @@ class Decoder {
     return value;
   }
 
-  [[nodiscard]] auto bytes() -> std::span<const std::byte> {
-    const auto size = u32();
-    if (size > kMaximumStringBytes) {
-      throw std::invalid_argument("WAL byte field exceeds the decoder limit");
-    }
-    require(size);
-    const auto value = input_.subspan(offset_, size);
-    offset_ += size;
+  // Read exactly `count` raw bytes (bounds-checked). Any length framing on top
+  // of this is the owning family's codec — the framework reader stays a pure
+  // primitive set (unified-wal-vocabulary.md clause J; no collection string
+  // limit, no RowAddress, here).
+  [[nodiscard]] auto take(std::size_t count) -> std::span<const std::byte> {
+    require(count);
+    const auto value = input_.subspan(offset_, count);
+    offset_ += count;
     return value;
-  }
-
-  [[nodiscard]] auto string() -> std::string {
-    const auto value = bytes();
-    return {reinterpret_cast<const char *>(value.data()), value.size()};
   }
 
   [[nodiscard]] auto empty() const noexcept -> bool { return offset_ == input_.size(); }
   [[nodiscard]] auto remaining() const noexcept -> std::size_t { return input_.size() - offset_; }
 
  private:
-  static constexpr std::uint32_t kMaximumStringBytes = 16U << 20U;
-
   void require(std::size_t bytes) const {
     if (bytes > input_.size() - offset_) {
       throw std::invalid_argument("WAL payload is truncated");

@@ -155,42 +155,88 @@ TEST(WalFile, ResetToSingleFrameLeavesExactlyOneDurableMarker) {
   std::filesystem::remove_all(dir);
 }
 
-TEST(WalDecoder, ReadsPrimitivesAndDetectsTruncation) {
+TEST(WalDecoder, ReadsPrimitivesTakesRawBytesAndDetectsTruncation) {
   std::vector<std::byte> buf;
   put_u16(buf, 0x0102);
   put_u32(buf, 0x03040506U);
   put_u64(buf, 0x0708090A0B0C0D0EULL);
+  const auto tail = bytes_of({0xCA, 0xFE, 0xBA, 0xBE});
+  buf.insert(buf.end(), tail.begin(), tail.end());
   Decoder decoder(buf);
   EXPECT_EQ(decoder.u16(), 0x0102);
   EXPECT_EQ(decoder.u32(), 0x03040506U);
   EXPECT_EQ(decoder.u64(), 0x0708090A0B0C0D0EULL);
+  EXPECT_EQ(decoder.remaining(), tail.size());
+  const auto taken = decoder.take(tail.size());
+  EXPECT_TRUE(std::equal(taken.begin(), taken.end(), tail.begin()));
   EXPECT_TRUE(decoder.empty());
-  EXPECT_THROW((void)decoder.u8(), std::invalid_argument);
+  EXPECT_THROW((void)decoder.take(1), std::invalid_argument);
 }
 
-// unified-wal-vocabulary.md item 2 / the manifest W1 rule: a structurally valid
-// but foreign (type 5) frame inside a *collection* WAL is a cross-family
-// contamination. The collection scan must fail loudly, never silently truncate
-// and drop committed data.
-TEST(CollectionScanCrossFamily, UnknownRecordTypeIsHardErrorNotSilentTruncation) {
+std::vector<char> slurp(const std::filesystem::path &path) {
+  std::ifstream in(path, std::ios::binary);
+  return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+// unified-wal-vocabulary.md clause J / the manifest W1 rule: a structurally
+// valid but foreign (type 5) frame inside a *collection* WAL is a cross-family
+// contamination. The collection layer must fail loudly with a typed error and
+// must NOT truncate, reset, or otherwise mutate the file (no silent data loss).
+TEST(CollectionScanCrossFamily, UnknownRecordTypeIsHardErrorAndLeavesFileByteIdentical) {
   using alaya::internal::collection::CollectionLogicalWal;
-  const auto dir = std::filesystem::temp_directory_path() /
-                   ("wal_xfam_" + std::to_string(::getpid()));
-  std::filesystem::remove_all(dir);
-  const auto path = dir / "contaminated.wal";
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("wal_xfam_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(root);
+  const auto wal_path = root / ".alaya_internal" / "collection_wal_v1" / "logical.wal";
   {
-    WalFile wal(path);
+    WalFile wal(wal_path);
     wal.append(/*type=*/2, 0, 1, 0, bytes_of({1}), WalFile::Sync::fsync);  // COMMIT (valid 1-4)
     wal.append(/*type=*/5, 0, 2, 0, bytes_of({2}), WalFile::Sync::fsync);  // SEGMENT_OP (foreign)
   }
-  // The framework scan accepts both frames structurally.
-  const auto raw = WalFile::scan_path(path);
+  const auto before = slurp(wal_path);
+  ASSERT_FALSE(before.empty());
+
+  // The framework scan accepts both frames structurally...
+  const auto raw = WalFile::scan_path(wal_path);
   ASSERT_EQ(raw.frames.size(), 2U);
   EXPECT_FALSE(raw.stopped_at_corrupt_or_torn_tail);
-  // The collection layer rejects the foreign type instead of truncating.
-  const auto scanned = CollectionLogicalWal::scan_file(path);
+
+  // ...but the collection layer rejects the foreign type with a typed error.
+  const auto scanned = CollectionLogicalWal::scan_file(wal_path);
   EXPECT_FALSE(scanned.ok());
-  std::filesystem::remove_all(dir);
+
+  // And a full open (which truncates a genuine torn tail) must NOT touch the
+  // file when the failure is a foreign record type.
+  const auto opened = CollectionLogicalWal::open(root);
+  EXPECT_FALSE(opened.ok());
+  const auto after = slurp(wal_path);
+  EXPECT_EQ(before, after) << "collection WAL must be byte-identical after a rejected foreign type";
+  std::filesystem::remove_all(root);
+}
+
+// The structural-corruption (torn tail) path is unchanged: open heals it by
+// truncating to the last verified boundary. This is deliberately distinct from
+// the foreign-type case above.
+TEST(CollectionScanCrossFamily, TornTailStillTruncatesToVerifiedBoundary) {
+  using alaya::internal::collection::CollectionLogicalWal;
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("wal_torn_" + std::to_string(::getpid()));
+  std::filesystem::remove_all(root);
+  const auto wal_path = root / ".alaya_internal" / "collection_wal_v1" / "logical.wal";
+  {
+    WalFile wal(wal_path);
+    wal.append(/*type=*/2, 0, 1, 0, bytes_of({1}), WalFile::Sync::fsync);
+  }
+  const auto clean_size = slurp(wal_path).size();
+  {
+    std::ofstream out(wal_path, std::ios::binary | std::ios::app);
+    const char junk[6] = {'W', 'A', 'L', '7', 1, 0};
+    out.write(junk, sizeof(junk));
+  }
+  const auto opened = CollectionLogicalWal::open(root);
+  ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
+  EXPECT_EQ(slurp(wal_path).size(), clean_size) << "torn tail should be healed to the boundary";
+  std::filesystem::remove_all(root);
 }
 
 }  // namespace

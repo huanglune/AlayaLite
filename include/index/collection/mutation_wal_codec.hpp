@@ -77,15 +77,30 @@ inline void put_address(std::vector<std::byte> &output, const RowAddress &addres
   put_u64(output, static_cast<std::uint64_t>(address.row_id));
 }
 
-// The byte Decoder is hoisted into the framework layer (alaya::wal, see
-// unified-wal-vocabulary.md section 5) so both op families share one reader.
-using alaya::wal::Decoder;
+// The framework layer (alaya::wal, unified-wal-vocabulary.md section 5 + clause
+// J) owns the primitive byte reader. The collection payload's length-prefixed
+// byte/string fields (with the collection size limit) and its RowAddress
+// decoding are a thin adapter on top — they must not leak into the framing
+// layer. The byte format is unchanged.
+class Decoder : public alaya::wal::Decoder {
+ public:
+  using alaya::wal::Decoder::Decoder;
 
-// RowAddress is a collection type, so its composite decode helper stays here;
-// the hoisted alaya::wal::Decoder only knows scalar/byte primitives.
-[[nodiscard]] inline auto decode_address(Decoder &decoder) -> RowAddress {
-  return {decoder.u64(), decoder.u64(), core::SegmentRowId(decoder.u64())};
-}
+  [[nodiscard]] auto bytes() -> std::span<const std::byte> {
+    const auto size = u32();
+    if (size > kMaximumStringBytes) {
+      throw std::invalid_argument("mutation WAL byte field exceeds the decoder limit");
+    }
+    return take(size);
+  }
+
+  [[nodiscard]] auto string() -> std::string {
+    const auto value = bytes();
+    return {reinterpret_cast<const char *>(value.data()), value.size()};
+  }
+
+  [[nodiscard]] auto address() -> RowAddress { return {u64(), u64(), core::SegmentRowId(u64())}; }
+};
 
 inline void encode_metadata(std::vector<std::byte> &output, const Metadata &metadata) {
   if (metadata.size() > std::numeric_limits<std::uint32_t>::max()) {
@@ -268,9 +283,9 @@ inline void encode_logical_id(std::vector<std::byte> &output, const core::Logica
     row.action = static_cast<SegmentMutationAction>(action);
     row.status = static_cast<RowMutationStatus>(status);
     row.logical_id = decode_logical_id(decoder);
-    row.target = decode_address(decoder);
+    row.target = decoder.address();
     if (decoder.u8() != 0) {
-      row.previous = decode_address(decoder);
+      row.previous = decoder.address();
     }
     row.payload = decode_payload(decoder);
     row.retry_token = decoder.string();
