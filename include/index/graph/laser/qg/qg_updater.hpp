@@ -2308,6 +2308,17 @@ class QGUpdater {
     return row;
   }
 
+  [[nodiscard]] size_t debug_page_size() const { return page_size_; }
+  [[nodiscard]] size_t debug_npp() const { return npp_; }
+
+  // The valid neighbor PID list of a row (for BFS reachability tests of the bundle spine).
+  [[nodiscard]] std::vector<PID> debug_row_neighbors(PID id) {
+    const auto row = debug_read_row(id);
+    const auto tr = trailer(id);
+    const auto *ids = reinterpret_cast<const PID *>(row.data() + neighbor_off_bytes());
+    return std::vector<PID>(ids, ids + tr.valid_degree);
+  }
+
   [[nodiscard]] size_t trailer_offset_in_page(PID id) const {
     return qg_page_trailer_offset(page_size_, npp_, id % npp_);
   }

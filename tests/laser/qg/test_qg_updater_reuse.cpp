@@ -13,8 +13,10 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <filesystem>
 #include <memory>
+#include <queue>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -426,6 +428,393 @@ TEST(QgUpdaterReuse, NoReuseFlagKeepsLegacyV2Base) {
     EXPECT_EQ(s.upd->superblock_format_version(), kQGFormatVersion)
         << "a no-reuse segment must stay v2 (never auto-activates a v3 pid base)";
   }
+  std::filesystem::remove_all(dir);
+}
+
+// The full recovery-relevant fingerprint (routing entry, medoid set, per-PID trailer +
+// hidden bit + row bytes, walked free chain, label bindings). Clean and replayed states
+// with the SAME fingerprint are identical.
+std::string full_fp(QGUpdater &upd) {
+  std::string fp;
+  auto put = [&](uint64_t v) { fp.append(reinterpret_cast<const char *>(&v), sizeof(v)); };
+  const auto n = static_cast<PID>(upd.num_points());
+  put(upd.num_points());
+  put(upd.live_count());
+  put(upd.free_count());
+  put(static_cast<uint64_t>(upd.entry_point()));
+  put(upd.medoids().size());
+  for (PID m : upd.medoids()) put(static_cast<uint64_t>(m));
+  for (PID id = 0; id < n; ++id) {
+    const auto tr = upd.trailer(id);
+    put(tr.flags);
+    put(tr.valid_degree);
+    put(upd.row_hidden(id) ? 1U : 0U);
+    const auto row = upd.debug_read_row(id);
+    fp.append(row.data(), row.size());
+  }
+  PID cur = upd.free_list_head();
+  size_t guard = 0;
+  while (cur != kPidMax && guard <= upd.num_points() + 1) {
+    put(cur);
+    const auto row = upd.debug_read_row(cur);
+    uint64_t nx = 0;
+    std::memcpy(&nx, row.data(), sizeof(nx));
+    cur = static_cast<PID>(nx);
+    ++guard;
+  }
+  put(cur);
+  const auto snap = upd.label_snapshot();
+  if (snap != nullptr) {
+    for (const auto &[pid, binding] : snap->bindings) {
+      put(pid);
+      put(binding.pid_generation);
+      put(binding.label);
+    }
+  }
+  return fp;
+}
+
+std::vector<PID> walk_free_chain(QGUpdater &upd) {
+  std::vector<PID> chain;
+  PID cur = upd.free_list_head();
+  size_t guard = 0;
+  while (cur != kPidMax && guard <= upd.num_points() + 1) {
+    chain.push_back(cur);
+    const auto row = upd.debug_read_row(cur);
+    uint64_t nx = 0;
+    std::memcpy(&nx, row.data(), sizeof(nx));
+    cur = static_cast<PID>(nx);
+    ++guard;
+  }
+  return chain;
+}
+
+// ---------------------------------------------------------------------------
+// BLOCKER-1 (all-append case) + MAJOR-2 (medoid): delete-all -> all-APPEND (no reclaim)
+// must converge the routing entry + medoid set + full state clean vs a WAL replay reopen
+// AND a checkpoint reopen. The old repair scanned committed_ == old_hwm and left the entry
+// in the dead component (clean query empty) while recovery relocated over the new watermark.
+// ---------------------------------------------------------------------------
+TEST(QgUpdaterReuse, DeleteAllThenAllAppendConvergesCleanVsReplay) {
+  const auto dir = scratch_dir("del_all_append");
+  std::filesystem::remove_all(dir);
+  const size_t small_n = 24;
+  auto base = WalTinyIndex::build(dir, small_n, /*seed=*/91);
+  const size_t append_n = 7;
+  const auto vecs = waltest::make_data(append_n, kDim, /*seed=*/48);
+  std::vector<uint64_t> labels(append_n);
+  for (size_t i = 0; i < append_n; ++i) labels[i] = 51000 + i;
+
+  std::string clean_fp;
+  {
+    ReuseSession s(base.prefix, small_n, 4 * small_n, /*enable_reuse=*/true);
+    for (size_t i = 0; i < small_n; ++i) s.upd->tombstone(static_cast<PID>(i));  // delete all
+    EXPECT_EQ(s.upd->live_count(), 0U);
+    // all-APPEND (nothing reclaimed): the bundle activates + appends new PIDs.
+    const auto range = s.upd->commit_physical_bundle(1, 1, vecs.data(), labels.data(), append_n);
+    EXPECT_EQ(range.first, static_cast<PID>(small_n));
+    EXPECT_EQ(range.second, static_cast<PID>(small_n + append_n));
+    // Every appended row is searchable in-process (entry relocated over the NEW watermark).
+    for (size_t i = 0; i < append_n; ++i) {
+      EXPECT_TRUE(searchable(*s.upd, vecs.data() + i * kDim, static_cast<PID>(small_n + i)))
+          << "clean: appended row " << i << " unreachable (dead entry not relocated)";
+    }
+    clean_fp = full_fp(*s.upd);
+    // Do NOT checkpoint: the next reopen is a pure WAL replay.
+  }
+  {
+    ReuseSession s(base.prefix, small_n, 4 * small_n, /*enable_reuse=*/true);
+    EXPECT_EQ(full_fp(*s.upd), clean_fp) << "WAL replay diverged from the clean state (entry/medoid)";
+    for (size_t i = 0; i < append_n; ++i) {
+      EXPECT_TRUE(searchable(*s.upd, vecs.data() + i * kDim, static_cast<PID>(small_n + i)))
+          << "replay: appended row " << i << " unreachable";
+    }
+    s.upd->checkpoint();
+  }
+  {
+    ReuseSession s(base.prefix, small_n, 4 * small_n, /*enable_reuse=*/true);
+    EXPECT_EQ(full_fp(*s.upd), clean_fp) << "checkpoint reopen diverged from the clean state";
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// MAJOR-2 (medoid) + BLOCKER-1 (entry): a mixed reuse bundle must converge the FULL state
+// (entry + medoid set + bindings + free chain) clean vs WAL replay vs checkpoint reopen.
+// A reused base row whose PID was a medoid drops from the medoid set on BOTH sides.
+// ---------------------------------------------------------------------------
+TEST(QgUpdaterReuse, MixedReuseFullStateConvergesCleanVsReplay) {
+  const auto dir = scratch_dir("mixed_converge");
+  std::filesystem::remove_all(dir);
+  const size_t small_n = 40;
+  auto base = WalTinyIndex::build(dir, small_n, /*seed=*/57);
+  const size_t bundle_n = 5;  // 3 reused + 2 append
+  const auto vecs = waltest::make_data(bundle_n, kDim, /*seed=*/66);
+  std::vector<uint64_t> labels(bundle_n);
+  for (size_t i = 0; i < bundle_n; ++i) labels[i] = 44000 + i;
+
+  std::string clean_fp;
+  {
+    ReuseSession s(base.prefix, small_n, 4 * small_n, /*enable_reuse=*/true);
+    free_base_rows(*s.upd, {1, 4, 12});  // free 3 base rows (incl. possible medoid PIDs)
+    s.upd->commit_physical_bundle(1, 1, vecs.data(), labels.data(), bundle_n);
+    clean_fp = full_fp(*s.upd);
+  }
+  {
+    ReuseSession s(base.prefix, small_n, 4 * small_n, /*enable_reuse=*/true);
+    EXPECT_EQ(full_fp(*s.upd), clean_fp) << "WAL replay diverged (medoid/entry/free-chain)";
+    s.upd->checkpoint();
+  }
+  {
+    ReuseSession s(base.prefix, small_n, 4 * small_n, /*enable_reuse=*/true);
+    EXPECT_EQ(full_fp(*s.upd), clean_fp) << "checkpoint reopen diverged";
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// MAJOR-3: two reclaim rounds (round 1 frees LOW PIDs, round 2 frees HIGH PIDs) must leave
+// a GLOBALLY ascending free chain -- byte-identical to the recovery rebuild. The old code
+// prepended the new set onto the old chain (high -> low), so the runtime order (10,11,3,4)
+// contradicted the reopen order (3,4,10,11) and the next bundle reused a different PID.
+// ---------------------------------------------------------------------------
+TEST(QgUpdaterReuse, TwoRoundReclaimFreeChainIsAscendingAndMatchesReopen) {
+  const auto dir = scratch_dir("free_chain");
+  std::filesystem::remove_all(dir);
+  const size_t small_n = 32;
+  auto base = WalTinyIndex::build(dir, small_n, /*seed=*/61);
+
+  std::vector<PID> clean_chain;
+  {
+    ReuseSession s(base.prefix, small_n, 4 * small_n, /*enable_reuse=*/true);
+    // Activate first so both rounds run on a v3 pid base.
+    const auto v = waltest::make_data(1, kDim, 5);
+    const uint64_t l = 1;
+    s.upd->commit_physical_bundle(1, 1, v.data(), &l, 1);
+    free_base_rows(*s.upd, {3, 4});    // round 1: LOW PIDs
+    free_base_rows(*s.upd, {10, 11});  // round 2: HIGH PIDs (merged onto the round-1 chain)
+    clean_chain = walk_free_chain(*s.upd);
+    ASSERT_EQ(clean_chain.size(), 4U);
+    // Globally ascending: head = smallest, strictly increasing.
+    EXPECT_TRUE(std::is_sorted(clean_chain.begin(), clean_chain.end()))
+        << "runtime free chain is not globally ascending after a second reclaim round";
+    EXPECT_EQ(clean_chain.front(), static_cast<PID>(3));
+    s.upd->checkpoint();
+  }
+  {
+    ReuseSession s(base.prefix, small_n, 4 * small_n, /*enable_reuse=*/true);
+    EXPECT_EQ(walk_free_chain(*s.upd), clean_chain)
+        << "reopened free chain differs from the runtime chain (M3)";
+    // The next reuse pops the same (smallest) PID clean vs after reopen.
+    const auto v = waltest::make_data(1, kDim, 6);
+    const uint64_t l = 2;
+    s.upd->commit_physical_bundle(2, 2, v.data(), &l, 1);
+    bool reused_three = false;
+    for (PID p : s.upd->search(v.data(), 5, 64)) {
+      if (label_of(*s.upd, p) == 2) reused_three = (p == static_cast<PID>(3));
+    }
+    EXPECT_TRUE(reused_three) << "the next reuse must pop the canonical smallest free PID (3)";
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// MAJOR-1: a saturated bundle (N > degree) must keep the FINAL directed spine cycle so
+// every bundle row reaches every other via graph edges. Under Backlink::kNone the spine is
+// the ONLY reverse connectivity. Verify (a) each row's neighbor list holds the next cycle
+// edge (the protected edge survived a forced eviction) and (b) BFS from the entry reaches all.
+// ---------------------------------------------------------------------------
+TEST(QgUpdaterReuse, SaturatedBundleSpineCycleReachesEveryRow) {
+  const auto dir = scratch_dir("spine");
+  std::filesystem::remove_all(dir);
+  const size_t small_n = 8;
+  auto base = WalTinyIndex::build(dir, small_n, /*seed=*/73);
+  const size_t append_n = kDeg + 6;  // N > degree: later rows saturate, forcing eviction
+  const auto vecs = waltest::make_data(append_n, kDim, /*seed=*/74);
+  std::vector<uint64_t> labels(append_n);
+  for (size_t i = 0; i < append_n; ++i) labels[i] = 31000 + i;
+
+  struct Holder {
+    QuantizedGraph qg;
+    std::unique_ptr<QGUpdater> upd;
+    Holder(const std::string &prefix, size_t base_n, size_t max_points) : qg(base_n, kDeg, kDim, kDim) {
+      qg.load_disk_index(prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+      qg.set_params(64, 1, 1);
+      UpdateParams params;
+      params.enable_wal = true;
+      params.enable_pid_reuse = true;
+      params.ef_insert = 64;
+      params.max_points = max_points;
+      params.backlink_mode = UpdateParams::Backlink::kNone;  // spine is the ONLY reverse edge
+      upd = std::make_unique<QGUpdater>(qg, params);
+    }
+  };
+  Holder h(base.prefix, small_n, 4 * (small_n + append_n));
+  for (size_t i = 0; i < small_n; ++i) h.upd->tombstone(static_cast<PID>(i));  // delete all base
+  const auto range = h.upd->commit_physical_bundle(1, 1, vecs.data(), labels.data(), append_n);
+  const PID first = static_cast<PID>(range.first);
+  ASSERT_EQ(range.second - range.first, static_cast<PID>(append_n));
+
+  // (a) the directed cycle edge rows[i] -> rows[(i+1)%n] survived on every row.
+  for (size_t i = 0; i < append_n; ++i) {
+    const PID from = first + static_cast<PID>(i);
+    const PID want = first + static_cast<PID>((i + 1) % append_n);
+    const auto nbrs = h.upd->debug_row_neighbors(from);
+    EXPECT_NE(std::find(nbrs.begin(), nbrs.end(), want), nbrs.end())
+        << "row " << i << " lost its protected spine edge to " << (i + 1) % append_n;
+  }
+  // (b) BFS from the entry reaches every bundle row over the committed adjacency.
+  std::unordered_set<PID> seen;
+  std::queue<PID> q;
+  q.push(h.upd->entry_point());
+  seen.insert(h.upd->entry_point());
+  while (!q.empty()) {
+    const PID u = q.front();
+    q.pop();
+    for (PID v : h.upd->debug_row_neighbors(u)) {
+      if (v < static_cast<PID>(h.upd->num_points()) && seen.insert(v).second) q.push(v);
+    }
+  }
+  size_t reached = 0;
+  for (size_t i = 0; i < append_n; ++i) reached += seen.count(first + static_cast<PID>(i));
+  EXPECT_EQ(reached, append_n) << "BFS from the entry did not reach every saturated bundle row";
+  std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// B-2C-02 poison 3: a canonical bundle whose kind=8 binds an appended PID but whose FINAL
+// page after-image still carries a FREE trailer (row never made live) must poison on reopen.
+// A whole page with the correct geometry is written, differing from poison 1 (no page at all).
+// ---------------------------------------------------------------------------
+TEST(QgUpdaterReuse, CanonicalFinalTrailerFreePoisonsOnReopen) {
+  const auto dir = scratch_dir("poison_free_trailer");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/85);
+  uint64_t seg_uid = 0;
+  uint64_t gen = 0;
+  uint64_t old_hwm = 0;
+  size_t page_size = 0;
+  size_t npp = 0;
+  {
+    ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);
+    const auto v = waltest::make_data(1, kDim, 1);
+    const uint64_t l = 5;
+    s.upd->commit_physical_bundle(1, 1, v.data(), &l, 1);  // activate v3 pid
+    s.upd->checkpoint();
+    seg_uid = s.upd->segment_uid();
+    gen = s.upd->generation();
+    old_hwm = s.upd->num_points();
+    page_size = s.upd->debug_page_size();
+    npp = s.upd->debug_npp();
+  }
+  // One appended bind for PID old_hwm, plus a whole-page final row_patch whose slot trailer is
+  // left FREE (the "not made live" bug). The append algebra passes; the B-2C-02 final-live
+  // trailer check must reject it.
+  const std::string wal_path = base.prefix + waltest::index_suffix() + ".opwal";
+  {
+    alaya::wal::WalFile wal(wal_path);
+    const uint64_t txid = 2;
+    wal.append(kSegmentOpRecordType, 0, 1, txid,
+               encode_label_bind(seg_uid, gen, txid, /*row_op=*/0, static_cast<uint32_t>(old_hwm),
+                                 /*gen=*/0, /*label=*/6),
+               alaya::wal::WalFile::Sync::buffered);
+    const size_t page = old_hwm / npp;
+    const size_t slot = old_hwm % npp;
+    std::vector<char> bytes(page_size, 0);
+    QGRowTrailer tr{};
+    tr.valid_degree = 0;
+    tr.flags = static_cast<uint16_t>(kQGRowTombstone | kQGRowFree);  // NOT live: the injected bug
+    qg_write_page_trailer(bytes.data(), page_size, npp, slot, tr);
+    wal.append(kSegmentOpRecordType, 0, 2, 0,
+               encode_row_patch(seg_uid, gen, /*first_pid=*/page * npp,
+                                /*offset=*/512 + page * page_size,
+                                std::span<const std::byte>(
+                                    reinterpret_cast<const std::byte *>(bytes.data()), page_size)),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType, 0, 3, txid,
+               encode_tx_publish(seg_uid, gen, txid, /*new_hwm=*/old_hwm + 1,
+                                 /*binding_count=*/1, /*applied=*/1),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  EXPECT_THROW(
+      { ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true); }, std::exception)
+      << "a bound PID whose final page trailer is FREE must poison (B-2C-02)";
+  std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// BLOCKER-2: any exception AFTER the reservation is published must fail the handle closed,
+// even a NON-std::exception thrown by a failpoint hook (throw 7) and an OOM in the reason
+// path. The atomic poison latch -- not the reason string -- is authoritative.
+// ---------------------------------------------------------------------------
+TEST(QgUpdaterReuse, ReservationNonStdExceptionPoisonsHandle) {
+  const auto dir = scratch_dir("poison_reserve");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/95);
+  QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+  qg.load_disk_index(base.prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+  qg.set_params(64, 1, 1);
+  UpdateParams params;
+  params.enable_wal = true;
+  params.enable_pid_reuse = true;
+  params.ef_insert = 64;
+  params.max_points = 4 * kBaseN;
+  // Throw a NON-std::exception right after the reservation is published (R0).
+  params.failpoint_hook = [](SegmentOpFailPoint fp) {
+    if (fp == SegmentOpFailPoint::after_reuse_reserve_before_binds) throw 7;  // NOLINT
+  };
+  QGUpdater upd(qg, params);
+  const auto v = waltest::make_data(1, kDim, 1);
+  const uint64_t l = 9;
+  bool threw = false;
+  try {
+    upd.commit_physical_bundle(1, 1, v.data(), &l, 1);
+  } catch (...) {  // the int 7 escapes as the original exception
+    threw = true;
+  }
+  ASSERT_TRUE(threw);
+  // The handle is now latched: every subsequent write op fails closed with std::exception.
+  EXPECT_THROW(upd.commit_physical_bundle(2, 2, v.data(), &l, 1), std::exception)
+      << "a non-std::exception past the reservation must still poison the handle";
+  EXPECT_THROW(upd.tombstone(0), std::exception);
+  std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// BLOCKER-4: once the checkpoint flip is durable, an in-process exception (here a post-flip
+// failpoint throw) must poison the handle so it can never write a second, differing flip.
+// ---------------------------------------------------------------------------
+TEST(QgUpdaterReuse, DurableFlipThenExceptionPoisonsHandle) {
+  const auto dir = scratch_dir("poison_flip");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/96);
+  QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+  qg.load_disk_index(base.prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+  qg.set_params(64, 1, 1);
+  UpdateParams params;
+  params.enable_wal = true;
+  params.enable_pid_reuse = true;
+  params.ef_insert = 64;
+  params.max_points = 4 * kBaseN;
+  // Throw AFTER the flip frame is appended + fsynced (durable), before the superblock write --
+  // but ONLY once armed, so the constructor's fresh-enable checkpoint flip is unaffected.
+  auto armed = std::make_shared<bool>(false);
+  params.failpoint_hook = [armed](SegmentOpFailPoint fp) {
+    if (*armed && fp == SegmentOpFailPoint::after_flip_append_before_superblock_write) {
+      throw std::runtime_error("post-flip failpoint");
+    }
+  };
+  QGUpdater upd(qg, params);  // fresh-enable checkpoint runs here (not yet armed)
+  const auto v = waltest::make_data(1, kDim, 1);
+  const uint64_t l = 9;
+  *armed = true;
+  // The checkpoint flip becomes durable, then the failpoint throws -> the handle must poison
+  // (BLOCKER-4) so it can never write a second, differing G+1 flip.
+  EXPECT_THROW(upd.checkpoint(), std::exception);
+  // A retried checkpoint / bundle must fail closed.
+  EXPECT_THROW(upd.checkpoint(), std::exception)
+      << "a durable-flip exception must latch the handle (no second flip)";
+  EXPECT_THROW(upd.commit_physical_bundle(1, 1, v.data(), &l, 1), std::exception);
   std::filesystem::remove_all(dir);
 }
 
