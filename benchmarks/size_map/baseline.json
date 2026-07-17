@@ -1,6 +1,6 @@
 {
   "build_type": "Release",
-  "canonical_identity_rows": 33,
+  "canonical_identity_rows": 0,
   "extension_module": {
     "bytes": 17511064,
     "text_bytes": 10709104

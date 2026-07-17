@@ -3,8 +3,6 @@
 
 from pathlib import Path
 
-import yaml
-
 ROOT = Path(__file__).resolve().parents[3]
 
 REMOVED_PATHS = (
@@ -22,6 +20,11 @@ REMOVED_PATHS = (
     "python/src/alayalite/laser/_bindings.hpp",
     "python/src/alayalite/vamana/_bindings.hpp",
     "tools/codegen/templates/dispatch_factory.hpp.j2",
+    # HNSW retirement wave: the whole hnsw-keyed dispatch codegen chain.
+    "tools/codegen/dispatch.yaml",
+    "tools/codegen/gen.py",
+    "tools/codegen/templates/test_matrix_params.py.j2",
+    "python/tests/client/_dispatch_matrix_params.py",
 )
 
 
@@ -39,20 +42,6 @@ def test_native_module_has_no_legacy_api_registration():
         "register_laser_module",
     )
     assert not [name for name in forbidden if name in binding]
-
-
-def test_codegen_schema_has_no_runtime_or_rollback_fields():
-    config = yaml.safe_load((ROOT / "tools/codegen/dispatch.yaml").read_text(encoding="utf-8"))
-    assert set(config) == {"implementation_registry", "combinations"}
-    obsolete = {
-        "runtime_template",
-        "feature_flag",
-        "legacy_implementation_key",
-        "legacy_engine_factory_key",
-        "rollback",
-    }
-    registrations = config["implementation_registry"].values()
-    assert not any(obsolete.intersection(registration) for registration in registrations)
 
 
 def test_utils_have_no_blanket_nolint_regions():
