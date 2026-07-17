@@ -679,8 +679,8 @@ inline auto write_pca_base_fbin(const std::string &prefix,
   out.write(reinterpret_cast<const char *>(vectors.data()),
             static_cast<std::streamsize>(vectors.size() * sizeof(float)));
   if (!out) {
-    throw std::runtime_error(
-        "Collection LASER target: failed writing pca_base scratch file: " + prefix);
+    throw std::runtime_error("Collection LASER target: failed writing pca_base scratch file: " +
+                             prefix);
   }
 }
 
@@ -709,8 +709,7 @@ struct ScratchDir {
 #endif
 
 [[nodiscard]] inline auto laser_publication_from_collection(
-    const CollectionTargetPublication &publication)
-    -> ::alaya::disk::LaserSegmentReferenceOptions {
+    const CollectionTargetPublication &publication) -> ::alaya::disk::LaserSegmentReferenceOptions {
   ::alaya::disk::LaserSegmentReferenceOptions translated;
   translated.collection_root = publication.collection_root;
   translated.segment_id = publication.segment_id;
@@ -776,11 +775,10 @@ struct ScratchDir {
 
   try {
     const auto tick = std::chrono::steady_clock::now().time_since_epoch().count();
-    laser_target_detail::ScratchDir raw_dir(
-        std::filesystem::temp_directory_path() /
-        ("alayalite-laser-collection-build-" +
-         std::to_string(::alaya::platform::get_pid()) + "-" + std::to_string(tick) + "-" +
-         publication.segment_id));
+    laser_target_detail::ScratchDir raw_dir(std::filesystem::temp_directory_path() /
+                                            ("alayalite-laser-collection-build-" +
+                                             std::to_string(::alaya::platform::get_pid()) + "-" +
+                                             std::to_string(tick) + "-" + publication.segment_id));
     const std::string raw_prefix = (raw_dir.path / ("dsqg_" + publication.segment_id)).string();
 
     laser_target_detail::write_pca_base_fbin(raw_prefix, vectors, count, schema.dim);

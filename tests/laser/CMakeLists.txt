@@ -241,11 +241,9 @@ alaya_add_test(
   LABELS laser
 )
 
-# Regression test for a data-dependent heap overflow in QGBuilder's
-# out-of-core build path (init_from_vamana() reading unclamped per-node
-# degrees; see qg_builder.hpp and the test source for the full root-cause
-# chain). Builds several tiny indices back-to-back in one process, which used
-# to crash intermittently pre-fix.
+# Regression test for a data-dependent heap overflow in QGBuilder's out-of-core build path (init_from_vamana() reading
+# unclamped per-node degrees; see qg_builder.hpp and the test source for the full root-cause chain). Builds several tiny
+# indices back-to-back in one process, which used to crash intermittently pre-fix.
 alaya_cc_target(
   test_qg_builder_oom_regression
   BARE GTEST

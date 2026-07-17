@@ -593,9 +593,8 @@ inline void QGBuilder::init_from_vamana(const std::string &filename) {
 
   if (clamped_nodes > 0) {
     std::cerr << "WARNING: QGBuilder::init_from_vamana: clamped " << clamped_nodes
-              << " node(s) whose vamana out-neighbour list exceeded degree_bound="
-              << degree_bound_ << " (max observed in file: " << max_range_of_graph << ")"
-              << std::endl;
+              << " node(s) whose vamana out-neighbour list exceeded degree_bound=" << degree_bound_
+              << " (max observed in file: " << max_range_of_graph << ")" << std::endl;
   }
 
   qg_.cache_ids_.resize(num_nodes_);

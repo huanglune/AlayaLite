@@ -51,4 +51,3 @@ namespace alaya::disk {
 }  // namespace alaya::disk
 
 #undef ALAYA_DISK_SEGMENT_FACTORY_LASER_SUPPORTED
-

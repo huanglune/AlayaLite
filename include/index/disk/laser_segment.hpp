@@ -200,20 +200,20 @@ class LaserSegment {
         auto unified_searcher =
             std::make_shared<UnifiedLaserSegmentSearcher>(directory, *residency);
         return std::unique_ptr<LaserSegment>(new LaserSegment(nullptr,
-                                                               std::move(unified_searcher),
-                                                               std::move(native),
-                                                               directory,
-                                                               bytes));
+                                                              std::move(unified_searcher),
+                                                              std::move(native),
+                                                              directory,
+                                                              bytes));
       }
       // Default (no residency configured) and an explicit paged_pool
       // request both land here unchanged: the legacy searcher, exactly as
       // before residency selection existed.
       auto legacy_searcher = std::make_shared<LaserSegmentSearcher>(directory);
       return std::unique_ptr<LaserSegment>(new LaserSegment(std::move(legacy_searcher),
-                                                             nullptr,
-                                                             std::move(native),
-                                                             directory,
-                                                             bytes));
+                                                            nullptr,
+                                                            std::move(native),
+                                                            directory,
+                                                            bytes));
     } catch (const std::invalid_argument &error) {
       return core::Status::error(core::StatusCode::corruption,
                                  core::OperationStage::open,

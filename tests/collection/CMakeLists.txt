@@ -165,9 +165,8 @@ if(ALAYA_ENABLE_LASER)
   )
 
   # End-to-end coverage for LASER as a Collection target algorithm (U2-c W1):
-  # create/upsert/seal/search/filter-search/close/reopen/rotate_to_successor
-  # through the public Collection facade, plus the metric=inner_product ->
-  # flat fallback.
+  # create/upsert/seal/search/filter-search/close/reopen/rotate_to_successor through the public Collection facade, plus
+  # the metric=inner_product -> flat fallback.
   alaya_cc_target(
     collection_laser_target_test
     GTEST LASER
