@@ -165,6 +165,21 @@ alaya_add_test(
   LABELS laser wal persistence
 )
 
+# G1 crash matrix: SIGKILL/failpoint cuts + a power-loss persistence model.
+alaya_cc_target(
+  test_segment_op_wal_crash
+  BARE GTEST
+  SRCS qg/test_segment_op_wal_crash.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_segment_op_wal_crash
+  TARGET test_segment_op_wal_crash
+  LABELS laser wal persistence crash
+  TIMEOUT 120
+)
+
 # Residency seams behind UnifiedLaserSegment: prefetch budget default, ResidencyProvider dispatch, ensure_resident_arena
 # file materialization, and the QGUpdater write_at -> arena mirror.
 alaya_cc_target(
