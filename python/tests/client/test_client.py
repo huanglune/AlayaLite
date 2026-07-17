@@ -90,7 +90,9 @@ class TestClient(unittest.TestCase):  # pylint: disable=missing-class-docstring
         ]
         first = self.client.create_collection("col1")
         first.insert(items)
-        self.assertEqual(first.get_index_params().quantization_type, "none")
+        # float32 with no explicit index_type/quantization_type now defaults
+        # to qg+rabitq (HNSW retirement wave, see CHANGELOG).
+        self.assertEqual(first.get_index_params().quantization_type, "rabitq")
 
         second = self.client.create_collection("col2", quantization_type="sq8")
         second.insert(items)

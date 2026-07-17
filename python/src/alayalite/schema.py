@@ -61,14 +61,31 @@ class IndexParams:
             return os.path.join(folder_uri, f"{self.quantization_type}.data")
 
     def fill_none_values(self):
-        if self.index_type is None:
-            self.index_type = "hnsw"
         if self.data_type is None:
             self.data_type = np.float32
+        if self.index_type is None:
+            is_float32 = np.dtype(self.data_type) == np.dtype(np.float32)
+            if is_float32 and self.quantization_type in (None, "rabitq"):
+                # qg (RaBitQ-quantized in-memory graph) is the default
+                # target for float32 vectors with no competing
+                # quantization request.
+                self.index_type = "qg"
+            elif is_float32:
+                # An explicit sq8/sq4/none quantization_type still needs
+                # hnsw's raw or scalar-quantized float32 support: qg is
+                # rabitq-only and flat never quantizes, so hnsw is the only
+                # engine that can honor a non-rabitq request here.
+                self.index_type = "hnsw"
+            else:
+                # qg is physically float32-only, and hnsw's non-float32
+                # support is narrower than flat's; anything non-float32
+                # honestly falls back to exact flat search rather than
+                # silently downgrading accuracy on an unsupported engine.
+                self.index_type = "flat"
         if self.id_type is None:
             self.id_type = np.uint32
         if self.quantization_type is None:
-            self.quantization_type = "none"
+            self.quantization_type = "rabitq" if self.index_type == "qg" else "none"
         if self.metric is None:
             self.metric = "l2"
         if self.capacity is None:
