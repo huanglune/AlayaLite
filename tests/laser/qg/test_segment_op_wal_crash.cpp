@@ -223,6 +223,7 @@ struct ConsolidateKillCase {
   const char *name;
   SegmentOpFailPoint point;
   bool expect_reclaimed;  // after recovery the free-list holds the kConsolTomb rows
+  size_t cache_cap = 0;   // 0 = default (no spill); a small cap forces overlay spill (C4/C5)
 };
 
 class SegmentOpWalConsolidateSigkill : public ::testing::TestWithParam<ConsolidateKillCase> {};
@@ -250,6 +251,7 @@ TEST_P(SegmentOpWalConsolidateSigkill, ReopenIsPrefixReachableAndDoubleReplaySta
       UpdateParams params;
       params.enable_wal = true;
       params.max_points = max_points;
+      if (param.cache_cap != 0) params.cache_cap_pages = param.cache_cap;  // force overlay spill
       const SegmentOpFailPoint target = param.point;
       params.failpoint_hook = [target](SegmentOpFailPoint fp) {
         if (fp == target) {
@@ -288,15 +290,39 @@ TEST_P(SegmentOpWalConsolidateSigkill, ReopenIsPrefixReachableAndDoubleReplaySta
 INSTANTIATE_TEST_SUITE_P(
     ConsolidateKillPoints, SegmentOpWalConsolidateSigkill,
     ::testing::Values(
-        ConsolidateKillCase{"begin_fsync", SegmentOpFailPoint::after_consolidate_begin_fsync,
+        // C0-C7: every cut before the END *force* loses the buffered END (SIGKILL keeps
+        // the OS page cache but not this process's userspace stream buffer), so recovery
+        // sees an unmatched BEGIN, truncates the epoch, and converges to S_old (free 0).
+        ConsolidateKillCase{"c0_before_begin_append",
+                            SegmentOpFailPoint::before_consolidate_begin_append, false},
+        ConsolidateKillCase{"c1_after_begin_append",
+                            SegmentOpFailPoint::after_consolidate_begin_append, false},
+        ConsolidateKillCase{"c2_before_begin_fsync",
+                            SegmentOpFailPoint::before_consolidate_begin_fsync, false},
+        ConsolidateKillCase{"c3_after_begin_fsync",
+                            SegmentOpFailPoint::after_consolidate_begin_fsync, false},
+        ConsolidateKillCase{"c4_overlay_before_spill",
+                            SegmentOpFailPoint::after_consolidate_overlay_modify_before_spill, false,
+                            /*cache_cap=*/2},
+        ConsolidateKillCase{"c5_after_spill_flush",
+                            SegmentOpFailPoint::after_consolidate_spill_flush, false,
+                            /*cache_cap=*/2},
+        ConsolidateKillCase{"c6_live_repair_before_free",
+                            SegmentOpFailPoint::after_consolidate_live_repair_before_free_image,
                             false},
         ConsolidateKillCase{"before_end_append",
                             SegmentOpFailPoint::before_consolidate_end_append, false},
-        ConsolidateKillCase{"end_fsync", SegmentOpFailPoint::after_consolidate_end_fsync, true},
-        ConsolidateKillCase{"install_page", SegmentOpFailPoint::after_consolidate_install_page,
-                            true},
-        ConsolidateKillCase{"install_before_publish",
-                            SegmentOpFailPoint::after_consolidate_install_before_publish, true}),
+        ConsolidateKillCase{"c7_end_append_before_fsync",
+                            SegmentOpFailPoint::after_consolidate_end_append_before_fsync, false},
+        // C8-C11: the END force is the commit point; every later cut rolls forward to
+        // S_new (free-list holds the kConsolTomb reclaimed rows) via pure WAL redo.
+        ConsolidateKillCase{"c8_end_fsync", SegmentOpFailPoint::after_consolidate_end_fsync, true},
+        ConsolidateKillCase{"c9_install_page",
+                            SegmentOpFailPoint::after_consolidate_install_page, true},
+        ConsolidateKillCase{"c10_install_before_publish",
+                            SegmentOpFailPoint::after_consolidate_install_before_publish, true},
+        ConsolidateKillCase{"c11_after_publish",
+                            SegmentOpFailPoint::after_consolidate_publish, true}),
     [](const ::testing::TestParamInfo<ConsolidateKillCase> &info) { return info.param.name; });
 
 // Layer 1 (label transaction, B-07): SIGKILL at the four new bundle/checkpoint
@@ -567,6 +593,69 @@ TEST(SegmentOpWalPowerLoss, BundleWithLabelsIsAtomicAcrossPowerLoss) {
         upd.writeback(1);  // pwrite pages (unforced) after the kind=8 fsync
       },
       kBaseN + kInsert, /*label_when_committed=*/70000U);
+}
+
+// A consolidate maintenance transaction is atomic across power loss (W1 backfill /
+// design section 6.3): the END fsync is the single commit point, so once it is
+// durable recovery must roll forward to S_new over an index that installed NONE of
+// the pages (the forced snapshot -- install pwrites are unforced) or ALL of them
+// (the current file). The SIGKILL C9 cut covers the partial-install middle.
+TEST(SegmentOpWalPowerLoss, ConsolidateRollsForwardAcrossUnforcedIndexLoss) {
+  constexpr size_t kTomb = 4;
+  const auto root = battery_root("consolidate_rollforward");
+  std::filesystem::remove_all(root);
+  const auto template_dir = root / "template";
+  auto base = WalTinyIndex::build(template_dir, kBaseN, 7373);
+  const size_t max_points = kBaseN + kInsert + 16;
+  prepare_wal_base(base.prefix, max_points);
+  const auto run_dir = root / "run";
+  copy_tree(template_dir, run_dir);
+  const std::string run_prefix = (run_dir / "wal_base").string();
+  const std::string index_path = run_prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+
+  std::vector<char> forced_index;  // last index fsync == the activation checkpoint (pre-install)
+  {
+    QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+    qg.load_disk_index(run_prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+    qg.set_params(64, 1, 1);
+    UpdateParams params;
+    params.enable_wal = true;
+    params.max_points = max_points;
+    SegmentIoObserver observer;
+    observer.on_index_fsync = [&] { forced_index = read_file(index_path); };
+    params.io_observer = &observer;
+    QGUpdater upd(qg, params);
+    for (PID id = 0; id < static_cast<PID>(kTomb); ++id) upd.tombstone(id);
+    upd.consolidate(1, /*r_target=*/0, /*reclaim_slots=*/true, /*bloom_consolidate=*/false);
+  }
+  const auto current_index = read_file(index_path);
+  const auto current_wal = read_file(wal_path);  // [flip, begin, pages..., end] (END durable)
+  ASSERT_FALSE(forced_index.empty()) << "the activation checkpoint must fsync the index once";
+  EXPECT_NE(forced_index, current_index) << "install pwrites are unforced (no index fsync)";
+
+  struct IndexState {
+    const char *label;
+    const std::vector<char> &index;
+  };
+  const std::vector<IndexState> states = {
+      {"drop-all-install", forced_index},
+      {"keep-all-install", current_index},
+  };
+  for (const auto &st : states) {
+    SCOPED_TRACE(std::string("consolidate power-loss: ") + st.label);
+    const auto first =
+        recover_power_loss_state(template_dir, root / "state", st.index, current_wal, max_points);
+    ASSERT_FALSE(first.poisoned) << "END durable => must roll forward, not poison";
+    EXPECT_EQ(first.num_points, kBaseN);
+    EXPECT_EQ(first.live_count, kBaseN - kTomb);
+    EXPECT_EQ(first.free_count, kTomb) << "the reclaimed rows land on the free-list (S_new)";
+    const auto second =
+        recover_power_loss_state(template_dir, root / "state2", st.index, current_wal, max_points);
+    EXPECT_EQ(first.index_bytes, second.index_bytes) << "index not byte-stable on double replay";
+    EXPECT_EQ(first.wal_bytes, second.wal_bytes) << "wal not byte-stable on double replay";
+  }
+  std::filesystem::remove_all(root);
 }
 
 // The label-snapshot checkpoint flip is atomic across power loss (B-07): over an

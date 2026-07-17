@@ -1886,6 +1886,18 @@ class QGUpdater {
     return row_trailer(page.data(), id);
   }
 
+  // Test-only: copy the raw node_len bytes of a row's committed on-disk image, so an
+  // oracle test can compare a WAL consolidation against the non-WAL path byte-for-byte
+  // (W1 acceptance: (reclaim x bloom x r_target) == non-WAL oracle page hash / free set).
+  [[nodiscard]] std::vector<char> debug_read_row(PID id) {
+    if (id >= allocated_points()) throw std::out_of_range("QGUpdater::debug_read_row id");
+    AlignedBuf page(page_size_);
+    read_node_page(id, page.data());
+    std::vector<char> row(node_len_);
+    std::memcpy(row.data(), page.data() + node_offset_in_page(id), node_len_);
+    return row;
+  }
+
   [[nodiscard]] size_t trailer_offset_in_page(PID id) const {
     return qg_page_trailer_offset(page_size_, npp_, id % npp_);
   }
@@ -3103,6 +3115,13 @@ class QGUpdater {
   }
 
   void write_at(uint64_t off, const char *buf, size_t len) {
+    // Last-line steal guard (design execution-pitfall 1): between a durable BEGIN
+    // and a durable END no index/arena maintenance write may happen -- the only
+    // durable maintenance store is the private overlay -> op-WAL. A stray write_at
+    // here (a hidden eviction/mirror/flush path) is a no-steal violation; poison.
+    if (maint_in_build_phase_ && !replaying_) {
+      poison("maintenance index/arena write before the END commit point (no-steal violation)");
+    }
     const int fd = direct_io_ ? wfd_ : fd_;
     if (direct_io_ && (reinterpret_cast<uintptr_t>(buf) & (kDioAlign - 1)) != 0) {
       char *b = tls_bounce(len);
@@ -3195,9 +3214,10 @@ class QGUpdater {
     for (auto it = maint_pages_.begin();
          it != maint_pages_.end() && maint_pages_.size() > cap;) {
       const size_t pi = it->first;
+      wal_failpoint(SegmentOpFailPoint::after_consolidate_overlay_modify_before_spill);  // C4
       const auto loc = maint_log_page(pi, it->second.data(), alaya::wal::WalFile::Sync::flush);
       maint_spilled_[pi] = loc;
-      wal_failpoint(SegmentOpFailPoint::after_consolidate_spill_flush);
+      wal_failpoint(SegmentOpFailPoint::after_consolidate_spill_flush);  // C5
       it = maint_pages_.erase(it);
     }
   }
@@ -3303,15 +3323,48 @@ class QGUpdater {
   // BEGIN-time headroom preflight (design section 1.2): a maintenance epoch may
   // spill up to ~2x the touched page set to the .opwal. A shortfall is an ordinary
   // pre-transaction error (the epoch has not started, so nothing to roll back).
-  void maint_statvfs_preflight() {
+  void maint_statvfs_preflight(bool reclaim_slots) {
     struct statvfs vfs {};
     if (::statvfs(op_wal_->path().c_str(), &vfs) != 0) {
       throw std::runtime_error("QGUpdater::consolidate: statvfs failed errno=" +
                                std::to_string(errno));
     }
     const uint64_t available = static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize;
-    const uint64_t needed =
-        static_cast<uint64_t>(file_pages()) * page_size_ * 2 + (uint64_t{1} << 20U);
+    // Precise headroom bound (design section 1.3; supersedes the old file_pages*2
+    // heuristic / JC-10). Every touched page is logged at most once per phase: rows
+    // are visited in page order and a completed page is never revisited within a
+    // phase, so the total kind=1 frame count <= repair_pages + reclaim_pages (a page
+    // touched by both phases is counted twice -- exactly its at-most-two logs). Per
+    // page-frame overhead = WAL7 header/trailer (kHeaderBytes 36 + kTrailerBytes 4)
+    // + SEGMENT_OP header (19) + row_patch fixed fields (pid 8 + offset 8 + len 4 =
+    // 20) = 79; each consolidate marker frame = 40 + 19 + 8 (epoch) = 67. A CoW
+    // filesystem also duplicates every installed index page, so add page_size per
+    // union page conservatively.
+    const uint64_t committed = committed_.load(std::memory_order_acquire);
+    const uint64_t committed_pages = committed == 0 ? 0 : (committed + npp_ - 1) / npp_;
+    const uint64_t repair_pages = committed_pages;                    // <= all live rows' pages
+    const uint64_t reclaim_pages = reclaim_slots ? committed_pages : 0;
+    constexpr uint64_t kPerPageFrameOverhead =
+        alaya::wal::kHeaderBytes + alaya::wal::kTrailerBytes + 19 + 20;  // == 79
+    constexpr uint64_t kMarkerFrameBytes = alaya::wal::kHeaderBytes + alaya::wal::kTrailerBytes +
+                                           19 + 8;  // == 67 (begin/end epoch marker)
+    const uint64_t per_page = page_size_ + kPerPageFrameOverhead;
+    // Saturating arithmetic: a page count large enough to overflow cannot fit on any
+    // real device, so saturate to UINT64_MAX (guaranteed reject) instead of wrapping.
+    auto sat_mul = [](uint64_t a, uint64_t b) -> uint64_t {
+      return (b != 0 && a > (std::numeric_limits<uint64_t>::max)() / b)
+                 ? (std::numeric_limits<uint64_t>::max)()
+                 : a * b;
+    };
+    auto sat_add = [](uint64_t a, uint64_t b) -> uint64_t {
+      return a > (std::numeric_limits<uint64_t>::max)() - b ? (std::numeric_limits<uint64_t>::max)()
+                                                            : a + b;
+    };
+    const uint64_t wal_growth =
+        sat_add(sat_mul(sat_add(repair_pages, reclaim_pages), per_page), 2 * kMarkerFrameBytes);
+    const uint64_t index_cow_growth = sat_mul(committed_pages, page_size_);
+    const uint64_t base = sat_add(wal_growth, index_cow_growth);
+    const uint64_t needed = sat_add(base, (std::max<uint64_t>)(uint64_t{16} << 20U, base / 20));
     if (available < needed) {
       throw std::runtime_error(
           "QGUpdater::consolidate: insufficient free space for the maintenance WAL");
@@ -3399,23 +3452,27 @@ class QGUpdater {
     if (write_cache_.total_pages() != 0) {
       poison("consolidate baseline cache did not drain to zero");
     }
-    maint_statvfs_preflight();
+    maint_statvfs_preflight(reclaim_slots);
     const uint64_t epoch = last_completed_consolidate_epoch_ + 1;
     maint_epoch_ = epoch;
     maint_reset_overlay();
     maint_local_free_head_ = free_list_head_.load(std::memory_order_acquire);
     maint_local_free_count_ = free_count_.load(std::memory_order_acquire);
     try {
+      wal_failpoint(SegmentOpFailPoint::before_consolidate_begin_append);  // C0
       wal_append(encode_consolidate_marker(segment_uid_,
                                            superblock_.generation,
                                            SegmentOpKind::consolidate_begin,
                                            epoch),
                  alaya::wal::WalFile::Sync::buffered);
-      wal_failpoint(SegmentOpFailPoint::after_consolidate_begin_append);
+      wal_failpoint(SegmentOpFailPoint::after_consolidate_begin_append);        // C1
+      wal_failpoint(SegmentOpFailPoint::before_consolidate_begin_fsync);        // C2
       force_wal();  // BEGIN durable before any page mutation
-      wal_failpoint(SegmentOpFailPoint::after_consolidate_begin_fsync);
+      wal_failpoint(SegmentOpFailPoint::after_consolidate_begin_fsync);         // C3
       maintenance_active_ = true;
+      maint_in_build_phase_ = true;  // no index/arena write allowed until END durable
       consolidate_row_phase(r_target, bloom_consolidate);
+      wal_failpoint(SegmentOpFailPoint::after_consolidate_live_repair_before_free_image);  // C6
       if (reclaim_slots) {
         maint_reclaim_phase();
       }
@@ -3427,16 +3484,21 @@ class QGUpdater {
           maint_log_page(pi, bytes.data(), alaya::wal::WalFile::Sync::buffered);
         }
       }
-      // END + fsync: the single durable commit point.
+      // END: buffered append -> torn-END window (C7) -> the single durable commit
+      // point (C8). Splitting append from force lets the harness cut a torn END; the
+      // net WAL bytes + observer notify are identical to one Sync::fsync append.
       wal_append(encode_consolidate_marker(segment_uid_,
                                            superblock_.generation,
                                            SegmentOpKind::consolidate_end,
                                            epoch),
-                 alaya::wal::WalFile::Sync::fsync);
-      wal_failpoint(SegmentOpFailPoint::after_consolidate_end_fsync);
-      // Commit point passed: install every touched page (no more steal risk).
-      maint_install_all();
-      wal_failpoint(SegmentOpFailPoint::after_consolidate_install_before_publish);
+                 alaya::wal::WalFile::Sync::buffered);
+      wal_failpoint(SegmentOpFailPoint::after_consolidate_end_append_before_fsync);  // C7
+      force_wal();  // END durable: the single maintenance commit point
+      wal_failpoint(SegmentOpFailPoint::after_consolidate_end_fsync);                // C8
+      // Commit point passed: leave the BUILD window so the install writes are allowed.
+      maint_in_build_phase_ = false;
+      maint_install_all();  // fires after_consolidate_install_page (C9) per page
+      wal_failpoint(SegmentOpFailPoint::after_consolidate_install_before_publish);   // C10
       if (reclaim_slots) {
         free_list_head_.store(maint_local_free_head_, std::memory_order_release);
         free_count_.store(maint_local_free_count_, std::memory_order_release);
@@ -3444,6 +3506,7 @@ class QGUpdater {
       last_completed_consolidate_epoch_ = epoch;
       maintenance_active_ = false;
       maint_reset_overlay();
+      wal_failpoint(SegmentOpFailPoint::after_consolidate_publish);                  // C11
     } catch (const std::exception &error) {
       // Design/checkpoint-admission ruling: a failure past BEGIN keeps the epoch
       // state and overlay intact and poisons the handle -- recovery rebuilds from
@@ -5627,6 +5690,10 @@ class QGUpdater {
   uint64_t maint_epoch_ = 0;                        // the in-flight epoch id
   PID maint_local_free_head_ = kPidMax;             // transaction-local free head (published at END)
   uint64_t maint_local_free_count_ = 0;
+  // True only inside the maintenance BUILD window [BEGIN durable, END durable):
+  // the last-line steal guard in write_at() poisons on ANY index/arena write in
+  // this window (design section 9.1 / W1 acceptance: END-前 index/arena 维护写 == 0).
+  bool maint_in_build_phase_ = false;
 };
 
 }  // namespace alaya::laser

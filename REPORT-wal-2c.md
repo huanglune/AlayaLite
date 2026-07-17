@@ -10,8 +10,9 @@
 
 - **W0 完成并 commit**:bloom MAP_SHARED 根治、恢复三阶段严格化、kind=2 trailer 幂等、FREE 引用完整性、v2/v3 reader + 选择器 fail-closed、kind=7/8 golden。
 - **W1 完成并 commit**(两个 commit:frame API/failpoints + consolidate 事务):consolidate 四参数在 enable_wal 下作为维护事务解禁、MaintenanceOverlay + WAL 溢写、epoch 恢复状态机 + 语义截断、free-list redo 后收敛(canonical chain)、v3 activation checkpoint、consolidate SIGKILL 矩阵。garden 仍 throw。
+- **W1 补账完成并 commit**(续程):完整 C0-C11 SIGKILL 崩溃矩阵(13 格,含 tiny-cap 强制 spill 的 C4/C5)+ consolidate 掉电族 roll-forward 测试(END durable → S_new over 全丢/全留 install);`(reclaim×bloom×r_target)` 5 格与非 WAL oracle 的 live-row 逐字节 + tombstone/free 集合一致;statvfs 精确上界(design §1.3,取代 JC-10);write_at BUILD-phase steal 断言("END 前 index/arena 维护写=0")。
 - **W2/W3**:未开始(见"遗留")。**W2 前须按纪律发起 codex 对抗审查。**
-- 相关 ctest(laser/collection/wal/crash 标签)40/40 绿;新增测试:frame 三 API、fail-closed 选择器、kind=7/8 golden、consolidate 三功能测试、consolidate SIGKILL 5 格。
+- 相关 ctest(laser/collection/wal/crash 标签)40/40 绿;新增测试:frame 三 API、fail-closed 选择器、kind=7/8 golden、consolidate 三功能测试、consolidate SIGKILL C0-C11(13 格)、consolidate 掉电 roll-forward、oracle 等价 5 格。
 
 ---
 
@@ -57,6 +58,8 @@
 - **JC-10**:statvfs 预检用 `file_pages()×page_size×2 + 1MiB` 启发式(非 codex 的逐帧 overhead 精确式)。理由:小图测试余量充足;精确上界为 deferred。
 - **JC-11**:恢复 absorbed 前缀(E ≤ base epoch)validate-only(stage 校验但不 re-apply)。采纳 codex B-2C-05 坑 5(虽 in-order replay 可证正确,保守更稳)。
 - **JC-12**:consolidate 失败(过 BEGIN)catch 中**保持** epoch/overlay 状态并 poison(不清理),交 reopen 重建(设计/准入裁决)。
+- **JC-13**(W1 补账,取代 JC-10):`maint_statvfs_preflight(reclaim_slots)` 用 design §1.3 精确上界。推导:repair/reclaim 各按页序处理、完成页本相位内不再触碰,故每页每相位至多 log 一次 ⇒ kind=1 帧数 ≤ repair_pages + reclaim_pages(混合页计两次=其至多两 log)。每页帧 overhead = WAL7(kHeaderBytes 36 + kTrailerBytes 4) + SEGMENT_OP 头 19 + row_patch 定长 20 = 79;marker 帧 = 40+19+8 = 67;另加 CoW 文件系统每装入页 ×page_size 的保守项 + max(16MiB, base/20) 余量。全程 saturating 乘加(溢出即 UINT64_MAX 拒绝)。repair_upper=reclaim_upper=committed_pages 是安全上界(bloom 模式候选页 ≤ committed_pages)。
+- **JC-14**(W1 补账,量化 JC-9 内存验收缺口):全流式 replay 仍**deferred**。量化依据:单个未 checkpoint 的维护 epoch 其 WAL 帧数 ≤ repair_pages+reclaim_pages ≤ 2×committed_pages(见 JC-13),故 `recovery_scan()` 峰值 ≈ 2× 索引 live 页字节(与加载索引同阶,非无界);epoch 状态机的 `epoch_pages`(latest-per-page)独立地 ≤ committed_pages×page_size(不随 spill 次数 S 涨)。真正的 O(WAL 字节)只在"多 epoch 长期不 checkpoint"下累积,而 checkpoint 的 WAL reset 在实践中封顶。将 `recovery_scan()` 改为 `visit_frames` 驱动(API 已建、已用于 overlay 溢写重载)可把 replay 峰值降到 O(max-frame + touched×page)——因动全部恢复/崩溃路径,风险大,列为 deferred 优化。"END 前维护写=0" 由 write_at 的 BUILD-phase 硬断言直接保证(任何隐蔽 steal 即 poison,C0-C7 崩溃格与 oracle 测试全绿即其反证)。
 
 ## 四、边界清单
 
@@ -80,6 +83,6 @@
 
 ## 六、遗留 / 未开始
 
-- **W1 deferred 硬化**:并行 OpenMP 维护 page workers + barrier-外 spill(JC-8);全流式 replay via visit_frames(JC-9);完整 C0-C11 + END-durable 后 index 任意 k 页/单页扇区撕裂的掉电族;statvfs 精确上界(JC-10);observer 断言"END 前 index/arena 维护写=0";`(reclaim×bloom×r_target)` 与非 WAL oracle page-hash/free-set 逐项等价对照;TSan 覆盖维护并行(单线程下 N/A,记录实况)。
+- **W1 deferred 硬化**(续程后现状):完整 C0-C11 崩溃矩阵 ✅、掉电 roll-forward 族 ✅、statvfs 精确上界 ✅(JC-13)、`(reclaim×bloom×r_target)` 非 WAL oracle 等价 ✅、"END 前维护写=0" write_at 硬断言 ✅。**仍 deferred**:并行 OpenMP 维护 page workers + barrier-外 spill(JC-8,单线程串行 lane 是 minimal-viable-correct);全流式 replay via visit_frames(JC-9/JC-14,已量化内存上界);TSan 覆盖维护并行(单线程下无并发维护写,tsan preset 亦 ALAYA_ENABLE_LASER=OFF,记录实况)。
 - **W2**:PID generation + bundle-only reuse(writer-private seed B-2C-01、canonical prebind 恢复完整性 B-2C-02、checkpoint 准入 all-reuse 窗口、effective_label override、2B adapter token 化、v3 PID activation、R0-R11、B-2C-07 硬验收)。**须 codex 对抗审查后进 W3。**
 - **W3**:Collection maintenance hook + 门禁链 B-2C-03、activation checkpoint 全套 + A/B 混合槽 seal 前双 v3 门禁、四携带项(B-03 failpoint/durability 三模式/B-09 SIGKILL keep-set/边界 7 rerank 回归)、非 goal 三条(已在上)、consolidate×active write/checkpoint/seal-rotate 交错矩阵、search×END 安装断言、statvfs/ENOSPC 两测试、四文件时间线 + 文档 `unified-wal-vocabulary.md`、TSan。

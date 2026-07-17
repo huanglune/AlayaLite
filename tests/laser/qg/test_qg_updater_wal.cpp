@@ -278,6 +278,95 @@ TEST(QgUpdaterWal, ConsolidateThenCheckpointFlipsV3AndReopens) {
   std::filesystem::remove_all(dir);
 }
 
+// W1 oracle equivalence: a WAL maintenance transaction must produce the SAME
+// consolidation result as the trusted non-WAL path for every (reclaim x bloom x
+// r_target) combination -- the live graph byte-for-byte, and the same tombstone /
+// free sets. The free-row next-free linkage is intentionally NOT compared: the WAL
+// path builds the canonical ascending chain (recovery byte-stability, clause 11)
+// while the non-WAL runtime path builds a LIFO chain, so only the free SET matches.
+struct OracleCase {
+  const char *name;
+  bool reclaim;
+  bool bloom;
+  size_t r_target;
+};
+class QgUpdaterWalOracle : public ::testing::TestWithParam<OracleCase> {};
+
+TEST_P(QgUpdaterWalOracle, WalConsolidateMatchesNonWalOracle) {
+  const auto param = GetParam();
+  const auto root = scratch_dir(std::string("oracle_") + param.name);
+  std::filesystem::remove_all(root);
+  const auto tmpl = root / "template";
+  auto base = WalTinyIndex::build(tmpl, kBaseN, 4242);
+  auto clone = [&](const char *sub) {
+    const auto dst = root / sub;
+    std::filesystem::copy(tmpl, dst,
+                          std::filesystem::copy_options::recursive |
+                              std::filesystem::copy_options::overwrite_existing);
+    return (dst / "wal_base").string();
+  };
+  std::vector<PID> tomb;
+  for (PID id = 3; id < static_cast<PID>(kBaseN); id += 17) tomb.push_back(id);
+
+  // --- non-WAL oracle: tombstone + consolidate + checkpoint, then snapshot ---
+  std::vector<std::vector<char>> oracle_rows(kBaseN);
+  std::vector<uint16_t> oracle_flags(kBaseN, 0);
+  uint64_t oracle_free = 0;
+  uint64_t oracle_live = 0;
+  {
+    const std::string prefix = clone("oracle");
+    QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+    qg.load_disk_index(prefix.c_str(), 0.0F);
+    qg.set_params(64, 1, 1);
+    UpdateParams params;  // enable_wal defaults to false: the trusted in-place path
+    params.ef_insert = 64;
+    params.max_points = kBaseN + 64;
+    QGUpdater upd(qg, params);
+    for (PID id : tomb) upd.tombstone(id);
+    upd.consolidate(1, param.r_target, param.reclaim, param.bloom);
+    upd.checkpoint();
+    for (PID id = 0; id < static_cast<PID>(kBaseN); ++id) {
+      oracle_flags[id] = upd.trailer(id).flags;
+      if ((oracle_flags[id] & (kQGRowTombstone | kQGRowFree)) == 0) {
+        oracle_rows[id] = upd.debug_read_row(id);
+      }
+    }
+    oracle_free = upd.free_count();
+    oracle_live = upd.live_count();
+  }
+
+  // --- WAL path: identical operations as one maintenance transaction ---
+  {
+    const std::string prefix = clone("wal");
+    Session s(prefix, kBaseN + 64);
+    for (PID id : tomb) s.upd->tombstone(id);
+    s.upd->consolidate(1, param.r_target, param.reclaim, param.bloom);
+    s.upd->checkpoint();
+    EXPECT_EQ(s.upd->free_count(), oracle_free) << "free set size differs from the oracle";
+    EXPECT_EQ(s.upd->live_count(), oracle_live) << "live count differs from the oracle";
+    for (PID id = 0; id < static_cast<PID>(kBaseN); ++id) {
+      const uint16_t flags = s.upd->trailer(id).flags;
+      const uint16_t mask = kQGRowTombstone | kQGRowFree;
+      ASSERT_EQ(flags & mask, oracle_flags[id] & mask)
+          << "pid " << id << " tombstone/free disagrees with the oracle";
+      if ((flags & mask) == 0) {
+        EXPECT_EQ(s.upd->debug_read_row(id), oracle_rows[id])
+            << "live row " << id << " bytes differ from the non-WAL oracle";
+      }
+    }
+  }
+  std::filesystem::remove_all(root);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    ConsolidateParamGrid, QgUpdaterWalOracle,
+    ::testing::Values(OracleCase{"purge_only", false, false, 0},
+                      OracleCase{"reclaim", true, false, 0},
+                      OracleCase{"bloom_reclaim", true, true, 0},
+                      OracleCase{"reclaim_rtarget", true, false, kDeg / 2},
+                      OracleCase{"bloom_reclaim_rtarget", true, true, kDeg / 2}),
+    [](const ::testing::TestParamInfo<OracleCase> &info) { return info.param.name; });
+
 // ---------------------------------------------------------------------------
 // W3: label transaction functional durability (commit_physical_bundle + replay
 // staging/promotion). The kill-point crash matrix lives in the crash test.

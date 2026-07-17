@@ -87,6 +87,14 @@ enum class SegmentOpFailPoint : std::uint8_t {
   after_consolidate_end_fsync,             // kind=4 durable (the commit point), before install
   after_consolidate_install_page,          // one index page installed post-commit
   after_consolidate_install_before_publish,  // all pages installed, before free-list/epoch publish
+  // 2C W1-backfill completion of the C0-C11 matrix (appended so every prior value
+  // is preserved; the logical time order no longer matches the numeric order).
+  before_consolidate_begin_append,               // C0: active epoch set, before the kind=3 append
+  before_consolidate_begin_fsync,                // C2: kind=3 buffered, before its force
+  after_consolidate_overlay_modify_before_spill,  // C4: an overlay page dirtied, before its spill
+  after_consolidate_live_repair_before_free_image,  // C6: live repair done, before any FREE image
+  after_consolidate_end_append_before_fsync,     // C7: kind=4 buffered, before its force (torn END)
+  after_consolidate_publish,                     // C11: free-list/epoch/idle all published
 };
 
 // Test-only observer for the persistence-model (power-loss) crash layer. It is
