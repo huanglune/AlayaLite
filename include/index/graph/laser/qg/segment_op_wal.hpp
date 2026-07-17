@@ -44,6 +44,14 @@ inline constexpr std::uint16_t kSegmentOpPayloadVersion = 1;
 // replay rewrite the superblock directly rather than merely validate it).
 inline constexpr std::size_t kSegmentSuperblockImageBytes = 512;
 
+// Record-type compatibility matrix (2A decision 1, codec suggestion 2):
+//   * old decoder -> new WAL: fails closed at the first kind=7/8 frame (its range
+//     check rejects the unknown kind) — no silent misread.
+//   * new decoder -> old WAL: accepts every kind=1..6 verbatim; labels fall back
+//     to identity (no kind=7/8 present).
+//   * new decoder -> mixed WAL: processes kind=5 (publish) and kind=8 (tx_publish)
+//     side by side; kind=5 NEVER promotes any staged label binding.
+// There is no safe downgrade. kind=1..6 wire bytes are frozen (golden-bytes test).
 enum class SegmentOpKind : std::uint8_t {
   row_patch = 1,          // pid, absolute byte offset, length, bytes (idempotent rewrite)
   tombstone = 2,          // pid (set-only; a resurrect is a new insert, never an un-tombstone)
@@ -51,6 +59,8 @@ enum class SegmentOpKind : std::uint8_t {
   consolidate_end = 4,    // epoch (phase barrier)
   publish = 5,            // visibility watermark (monotone max on replay)
   superblock_flip = 6,    // target slot + 512-byte superblock image (checkpoint commit point)
+  label_bind = 7,         // 2A: tx_id, row_op_id, pid, pid_generation, label (staged until tx_publish)
+  tx_publish = 8,         // 2A: tx_id, new_pid_watermark, binding_count, applied_collection_op_id
 };
 
 // Crash-injection points for the G1 crash matrix, ordered along one op's
@@ -63,6 +73,11 @@ enum class SegmentOpFailPoint : std::uint8_t {
   after_flip_append_before_superblock_write,
   after_superblock_write_before_wal_reset,
   after_wal_reset,
+  // 2A label-transaction cuts (appended so the existing six keep their values):
+  after_label_bind_append,         // bundle kind=7 binds buffered, before tx_publish append
+  before_tx_publish_append,        // snapshot pre-built, immediately before the kind=8 append
+  after_tx_publish_fsync,          // kind=8 durable, before the snapshot swap + committed store
+  label_slot_written_before_flip,  // inactive label slot durable, before the checkpoint flip frame
 };
 
 // Test-only observer for the persistence-model (power-loss) crash layer. It is
@@ -73,6 +88,9 @@ enum class SegmentOpFailPoint : std::uint8_t {
 struct SegmentIoObserver {
   std::function<void()> on_index_fsync{};
   std::function<void()> on_wal_fsync{};
+  // 2A: fired right after an inactive label-slot file is fsynced durable during a
+  // checkpoint, so the power-loss harness can snapshot the forced slot contents.
+  std::function<void()> on_label_slot_fsync{};
 };
 
 // One decoded SEGMENT_OP. Only the body fields matching `kind` are meaningful.
@@ -87,6 +105,14 @@ struct SegmentOp {
   std::uint64_t epoch{};           // consolidate_begin / consolidate_end
   std::uint64_t watermark{};       // publish
   std::uint8_t target_slot{};      // superblock_flip
+  // 2A label transaction. tx_id mirrors the frame batch_id (validated on replay).
+  std::uint64_t tx_id{};                     // label_bind, tx_publish
+  std::uint64_t row_op_id{};                 // label_bind: 0..binding_count-1 within the bundle
+  std::uint32_t pid_generation{};            // label_bind: must be 0 (non-zero => poison)
+  std::uint64_t label{};                     // label_bind: appended-row label (pid stored in `pid`)
+  std::uint64_t new_pid_watermark{};         // tx_publish: old_hwm + binding_count
+  std::uint64_t binding_count{};             // tx_publish: >= 1
+  std::uint64_t applied_collection_op_id{};  // tx_publish: caller monotone op watermark
 };
 
 namespace segment_op_detail {
@@ -176,6 +202,45 @@ inline void put_bytes(std::vector<std::byte> &out, std::span<const std::byte> va
   return out;
 }
 
+// label_bind body (2A): tx_id, row_op_id, pid (u32), pid_generation (u32), label.
+// Staged by tx_id on replay; promoted only when the matching tx_publish is seen.
+// The enclosing frame carries batch_id == tx_id (replay poisons on a mismatch).
+[[nodiscard]] inline auto encode_label_bind(std::uint64_t segment_id,
+                                            std::uint64_t segment_generation,
+                                            std::uint64_t tx_id,
+                                            std::uint64_t row_op_id,
+                                            std::uint32_t pid,
+                                            std::uint32_t pid_generation,
+                                            std::uint64_t label) -> std::vector<std::byte> {
+  std::vector<std::byte> out;
+  segment_op_detail::put_header(out, segment_id, segment_generation, SegmentOpKind::label_bind);
+  alaya::wal::put_u64(out, tx_id);
+  alaya::wal::put_u64(out, row_op_id);
+  alaya::wal::put_u32(out, pid);
+  alaya::wal::put_u32(out, pid_generation);
+  alaya::wal::put_u64(out, label);
+  return out;
+}
+
+// tx_publish body (2A): tx_id, new_pid_watermark, binding_count, applied op-id.
+// The single durable commit point of a physical bundle (fsync); its frame carries
+// batch_id == tx_id. binding_count == 0 is illegal (no empty / pure-tombstone tx).
+[[nodiscard]] inline auto encode_tx_publish(std::uint64_t segment_id,
+                                            std::uint64_t segment_generation,
+                                            std::uint64_t tx_id,
+                                            std::uint64_t new_pid_watermark,
+                                            std::uint64_t binding_count,
+                                            std::uint64_t applied_collection_op_id)
+    -> std::vector<std::byte> {
+  std::vector<std::byte> out;
+  segment_op_detail::put_header(out, segment_id, segment_generation, SegmentOpKind::tx_publish);
+  alaya::wal::put_u64(out, tx_id);
+  alaya::wal::put_u64(out, new_pid_watermark);
+  alaya::wal::put_u64(out, binding_count);
+  alaya::wal::put_u64(out, applied_collection_op_id);
+  return out;
+}
+
 // Decode one SEGMENT_OP payload. Throws std::invalid_argument on an unknown
 // payload version / kind or a truncated / trailing-byte payload.
 [[nodiscard]] inline auto decode_segment_op(std::span<const std::byte> payload) -> SegmentOp {
@@ -189,7 +254,7 @@ inline void put_bytes(std::vector<std::byte> &out, std::span<const std::byte> va
   op.segment_generation = decoder.u64();
   const auto kind_raw = decoder.u8();
   if (kind_raw < static_cast<std::uint8_t>(SegmentOpKind::row_patch) ||
-      kind_raw > static_cast<std::uint8_t>(SegmentOpKind::superblock_flip)) {
+      kind_raw > static_cast<std::uint8_t>(SegmentOpKind::tx_publish)) {
     throw std::invalid_argument("decode_segment_op: unknown op kind");
   }
   op.kind = static_cast<SegmentOpKind>(kind_raw);
@@ -220,6 +285,21 @@ inline void put_bytes(std::vector<std::byte> &out, std::span<const std::byte> va
       }
       const auto image = decoder.take(image_length);
       op.bytes.assign(image.begin(), image.end());
+      break;
+    }
+    case SegmentOpKind::label_bind: {
+      op.tx_id = decoder.u64();
+      op.row_op_id = decoder.u64();
+      op.pid = decoder.u32();
+      op.pid_generation = decoder.u32();
+      op.label = decoder.u64();
+      break;
+    }
+    case SegmentOpKind::tx_publish: {
+      op.tx_id = decoder.u64();
+      op.new_pid_watermark = decoder.u64();
+      op.binding_count = decoder.u64();
+      op.applied_collection_op_id = decoder.u64();
       break;
     }
   }

@@ -95,9 +95,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -117,6 +119,7 @@
 #include "index/graph/laser/quantization/fastscan_impl.hpp"
 #include "index/graph/laser/quantization/rabitq.hpp"
 #include "index/graph/laser/space/l2.hpp"
+#include "platform/fs.hpp"
 #include "simd/fastscan.hpp"
 #include "wal/frame.hpp"
 
@@ -435,6 +438,20 @@ struct GardenParams {
                            // out-edges; avoids the degree-reduction effect of pruning)
 };
 
+// Immutable appended-label snapshot (2A, B-02). Maps appended PIDs (pid >=
+// base_count) to explicit labels; PIDs absent from the map fall back to identity
+// at the segment layer. Published via std::atomic<shared_ptr> and never mutated
+// after publish, so lock-free search translates labels off a consistent snapshot.
+// The map is ordered so slot serialization is deterministic (ascending pid).
+struct LabelBindings {
+  std::map<PID, uint64_t> bindings;  // pid -> label, appended PIDs only
+
+  [[nodiscard]] const uint64_t *find(PID pid) const {
+    const auto it = bindings.find(pid);
+    return it == bindings.end() ? nullptr : &it->second;
+  }
+};
+
 struct UpdateParams {
   size_t ef_insert = 100;
   float alpha = 1.2F;
@@ -542,6 +559,16 @@ class QGUpdater {
           "QGUpdater: enable_wal is incompatible with direct_io (O_DIRECT bypasses the "
           "write-ahead ordering between the WAL and the index)");
     }
+    // No-steal (clause B): with write_cache off, modify_node_page writes each page
+    // through immediately (force_wal + pwrite), making an uncommitted after-image
+    // durable BEFORE the commit fsync. A torn bundle then leaves a durable backlink
+    // patch whose tentative PID is re-appended by the next transaction => a stale
+    // edge. enable_wal therefore requires the no-steal page cache.
+    if (enable_wal_ && !params_.write_cache) {
+      throw std::invalid_argument(
+          "QGUpdater: enable_wal requires write_cache (the no-steal page cache; a write-through "
+          "cache would make uncommitted after-images durable before the commit fsync)");
+    }
     for (auto &word : hidden_words_) word.store(0, std::memory_order_relaxed);
     for (auto &generation : row_generations_) generation.store(0, std::memory_order_relaxed);
     // Reads stay buffered: the OS page cache serves the ~ef_insert row reads
@@ -616,6 +643,31 @@ class QGUpdater {
 
   [[nodiscard]] size_t num_points() const { return committed_.load(std::memory_order_acquire); }
 
+  // Read-path poison gate (B-02): search/label translation never take the handle
+  // write mutex, so they check this lock-free atomic latch at entry and exit. A
+  // poisoned handle requires recovery — reads must fail closed rather than serve a
+  // half-published or torn state.
+  void ensure_readable() const {
+    if (poisoned_.load(std::memory_order_acquire)) {
+      throw std::runtime_error("QGUpdater op-WAL handle is poisoned (recovery required)");
+    }
+  }
+
+  // Current immutable appended-label snapshot (B-02). Acquire-load AFTER the
+  // committed watermark used by search: the snapshot is published before committed
+  // on the write side, so it always covers every binding for a committed PID.
+  [[nodiscard]] std::shared_ptr<const LabelBindings> label_snapshot() const {
+    const std::lock_guard<std::mutex> guard(label_snapshot_mutex_);
+    return label_snapshot_;
+  }
+  // True iff pid is a committed, non-hidden (live) row. Used by the segment-layer
+  // global bijection check (B-06) over the effective-label domain.
+  [[nodiscard]] bool row_is_live(PID pid) const {
+    return static_cast<size_t>(pid) < committed_.load(std::memory_order_acquire) && !is_hidden(pid);
+  }
+  [[nodiscard]] uint64_t last_committed_txid() const { return last_committed_txid_; }
+  [[nodiscard]] uint64_t applied_collection_op_id() const { return applied_collection_op_id_; }
+
   [[nodiscard]] size_t allocated_points() const {
     return allocated_points_.load(std::memory_order_acquire);
   }
@@ -629,6 +681,7 @@ class QGUpdater {
   }
 
   [[nodiscard]] uint64_t generation() const { return superblock_.generation; }
+  [[nodiscard]] uint64_t segment_uid() const { return segment_uid_; }
 
   [[nodiscard]] int active_superblock_slot() const { return active_superblock_slot_; }
 
@@ -970,6 +1023,29 @@ class QGUpdater {
    * and backlinks for ids below `new_committed` must already be written.
    */
   void publish(size_t new_committed) {
+    // The kind=5 emit is byte-identical to the pre-refactor path (golden bytes +
+    // the 12-cell crash matrix protect it); commit_physical_bundle reuses the
+    // shared core below with a snapshot-swap emit instead of a publish frame.
+    publish_common(new_committed, [&] {
+      if (enable_wal_ && !replaying_) {
+        if (has_staged_edges()) {
+          poison("staged backlinks must be drained before publish under enable_wal");
+        }
+        wal_failpoint(SegmentOpFailPoint::after_apply_before_publish_fsync);
+        wal_append(encode_publish(segment_uid_, superblock_.generation, new_committed),
+                   alaya::wal::WalFile::Sync::fsync);
+        wal_failpoint(SegmentOpFailPoint::after_publish_fsync);
+      }
+    });
+  }
+
+  // Shared publish core (clause B): validate the watermark, drain reused ids,
+  // then run `emit_record` (the kind=5 publish frame for publish(); the label
+  // snapshot swap for a bundle) at exactly the pre-refactor point — after the
+  // reused-row visibility fixups and before the committed release-store. Group
+  // commit still forces every buffered after-image durable inside `emit_record`.
+  template <typename EmitFn>
+  void publish_common(size_t new_committed, EmitFn &&emit_record) {
     if (enable_wal_) ensure_writable();
     const size_t old_committed = committed_.load(std::memory_order_acquire);
     if (new_committed < old_committed || new_committed > allocated_points()) {
@@ -1002,23 +1078,93 @@ class QGUpdater {
       mirror_deleted_erase(id);
       clear_hidden(id);
     }
-    // Group commit (clause B): every buffered after-image for the batch and the
-    // publish record are forced together before the watermark advances. All
-    // backlink after-images must already exist, so staged (deferred) backlinks
-    // are rejected under enable_wal — the mutable segment patches inline.
-    if (enable_wal_ && !replaying_) {
-      if (has_staged_edges()) {
-        poison("staged backlinks must be drained before publish under enable_wal");
-      }
-      wal_failpoint(SegmentOpFailPoint::after_apply_before_publish_fsync);
-      wal_append(encode_publish(segment_uid_, superblock_.generation, new_committed),
-                 alaya::wal::WalFile::Sync::fsync);
-      wal_failpoint(SegmentOpFailPoint::after_publish_fsync);
-    }
+    emit_record();
     live_count_.fetch_add(reused.size() + (new_committed - old_committed),
                           std::memory_order_acq_rel);
     committed_.store(new_committed, std::memory_order_release);
     qg_.num_points_ = new_committed;
+  }
+
+  // Commit a physical label bundle (2A, semantics 2/3): append kind=7 per row +
+  // one kind=8 (fsync) as the single durable commit point, atomically swap the
+  // label snapshot, then advance committed via publish_common (snapshot released
+  // before committed). Preconditions throw (caller error, never poison); any I/O
+  // or internal failure poisons. Returns the appended PID range [old_hwm, new_hwm).
+  std::pair<PID, PID> commit_physical_bundle(uint64_t txid,
+                                             uint64_t applied_op_id,
+                                             const float *vecs,
+                                             const uint64_t *labels,
+                                             size_t n) {
+    if (!enable_wal_) {
+      throw std::logic_error("QGUpdater::commit_physical_bundle requires enable_wal");
+    }
+    ensure_writable();
+    if (n == 0 || vecs == nullptr || labels == nullptr) {
+      throw std::invalid_argument("commit_physical_bundle: empty/null bundle");
+    }
+    if (txid <= last_committed_txid_) {
+      throw std::invalid_argument("commit_physical_bundle: txid must exceed last_committed_txid");
+    }
+    if (applied_op_id < applied_collection_op_id_) {
+      throw std::invalid_argument(
+          "commit_physical_bundle: applied_collection_op_id must not regress");
+    }
+    const size_t old_hwm = committed_.load(std::memory_order_acquire);
+    if (old_hwm != allocated_points()) {
+      throw std::logic_error("commit_physical_bundle requires allocated == committed");
+    }
+    const size_t new_hwm = old_hwm + n;
+    if (new_hwm > static_cast<size_t>(kPidMax) || new_hwm > row_generations_.size()) {
+      throw std::invalid_argument("commit_physical_bundle: PID capacity exceeded");
+    }
+    // Mutating section (B-04 hardening): past this point allocated may exceed
+    // committed, so ANY failure -- including an exception that does not itself
+    // poison (e.g. std::bad_alloc while pre-building the snapshot) -- must poison
+    // the handle. Otherwise a later add() would kind=5-publish over the allocation
+    // gap and commit the failed bundle's rows WITHOUT bindings (identity labels).
+    try {
+      // (1) allocate + insert each row and append its kind=7 bind (buffered). Row
+      // after-images buffer too; the kind=8 fsync forces the whole group durable.
+      for (size_t i = 0; i < n; ++i) {
+        const PID pid = allocate_and_insert(vecs + i * dim_);
+        if (static_cast<size_t>(pid) != old_hwm + i) {
+          poison("commit_physical_bundle: append produced a non-dense PID");
+        }
+        wal_append(encode_label_bind(segment_uid_, superblock_.generation, txid,
+                                     static_cast<uint64_t>(i), pid, /*pid_generation=*/0, labels[i]),
+                   alaya::wal::WalFile::Sync::buffered, txid);
+      }
+      wal_failpoint(SegmentOpFailPoint::after_label_bind_append);
+      // Reverse edges must be materialized inline before the commit (B-03/clause B):
+      // a staged (deferred) backlink would let kind=8 commit a row whose only routing
+      // edges live in RAM and vanish on a crash, leaving it permanently unreachable.
+      if (has_staged_edges()) {
+        poison("commit_physical_bundle: staged backlinks must be drained (inline patching "
+               "is required under enable_wal)");
+      }
+      // (2) pre-build the new immutable snapshot (zero allocation / no failure after
+      // this point on the publish path).
+      auto next = std::make_shared<LabelBindings>(*load_label_snapshot());
+      for (size_t i = 0; i < n; ++i) {
+        next->bindings.emplace(static_cast<PID>(old_hwm + i), labels[i]);
+      }
+      std::shared_ptr<const LabelBindings> published = std::move(next);
+      // (3) append kind=8 + fsync: the single durable commit point of the bundle.
+      wal_failpoint(SegmentOpFailPoint::before_tx_publish_append);
+      wal_append(encode_tx_publish(segment_uid_, superblock_.generation, txid,
+                                   static_cast<uint64_t>(new_hwm), static_cast<uint64_t>(n),
+                                   applied_op_id),
+                 alaya::wal::WalFile::Sync::fsync, txid);
+      wal_failpoint(SegmentOpFailPoint::after_tx_publish_fsync);
+      // (4) publish snapshot (release) THEN committed (release), via the shared core.
+      publish_common(new_hwm, [&] { store_label_snapshot(published); });
+      last_committed_txid_ = txid;
+      applied_collection_op_id_ = applied_op_id;
+      return {static_cast<PID>(old_hwm), static_cast<PID>(new_hwm)};
+    } catch (const std::exception &error) {
+      // poison() re-throws (preserving the first reason if already poisoned).
+      poison(std::string("commit_physical_bundle failed mid-transaction: ") + error.what());
+    }
   }
 
   /**
@@ -1553,6 +1699,32 @@ class QGUpdater {
     next.file_size = file_size;
     if (enable_wal_) {
       write_superblock_uid(next, segment_uid_);  // carry the lineage forward
+      // Label slot integration: the explicit binding set is append-only, so a
+      // strict count increase means new bindings to persist. Write them to the
+      // INACTIVE slot (double-buffered), then carry the new label tuple; otherwise
+      // copy the current tuple. The tx watermarks always ride along (B-03: even a
+      // no-increment checkpoint must carry the txid history forward).
+      const auto snap = load_label_snapshot();
+      const uint64_t current_count = snap->bindings.size();
+      LabelSlotState next_label;
+      if (current_count > label_count_) {
+        const int inactive_label_slot = active_label_slot_ == 0 ? 1 : 0;
+        const auto body = serialize_label_slot(*snap);
+        write_label_slot_file(inactive_label_slot, body);  // pwrite + fsync (slot durable)
+        wal_failpoint(SegmentOpFailPoint::label_slot_written_before_flip);
+        next_label.slot = static_cast<uint64_t>(inactive_label_slot);
+        next_label.generation = label_generation_ + 1;
+        next_label.count = current_count;
+        next_label.checksum = static_cast<uint64_t>(alaya::wal::crc32(body));
+      } else {
+        next_label.slot = static_cast<uint64_t>(active_label_slot_);
+        next_label.generation = label_generation_;
+        next_label.count = label_count_;
+        next_label.checksum = label_checksum_;
+      }
+      write_superblock_label_state(next, next_label);
+      write_superblock_tx_state(next,
+                                TxWatermarkState{last_committed_txid_, applied_collection_op_id_});
     }
     next.checksum = qg_superblock_checksum(next);
     const int next_slot = active_superblock_slot_ == 0 ? 1 : 0;
@@ -1591,6 +1763,13 @@ class QGUpdater {
     superblock_ = next;
     active_superblock_slot_ = next_slot;
     qg_.num_points_ = committed_.load(std::memory_order_acquire);
+    if (enable_wal_) {
+      const auto ls = read_superblock_label_state(next);
+      active_label_slot_ = static_cast<int>(ls.slot);
+      label_generation_ = ls.generation;
+      label_count_ = ls.count;
+      label_checksum_ = ls.checksum;
+    }
   }
 
   void finalize() { checkpoint(); }
@@ -4066,8 +4245,29 @@ class QGUpdater {
   // rebuild (clause C), a flip-frame generation state machine (clause E), and a
   // fail-closed writer that poisons on any WAL/critical-index error (clause I).
 
-  // segment_uid occupies the first 8 bytes of QGSuperblockV2::reserved.
+  // QGSuperblockV2::reserved[408] sub-layout (host-endian, mirroring the uid
+  // convention). 512B superblock size is unchanged; see qg.hpp for the map.
+  //   [0..8)   segment_uid
+  //   [8..40)  label state: slot | generation | count | checksum (4x u64)
+  //   [40..56) tx state: last_committed_txid | applied_collection_op_id (2x u64)
+  //   [56..408) reserved for 2C.
   static constexpr size_t kUidReservedOffset = 0;
+  static constexpr size_t kLabelStateReservedOffset = 8;
+  static constexpr size_t kTxStateReservedOffset = 40;
+  static_assert(kTxStateReservedOffset + 16 <= 408,
+                "superblock reserved sub-layout overflows QGSuperblockV2::reserved[]");
+
+  struct LabelSlotState {
+    uint64_t slot = 0;
+    uint64_t generation = 0;
+    uint64_t count = 0;
+    uint64_t checksum = 0;  // low 32 bits = crc32 of the sorted slot body; high 32 must be 0
+  };
+  struct TxWatermarkState {
+    uint64_t last_committed_txid = 0;
+    uint64_t applied_collection_op_id = 0;
+  };
+
   [[nodiscard]] static uint64_t read_superblock_uid(const QGSuperblockV2 &sb) {
     uint64_t uid = 0;
     std::memcpy(&uid, sb.reserved.data() + kUidReservedOffset, sizeof(uid));
@@ -4076,8 +4276,217 @@ class QGUpdater {
   static void write_superblock_uid(QGSuperblockV2 &sb, uint64_t uid) {
     std::memcpy(sb.reserved.data() + kUidReservedOffset, &uid, sizeof(uid));
   }
+  [[nodiscard]] static LabelSlotState read_superblock_label_state(const QGSuperblockV2 &sb) {
+    LabelSlotState s;
+    const auto *base = sb.reserved.data() + kLabelStateReservedOffset;
+    std::memcpy(&s.slot, base + 0, 8);
+    std::memcpy(&s.generation, base + 8, 8);
+    std::memcpy(&s.count, base + 16, 8);
+    std::memcpy(&s.checksum, base + 24, 8);
+    return s;
+  }
+  static void write_superblock_label_state(QGSuperblockV2 &sb, const LabelSlotState &s) {
+    auto *base = sb.reserved.data() + kLabelStateReservedOffset;
+    std::memcpy(base + 0, &s.slot, 8);
+    std::memcpy(base + 8, &s.generation, 8);
+    std::memcpy(base + 16, &s.count, 8);
+    std::memcpy(base + 24, &s.checksum, 8);
+  }
+  [[nodiscard]] static TxWatermarkState read_superblock_tx_state(const QGSuperblockV2 &sb) {
+    TxWatermarkState s;
+    const auto *base = sb.reserved.data() + kTxStateReservedOffset;
+    std::memcpy(&s.last_committed_txid, base + 0, 8);
+    std::memcpy(&s.applied_collection_op_id, base + 8, 8);
+    return s;
+  }
+  static void write_superblock_tx_state(QGSuperblockV2 &sb, const TxWatermarkState &s) {
+    auto *base = sb.reserved.data() + kTxStateReservedOffset;
+    std::memcpy(base + 0, &s.last_committed_txid, 8);
+    std::memcpy(base + 8, &s.applied_collection_op_id, 8);
+  }
+
+  // --- 2A label slot serialization + durable double-buffered slot files ---
+  // Slot body = explicit little-endian {pid u32, pid_generation u32, label u64}
+  // per binding, ascending pid (std::map order). Checksum = crc32 of that body.
+  [[nodiscard]] static std::vector<std::byte> serialize_label_slot(const LabelBindings &lb) {
+    std::vector<std::byte> out;
+    out.reserve(lb.bindings.size() * 16);
+    for (const auto &[pid, label] : lb.bindings) {
+      alaya::wal::put_u32(out, static_cast<std::uint32_t>(pid));
+      alaya::wal::put_u32(out, 0);  // pid_generation is always 0 in 2A
+      alaya::wal::put_u64(out, label);
+    }
+    return out;
+  }
+
+  // Load + fully validate a slot file against the superblock tuple (all failures
+  // poison / fail-closed). Caller guarantees a non-canonical-empty tuple.
+  LabelBindings load_label_slot_bindings(const std::string &path, uint64_t count,
+                                         uint64_t checksum) {
+    if ((checksum >> 32) != 0) {
+      poison("label slot checksum high 32 bits must be zero");
+    }
+    if (count > static_cast<uint64_t>((std::numeric_limits<std::size_t>::max)()) / 16) {
+      poison("label slot count overflows the slot size");
+    }
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+      poison("label slot file is missing for a non-empty label tuple");
+    }
+    const auto file_size = std::filesystem::file_size(path, ec);
+    if (ec) {
+      poison("cannot stat the label slot file");
+    }
+    const uint64_t expected = count * 16;
+    if (file_size != expected) {
+      poison("label slot size does not equal count*16");
+    }
+    std::vector<std::byte> bytes(static_cast<std::size_t>(expected));
+    if (expected > 0) {
+      std::ifstream in(path, std::ios::binary);
+      if (!in) {
+        poison("cannot open the label slot file");
+      }
+      in.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+      if (!in) {
+        poison("short read on the label slot file");
+      }
+    }
+    if (static_cast<uint64_t>(alaya::wal::crc32(bytes)) != (checksum & 0xffffffffULL)) {
+      poison("label slot checksum mismatch");
+    }
+    LabelBindings lb;
+    uint64_t prev_pid = 0;
+    bool first = true;
+    for (uint64_t i = 0; i < count; ++i) {
+      const std::size_t off = static_cast<std::size_t>(i) * 16;
+      const auto pid = alaya::wal::get_u32(bytes, off);
+      const auto gen = alaya::wal::get_u32(bytes, off + 4);
+      const auto label = alaya::wal::get_u64(bytes, off + 8);
+      if (gen != 0) {
+        poison("label slot entry has a non-zero generation");
+      }
+      if (!first && pid <= prev_pid) {
+        poison("label slot entries are not strictly ascending by pid");
+      }
+      first = false;
+      prev_pid = pid;
+      lb.bindings.emplace(static_cast<PID>(pid), label);
+    }
+    return lb;
+  }
+
+  // Overwrite the inactive slot in place (its directory entry is already durable
+  // from precreate_label_slots, so no rename — B-05). Never touches the active slot.
+  void write_label_slot_file(int slot, const std::vector<std::byte> &body) {
+    const auto &path = label_slot_path_[slot];
+    {
+      std::ofstream out(path, std::ios::binary | std::ios::trunc);
+      if (!out) {
+        poison("cannot open the inactive label slot for write");
+      }
+      if (!body.empty()) {
+        out.write(reinterpret_cast<const char *>(body.data()),
+                  static_cast<std::streamsize>(body.size()));
+      }
+      out.flush();
+      if (!out) {
+        poison("cannot write the inactive label slot");
+      }
+    }
+    try {
+      alaya::platform::sync_file_or_throw(path);
+    } catch (const std::exception &error) {
+      poison(std::string("label slot fsync failed: ") + error.what());
+    }
+    if (io_observer_ != nullptr && !replaying_ && io_observer_->on_label_slot_fsync) {
+      io_observer_->on_label_slot_fsync();
+    }
+  }
+
+  // B-05 root-cause fix: pre-create BOTH slot files (empty) + fsync each + fsync
+  // the parent directory once, so every later flip only overwrites an inactive
+  // slot's contents (its directory entry is already durable). Existing (non-empty)
+  // slot files are left untouched.
+  void precreate_label_slots() {
+    bool created = false;
+    std::error_code ec;
+    for (int s = 0; s < 2; ++s) {
+      if (!std::filesystem::exists(label_slot_path_[s], ec)) {
+        {
+          std::ofstream f(label_slot_path_[s], std::ios::binary | std::ios::trunc);
+          if (!f) {
+            poison("cannot pre-create a label slot file");
+          }
+        }
+        try {
+          alaya::platform::sync_file_or_throw(label_slot_path_[s]);
+        } catch (const std::exception &error) {
+          poison(std::string("label slot pre-create fsync failed: ") + error.what());
+        }
+        created = true;
+      }
+    }
+    if (created) {
+      try {
+        alaya::platform::sync_directory_or_throw(
+            std::filesystem::path(label_slot_path_[0]).parent_path());
+      } catch (const std::exception &error) {
+        poison(std::string("label slot directory fsync failed: ") + error.what());
+      }
+    }
+  }
+
+  // Snapshot pointer accessors: a tiny dedicated mutex (never the handle mutex)
+  // makes the shared_ptr swap/copy race-free and portable (no atomic<shared_ptr>).
+  [[nodiscard]] std::shared_ptr<const LabelBindings> load_label_snapshot() const {
+    const std::lock_guard<std::mutex> guard(label_snapshot_mutex_);
+    return label_snapshot_;
+  }
+  void store_label_snapshot(std::shared_ptr<const LabelBindings> snap) {
+    const std::lock_guard<std::mutex> guard(label_snapshot_mutex_);
+    label_snapshot_ = std::move(snap);
+  }
+
+  // Publish the immutable snapshot from the recovery scratch map (release via mutex).
+  void publish_label_snapshot() {
+    auto snap = std::make_shared<LabelBindings>();
+    snap->bindings = label_working_;
+    store_label_snapshot(std::shared_ptr<const LabelBindings>(std::move(snap)));
+  }
+
+  // Adopt the label + tx state of a base into the running/base watermarks and the
+  // recovery scratch map (used at recovery start and on a flip adoption in replay).
+  void adopt_label_state(const QGSuperblockV2 &sb) {
+    const auto ls = read_superblock_label_state(sb);
+    const auto tx = read_superblock_tx_state(sb);
+    last_committed_txid_ = tx.last_committed_txid;
+    applied_collection_op_id_ = tx.applied_collection_op_id;
+    base_committed_txid_ = tx.last_committed_txid;
+    base_applied_op_id_ = tx.applied_collection_op_id;
+    base_num_points_ = sb.num_points;
+    label_generation_ = ls.generation;
+    label_count_ = ls.count;
+    label_checksum_ = ls.checksum;
+    staged_binds_.clear();
+    if (ls.generation == 0 && ls.count == 0 && ls.checksum == 0) {
+      active_label_slot_ = ls.slot <= 1 ? static_cast<int>(ls.slot) : 0;
+      label_working_.clear();
+      return;  // canonical legacy empty: the slot file may be absent
+    }
+    if (ls.slot > 1) {
+      poison("label slot index out of range in the superblock");
+    }
+    active_label_slot_ = static_cast<int>(ls.slot);
+    auto lb = load_label_slot_bindings(label_slot_path_[ls.slot], ls.count, ls.checksum);
+    label_working_ = std::move(lb.bindings);
+  }
 
   [[noreturn]] void poison(const std::string &reason) {
+    // Set the lock-free poison latch first so a concurrent search (which never
+    // takes the handle write mutex) observes the poisoned handle via the atomic,
+    // without racing on the poison_reason_ std::string (write-path only).
+    poisoned_.store(true, std::memory_order_release);
     if (poison_reason_.empty()) {
       poison_reason_ = reason;
     }
@@ -4114,10 +4523,14 @@ class QGUpdater {
     return false;
   }
 
-  // Append one SEGMENT_OP frame; poison the writer on any WAL error.
-  void wal_append(const std::vector<std::byte> &payload, alaya::wal::WalFile::Sync sync) {
+  // Append one SEGMENT_OP frame; poison the writer on any WAL error. batch_id is 0
+  // for kind=1..6 (byte-identical to before); kind=7/8 carry tx_id in batch_id, and
+  // replay validates frame.batch_id == payload.tx_id (B-04).
+  void wal_append(const std::vector<std::byte> &payload,
+                  alaya::wal::WalFile::Sync sync,
+                  std::uint64_t batch_id = 0) {
     try {
-      op_wal_->append(kSegmentOpRecordType, 0, ++wal_op_id_, 0, payload, sync);
+      op_wal_->append(kSegmentOpRecordType, 0, ++wal_op_id_, batch_id, payload, sync);
     } catch (const std::exception &error) {
       poison(std::string("WAL append failed: ") + error.what());
     }
@@ -4167,18 +4580,42 @@ class QGUpdater {
         segment_uid_ = 0x9E3779B97F4A7C15ULL;
       }
     }
+    label_slot_path_[0] = qg_.index_file_name_ + ".labels.slot0";
+    label_slot_path_[1] = qg_.index_file_name_ + ".labels.slot1";
+    store_label_snapshot(std::make_shared<const LabelBindings>());
     op_wal_ = std::make_unique<alaya::wal::WalFile>(qg_.index_file_name_ + ".opwal");
     const auto &scanned = op_wal_->recovery_scan();
     if (fresh_lineage) {
-      if (!scanned.frames.empty()) {
-        poison("enable_wal on an unstamped superblock but the .opwal already has frames");
+      // A non-empty .opwal on an UNSTAMPED (uid==0) superblock is the legal
+      // fresh-enable crash window: a fresh checkpoint fsynced its flip frame but
+      // crashed before the superblock write, so the base is still unstamped yet the
+      // WAL holds an orphan flip. No committed op-WAL data can exist on an unstamped
+      // base, so the orphan is discardable -- checkpoint() below overwrites the WAL
+      // via reset_to_single_frame. Guard: only flip frames are legal here; anything
+      // else is unexpected (data on an unstamped base) and poisons (fail-closed).
+      for (const auto &frame : scanned.frames) {
+        SegmentOp probe;
+        try {
+          probe = decode_segment_op(frame.payload);
+        } catch (const std::exception &) {
+          poison("enable_wal on an unstamped superblock but the .opwal has an undecodable frame");
+        }
+        if (probe.kind != SegmentOpKind::superblock_flip) {
+          poison("enable_wal on an unstamped superblock but the .opwal has committed op frames");
+        }
       }
-      checkpoint();  // stamps the uid into a fresh durable base and resets the WAL
+      label_working_.clear();
+      checkpoint();              // stamps uid + canonical label/tx tuple; overwrites the WAL
+      publish_label_snapshot();  // empty snapshot
+      precreate_label_slots();   // B-05: both slots + parent dir durable before any content flip
       return;
     }
+    adopt_label_state(superblock_);  // load persisted bindings + tx watermarks from the base
     if (!scanned.frames.empty()) {
-      replay_and_rebuild(scanned);
+      replay_and_rebuild(scanned);   // promotes staged bundles into label_working_ (W3)
     }
+    publish_label_snapshot();        // seal the recovered label state (tail convergence)
+    precreate_label_slots();
   }
 
   void replay_and_rebuild(const alaya::wal::ScanResult &scanned) {
@@ -4216,6 +4653,12 @@ class QGUpdater {
         case SegmentOpKind::superblock_flip:
           replay_flip(op);
           break;
+        case SegmentOpKind::label_bind:
+          replay_label_bind(op, frame.batch_id);
+          break;
+        case SegmentOpKind::tx_publish:
+          replay_tx_publish(op, frame.batch_id, committed_watermark);
+          break;
         case SegmentOpKind::consolidate_begin:
         case SegmentOpKind::consolidate_end:
           replaying_ = false;
@@ -4247,6 +4690,124 @@ class QGUpdater {
       poison("row_patch pid/offset geometry mismatch");
     }
     write_at(op.offset, reinterpret_cast<const char *>(op.bytes.data()), op.bytes.size());
+  }
+
+  // Stage a label_bind by tx_id (B-04): pid_generation must be 0 and the frame
+  // batch_id must equal the payload tx_id. Set-level validation happens at
+  // tx_publish; a tx that never reaches tx_publish is silently dropped.
+  void replay_label_bind(const SegmentOp &op, uint64_t frame_batch_id) {
+    if (op.pid_generation != 0) {
+      poison("op-WAL label_bind has a non-zero pid_generation");
+    }
+    if (frame_batch_id != op.tx_id) {
+      poison("op-WAL label_bind frame batch_id != payload tx_id");
+    }
+    // Idempotent de-dup by (tx_id, row_op_id): a same-txid retry after a torn bundle
+    // whose earlier binds survived in the OS page cache (process crash on a bundle
+    // larger than the WAL userspace buffer) re-appends identical binds. Collapse
+    // them (same pid+label == idempotent; differing == poison) so a legal retry is
+    // not falsely rejected by the count check. Torn power-loss states never expose
+    // this (the forced WAL ends at the last fsync, before any bind).
+    auto &staged = staged_binds_[op.tx_id];
+    for (const auto &existing : staged) {
+      if (existing.row_op_id == op.row_op_id) {
+        if (existing.pid != static_cast<PID>(op.pid) || existing.label != op.label) {
+          poison("op-WAL label_bind conflicting re-bind of the same (tx_id, row_op_id)");
+        }
+        return;  // idempotent duplicate
+      }
+    }
+    staged.push_back(LabelBindStage{op.row_op_id, static_cast<PID>(op.pid), op.label});
+  }
+
+  // Promote or idempotently verify a tx_publish (B-04, semantics 4). Splits on the
+  // adopted base's persisted txid: (a) a new tx to promote, (b) a tx already
+  // absorbed by the base (new superblock flipped, old WAL not yet reset).
+  void replay_tx_publish(const SegmentOp &op, uint64_t frame_batch_id,
+                         uint64_t &committed_watermark) {
+    if (frame_batch_id != op.tx_id) {
+      poison("op-WAL tx_publish frame batch_id != payload tx_id");
+    }
+    if (op.binding_count == 0) {
+      poison("op-WAL tx_publish binding_count must be >= 1");
+    }
+    const auto it = staged_binds_.find(op.tx_id);
+    static const std::vector<LabelBindStage> kNoStaged;
+    const std::vector<LabelBindStage> &staged = it != staged_binds_.end() ? it->second : kNoStaged;
+
+    if (op.tx_id <= base_committed_txid_) {
+      // (b) already absorbed by the selected base: verify idempotently and skip.
+      // Do NOT apply new-range checks or re-promote.
+      if (op.new_pid_watermark > base_num_points_) {
+        poison("op-WAL absorbed tx_publish watermark exceeds the base num_points");
+      }
+      if (op.applied_collection_op_id > base_applied_op_id_) {
+        poison("op-WAL absorbed tx_publish applied_op_id exceeds the base");
+      }
+      if (staged.size() != op.binding_count) {
+        poison("op-WAL absorbed tx_publish staged bind count mismatch");
+      }
+      for (const auto &bind : staged) {
+        if (bind.row_op_id >= op.binding_count) {
+          poison("op-WAL absorbed tx_publish row_op_id out of range");
+        }
+        const auto found = label_working_.find(bind.pid);
+        if (found == label_working_.end() || found->second != bind.label) {
+          poison("op-WAL absorbed tx_publish binding disagrees with the persisted slot");
+        }
+      }
+      staged_binds_.erase(op.tx_id);
+      return;
+    }
+
+    // (a) a new transaction to promote. Full B-04 validation set.
+    if (op.tx_id <= last_committed_txid_) {
+      poison("op-WAL tx_publish tx_id is not strictly increasing");
+    }
+    if (op.applied_collection_op_id < applied_collection_op_id_) {
+      poison("op-WAL tx_publish applied_collection_op_id regressed");
+    }
+    const uint64_t old_hwm = committed_watermark;
+    const uint64_t new_hwm = op.new_pid_watermark;
+    if (new_hwm != old_hwm + op.binding_count) {
+      poison("op-WAL tx_publish new_pid_watermark != old_hwm + binding_count");
+    }
+    if (staged.size() != op.binding_count) {
+      poison("op-WAL tx_publish staged bind count != binding_count");
+    }
+    if (new_hwm > static_cast<uint64_t>(kPidMax) || new_hwm > row_generations_.size()) {
+      poison("op-WAL tx_publish new_pid_watermark exceeds the PID capacity");
+    }
+    // Staged set must be exactly row_op_id == {0..count-1} and pid == [old,new),
+    // each unique (counts already match, so covering + unique == a bijection).
+    std::vector<uint8_t> row_seen(static_cast<size_t>(op.binding_count), 0);
+    std::vector<uint8_t> pid_seen(static_cast<size_t>(op.binding_count), 0);
+    for (const auto &bind : staged) {
+      if (bind.row_op_id >= op.binding_count || row_seen[static_cast<size_t>(bind.row_op_id)] != 0) {
+        poison("op-WAL tx_publish row_op_id set is not exactly {0..count-1}");
+      }
+      row_seen[static_cast<size_t>(bind.row_op_id)] = 1;
+      const uint64_t pid_u64 = static_cast<uint64_t>(bind.pid);
+      if (pid_u64 < old_hwm || pid_u64 >= new_hwm) {
+        poison("op-WAL tx_publish pid outside [old_hwm, new_hwm)");
+      }
+      const size_t pidx = static_cast<size_t>(pid_u64 - old_hwm);
+      if (pid_seen[pidx] != 0) {
+        poison("op-WAL tx_publish has a duplicate pid");
+      }
+      pid_seen[pidx] = 1;
+    }
+    // Promote: install the bindings, advance committed + both tx watermarks.
+    for (const auto &bind : staged) {
+      const auto inserted = label_working_.emplace(bind.pid, bind.label);
+      if (!inserted.second && inserted.first->second != bind.label) {
+        poison("op-WAL tx_publish rebinds an existing pid to a different label");
+      }
+    }
+    committed_watermark = new_hwm;
+    last_committed_txid_ = op.tx_id;
+    applied_collection_op_id_ = op.applied_collection_op_id;
+    staged_binds_.erase(op.tx_id);
   }
 
   void replay_flip(const SegmentOp &op) {
@@ -4286,6 +4847,10 @@ class QGUpdater {
     active_superblock_slot_ = next_slot;
     qg_.entry_point_ = static_cast<PID>(image.entry_point);
     committed_.store(image.num_points, std::memory_order_release);
+    // Re-adopt the base's label + tx state: the flip carried a (possibly new)
+    // label slot tuple and tx watermarks; load the persisted bindings from it so
+    // any bundles it already absorbed are reflected without re-promotion.
+    adopt_label_state(image);
   }
 
   // The single authoritative post-replay pass (clause C): derive the whole
@@ -4379,9 +4944,36 @@ class QGUpdater {
   std::unique_ptr<alaya::wal::WalFile> op_wal_;  // <index>.opwal, present iff enable_wal_
   bool replaying_ = false;                       // set during recovery redo: suppress log + force
   std::string poison_reason_;                    // non-empty => writer permanently poisoned
+  std::atomic<bool> poisoned_{false};            // lock-free latch mirroring poison_reason_ for reads
   uint64_t segment_uid_ = 0;                     // durable lineage id (superblock reserved[0..8))
   uint64_t wal_op_id_ = 0;                       // monotone frame op-id (informational/diagnostic)
   SegmentIoObserver *io_observer_ = nullptr;     // persistence-model harness hook (test only)
+
+  // --- 2A appended-label transaction state ---
+  // Immutable published snapshot (B-02). The single writer swaps the pointer under
+  // label_snapshot_mutex_ (NOT the handle mutex); search copies it under the same
+  // tiny mutex. Ordering "snapshot before committed" holds via the mutex
+  // release/acquire plus search's committed acquire. Never null post-recovery.
+  mutable std::mutex label_snapshot_mutex_;
+  std::shared_ptr<const LabelBindings> label_snapshot_;
+  std::map<PID, uint64_t> label_working_;  // recovery-only scratch (slot load + promotions)
+  std::string label_slot_path_[2];         // <index>.labels.slot0 / .slot1
+  int active_label_slot_ = 0;              // slot holding the persisted bindings
+  uint64_t label_generation_ = 0;          // persisted-slot generation (bumped on content checkpoint)
+  uint64_t label_count_ = 0;               // persisted-slot binding count (== superblock label_count)
+  uint64_t label_checksum_ = 0;            // persisted-slot checksum (low 32 = crc32, high 32 = 0)
+  uint64_t last_committed_txid_ = 0;       // running: strictly increases per committed bundle
+  uint64_t applied_collection_op_id_ = 0;  // running: caller op watermark (2B idempotency basis)
+  uint64_t base_committed_txid_ = 0;       // adopted base's persisted txid (case (a)/(b) split)
+  uint64_t base_applied_op_id_ = 0;        // adopted base's persisted applied op id
+  uint64_t base_num_points_ = 0;           // adopted base committed watermark (case (b) bound check)
+  // Recovery staging: label_bind frames accumulated per tx_id until tx_publish.
+  struct LabelBindStage {
+    uint64_t row_op_id = 0;
+    PID pid = 0;
+    uint64_t label = 0;
+  };
+  std::unordered_map<uint64_t, std::vector<LabelBindStage>> staged_binds_;
 };
 
 }  // namespace alaya::laser
