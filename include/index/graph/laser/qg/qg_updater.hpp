@@ -2299,6 +2299,7 @@ class QGUpdater {
   }
 
   void write_superblock(int slot, const QGSuperblockV2 &sb) {
+    assert_no_maintenance_steal("superblock pwrite");  // wal-2c MAJOR-8
     if (slot < 0 || slot >= static_cast<int>(kQGSuperblockCopies) || !qg_superblock_valid(sb)) {
       throw std::invalid_argument("QGUpdater::write_superblock invalid slot/block");
     }
@@ -3050,10 +3051,12 @@ class QGUpdater {
     if (::fstat(fd_, &file_stat) != 0) {
       throw std::runtime_error("QGUpdater: fstat failed errno=" + std::to_string(errno));
     }
-    if (static_cast<uint64_t>(file_stat.st_size) < required_file_size &&
-        ::ftruncate(fd_, static_cast<off_t>(required_file_size)) != 0) {
-      throw std::runtime_error("QGUpdater: ftruncate before mmap failed errno=" +
-                               std::to_string(errno));
+    if (static_cast<uint64_t>(file_stat.st_size) < required_file_size) {
+      assert_no_maintenance_steal("index ftruncate (bloom-scan grow)");  // wal-2c MAJOR-8
+      if (::ftruncate(fd_, static_cast<off_t>(required_file_size)) != 0) {
+        throw std::runtime_error("QGUpdater: ftruncate before mmap failed errno=" +
+                                 std::to_string(errno));
+      }
     }
     if (pid_scan_mapping_ == nullptr) {
       pid_scan_mapping_ =
@@ -3143,14 +3146,21 @@ class QGUpdater {
     }
   }
 
-  void write_at(uint64_t off, const char *buf, size_t len) {
-    // Last-line steal guard (design execution-pitfall 1): between a durable BEGIN
-    // and a durable END no index/arena maintenance write may happen -- the only
-    // durable maintenance store is the private overlay -> op-WAL. A stray write_at
-    // here (a hidden eviction/mirror/flush path) is a no-steal violation; poison.
+  // wal-2c MAJOR-8: unified no-steal audit for EVERY durable index-mutating primitive
+  // (pwrite via write_at, ftruncate, superblock pwrite). Between a durable maintenance BEGIN
+  // and its durable END the only durable store is the private overlay -> op-WAL; any index /
+  // arena / file-length mutation in that window is a steal-before-commit -> poison (fail-
+  // closed). Recovery (replaying_) and the pre-BEGIN activation checkpoint are outside the
+  // window, so the guard is a no-op on every legitimate path.
+  void assert_no_maintenance_steal(const char *what) {
     if (maint_in_build_phase_ && !replaying_) {
-      poison("maintenance index/arena write before the END commit point (no-steal violation)");
+      poison(std::string("maintenance ") + what +
+             " before the END commit point (no-steal violation)");
     }
+  }
+
+  void write_at(uint64_t off, const char *buf, size_t len) {
+    assert_no_maintenance_steal("index/arena pwrite");
     const int fd = direct_io_ ? wfd_ : fd_;
     if (direct_io_ && (reinterpret_cast<uintptr_t>(buf) & (kDioAlign - 1)) != 0) {
       char *b = tls_bounce(len);
@@ -3309,7 +3319,16 @@ class QGUpdater {
       const PID first_pid = static_cast<PID>(pi * npp_);
       const std::lock_guard<std::mutex> guard(page_lock(first_pid));
       page_versions_[pi].fetch_add(1, std::memory_order_acq_rel);  // -> odd
-      write_at(kSectorLen + pi * page_size_, bytes, page_size_);
+      // wal-2c BLOCKER-4: close the seqlock pair (-> even) even if write_at throws, so a
+      // concurrent reader spinning on the odd version can never hang forever (the same throw
+      // poisons the handle; liveness must hold). A torn page under a poisoned handle carries no
+      // post-commit content guarantee -- only that readers make progress.
+      try {
+        write_at(kSectorLen + pi * page_size_, bytes, page_size_);
+      } catch (...) {
+        page_versions_[pi].fetch_add(1, std::memory_order_release);  // -> even (close the pair)
+        throw;
+      }
       page_versions_[pi].fetch_add(1, std::memory_order_release);  // -> even
       wal_failpoint(SegmentOpFailPoint::after_consolidate_install_page);
     }
@@ -5169,6 +5188,7 @@ class QGUpdater {
     bool in_epoch = false;
     bool epoch_apply = false;  // false => absorbed-by-base prefix: validate order, do not re-apply
     uint64_t epoch_id = 0;
+    uint64_t epoch_generation = 0;  // wal-2c BLOCKER-5: the generation the epoch was written at
     uint64_t epoch_begin_offset = 0;
     std::unordered_map<size_t, std::vector<std::byte>> epoch_pages;  // page_index -> latest bytes
     for (const auto &frame : scanned.frames) {
@@ -5197,6 +5217,10 @@ class QGUpdater {
       if (in_epoch) {
         switch (op.kind) {
           case SegmentOpKind::row_patch: {
+            if (op.segment_generation != epoch_generation) {  // wal-2c BLOCKER-5
+              replaying_ = false;
+              poison("op-WAL maintenance row_patch generation != the epoch BEGIN generation");
+            }
             const size_t page = replay_validate_row_patch_geometry(op);
             epoch_pages[page].assign(op.bytes.begin(), op.bytes.end());  // latest wins
             break;
@@ -5205,6 +5229,10 @@ class QGUpdater {
             if (op.epoch != epoch_id) {
               replaying_ = false;
               poison("op-WAL consolidate_end epoch does not match its begin");
+            }
+            if (op.segment_generation != epoch_generation) {  // wal-2c BLOCKER-5
+              replaying_ = false;
+              poison("op-WAL consolidate_end generation != the epoch BEGIN generation");
             }
             // Only a NEW epoch (> the base's last_completed) is applied; an
             // absorbed-by-base prefix (E <= base epoch) is validated for order but
@@ -5260,11 +5288,22 @@ class QGUpdater {
             replaying_ = false;
             poison("op-WAL consolidate epoch is not the next legal step");
           }
+          // wal-2c BLOCKER-5: every consolidate frame is written at the then-current base
+          // generation (encode_consolidate_marker / encode_row_patch use superblock_.generation),
+          // which cannot change inside an epoch -- a mid-epoch flip/other op poisons below. Bind
+          // the epoch to the cursor generation here and require BEGIN / kind=1 / END to all match
+          // it, so a spliced cross-generation frame (BEGIN(E,G) row_patch(G+9) END(E,G+4)) is
+          // rejected instead of applied.
+          if (op.segment_generation != superblock_.generation) {
+            replaying_ = false;
+            poison("op-WAL consolidate_begin generation != the replay cursor generation");
+          }
           // op.epoch <= last_completed => absorbed-by-base prefix (a checkpoint flip
           // already carried it); the redo below is byte-identical and idempotent.
           in_epoch = true;
           epoch_apply = op.epoch > last_completed_consolidate_epoch_;
           epoch_id = op.epoch;
+          epoch_generation = op.segment_generation;
           epoch_begin_offset = frame.offset;
           epoch_pages.clear();
           break;
