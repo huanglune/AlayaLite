@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-#include "index/graph/laser/utils/memory.hpp"
+#include "utils/memory.hpp"
 
 namespace alaya::laser::data {
 
@@ -21,12 +21,14 @@ namespace alaya::laser::data {
  *
  * Holds a contiguous allocation of `prod(dims_)` elements obtained from an
  * allocator, with bytewise save/load to std::ofstream / std::ifstream. The
- * allocator is the only knob that controls alignment — pass
- * memory::AlignedAllocator<T, A, HugePage> to get A-byte aligned storage.
+ * allocator is the only knob that controls alignment — defaults to
+ * alaya::AlignedAlloc<T> (utils/memory.hpp), which picks 64B or 2MB+THP
+ * alignment from the allocation size; pass a different Alloc for anything
+ * that needs a fixed alignment regardless of size.
  *
  * Non-copyable (owns raw pointer); move-only.
  */
-template <typename T, typename Dims = std::vector<size_t>, typename Alloc = memory::Allocator<T>>
+template <typename T, typename Dims = std::vector<size_t>, typename Alloc = ::alaya::AlignedAlloc<T>>
 class Array {
   static_assert(std::is_trivial_v<T>, "alaya::laser::data::Array requires a trivial element type");
 

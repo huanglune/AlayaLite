@@ -44,10 +44,11 @@
 #include <string>
 
 #include "index/graph/laser/utils/array.hpp"
-#include "index/graph/laser/utils/memory.hpp"
+#include "index/graph/laser/utils/tools.hpp"
 #include "platform/detect.hpp"
 #include "simd/laser_dispatch.hpp"
 #include "space/quant/rabitq/rotator.hpp"
+#include "utils/memory.hpp"
 
 #if defined(ALAYA_ARCH_X86) && (defined(__GNUC__) || defined(__clang__))
   #include "third_party/ffht/fht_avx.hpp"
@@ -115,7 +116,7 @@ inline auto select_fht_float(size_t log_b) -> std::function<void(float *)> {
  * (to rotate query vectors) with the same random signs for consistency.
  */
 class FHTRotator : public alaya::Rotator<float> {
-  using data_type = data::Array<float, std::vector<size_t>, memory::AlignedAllocator<float>>;
+  using data_type = data::Array<float, std::vector<size_t>, ::alaya::AlignedAlloc<float>>;
 
  private:
   std::function<void(float *)> fht_float_ = detail::select_fht_float(6);
