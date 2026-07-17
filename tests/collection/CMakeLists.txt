@@ -147,3 +147,21 @@ alaya_add_test(
   LABELS integration collection disk segment
   TIMEOUT 180
 )
+
+# Collection-level end-to-end tests for the segment admission contract
+# (docs/design/segment-admission-contract.md): a real LASER segment
+# executing a bitmap traversal filter, and the auto-policy fallback when a
+# qg memory segment in the same collection still rejects the filter kind.
+if(ALAYA_ENABLE_LASER)
+  alaya_cc_target(
+    segmented_collection_laser_filter_test
+    GTEST LASER
+    SRCS segmented_collection_laser_filter_test.cpp
+  )
+  alaya_add_test(
+    NAME segmented_collection_laser_filter_test
+    TARGET segmented_collection_laser_filter_test
+    LABELS integration collection laser segment
+    TIMEOUT 120
+  )
+endif()
