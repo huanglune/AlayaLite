@@ -4882,7 +4882,8 @@ class QGUpdater {
   // poison / fail-closed). Caller guarantees a non-canonical-empty tuple.
   LabelBindings load_label_slot_bindings(const std::string &path,
                                          uint64_t count,
-                                         uint64_t checksum) {
+                                         uint64_t checksum,
+                                         uint64_t num_points) {  // wal-2c MAJOR-9
     if ((checksum >> 32) != 0) {
       poison("label slot checksum high 32 bits must be zero");
     }
@@ -4923,6 +4924,11 @@ class QGUpdater {
       const auto pid = alaya::wal::get_u32(bytes, off);
       const auto gen = alaya::wal::get_u32(bytes, off + 4);
       const auto label = alaya::wal::get_u64(bytes, off + 8);
+      // wal-2c MAJOR-9: every binding must reference a committed row -- a forged slot with a
+      // pid >= the base HWM would map a label onto a non-existent (or future) PID.
+      if (static_cast<uint64_t>(pid) >= num_points) {
+        poison("label slot entry references a pid at or beyond the committed high-water mark");
+      }
       // W2c relaxes this once pid_generation_v1 is activated; until then (append-only)
       // every slot entry must carry generation 0 (fail-closed on a forged non-zero).
       if (gen != 0 && !pid_generation_activated_) {
@@ -5048,7 +5054,8 @@ class QGUpdater {
       poison("label slot index out of range in the superblock");
     }
     active_label_slot_ = static_cast<int>(ls.slot);
-    auto lb = load_label_slot_bindings(label_slot_path_[ls.slot], ls.count, ls.checksum);
+    auto lb = load_label_slot_bindings(label_slot_path_[ls.slot], ls.count, ls.checksum,
+                                       sb.num_points);
     label_working_ = std::move(lb.bindings);
   }
 
