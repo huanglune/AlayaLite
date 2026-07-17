@@ -66,6 +66,18 @@ alaya_add_test(
 )
 
 alaya_cc_target(
+  collection_hnsw_qg_parity_test
+  SRCS collection_hnsw_qg_parity_test.cpp
+  GTEST
+)
+alaya_add_test(
+  NAME collection_hnsw_qg_parity_test
+  TARGET collection_hnsw_qg_parity_test
+  LABELS integration collection memory
+  TIMEOUT 300
+)
+
+alaya_cc_target(
   collection_facade_stress_test
   SRCS collection_facade_stress_test.cpp
   GTEST
