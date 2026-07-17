@@ -285,17 +285,16 @@ alaya_cc_target(
 # while compiling them as one translation unit, as the original single-source target did.
 set_target_properties(bench_laser_update_sift PROPERTIES UNITY_BUILD ON)
 
-# W0 oracle base for the LASER inner-product (IP) distance kernel (ip.hpp, W1).
-# Pins the ground truth from three references (official RaBitQ-Library METRIC_IP
-# re-derivation, in-repo memqg RaBitQCore/RaBitQSpace, brute-force exact) plus
-# an error-bound scaffold and a committable golden. Core-space only (no LASER
-# internals), so it takes the default AlayaLite link; DEFS points the golden at
-# the source tree so it can be committed.
+# laser-ip: W0 oracle base for the LASER IP kernel. Pins ground truth from the
+# immutable official RaBitQ-Library METRIC_IP fixture (generated offline by
+# space/tools/gen_ip_official_fixture.cpp), the in-repo memqg path and brute-force
+# exact, plus the one-bit bound and degenerate-input contract. Fixture is read-only
+# here (hard fail if missing/bad); ALAYA_IP_FIXTURE_DIR points at the source tree.
 alaya_cc_target(
   laser_ip_oracle_test
   GTEST
   SRCS space/ip_oracle_test.cpp
-  DEFS ALAYA_IP_ORACLE_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/space"
+  DEFS ALAYA_IP_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/space"
   OPTS -O3 -DNDEBUG -Wall -Wextra
 )
 alaya_add_test(
