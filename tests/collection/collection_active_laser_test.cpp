@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <random>
 #include <string>
 #include <vector>
@@ -221,6 +222,83 @@ TEST(CollectionActiveLaser, SealActiveLaserThenSearchAndReopen) {
     }
   }
   EXPECT_LE(active_dirs, 1U) << "B-09: seal/rotate must not leak orphan active-laser directories";
+}
+
+// B-01/B-02: a per-row-independent batch is N separate logical transactions, each
+// with its OWN op_id as the physical txid. The pre-fix design shared one batch_op_id
+// so every row after the first satisfied "txid <= last_committed" and was dropped.
+// The size after the batch must equal the row count -- no dropped writes.
+TEST(CollectionActiveLaser, PerRowBatchAppliesEveryRow) {
+  TemporaryDirectory dir("perrow");
+  constexpr core::RowCount kBatch = 64;
+  const auto dataset = make_dataset(kBatch, /*seed=*/13131U);
+  auto created = Collection::create(active_laser_options(dir.path()));
+  ASSERT_TRUE(created.ok()) << created.status().diagnostic();
+  auto collection = std::move(created).value();
+
+  std::vector<CollectionItem> items;
+  items.reserve(dataset.ids.size());
+  for (core::RowCount row = 0; row < kBatch; ++row) {
+    CollectionItem item;
+    item.logical_id = dataset.ids[static_cast<std::size_t>(row)];
+    item.vector = core::TypedTensorView::contiguous(
+        dataset.vectors.data() + static_cast<std::ptrdiff_t>(row) * kDim, 1, kDim);
+    items.push_back(std::move(item));
+  }
+  auto added = collection->add_batch(items, CollectionBatchMutationMode::per_row_independent);
+  ASSERT_TRUE(added.ok()) << added.status().diagnostic();
+  EXPECT_EQ(collection->size(), kBatch)
+      << "B-01: every row of a per-row-independent batch must apply (no shared-txid drop)";
+
+  // And they survive reopen (each row replayed with its own physical txid).
+  ASSERT_TRUE(collection->close().ok());
+  collection.reset();
+  auto reopened = Collection::open(dir.path());
+  ASSERT_TRUE(reopened.ok()) << reopened.status().diagnostic();
+  EXPECT_EQ(reopened.value()->size(), kBatch);
+}
+
+[[nodiscard]] auto schema_field_count(const std::filesystem::path &root) -> std::size_t {
+  std::ifstream input(root / ".alaya_internal" / "collection_facade_v1" / "schema.v1");
+  std::size_t lines = 0;
+  for (std::string line; std::getline(input, line);) {
+    if (!line.empty()) {
+      ++lines;
+    }
+  }
+  return lines;
+}
+
+// B-08: a flat active collection keeps the pre-2B 14-field schema (byte-compatible
+// with old readers); a laser active collection widens it to 15 fields, so an old
+// binary's strict field-count check fails closed instead of silently reverting to
+// flat.
+TEST(CollectionActiveLaser, ActiveEngineSchemaWidthGatesOldReaders) {
+  TemporaryDirectory flat_dir("schema_flat");
+  CollectionOptions flat = active_laser_options(flat_dir.path());
+  flat.active_engine = core::algorithm::flat;
+  flat.target_algorithm = core::algorithm::flat;
+  flat.quantization = CollectionQuantization::none;
+  auto flat_created = Collection::create(flat);
+  ASSERT_TRUE(flat_created.ok()) << flat_created.status().diagnostic();
+  EXPECT_EQ(flat_created.value()->active_algorithm(), core::algorithm::flat);
+  EXPECT_EQ(schema_field_count(flat_dir.path()), 14U);
+
+  TemporaryDirectory laser_dir("schema_laser");
+  auto laser_created = Collection::create(active_laser_options(laser_dir.path()));
+  ASSERT_TRUE(laser_created.ok()) << laser_created.status().diagnostic();
+  auto laser_collection = std::move(laser_created).value();
+  EXPECT_EQ(laser_collection->active_algorithm(), core::algorithm::laser);
+  EXPECT_EQ(schema_field_count(laser_dir.path()), 15U);
+
+  // Reopen restores the laser active engine from the 15-field schema. Drop the
+  // handle first: the on-disk active segment's single-writer flock is released on
+  // destruction (not close()), so reopening the same path needs the old handle gone.
+  ASSERT_TRUE(laser_collection->close().ok());
+  laser_collection.reset();
+  auto reopened = Collection::open(laser_dir.path());
+  ASSERT_TRUE(reopened.ok()) << reopened.status().diagnostic();
+  EXPECT_EQ(reopened.value()->active_algorithm(), core::algorithm::laser);
 }
 
 }  // namespace
