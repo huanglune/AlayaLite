@@ -1015,6 +1015,15 @@ ActivatedFacts activate_facts(const std::string &prefix, size_t base_n) {
   return f;
 }
 
+std::vector<char> read_index_page(const std::string &index_path, size_t page_size, size_t page) {
+  std::vector<char> bytes(page_size);
+  std::ifstream in(index_path, std::ios::binary);
+  in.seekg(static_cast<std::streamoff>(kSectorLen + page * page_size));
+  in.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  EXPECT_EQ(in.gcount(), static_cast<std::streamsize>(bytes.size()));
+  return bytes;
+}
+
 // NEW-BLOCKER-1 completion (leg-9, r3 section 2): the r3 case leg-8's test explicitly OMITTED -- a
 // forged legacy bundle with a CURRENT-generation row_patch spliced between the legacy kind=7 and
 // kind=8. leg-8 classified the kind=1 as kApply and wrote it IMMEDIATELY (index changed) before the
@@ -1031,8 +1040,8 @@ TEST(QgUpdaterReuse, ActivatedBaseLegacyBundleWithCurrentGenRowPatchStaysUnchang
   const auto index_before = read_all_bytes(index_path);
   const uint64_t forged_gen = f.activation_gen - 1;  // legacy lane
   const uint64_t forged_txid = f.base_txid + 1;      // non-absorbed
-  // A CURRENT-generation (== cursor) whole-page after-image for page 0 with one payload byte flipped:
-  // classified kApply, so a pre-leg-9 build wrote it immediately. Stays staged in leg-9.
+  // A CURRENT-generation (== cursor) whole-page after-image for page 0 with one payload byte
+  // flipped: classified kApply, so a pre-leg-9 build wrote it immediately. Stays staged in leg-9.
   const size_t target_page = 0;
   std::vector<char> forged_page(f.page_size);
   {
@@ -1043,33 +1052,54 @@ TEST(QgUpdaterReuse, ActivatedBaseLegacyBundleWithCurrentGenRowPatchStaysUnchang
   forged_page[40] = static_cast<char>(forged_page[40] ^ 0x5A);
   {
     alaya::wal::WalFile wal(wal_path);
-    wal.append(kSegmentOpRecordType, 0, 1, forged_txid,
-               encode_label_bind(f.seg_uid, forged_gen, forged_txid, /*row_op=*/0,
-                                 static_cast<uint32_t>(f.old_hwm), /*gen=*/0, /*label=*/6),
+    wal.append(kSegmentOpRecordType,
+               0,
+               1,
+               forged_txid,
+               encode_label_bind(f.seg_uid,
+                                 forged_gen,
+                                 forged_txid,
+                                 /*row_op=*/0,
+                                 static_cast<uint32_t>(f.old_hwm),
+                                 /*gen=*/0,
+                                 /*label=*/6),
                alaya::wal::WalFile::Sync::buffered);
-    wal.append(kSegmentOpRecordType, 0, 2, 0,
-               encode_row_patch(f.seg_uid, f.cursor_gen, /*first_pid=*/target_page * f.npp,
+    wal.append(kSegmentOpRecordType,
+               0,
+               2,
+               0,
+               encode_row_patch(f.seg_uid,
+                                f.cursor_gen,
+                                /*first_pid=*/target_page * f.npp,
                                 /*offset=*/kSectorLen + target_page * f.page_size,
-                                std::span<const std::byte>(
-                                    reinterpret_cast<const std::byte *>(forged_page.data()),
-                                    f.page_size)),
+                                std::span<const std::byte>(reinterpret_cast<const std::byte *>(
+                                                               forged_page.data()),
+                                                           f.page_size)),
                alaya::wal::WalFile::Sync::buffered);
-    wal.append(kSegmentOpRecordType, 0, 3, forged_txid,
-               encode_tx_publish(f.seg_uid, forged_gen, forged_txid, /*new_hwm=*/f.old_hwm + 1,
-                                 /*binding_count=*/1, /*applied=*/1),
+    wal.append(kSegmentOpRecordType,
+               0,
+               3,
+               forged_txid,
+               encode_tx_publish(f.seg_uid,
+                                 forged_gen,
+                                 forged_txid,
+                                 /*new_hwm=*/f.old_hwm + 1,
+                                 /*binding_count=*/1,
+                                 /*applied=*/1),
                alaya::wal::WalFile::Sync::fsync);
   }
-  EXPECT_THROW({ ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true); },
-               std::exception)
+  EXPECT_THROW(
+      { ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true); }, std::exception)
       << "the legacy cross-generation bundle must poison at the kind=8 commit";
   EXPECT_EQ(read_all_bytes(index_path), index_before)
-      << "index unchanged: the current-generation kind=1 was STAGED, never applied before the poison";
+      << "index unchanged: the current-generation kind=1 was STAGED, never applied before the "
+         "poison";
   std::filesystem::remove_all(dir);
 }
 
-// NEW-BLOCKER-1 (leg-9): two interleaved legacy transactions prove the staging does not cross tx
-// boundaries -- each kind=7 stages under its own tx_id, and the FIRST effectful legacy commit (a
-// non-absorbed kind=8 on a pid-active base) poisons before anything is applied.
+// NEW-BLOCKER-1 (r4): kind1 has no txid, so 7A,1A,7B,1B,8A is ambiguous at the second transaction.
+// Recovery must reject before either staged page can be written; it must never let 8A consume B's
+// page through a global pending map.
 TEST(QgUpdaterReuse, ActivatedBaseTwoInterleavedLegacyTxPoisonIndexUnchanged) {
   const auto dir = scratch_dir("newb1_two_tx");
   std::filesystem::remove_all(dir);
@@ -1079,26 +1109,326 @@ TEST(QgUpdaterReuse, ActivatedBaseTwoInterleavedLegacyTxPoisonIndexUnchanged) {
   const std::string index_path = base.prefix + waltest::index_suffix();
   const std::string wal_path = index_path + ".opwal";
   const auto index_before = read_all_bytes(index_path);
-  const uint64_t g = f.activation_gen - 1;   // legacy lane for both
-  const uint64_t txa = f.base_txid + 1;      // both non-absorbed
+  const uint64_t g = f.activation_gen - 1;  // legacy lane for both
+  const uint64_t txa = f.base_txid + 1;     // both non-absorbed
   const uint64_t txb = f.base_txid + 2;
+  auto page_a = read_index_page(index_path, f.page_size, 0);
+  auto page_b = read_index_page(index_path, f.page_size, 1);
+  page_a[40] = static_cast<char>(page_a[40] ^ 0x31);
+  page_b[40] = static_cast<char>(page_b[40] ^ 0x52);
   {
     alaya::wal::WalFile wal(wal_path);
-    wal.append(kSegmentOpRecordType, 0, 1, txa,
+    wal.append(kSegmentOpRecordType,
+               0,
+               1,
+               txa,
                encode_label_bind(f.seg_uid, g, txa, 0, static_cast<uint32_t>(f.old_hwm), 0, 61),
                alaya::wal::WalFile::Sync::buffered);
-    wal.append(kSegmentOpRecordType, 0, 2, txb,
+    wal.append(kSegmentOpRecordType,
+               0,
+               2,
+               0,
+               encode_row_patch(f.seg_uid,
+                                f.cursor_gen,
+                                /*first_pid=*/0,
+                                /*offset=*/kSectorLen,
+                                std::span<const std::byte>(reinterpret_cast<const std::byte *>(
+                                                               page_a.data()),
+                                                           page_a.size())),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType,
+               0,
+               3,
+               txb,
                encode_label_bind(f.seg_uid, g, txb, 0, static_cast<uint32_t>(f.old_hwm + 1), 0, 62),
-               alaya::wal::WalFile::Sync::buffered);  // interleaved: tx B's bind before tx A commits
-    wal.append(kSegmentOpRecordType, 0, 3, txa,
+               alaya::wal::WalFile::Sync::buffered);  // interleaved: tx B's bind before tx A
+                                                      // commits
+    wal.append(kSegmentOpRecordType,
+               0,
+               4,
+               0,
+               encode_row_patch(f.seg_uid,
+                                f.cursor_gen,
+                                /*first_pid=*/f.npp,
+                                /*offset=*/kSectorLen + f.page_size,
+                                std::span<const std::byte>(reinterpret_cast<const std::byte *>(
+                                                               page_b.data()),
+                                                           page_b.size())),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType,
+               0,
+               5,
+               txa,
                encode_tx_publish(f.seg_uid, g, txa, f.old_hwm + 1, 1, 1),
-               alaya::wal::WalFile::Sync::fsync);      // first effectful commit -> poison
+               alaya::wal::WalFile::Sync::fsync);
   }
-  EXPECT_THROW({ ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true); },
-               std::exception)
-      << "the first non-absorbed legacy commit must poison";
+  EXPECT_THROW(
+      { ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true); }, std::exception)
+      << "ambiguous A/B ownership must poison before the first commit";
   EXPECT_EQ(read_all_bytes(index_path), index_before)
-      << "index unchanged: both txs only staged (kind=7), nothing applied before the poison";
+      << "index unchanged: neither A nor B kind=1 may be applied before ownership is unique";
+  std::filesystem::remove_all(dir);
+}
+
+TEST(QgUpdaterReuse, LegacyOwnedRowPatchCannotBeConsumedByStandalonePublish) {
+  const auto dir = scratch_dir("newb1_legacy_kind5");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/157);
+  const auto f = activate_facts(base.prefix, kBaseN);
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  const auto index_before = read_all_bytes(index_path);
+  const uint64_t legacy_gen = f.activation_gen - 1;
+  const uint64_t txid = f.base_txid + 1;
+  auto page = read_index_page(index_path, f.page_size, 0);
+  page[40] = static_cast<char>(page[40] ^ 0x63);
+  {
+    alaya::wal::WalFile wal(wal_path);
+    wal.append(kSegmentOpRecordType,
+               0,
+               1,
+               txid,
+               encode_label_bind(f.seg_uid,
+                                 legacy_gen,
+                                 txid,
+                                 0,
+                                 static_cast<uint32_t>(f.old_hwm),
+                                 0,
+                                 71),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType,
+               0,
+               2,
+               0,
+               encode_row_patch(f.seg_uid,
+                                f.cursor_gen,
+                                0,
+                                kSectorLen,
+                                std::span<const std::byte>(reinterpret_cast<const std::byte *>(
+                                                               page.data()),
+                                                           page.size())),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType,
+               0,
+               3,
+               0,
+               encode_publish(f.seg_uid, f.cursor_gen, f.old_hwm),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType,
+               0,
+               4,
+               txid,
+               encode_tx_publish(f.seg_uid, legacy_gen, txid, f.old_hwm + 1, 1, 1),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  EXPECT_THROW({ ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, true); }, std::exception);
+  EXPECT_EQ(read_all_bytes(index_path), index_before)
+      << "kind=5 must reject, not consume, a legacy-owned page unit";
+  std::filesystem::remove_all(dir);
+}
+
+TEST(QgUpdaterReuse, LegacyOwnedTombstoneWaitsForKind8Validation) {
+  const auto dir = scratch_dir("newb1_legacy_kind2");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/158);
+  const auto f = activate_facts(base.prefix, kBaseN);
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  const auto index_before = read_all_bytes(index_path);
+  const uint64_t legacy_gen = f.activation_gen - 1;
+  const uint64_t txid = f.base_txid + 1;
+  {
+    alaya::wal::WalFile wal(wal_path);
+    wal.append(kSegmentOpRecordType,
+               0,
+               1,
+               txid,
+               encode_label_bind(f.seg_uid,
+                                 legacy_gen,
+                                 txid,
+                                 0,
+                                 static_cast<uint32_t>(f.old_hwm),
+                                 0,
+                                 72),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType,
+               0,
+               2,
+               0,
+               encode_tombstone(f.seg_uid, f.cursor_gen, /*pid=*/0),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType,
+               0,
+               3,
+               txid,
+               encode_tx_publish(f.seg_uid, legacy_gen, txid, f.old_hwm + 1, 1, 1),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  EXPECT_THROW({ ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, true); }, std::exception);
+  EXPECT_EQ(read_all_bytes(index_path), index_before)
+      << "legacy-owned kind=2 must not pwrite its trailer before kind=8 is accepted";
+  std::filesystem::remove_all(dir);
+}
+
+TEST(QgUpdaterReuse, AbsorbedLegacyKind8ClearsOnlyItsOwnedPageUnit) {
+  const auto dir = scratch_dir("newb1_absorbed_clear");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/159);
+  const auto f = activate_facts(base.prefix, kBaseN);
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  const auto index_before = read_all_bytes(index_path);
+  auto page = read_index_page(index_path, f.page_size, 0);
+  page[40] = static_cast<char>(page[40] ^ 0x74);
+  const uint64_t legacy_gen = f.activation_gen - 1;
+  const PID bound_pid = static_cast<PID>(f.old_hwm - 1);  // activation bundle's label 5
+  {
+    alaya::wal::WalFile wal(wal_path);
+    wal.append(kSegmentOpRecordType,
+               0,
+               1,
+               f.base_txid,
+               encode_label_bind(f.seg_uid, legacy_gen, f.base_txid, 0, bound_pid, 0, 5),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType,
+               0,
+               2,
+               0,
+               encode_row_patch(f.seg_uid,
+                                f.cursor_gen,
+                                0,
+                                kSectorLen,
+                                std::span<const std::byte>(reinterpret_cast<const std::byte *>(
+                                                               page.data()),
+                                                           page.size())),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType,
+               0,
+               3,
+               f.base_txid,
+               encode_tx_publish(f.seg_uid, legacy_gen, f.base_txid, f.old_hwm, 1, 1),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  {
+    ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, true);
+  }
+  EXPECT_EQ(read_all_bytes(index_path), index_before)
+      << "absorbed kind=8 validates and discards its page unit without reapplying it";
+  std::filesystem::remove_all(dir);
+}
+
+TEST(QgUpdaterReuse, UnresolvedStandalonePageCannotCrossCanonicalLaneBoundary) {
+  const auto dir = scratch_dir("newb1_canonical_boundary");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/160);
+  const auto f = activate_facts(base.prefix, kBaseN);
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  const auto index_before = read_all_bytes(index_path);
+  auto page = read_index_page(index_path, f.page_size, 0);
+  page[40] = static_cast<char>(page[40] ^ 0x25);
+  const uint64_t txid = f.base_txid + 1;
+  {
+    alaya::wal::WalFile wal(wal_path);
+    wal.append(kSegmentOpRecordType,
+               0,
+               1,
+               0,
+               encode_row_patch(f.seg_uid,
+                                f.cursor_gen,
+                                0,
+                                kSectorLen,
+                                std::span<const std::byte>(reinterpret_cast<const std::byte *>(
+                                                               page.data()),
+                                                           page.size())),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType,
+               0,
+               2,
+               txid,
+               encode_label_bind(f.seg_uid,
+                                 f.cursor_gen,
+                                 txid,
+                                 0,
+                                 static_cast<uint32_t>(f.old_hwm),
+                                 0,
+                                 73),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  EXPECT_THROW({ ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, true); }, std::exception);
+  EXPECT_EQ(read_all_bytes(index_path), index_before);
+  std::filesystem::remove_all(dir);
+}
+
+TEST(QgUpdaterReuse, UnresolvedStandalonePageCannotCrossMaintenanceLaneBoundary) {
+  const auto dir = scratch_dir("newb1_maintenance_boundary");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/161);
+  const auto f = activate_facts(base.prefix, kBaseN);
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  const auto index_before = read_all_bytes(index_path);
+  auto page = read_index_page(index_path, f.page_size, 0);
+  page[40] = static_cast<char>(page[40] ^ 0x46);
+  {
+    alaya::wal::WalFile wal(wal_path);
+    wal.append(kSegmentOpRecordType,
+               0,
+               1,
+               0,
+               encode_row_patch(f.seg_uid,
+                                f.cursor_gen,
+                                0,
+                                kSectorLen,
+                                std::span<const std::byte>(reinterpret_cast<const std::byte *>(
+                                                               page.data()),
+                                                           page.size())),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType,
+               0,
+               2,
+               0,
+               encode_consolidate_marker(f.seg_uid,
+                                         f.cursor_gen,
+                                         SegmentOpKind::consolidate_begin,
+                                         /*epoch=*/1),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  EXPECT_THROW({ ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, true); }, std::exception);
+  EXPECT_EQ(read_all_bytes(index_path), index_before);
+  std::filesystem::remove_all(dir);
+}
+
+TEST(QgUpdaterReuse, StandaloneTombstoneFlipBoundaryReopensWithoutFalseReject) {
+  const auto dir = scratch_dir("i3_tombstone_flip_boundary");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/162);
+  (void)activate_facts(base.prefix, kBaseN);  // durable pid-active base
+  {
+    QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+    qg.load_disk_index(base.prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+    qg.set_params(64, 1, 1);
+    UpdateParams params;
+    params.enable_wal = true;
+    params.enable_pid_reuse = true;
+    params.ef_insert = 64;
+    params.max_points = 4 * kBaseN;
+    auto armed = std::make_shared<bool>(false);
+    params.failpoint_hook = [armed](SegmentOpFailPoint fp) {
+      if (*armed && fp == SegmentOpFailPoint::after_flip_append_before_superblock_write) {
+        throw std::runtime_error("crash after durable flip, before superblock install");
+      }
+    };
+    QGUpdater upd(qg, params);
+    upd.tombstone(0);  // kind=2 + kind=1, intentionally no kind=5
+    *armed = true;
+    EXPECT_THROW(upd.checkpoint(), std::exception);
+  }
+  for (int reopen = 0; reopen < 2; ++reopen) {
+    ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, true);
+    EXPECT_FALSE(row_is_live(*s.upd, 0)) << "reopen " << reopen;
+    EXPECT_EQ(s.upd->num_points(), kBaseN + 1) << "reopen " << reopen;
+  }
   std::filesystem::remove_all(dir);
 }
 
@@ -1115,12 +1445,15 @@ TEST(QgUpdaterReuse, StandalonePublishWithoutRowPatchPoisonsIndexUnchanged) {
   const auto index_before = read_all_bytes(index_path);
   {
     alaya::wal::WalFile wal(wal_path);  // a lone current-generation publish(old_hwm + 1), no kind=1
-    wal.append(kSegmentOpRecordType, 0, 1, 0,
+    wal.append(kSegmentOpRecordType,
+               0,
+               1,
+               0,
                encode_publish(f.seg_uid, f.cursor_gen, f.old_hwm + 1),
                alaya::wal::WalFile::Sync::fsync);
   }
-  EXPECT_THROW({ ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true); },
-               std::exception)
+  EXPECT_THROW(
+      { ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true); }, std::exception)
       << "a publish with no page evidence for the new row must poison";
   EXPECT_EQ(read_all_bytes(index_path), index_before) << "index must be byte-for-byte unchanged";
   std::filesystem::remove_all(dir);

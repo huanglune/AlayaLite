@@ -6237,8 +6237,29 @@ class QGUpdater {
     uint64_t begin_offset = 0;
     bool saw_row_patch = false;  // once a kind=1 is seen, any further kind=7 poisons
     std::vector<CanonicalBind> binds;
-    std::map<size_t, alaya::wal::FrameLocation> preimage_refs;  // page -> FIRST kind=1 (pre-tx FREE)
-    std::map<size_t, alaya::wal::FrameLocation> latest_refs;    // page -> LAST kind=1 (final image)
+    std::map<size_t, alaya::wal::FrameLocation>
+        preimage_refs;                                        // page -> FIRST kind=1 (pre-tx FREE)
+    std::map<size_t, alaya::wal::FrameLocation> latest_refs;  // page -> LAST kind=1 (final image)
+  };
+
+  // Recovery-only commit unit for armed standalone / legacy effects. Kind=1 has no txid, so pages
+  // begin unowned and may be attached to exactly one legacy tx by the surrounding kind=7 grammar.
+  // A second candidate tx poisons before any page write. Full pages stay in the WAL; memory holds
+  // only page -> FrameLocation plus bounded row/tombstone evidence. Every commit re-reads and
+  // re-validates the selected frames (including CRC in WalFile::read_frame).
+  struct EffectCommitUnit {
+    uint64_t generation = 0;
+    uint64_t begin_offset = 0;
+    uint64_t legacy_txid = 0;  // 0 => standalone/unowned; legacy producer txids are strictly > 0
+    bool saw_standalone_tombstone = false;
+    std::map<size_t, alaya::wal::FrameLocation> latest_refs;
+    std::set<PID> staged_legacy_tombstones;
+
+    [[nodiscard]] bool has_staged_effects() const {
+      return !latest_refs.empty() || !staged_legacy_tombstones.empty();
+    }
+    [[nodiscard]] bool active() const { return has_staged_effects() || saw_standalone_tombstone; }
+    void clear() { *this = EffectCommitUnit{}; }
   };
   // True once PID reuse is activated (design 7.2) AND this frame's generation is at or
   // after the reuse activation generation. Dormant pre-activation (activation gen 0 =>
@@ -6257,7 +6278,8 @@ class QGUpdater {
   // (superblock_.generation, advanced by replay_flip):
   //   - gen == cursor: a legit new write at the current base (e.g. a tombstone's trailer
   //     after-image) -> APPLY (byte-identical to the pre-leg-8 path).
-  //   - gen  < cursor: an already-absorbed historical-prefix frame -- a checkpoint flip advanced the
+  //   - gen  < cursor: an already-absorbed historical-prefix frame -- a checkpoint flip advanced
+  //   the
   //     cursor past it, so the base at the cursor generation already reflects it -> VALIDATE-ONLY
   //     (verify structural legality but never re-apply). This is the NEW-BLOCKER-1 fix: a stale /
   //     forged old-generation after-image can no longer clobber the higher-generation base (a
@@ -6528,237 +6550,216 @@ class QGUpdater {
     // maintenance epoch above; dormant until reuse is activated (is_canonical_generation).
     bool in_canonical_bundle = false;
     CanonicalBundleStage cstage;
-    // Pending STANDALONE effect unit (I-2 + NEW-B1, leg-9, r3): once the reuse classifier is armed
-    // (pid_generation_activated_ || enable_pid_reuse_), a current-generation standalone row_patch
-    // after-image is STAGED here (page_index -> latest whole-page bytes) instead of being written
-    // immediately; it is applied only at its commit point -- a kind=5 publish (plain append) or a
-    // kind=8 tx_publish (labeled bundle). This (a) closes NEW-B1: a forged legacy [kind7,kind1,kind8]
-    // bundle's current-generation kind=1 no longer clobbers a committed page before the kind=8
-    // poison (nothing is written until a commit that the forge never reaches), and (b) closes I-2:
-    // a publish can no longer advance the HWM over a row that has no whole-page after-image (a
-    // phantom live row from a zero-filled page). A torn unit at EOF is discarded (index stays
-    // S_old). The legacy path (classifier disarmed) still applies kind=1 immediately (unchanged).
-    std::unordered_map<size_t, std::vector<std::byte>> pending_effect_pages;
+    // Armed standalone/legacy commit-unit state. Unlike the former global page->bytes map, this
+    // records an explicit owner and keeps only WAL frame references. It therefore cannot be
+    // consumed by the first unrelated kind=5/kind=8 and recovery memory is O(unique pages *
+    // FrameLocation), not O(unique pages * page_size). The double-false legacy path never touches
+    // this state.
+    EffectCommitUnit effect_unit;
     // wal-2c BLOCKER-3: stream the op-WAL one frame at a time (O(max frame), not O(WAL bytes)).
-    alaya::wal::WalFile::visit_frames(
-        op_wal_->path(), [&](const alaya::wal::ScannedFrame &frame) -> bool {
-      if (frame.type != kSegmentOpRecordType) {
-        replaying_ = false;
-        poison("op-WAL contains a non-SEGMENT_OP record type");
-      }
-      SegmentOp op;
-      try {
-        op = decode_segment_op(frame.payload);
-      } catch (const std::exception &error) {
-        replaying_ = false;
-        poison(std::string("op-WAL frame decode failed: ") + error.what());
-      }
-      if (op.segment_id != segment_uid_) {
-        replaying_ = false;
-        poison("op-WAL lineage mismatch (stale or foreign .opwal)");
-      }
-      // kind=1..6 frames always carry batch_id 0 (clause 11 / REPORT-wal-2a); only
-      // the label ops (7/8) carry a tx_id. Reject a producer that violates this.
-      if (op.kind != SegmentOpKind::label_bind && op.kind != SegmentOpKind::tx_publish &&
-          frame.batch_id != 0) {
-        replaying_ = false;
-        poison("op-WAL kind=1..6 frame has a non-zero batch_id");
-      }
-      if (in_epoch) {
-        switch (op.kind) {
-          case SegmentOpKind::row_patch: {
-            if (op.segment_generation != epoch_generation) {  // wal-2c BLOCKER-5
-              replaying_ = false;
-              poison("op-WAL maintenance row_patch generation != the epoch BEGIN generation");
-            }
-            const size_t page = replay_validate_row_patch_geometry(op);
-            epoch_pages[page].assign(op.bytes.begin(), op.bytes.end());  // latest wins
-            break;
-          }
-          case SegmentOpKind::consolidate_end: {
-            if (op.epoch != epoch_id) {
-              replaying_ = false;
-              poison("op-WAL consolidate_end epoch does not match its begin");
-            }
-            if (op.segment_generation != epoch_generation) {  // wal-2c BLOCKER-5
-              replaying_ = false;
-              poison("op-WAL consolidate_end generation != the epoch BEGIN generation");
-            }
-            // Only a NEW epoch (> the base's last_completed) is applied; an
-            // absorbed-by-base prefix (E <= base epoch) is validated for order but
-            // NOT re-applied, so a stale image can never clobber a higher base
-            // generation (codex B-2C-05 pitfall 5).
-            if (epoch_apply) {
-              for (const auto &[page, bytes] : epoch_pages) {
-                write_at(kSectorLen + page * page_size_,
-                         reinterpret_cast<const char *>(bytes.data()),
-                         page_size_);
-              }
-              last_completed_consolidate_epoch_ = epoch_id;
-            }
-            in_epoch = false;
-            epoch_pages.clear();
-            break;
-          }
-          default:
+    alaya::wal::WalFile::
+        visit_frames(op_wal_->path(), [&](const alaya::wal::ScannedFrame &frame) -> bool {
+          if (frame.type != kSegmentOpRecordType) {
             replaying_ = false;
-            poison("op-WAL maintenance epoch contains an unexpected op kind");
-        }
-        return true;
-      }
-      if (in_canonical_bundle) {
-        canonical_lane_step(cstage, op, frame, in_canonical_bundle, committed_watermark);
-        return true;
-      }
-      switch (op.kind) {
-        case SegmentOpKind::row_patch:
-          // NEW-BLOCKER-1 (leg-8): classify by generation against the replay cursor. A pre-leg-8
-          // build applied EVERY standalone row_patch by absolute offset with no generation check,
-          // so a CRC-legal old-generation whole-page after-image spliced onto a pid-active base
-          // clobbered a committed page permanently (the final ftruncate only trims beyond the HWM).
-          switch (classify_standalone_effect(op.segment_generation)) {
-            case StandaloneEffect::kApply:
-              if (pid_generation_activated_ || enable_pid_reuse_) {
-                // I-2 / NEW-B1 (leg-9): armed -> STAGE the whole-page after-image (validate its
-                // geometry first); apply only at the commit point (kind=5 / kind=8). Latest-per-page
-                // wins, exactly like the maintenance epoch's staging.
+            poison("op-WAL contains a non-SEGMENT_OP record type");
+          }
+          SegmentOp op;
+          try {
+            op = decode_segment_op(frame.payload);
+          } catch (const std::exception &error) {
+            replaying_ = false;
+            poison(std::string("op-WAL frame decode failed: ") + error.what());
+          }
+          if (op.segment_id != segment_uid_) {
+            replaying_ = false;
+            poison("op-WAL lineage mismatch (stale or foreign .opwal)");
+          }
+          // kind=1..6 frames always carry batch_id 0 (clause 11 / REPORT-wal-2a); only
+          // the label ops (7/8) carry a tx_id. Reject a producer that violates this.
+          if (op.kind != SegmentOpKind::label_bind && op.kind != SegmentOpKind::tx_publish &&
+              frame.batch_id != 0) {
+            replaying_ = false;
+            poison("op-WAL kind=1..6 frame has a non-zero batch_id");
+          }
+          if (in_epoch) {
+            switch (op.kind) {
+              case SegmentOpKind::row_patch: {
+                if (op.segment_generation != epoch_generation) {  // wal-2c BLOCKER-5
+                  replaying_ = false;
+                  poison("op-WAL maintenance row_patch generation != the epoch BEGIN generation");
+                }
                 const size_t page = replay_validate_row_patch_geometry(op);
-                pending_effect_pages[page].assign(op.bytes.begin(), op.bytes.end());
+                epoch_pages[page].assign(op.bytes.begin(), op.bytes.end());  // latest wins
+                break;
+              }
+              case SegmentOpKind::consolidate_end: {
+                if (op.epoch != epoch_id) {
+                  replaying_ = false;
+                  poison("op-WAL consolidate_end epoch does not match its begin");
+                }
+                if (op.segment_generation != epoch_generation) {  // wal-2c BLOCKER-5
+                  replaying_ = false;
+                  poison("op-WAL consolidate_end generation != the epoch BEGIN generation");
+                }
+                // Only a NEW epoch (> the base's last_completed) is applied; an
+                // absorbed-by-base prefix (E <= base epoch) is validated for order but
+                // NOT re-applied, so a stale image can never clobber a higher base
+                // generation (codex B-2C-05 pitfall 5).
+                if (epoch_apply) {
+                  for (const auto &[page, bytes] : epoch_pages) {
+                    write_at(kSectorLen + page * page_size_,
+                             reinterpret_cast<const char *>(bytes.data()),
+                             page_size_);
+                  }
+                  last_completed_consolidate_epoch_ = epoch_id;
+                }
+                in_epoch = false;
+                epoch_pages.clear();
+                break;
+              }
+              default:
+                replaying_ = false;
+                poison("op-WAL maintenance epoch contains an unexpected op kind");
+            }
+            return true;
+          }
+          if (in_canonical_bundle) {
+            canonical_lane_step(cstage, op, frame, in_canonical_bundle, committed_watermark);
+            return true;
+          }
+          switch (op.kind) {
+            case SegmentOpKind::row_patch:
+              // NEW-BLOCKER-1 (leg-8): classify by generation against the replay cursor. A
+              // pre-leg-8 build applied EVERY standalone row_patch by absolute offset with no
+              // generation check, so a CRC-legal old-generation whole-page after-image spliced onto
+              // a pid-active base clobbered a committed page permanently (the final ftruncate only
+              // trims beyond the HWM).
+              switch (classify_standalone_effect(op.segment_generation)) {
+                case StandaloneEffect::kApply:
+                  if (pid_generation_activated_ || enable_pid_reuse_) {
+                    stage_effect_page(effect_unit, op, frame, committed_watermark);
+                  } else {
+                    replay_row_patch(op);  // legacy 2A/2B: immediate apply, byte-for-byte unchanged
+                  }
+                  break;
+                case StandaloneEffect::kValidateOnly:
+                  // Absorbed/old-generation after-image: validate geometry (structural legality)
+                  // but do NOT write -- the base at the cursor generation already holds the
+                  // authoritative page.
+                  (void)replay_validate_row_patch_geometry(op);
+                  break;
+                case StandaloneEffect::kPoison:
+                  replaying_ = false;
+                  poison("op-WAL standalone row_patch generation is newer than the replay cursor");
+              }
+              break;
+            case SegmentOpKind::tombstone:
+              switch (classify_standalone_effect(op.segment_generation)) {
+                case StandaloneEffect::kApply:
+                  replay_apply_or_stage_tombstone(op, effect_unit);
+                  break;
+                case StandaloneEffect::kValidateOnly:
+                  // NEW-BLOCKER-1 (leg-8): an old-generation tombstone is already reflected in the
+                  // base (or is a generation-unaware ABA forge against a reused incarnation) -- do
+                  // NOT apply it, so a stale kind=2 can never re-hide a live reused PID.
+                  break;
+                case StandaloneEffect::kPoison:
+                  replaying_ = false;
+                  poison("op-WAL standalone tombstone generation is newer than the replay cursor");
+              }
+              break;
+            case SegmentOpKind::publish:
+              switch (classify_standalone_effect(op.segment_generation)) {
+                case StandaloneEffect::kApply:
+                  if (pid_generation_activated_ || enable_pid_reuse_) {
+                    commit_effect_unit_at_publish(op.watermark, committed_watermark, effect_unit);
+                  } else {
+                    committed_watermark = std::max(committed_watermark, op.watermark);  // legacy
+                  }
+                  break;
+                case StandaloneEffect::kValidateOnly:
+                  // Do not advance the watermark from an absorbed/forged old-generation publish.
+                  break;
+                case StandaloneEffect::kPoison:
+                  replaying_ = false;
+                  poison("op-WAL standalone publish generation is newer than the replay cursor");
+              }
+              break;
+            case SegmentOpKind::superblock_flip:
+              replay_flip_with_effect_unit(op, committed_watermark, effect_unit);
+              break;
+            case SegmentOpKind::label_bind:
+              if (is_canonical_generation(op.segment_generation)) {
+                resolve_effect_unit_before_lane(effect_unit, "canonical");
+                canonical_open_lane(cstage, op, frame, in_canonical_bundle);
               } else {
-                replay_row_patch(op);  // legacy 2A/2B: immediate apply, byte-for-byte unchanged
+                replay_label_bind(op, frame.batch_id);
+                attach_legacy_owner(effect_unit, op.tx_id);
               }
               break;
-            case StandaloneEffect::kValidateOnly:
-              // Absorbed/old-generation after-image: validate geometry (structural legality) but do
-              // NOT write -- the base at the cursor generation already holds the authoritative page.
-              (void)replay_validate_row_patch_geometry(op);
-              break;
-            case StandaloneEffect::kPoison:
-              replaying_ = false;
-              poison("op-WAL standalone row_patch generation is newer than the replay cursor");
-          }
-          break;
-        case SegmentOpKind::tombstone:
-          switch (classify_standalone_effect(op.segment_generation)) {
-            case StandaloneEffect::kApply:
-              if (op.pid < row_generations_.size()) {
-                mark_hidden(static_cast<PID>(op.pid));
-                mirror_deleted_insert(static_cast<PID>(op.pid));
-                // Idempotently persist the trailer tombstone bit straight to disk so a
-                // torn/lost following row_patch cannot drop the tombstone at the final
-                // authoritative trailer scan (design section 3.7). rebuild_state_after_replay
-                // ftruncates back to the committed page count, so a stray pid is harmless.
-                replay_persist_tombstone_trailer(static_cast<PID>(op.pid));
+            case SegmentOpKind::tx_publish:
+              if (is_canonical_generation(op.segment_generation)) {
+                replaying_ = false;
+                poison("op-WAL canonical tx_publish with no open bundle (missing kind=7 prefix)");
               }
+              replay_tx_publish(op, frame.batch_id, committed_watermark, effect_unit);
               break;
-            case StandaloneEffect::kValidateOnly:
-              // NEW-BLOCKER-1 (leg-8): an old-generation tombstone is already reflected in the base
-              // (or is a generation-unaware ABA forge against a reused incarnation) -- do NOT apply
-              // it, so a stale kind=2 can never re-hide a live reused PID.
-              break;
-            case StandaloneEffect::kPoison:
-              replaying_ = false;
-              poison("op-WAL standalone tombstone generation is newer than the replay cursor");
-          }
-          break;
-        case SegmentOpKind::publish:
-          switch (classify_standalone_effect(op.segment_generation)) {
-            case StandaloneEffect::kApply:
-              if (pid_generation_activated_ || enable_pid_reuse_) {
-                // I-2 (leg-9): the commit point of a plain-append pending unit -- bound the watermark
-                // to the handle capacity, require whole-page evidence for every new row, apply the
-                // staged pages, then advance the HWM.
-                commit_pending_effect_unit(op.watermark, committed_watermark, pending_effect_pages);
-              } else {
-                committed_watermark = std::max(committed_watermark, op.watermark);  // legacy
+            case SegmentOpKind::consolidate_begin: {
+              if (op.epoch == 0 || op.epoch > last_completed_consolidate_epoch_ + 1) {
+                replaying_ = false;
+                poison("op-WAL consolidate epoch is not the next legal step");
               }
+              // wal-2c BLOCKER-5: every consolidate frame is written at the then-current base
+              // generation (encode_consolidate_marker / encode_row_patch use
+              // superblock_.generation), which cannot change inside an epoch -- a mid-epoch
+              // flip/other op poisons below. Bind the epoch to the BEGIN generation and require
+              // kind=1 / END to all match it, so a spliced cross-generation frame (BEGIN(E,G)
+              // row_patch(G+9) END(E,G+4)) is rejected.
+              //
+              // I-1 (leg-9, r3 independent audit): classify the BEGIN generation against the replay
+              // cursor (superblock_.generation, advanced by replay_flip) with the SAME three-way
+              // split classify_standalone_effect uses, instead of demanding an exact cursor match:
+              //   gen  > cursor: impossible in a valid log (a frame is written at the then-current
+              //   base,
+              //                  which only reaches G+1 after its flip is replayed) -> poison.
+              //   gen == cursor: a new epoch (op.epoch == last_completed+1) or a same-generation
+              //                  absorbed prefix -- epoch_apply below picks new vs absorbed.
+              //   gen  < cursor: an epoch written at an OLDER generation whose result a checkpoint
+              //   flip
+              //                  has since carried into the higher-generation base (crash AFTER the
+              //                  checkpoint's superblock write, BEFORE the WAL reset). Legal ONLY
+              //                  as an absorbed prefix (op.epoch <= last_completed, so the base
+              //                  already reflects it) -> stage + validate-only. A new epoch
+              //                  (op.epoch > last_completed) at an old generation is impossible /
+              //                  forged -> poison.
+              // Without this split a legal consolidate->checkpoint->SB-fsync->crash-before-reset
+              // state (BEGIN(E,G) still in the WAL under a selected G+1 base) fail-closed forever.
+              const uint64_t cursor = superblock_.generation;
+              if (op.segment_generation > cursor) {
+                replaying_ = false;
+                poison("op-WAL consolidate_begin generation is newer than the replay cursor");
+              }
+              if (op.segment_generation < cursor && op.epoch > last_completed_consolidate_epoch_) {
+                replaying_ = false;
+                poison("op-WAL consolidate_begin at an older generation is not an absorbed prefix");
+              }
+              resolve_effect_unit_before_lane(effect_unit, "maintenance");
+              // op.epoch <= last_completed => absorbed-by-base prefix (a checkpoint flip
+              // already carried it); the redo below is byte-identical and idempotent.
+              in_epoch = true;
+              epoch_apply = op.epoch > last_completed_consolidate_epoch_;
+              epoch_id = op.epoch;
+              epoch_generation = op.segment_generation;
+              epoch_begin_offset = frame.offset;
+              epoch_pages.clear();
               break;
-            case StandaloneEffect::kValidateOnly:
-              // Do not advance the watermark from an absorbed/forged old-generation publish.
-              break;
-            case StandaloneEffect::kPoison:
+            }
+            case SegmentOpKind::consolidate_end:
               replaying_ = false;
-              poison("op-WAL standalone publish generation is newer than the replay cursor");
+              poison("op-WAL consolidate_end without a matching begin");
           }
-          break;
-        case SegmentOpKind::superblock_flip:
-          // A checkpoint flip is never legally preceded by an uncommitted standalone page unit
-          // (checkpoint admission requires allocated == committed, so every append published first).
-          // A staged-but-uncommitted unit here is a forged interleaving -- fail closed rather than
-          // let a later publish apply these (now stale, pre-flip-generation) pages to the post-flip
-          // base (leg-9).
-          if (!pending_effect_pages.empty()) {
-            replaying_ = false;
-            poison("op-WAL superblock_flip with an uncommitted standalone page unit");
-          }
-          replay_flip(op, committed_watermark);
-          break;
-        case SegmentOpKind::label_bind:
-          if (is_canonical_generation(op.segment_generation)) {
-            canonical_open_lane(cstage, op, frame, in_canonical_bundle);
-          } else {
-            replay_label_bind(op, frame.batch_id);
-          }
-          break;
-        case SegmentOpKind::tx_publish:
-          if (is_canonical_generation(op.segment_generation)) {
-            replaying_ = false;
-            poison("op-WAL canonical tx_publish with no open bundle (missing kind=7 prefix)");
-          }
-          replay_tx_publish(op, frame.batch_id, committed_watermark, pending_effect_pages);
-          break;
-        case SegmentOpKind::consolidate_begin: {
-          if (op.epoch == 0 || op.epoch > last_completed_consolidate_epoch_ + 1) {
-            replaying_ = false;
-            poison("op-WAL consolidate epoch is not the next legal step");
-          }
-          // wal-2c BLOCKER-5: every consolidate frame is written at the then-current base
-          // generation (encode_consolidate_marker / encode_row_patch use superblock_.generation),
-          // which cannot change inside an epoch -- a mid-epoch flip/other op poisons below. Bind
-          // the epoch to the BEGIN generation and require kind=1 / END to all match it, so a
-          // spliced cross-generation frame (BEGIN(E,G) row_patch(G+9) END(E,G+4)) is rejected.
-          //
-          // I-1 (leg-9, r3 independent audit): classify the BEGIN generation against the replay
-          // cursor (superblock_.generation, advanced by replay_flip) with the SAME three-way split
-          // classify_standalone_effect uses, instead of demanding an exact cursor match:
-          //   gen  > cursor: impossible in a valid log (a frame is written at the then-current base,
-          //                  which only reaches G+1 after its flip is replayed) -> poison.
-          //   gen == cursor: a new epoch (op.epoch == last_completed+1) or a same-generation
-          //                  absorbed prefix -- epoch_apply below picks new vs absorbed.
-          //   gen  < cursor: an epoch written at an OLDER generation whose result a checkpoint flip
-          //                  has since carried into the higher-generation base (crash AFTER the
-          //                  checkpoint's superblock write, BEFORE the WAL reset). Legal ONLY as an
-          //                  absorbed prefix (op.epoch <= last_completed, so the base already
-          //                  reflects it) -> stage + validate-only. A new epoch (op.epoch >
-          //                  last_completed) at an old generation is impossible / forged -> poison.
-          // Without this split a legal consolidate->checkpoint->SB-fsync->crash-before-reset state
-          // (BEGIN(E,G) still in the WAL under a selected G+1 base) fail-closed forever.
-          const uint64_t cursor = superblock_.generation;
-          if (op.segment_generation > cursor) {
-            replaying_ = false;
-            poison("op-WAL consolidate_begin generation is newer than the replay cursor");
-          }
-          if (op.segment_generation < cursor &&
-              op.epoch > last_completed_consolidate_epoch_) {
-            replaying_ = false;
-            poison("op-WAL consolidate_begin at an older generation is not an absorbed prefix");
-          }
-          // op.epoch <= last_completed => absorbed-by-base prefix (a checkpoint flip
-          // already carried it); the redo below is byte-identical and idempotent.
-          in_epoch = true;
-          epoch_apply = op.epoch > last_completed_consolidate_epoch_;
-          epoch_id = op.epoch;
-          epoch_generation = op.segment_generation;
-          epoch_begin_offset = frame.offset;
-          epoch_pages.clear();
-          break;
-        }
-        case SegmentOpKind::consolidate_end:
-          replaying_ = false;
-          poison("op-WAL consolidate_end without a matching begin");
-      }
-      return true;
-    });
+          return true;
+        });
     // Unmatched BEGIN at EOF: discard the incomplete epoch (nothing was installed --
     // END was never durable, so the index is still S_old) and truncate the WAL back
     // to the BEGIN boundary so the next append starts clean (design section 1.3).
@@ -6784,19 +6785,17 @@ class QGUpdater {
                error.what());
       }
     }
-    // I-2 / NEW-B1 (leg-9): a torn STANDALONE unit at EOF (staged row_patch after-images with no
-    // committing kind=5/kind=8) is discarded -- nothing was written, so the index is still S_old and
-    // the committed watermark below reflects only the committed prefix. The kind=1 frames stay in the
-    // WAL and re-stage/re-discard idempotently on the next open (exactly as the pre-leg-9 torn
-    // plain-append did: its immediate pages were ftruncated back by rebuild_state_after_replay).
-    pending_effect_pages.clear();
+    // EOF explicitly resolves a torn standalone/legacy unit. Frame references and staged legacy
+    // tombstones are recovery-local and have not been applied, so discarding them leaves S_old; a
+    // standalone kind=2 was already applied idempotently and remains authoritative.
+    effect_unit.clear();
     // I-4 (leg-9, r3): staged_binds_ is a REPLAY-LOCAL scratch (recovery-only, never read on the
     // writer path). Any orphan kind=7 binds that never matched a kind=8 (a torn bundle whose commit
     // was lost) are dropped here, explicitly and unconditionally -- adopt_label_state() only clears
     // them on a G+1 install flip, so a SAME-generation activation flip (already the selected base,
-    // early-returns in replay_flip without re-adopting) previously left them dangling until the next
-    // recovery. Clearing at the single convergence point makes the "orphan dropped at EOF" comment in
-    // replay_label_bind literally true for every flip disposition.
+    // early-returns in replay_flip without re-adopting) previously left them dangling until the
+    // next recovery. Clearing at the single convergence point makes the "orphan dropped at EOF"
+    // comment in replay_label_bind literally true for every flip disposition.
     staged_binds_.clear();
     committed_.store(committed_watermark, std::memory_order_release);
     // replaying_ stays true through the entire rebuild so no derived-state repair
@@ -6834,27 +6833,166 @@ class QGUpdater {
     write_at(op.offset, reinterpret_cast<const char *>(op.bytes.data()), op.bytes.size());
   }
 
-  // I-2 / NEW-B1 (leg-9): apply every whole-page after-image staged in the pending standalone unit
-  // (distinct page indices, so the write order is irrelevant), then clear it. Shared by the kind=5
-  // publish commit and the kind=8 tx_publish commit.
-  void apply_pending_effect_pages(std::unordered_map<size_t, std::vector<std::byte>> &pending) {
-    for (const auto &[page, bytes] : pending) {
-      write_at(kSectorLen + static_cast<uint64_t>(page) * page_size_,
-               reinterpret_cast<const char *>(bytes.data()), bytes.size());
+  [[nodiscard]] uint64_t single_staged_legacy_txid() {
+    uint64_t candidate = 0;
+    for (const auto &[txid, binds] : staged_binds_) {
+      if (binds.empty()) {
+        continue;
+      }
+      if (candidate != 0 && candidate != txid) {
+        poison("op-WAL kind=1/kind=2 has ambiguous ownership across legacy transactions");
+      }
+      candidate = txid;
     }
-    pending.clear();
+    return candidate;
   }
 
-  // I-2 (leg-9, r3 independent audit): commit a plain-append pending unit at a kind=5 publish. A
-  // pre-leg-9 build advanced committed_watermark = max(committed_watermark, op.watermark) with no
-  // capacity bound and NO page evidence, so a bare publish(N+1) with no row_patch fabricated a live
-  // row from a zero-filled (absent) page on rebuild (read_at zero-fills past the file tail and a zero
-  // trailer scans as live). Now: bound the watermark to the handle capacity, require a staged
-  // whole-page after-image for every NEW row in [old_hwm, watermark), apply the staged pages, then
-  // advance. A publish that does not advance (watermark <= old_hwm) applies the staged pages (an
-  // idempotent same-generation rewrite) without regressing the watermark.
-  void commit_pending_effect_unit(uint64_t publish_watermark, uint64_t &committed_watermark,
-                                  std::unordered_map<size_t, std::vector<std::byte>> &pending) {
+  void begin_or_check_effect_unit(EffectCommitUnit &unit,
+                                  uint64_t generation,
+                                  uint64_t frame_offset) {
+    if (!unit.active()) {
+      unit.generation = generation;
+      unit.begin_offset = frame_offset;
+      return;
+    }
+    if (unit.generation != generation) {
+      poison("op-WAL effect commit unit mixes segment generations");
+    }
+  }
+
+  void attach_legacy_owner(EffectCommitUnit &unit, uint64_t txid) {
+    if (!unit.active()) {
+      return;
+    }
+    // A preceding standalone tombstone is a distinct idempotent unit. Its kind=1 pages are
+    // redundant with the immediately persisted trailer/rebuild state and must not become owned by a
+    // later legacy bind merely because kind=1 has no txid.
+    if (unit.saw_standalone_tombstone) {
+      validate_effect_unit_pages(unit);
+      unit.clear();
+      return;
+    }
+    if (!unit.has_staged_effects()) {
+      return;
+    }
+    if (unit.legacy_txid == 0) {
+      unit.legacy_txid = txid;
+      return;
+    }
+    if (unit.legacy_txid != txid) {
+      poison("op-WAL effect commit unit is interleaved across two legacy txids");
+    }
+  }
+
+  void stage_effect_page(EffectCommitUnit &unit,
+                         const SegmentOp &op,
+                         const alaya::wal::ScannedFrame &frame,
+                         uint64_t committed_watermark) {
+    (void)committed_watermark;  // row-level allocation evidence is added in the I-2 unit below
+    const size_t page = replay_validate_row_patch_geometry(op);
+    begin_or_check_effect_unit(unit, op.segment_generation, frame.offset);
+    if (unit.legacy_txid == 0 && !unit.saw_standalone_tombstone) {
+      unit.legacy_txid = single_staged_legacy_txid();
+    }
+    unit.latest_refs[page] = alaya::wal::FrameLocation{frame.offset, frame.size};
+  }
+
+  [[nodiscard]] SegmentOp reread_effect_page(const alaya::wal::FrameLocation &ref,
+                                             uint64_t expected_generation,
+                                             size_t expected_page) {
+    alaya::wal::ScannedFrame frame;
+    try {
+      frame = alaya::wal::WalFile::read_frame(op_wal_->path(), ref);
+    } catch (const std::exception &error) {
+      poison(std::string("op-WAL effect page re-read failed: ") + error.what());
+    }
+    if (frame.type != kSegmentOpRecordType || frame.batch_id != 0) {
+      poison("op-WAL effect page reference does not name a standalone kind=1 frame");
+    }
+    SegmentOp op;
+    try {
+      op = decode_segment_op(frame.payload);
+    } catch (const std::exception &error) {
+      poison(std::string("op-WAL effect page re-decode failed: ") + error.what());
+    }
+    if (op.kind != SegmentOpKind::row_patch || op.segment_id != segment_uid_ ||
+        op.segment_generation != expected_generation) {
+      poison("op-WAL effect page reference changed identity or generation");
+    }
+    if (replay_validate_row_patch_geometry(op) != expected_page) {
+      poison("op-WAL effect page reference changed page identity");
+    }
+    return op;
+  }
+
+  void validate_effect_unit_pages(const EffectCommitUnit &unit) {
+    for (const auto &[page, ref] : unit.latest_refs) {
+      (void)reread_effect_page(ref, unit.generation, page);
+    }
+  }
+
+  void apply_effect_unit_pages(const EffectCommitUnit &unit) {
+    for (const auto &[page, ref] : unit.latest_refs) {
+      const SegmentOp op = reread_effect_page(ref, unit.generation, page);
+      write_at(op.offset, reinterpret_cast<const char *>(op.bytes.data()), op.bytes.size());
+    }
+  }
+
+  void apply_one_replay_tombstone(PID pid) {
+    mark_hidden(pid);
+    mirror_deleted_insert(pid);
+    replay_persist_tombstone_trailer(pid);
+  }
+
+  void apply_staged_legacy_tombstones(const EffectCommitUnit &unit) {
+    for (PID pid : unit.staged_legacy_tombstones) {
+      apply_one_replay_tombstone(pid);
+    }
+  }
+
+  void replay_apply_or_stage_tombstone(const SegmentOp &op, EffectCommitUnit &unit) {
+    if (op.pid >= row_generations_.size()) {
+      return;  // preserves the existing idempotent out-of-capacity no-op
+    }
+    const PID pid = static_cast<PID>(op.pid);
+    if (pid_generation_activated_ || enable_pid_reuse_) {
+      uint64_t owner = unit.legacy_txid;
+      if (owner == 0 && !unit.saw_standalone_tombstone) {
+        owner = single_staged_legacy_txid();
+      }
+      if (owner != 0) {
+        begin_or_check_effect_unit(unit, op.segment_generation, /*frame_offset=*/0);
+        unit.legacy_txid = owner;
+        unit.staged_legacy_tombstones.insert(pid);
+        return;
+      }
+      begin_or_check_effect_unit(unit, op.segment_generation, /*frame_offset=*/0);
+      unit.saw_standalone_tombstone = true;
+    }
+    // Unit-external current-generation tombstones retain the historical immediate, idempotent
+    // apply.
+    apply_one_replay_tombstone(pid);
+  }
+
+  void resolve_effect_unit_before_lane(EffectCommitUnit &unit, const char *lane) {
+    if (!unit.active()) {
+      return;
+    }
+    if (unit.legacy_txid != 0 || (!unit.latest_refs.empty() && !unit.saw_standalone_tombstone)) {
+      poison(std::string("op-WAL unresolved effect unit crosses into the ") + lane + " lane");
+    }
+    // A standalone tombstone was already installed idempotently. Validate its referenced final
+    // pages, then discard the recovery-only refs so the lane cannot consume them accidentally.
+    validate_effect_unit_pages(unit);
+    unit.clear();
+  }
+
+  void commit_effect_unit_at_publish(uint64_t publish_watermark,
+                                     uint64_t &committed_watermark,
+                                     EffectCommitUnit &unit) {
+    if (unit.legacy_txid != 0) {
+      poison("op-WAL kind=5 cannot consume a legacy-owned effect unit");
+    }
     if (publish_watermark > static_cast<uint64_t>(kPidMax) ||
         publish_watermark > row_generations_.size()) {
       poison("op-WAL standalone publish watermark exceeds the PID capacity");
@@ -6862,12 +7000,14 @@ class QGUpdater {
     const uint64_t old_hwm = committed_watermark;
     for (uint64_t p = old_hwm; p < publish_watermark; ++p) {
       const size_t page = page_index(static_cast<PID>(p));
-      if (pending.find(page) == pending.end()) {
+      if (unit.latest_refs.find(page) == unit.latest_refs.end()) {
         poison("op-WAL standalone publish advances the HWM over a row with no page after-image");
       }
     }
-    apply_pending_effect_pages(pending);
+    validate_effect_unit_pages(unit);  // complete validation before the first page write
+    apply_effect_unit_pages(unit);
     committed_watermark = (std::max)(committed_watermark, publish_watermark);
+    unit.clear();
   }
 
   // Idempotently set the on-disk trailer tombstone bit for one row during replay
@@ -6902,20 +7042,20 @@ class QGUpdater {
     }
     // NEW-BLOCKER-2 (leg-8, r2 blind-audit): a kind=7 bind only STAGES a binding -- it writes
     // nothing to the index -- so it is NEVER convicted on its own, even on a pid-activated base.
-    // leg-7 poisoned here whenever pid_generation_activated_ && tx_id > base, but that falsely killed
-    // a LEGAL crash state: a legacy bundle whose orphan kind=7 bind survived the kind=8 (SIGKILL
-    // before commit -- explicitly allowed by the (tx_id,row_op_id) dedup contract) followed by a
-    // pid-activation checkpoint that fsynced its G+1 superblock but crashed before the WAL reset.
-    // On reopen the pid-active G+1 base is selected while the orphan (tx_id > base) still precedes
-    // the activation flip in the WAL; poisoning here fail-closed a recoverable segment forever. The
-    // orphan is now staged and then dropped at the single end-of-replay clear (I-4): a G+1 install
-    // flip re-adopts the base and clears staged_binds_ in adopt_label_state, while a SAME-generation
-    // activation flip (already the selected base) early-returns without re-adopting, so the explicit
-    // staged_binds_.clear() at the end of replay_and_rebuild is what drops it in that case. Conviction
-    // of a forged NON-absorbed legacy transaction
-    // moves to its effectful commit point (replay_tx_publish, tx_id > base), and its interleaved
-    // row_patch after-images are validate-only by classify_standalone_effect -- so nothing the
-    // forged bundle carries is ever applied before that commit-time poison (index stays unchanged).
+    // leg-7 poisoned here whenever pid_generation_activated_ && tx_id > base, but that falsely
+    // killed a LEGAL crash state: a legacy bundle whose orphan kind=7 bind survived the kind=8
+    // (SIGKILL before commit -- explicitly allowed by the (tx_id,row_op_id) dedup contract)
+    // followed by a pid-activation checkpoint that fsynced its G+1 superblock but crashed before
+    // the WAL reset. On reopen the pid-active G+1 base is selected while the orphan (tx_id > base)
+    // still precedes the activation flip in the WAL; poisoning here fail-closed a recoverable
+    // segment forever. The orphan is now staged and then dropped at the single end-of-replay clear
+    // (I-4): a G+1 install flip re-adopts the base and clears staged_binds_ in adopt_label_state,
+    // while a SAME-generation activation flip (already the selected base) early-returns without
+    // re-adopting, so the explicit staged_binds_.clear() at the end of replay_and_rebuild is what
+    // drops it in that case. Conviction of a forged NON-absorbed legacy transaction moves to its
+    // effectful commit point (replay_tx_publish, tx_id > base), and its interleaved row_patch
+    // after-images are validate-only by classify_standalone_effect -- so nothing the forged bundle
+    // carries is ever applied before that commit-time poison (index stays unchanged).
     //
     // Idempotent de-dup by (tx_id, row_op_id): a same-txid retry after a torn bundle
     // whose earlier binds survived in the OS page cache (process crash on a bundle
@@ -6941,13 +7081,17 @@ class QGUpdater {
   void replay_tx_publish(const SegmentOp &op,
                          uint64_t frame_batch_id,
                          uint64_t &committed_watermark,
-                         std::unordered_map<size_t, std::vector<std::byte>> &pending) {
+                         EffectCommitUnit &unit) {
     if (frame_batch_id != op.tx_id) {
       poison("op-WAL tx_publish frame batch_id != payload tx_id");
     }
     if (op.binding_count == 0) {
       poison("op-WAL tx_publish binding_count must be >= 1");
     }
+    if (unit.legacy_txid != 0 && unit.legacy_txid != op.tx_id) {
+      poison("op-WAL legacy tx_publish cannot consume another txid's effect unit");
+    }
+    const bool owns_effect_unit = unit.legacy_txid == op.tx_id;
     // NEW-BLOCKER-1/2 (leg-8): this is the COMMIT-TIME conviction point for the legacy lane. A
     // kind=8 is the effectful commit (it promotes staged binds + advances the watermark), so once
     // pid reuse is activated a legacy tx_publish (segment_generation < activation) that is NOT an
@@ -6987,10 +7131,12 @@ class QGUpdater {
         }
       }
       staged_binds_.erase(op.tx_id);
-      // I-2 / NEW-B1 (leg-9): the selected base already holds this bundle's durable pages, so any
-      // staged current-generation page unit for it is redundant (and could be a stale/forged
-      // after-image) -- discard it, never re-apply over the higher base (JC-22 validate-only spirit).
-      pending.clear();
+      // The selected base already holds an absorbed bundle. Resolve only the effect unit explicitly
+      // owned by this tx; unrelated standalone evidence remains available to its later boundary.
+      if (owns_effect_unit) {
+        validate_effect_unit_pages(unit);
+        unit.clear();
+      }
       return;
     }
 
@@ -7040,19 +7186,25 @@ class QGUpdater {
       pid_seen[pidx] = 1;
     }
     // I-2 / NEW-B1 (leg-9): when the reuse classifier is armed, this bundle's row after-images were
-    // STAGED (not applied immediately), so apply them here -- AFTER the full B-04 validation set and
-    // the NEW-BLOCKER-1 absorbed-gate above, so a forged legacy bundle poisons before anything is
-    // written. Verify whole-page evidence for the new range (a phantom bound row with no after-image
-    // is rejected), then apply the pages before promoting the bindings. On the legacy path (classifier
-    // disarmed) kind=1 was applied immediately and `pending` is empty, so this is skipped (unchanged).
+    // STAGED (not applied immediately), so apply them here -- AFTER the full B-04 validation set
+    // and the NEW-BLOCKER-1 absorbed-gate above, so a forged legacy bundle poisons before anything
+    // is written. Verify whole-page evidence for the new range (a phantom bound row with no
+    // after-image is rejected), then apply the pages before promoting the bindings. On the legacy
+    // path (classifier disarmed) kind=1 was applied immediately and `pending` is empty, so this is
+    // skipped (unchanged).
     if (pid_generation_activated_ || enable_pid_reuse_) {
       for (uint64_t p = old_hwm; p < new_hwm; ++p) {
         const size_t page = page_index(static_cast<PID>(p));
-        if (pending.find(page) == pending.end()) {
+        if (!owns_effect_unit || unit.latest_refs.find(page) == unit.latest_refs.end()) {
           poison("op-WAL tx_publish advances the HWM over a row with no page after-image");
         }
       }
-      apply_pending_effect_pages(pending);
+      if (owns_effect_unit) {
+        validate_effect_unit_pages(unit);  // full unit validation before the first page write
+        apply_effect_unit_pages(unit);
+        apply_staged_legacy_tombstones(unit);
+        unit.clear();
+      }
     }
     // Promote: install the bindings, advance committed + both tx watermarks.
     for (const auto &bind : staged) {
@@ -7265,9 +7417,9 @@ class QGUpdater {
          img_label.checksum != cur_label.checksum)) {
       poison("flip image same-generation label tuple differs (content changed without a bump)");
     }
-    // Overflow: minting a NEW label tuple (a differing slot/count/checksum) once the label generation
-    // is already saturated is impossible (the checkpoint's label_generation_ + 1 would wrap to 0,
-    // which the regress check above also catches). Reject explicitly for clarity.
+    // Overflow: minting a NEW label tuple (a differing slot/count/checksum) once the label
+    // generation is already saturated is impossible (the checkpoint's label_generation_ + 1 would
+    // wrap to 0, which the regress check above also catches). Reject explicitly for clarity.
     if (cur_label.generation == (std::numeric_limits<uint64_t>::max)() &&
         (img_label.slot != cur_label.slot || img_label.generation != cur_label.generation ||
          img_label.count != cur_label.count || img_label.checksum != cur_label.checksum)) {
@@ -7275,13 +7427,24 @@ class QGUpdater {
     }
   }
 
-  void replay_flip(const SegmentOp &op, uint64_t &committed_watermark) {
+  enum class ReplayFlipDisposition { kStale, kRetained, kInstall };
+  struct PreparedReplayFlip {
+    QGSuperblockV2 image{};
+    ReplayFlipDisposition disposition = ReplayFlipDisposition::kStale;
+    int next_slot = -1;
+  };
+
+  // Pure/read-only replay phase for a flip. This performs every structural, label, transition and
+  // unit-independent check before the caller is allowed to write either staged pages or the base.
+  [[nodiscard]] PreparedReplayFlip prepare_replay_flip(const SegmentOp &op,
+                                                       uint64_t committed_watermark) {
     if (op.bytes.size() != kSegmentSuperblockImageBytes) {
       poison("flip image is not 512 bytes");
     }
-    QGSuperblockV2 image;
-    std::memcpy(&image, op.bytes.data(), sizeof(image));
-    if (!qg_superblock_valid(image)) {
+    PreparedReplayFlip prepared;
+    std::memcpy(&prepared.image, op.bytes.data(), sizeof(prepared.image));
+    QGSuperblockV2 &image = prepared.image;
+    if (!qg_superblock_valid(prepared.image)) {
       poison("flip image checksum invalid");
     }
     // BLOCKER-5: fail closed on an UNSUPPORTED (or self-inconsistent) flip image BEFORE any
@@ -7305,14 +7468,16 @@ class QGUpdater {
       poison("flip op generation != the image generation");
     }
     if (image_generation < disk_generation) {
-      return;  // stale retained marker: it is an old base, replay only the tail
+      prepared.disposition = ReplayFlipDisposition::kStale;
+      return prepared;
     }
     if (image_generation == disk_generation) {
       // Same generation must be byte-identical (idempotent re-adopt of the base).
       if (std::memcmp(&image, &superblock_, sizeof(image)) != 0) {
         poison("flip same-generation image differs from the selected superblock");
       }
-      return;
+      prepared.disposition = ReplayFlipDisposition::kRetained;
+      return prepared;
     }
     if (image_generation != disk_generation + 1) {
       poison("flip generation transition is not the next legal step");
@@ -7323,34 +7488,74 @@ class QGUpdater {
     // re-selecting). adopt_label_state() below re-runs the same checks and mutates the members.
     validate_flip_label_state(image);
     // BLOCKER-3 (leg-8, r2 section 1) + B3 completion (leg-9, r3 section 1): full structural
-    // transition validation (immutable geometry, exact file length, inactive target slot, generation
-    // step, state monotonicity, real handle capacity, expected HWM, count joint invariants, label
-    // tuple transition) BEFORE any pwrite/ftruncate -- a crafted geometry/short-file/active-slot/
-    // capacity+1/HWM-regress/old-label-slot flip is rejected here with the index byte-for-byte
-    // unchanged, instead of installing and only failing closed on the next open. The expected HWM is
-    // the replayed committed watermark at this flip: a legal checkpoint captured committed_ into
-    // image.num_points, so a G+1 install image whose num_points disagrees with the recovered prefix
-    // is forged.
+    // transition validation (immutable geometry, exact file length, inactive target slot,
+    // generation step, state monotonicity, real handle capacity, expected HWM, count joint
+    // invariants, label tuple transition) BEFORE any pwrite/ftruncate -- a crafted
+    // geometry/short-file/active-slot/ capacity+1/HWM-regress/old-label-slot flip is rejected here
+    // with the index byte-for-byte unchanged, instead of installing and only failing closed on the
+    // next open. The expected HWM is the replayed committed watermark at this flip: a legal
+    // checkpoint captured committed_ into image.num_points, so a G+1 install image whose num_points
+    // disagrees with the recovered prefix is forged.
     validate_flip_transition(image, op.segment_generation, op.target_slot, committed_watermark);
+    prepared.disposition = ReplayFlipDisposition::kInstall;
+    prepared.next_slot = static_cast<int>(op.target_slot);
+    return prepared;
+  }
+
+  void apply_prepared_replay_flip(const PreparedReplayFlip &prepared,
+                                  uint64_t &committed_watermark) {
+    if (prepared.disposition != ReplayFlipDisposition::kInstall) {
+      return;
+    }
     // Apply the next legal base: rewrite its slot and set the file length.
-    const auto next_slot = static_cast<int>(op.target_slot);
-    write_superblock(next_slot, image);
-    if (::ftruncate(fd_, static_cast<off_t>(image.file_size)) != 0) {
+    write_superblock(prepared.next_slot, prepared.image);
+    if (::ftruncate(fd_, static_cast<off_t>(prepared.image.file_size)) != 0) {
       poison("flip replay ftruncate failed");
     }
-    superblock_ = image;
-    active_superblock_slot_ = next_slot;
-    qg_.entry_point_ = static_cast<PID>(image.entry_point);
-    committed_.store(image.num_points, std::memory_order_release);
+    superblock_ = prepared.image;
+    active_superblock_slot_ = prepared.next_slot;
+    qg_.entry_point_ = static_cast<PID>(prepared.image.entry_point);
+    committed_.store(prepared.image.num_points, std::memory_order_release);
     // The new base is the replay cursor from here on; the local running watermark must track it
     // (the final committed_.store uses this local). For a legal WAL the install flip is the last
-    // frame, so this equals the value validate_flip_transition just checked, but keeping it explicit
-    // (not a coincidence of "no frames follow the flip") is what makes the expected-HWM invariant sound.
-    committed_watermark = image.num_points;
+    // frame, so this equals the value validate_flip_transition just checked, but keeping it
+    // explicit (not a coincidence of "no frames follow the flip") is what makes the expected-HWM
+    // invariant sound.
+    committed_watermark = prepared.image.num_points;
     // Re-adopt the base's label + tx state: the flip carried a (possibly new)
     // label slot tuple and tx watermarks; load the persisted bindings from it so
     // any bundles it already absorbed are reflected without re-promotion.
-    adopt_label_state(image);
+    adopt_label_state(prepared.image);
+  }
+
+  void replay_flip(const SegmentOp &op, uint64_t &committed_watermark) {
+    const PreparedReplayFlip prepared = prepare_replay_flip(op, committed_watermark);
+    apply_prepared_replay_flip(prepared, committed_watermark);
+  }
+
+  void replay_flip_with_effect_unit(const SegmentOp &op,
+                                    uint64_t &committed_watermark,
+                                    EffectCommitUnit &unit) {
+    // Complete flip validation comes first. In particular, a malformed G+1 image cannot cause an
+    // otherwise valid staged page to be written before the flip is rejected.
+    const PreparedReplayFlip prepared = prepare_replay_flip(op, committed_watermark);
+    if (unit.active()) {
+      if (unit.legacy_txid != 0) {
+        poison("op-WAL flip cannot consume a legacy-owned effect unit");
+      }
+      if (prepared.disposition != ReplayFlipDisposition::kInstall && unit.has_staged_effects()) {
+        poison("op-WAL retained/stale flip has an unresolved current effect unit");
+      }
+      if (prepared.disposition == ReplayFlipDisposition::kInstall) {
+        validate_effect_unit_pages(unit);  // all refs re-read/re-CRC before the first page write
+        apply_effect_unit_pages(unit);
+      }
+      unit.clear();
+    }
+    // A valid flip is an explicit orphan-bind boundary for every disposition. An install will also
+    // clear this in adopt_label_state(), but clearing here covers stale/retained exits as well.
+    staged_binds_.clear();
+    apply_prepared_replay_flip(prepared, committed_watermark);
   }
 
   // The single authoritative post-replay pass (clause C): derive the whole
