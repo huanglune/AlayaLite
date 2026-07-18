@@ -56,10 +56,14 @@ inline auto get_rabitq_simd_name(RabitqSimdLevel level) -> const char * {
   ALAYA_UNREACHABLE;
 }
 
-inline auto detect_rabitq_simd_level() -> RabitqSimdLevel {
+inline auto select_rabitq_simd_level(const ::alaya::simd::CpuFeatures &features)
+    -> RabitqSimdLevel {
 #ifdef ALAYA_ARCH_X86
-  const auto &features = ::alaya::simd::get_cpu_features();
-  if (features.avx512f_ && features.avx512bw_) {
+  // This shared tier includes scalar_quantize_optimized_avx512, whose target
+  // attribute permits F, BW, DQ, and VL instructions. Admit it only when all
+  // four ISA subsets and the OS-managed opmask/ZMM state are available.
+  if (features.avx512f_ && features.avx512bw_ && features.avx512dq_ && features.avx512vl_ &&
+      features.avx512_os_state_) {
     return RabitqSimdLevel::kAvx512;
   }
   if (features.avx2_ && features.fma_) {
@@ -72,6 +76,10 @@ inline auto detect_rabitq_simd_level() -> RabitqSimdLevel {
   // throwing.
 #endif
   return RabitqSimdLevel::kGeneric;
+}
+
+inline auto detect_rabitq_simd_level() -> RabitqSimdLevel {
+  return select_rabitq_simd_level(::alaya::simd::get_cpu_features());
 }
 
 inline auto get_rabitq_simd_level() -> RabitqSimdLevel {
@@ -334,7 +342,7 @@ inline auto get_accumulate_and_estimate_distances_func() -> AccumulateAndEstimat
 // 4. flip_sign (rotator.hpp) — needs AVX512DQ for the masked packed-float xor
 //    (_mm512_mask_xor_ps), hence ALAYA_TARGET_AVX512 (F+BW+DQ) rather than the
 //    _BW-only macro; matches distance_ip.ipp's own ip_sqr_avx512 precedent of
-//    using the DQ-inclusive macro while gating dispatch on avx512f_+avx512bw_.
+//    using the DQ-inclusive macro; the shared tier gate covers its full feature set.
 // ============================================================================
 
 using FlipSignFn = void (*)(const uint8_t *, float *, size_t);

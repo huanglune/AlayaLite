@@ -17,6 +17,9 @@ namespace alaya::simd {
 struct CpuFeatures {
   bool avx512f_ = false;
   bool avx512bw_ = false;
+  bool avx512dq_ = false;
+  bool avx512vl_ = false;
+  bool avx512_os_state_ = false;
   bool avx2_ = false;
   bool fma_ = false;
   bool sse4_1_ = false;
@@ -32,6 +35,16 @@ struct CpuFeatures {
     if (__builtin_cpu_supports("avx512bw")) {
       features.avx512bw_ = true;
     }
+    if (__builtin_cpu_supports("avx512dq")) {
+      features.avx512dq_ = true;
+    }
+    if (__builtin_cpu_supports("avx512vl")) {
+      features.avx512vl_ = true;
+    }
+    // GCC and Clang make the AVX-512 builtins false unless the OS has enabled
+    // opmask and ZMM state. A true AVX512F result therefore records the same
+    // XCR0 admission condition checked explicitly on MSVC below.
+    features.avx512_os_state_ = features.avx512f_;
     if (__builtin_cpu_supports("avx2")) {
       features.avx2_ = true;
     }
@@ -50,11 +63,18 @@ struct CpuFeatures {
       __cpuid(cpu_info, 1);
       features.sse4_1_ = (cpu_info[2] & (1 << 19)) != 0;
       features.fma_ = (cpu_info[2] & (1 << 12)) != 0;
+      const bool osxsave = (cpu_info[2] & (1 << 27)) != 0;
+      if (osxsave) {
+        const auto xcr0 = _xgetbv(0);
+        features.avx512_os_state_ = (xcr0 & 0xE6U) == 0xE6U;
+      }
     }
     if (max_func >= 7) {
       __cpuidex(cpu_info, 7, 0);
       features.avx512f_ = (cpu_info[1] & (1 << 16)) != 0;
       features.avx512bw_ = (cpu_info[1] & (1 << 30)) != 0;
+      features.avx512dq_ = (cpu_info[1] & (1 << 17)) != 0;
+      features.avx512vl_ = (cpu_info[1] & (1U << 31)) != 0;
       features.avx2_ = (cpu_info[1] & (1 << 5)) != 0;
     }
   #endif
