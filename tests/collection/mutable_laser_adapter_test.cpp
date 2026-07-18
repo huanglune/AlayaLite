@@ -42,7 +42,8 @@ std::filesystem::path scratch(const std::string &name) {
 
 std::shared_ptr<::alaya::disk::MutableLaserSegment> open_empty(
     const std::filesystem::path &dir,
-    std::function<void(laser::SegmentOpFailPoint)> failpoint_hook = {}) {
+    std::function<void(laser::SegmentOpFailPoint)> failpoint_hook = {},
+    std::function<void(std::uint64_t, std::size_t)> before_index_write_hook = {}) {
   std::filesystem::remove_all(dir);
   ::alaya::disk::MutableLaserSegment::create_empty(dir,
                                                    "seg_00000002",
@@ -54,6 +55,7 @@ std::shared_ptr<::alaya::disk::MutableLaserSegment> open_empty(
   params.max_points = 4096;
   params.ef_insert = 64;
   params.failpoint_hook = std::move(failpoint_hook);
+  params.before_index_write_hook = std::move(before_index_write_hook);
   return std::make_shared<::alaya::disk::MutableLaserSegment>(dir,
                                                               params,
                                                               laser::ResidencyMode::kPagedPool,
@@ -101,7 +103,8 @@ std::vector<float> ramp(std::uint64_t row_id) {
   return v;
 }
 
-SegmentMutationPayload make_write(std::uint64_t op_id, std::uint64_t row_id,
+SegmentMutationPayload make_write(std::uint64_t op_id,
+                                  std::uint64_t row_id,
                                   const std::vector<float> &vec,
                                   std::optional<std::uint64_t> previous) {
   SegmentMutationPayload p;
@@ -118,8 +121,10 @@ SegmentMutationPayload make_write(std::uint64_t op_id, std::uint64_t row_id,
 
 // Drive one single-row transaction (prepare -> stage -> publish) with an explicit
 // physical txid + max op (as Collection would set them).
-core::Status drive(MutableLaserCollectionAdapter &adapter, const SegmentMutationPayload &payload,
-                   std::uint64_t txid, std::uint64_t max_row_op_id,
+core::Status drive(MutableLaserCollectionAdapter &adapter,
+                   const SegmentMutationPayload &payload,
+                   std::uint64_t txid,
+                   std::uint64_t max_row_op_id,
                    WriteDurability durability = WriteDurability::wal_fsync) {
   WalMutationTransaction transaction;  // Collection's token target (durability tier)
   transaction.durability = durability;
@@ -143,7 +148,8 @@ core::Status drive(MutableLaserCollectionAdapter &adapter, const SegmentMutation
 }
 
 bool searchable(const std::shared_ptr<::alaya::disk::MutableLaserSegment> &seg,
-                const std::vector<float> &query, std::uint64_t label) {
+                const std::vector<float> &query,
+                std::uint64_t label) {
   ::alaya::disk::DiskSearchOptions opts;
   opts.top_k = 16;
   opts.ef = 128;
@@ -366,6 +372,35 @@ TEST(MutableLaserAdapter, StatvfsFailureBeforeBeginClearsMaintenanceWithoutLatch
   std::filesystem::remove_all(dir);
 }
 
+TEST(MutableLaserAdapter, BaselineFlushFailureIsRecoveryRequired) {
+  const auto dir = scratch("maintenance_baseline_flush");
+  std::atomic_bool armed{};
+  auto seg = open_empty(dir, {}, [&](std::uint64_t, std::size_t) {
+    if (armed.exchange(false, std::memory_order_acq_rel)) {
+      throw std::system_error(std::make_error_code(std::errc::no_space_on_device),
+                              "injected baseline pwrite ENOSPC");
+    }
+  });
+  MutableLaserCollectionAdapter adapter(seg, schema(), kSegId, kGen);
+
+  // The first empty consolidate activates maintenance. A later committed write
+  // remains dirty in the QG write cache until the next baseline normalization.
+  ASSERT_TRUE(adapter.consolidate(1, 0, true, false).ok());
+  const auto vector = ramp(75);
+  ASSERT_TRUE(drive(adapter, make_write(751, 75, vector, std::nullopt), 751, 751).ok());
+  armed.store(true, std::memory_order_release);
+
+  const auto failed = adapter.consolidate(1, 0, true, false);
+  EXPECT_FALSE(failed.ok());
+  EXPECT_TRUE(seg->recovery_required());
+  EXPECT_TRUE(adapter.recovery_required());
+  EXPECT_TRUE(adapter.is_latched());
+  core::CheckpointContext context;
+  core::CheckpointToken token;
+  EXPECT_FALSE(adapter.checkpoint(context, token).ok());
+  std::filesystem::remove_all(dir);
+}
+
 TEST(MutableLaserAdapter, FailureAfterDurableBeginLatchesAndGatesCheckpoint) {
   const auto dir = scratch("maintenance_after_begin");
   std::atomic_bool armed{true};
@@ -394,8 +429,7 @@ TEST(MutableLaserAdapter, SharedExtensionsResolveSameForActiveAndSealedDefaults)
   parameters.beam_width = 7;
   auto extension = ::alaya::disk::make_laser_segment_search_extension(parameters);
   core::SearchOptions request_options(5);
-  request_options.extensions =
-      std::span<const core::AlgorithmSearchExtension>(&extension, 1);
+  request_options.extensions = std::span<const core::AlgorithmSearchExtension>(&extension, 1);
 
   ::alaya::disk::DiskSearchOptions active_defaults;
   active_defaults.ef = 128;
@@ -462,8 +496,7 @@ TEST(MutableLaserAdapter, SearchExtensionChangesActiveExpansionEffort) {
     core::SearchRequest request;
     request.queries = core::TypedTensorView::contiguous(vectors.data() + 173 * kDim, 1, kDim);
     request.options.top_k = 1;
-    request.options.extensions =
-        std::span<const core::AlgorithmSearchExtension>(&extension, 1);
+    request.options.extensions = std::span<const core::AlgorithmSearchExtension>(&extension, 1);
     request.context = &context;
     request.response = &response;
     const auto before = seg->search_stats().query_page_reads;
