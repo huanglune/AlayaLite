@@ -400,6 +400,166 @@ TEST(QgUpdaterReuse, CanonicalBindWithoutRowPatchPoisonsOnReopen) {
 }
 
 // ---------------------------------------------------------------------------
+// leg-7 fail-closed replay family: BLOCKER-3 crafted flips (rejected BEFORE any pwrite,
+// index byte-for-byte unchanged) and NEW-BLOCKER-1 classifier-downgrade poison.
+// ---------------------------------------------------------------------------
+std::vector<char> read_all_bytes(const std::string &path) {
+  std::ifstream in(path, std::ios::binary);
+  return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+// The active on-disk base superblock (highest-generation structurally-valid A/B copy).
+QGSuperblockV2 read_active_superblock(const std::string &index_path) {
+  std::ifstream in(index_path, std::ios::binary);
+  std::vector<char> header(2 * kQGSuperblockSize);
+  in.read(header.data(), static_cast<std::streamsize>(header.size()));
+  QGSuperblockV2 sb{};
+  EXPECT_GE(select_qg_superblock(header.data(), sb), 0);
+  return sb;
+}
+
+// Build a durable pid-activated v3 base (1-row activation bundle + checkpoint) and return its
+// uid + active slot; the caller reads the persisted superblock separately.
+struct ActivatedInfo {
+  uint64_t seg_uid = 0;
+  int active_slot = 0;
+};
+ActivatedInfo activate_v3_pid_base(const std::string &prefix, size_t base_n) {
+  ActivatedInfo info;
+  ReuseSession s(prefix, base_n, 4 * base_n, /*enable_reuse=*/true);
+  const auto v = waltest::make_data(1, kDim, 7);
+  const uint64_t l = 5;
+  s.upd->commit_physical_bundle(1, 1, v.data(), &l, 1);  // activate v3 pid
+  s.upd->checkpoint();                                   // durable v3 pid base, WAL == one flip
+  EXPECT_TRUE(s.upd->pid_generation_activated());
+  info.seg_uid = s.upd->segment_uid();
+  info.active_slot = s.upd->active_superblock_slot();
+  return info;
+}
+
+// BLOCKER-3 (leg-7): craft a superblock_flip carrying a v3 image whose defect must be caught in
+// the PURE validation phase (selector) or the pre-pwrite label-slot validation. The reopen must
+// poison AND leave the .index byte-for-byte unchanged (the flip is rejected before write_superblock).
+template <typename Corrupt>
+void assert_crafted_flip_fails_closed(const char *name, Corrupt corrupt) {
+  const auto dir = scratch_dir(name);
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/47);
+  const auto info = activate_v3_pid_base(base.prefix, kBaseN);
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  const QGSuperblockV2 base_sb = read_active_superblock(index_path);
+  const auto index_before = read_all_bytes(index_path);
+
+  QGSuperblockV2 image = base_sb;
+  image.generation = base_sb.generation + 1;  // a legal next-generation flip target
+  corrupt(image);                             // inject the specific defect
+  image.checksum = qg_superblock_checksum(image);
+  const int target_slot = info.active_slot == 0 ? 1 : 0;
+  std::vector<std::byte> img_bytes(sizeof(image));
+  std::memcpy(img_bytes.data(), &image, sizeof(image));
+  {
+    alaya::wal::WalFile wal(wal_path);  // scans the base flip, then appends the crafted flip
+    wal.append(kSegmentOpRecordType, 0, 1, 0,
+               encode_superblock_flip(info.seg_uid, image.generation,
+                                      static_cast<uint8_t>(target_slot),
+                                      std::span<const std::byte>(img_bytes.data(), img_bytes.size())),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  EXPECT_THROW({ ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true); },
+               std::exception)
+      << name << ": crafted flip must poison on replay";
+  EXPECT_EQ(read_all_bytes(index_path), index_before)
+      << name << ": index must be byte-for-byte unchanged (flip rejected before any pwrite)";
+  std::filesystem::remove_all(dir);
+}
+
+TEST(QgUpdaterReuse, CraftedFlipMaintenanceGenZeroFailsClosedBeforeWrite) {
+  // maintenance is required for every v3, so a maint-activation-gen of 0 is an impossible v3.
+  // The selector (qg_superblock_supported) now rejects it in the pure validation phase, before
+  // replay_flip's write_superblock.
+  assert_crafted_flip_fails_closed("flip_maint_gen_zero", [](QGSuperblockV2 &image) {
+    const uint64_t zero = 0;
+    std::memcpy(image.reserved.data() + kWal2cReservedOffset + 24, &zero, 8);
+  });
+}
+
+TEST(QgUpdaterReuse, CraftedFlipActivationGenFutureFailsClosedBeforeWrite) {
+  // A pid-reuse activation generation NEWER than the image's own generation is forged; the
+  // selector's (0, sb.generation] bound rejects it before any pwrite.
+  assert_crafted_flip_fails_closed("flip_activation_future", [](QGSuperblockV2 &image) {
+    const uint64_t future = image.generation + 1;  // > image.generation
+    std::memcpy(image.reserved.data() + kWal2cReservedOffset + 32, &future, 8);
+  });
+}
+
+TEST(QgUpdaterReuse, CraftedFlipBadLabelSlotFailsClosedBeforeWrite) {
+  // A structurally/activation-valid image whose label tuple references a slot file that cannot
+  // exist (count*16 != file size) must be rejected by replay_flip's pre-pwrite
+  // validate_flip_label_state, not by adopt_label_state AFTER the superblock is installed.
+  assert_crafted_flip_fails_closed("flip_bad_label_slot", [](QGSuperblockV2 &image) {
+    const uint64_t slot = 0;
+    const uint64_t gen = 1;
+    const uint64_t count = 99;                 // no real slot file has 99*16 bytes here
+    const uint64_t checksum = 0xDEADBEEFULL;
+    auto *b = image.reserved.data() + 8;       // label tuple: slot@0 gen@8 count@16 checksum@24
+    std::memcpy(b + 0, &slot, 8);
+    std::memcpy(b + 8, &gen, 8);
+    std::memcpy(b + 16, &count, 8);
+    std::memcpy(b + 24, &checksum, 8);
+  });
+}
+
+TEST(QgUpdaterReuse, ActivatedBaseLegacyCrossGenNewTxidPoisonsIndexUnchanged) {
+  // NEW-BLOCKER-1 (leg-7): on a pid-ACTIVATED base, a legacy-lane label transaction (segment
+  // generation < activation, so is_canonical_generation() routes it to the legacy path) that
+  // carries a NEW txid (> the base's committed txid) is a cross-generation classifier downgrade.
+  // Replay must poison at the kind=7 -- before any row_patch apply -- with the index unchanged.
+  const auto dir = scratch_dir("newb1_downgrade");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/48);
+  uint64_t seg_uid = 0;
+  uint64_t activation_gen = 0;
+  uint64_t base_txid = 0;
+  uint64_t old_hwm = 0;
+  {
+    ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);
+    const auto v = waltest::make_data(1, kDim, 1);
+    const uint64_t l = 5;
+    s.upd->commit_physical_bundle(1, 1, v.data(), &l, 1);  // activate v3 pid
+    s.upd->checkpoint();
+    ASSERT_TRUE(s.upd->pid_generation_activated());
+    seg_uid = s.upd->segment_uid();
+    activation_gen = s.upd->pid_reuse_activation_gen();
+    base_txid = s.upd->last_committed_txid();
+    old_hwm = s.upd->num_points();
+  }
+  ASSERT_GT(activation_gen, 0U);
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  const auto index_before = read_all_bytes(index_path);
+  const uint64_t forged_gen = activation_gen - 1;  // < activation -> legacy lane
+  const uint64_t forged_txid = base_txid + 1;      // > base committed -> non-absorbed
+  {
+    alaya::wal::WalFile wal(wal_path);  // scans the base flip, then appends the forged bundle
+    wal.append(kSegmentOpRecordType, 0, 1, forged_txid,
+               encode_label_bind(seg_uid, forged_gen, forged_txid, /*row_op=*/0,
+                                 static_cast<uint32_t>(old_hwm), /*gen=*/0, /*label=*/6),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType, 0, 2, forged_txid,
+               encode_tx_publish(seg_uid, forged_gen, forged_txid, /*new_hwm=*/old_hwm + 1,
+                                 /*binding_count=*/1, /*applied=*/1),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  EXPECT_THROW({ ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true); },
+               std::exception)
+      << "a post-activation legacy cross-generation new-txid transaction must poison";
+  EXPECT_EQ(read_all_bytes(index_path), index_before)
+      << "the index must be byte-for-byte unchanged (poison at kind=7, before any row_patch apply)";
+  std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
 // garden() stays gated under reuse (it is still not a WAL maintenance transaction).
 // ---------------------------------------------------------------------------
 TEST(QgUpdaterReuse, GardenStillThrowsUnderReuse) {

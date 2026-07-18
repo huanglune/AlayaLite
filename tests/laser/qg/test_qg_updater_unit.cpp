@@ -514,6 +514,11 @@ QGSuperblockV2 make_v3_slot(uint64_t gen, uint32_t required) {
   const uint32_t layout = kWal2cLayoutVersion;
   std::memcpy(sb.reserved.data() + kWal2cReservedOffset + 8, &layout, 4);
   std::memcpy(sb.reserved.data() + kWal2cReservedOffset + 12, &required, 4);
+  // leg-7 BLOCKER-3: maintenance is required for every v3, so a self-consistent v3 must carry
+  // a maintenance activation generation in (0, gen]. A maint_gen==0 v3 is now (correctly)
+  // rejected by qg_superblock_supported in the pure validation phase, so stamp a valid one.
+  const uint64_t maint_gen = gen;
+  std::memcpy(sb.reserved.data() + kWal2cReservedOffset + 24, &maint_gen, 8);
   sb.checksum = qg_superblock_checksum(sb);
   return sb;
 }

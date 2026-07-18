@@ -57,6 +57,85 @@ bool row_is_live(QGUpdater &upd, PID id) {
   return (flags & (kQGRowTombstone | kQGRowFree)) == 0;
 }
 
+std::vector<char> read_file_bytes(const std::string &path) {
+  std::ifstream in(path, std::ios::binary);
+  return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+// True iff the LAST decodable frame in the op-WAL is a superblock_flip. Used to fire the
+// BLOCKER-4 observer at exactly the checkpoint flip's on_wal_fsync (the only flip appended
+// during a checkpoint; earlier forces see a data/publish frame as the tail).
+bool wal_last_frame_is_flip(const std::string &wal_path) {
+  bool is_flip = false;
+  alaya::wal::WalFile::visit_frames(wal_path, [&](const alaya::wal::ScannedFrame &frame) -> bool {
+    try {
+      is_flip = decode_segment_op(frame.payload).kind == SegmentOpKind::superblock_flip;
+    } catch (...) {
+      is_flip = false;
+    }
+    return true;  // keep visiting; the last frame's verdict wins
+  });
+  return is_flip;
+}
+
+// BLOCKER-4 (leg-7): once the checkpoint flip is durable (append+fsync), its on_wal_fsync
+// observer is inside the same catch-all as the superblock write / WAL reset / adoption. An
+// exception there must poison the handle so it can never retry checkpoint() and write a
+// SECOND, different G+1 flip that replay cannot reconcile ("same generation image differs").
+TEST(QgUpdaterWal, DurableFlipThenWalFsyncObserverThrowPoisonsHandle) {
+  const auto dir = scratch_dir("b4_flip_observer");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, 4242);
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+
+  SegmentIoObserver observer;
+  bool armed = false;
+  bool observer_threw = false;
+  observer.on_wal_fsync = [&] {
+    if (armed && !observer_threw && wal_last_frame_is_flip(wal_path)) {
+      observer_threw = true;
+      throw std::runtime_error("injected on_wal_fsync failure after the durable G+1 flip");
+    }
+  };
+  {
+    QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+    qg.load_disk_index(base.prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+    qg.set_params(64, 1, 1);
+    UpdateParams params;
+    params.enable_wal = true;
+    params.ef_insert = 64;
+    params.max_points = kBaseN + 64;
+    params.io_observer = &observer;
+    QGUpdater upd(qg, params);
+    // Publish some inserts first so the WAL tail before the checkpoint flip is a data/publish
+    // frame (not a flip) -- the observer then fires at the flip's own fsync.
+    auto inserted = waltest::make_data(4, kDim, 99);
+    for (size_t i = 0; i < 4; ++i) upd.allocate_and_insert(inserted.data() + i * kDim);
+    upd.publish(upd.allocated_points());
+    armed = true;
+    EXPECT_THROW(upd.checkpoint(), std::exception) << "the flip-fsync observer throw must propagate";
+    EXPECT_TRUE(observer_threw) << "the observer must have fired at the durable flip's fsync";
+    // The handle is poisoned: it must refuse to write a second G+1 flip.
+    EXPECT_THROW(upd.checkpoint(), std::exception)
+        << "a poisoned handle must not checkpoint a conflicting second G+1 flip";
+  }
+  // Recovery rolls the single durable flip forward; it never sees two conflicting G+1 flips,
+  // and the published inserts (durable in the WAL) survive.
+  {
+    QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+    qg.load_disk_index(base.prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+    qg.set_params(64, 1, 1);
+    UpdateParams params;
+    params.enable_wal = true;
+    params.ef_insert = 64;
+    params.max_points = kBaseN + 64;
+    QGUpdater upd(qg, params);  // must NOT poison
+    EXPECT_EQ(upd.num_points(), kBaseN + 4);
+  }
+  std::filesystem::remove_all(dir);
+}
+
 TEST(QgUpdaterWal, FreshEnableStampsLineageAndCreatesWal) {
   const auto dir = scratch_dir("fresh");
   std::filesystem::remove_all(dir);
