@@ -15,6 +15,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -136,6 +137,48 @@ struct Session {
     return true;
   });
   return counts;
+}
+
+struct MaintenanceWalWindow {
+  uint64_t epoch{};
+  uint64_t page_frames{};
+  uint64_t bytes{};
+  bool complete{};
+};
+
+[[nodiscard]] auto latest_maintenance_window(const std::string &prefix) -> MaintenanceWalWindow {
+  MaintenanceWalWindow current;
+  MaintenanceWalWindow latest;
+  bool in_epoch = false;
+  const auto wal_path = prefix + waltest::index_suffix() + ".opwal";
+  alaya::wal::WalFile::visit_frames(wal_path, [&](const alaya::wal::ScannedFrame &frame) {
+    const auto op = decode_segment_op(frame.payload);
+    if (op.kind == SegmentOpKind::consolidate_begin) {
+      if (in_epoch) {
+        throw std::runtime_error("nested maintenance BEGIN in test WAL scan");
+      }
+      current = MaintenanceWalWindow{op.epoch, 0, frame.size, false};
+      in_epoch = true;
+      return true;
+    }
+    if (!in_epoch) {
+      return true;
+    }
+    current.bytes += frame.size;
+    if (op.kind == SegmentOpKind::row_patch) {
+      ++current.page_frames;
+    }
+    if (op.kind == SegmentOpKind::consolidate_end) {
+      if (op.epoch != current.epoch) {
+        throw std::runtime_error("maintenance END epoch mismatch in test WAL scan");
+      }
+      current.complete = true;
+      latest = current;
+      in_epoch = false;
+    }
+    return true;
+  });
+  return latest;
 }
 
 struct StateFingerprint {
@@ -472,31 +515,70 @@ TEST(QgMaintenanceConcurrency, DependencyReloadFramesStayWithinPreflightBound) {
   Session session(base.prefix, {}, /*cache_cap_pages=*/1);
   auto &updater = *session.updater;
   ASSERT_NO_THROW(updater.consolidate(1, 0, false, false));
-  for (size_t raw_id = 0; raw_id < kBaseN; raw_id += 2) {
-    updater.tombstone(static_cast<PID>(raw_id));
-  }
 
+  // Open the measurement window before producing exactly one tombstone and one
+  // row-patch frame per physical page. Depending on libstdc++ buffering, those
+  // already-appended frames may not become visible to another file descriptor
+  // until consolidate's baseline force_wal(). Keeping them inside the window
+  // makes the test independent of that implementation detail.
   const auto wal_path = base.prefix + waltest::index_suffix() + ".opwal";
   const auto counts_before = kind_counts(base.prefix);
   const auto bytes_before = std::filesystem::file_size(wal_path);
   const auto stats_before = updater.stats();
+  for (size_t raw_id = 0; raw_id < kBaseN; raw_id += 2) {
+    updater.tombstone(static_cast<PID>(raw_id));
+  }
+  ASSERT_EQ(updater.pool_pages(), updater.file_pages());
+
   ASSERT_NO_THROW(updater.consolidate(1, 0, true, false));
   const auto stats_after = updater.stats();
   const auto counts_after = kind_counts(base.prefix);
   const auto bytes_after = std::filesystem::file_size(wal_path);
+  const auto maintenance_window = latest_maintenance_window(base.prefix);
 
   const uint64_t actual_frames =
       stats_after.maintenance_page_frames - stats_before.maintenance_page_frames;
   const uint64_t scanned_frames = counts_after[static_cast<size_t>(SegmentOpKind::row_patch)] -
                                   counts_before[static_cast<size_t>(SegmentOpKind::row_patch)];
+  const uint64_t scanned_tombstones = counts_after[static_cast<size_t>(SegmentOpKind::tombstone)] -
+                                      counts_before[static_cast<size_t>(SegmentOpKind::tombstone)];
+  const uint64_t baseline_flushed_pages =
+      stats_after.flush_unique_pages - stats_before.flush_unique_pages;
   const uint64_t actual_wal_bytes = bytes_after - bytes_before;
+
+  std::vector<std::byte> page_bytes(updater.debug_page_size());
+  const auto row_patch_payload =
+      encode_row_patch(updater.segment_uid(),
+                       updater.generation(),
+                       0,
+                       kSectorLen,
+                       std::span<const std::byte>(page_bytes.data(), page_bytes.size()));
+  const auto tombstone_payload = encode_tombstone(updater.segment_uid(), updater.generation(), 0);
+  const auto framed_bytes = [](const auto &payload) {
+    return static_cast<uint64_t>(alaya::wal::kHeaderBytes) + payload.size() +
+           alaya::wal::kTrailerBytes;
+  };
+  const uint64_t baseline_wal_bytes =
+      baseline_flushed_pages * (framed_bytes(row_patch_payload) + framed_bytes(tombstone_payload));
+
+  // Prove that consolidate really entered with all 128 cache pages dirty. The
+  // global WAL delta therefore contains a deterministic baseline prefix in
+  // addition to the marker-delimited maintenance transaction.
+  ASSERT_EQ(baseline_flushed_pages, updater.file_pages());
+  EXPECT_EQ(scanned_tombstones, baseline_flushed_pages);
+  EXPECT_EQ(scanned_frames, actual_frames + baseline_flushed_pages);
+  ASSERT_TRUE(maintenance_window.complete);
+  EXPECT_EQ(maintenance_window.epoch, updater.last_completed_consolidate_epoch());
+  EXPECT_EQ(actual_frames, maintenance_window.page_frames);
   EXPECT_GT(actual_frames, 0U);
-  EXPECT_EQ(actual_frames, scanned_frames);
   EXPECT_EQ(stats_after.maintenance_last_preflight_page_frames, updater.file_pages() * 2);
   EXPECT_LE(actual_frames, stats_after.maintenance_last_preflight_page_frames);
-  EXPECT_LE(actual_wal_bytes, stats_after.maintenance_last_preflight_wal_bytes);
+  EXPECT_LE(maintenance_window.bytes, stats_after.maintenance_last_preflight_wal_bytes);
   EXPECT_LE(stats_after.maintenance_page_frame_bytes - stats_before.maintenance_page_frame_bytes,
             stats_after.maintenance_last_preflight_wal_bytes);
+  EXPECT_EQ(actual_wal_bytes, baseline_wal_bytes + maintenance_window.bytes);
+  EXPECT_LE(actual_wal_bytes,
+            baseline_wal_bytes + stats_after.maintenance_last_preflight_wal_bytes);
 }
 
 TEST(QgMaintenanceConcurrency, EnospcAfterBeginPoisonsAndReopenRollsBack) {
