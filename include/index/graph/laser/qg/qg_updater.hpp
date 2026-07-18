@@ -2377,6 +2377,32 @@ class QGUpdater {
     read_node_page(static_cast<PID>(page_index * npp_), page.data(), /*query_read=*/true);
     return std::vector<char>(page.data(), page.data() + page_size_);
   }
+  [[nodiscard]] uint32_t debug_page_version(size_t page_index) const {
+    if (page_index >= page_versions_.size()) {
+      throw std::out_of_range("QGUpdater::debug_page_version page");
+    }
+    return page_versions_[page_index].load(std::memory_order_acquire);
+  }
+  [[nodiscard]] std::vector<char> debug_read_disk_page(size_t page_index) const {
+    if (page_index >= page_versions_.size()) {
+      throw std::out_of_range("QGUpdater::debug_read_disk_page page");
+    }
+    std::vector<char> page(page_size_);
+    read_at(kSectorLen + page_index * page_size_, page.data(), page.size());
+    return page;
+  }
+  [[nodiscard]] std::vector<char> debug_read_arena_rows(size_t page_index) const {
+    if (!qg_.arena_resident()) {
+      throw std::logic_error("QGUpdater::debug_read_arena_rows requires resident arena");
+    }
+    const size_t first = page_index * npp_;
+    const size_t count = first >= committed_.load(std::memory_order_acquire)
+                             ? 0
+                             : std::min(npp_, committed_.load(std::memory_order_acquire) - first);
+    std::vector<char> rows(count * node_len_);
+    std::memcpy(rows.data(), qg_.cache_nodes_.data() + first * node_len_, rows.size());
+    return rows;
+  }
   // The routing medoid vectors (design section 4): a separate cache that must agree with the
   // medoid PIDs' row data, so a routing-vector divergence a per-row fingerprint would miss is
   // caught (leg-7 BLOCKER-7).
@@ -3939,8 +3965,14 @@ class QGUpdater {
       // poisons the handle; liveness must hold). A torn page under a poisoned handle carries no
       // post-commit content guarantee -- only that readers make progress.
       try {
+        wal_failpoint(SegmentOpFailPoint::after_consolidate_install_version_odd);
         write_at(kSectorLen + pi * page_size_, bytes, page_size_);
+        wal_failpoint(SegmentOpFailPoint::after_consolidate_install_write_before_even);
       } catch (...) {
+        // Publish poison before the even version. A reader that acquires the
+        // reopened seqlock can then finish its copy, but its exit gate must
+        // observe recovery-required rather than return post-END partial state.
+        poison_latch();
         page_versions_[pi].fetch_add(1, std::memory_order_release);  // -> even (close the pair)
         throw;
       }
@@ -4256,6 +4288,7 @@ class QGUpdater {
   // pre-transaction error (the epoch has not started, so nothing to roll back).
   void maint_statvfs_preflight(bool reclaim_slots) {
     struct statvfs vfs {};
+    wal_failpoint(SegmentOpFailPoint::before_consolidate_statvfs);
     if (::statvfs(op_wal_->path().c_str(), &vfs) != 0) {
       throw std::runtime_error("QGUpdater::consolidate: statvfs failed errno=" +
                                std::to_string(errno));

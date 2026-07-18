@@ -109,6 +109,10 @@ enum class SegmentOpFailPoint : std::uint8_t {
   // after_wal_reset).
   after_reuse_free_preimage_before_build,   // R2: reused-page FREE preimages logged, before build
   after_reuse_partial_final_page,           // R3: the FIRST final (build/spine) page logged, before rest
+  // W3 maintenance admission/install cuts. Append-only: every earlier value is frozen.
+  before_consolidate_statvfs,
+  after_consolidate_install_version_odd,
+  after_consolidate_install_write_before_even,
 };
 
 // Test-only observer for the persistence-model (power-loss) crash layer. It is
