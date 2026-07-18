@@ -178,6 +178,13 @@ struct RegisteredRow {
   RecordPayload payload{};
 };
 
+struct SegmentMaintenanceHook {
+  using ConsolidateFn = std::function<core::Status(std::size_t, std::size_t, bool, bool)>;
+
+  ConsolidateFn consolidate{};
+  std::function<bool()> recovery_required{};
+};
+
 struct SegmentRegistration {
   std::uint64_t segment_id{};
   std::uint64_t generation{1};
@@ -190,6 +197,12 @@ struct SegmentRegistration {
   // table: an engine opts into receiving one opaque bundle through the
   // existing mutation token protocol.
   bool atomic_mutation_bundle{};
+  SegmentMaintenanceHook maintenance{};
+};
+
+struct SegmentMaintenanceReceipt {
+  std::uint64_t active_segment_id{};
+  std::uint64_t active_generation{};
 };
 
 struct CollectionHit {

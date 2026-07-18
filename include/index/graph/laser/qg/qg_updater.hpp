@@ -704,6 +704,10 @@ class QGUpdater {
     }
   }
 
+  [[nodiscard]] bool is_poisoned() const noexcept {
+    return poisoned_.load(std::memory_order_acquire);
+  }
+
   // Current immutable appended-label snapshot (B-02). Acquire-load AFTER the
   // committed watermark used by search: the snapshot is published before committed
   // on the write side, so it always covers every binding for a committed PID.
@@ -762,6 +766,36 @@ class QGUpdater {
   [[nodiscard]] uint32_t pid_reuse_activation_gen() const { return static_cast<uint32_t>(pid_reuse_activation_gen_); }
 
   [[nodiscard]] int active_superblock_slot() const { return active_superblock_slot_; }
+
+  // An activated mutable source may become readable through a sealed role after
+  // Collection rotation. Before that handoff both A/B copies must be supported v3
+  // images carrying every feature required by the selected base; a stale v2 or
+  // lower-feature fallback is not safe to expose.
+  void require_dual_v3_if_activated() {
+    if (superblock_.format_version == kQGFormatVersion) {
+      return;
+    }
+    try {
+      if (superblock_.format_version != kQGFormatVersionV3) {
+        poison("activated QG selected an unsupported outer superblock version");
+      }
+      std::array<char, kSectorLen> header{};
+      read_at(0, header.data(), header.size());
+      QGSuperblockV2 copies[kQGSuperblockCopies];
+      std::memcpy(&copies[0], header.data(), sizeof(QGSuperblockV2));
+      std::memcpy(&copies[1], header.data() + kQGSuperblockSize, sizeof(QGSuperblockV2));
+      const uint32_t required = qg_read_required_feature_flags(superblock_);
+      for (const auto &copy : copies) {
+        if (!qg_superblock_valid(copy) || copy.format_version != kQGFormatVersionV3 ||
+            !qg_superblock_supported(copy, kQgSupportedRequiredFeatures) ||
+            (qg_read_required_feature_flags(copy) & required) != required) {
+          poison("activated QG requires two supported v3 superblock copies before role handoff");
+        }
+      }
+    } catch (...) {
+      poison_current_exception("failed to verify dual v3 superblock copies");
+    }
+  }
 
   /** Page count represented by the currently selected/checkpointed superblock. */
   [[nodiscard]] size_t file_pages() const {

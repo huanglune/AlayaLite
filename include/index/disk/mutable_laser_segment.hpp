@@ -258,8 +258,11 @@ class MutableLaserSegment {
   // Run a consolidate maintenance transaction (2C): purge dead out-edges and, when
   // reclaim is set, free tombstoned rows into the canonical free-list so a later
   // commit_physical_bundle can reuse their PIDs. Held under the single-writer handle
-  // mutex; the Collection maintenance hook (W3) drives the full门禁 chain on top.
-  void consolidate(size_t num_threads, size_t r_target, bool reclaim_slots, bool bloom_consolidate) {
+  // mutex; the Collection maintenance hook (W3) drives the full admission chain on top.
+  void consolidate(size_t num_threads,
+                   size_t r_target,
+                   bool reclaim_slots,
+                   bool bloom_consolidate) {
     const std::lock_guard<std::mutex> guard(mutex_);
     updater_->consolidate(num_threads, r_target, reclaim_slots, bloom_consolidate);
   }
@@ -267,9 +270,11 @@ class MutableLaserSegment {
   [[nodiscard]] auto pid_generation_activated() const -> bool {
     return updater_->pid_generation_activated();
   }
+  [[nodiscard]] auto recovery_required() const noexcept -> bool { return updater_->is_poisoned(); }
   void checkpoint() {
     const std::lock_guard<std::mutex> guard(mutex_);  // single-writer handle mutex (W0)
     updater_->checkpoint();
+    updater_->require_dual_v3_if_activated();
   }
 
   [[nodiscard]] auto search(const float *query, const DiskSearchOptions &opts)

@@ -23,14 +23,16 @@ struct SegmentEntry {
                core::AnySegment erased_segment,
                ExactRerank rerank,
                std::uint64_t first_unused_row,
-               bool supports_atomic_bundle)
+               bool supports_atomic_bundle,
+               SegmentMaintenanceHook maintenance_hook = {})
       : segment_id(id),
         generation(segment_generation),
         role(segment_role),
         segment(std::move(erased_segment)),
         exact_rerank(std::move(rerank)),
         next_row_id(first_unused_row),
-        atomic_mutation_bundle(supports_atomic_bundle) {}
+        atomic_mutation_bundle(supports_atomic_bundle),
+        maintenance(std::move(maintenance_hook)) {}
 
   std::uint64_t segment_id{};
   std::uint64_t generation{};
@@ -39,6 +41,7 @@ struct SegmentEntry {
   ExactRerank exact_rerank{};
   std::atomic_uint64_t next_row_id{};
   bool atomic_mutation_bundle{};
+  SegmentMaintenanceHook maintenance{};
 
   // Collection uses this lock only when an instance declares a weaker
   // ConcurrencyProfile. It never changes the engine's operation table.

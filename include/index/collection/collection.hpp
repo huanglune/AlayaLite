@@ -98,6 +98,18 @@ struct CollectionSealOptions {
   std::function<void(CollectionSealFailPoint)> failpoint_hook{};
 };
 
+struct CollectionConsolidateOptions {
+  std::uint32_t num_threads{1};
+  std::uint32_t r_target{0};
+  bool reclaim_slots{true};
+  bool bloom_consolidate{false};
+};
+
+struct CollectionConsolidateReceipt {
+  std::uint64_t active_segment_id{};
+  std::uint64_t active_generation{};
+};
+
 struct CollectionSealReceipt {
   std::uint64_t source_segment_id{};
   std::uint64_t successor_segment_id{};
@@ -538,6 +550,20 @@ class Collection {
     return checkpoint(context);
   }
 
+  [[nodiscard]] auto consolidate(CollectionConsolidateOptions options = {})
+      -> core::Result<CollectionConsolidateReceipt> {
+    std::lock_guard lock(control_mutex_);
+    auto receipt = implementation_->consolidate(options.num_threads,
+                                                options.r_target,
+                                                options.reclaim_slots,
+                                                options.bloom_consolidate);
+    if (!receipt.ok()) {
+      return receipt.status();
+    }
+    return CollectionConsolidateReceipt{receipt.value().active_segment_id,
+                                        receipt.value().active_generation};
+  }
+
   [[nodiscard]] auto seal(CollectionSealOptions options = {})
       -> core::Result<CollectionSealReceipt> {
     core::SealContext context;
@@ -945,6 +971,7 @@ class Collection {
     try {
       laser::UpdateParams params;
       params.max_points = active_laser_capacity(options);
+      params.enable_pid_reuse = true;
       auto segment =
           std::make_shared<::alaya::disk::MutableLaserSegment>(dir,
                                                                params,
@@ -1373,6 +1400,9 @@ class Collection {
 
   [[nodiscard]] auto seal_locked(core::SealContext &context, const CollectionSealOptions &options)
       -> core::Result<CollectionSealReceipt> {
+    if (auto gate = implementation_->recovery_gate(core::OperationStage::freeze); !gate.ok()) {
+      return gate;
+    }
     auto handle = prepare_successor_locked(context, options);
     if (!handle.ok()) {
       return handle.status();
@@ -1395,6 +1425,9 @@ class Collection {
   [[nodiscard]] auto prepare_successor_locked(core::SealContext &context,
                                               const CollectionSealOptions &options)
       -> core::Result<CollectionRotationHandle> {
+    if (auto gate = implementation_->recovery_gate(core::OperationStage::freeze); !gate.ok()) {
+      return gate;
+    }
     if (pending_rotation_.has_value()) {
       return error(core::StatusCode::conflict,
                    core::OperationStage::freeze,
@@ -1659,6 +1692,9 @@ class Collection {
   [[nodiscard]] auto rotate_to_successor_locked(const CollectionRotationHandle &handle,
                                                 core::SealContext &context)
       -> core::Result<CollectionSealReceipt> {
+    if (auto gate = implementation_->recovery_gate(core::OperationStage::save); !gate.ok()) {
+      return gate;
+    }
     if (!pending_rotation_.has_value() ||
         control_state_.phase != internal::collection::CollectionControlPhase::manifest_published ||
         handle.successor_segment_id != control_state_.target_segment_id ||
@@ -1819,6 +1855,9 @@ class Collection {
 
   [[nodiscard]] auto compact_locked(core::SealContext &context)
       -> core::Result<CollectionCompactReceipt> {
+    if (auto gate = implementation_->recovery_gate(core::OperationStage::build); !gate.ok()) {
+      return gate;
+    }
     auto status = core::validate_runtime_control(context.deadline,
                                                  context.cancellation,
                                                  core::OperationStage::build);
@@ -2059,6 +2098,9 @@ class Collection {
   }
 
   [[nodiscard]] auto gc_locked() -> core::Result<CollectionGcReceipt> {
+    if (auto gate = implementation_->recovery_gate(core::OperationStage::save); !gate.ok()) {
+      return gate;
+    }
     auto loaded = internal::collection::load_manifest_v2_if_present(options_.root);
     if (!loaded.ok()) {
       return loaded.status();
