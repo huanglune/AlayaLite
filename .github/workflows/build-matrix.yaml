@@ -14,6 +14,26 @@ jobs:
         case: [core-only, laser-default, portable-no-avx512, portable-no-avx2, python-on]
     steps:
     - uses: actions/checkout@v4
+
+    - name: Restore Conan cache
+      id: conan-cache
+      uses: ./.github/actions/cache-restore
+      with:
+        build-type: Release
+        target-arch: ${{ runner.arch }}
+
+    - name: Restore compiler cache
+      uses: hendrikmuhs/ccache-action@v1
+      with:
+        key: >-
+          build-matrix-v1-${{ runner.os }}-${{ runner.arch }}-gcc-Release-${{ matrix.case }}-${{
+          hashFiles('conanfile.py', 'pyproject.toml', 'uv.lock', 'cmake/AlayaConan.cmake',
+          'cmake/vendor/conan_provider.cmake') }}
+        restore-keys: |
+          build-matrix-v1-${{ runner.os }}-${{ runner.arch }}-gcc-Release-${{ matrix.case }}-
+          build-matrix-v1-${{ runner.os }}-${{ runner.arch }}-gcc-Release-
+        max-size: 2G
+
     - name: Install LASER system dependency
       if: matrix.case == 'laser-default'
       run: sudo apt-get update && sudo apt-get install -y libaio-dev
@@ -25,3 +45,12 @@ jobs:
       run: pip install 'conan>=2,<3'
     - name: Compile ${{ matrix.case }}
       run: .github/scripts/run_matrix.sh '${{ matrix.case }}'
+
+    - name: Save Conan cache
+      if: steps.conan-cache.outputs.cache-hit != 'true'
+      continue-on-error: true
+      uses: ./.github/actions/cache-restore
+      with:
+        mode: save
+        build-type: Release
+        target-arch: ${{ runner.arch }}

@@ -4,16 +4,17 @@
 
 # AlayaTesting.cmake - declarative helpers for test/bench executables.
 #
-# alaya_cc_target(<name> SRCS <files...> [GTEST] [LASER] [BARE] [LIBS <targets...>] [DEFS <defines...>] [OPTS
-# <options...>]) Creates the executable, links AlayaLite (headers + all third-party libs) and the standard build flags,
-# applies coverage instrumentation, and optionally the GTest libraries and/or the LASER consumer surface (alaya_laser +
-# ALAYA_ENABLE_LASER=1 + the SIMD/vectorization options LASER translation units require). BARE skips the implicit
-# AlayaLite link for targets that must control their exact link set (the LASER backend unit tests); such targets still
-# get alaya_build_flags and list everything else through LIBS.
+# alaya_cc_target(<name> SRCS <files...> [GTEST] [LASER] [BARE] [PCH_REUSE_FROM <target>] [LIBS <targets...>] [DEFS
+# <defines...>] [OPTS <options...>]) Creates the executable, links AlayaLite (headers + all third-party libs) and the
+# standard build flags, applies coverage instrumentation, and optionally the GTest libraries and/or the LASER consumer
+# surface (alaya_laser + ALAYA_ENABLE_LASER=1 + the SIMD/vectorization options LASER translation units require). BARE
+# skips the implicit AlayaLite link for targets that must control their exact link set (the LASER backend unit tests);
+# such targets still get alaya_build_flags and list everything else through LIBS. PCH_REUSE_FROM shares a precompiled
+# header from a target with an identical compile profile.
 #
 # alaya_add_test(NAME <name> TARGET <target> [FILTER <gtest-filter>] [LABELS <labels...>] [TIMEOUT <seconds>]
-# [WORKING_DIRECTORY <dir>]) Registers one ctest entry for an alaya_cc_target executable. A target may be registered
-# several times with different FILTERs (e.g. one ctest entry per GTest suite in a binary).
+# [WORKING_DIRECTORY <dir>] [RUN_SERIAL]) Registers one ctest entry for an alaya_cc_target executable. A target may be
+# registered several times with different FILTERs (e.g. one ctest entry per GTest suite in a binary).
 #
 # Target names, test names, and labels are part of the project's external contract — CI scripts build targets by name
 # and select tests by label — so helpers take both names explicitly instead of deriving one from the other.
@@ -54,7 +55,7 @@ endforeach()
 
 function(alaya_cc_target target_name)
   set(flag_keywords GTEST LASER BARE)
-  set(one_value_keywords)
+  set(one_value_keywords PCH_REUSE_FROM)
   set(multi_value_keywords SRCS LIBS DEFS OPTS)
   cmake_parse_arguments(
     ARG
@@ -106,10 +107,19 @@ function(alaya_cc_target target_name)
   endif()
 
   add_coverage_to_target(${target_name})
+
+  if(ARG_PCH_REUSE_FROM)
+    if(NOT TARGET ${ARG_PCH_REUSE_FROM})
+      message(
+        FATAL_ERROR "alaya_cc_target(${target_name}): PCH_REUSE_FROM target '${ARG_PCH_REUSE_FROM}' does not exist"
+      )
+    endif()
+    target_precompile_headers(${target_name} REUSE_FROM ${ARG_PCH_REUSE_FROM})
+  endif()
 endfunction()
 
 function(alaya_add_test)
-  set(flag_keywords)
+  set(flag_keywords RUN_SERIAL)
   set(one_value_keywords
       NAME
       TARGET
@@ -147,5 +157,8 @@ function(alaya_add_test)
   endif()
   if(ARG_WORKING_DIRECTORY)
     set_tests_properties(${ARG_NAME} PROPERTIES WORKING_DIRECTORY ${ARG_WORKING_DIRECTORY})
+  endif()
+  if(ARG_RUN_SERIAL)
+    set_tests_properties(${ARG_NAME} PROPERTIES RUN_SERIAL TRUE)
   endif()
 endfunction()

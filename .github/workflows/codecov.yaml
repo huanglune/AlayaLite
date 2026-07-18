@@ -61,11 +61,13 @@ jobs:
       uses: hendrikmuhs/ccache-action@v1
       with:
         key: >-
-          codecov-python-portable-v3-${{ runner.os }}-${{ runner.arch }}-Release-${{ hashFiles('CMakeLists.txt',
-          'python/CMakeLists.txt', 'conanfile.py', 'cmake/**/*.cmake') }}
+          codecov-python-v4-${{ runner.os }}-${{ runner.arch }}-gcc-Release-${{ hashFiles('conanfile.py',
+          'pyproject.toml', 'uv.lock', 'cmake/AlayaConan.cmake', 'cmake/vendor/conan_provider.cmake') }}
         restore-keys: |
+          codecov-python-v4-${{ runner.os }}-${{ runner.arch }}-gcc-Release-
           codecov-python-portable-v3-${{ runner.os }}-${{ runner.arch }}-Release-
           py-unit-portable-v2-${{ runner.os }}-${{ runner.arch }}-Release-
+        max-size: 2G
 
     - name: Install system dependencies
       run: sudo apt-get install -y gdb libaio-dev
@@ -115,7 +117,7 @@ jobs:
     timeout-minutes: 90
     env:
       BUILD_JOBS: 2
-      CTEST_JOBS: 1
+      CTEST_JOBS: 4
       # "." matches any label, so every labeled test runs in this lane. The
       # previous hand-maintained allowlist (unit|storage|simd|space|utils)
       # silently excluded the laser/wal/collection/crash suites as they were
@@ -146,10 +148,12 @@ jobs:
       uses: hendrikmuhs/ccache-action@v1
       with:
         key: >-
-          codecov-cpp-portable-v2-${{ runner.os }}-${{ runner.arch }}-Debug-${{ hashFiles('CMakeLists.txt',
-          'tests/CMakeLists.txt', 'conanfile.py', 'cmake/**/*.cmake', '.github/scripts/codecov/gnu_codecoverage.sh') }}
+          codecov-cpp-v3-${{ runner.os }}-${{ runner.arch }}-gcc-13-Debug-${{ hashFiles('conanfile.py',
+          'pyproject.toml', 'uv.lock', 'cmake/AlayaConan.cmake', 'cmake/vendor/conan_provider.cmake') }}
         restore-keys: |
+          codecov-cpp-v3-${{ runner.os }}-${{ runner.arch }}-gcc-13-Debug-
           codecov-cpp-portable-v2-${{ runner.os }}-${{ runner.arch }}-Debug-
+        max-size: 2G
 
     - name: Install system dependencies
       run: sudo apt-get install -y lcov libaio-dev

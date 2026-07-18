@@ -81,7 +81,7 @@ alaya_cc_target(
 alaya_add_test(
   NAME laser_test_threadpool_file_reader
   TARGET test_threadpool_file_reader
-  LABELS laser threadpool
+  LABELS laser threadpool RUN_SERIAL
 )
 
 alaya_cc_target(
@@ -123,6 +123,17 @@ alaya_add_test(
 )
 
 if(ALAYA_ENABLE_MUTABLE_LASER)
+  # All consumers below have the BARE+GTEST+LASER+_laser_test_opts profile. Keeping the owner profile identical is
+  # required by CMake's REUSE_FROM contract; ALAYA_LASER_TESTING and non-GTest targets intentionally opt out.
+  alaya_cc_target(
+    alaya_laser_qg_test_pch
+    BARE GTEST
+    SRCS ../pch_anchor.cpp
+    LIBS alaya_laser
+    OPTS ${_laser_test_opts}
+  )
+  target_precompile_headers(alaya_laser_qg_test_pch PRIVATE <gtest/gtest.h> <utils/laser_test_pch.hpp>)
+
   # Streaming-update research prototype (qg_updater.hpp): patch primitives, builder byte-equality, insert/tombstone
   # end-to-end on a tiny index.
   alaya_cc_target(
@@ -130,7 +141,7 @@ if(ALAYA_ENABLE_MUTABLE_LASER)
     BARE GTEST
     SRCS qg/test_qg_updater_unit.cpp
     LIBS alaya_laser
-    OPTS ${_laser_test_opts}
+    OPTS ${_laser_test_opts} PCH_REUSE_FROM alaya_laser_qg_test_pch
   )
   alaya_add_test(
     NAME laser_test_qg_updater_unit
@@ -158,7 +169,7 @@ if(ALAYA_ENABLE_MUTABLE_LASER)
     BARE GTEST
     SRCS qg/test_qg_updater_wal.cpp
     LIBS alaya_laser
-    OPTS ${_laser_test_opts}
+    OPTS ${_laser_test_opts} PCH_REUSE_FROM alaya_laser_qg_test_pch
   )
   alaya_add_test(
     NAME laser_test_qg_updater_wal
@@ -187,7 +198,7 @@ if(ALAYA_ENABLE_MUTABLE_LASER)
     BARE GTEST
     SRCS qg/test_segment_op_wal_crash.cpp
     LIBS alaya_laser
-    OPTS ${_laser_test_opts}
+    OPTS ${_laser_test_opts} PCH_REUSE_FROM alaya_laser_qg_test_pch
   )
   # 420s ceiling: coverage-instrumented runs put the crash matrix past the default 120s (CI-only timeouts on
   # otherwise-green runs; instrumentation costs 2-4x).
@@ -204,7 +215,7 @@ if(ALAYA_ENABLE_MUTABLE_LASER)
     BARE GTEST
     SRCS qg/test_mutable_laser_segment.cpp
     LIBS alaya_laser
-    OPTS ${_laser_test_opts}
+    OPTS ${_laser_test_opts} PCH_REUSE_FROM alaya_laser_qg_test_pch
   )
   alaya_add_test(
     NAME laser_test_mutable_laser_segment
@@ -220,7 +231,7 @@ if(ALAYA_ENABLE_MUTABLE_LASER)
     BARE GTEST
     SRCS qg/test_unified_residency.cpp
     LIBS alaya_laser
-    OPTS ${_laser_test_opts}
+    OPTS ${_laser_test_opts} PCH_REUSE_FROM alaya_laser_qg_test_pch
   )
   alaya_add_test(
     NAME laser_test_unified_residency
@@ -314,7 +325,7 @@ if(ALAYA_ENABLE_MUTABLE_LASER)
     BARE GTEST
     SRCS qg/test_qg_updater_reuse.cpp
     LIBS alaya_laser
-    OPTS ${_laser_test_opts}
+    OPTS ${_laser_test_opts} PCH_REUSE_FROM alaya_laser_qg_test_pch
   )
   alaya_add_test(
     NAME laser_test_qg_updater_reuse
@@ -328,7 +339,7 @@ if(ALAYA_ENABLE_MUTABLE_LASER)
     BARE GTEST
     SRCS qg/test_mutable_laser_segment_reuse.cpp
     LIBS alaya_laser
-    OPTS ${_laser_test_opts}
+    OPTS ${_laser_test_opts} PCH_REUSE_FROM alaya_laser_qg_test_pch
   )
   alaya_add_test(
     NAME laser_test_mutable_laser_segment_reuse
@@ -342,7 +353,7 @@ if(ALAYA_ENABLE_MUTABLE_LASER)
     BARE GTEST
     SRCS qg/test_segment_op_wal_reuse_crash.cpp
     LIBS alaya_laser
-    OPTS ${_laser_test_opts}
+    OPTS ${_laser_test_opts} PCH_REUSE_FROM alaya_laser_qg_test_pch
   )
   # 420s ceiling: same coverage-lane margin as the crash matrix above (53s+ measured instrumented; slower runners were
   # within one variance step of the 120s default).

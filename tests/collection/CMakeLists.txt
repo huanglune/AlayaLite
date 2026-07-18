@@ -5,10 +5,19 @@
 alaya_cc_target(segmented_collection_header_closure SRCS segmented_collection_header_closure.cpp)
 alaya_cc_target(collection_header_closure SRCS collection_header_closure.cpp)
 
+# Collection tests share one PCH per compile profile. Header-closure targets stay deliberately PCH-free so they continue
+# to prove that public headers compile in isolation.
+alaya_cc_target(
+  alaya_collection_test_pch
+  SRCS ../pch_anchor.cpp
+  GTEST
+)
+target_precompile_headers(alaya_collection_test_pch PRIVATE <gtest/gtest.h> <alaya/collection.hpp>)
+
 alaya_cc_target(
   collection_facade_test
   SRCS collection_facade_test.cpp
-  GTEST
+  GTEST PCH_REUSE_FROM alaya_collection_test_pch
 )
 alaya_add_test(
   NAME collection_facade_test
@@ -20,7 +29,7 @@ alaya_add_test(
 alaya_cc_target(
   collection_rotate_test
   SRCS collection_rotate_test.cpp
-  GTEST
+  GTEST PCH_REUSE_FROM alaya_collection_test_pch
 )
 alaya_add_test(
   NAME collection_rotate_test
@@ -32,7 +41,7 @@ alaya_add_test(
 alaya_cc_target(
   collection_qg_seal_test
   SRCS collection_qg_seal_test.cpp
-  GTEST
+  GTEST PCH_REUSE_FROM alaya_collection_test_pch
 )
 alaya_add_test(
   NAME collection_qg_seal_test
@@ -44,7 +53,7 @@ alaya_add_test(
 alaya_cc_target(
   collection_qg_ip_norm_test
   SRCS collection_qg_ip_norm_test.cpp
-  GTEST
+  GTEST PCH_REUSE_FROM alaya_collection_test_pch
 )
 alaya_add_test(
   NAME collection_qg_ip_norm_test
@@ -56,7 +65,7 @@ alaya_add_test(
 alaya_cc_target(
   collection_qg_recall_floor_test
   SRCS collection_qg_recall_floor_test.cpp
-  GTEST
+  GTEST PCH_REUSE_FROM alaya_collection_test_pch
 )
 alaya_add_test(
   NAME collection_qg_recall_floor_test
@@ -68,7 +77,7 @@ alaya_add_test(
 alaya_cc_target(
   collection_facade_stress_test
   SRCS collection_facade_stress_test.cpp
-  GTEST
+  GTEST PCH_REUSE_FROM alaya_collection_test_pch
 )
 alaya_add_test(
   NAME collection_facade_stress_test
@@ -177,6 +186,19 @@ alaya_add_test(
 # same collection still rejects the filter kind.
 if(ALAYA_ENABLE_LASER)
   alaya_cc_target(
+    alaya_collection_laser_test_pch
+    SRCS ../pch_anchor.cpp
+    GTEST LASER
+  )
+  target_precompile_headers(
+    alaya_collection_laser_test_pch
+    PRIVATE
+    <gtest/gtest.h>
+    <utils/laser_test_pch.hpp>
+    <index/collection/segmented_collection.hpp>
+  )
+
+  alaya_cc_target(
     segmented_collection_laser_filter_test
     GTEST LASER
     SRCS segmented_collection_laser_filter_test.cpp
@@ -194,7 +216,7 @@ if(ALAYA_ENABLE_LASER)
   alaya_cc_target(
     collection_laser_target_test
     GTEST LASER
-    SRCS collection_laser_target_test.cpp
+    SRCS collection_laser_target_test.cpp PCH_REUSE_FROM alaya_collection_laser_test_pch
   )
   alaya_add_test(
     NAME collection_laser_target_test
@@ -210,7 +232,7 @@ if(ALAYA_ENABLE_LASER)
   alaya_cc_target(
     collection_laser_recall_floor_test
     GTEST LASER
-    SRCS collection_laser_recall_floor_test.cpp
+    SRCS collection_laser_recall_floor_test.cpp PCH_REUSE_FROM alaya_collection_laser_test_pch
   )
   alaya_add_test(
     NAME collection_laser_recall_floor_test
@@ -247,7 +269,7 @@ if(ALAYA_ENABLE_LASER)
     alaya_cc_target(
       mutable_laser_adapter_test
       GTEST LASER
-      SRCS mutable_laser_adapter_test.cpp
+      SRCS mutable_laser_adapter_test.cpp PCH_REUSE_FROM alaya_collection_laser_test_pch
     )
     alaya_add_test(
       NAME mutable_laser_adapter_test
@@ -261,7 +283,7 @@ if(ALAYA_ENABLE_LASER)
     alaya_cc_target(
       collection_active_laser_test
       GTEST LASER
-      SRCS collection_active_laser_test.cpp
+      SRCS collection_active_laser_test.cpp PCH_REUSE_FROM alaya_collection_laser_test_pch
     )
     alaya_add_test(
       NAME collection_active_laser_test
@@ -273,7 +295,7 @@ if(ALAYA_ENABLE_LASER)
     alaya_cc_target(
       collection_active_laser_maintenance_test
       GTEST LASER
-      SRCS collection_active_laser_maintenance_test.cpp
+      SRCS collection_active_laser_maintenance_test.cpp PCH_REUSE_FROM alaya_collection_laser_test_pch
     )
     alaya_add_test(
       NAME collection_active_laser_maintenance_test
@@ -283,13 +305,13 @@ if(ALAYA_ENABLE_LASER)
              laser
              wal
              tsan
-      TIMEOUT 300
+      TIMEOUT 300 RUN_SERIAL
     )
 
     alaya_cc_target(
       collection_active_laser_recovery_test
       GTEST LASER
-      SRCS collection_active_laser_recovery_test.cpp
+      SRCS collection_active_laser_recovery_test.cpp PCH_REUSE_FROM alaya_collection_laser_test_pch
     )
     alaya_add_test(
       NAME collection_active_laser_recovery_test
