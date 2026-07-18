@@ -12,11 +12,18 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
+#include <functional>
+#include <future>
+#include <limits>
 #include <memory>
+#include <mutex>
 #include <queue>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -37,7 +44,11 @@ constexpr size_t kBaseN = 128;
 struct ReuseSession {
   QuantizedGraph qg;
   std::unique_ptr<QGUpdater> upd;
-  ReuseSession(const std::string &prefix, size_t base_n, size_t max_points, bool enable_reuse)
+  ReuseSession(const std::string &prefix,
+               size_t base_n,
+               size_t max_points,
+               bool enable_reuse,
+               std::function<void(SegmentOpFailPoint)> failpoint_hook = {})
       : qg(base_n, kDeg, kDim, kDim) {
     qg.load_disk_index(prefix.c_str(), 0.0F, /*recovery_mode=*/true);
     qg.set_params(64, 1, 1);
@@ -47,6 +58,7 @@ struct ReuseSession {
     params.ef_insert = 64;
     params.max_points = max_points;
     params.backlink_mode = UpdateParams::Backlink::kAlphaEvict;
+    params.failpoint_hook = std::move(failpoint_hook);
     upd = std::make_unique<QGUpdater>(qg, params);
   }
 };
@@ -80,6 +92,43 @@ void free_base_rows(QGUpdater &upd, const std::vector<PID> &rows) {
   for (PID id : rows) upd.tombstone(id);
   upd.consolidate(1, /*r_target=*/0, /*reclaim_slots=*/true, /*bloom=*/false);
 }
+
+// Deterministic pause inside the canonical writer. The hook runs while the writer owns
+// checkpoint_mutex_, allowing a public query or checkpoint caller to probe the exact window.
+class FailpointGate {
+ public:
+  explicit FailpointGate(SegmentOpFailPoint target) : target_(target) {}
+
+  void operator()(SegmentOpFailPoint point) {
+    if (point != target_) return;
+    std::unique_lock<std::mutex> lock(mutex_);
+    reached_ = true;
+    cv_.notify_all();
+    cv_.wait(lock, [&] {
+      return released_;
+    });
+  }
+
+  bool wait_until_reached(std::chrono::seconds timeout = std::chrono::seconds(5)) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return cv_.wait_for(lock, timeout, [&] {
+      return reached_;
+    });
+  }
+
+  void release() {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    released_ = true;
+    cv_.notify_all();
+  }
+
+ private:
+  SegmentOpFailPoint target_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool reached_ = false;
+  bool released_ = false;
+};
 
 // ---------------------------------------------------------------------------
 // Activation + all-append canonical bundle.
@@ -183,6 +232,157 @@ TEST(QgUpdaterReuse, DeleteAllThenAllReuseSurvivesDoubleReopen) {
   verify("first-reopen");
   verify("second-reopen");  // reopen the FIRST recovery's checkpointed output again
   std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// B-2C-01 query isolation: after all replacement rows have been built in the
+// writer-private overlay but before kind=8/publication, public search must still
+// observe the old all-FREE state. Once released, the same rows become searchable.
+// ---------------------------------------------------------------------------
+TEST(QgUpdaterReuse, CanonicalWriterPrivatePagesStayInvisibleToConcurrentPublicSearch) {
+  const auto dir = scratch_dir("query_isolation");
+  std::filesystem::remove_all(dir);
+  const size_t small_n = 16;
+  auto base = WalTinyIndex::build(dir, small_n, /*seed=*/18);
+  const size_t reuse_n = 4;
+  const auto vecs = waltest::make_data(reuse_n, kDim, /*seed=*/72);
+  const std::vector<uint64_t> labels = {91000, 91001, 91002, 91003};
+  auto gate = std::make_shared<FailpointGate>(SegmentOpFailPoint::after_reuse_partial_final_page);
+
+  ReuseSession s(base.prefix,
+                 small_n,
+                 4 * small_n,
+                 /*enable_reuse=*/true,
+                 [gate](SegmentOpFailPoint point) {
+                   (*gate)(point);
+                 });
+  std::vector<PID> all(small_n);
+  for (size_t i = 0; i < small_n; ++i) all[i] = static_cast<PID>(i);
+  free_base_rows(*s.upd, all);
+  ASSERT_EQ(s.upd->free_count(), small_n);
+
+  auto writer = std::async(std::launch::async, [&] {
+    return s.upd->commit_physical_bundle_tokens(1, 1, vecs.data(), labels.data(), reuse_n);
+  });
+  const bool reached = gate->wait_until_reached();
+  if (!reached) {
+    gate->release();
+    ADD_FAILURE() << "canonical writer did not reach the partial-final-page isolation cut";
+    EXPECT_NO_THROW((void)writer.get());
+    std::filesystem::remove_all(dir);
+    return;
+  }
+
+  // Canonical reclaim ordering makes PIDs [0,reuse_n) the reserved prefix. They remain
+  // hidden, absent from the immutable label snapshot, and unreturnable by public search.
+  const auto pre_publish_snapshot = s.upd->label_snapshot();
+  for (PID pid = 0; pid < static_cast<PID>(reuse_n); ++pid) {
+    EXPECT_TRUE(s.upd->row_hidden(pid));
+    EXPECT_EQ(pre_publish_snapshot->find(pid), nullptr);
+  }
+  for (size_t i = 0; i < reuse_n; ++i) {
+    const auto result = s.upd->search(vecs.data() + i * kDim, reuse_n, 64);
+    for (PID pid : result) {
+      EXPECT_GE(pid, static_cast<PID>(reuse_n))
+          << "public query observed a writer-private reused row before kind=8/publication";
+    }
+  }
+
+  gate->release();
+  PhysicalBundleResult committed;
+  ASSERT_NO_THROW(committed = writer.get());
+  ASSERT_EQ(committed.rows.size(), reuse_n);
+  for (size_t i = 0; i < reuse_n; ++i) {
+    const PID pid = committed.rows[i].pid;
+    EXPECT_FALSE(s.upd->row_hidden(pid));
+    EXPECT_EQ(label_of(*s.upd, pid), labels[i]);
+    EXPECT_TRUE(searchable(*s.upd, vecs.data() + i * kDim, pid));
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// B-2C-06 checkpoint admission: an all-reuse bundle does not move the HWM, so
+// allocated==committed cannot identify it. checkpoint_mutex_ must serialize the
+// public checkpoint at both the pre-kind=7 reservation and post-kind=7 windows.
+// ---------------------------------------------------------------------------
+TEST(QgUpdaterReuse, AllReuseBundleSerializesConcurrentCheckpointAtBothBindWindows) {
+  const std::vector<SegmentOpFailPoint> cuts = {
+      SegmentOpFailPoint::after_reuse_reserve_before_binds,
+      SegmentOpFailPoint::after_label_bind_append,
+  };
+  for (size_t case_index = 0; case_index < cuts.size(); ++case_index) {
+    const auto dir = scratch_dir("checkpoint_window_" + std::to_string(case_index));
+    std::filesystem::remove_all(dir);
+    const size_t small_n = 16;
+    auto base = WalTinyIndex::build(dir, small_n, static_cast<uint32_t>(19 + case_index));
+    const size_t reuse_n = 4;
+    const auto vecs = waltest::make_data(reuse_n, kDim, static_cast<uint32_t>(73 + case_index));
+    const std::vector<uint64_t> labels = {
+        92000 + case_index * 10,
+        92001 + case_index * 10,
+        92002 + case_index * 10,
+        92003 + case_index * 10,
+    };
+    auto gate = std::make_shared<FailpointGate>(cuts[case_index]);
+    PhysicalBundleResult committed;
+
+    {
+      ReuseSession s(base.prefix,
+                     small_n,
+                     4 * small_n,
+                     /*enable_reuse=*/true,
+                     [gate](SegmentOpFailPoint point) {
+                       (*gate)(point);
+                     });
+      std::vector<PID> all(small_n);
+      for (size_t i = 0; i < small_n; ++i) all[i] = static_cast<PID>(i);
+      free_base_rows(*s.upd, all);
+      ASSERT_EQ(s.upd->free_count(), small_n);
+
+      auto writer = std::async(std::launch::async, [&] {
+        return s.upd->commit_physical_bundle_tokens(1, 1, vecs.data(), labels.data(), reuse_n);
+      });
+      const bool reached = gate->wait_until_reached();
+      if (!reached) {
+        gate->release();
+        ADD_FAILURE() << "canonical writer did not reach checkpoint cut " << case_index;
+        EXPECT_NO_THROW((void)writer.get());
+        std::filesystem::remove_all(dir);
+        continue;
+      }
+
+      std::promise<void> checkpoint_started;
+      auto checkpoint_started_future = checkpoint_started.get_future();
+      auto checkpoint = std::async(std::launch::async, [&] {
+        checkpoint_started.set_value();
+        s.upd->checkpoint();
+      });
+      const bool checkpoint_thread_started =
+          checkpoint_started_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+      EXPECT_TRUE(checkpoint_thread_started);
+      if (checkpoint_thread_started) {
+        EXPECT_EQ(checkpoint.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout)
+            << "checkpoint crossed an in-flight all-reuse bundle at cut " << case_index;
+      }
+
+      gate->release();
+      ASSERT_NO_THROW(committed = writer.get());
+      EXPECT_NO_THROW(checkpoint.get());
+      EXPECT_EQ(committed.old_hwm, small_n);
+      EXPECT_EQ(committed.new_hwm, small_n) << "the exercised bundle must be all-reuse";
+    }
+
+    {
+      ReuseSession reopened(base.prefix, small_n, 4 * small_n, /*enable_reuse=*/true);
+      ASSERT_EQ(committed.rows.size(), reuse_n);
+      for (size_t i = 0; i < reuse_n; ++i) {
+        EXPECT_EQ(label_of(*reopened.upd, committed.rows[i].pid), labels[i]);
+        EXPECT_TRUE(row_is_live(*reopened.upd, committed.rows[i].pid));
+      }
+    }
+    std::filesystem::remove_all(dir);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +616,78 @@ QGSuperblockV2 read_active_superblock(const std::string &index_path) {
   QGSuperblockV2 sb{};
   EXPECT_GE(select_qg_superblock(header.data(), sb), 0);
   return sb;
+}
+
+void overwrite_file_range(const std::string &path,
+                          uint64_t offset,
+                          const void *bytes,
+                          size_t size) {
+  std::fstream io(path, std::ios::binary | std::ios::in | std::ios::out);
+  if (!io) throw std::runtime_error("cannot open test fixture for overwrite: " + path);
+  io.seekp(static_cast<std::streamoff>(offset));
+  io.write(reinterpret_cast<const char *>(bytes), static_cast<std::streamsize>(size));
+  io.flush();
+  if (!io) throw std::runtime_error("cannot overwrite test fixture: " + path);
+  alaya::platform::sync_file_or_throw(path);
+}
+
+// Turn one valid durable binding into generation UINT32_MAX while keeping the active
+// label slot, its checksum, the v3 summary, and the selected A/B superblock consistent.
+// This creates a protocol-valid saturated incarnation without iterating 2^32 reuses.
+void saturate_pid_binding_on_disk(const std::string &index_path, int active_sb_slot, PID pid) {
+  QGSuperblockV2 sb = read_active_superblock(index_path);
+  uint64_t label_slot = 0;
+  uint64_t label_count = 0;
+  std::memcpy(&label_slot, sb.reserved.data() + 8, 8);
+  std::memcpy(&label_count, sb.reserved.data() + 24, 8);
+  if (label_slot > 1 || label_count == 0) {
+    throw std::runtime_error("saturated binding fixture requires a non-empty valid label slot");
+  }
+  const std::string slot_path = index_path + ".labels.slot" + std::to_string(label_slot);
+  std::vector<std::byte> body(static_cast<size_t>(label_count) * 16);
+  {
+    std::ifstream in(slot_path, std::ios::binary);
+    in.read(reinterpret_cast<char *>(body.data()), static_cast<std::streamsize>(body.size()));
+    if (!in) throw std::runtime_error("cannot read active label slot for saturation fixture");
+  }
+  bool found = false;
+  uint32_t nonzero_count = 0;
+  const uint32_t saturated = (std::numeric_limits<uint32_t>::max)();
+  for (size_t off = 0; off < body.size(); off += 16) {
+    const uint32_t entry_pid = alaya::wal::get_u32(body, off);
+    uint32_t entry_generation = alaya::wal::get_u32(body, off + 4);
+    if (entry_pid == static_cast<uint32_t>(pid)) {
+      std::memcpy(body.data() + off + 4, &saturated, sizeof(saturated));
+      entry_generation = saturated;
+      found = true;
+    }
+    if (entry_generation != 0) ++nonzero_count;
+  }
+  if (!found) throw std::runtime_error("target PID has no durable label binding to saturate");
+
+  overwrite_file_range(slot_path, 0, body.data(), body.size());
+  const uint64_t slot_checksum = static_cast<uint64_t>(alaya::wal::crc32(body));
+  std::memcpy(sb.reserved.data() + 32, &slot_checksum, 8);  // label tuple checksum
+  std::memcpy(sb.reserved.data() + 96, &saturated, 4);      // w2c.max_pid_generation
+  std::memcpy(sb.reserved.data() + 100, &nonzero_count, 4);
+  sb.checksum = qg_superblock_checksum(sb);
+  overwrite_file_range(index_path,
+                       static_cast<uint64_t>(active_sb_slot) * kQGSuperblockSize,
+                       &sb,
+                       sizeof(sb));
+
+  // checkpoint() retains a same-generation flip marker. Keep that marker byte-identical
+  // to the patched selected base so the fixture reaches the saturation guards themselves.
+  uint64_t segment_uid = 0;
+  std::memcpy(&segment_uid, sb.reserved.data(), sizeof(segment_uid));
+  const auto image =
+      std::span<const std::byte>(reinterpret_cast<const std::byte *>(&sb), sizeof(sb));
+  const auto flip = encode_superblock_flip(segment_uid,
+                                           sb.generation,
+                                           static_cast<uint8_t>(active_sb_slot),
+                                           image);
+  alaya::wal::WalFile wal(index_path + ".opwal");
+  wal.reset_to_single_frame(kSegmentOpRecordType, 0, /*op_id=*/1, /*batch_id=*/0, flip);
 }
 
 // Build a durable pid-activated v3 base (1-row activation bundle + checkpoint) and return its
@@ -2135,6 +2407,174 @@ TEST(QgUpdaterReuse, SaturatedBundleSpineCycleReachesEveryRow) {
   size_t reached = 0;
   for (size_t i = 0; i < append_n; ++i) reached += seen.count(first + static_cast<PID>(i));
   EXPECT_EQ(reached, append_n) << "BFS from the entry did not reach every saturated bundle row";
+  std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// Saturated-FREE dual guard: generation UINT32_MAX is a valid live incarnation,
+// but once tombstoned it is permanent and must not be reclaimed. A crafted FREE
+// trailer for the same durable binding must fail closed during recovery.
+// ---------------------------------------------------------------------------
+TEST(QgUpdaterReuse, SaturatedPidStaysTombstonedAndFreeImagePoisonsOnReopen) {
+  const auto dir = scratch_dir("saturated_free");
+  std::filesystem::remove_all(dir);
+  const size_t small_n = 16;
+  const PID pid = 3;
+  auto base = WalTinyIndex::build(dir, small_n, /*seed=*/84);
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const auto vec = waltest::make_data(1, kDim, /*seed=*/86);
+  int active_sb_slot = 0;
+  size_t page_size = 0;
+  size_t npp = 0;
+
+  {
+    ReuseSession s(base.prefix, small_n, 4 * small_n, /*enable_reuse=*/true);
+    free_base_rows(*s.upd, {pid});
+    const uint64_t label = 93000;
+    const auto result = s.upd->commit_physical_bundle_tokens(1, 1, vec.data(), &label, 1);
+    ASSERT_EQ(result.rows.size(), 1U);
+    ASSERT_EQ(result.rows[0].pid, pid);
+    ASSERT_EQ(result.rows[0].pid_generation, 1U);
+    s.upd->checkpoint();
+    active_sb_slot = s.upd->active_superblock_slot();
+    page_size = s.upd->debug_page_size();
+    npp = s.upd->debug_npp();
+  }
+
+  ASSERT_NO_THROW(saturate_pid_binding_on_disk(index_path, active_sb_slot, pid));
+  const uint32_t saturated = (std::numeric_limits<uint32_t>::max)();
+  {
+    ReuseSession s(base.prefix, small_n, 4 * small_n, /*enable_reuse=*/true);
+    ASSERT_EQ(s.upd->durable_generation(pid), saturated);
+    s.upd->tombstone(pid);
+    s.upd->consolidate(2, /*r_target=*/0, /*reclaim_slots=*/true, /*bloom=*/false);
+    const auto trailer = s.upd->trailer(pid);
+    EXPECT_NE(trailer.flags & kQGRowTombstone, 0U);
+    EXPECT_EQ(trailer.flags & kQGRowFree, 0U)
+        << "a saturated incarnation must remain a permanent tombstone";
+    EXPECT_EQ(s.upd->free_count(), 0U);
+    s.upd->checkpoint();
+  }
+  {
+    ReuseSession reopened(base.prefix, small_n, 4 * small_n, /*enable_reuse=*/true);
+    EXPECT_EQ(reopened.upd->durable_generation(pid), saturated);
+    EXPECT_NE(reopened.upd->trailer(pid).flags & kQGRowTombstone, 0U);
+    EXPECT_EQ(reopened.upd->trailer(pid).flags & kQGRowFree, 0U);
+    EXPECT_EQ(reopened.upd->free_count(), 0U);
+  }
+
+  // Corrupt only the committed trailer into FREE while leaving the saturated binding
+  // and v3 summary valid. Recovery must reject this impossible state, not wrap to gen 0.
+  const size_t page = static_cast<size_t>(pid) / npp;
+  const size_t slot = static_cast<size_t>(pid) % npp;
+  auto bytes = read_index_page(index_path, page_size, page);
+  auto trailer = qg_read_page_trailer(bytes.data(), page_size, npp, slot);
+  trailer.flags |= static_cast<uint16_t>(kQGRowTombstone | kQGRowFree);
+  qg_write_page_trailer(bytes.data(), page_size, npp, slot, trailer);
+  ASSERT_NO_THROW(
+      overwrite_file_range(index_path, kSectorLen + page * page_size, bytes.data(), bytes.size()));
+  EXPECT_THROW(
+      { ReuseSession poisoned(base.prefix, small_n, 4 * small_n, /*enable_reuse=*/true); },
+      std::exception)
+      << "recovery must poison when a saturated durable incarnation appears on the FREE list";
+  std::filesystem::remove_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// B-2C-02 poison 2: two bound appended PIDs span two pages, but the crafted
+// transaction supplies a final page only for the first PID. Bind count/HWM
+// algebra pass; per-binding final-page completeness must reject the second.
+// ---------------------------------------------------------------------------
+TEST(QgUpdaterReuse, CanonicalMissingOneBoundPidFinalPagePoisonsOnReopen) {
+  const auto dir = scratch_dir("poison_missing_bound_page");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/87);
+  uint64_t seg_uid = 0;
+  uint64_t gen = 0;
+  uint64_t old_hwm = 0;
+  size_t page_size = 0;
+  size_t npp = 0;
+  {
+    ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);
+    const auto v = waltest::make_data(1, kDim, 1);
+    const uint64_t label = 5;
+    s.upd->commit_physical_bundle(1, 1, v.data(), &label, 1);
+    s.upd->checkpoint();
+    seg_uid = s.upd->segment_uid();
+    gen = s.upd->generation();
+    old_hwm = s.upd->num_points();
+    page_size = s.upd->debug_page_size();
+    npp = s.upd->debug_npp();
+  }
+  ASSERT_EQ(old_hwm % npp, npp - 1)
+      << "fixture requires the two appended bindings to occupy different pages";
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  const auto index_before = read_all_bytes(index_path);
+  {
+    alaya::wal::WalFile wal(wal_path);
+    const uint64_t txid = 2;
+    wal.append(kSegmentOpRecordType,
+               0,
+               1,
+               txid,
+               encode_label_bind(seg_uid,
+                                 gen,
+                                 txid,
+                                 /*row_op=*/0,
+                                 static_cast<uint32_t>(old_hwm),
+                                 /*gen=*/0,
+                                 /*label=*/6),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType,
+               0,
+               2,
+               txid,
+               encode_label_bind(seg_uid,
+                                 gen,
+                                 txid,
+                                 /*row_op=*/1,
+                                 static_cast<uint32_t>(old_hwm + 1),
+                                 /*gen=*/0,
+                                 /*label=*/7),
+               alaya::wal::WalFile::Sync::buffered);
+    const size_t page = old_hwm / npp;
+    const size_t slot = old_hwm % npp;
+    std::vector<char> final_page(page_size, 0);
+    QGRowTrailer live{};
+    live.valid_degree = 0;
+    live.flags = 0;
+    qg_write_page_trailer(final_page.data(), page_size, npp, slot, live);
+    wal.append(kSegmentOpRecordType,
+               0,
+               3,
+               txid,
+               encode_row_patch(seg_uid,
+                                gen,
+                                /*first_pid=*/page * npp,
+                                /*offset=*/kSectorLen + page * page_size,
+                                std::span<const std::byte>(reinterpret_cast<const std::byte *>(
+                                                               final_page.data()),
+                                                           final_page.size())),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType,
+               0,
+               4,
+               txid,
+               encode_tx_publish(seg_uid,
+                                 gen,
+                                 txid,
+                                 /*new_hwm=*/old_hwm + 2,
+                                 /*binding_count=*/2,
+                                 /*applied=*/2),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  EXPECT_THROW(
+      { ReuseSession poisoned(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true); },
+      std::exception)
+      << "a canonical bundle missing one bound PID's final page must poison (B-2C-02)";
+  EXPECT_EQ(read_all_bytes(index_path), index_before)
+      << "final-page completeness must be validated before any page is installed";
   std::filesystem::remove_all(dir);
 }
 
