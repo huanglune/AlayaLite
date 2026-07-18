@@ -88,6 +88,45 @@ struct LaserSegmentSearchExtension {
   return extension;
 }
 
+// Shared LASER extension admission for mutable and sealed segment faces. Callers
+// provide their storage-specific defaults; a matching extension overrides effort
+// and beam width with one validation contract on both paths.
+[[nodiscard]] inline auto resolve_laser_search_extensions(const core::SearchOptions &options,
+                                                          DiskSearchOptions defaults)
+    -> core::Result<DiskSearchOptions> {
+  for (const auto &extension : options.extensions) {
+    if (extension.algorithm_id != core::algorithm::laser) {
+      if (extension.unknown_policy == core::UnknownExtensionPolicy::reject) {
+        return core::Status::error(core::StatusCode::invalid_argument,
+                                   core::OperationStage::validation,
+                                   core::StatusDetail::unknown_extension,
+                                   "LASER received an extension for another algorithm");
+      }
+      continue;
+    }
+    if (extension.payload == nullptr ||
+        extension.payload_size < sizeof(LaserSegmentSearchExtension)) {
+      return core::Status::error(core::StatusCode::invalid_argument,
+                                 core::OperationStage::validation,
+                                 core::StatusDetail::malformed_struct,
+                                 "LASER search extension payload is truncated");
+    }
+    const auto &typed = *static_cast<const LaserSegmentSearchExtension *>(extension.payload);
+    if (!core::is_current_struct(typed) || typed.effort == 0 || typed.beam_width == 0 ||
+        typed.beam_width > static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
+      return core::Status::error(core::StatusCode::invalid_argument,
+                                 core::OperationStage::validation,
+                                 core::StatusDetail::malformed_struct,
+                                 "LASER search extension values are invalid");
+    }
+    defaults.ef = typed.effort;
+    defaults.beam_width = typed.beam_width;
+  }
+  defaults.top_k = static_cast<std::uint32_t>(options.top_k);
+  defaults.exact_rerank = false;
+  return defaults;
+}
+
 struct LaserSegmentReferenceOptions {
   std::filesystem::path collection_root{};
   std::string segment_id{};
@@ -695,37 +734,7 @@ class LaserSegment {
       }
       resolved.beam_width = static_cast<std::uint32_t>(parsed);
     }
-    for (const auto &extension : options.extensions) {
-      if (extension.algorithm_id != kAlgorithmId) {
-        if (extension.unknown_policy == core::UnknownExtensionPolicy::reject) {
-          return core::Status::error(core::StatusCode::invalid_argument,
-                                     core::OperationStage::validation,
-                                     core::StatusDetail::unknown_extension,
-                                     "LaserSegment received an extension for another algorithm");
-        }
-        continue;
-      }
-      if (extension.payload == nullptr ||
-          extension.payload_size < sizeof(LaserSegmentSearchExtension)) {
-        return core::Status::error(core::StatusCode::invalid_argument,
-                                   core::OperationStage::validation,
-                                   core::StatusDetail::malformed_struct,
-                                   "LaserSegment search extension payload is truncated");
-      }
-      const auto &typed = *static_cast<const LaserSegmentSearchExtension *>(extension.payload);
-      if (!core::is_current_struct(typed) || typed.effort == 0 || typed.beam_width == 0 ||
-          typed.beam_width > static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
-        return core::Status::error(core::StatusCode::invalid_argument,
-                                   core::OperationStage::validation,
-                                   core::StatusDetail::malformed_struct,
-                                   "LaserSegment search extension values are invalid");
-      }
-      resolved.ef = typed.effort;
-      resolved.beam_width = typed.beam_width;
-    }
-    resolved.top_k = static_cast<std::uint32_t>(options.top_k);
-    resolved.exact_rerank = false;
-    return resolved;
+    return resolve_laser_search_extensions(options, std::move(resolved));
   }
 
   [[nodiscard]] auto validate_search_request(const core::SearchRequest &request) const

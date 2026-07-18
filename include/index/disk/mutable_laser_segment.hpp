@@ -282,9 +282,13 @@ class MutableLaserSegment {
     if (opts.top_k == 0) {
       throw std::invalid_argument("MutableLaserSegment: top_k must be > 0");
     }
+    if (opts.beam_width == 0 ||
+        opts.beam_width > static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
+      throw std::invalid_argument("MutableLaserSegment: beam_width is invalid");
+    }
     updater_->ensure_readable();  // entry poison gate (B-02); lock-free
     const size_t ef = std::max<size_t>(opts.ef, opts.top_k);
-    const auto pids = updater_->search(query, opts.top_k, ef);
+    const auto pids = updater_->search(query, opts.top_k, ef, opts.beam_width);
     // Acquire the label snapshot AFTER search took its committed watermark: the
     // snapshot is published before committed, so it covers every committed PID's
     // binding, and identity fallback never fires spuriously (B-02).
@@ -326,6 +330,7 @@ class MutableLaserSegment {
   [[nodiscard]] auto last_committed_txid() const -> uint64_t {
     return updater_->last_committed_txid();
   }
+  [[nodiscard]] auto search_stats() const -> laser::UpdateStats { return updater_->stats(); }
 
   // Create a brand-new EMPTY (count=0) active LASER segment directory: a
   // checksum-valid v2 superblock (num_points=0), a matching FHT rotator, two

@@ -883,9 +883,15 @@ class QGUpdater {
    * watermark may become visible during the query at their hidden-bit clear.
    * Tombstoned/free/dark rows remain traversable but are never results.
    */
-  [[nodiscard]] std::vector<PID> search(const float *query_vec, size_t k, size_t ef) {
+  [[nodiscard]] std::vector<PID> search(const float *query_vec,
+                                        size_t k,
+                                        size_t ef,
+                                        size_t max_beam_width = 16) {
     if (query_vec == nullptr) throw std::invalid_argument("QGUpdater::search null query");
     if (k == 0) return {};
+    if (max_beam_width == 0) {
+      throw std::invalid_argument("QGUpdater::search max_beam_width must be > 0");
+    }
     const size_t snapshot = committed_.load(std::memory_order_acquire);
     if (snapshot == 0) return {};
 
@@ -947,7 +953,7 @@ class QGUpdater {
       // growing beam before any row in that beam contributes neighbors. The
       // reads themselves stay synchronous through the updater pool, but this
       // preserves the diversity effect of the native async beam (2,4,8,16).
-      beam_width = std::min<size_t>(16, beam_width * 2);
+      beam_width = std::min(max_beam_width, beam_width * 2);
       std::vector<PID> frontier;
       frontier.reserve(beam_width);
       while (sp.has_next() && frontier.size() < beam_width) {

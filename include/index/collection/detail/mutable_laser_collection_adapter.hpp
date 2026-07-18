@@ -39,6 +39,7 @@
 #include "core/algorithm_registry.hpp"
 #include "index/collection/mutation_wal_codec.hpp"
 #include "index/collection/types.hpp"
+#include "index/disk/laser_segment.hpp"
 #include "index/disk/mutable_laser_segment.hpp"
 
 namespace alaya::internal::collection::detail {
@@ -641,8 +642,12 @@ class MutableLaserCollectionAdapter {
     }
 
     ::alaya::disk::DiskSearchOptions options;
-    options.top_k = static_cast<std::uint32_t>(request.options.top_k);
     options.ef = std::max<std::uint32_t>(static_cast<std::uint32_t>(request.options.top_k), 128U);
+    auto resolved = ::alaya::disk::resolve_laser_search_extensions(request.options, options);
+    if (!resolved.ok()) {
+      return resolved.status();
+    }
+    options = std::move(resolved).value();
 
     auto &response = *request.response;
     response.query_count = request.queries.rows;
