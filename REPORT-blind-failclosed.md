@@ -97,9 +97,10 @@ CTest、reuse 59/59、reuse 崩溃格 31/31、B04 8/8、kind 1-8 golden 2/2
 证据：
 
 - `QgMaintenanceConcurrency.DependencyReloadFramesStayWithinPreflightBound`：使用盲审探针同形
-  的 256 行/128 页、R64/d64、`cache_cap_pages=1`、偶数 PID tombstone、reclaim；确认实际
-  kind=1 扫描数等于内部 frame 计数，preflight frame 上界为 `128 * 2 = 256`，实际 frame、
-  page-frame bytes 和整个 WAL 文件增量都不超过对应 admission 上界。
+  的 256 行/128 页、R64/d64、`cache_cap_pages=1`、偶数 PID tombstone、reclaim；确认
+  marker 分隔的 maintenance kind=1 扫描数等于内部 frame 计数，preflight frame 上界为
+  `128 * 2 = 256`，maintenance frame 与事务字节都不超过对应 admission 上界。全文件窗口
+  另按 baseline tombstone/row-patch 与 maintenance 事务组成的合成上界检查。
 - `QgMaintenanceConcurrency.EnospcAfterBeginPoisonsAndReopenRollsBack` 与 crash grids 继续确认
   BEGIN 后异常仍 poison，重开按事务边界恢复。
 
@@ -147,6 +148,68 @@ Python 验证环境说明：配置指定的解释器来自主 checkout 的 `.ven
 `build/Blind/validation_python/sitecustomize.py` 移除该 finder，并通过 `PYTHONPATH` 传给
 build/CTest；fixture 随后明确打印并校验加载的是本工作树
 `build/Blind/python/_alayalitepy.cpython-313-x86_64-linux-gnu.so`。该辅助文件未提交。
+
+## CI coverage lane F2 回归追修
+
+### 裁决：测试窗口可见性（分析 1），不是生产双记（分析 2）
+
+Codecov 的 `542,976` 字节差值可以精确分解，而不只是近似为 130 个 page frame：
+
+`542,976 = 128 * [(4096 + 79) row_patch frame + 67 tombstone frame]`
+
+也就是 128 个偶数 PID tombstone 在 maintenance BEGIN 之前各自产生的一条 kind=1
+whole-page after-image 和一条 kind=2 tombstone。证据链如下：
+
+- `tombstone()` 先以 `Sync::buffered` 追加 kind=2，再由普通（非 maintenance）
+  `modify_node_page()` 追加 kind=1，并把对应 cache page 标为 dirty。
+- `WalFile::Sync::buffered` 只写入 `ofstream` 的进程内缓冲；该缓冲配置为 1 MiB。
+  外部 `visit_frames()` 和 `filesystem::file_size()` 能看到多少已追加记录取决于
+  libstdc++ 何时把 stream buffer 推给内核。gcc-11 本地与 gcc-13 coverage lane 因此得到
+  不同的开窗前可见前缀。
+- consolidate 的 baseline `flush_dirty()` 首先调用 `force_wal()`，所以此前已逻辑追加但尚未
+  对另一个 fd 可见的 128 对记录会在原测试窗口内一次显现。`flush_dirty()` 自身没有任何
+  WAL append；随后只执行 index pwrite。
+- BEGIN fsync 后才设置 `maintenance_active_=true`。row repair/reclaim 的每个
+  `modify_node_page()` 都在函数首部进入 private overlay 并提前返回，不可能落到 legacy
+  `log_page_after_image()` 分支。
+- `maintenance_page_frames` 只在 `maint_log_page()` 成功 append 后增加；按 BEGIN/END marker
+  扫描出的 maintenance kind=1 数与该统计增量相等，排除了同页 legacy + maintenance 双记。
+
+因此没有生产代码或 WAL wire 变更；`maintenance_last_preflight_wal_bytes` 继续表示
+marker-delimited maintenance 事务的专属上界。把含有更早 baseline 操作的全文件可见增量
+直接与它比较，是原回归的口径错误。
+
+### 确定性回归
+
+`DependencyReloadFramesStayWithinPreflightBound` 现在在 tombstone 之前开启测量窗，明确把
+baseline 与 maintenance 两部分都纳入，而不再依赖 stream buffer 是否提前可见：
+
+- 每物理页只 tombstone 一个 PID；consolidate 前断言 resident pool 为 128 页，完成后通过
+  `flush_unique_pages` 增量断言入口确有 128 个 dirty 页。
+- 全窗口精确断言新增 128 条 kind=2，且 kind=1 总数等于 128 条 baseline row-patch 加
+  maintenance 专属统计。
+- 扫描最后一个完整 BEGIN/END epoch，断言其中 kind=1 数等于 maintenance 专属统计，事务
+  字节不超过 `maintenance_last_preflight_wal_bytes`。
+- 用冻结 codec 实际计算 frame 大小，断言全文件增量精确等于
+  `128 * (row_patch_frame + tombstone_frame) + maintenance_window_bytes`，并检查相同组成的
+  合成上界。
+
+### 追修验证
+
+| 配置/套件 | 结果 | 退出码 |
+|---|---:|---:|
+| Release、Python ON、全量 CTest | 94/94 | 0 |
+| Debug、gcc-11、coverage ON、Python OFF、全量 CTest | 94/94 | 0 |
+| coverage 配置下确定性 F2 单测 | 1/1 | 0 |
+| reuse | 59/59 | 0 |
+| reuse crash | 31/31 | 0 |
+| B04 | 8/8 | 0 |
+| kind 1-8 golden | 2/2 | 0 |
+
+本机 Debug+coverage 下既有 `qg_builder_oom_regression` 需要 192-249 秒，超过源码设置的
+120 秒 CTest timeout。首次串行验证因此是 93/94 + 纯超时；只在 ignored build tree 的
+generated `CTestTestfile.cmake` 将该目标 timeout 调为 300 秒后，全量复跑 94/94，最终
+`COVERAGE_CTEST_RETRY_EXIT_CODE=0`。没有修改其源码、CMakeLists 或 tracked 文件。
 
 ## 领地与兼容性审计
 
