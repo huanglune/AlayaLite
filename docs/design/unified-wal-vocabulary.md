@@ -12,16 +12,16 @@ framing is normative and is not restated here.
 
 ## Why now
 
-Two write-ahead concerns exist on the roadmap:
+Two write-ahead concerns share one framing contract:
 
 1. **Collection logical WAL** (shipped): row-level logical mutations
    (`write`/`erase`), receipts, publication markers, checkpoints —
    record types 1–4 in the WAL7 frame format.
-2. **Segment op-WAL** (G1 gate): segment-physical, in-place operations on
-   sealed LASER segments (`QGUpdater`: row patches, tombstones,
-   consolidate, publish watermarks, superblock flips). Today these have
-   CRC'd A/B superblocks but **no WAL and no torn-write recovery**, which
-   is exactly why G1 blocks durable in-place claims.
+2. **Segment op-WAL** (shipped through 2C): segment-physical operations on
+   mutable LASER segments (`QGUpdater`: row patches, tombstones, maintenance
+   transactions, publish watermarks, label bundles, and superblock flips).
+   Whole-page redo, A/B superblocks, and prefix-safe replay jointly cover
+   torn writes; the Collection logical WAL remains the logical source of truth.
 
 If these two families grow independent framings/codecs, the divergence is
 permanent. This contract fixes the vocabulary before U2/G1 write the code.
@@ -57,17 +57,17 @@ u64 segment_id     u64 segment_generation     u8 op kind     op body
 
 | kind | name | body | replay rule |
 |---:|---|---|---|
-| 1 | `row_patch` | pid, absolute byte offset, length, bytes | absolute-offset rewrite (idempotent). Whole-row granularity is required whenever a resident-arena mirror is active (`arena_mirror_write` contract). |
-| 2 | `tombstone` | pid | set-only; "resurrect" is a new insert, never an un-tombstone |
-| 3 | `consolidate_begin` | consolidate epoch | phase barrier |
-| 4 | `consolidate_end` | consolidate epoch | an unmatched `begin` at recovery ⇒ the consolidate replays or is discarded **as a unit** |
-| 5 | `publish` | visibility watermark | monotone max on replay |
-| 6 | `superblock_flip` | target A/B slot, superblock CRC | commit point of a segment checkpoint; CRC-guarded |
-| 7 | `label_bind` | txid, row_op_id, pid, pid_generation, label | (2A) stages one explicit pid→label binding under a txid; buffered, promoted atomically by the matching `tx_publish`. Idempotent de-dup on `(txid, row_op_id)` for a torn large-bundle retry. |
-| 8 | `tx_publish` | txid, new_committed_watermark, row_count, applied_collection_op_id | (2A) the single durable (fsync) commit point of a label bundle: advances `committed`, promotes the bundle's staged `label_bind` frames, and carries the collection op watermark that is 2B's idempotency basis. `batch_id == tx_id`; strict-increasing txid; non-regressing applied op. |
+| 1 | `row_patch` | pid, absolute byte offset, length, bytes | One unchanged wire shape has three roles: ordinary legacy after-image; maintenance whole-page after-image; canonical bundle FREE preimage and latest final page. Replay validates the role from its state-machine lane. |
+| 2 | `tombstone` | pid | PID-only, set-only wire. Runtime ABA protection is carried by `PidToken {pid, pid_generation}` at the mutable-segment boundary, not by this record. |
+| 3 | `consolidate_begin` | consolidate epoch | Opens the maintenance lane; BEGIN alone is not a commit. |
+| 4 | `consolidate_end` | consolidate epoch | Its fsync is the maintenance transaction's only commit point. An unmatched BEGIN is discarded as a unit. |
+| 5 | `publish` | visibility watermark | Legacy append visibility only; monotone on replay and never a PID-reuse commit. |
+| 6 | `superblock_flip` | target A/B slot, superblock CRC | Commit point of a segment checkpoint/base absorption; it is not the maintenance commit point. |
+| 7 | `label_bind` | txid, row_op_id, pid, pid_generation, label | Legacy 2A binding or canonical prebind. A canonical writer emits every bind before its page frames; `pid_generation > 0` identifies reuse. |
+| 8 | `tx_publish` | txid, new_committed_watermark, row_count, applied_collection_op_id | Single durable commit point of a label bundle. Canonical replay validates generation/label/final-live evidence and `new_hwm = old_hwm + count(generation == 0)` before applying. `batch_id == tx_id`; strict-increasing txid; non-regressing applied op. |
 
-Gardening is not an op kind: a garden pass is a sequence of `row_patch`
-records (plus `publish`), nothing more.
+Kinds 1–6 retain `batch_id == 0`; kinds 7/8 use the physical transaction id.
+The payload layout and the kind 1–8 numeric values are unchanged.
 
 #### 3a. `consolidate` as a maintenance transaction (2C / W1)
 
@@ -99,10 +99,72 @@ nothing touches the index or the resident arena before the transaction commits.
   canonical label bundle form mutually-exclusive replay lanes; any other op kind
   inside an open epoch poisons.
 
-`garden()` still throws under `enable_wal` (it is *not* a kind 3/4 epoch — see §5.1 of
-the 2C design). PID reuse is likewise gated: the `label_bind.pid_generation` field is
-reserved and is currently always written 0 (every WAL insert appends a fresh PID);
-bundle-only reuse over a v3 `pid_generation` base is designed but not yet enabled.
+`garden()` still throws under `enable_wal`; it is not encoded as a maintenance
+epoch or a new op kind. Legacy `insert`/`add_batch`/kind-5 publication continues
+to append fresh PIDs. Reuse is limited to a canonical physical bundle.
+
+#### 3b. Canonical prebind and bundle-only PID reuse (2C / W2)
+
+Once PID-generation support is activated, every physical label bundle uses the
+canonical lane, including append-only, mixed, and all-reuse bundles:
+
+1. reserve all `PidToken`s, popping the canonical free-chain prefix before dense
+   append allocation;
+2. append all kind-7 prebinds;
+3. for every reused page, record its committed `FREE | TOMBSTONE` kind-1 preimage;
+4. build in a writer-private overlay and record each dirty page's latest final
+   kind-1 image;
+5. validate every bound PID's final trailer as live, then fsync one kind 8;
+6. publish in the fixed order label snapshot → routing → reused-hidden clear →
+   committed HWM.
+
+The high-water mark advances only for generation-0 rows. Therefore an all-reuse
+bundle has `new_hwm == old_hwm` while still carrying a positive binding count.
+Generation must advance exactly by one for a reused PID; `UINT32_MAX` is a
+permanent tombstone and can never become FREE again. Public query reads bypass the
+private overlay and cannot observe a reserved row before publication.
+
+#### 3c. Mutually exclusive replay lanes
+
+```text
+Idle
+  kind3 -> Maintenance
+  canonical kind7 -> CanonicalBundle
+
+Maintenance
+  kind1* -> Maintenance
+  matching kind4 -> Idle
+  EOF -> discard + truncate to begin
+  other -> poison
+
+CanonicalBundle
+  kind7* -> prebind
+  kind1* -> preimage/latest-page stage
+  matching kind8 -> validate/apply -> Idle
+  EOF -> discard + truncate to first kind7
+  other -> poison
+```
+
+Standalone and legacy effects use a separate commit unit after activation. It
+stores WAL frame locations plus row-level evidence, attaches an unambiguous legacy
+owner, and re-reads/re-validates frames at the consuming kind 5, kind 8, or flip.
+This prevents a current-generation page image from escaping through the wrong lane.
+
+#### 3d. v2/v3 activation and reader admission
+
+Immutable builders and `create_empty` continue to produce v2. The first WAL
+maintenance operation checkpoints a v3 base requiring maintenance transaction and
+post-redo free-list support. The first reuse-enabled bundle checkpoints the same v3
+outer layout with the maintenance pair plus the PID-generation, canonical-prebind,
+and mutable-label-slot triple. A reader must understand every required bit; it fails
+closed on the highest valid but unsupported copy instead of falling back to an older
+v2 copy.
+
+During activation one A/B copy can temporarily be v3 while the older copy is v2.
+The mutable updater understands this mixed-slot state, but role handoff to a sealed
+reader is allowed only after a checkpoint leaves both copies as supported v3 images.
+The Collection segment descriptor intentionally remains format 2: that descriptor is
+the capability/adapter contract, while v3 is the nested QG physical-base version.
 
 ### 4. Idempotency invariant
 
@@ -140,6 +202,23 @@ a segment `superblock_flip` is a durable base), never by a global WAL sequence.
 A single append-only stream that interleaves both families is therefore a
 framework-scan property, not a runtime layout — the runtime never writes both
 families into one file.
+
+The complete mutable-LASER persistence set is:
+
+```text
+index                       QG pages + A/B superblocks
+<index>.opwal               segment kinds 1–8
+<index>.labels.slot0        double-buffered explicit bindings
+<index>.labels.slot1        double-buffered explicit bindings
+collection_wal_v1/logical.wal   independent Collection mutations
+```
+
+A pure consolidate writes kinds 3/1/4 and installs index pages; it does not
+modify either label slot and it emits no Collection logical-WAL record. A reuse
+bundle writes kinds 7/1/8; a later checkpoint may serialize its bindings to the
+inactive label slot, append kind 6, install the alternate A/B copy, and reset the
+op-WAL to that flip. Ordering is defined within each file and by those explicit
+commit points, never by a synthetic cross-file sequence.
 
 ### 7. G1 gate, restated
 
@@ -185,7 +264,37 @@ Rotation/seal is unchanged control-plane vocabulary (§6): sealing an active LAS
 generation builds an immutable sealed LASER segment into the manifest; the retired
 active directory is reclaimed by an idempotent open-time sweep (no WAL restatement).
 
-## Acceptance (checked at G1)
+### 8a. Collection maintenance admission (2C / W3)
+
+`Collection::consolidate` is an explicit control call routed only to the current
+active mutable LASER generation. Its lock/admission order is fixed:
+
+```text
+Collection checkpoint mutex
+  -> mutation mutex
+  -> recovery-required recheck
+  -> resolve current routing snapshot and active identity
+  -> adapter maintenance admission (no pending mutation)
+  -> QG maintenance transaction
+```
+
+The active identity is resolved after waiting, so a queued request cannot maintain
+a source that became sealed during rotation. The hook is private routing metadata;
+it is cleared on sealed/replacement entries and does not extend the public segment
+capability ABI. Physical poison is queried explicitly and is promoted to the
+Collection recovery-required latch; only destroying and reopening the handle clears
+that state.
+
+Search does not take the checkpoint mutex, mutation mutex, a unique operation lock,
+or `ControlPlaneGate`. It may run throughout consolidate and relies on the QG page
+seqlock to retry an odd install version. Writes, checkpoint, rotate, seal, compact,
+and GC remain excluded or recovery-gated as appropriate. Active LASER filtering is
+still Collection postfilter, not QG pushdown.
+
+No kind 9 and no `.maint`, `.shadow`, or `.pidgen` file is introduced. Gardening
+remains gated under the WAL.
+
+## Acceptance
 
 1. Crash matrix: for each op kind × kill point, reopen converges to a
    state reachable by some prefix of the log, and a subsequent full replay
@@ -199,3 +308,8 @@ active directory is reclaimed by an idempotent open-time sweep (no WAL restateme
    collection layer is fail-closed on a foreign (`SEGMENT_OP`) record type — it
    raises a typed semantic error and leaves the WAL byte-identical, never
    silently truncating it.
+4. Maintenance/reuse: incomplete maintenance and canonical lanes roll back;
+   durable END/kind 8 roll forward; a second reopen is byte/semantic stable.
+5. Collection integration: active identity is revalidated under the mutation
+   lock, physical poison gates checkpoints and control operations, and public
+   search remains available across seqlock-protected page installation.

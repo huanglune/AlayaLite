@@ -26,8 +26,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   segment lineage id and a fail-closed poisoned-writer contract. The two-layer
   crash matrix (SIGKILL kill points + a power-loss persistence model) is green.
   A new `MutableLaserSegment` handle exposes this as a single-writer (flock)
-  mutable segment. The G1 minimal scope excludes PID reuse/reclaim, consolidate,
-  and gardening under the WAL; those transaction formats are a later wave.
+  mutable segment. `Collection::consolidate()` now routes explicitly to the
+  current active LASER generation: kinds 3/4 bracket a no-steal maintenance
+  transaction, its END fsync commits canonical free-list reclamation, and a
+  per-page seqlock keeps concurrent search off half-installed pages. Canonical
+  physical bundles add bundle-only PID generation/reuse (including mixed and
+  all-reuse HWM algebra) through the existing kinds 1/7/8; v3 feature checkpoints
+  activate maintenance and reuse fail-closed, and seal first leaves both A/B
+  copies readable by the activated format. The crash/recovery suites verify both
+  rollback and roll-forward through two consecutive reopens. A maintenance error
+  after durable BEGIN poisons the active LASER/Collection handle; destroy and
+  reopen it before further writes or checkpoints. Gardening remains gated under
+  the WAL. This adds no WAL envelope, record kind, or persistent stream/file.
 - A shared bottom-layer `wal/frame.hpp` module owns the Physical WAL v1 framing
   (WAL7 envelope, CRC, scan, `WalFile`, byte `Decoder`) for both the collection
   logical WAL and the segment op-WAL — one frame format, no divergence.
