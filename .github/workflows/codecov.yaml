@@ -119,7 +119,7 @@ jobs:
     timeout-minutes: 90
     env:
       BUILD_JOBS: 2
-      CTEST_JOBS: 4
+      CTEST_JOBS: 2
       # "." matches any label, so every labeled test runs in this lane. The
       # previous hand-maintained allowlist (unit|storage|simd|space|utils)
       # silently excluded the laser/wal/collection/crash suites as they were

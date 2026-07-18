@@ -146,7 +146,7 @@ if(ALAYA_ENABLE_MUTABLE_LASER)
   alaya_add_test(
     NAME laser_test_qg_updater_unit
     TARGET test_qg_updater_unit
-    LABELS laser COVERAGE_RUN_SERIAL
+    LABELS laser
   )
 
   # SEGMENT_OP op-WAL payload codec (segment_op_wal.hpp): round-trip + validation.
@@ -174,7 +174,7 @@ if(ALAYA_ENABLE_MUTABLE_LASER)
   alaya_add_test(
     NAME laser_test_qg_updater_wal
     TARGET test_qg_updater_wal
-    LABELS laser wal persistence COVERAGE_RUN_SERIAL
+    LABELS laser wal persistence
   )
 
   alaya_cc_target(
@@ -286,7 +286,7 @@ alaya_add_test(
   NAME laser_test_qg_builder_oom_regression
   TARGET test_qg_builder_oom_regression
   LABELS laser
-  TIMEOUT 420 COVERAGE_RUN_SERIAL
+  TIMEOUT 420
 )
 
 # Bench-only fbin mmap view used by update modes under cgroup RAM caps.
@@ -330,7 +330,7 @@ if(ALAYA_ENABLE_MUTABLE_LASER)
   alaya_add_test(
     NAME laser_test_qg_updater_reuse
     TARGET test_qg_updater_reuse
-    LABELS laser wal persistence COVERAGE_RUN_SERIAL
+    LABELS laser wal persistence
   )
 
   # wal-2c: W2 step 7 MutableLaserSegment token-ization + tombstone ABA + base reuse.
@@ -361,7 +361,7 @@ if(ALAYA_ENABLE_MUTABLE_LASER)
     NAME laser_test_segment_op_wal_reuse_crash
     TARGET test_segment_op_wal_reuse_crash
     LABELS laser wal persistence crash
-    TIMEOUT 420 COVERAGE_RUN_SERIAL
+    TIMEOUT 420
   )
 endif()
 # laser-ip: LASER inner-product (IP) distance kernel tests. Appended by branch feat/laser-ip-kernel; integrate as an
