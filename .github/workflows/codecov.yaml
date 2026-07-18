@@ -116,7 +116,11 @@ jobs:
     env:
       BUILD_JOBS: 2
       CTEST_JOBS: 1
-      CTEST_LABELS: unit|storage|simd|space|utils
+      # "." matches any label, so every labeled test runs in this lane. The
+      # previous hand-maintained allowlist (unit|storage|simd|space|utils)
+      # silently excluded the laser/wal/collection/crash suites as they were
+      # added; heavyweight opt-outs belong in CTEST_EXCLUDE_REGEX instead.
+      CTEST_LABELS: .
       OMP_NUM_THREADS: 1
       ALAYA_MAX_THREADS: 1
     steps:
