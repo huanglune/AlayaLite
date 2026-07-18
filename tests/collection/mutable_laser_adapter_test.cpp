@@ -8,8 +8,12 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <condition_variable>
 #include <filesystem>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -31,16 +35,54 @@ std::filesystem::path scratch(const std::string &name) {
          ("mutable_laser_adapter_" + name + "_" + std::to_string(::getpid()));
 }
 
-std::shared_ptr<::alaya::disk::MutableLaserSegment> open_empty(const std::filesystem::path &dir) {
+std::shared_ptr<::alaya::disk::MutableLaserSegment> open_empty(
+    const std::filesystem::path &dir,
+    std::function<void(laser::SegmentOpFailPoint)> failpoint_hook = {}) {
   std::filesystem::remove_all(dir);
-  ::alaya::disk::MutableLaserSegment::create_empty(dir, "seg_00000002", kDim, kDim, kR,
+  ::alaya::disk::MutableLaserSegment::create_empty(dir,
+                                                   "seg_00000002",
+                                                   kDim,
+                                                   kDim,
+                                                   kR,
                                                    core::Metric::l2);
   laser::UpdateParams params;
   params.max_points = 4096;
   params.ef_insert = 64;
-  return std::make_shared<::alaya::disk::MutableLaserSegment>(
-      dir, params, laser::ResidencyMode::kPagedPool, /*allow_empty=*/true);
+  params.failpoint_hook = std::move(failpoint_hook);
+  return std::make_shared<::alaya::disk::MutableLaserSegment>(dir,
+                                                              params,
+                                                              laser::ResidencyMode::kPagedPool,
+                                                              /*allow_empty=*/true);
 }
+
+class Gate {
+ public:
+  void wait() {
+    std::unique_lock lock(mutex_);
+    entered_ = true;
+    changed_.notify_all();
+    changed_.wait(lock, [&] {
+      return released_;
+    });
+  }
+  [[nodiscard]] auto wait_until_entered() -> bool {
+    std::unique_lock lock(mutex_);
+    return changed_.wait_for(lock, std::chrono::seconds(5), [&] {
+      return entered_;
+    });
+  }
+  void release() {
+    std::lock_guard lock(mutex_);
+    released_ = true;
+    changed_.notify_all();
+  }
+
+ private:
+  std::mutex mutex_{};
+  std::condition_variable changed_{};
+  bool entered_{};
+  bool released_{};
+};
 
 CollectionSchema schema() {
   CollectionSchema s;
@@ -208,6 +250,93 @@ TEST(MutableLaserAdapter, RejectsNonDurableWriteWithoutPendingLeak) {
   const auto v41 = ramp(41);
   ASSERT_TRUE(drive(adapter, make_write(402, 41, v41, std::nullopt), 402, 402).ok());
   EXPECT_EQ(seg->live_count(), 1U);
+  std::filesystem::remove_all(dir);
+}
+
+TEST(MutableLaserAdapter, PendingMutationRejectsMaintenanceWithoutLatch) {
+  const auto dir = scratch("maintenance_pending");
+  auto seg = open_empty(dir);
+  MutableLaserCollectionAdapter adapter(seg, schema(), kSegId, kGen);
+  const auto vector = ramp(50);
+  const auto payload = make_write(501, 50, vector, std::nullopt);
+  WalMutationTransaction transaction;
+  transaction.durability = WriteDurability::wal_fsync;
+  core::OpaqueOperationRequest request;
+  request.payload = &payload;
+  request.payload_size = sizeof(payload);
+  core::MutationContext context;
+  context.transaction_token = &transaction;
+  context.transaction_id = 501;
+  context.max_row_op_id = 501;
+  core::MutationToken token;
+  ASSERT_TRUE(adapter.prepare_mutation(request, context, token).ok());
+
+  auto conflict = adapter.consolidate(1, 0, true, false);
+  ASSERT_FALSE(conflict.ok());
+  EXPECT_EQ(conflict.code(), core::StatusCode::conflict);
+  EXPECT_FALSE(adapter.is_latched());
+  ASSERT_TRUE(adapter.abort_mutation(token, context).ok());
+  EXPECT_TRUE(adapter.consolidate(1, 0, true, false).ok());
+  EXPECT_FALSE(adapter.is_latched());
+  std::filesystem::remove_all(dir);
+}
+
+TEST(MutableLaserAdapter, MaintenanceFlagRejectsPrepareWhileSearchContinues) {
+  const auto dir = scratch("maintenance_active");
+  Gate gate;
+  auto seg = open_empty(dir, [&](laser::SegmentOpFailPoint point) {
+    if (point == laser::SegmentOpFailPoint::after_consolidate_begin_fsync) {
+      gate.wait();
+    }
+  });
+  MutableLaserCollectionAdapter adapter(seg, schema(), kSegId, kGen);
+  const auto seed = ramp(60);
+  ASSERT_TRUE(drive(adapter, make_write(601, 60, seed, std::nullopt), 601, 601).ok());
+
+  auto maintenance = std::async(std::launch::async, [&] {
+    return adapter.consolidate(1, 0, true, false);
+  });
+  ASSERT_TRUE(gate.wait_until_entered());
+
+  const auto next = ramp(61);
+  const auto payload = make_write(602, 61, next, std::nullopt);
+  WalMutationTransaction transaction;
+  transaction.durability = WriteDurability::wal_fsync;
+  core::OpaqueOperationRequest opaque;
+  opaque.payload = &payload;
+  opaque.payload_size = sizeof(payload);
+  core::MutationContext mutation_context;
+  mutation_context.transaction_token = &transaction;
+  mutation_context.transaction_id = 602;
+  mutation_context.max_row_op_id = 602;
+  core::MutationToken token;
+  auto rejected = adapter.prepare_mutation(opaque, mutation_context, token);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.code(), core::StatusCode::conflict);
+  EXPECT_FALSE(adapter.is_latched());
+
+  std::vector<core::SearchHit> hits(4);
+  std::array<core::RowCount, 2> offsets{};
+  std::array<core::RowCount, 1> counts{};
+  std::array<core::Status, 1> statuses{};
+  std::array<core::SearchCompleteness, 1> completeness{};
+  core::SearchResponse response;
+  response.hits = hits;
+  response.offsets = offsets;
+  response.valid_counts = counts;
+  response.statuses = statuses;
+  response.completeness = completeness;
+  core::SearchContext search_context;
+  core::SearchRequest search_request;
+  search_request.queries = core::TypedTensorView::contiguous(seed.data(), 1, seed.size());
+  search_request.options.top_k = 4;
+  search_request.context = &search_context;
+  search_request.response = &response;
+  EXPECT_TRUE(adapter.search(search_request).ok());
+  EXPECT_GE(counts[0], 1U);
+
+  gate.release();
+  EXPECT_TRUE(maintenance.get().ok());
   std::filesystem::remove_all(dir);
 }
 

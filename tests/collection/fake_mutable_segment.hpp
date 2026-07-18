@@ -266,6 +266,8 @@ class FakeMutableSegment {
 
   [[nodiscard]] auto checkpoint(core::CheckpointContext &, core::CheckpointToken &token)
       -> core::Status {
+    checkpoint_barrier_.arrive_and_wait();
+    checkpoint_count_.fetch_add(1, std::memory_order_acq_rel);
     std::lock_guard lock(mutex_);
     token.value = published_op_ids_.empty() ? 0 : published_op_ids_.back();
     return core::Status::success();
@@ -286,15 +288,23 @@ class FakeMutableSegment {
   void fail_next_publish() { fail_next_publish_.store(true, std::memory_order_release); }
   void gate_next_stage() { stage_barrier_.enable(); }
   void gate_next_search() { search_barrier_.enable(); }
+  void gate_next_checkpoint() { checkpoint_barrier_.enable(); }
   [[nodiscard]] auto wait_for_stage() -> bool { return stage_barrier_.wait_until_entered(); }
   [[nodiscard]] auto wait_for_search() -> bool { return search_barrier_.wait_until_entered(); }
+  [[nodiscard]] auto wait_for_checkpoint() -> bool {
+    return checkpoint_barrier_.wait_until_entered();
+  }
   void release_stage() { stage_barrier_.release(); }
   void release_search() { search_barrier_.release(); }
+  void release_checkpoint() { checkpoint_barrier_.release(); }
   [[nodiscard]] auto abort_count() const -> std::uint64_t {
     return abort_count_.load(std::memory_order_acquire);
   }
   [[nodiscard]] auto maximum_active_mutations() const -> std::uint64_t {
     return maximum_active_mutations_.load(std::memory_order_acquire);
+  }
+  [[nodiscard]] auto checkpoint_count() const -> std::uint64_t {
+    return checkpoint_count_.load(std::memory_order_acquire);
   }
   [[nodiscard]] auto prepared_op_ids() const -> std::vector<std::uint64_t> {
     std::lock_guard lock(mutex_);
@@ -404,6 +414,7 @@ class FakeMutableSegment {
   mutable std::mutex mutex_{};
   mutable Barrier search_barrier_{};
   Barrier stage_barrier_{};
+  Barrier checkpoint_barrier_{};
   std::map<std::uint64_t, PublishedRow> rows_{};
   std::map<std::uint64_t, Transaction> transactions_{};
   std::vector<std::uint64_t> prepared_op_ids_{};
@@ -414,6 +425,7 @@ class FakeMutableSegment {
   std::atomic_uint64_t abort_count_{};
   std::atomic_uint64_t active_mutations_{};
   std::atomic_uint64_t maximum_active_mutations_{};
+  std::atomic_uint64_t checkpoint_count_{};
 };
 
 [[nodiscard]] inline auto make_fake_mutable_any(const std::shared_ptr<FakeMutableSegment> &producer)

@@ -157,6 +157,73 @@ TEST_F(WalCoordinatorTest, WeakSearchableReceiptExplicitlyDisclaimsCrashDurabili
   EXPECT_TRUE(get(opened.value(), "weak").ok());
 }
 
+TEST_F(WalCoordinatorTest, AfterEnginePublishBeforeSnapshotLatchesRecoveryUntilReopen) {
+  const std::array<float, 2> seed_vector{1.0F, 2.0F};
+  const std::array<float, 2> committed_vector{7.0F, 8.0F};
+  std::shared_ptr<FakeMutableSegment> producer;
+  auto opened = open_collection(root_, producer);
+  ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
+  core::MutationContext context;
+  ASSERT_TRUE(opened.value()->write(write_request("seed", seed_vector), context).ok());
+  opened.value().reset();
+
+  opened = open_collection(root_,
+                           producer,
+                           true,
+                           MutationFailPoint::after_engine_publish_before_snapshot);
+  ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
+  auto collection = std::move(opened).value();
+  auto failed = collection->write(write_request("committed", committed_vector), context);
+  ASSERT_FALSE(failed.ok());
+  EXPECT_EQ(failed.status().stage(), core::OperationStage::mutation_publish);
+  EXPECT_EQ(get(collection, "committed").status().code(), core::StatusCode::not_found)
+      << "the logical snapshot must not publish the second row on this handle";
+
+  const std::array<float, 2> rejected_vector{9.0F, 10.0F};
+  auto rejected_write = collection->write(write_request("rejected", rejected_vector), context);
+  ASSERT_FALSE(rejected_write.ok());
+  EXPECT_EQ(rejected_write.status().detail(), core::StatusDetail::readonly_instance);
+  auto rejected_erase = collection->erase(core::LogicalId::from_utf8("seed"), context);
+  ASSERT_FALSE(rejected_erase.ok());
+  EXPECT_EQ(rejected_erase.status().detail(), core::StatusDetail::readonly_instance);
+  core::CheckpointContext checkpoint_context;
+  checkpoint_context.durability_target = core::DurabilityTarget::full_checkpoint;
+  auto rejected_checkpoint = collection->checkpoint(checkpoint_context);
+  ASSERT_FALSE(rejected_checkpoint.ok());
+  EXPECT_EQ(rejected_checkpoint.status().detail(), core::StatusDetail::readonly_instance);
+  auto rejected_maintenance = collection->consolidate(1, 0, true, false);
+  ASSERT_FALSE(rejected_maintenance.ok());
+  EXPECT_EQ(rejected_maintenance.status().detail(), core::StatusDetail::readonly_instance);
+
+  auto successor_producer = std::make_shared<FakeMutableSegment>();
+  auto successor_erased = test::make_fake_mutable_any(successor_producer);
+  ASSERT_TRUE(successor_erased.ok());
+  SegmentRegistration successor;
+  successor.segment_id = 3;
+  successor.generation = 1;
+  successor.role = SegmentRole::active_mutable;
+  successor.segment = std::move(successor_erased).value();
+  auto rejected_rotate = collection->rotate_to_successor(std::move(successor),
+                                                         checkpoint_context,
+                                                         [](const ActiveRotationReceipt &) {
+                                                           return core::Status::success();
+                                                         });
+  ASSERT_FALSE(rejected_rotate.ok());
+  EXPECT_EQ(rejected_rotate.status().detail(), core::StatusDetail::readonly_instance);
+
+  collection.reset();
+  for (int reopen = 0; reopen < 2; ++reopen) {
+    opened = open_collection(root_, producer);
+    ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
+    collection = std::move(opened).value();
+    EXPECT_TRUE(get(collection, "seed").ok());
+    EXPECT_TRUE(get(collection, "committed").ok())
+        << "the durable COMMIT must replay after destroying the latched handle";
+    EXPECT_EQ(get(collection, "rejected").status().code(), core::StatusCode::not_found);
+    collection.reset();
+  }
+}
+
 TEST_F(WalCoordinatorTest, EveryRedoCrashBoundaryHasTheSpecifiedRecoveryOutcome) {
   struct Case {
     MutationFailPoint point;

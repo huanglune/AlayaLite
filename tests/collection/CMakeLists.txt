@@ -149,6 +149,18 @@ alaya_add_test(
 )
 
 alaya_cc_target(
+  collection_maintenance_interleaving_test
+  SRCS collection_maintenance_interleaving_test.cpp
+  GTEST
+)
+alaya_add_test(
+  NAME collection_maintenance_interleaving_test
+  TARGET collection_maintenance_interleaving_test
+  LABELS unit collection wal tsan
+  TIMEOUT 120
+)
+
+alaya_cc_target(
   heterogeneous_segment_integration_test
   SRCS heterogeneous_segment_integration_test.cpp
   GTEST
@@ -241,5 +253,17 @@ if(ALAYA_ENABLE_LASER)
     TARGET collection_active_laser_test
     LABELS integration collection laser
     TIMEOUT 180
+  )
+
+  alaya_cc_target(
+    collection_active_laser_maintenance_test
+    GTEST LASER
+    SRCS collection_active_laser_maintenance_test.cpp
+  )
+  alaya_add_test(
+    NAME collection_active_laser_maintenance_test
+    TARGET collection_active_laser_maintenance_test
+    LABELS integration collection laser wal tsan
+    TIMEOUT 300
   )
 endif()
