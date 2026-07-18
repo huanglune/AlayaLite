@@ -9,17 +9,16 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <future>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -63,38 +62,34 @@ class FailpointGate {
     if (observed != target_ || claimed_.exchange(true, std::memory_order_acq_rel)) {
       return;
     }
-    std::unique_lock lock(mutex_);
-    entered_ = true;
-    changed_.notify_all();
-    changed_.wait(lock, [&] {
-      return released_;
-    });
+    entered_.store(true, std::memory_order_release);
+    while (!released_.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
     if (throw_on_release_) {
       throw std::runtime_error("injected maintenance install failure");
     }
   }
 
   [[nodiscard]] auto wait_until_entered() -> bool {
-    std::unique_lock lock(mutex_);
-    return changed_.wait_for(lock, std::chrono::seconds(5), [&] {
-      return entered_;
-    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!entered_.load(std::memory_order_acquire)) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return false;
+      }
+      std::this_thread::yield();
+    }
+    return true;
   }
 
-  void release() {
-    const std::lock_guard lock(mutex_);
-    released_ = true;
-    changed_.notify_all();
-  }
+  void release() { released_.store(true, std::memory_order_release); }
 
  private:
   SegmentOpFailPoint target_{};
   bool throw_on_release_{};
   std::atomic_bool claimed_{};
-  std::mutex mutex_{};
-  std::condition_variable changed_{};
-  bool entered_{};
-  bool released_{};
+  std::atomic_bool entered_{};
+  std::atomic_bool released_{};
 };
 
 struct Session {

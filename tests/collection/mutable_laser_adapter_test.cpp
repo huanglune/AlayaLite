@@ -11,17 +11,16 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <future>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #include "index/collection/detail/mutable_laser_collection_adapter.hpp"
@@ -64,30 +63,26 @@ std::shared_ptr<::alaya::disk::MutableLaserSegment> open_empty(
 class Gate {
  public:
   void wait() {
-    std::unique_lock lock(mutex_);
-    entered_ = true;
-    changed_.notify_all();
-    changed_.wait(lock, [&] {
-      return released_;
-    });
+    entered_.store(true, std::memory_order_release);
+    while (!released_.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
   }
   [[nodiscard]] auto wait_until_entered() -> bool {
-    std::unique_lock lock(mutex_);
-    return changed_.wait_for(lock, std::chrono::seconds(5), [&] {
-      return entered_;
-    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!entered_.load(std::memory_order_acquire)) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return false;
+      }
+      std::this_thread::yield();
+    }
+    return true;
   }
-  void release() {
-    std::lock_guard lock(mutex_);
-    released_ = true;
-    changed_.notify_all();
-  }
+  void release() { released_.store(true, std::memory_order_release); }
 
  private:
-  std::mutex mutex_{};
-  std::condition_variable changed_{};
-  bool entered_{};
-  bool released_{};
+  std::atomic_bool entered_{};
+  std::atomic_bool released_{};
 };
 
 CollectionSchema schema() {

@@ -12,8 +12,8 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
@@ -21,10 +21,10 @@
 #include <future>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <queue>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -101,33 +101,29 @@ class FailpointGate {
 
   void operator()(SegmentOpFailPoint point) {
     if (point != target_) return;
-    std::unique_lock<std::mutex> lock(mutex_);
-    reached_ = true;
-    cv_.notify_all();
-    cv_.wait(lock, [&] {
-      return released_;
-    });
+    reached_.store(true, std::memory_order_release);
+    while (!released_.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
   }
 
   bool wait_until_reached(std::chrono::seconds timeout = std::chrono::seconds(5)) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    return cv_.wait_for(lock, timeout, [&] {
-      return reached_;
-    });
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!reached_.load(std::memory_order_acquire)) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return false;
+      }
+      std::this_thread::yield();
+    }
+    return true;
   }
 
-  void release() {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    released_ = true;
-    cv_.notify_all();
-  }
+  void release() { released_.store(true, std::memory_order_release); }
 
  private:
   SegmentOpFailPoint target_;
-  std::mutex mutex_;
-  std::condition_variable cv_;
-  bool reached_ = false;
-  bool released_ = false;
+  std::atomic_bool reached_{};
+  std::atomic_bool released_{};
 };
 
 // ---------------------------------------------------------------------------
