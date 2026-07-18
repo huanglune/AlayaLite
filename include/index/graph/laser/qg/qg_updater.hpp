@@ -6248,6 +6248,38 @@ class QGUpdater {
            seg_generation >= pid_reuse_activation_gen_;
   }
 
+  // NEW-BLOCKER-1/2 (leg-8, r2 sections 3): disposition of a STANDALONE top-level effect op
+  // (row_patch / tombstone / publish -- NOT inside a maintenance epoch or a canonical bundle) once
+  // pid reuse is armed. Classified by the frame's generation against the replay cursor
+  // (superblock_.generation, advanced by replay_flip):
+  //   - gen == cursor: a legit new write at the current base (e.g. a tombstone's trailer
+  //     after-image) -> APPLY (byte-identical to the pre-leg-8 path).
+  //   - gen  < cursor: an already-absorbed historical-prefix frame -- a checkpoint flip advanced the
+  //     cursor past it, so the base at the cursor generation already reflects it -> VALIDATE-ONLY
+  //     (verify structural legality but never re-apply). This is the NEW-BLOCKER-1 fix: a stale /
+  //     forged old-generation after-image can no longer clobber the higher-generation base (a
+  //     one-byte page edit stays out; a generation-unaware kind=2 ABA can no longer tombstone a
+  //     reused incarnation), while the legit crash-after-flip-before-reset prefix -- whose
+  //     effect ops legitimately precede the absorbing flip -- is not falsely convicted.
+  //   - gen  > cursor: impossible in a valid log (a frame is written at the then-current base
+  //     generation, which only reaches G+1 AFTER its flip is replayed) -> POISON (fail closed).
+  // Gated on pid_generation_activated_ || enable_pid_reuse_ so the legacy 2A/2B replay path is
+  // byte-for-byte unchanged (this returns kApply there, exactly the pre-leg-8 behavior).
+  enum class StandaloneEffect { kApply, kValidateOnly, kPoison };
+  [[nodiscard]] StandaloneEffect classify_standalone_effect(uint64_t seg_generation) const {
+    if (!pid_generation_activated_ && !enable_pid_reuse_) {
+      return StandaloneEffect::kApply;  // legacy 2A/2B: unchanged
+    }
+    const uint64_t cursor = superblock_.generation;
+    if (seg_generation == cursor) {
+      return StandaloneEffect::kApply;
+    }
+    if (seg_generation < cursor) {
+      return StandaloneEffect::kValidateOnly;
+    }
+    return StandaloneEffect::kPoison;
+  }
+
   // BLOCKER-5: narrow a wire (uint64) PID to PID only after a range check. A wire PID at or
   // above kPidMax would otherwise wrap to a small in-range value and slip past the later
   // [old_hwm,new_hwm) / < old_hwm bound checks (reuse of a still-referenced row).
@@ -6566,21 +6598,59 @@ class QGUpdater {
       }
       switch (op.kind) {
         case SegmentOpKind::row_patch:
-          replay_row_patch(op);
+          // NEW-BLOCKER-1 (leg-8): classify by generation against the replay cursor. A pre-leg-8
+          // build applied EVERY standalone row_patch by absolute offset with no generation check,
+          // so a CRC-legal old-generation whole-page after-image spliced onto a pid-active base
+          // clobbered a committed page permanently (the final ftruncate only trims beyond the HWM).
+          switch (classify_standalone_effect(op.segment_generation)) {
+            case StandaloneEffect::kApply:
+              replay_row_patch(op);
+              break;
+            case StandaloneEffect::kValidateOnly:
+              // Absorbed/old-generation after-image: validate geometry (structural legality) but do
+              // NOT write -- the base at the cursor generation already holds the authoritative page.
+              (void)replay_validate_row_patch_geometry(op);
+              break;
+            case StandaloneEffect::kPoison:
+              replaying_ = false;
+              poison("op-WAL standalone row_patch generation is newer than the replay cursor");
+          }
           break;
         case SegmentOpKind::tombstone:
-          if (op.pid < row_generations_.size()) {
-            mark_hidden(static_cast<PID>(op.pid));
-            mirror_deleted_insert(static_cast<PID>(op.pid));
-            // Idempotently persist the trailer tombstone bit straight to disk so a
-            // torn/lost following row_patch cannot drop the tombstone at the final
-            // authoritative trailer scan (design section 3.7). rebuild_state_after_replay
-            // ftruncates back to the committed page count, so a stray pid is harmless.
-            replay_persist_tombstone_trailer(static_cast<PID>(op.pid));
+          switch (classify_standalone_effect(op.segment_generation)) {
+            case StandaloneEffect::kApply:
+              if (op.pid < row_generations_.size()) {
+                mark_hidden(static_cast<PID>(op.pid));
+                mirror_deleted_insert(static_cast<PID>(op.pid));
+                // Idempotently persist the trailer tombstone bit straight to disk so a
+                // torn/lost following row_patch cannot drop the tombstone at the final
+                // authoritative trailer scan (design section 3.7). rebuild_state_after_replay
+                // ftruncates back to the committed page count, so a stray pid is harmless.
+                replay_persist_tombstone_trailer(static_cast<PID>(op.pid));
+              }
+              break;
+            case StandaloneEffect::kValidateOnly:
+              // NEW-BLOCKER-1 (leg-8): an old-generation tombstone is already reflected in the base
+              // (or is a generation-unaware ABA forge against a reused incarnation) -- do NOT apply
+              // it, so a stale kind=2 can never re-hide a live reused PID.
+              break;
+            case StandaloneEffect::kPoison:
+              replaying_ = false;
+              poison("op-WAL standalone tombstone generation is newer than the replay cursor");
           }
           break;
         case SegmentOpKind::publish:
-          committed_watermark = std::max(committed_watermark, op.watermark);
+          switch (classify_standalone_effect(op.segment_generation)) {
+            case StandaloneEffect::kApply:
+              committed_watermark = std::max(committed_watermark, op.watermark);
+              break;
+            case StandaloneEffect::kValidateOnly:
+              // Do not advance the watermark from an absorbed/forged old-generation publish.
+              break;
+            case StandaloneEffect::kPoison:
+              replaying_ = false;
+              poison("op-WAL standalone publish generation is newer than the replay cursor");
+          }
           break;
         case SegmentOpKind::superblock_flip:
           replay_flip(op);
@@ -6721,17 +6791,20 @@ class QGUpdater {
     if (frame_batch_id != op.tx_id) {
       poison("op-WAL label_bind frame batch_id != payload tx_id");
     }
-    // NEW-BLOCKER-1 (leg-7): once pid reuse is activated, EVERY new writer transaction goes
-    // through the canonical lane (segment_generation >= activation). Reaching this legacy lane
-    // means is_canonical_generation() is false, i.e. segment_generation < activation, so this
-    // frame can only belong to the absorbed historical prefix (tx_id <= base). A legacy label
-    // transaction with tx_id > base is a forged cross-generation classifier downgrade -- poison
-    // NOW, BEFORE staging or any following row_patch apply (index bytes stay unchanged).
-    if (pid_generation_activated_ && op.tx_id > base_committed_txid_) {
-      poison(
-          "op-WAL post-activation legacy label_bind is not an absorbed prefix "
-          "(cross-generation classifier downgrade)");
-    }
+    // NEW-BLOCKER-2 (leg-8, r2 blind-audit): a kind=7 bind only STAGES a binding -- it writes
+    // nothing to the index -- so it is NEVER convicted on its own, even on a pid-activated base.
+    // leg-7 poisoned here whenever pid_generation_activated_ && tx_id > base, but that falsely killed
+    // a LEGAL crash state: a legacy bundle whose orphan kind=7 bind survived the kind=8 (SIGKILL
+    // before commit -- explicitly allowed by the (tx_id,row_op_id) dedup contract) followed by a
+    // pid-activation checkpoint that fsynced its G+1 superblock but crashed before the WAL reset.
+    // On reopen the pid-active G+1 base is selected while the orphan (tx_id > base) still precedes
+    // the activation flip in the WAL; poisoning here fail-closed a recoverable segment forever. The
+    // orphan is now staged and then dropped at EOF (no matching kind=8) or cleared when the
+    // activation flip re-adopts the base. Conviction of a forged NON-absorbed legacy transaction
+    // moves to its effectful commit point (replay_tx_publish, tx_id > base), and its interleaved
+    // row_patch after-images are validate-only by classify_standalone_effect -- so nothing the
+    // forged bundle carries is ever applied before that commit-time poison (index stays unchanged).
+    //
     // Idempotent de-dup by (tx_id, row_op_id): a same-txid retry after a torn bundle
     // whose earlier binds survived in the OS page cache (process crash on a bundle
     // larger than the WAL userspace buffer) re-appends identical binds. Collapse
@@ -6762,9 +6835,14 @@ class QGUpdater {
     if (op.binding_count == 0) {
       poison("op-WAL tx_publish binding_count must be >= 1");
     }
-    // NEW-BLOCKER-1 (leg-7): mirror the label_bind gate at the commit point (defense in depth,
-    // and it also catches a kind=8 with no preceding kind=7). Once pid reuse is activated a
-    // legacy tx_publish (segment_generation < activation) must be absorbed by the base.
+    // NEW-BLOCKER-1/2 (leg-8): this is the COMMIT-TIME conviction point for the legacy lane. A
+    // kind=8 is the effectful commit (it promotes staged binds + advances the watermark), so once
+    // pid reuse is activated a legacy tx_publish (segment_generation < activation) that is NOT an
+    // absorbed prefix (tx_id > base) is a forged cross-generation classifier downgrade -- poison
+    // BEFORE any promotion. Together with kind=7 staging (never convicted alone) and old-generation
+    // standalone row_patch being validate-only, a forged legacy bundle [kind=7,kind=1,kind=8] never
+    // applies anything before this poison, while a legal torn orphan (no kind=8) is dropped -- so
+    // NEW-BLOCKER-2's recoverable crash state is preserved and NEW-BLOCKER-1's forge stays closed.
     if (pid_generation_activated_ && op.tx_id > base_committed_txid_) {
       poison(
           "op-WAL post-activation legacy tx_publish is not an absorbed prefix "

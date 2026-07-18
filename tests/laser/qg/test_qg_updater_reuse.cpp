@@ -564,10 +564,13 @@ TEST(QgUpdaterReuse, CraftedFlipTargetsActiveSlotFailsClosedBeforeWrite) {
 }
 
 TEST(QgUpdaterReuse, ActivatedBaseLegacyCrossGenNewTxidPoisonsIndexUnchanged) {
-  // NEW-BLOCKER-1 (leg-7): on a pid-ACTIVATED base, a legacy-lane label transaction (segment
-  // generation < activation, so is_canonical_generation() routes it to the legacy path) that
-  // carries a NEW txid (> the base's committed txid) is a cross-generation classifier downgrade.
-  // Replay must poison at the kind=7 -- before any row_patch apply -- with the index unchanged.
+  // NEW-BLOCKER-1: on a pid-ACTIVATED base, a legacy-lane label transaction (segment generation <
+  // activation, so is_canonical_generation() routes it to the legacy path) that carries a NEW txid
+  // (> the base's committed txid) is a cross-generation classifier downgrade. leg-8 moved the
+  // conviction from the kind=7 gate (which leg-7 used, but which also fail-closed the legal orphan
+  // crash state -- see OrphanBindThenActivationCheckpointCrashReopenSurvives) to the effectful
+  // commit point: the kind=7 is staged, then the kind=8 (tx_id > base) poisons before any promotion.
+  // With no row_patch between them the index stays byte-for-byte unchanged either way.
   const auto dir = scratch_dir("newb1_downgrade");
   std::filesystem::remove_all(dir);
   auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/48);
@@ -608,7 +611,173 @@ TEST(QgUpdaterReuse, ActivatedBaseLegacyCrossGenNewTxidPoisonsIndexUnchanged) {
                std::exception)
       << "a post-activation legacy cross-generation new-txid transaction must poison";
   EXPECT_EQ(read_all_bytes(index_path), index_before)
-      << "the index must be byte-for-byte unchanged (poison at kind=7, before any row_patch apply)";
+      << "the index must be byte-for-byte unchanged (kind=7 staged, poison at the kind=8 commit "
+         "before any promotion; no row_patch between them)";
+  std::filesystem::remove_all(dir);
+}
+
+// NEW-BLOCKER-1 (leg-8, r2 section 3): a STANDALONE old-generation effect op on a pid-activated base
+// must be VALIDATE-ONLY, never applied. A pre-leg-8 build applied every standalone row_patch/tombstone
+// with no generation check, so a CRC-legal old-generation frame spliced onto the pid-active base
+// clobbered a committed page / hid a live PID permanently (the final ftruncate only trims beyond the
+// HWM). Reopen must SUCCEED (this is not a poison -- a legal crash-after-flip prefix carries such
+// frames) with the committed state unchanged.
+TEST(QgUpdaterReuse, ActivatedBaseOldGenStandaloneRowPatchIsValidateOnly) {
+  const auto dir = scratch_dir("newb1_rowpatch");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/50);
+  uint64_t seg_uid = 0;
+  uint64_t activation_gen = 0;
+  size_t page_size = 0;
+  size_t npp = 0;
+  {
+    ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);
+    const auto v = waltest::make_data(1, kDim, 1);
+    const uint64_t l = 5;
+    s.upd->commit_physical_bundle(1, 1, v.data(), &l, 1);  // activate v3 pid
+    s.upd->checkpoint();
+    ASSERT_TRUE(s.upd->pid_generation_activated());
+    seg_uid = s.upd->segment_uid();
+    activation_gen = s.upd->pid_reuse_activation_gen();
+    page_size = s.upd->debug_page_size();
+    npp = s.upd->debug_npp();
+  }
+  ASSERT_GT(activation_gen, 1U);  // activation_gen - 1 must be a real older generation (>= 1)
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  // Baseline: row 0 after a clean reopen (identical rebuild input, no forged frame).
+  std::vector<char> clean_row0;
+  {
+    ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);
+    clean_row0 = s.upd->debug_read_row(0);
+  }
+  // Craft an old-generation whole-page after-image for page 0 (live committed base rows) with one
+  // byte of row 0's payload flipped -- a subtle, CRC-legal clobber that would survive the ftruncate.
+  const size_t target_page = 0;
+  std::vector<char> forged_page(page_size);
+  {
+    std::ifstream in(index_path, std::ios::binary);
+    in.seekg(static_cast<std::streamoff>(kSectorLen + target_page * page_size));
+    in.read(forged_page.data(), static_cast<std::streamsize>(page_size));
+  }
+  forged_page[40] = static_cast<char>(forged_page[40] ^ 0x5A);  // deep in row 0's code payload
+  const uint64_t forged_gen = activation_gen - 1;               // < cursor -> validate-only
+  {
+    alaya::wal::WalFile wal(wal_path);  // scans the base flip, then appends the forged row_patch
+    wal.append(kSegmentOpRecordType, 0, 1, 0,
+               encode_row_patch(seg_uid, forged_gen, /*first_pid=*/target_page * npp,
+                                /*offset=*/kSectorLen + target_page * page_size,
+                                std::span<const std::byte>(
+                                    reinterpret_cast<const std::byte *>(forged_page.data()),
+                                    page_size)),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  {
+    ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);  // must NOT throw
+    EXPECT_EQ(s2.upd->debug_read_row(0), clean_row0)
+        << "an old-generation standalone row_patch clobbered a committed row (must be validate-only)";
+  }
+  std::filesystem::remove_all(dir);
+}
+
+TEST(QgUpdaterReuse, ActivatedBaseOldGenStandaloneTombstoneIsValidateOnly) {
+  const auto dir = scratch_dir("newb1_tombstone");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/51);
+  uint64_t seg_uid = 0;
+  uint64_t activation_gen = 0;
+  {
+    ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);
+    const auto v = waltest::make_data(1, kDim, 1);
+    const uint64_t l = 5;
+    s.upd->commit_physical_bundle(1, 1, v.data(), &l, 1);  // activate v3 pid
+    s.upd->checkpoint();
+    ASSERT_TRUE(s.upd->pid_generation_activated());
+    seg_uid = s.upd->segment_uid();
+    activation_gen = s.upd->pid_reuse_activation_gen();
+  }
+  ASSERT_GT(activation_gen, 1U);
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  const PID victim = 0;                            // a live committed base row
+  const uint64_t forged_gen = activation_gen - 1;  // < cursor -> validate-only (ABA delete forge)
+  {
+    alaya::wal::WalFile wal(wal_path);
+    wal.append(kSegmentOpRecordType, 0, 1, 0, encode_tombstone(seg_uid, forged_gen, victim),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  {
+    ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);  // must NOT throw
+    EXPECT_TRUE(row_is_live(*s2.upd, victim))
+        << "an old-generation standalone tombstone hid a live committed PID (must be validate-only)";
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// NEW-BLOCKER-2 (leg-8, r2 blind-audit): a LEGAL crash state must not be fail-closed. A legacy
+// orphan kind=7 (torn bundle, kind=8 lost -- explicitly allowed by the (tx_id,row_op_id) dedup
+// contract) survives in the WAL; then the first reuse-enabled call runs a pid-activation checkpoint
+// that fsyncs its G+1 superblock but crashes BEFORE the WAL reset (after_superblock_write_before_
+// wal_reset). On reopen the pid-active G+1 base is selected while the orphan (tx_id > base) still
+// precedes the activation flip. leg-7 poisoned the orphan at the kind=7 gate; leg-8 stages it
+// (dropped at EOF, no matching kind=8) so recovery succeeds with the data intact.
+TEST(QgUpdaterReuse, OrphanBindThenActivationCheckpointCrashReopenSurvives) {
+  const auto dir = scratch_dir("newb2_orphan_activation");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/52);
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  uint64_t seg_uid = 0;
+  uint64_t base_gen = 0;
+  // (1) Stamp the uid (fresh-enable checkpoint) so the planted orphan is not rejected by the
+  // unstamped-superblock guard; the base stays v2 (no bundle -> no pid activation yet).
+  {
+    ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);
+    seg_uid = s.upd->segment_uid();
+    base_gen = s.upd->generation();
+    EXPECT_FALSE(s.upd->pid_generation_activated());
+  }
+  // (2) Plant an orphan kind=7 (tx_id=1 > base committed 0), legacy generation, no matching kind=8.
+  {
+    alaya::wal::WalFile wal(wal_path);  // scans the base flip, then appends the orphan bind
+    wal.append(kSegmentOpRecordType, 0, 1, /*batch_id=*/1,
+               encode_label_bind(seg_uid, base_gen, /*txid=*/1, /*row_op=*/0,
+                                 static_cast<uint32_t>(kBaseN), /*gen=*/0, /*label=*/700),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  // (3) Open reuse-enabled + a failpoint that crashes the pid-activation checkpoint AFTER the
+  // superblock is durable but BEFORE the WAL reset -- the exact NEW-BLOCKER-2 window.
+  {
+    QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+    qg.load_disk_index(base.prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+    qg.set_params(64, 1, 1);
+    UpdateParams params;
+    params.enable_wal = true;
+    params.enable_pid_reuse = true;
+    params.ef_insert = 64;
+    params.max_points = 4 * kBaseN;
+    auto armed = std::make_shared<bool>(false);
+    params.failpoint_hook = [armed](SegmentOpFailPoint fp) {
+      if (*armed && fp == SegmentOpFailPoint::after_superblock_write_before_wal_reset) {
+        throw std::runtime_error("crash: activation superblock durable, WAL not yet reset");
+      }
+    };
+    QGUpdater upd(qg, params);  // replays [flip, orphan]; stages + drops the orphan (not activated)
+    *armed = true;
+    const auto v = waltest::make_data(1, kDim, 3);
+    const uint64_t l = 800;
+    EXPECT_THROW(upd.commit_physical_bundle(1, 1, v.data(), &l, 1), std::exception)
+        << "the failpoint crashes the activation checkpoint after the superblock is durable";
+  }
+  // (4) Reopen: the pid-active G+1 base is durable; the orphan precedes the activation flip in the
+  // WAL. leg-8 must NOT poison (leg-7 did), and the base data is intact.
+  {
+    ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);  // must NOT throw
+    EXPECT_TRUE(s.upd->pid_generation_activated()) << "reopen selected the durable pid-active base";
+    EXPECT_EQ(s.upd->num_points(), kBaseN) << "the base rows survived the crash intact";
+    EXPECT_EQ(s.upd->last_committed_txid(), 0U) << "the orphan bind was never committed";
+    EXPECT_TRUE(row_is_live(*s.upd, 0)) << "a base row is live after recovery";
+  }
   std::filesystem::remove_all(dir);
 }
 
