@@ -510,6 +510,59 @@ TEST(QgUpdaterReuse, CraftedFlipBadLabelSlotFailsClosedBeforeWrite) {
   });
 }
 
+// BLOCKER-3 (leg-8, r2 section 1): the write-before validate_flip_transition family. Each crafted
+// flip is CRC-legal and passes the selector + label-slot validation, yet would corrupt the index (or
+// only fail closed on the NEXT open) if replay did not validate the full transition BEFORE its
+// pwrite/ftruncate. All must poison on replay AND leave the .index byte-for-byte unchanged.
+TEST(QgUpdaterReuse, CraftedFlipGeometryMismatchFailsClosedBeforeWrite) {
+  // An immutable-geometry drift (dimension + 1) would install a higher-generation base whose next
+  // open fails the load_v2_state identity check -- validate_flip_transition rejects it up front.
+  assert_crafted_flip_fails_closed("flip_geometry",
+                                   [](QGSuperblockV2 &image) { image.dimension += 1; });
+}
+
+TEST(QgUpdaterReuse, CraftedFlipShortFileSizeFailsClosedBeforeWrite) {
+  // file_size == kSectorLen is the truncation bomb: after the superblock install, replay's
+  // ftruncate(image.file_size) would delete every data page. The exact-length check rejects it.
+  assert_crafted_flip_fails_closed("flip_short_file",
+                                   [](QGSuperblockV2 &image) { image.file_size = kSectorLen; });
+}
+
+TEST(QgUpdaterReuse, CraftedFlipTargetsActiveSlotFailsClosedBeforeWrite) {
+  // A flip targeting the ACTIVE A/B slot could, on a torn 512-byte pwrite, leave only the G-1 copy
+  // while the durable WAL still demands G+1 -- the next replay would face a two-generation jump.
+  // validate_flip_transition requires the inactive slot (the image is otherwise valid, so this
+  // isolates the target-slot check; assert_crafted_flip_fails_closed hardcodes the inactive slot).
+  const auto dir = scratch_dir("flip_active_slot");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/46);
+  const auto info = activate_v3_pid_base(base.prefix, kBaseN);
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  const QGSuperblockV2 base_sb = read_active_superblock(index_path);
+  const auto index_before = read_all_bytes(index_path);
+
+  QGSuperblockV2 image = base_sb;
+  image.generation = base_sb.generation + 1;
+  image.checksum = qg_superblock_checksum(image);
+  std::vector<std::byte> img_bytes(sizeof(image));
+  std::memcpy(img_bytes.data(), &image, sizeof(image));
+  {
+    alaya::wal::WalFile wal(wal_path);
+    wal.append(kSegmentOpRecordType, 0, 1, 0,
+               encode_superblock_flip(info.seg_uid, image.generation,
+                                      static_cast<uint8_t>(info.active_slot),  // ACTIVE slot: illegal
+                                      std::span<const std::byte>(img_bytes.data(), img_bytes.size())),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  EXPECT_THROW({ ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true); },
+               std::exception)
+      << "a flip targeting the active A/B slot must poison on replay";
+  EXPECT_EQ(read_all_bytes(index_path), index_before)
+      << "the index must be byte-for-byte unchanged (flip rejected before any pwrite)";
+  std::filesystem::remove_all(dir);
+}
+
 TEST(QgUpdaterReuse, ActivatedBaseLegacyCrossGenNewTxidPoisonsIndexUnchanged) {
   // NEW-BLOCKER-1 (leg-7): on a pid-ACTIVATED base, a legacy-lane label transaction (segment
   // generation < activation, so is_canonical_generation() routes it to the legacy path) that

@@ -2215,6 +2215,12 @@ class QGUpdater {
       }
     };
     if (enable_wal_ && !replaying_) {
+      // BLOCKER-3 (leg-8, r2 section 1): the constructed next image must pass the SAME pre-write
+      // transition validation replay applies, BEFORE it becomes a durable WAL flip. Rejects a
+      // generation overflow / geometry drift / file-length or activation-state regression the
+      // checkpoint should never mint, so replay never has to reconcile a base this build produced but
+      // cannot re-derive.
+      validate_flip_transition(next, next.generation, static_cast<uint8_t>(next_slot));
       // Sequence (clause D): flip frame append+fsync (WAL) -> ftruncate + superblock
       // pwrite+fsync (index) -> reset WAL. Each boundary is a crash-matrix cut.
       const auto image =
@@ -6897,6 +6903,93 @@ class QGUpdater {
     }
   }
 
+  // BLOCKER-3 (leg-8, r2 section 1): PURE pre-write validation of a flip TRANSITION. Poisons on any
+  // violation and writes NOTHING (no pwrite/ftruncate) -- a crafted flip is rejected with the index
+  // byte-for-byte unchanged. Runs before EVERY durable flip: replay_flip (before its
+  // write_superblock/ftruncate) AND checkpoint_locked (before wal_append(flip,fsync)). `image` is the
+  // NEXT base; `superblock_` is the current/selected base (the replay cursor); op_generation +
+  // target_slot come from the flip op. qg_superblock_supported() (self-consistency, activation
+  // bounds) and validate_flip_label_state() (label slot) already ran on the replay path; this closes
+  // the geometry / file-length / target-slot / generation-transition / state-monotonicity window they
+  // do not cover -- exactly the dimension+1 clone, the file_size=kSectorLen truncation bomb, and the
+  // target_slot==active tear the r2 review reached.
+  void validate_flip_transition(const QGSuperblockV2 &image, uint64_t op_generation,
+                                uint8_t target_slot) {
+    // (1) The op's declared generation must match the image it carries: a CRC-legal flip whose frame
+    // generation disagrees with its payload generation is malformed.
+    if (op_generation != image.generation) {
+      poison("flip op generation != the image generation");
+    }
+    // (2) A flip MUST target the INACTIVE A/B slot. Overwriting the active slot would, on a torn
+    // 512-byte pwrite, leave only the G-1 copy while the durable WAL still demands G+1 -- the next
+    // replay would face a two-generation jump and poison. (active_superblock_slot_ is -1 only before
+    // any base is loaded, which never reaches a flip.)
+    if (active_superblock_slot_ < 0 ||
+        static_cast<int>(target_slot) != 1 - active_superblock_slot_) {
+      poison("flip target slot is not the inactive A/B slot");
+    }
+    // (3) Generation is the next legal step with NO overflow. (replay_flip already gated == +1 on its
+    // path; the checkpoint's next.generation == superblock_.generation+1 -- assert both here so a
+    // wraparound at UINT64_MAX can never mint generation 0.)
+    if (superblock_.generation == (std::numeric_limits<uint64_t>::max)()) {
+      poison("flip generation overflow");
+    }
+    if (image.generation != superblock_.generation + 1) {
+      poison("flip generation is not the next legal step (G+1)");
+    }
+    // (4) Immutable geometry: dimension / node_len / node_per_page / page_size are fixed at build time
+    // (load_v2_state enforces the same identity on open). A clone that bumps the dimension by one
+    // would install and only fail closed on the NEXT open -- reject it before any write.
+    if (image.dimension != dim_ || image.node_len != node_len_ || image.node_per_page != npp_ ||
+        image.page_size != page_size_) {
+      poison("flip image geometry differs from the segment (immutable geometry)");
+    }
+    // (5) Capacity + count bounds (kPidMax is the free/entry sentinel).
+    if (image.num_points > static_cast<uint64_t>(kPidMax)) {
+      poison("flip image num_points exceeds the PID capacity");
+    }
+    if (image.live_count > image.num_points || image.free_count > image.num_points) {
+      poison("flip image live/free count exceeds num_points");
+    }
+    if (image.free_list_head != kPidMax && image.free_list_head >= image.num_points) {
+      poison("flip image free_list_head is out of range");
+    }
+    if (image.num_points != 0 && image.entry_point != static_cast<uint64_t>(kPidMax) &&
+        image.entry_point >= image.num_points) {
+      poison("flip image entry_point is out of range");
+    }
+    // (6) Exact file length: kSectorLen + ceil(num_points/npp)*page_size. A shrunk file_size (e.g.
+    // kSectorLen) would ftruncate away every data page after the superblock install; a grown one would
+    // leave the tail undefined. npp_ >= 1 by construction, so there is no divide-by-zero.
+    const uint64_t page_num = image.num_points == 0 ? 0 : (image.num_points + npp_ - 1) / npp_;
+    if (image.file_size != static_cast<uint64_t>(kSectorLen) + page_num * page_size_) {
+      poison("flip image file_size != kSectorLen + ceil(num_points/npp)*page_size");
+    }
+    // (7) State monotonicity (no regression): format_version, the activated feature set, the
+    // activation generations, the tx watermarks, and the consolidate epoch only ever move forward
+    // across a durable flip. A flip that rewinds any of them is forged / an ABA rollback.
+    if (image.format_version < superblock_.format_version) {
+      poison("flip image format_version regressed");
+    }
+    const auto cur_tx = read_superblock_tx_state(superblock_);
+    const auto img_tx = read_superblock_tx_state(image);
+    if (img_tx.last_committed_txid < cur_tx.last_committed_txid ||
+        img_tx.applied_collection_op_id < cur_tx.applied_collection_op_id) {
+      poison("flip image tx watermark regressed");
+    }
+    const auto cur_w = read_superblock_wal2c_state(superblock_);
+    const auto img_w = read_superblock_wal2c_state(image);
+    if ((img_w.required_feature_flags & cur_w.required_feature_flags) !=
+        cur_w.required_feature_flags) {
+      poison("flip image drops a previously-activated feature bit");
+    }
+    if (img_w.last_completed_consolidate_epoch < cur_w.last_completed_consolidate_epoch ||
+        img_w.maintenance_activation_sb_generation < cur_w.maintenance_activation_sb_generation ||
+        img_w.pid_reuse_activation_sb_generation < cur_w.pid_reuse_activation_sb_generation) {
+      poison("flip image maintenance/reuse activation state regressed");
+    }
+  }
+
   void replay_flip(const SegmentOp &op) {
     if (op.bytes.size() != kSegmentSuperblockImageBytes) {
       poison("flip image is not 512 bytes");
@@ -6935,6 +7028,11 @@ class QGUpdater {
     // higher-generation superblock is ever installed on disk (which later reopens would keep
     // re-selecting). adopt_label_state() below re-runs the same checks and mutates the members.
     validate_flip_label_state(image);
+    // BLOCKER-3 (leg-8, r2 section 1): full structural transition validation (immutable geometry,
+    // exact file length, inactive target slot, generation step, state monotonicity) BEFORE any
+    // pwrite/ftruncate -- a crafted geometry/short-file/active-slot flip is rejected here with the
+    // index byte-for-byte unchanged, instead of installing and only failing closed on the next open.
+    validate_flip_transition(image, op.segment_generation, op.target_slot);
     // Apply the next legal base: rewrite its slot and set the file length.
     const auto next_slot = static_cast<int>(op.target_slot);
     write_superblock(next_slot, image);
