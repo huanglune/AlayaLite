@@ -101,11 +101,11 @@
 #include <iostream>
 #include <limits>
 #include <map>
-#include <set>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -762,8 +762,12 @@ class QGUpdater {
   [[nodiscard]] PID entry_point() const { return qg_.entry_point_; }
   [[nodiscard]] const std::vector<PID> &medoids() const { return qg_.medoids_; }
   [[nodiscard]] bool row_hidden(PID id) const { return is_hidden(id); }
-  [[nodiscard]] uint32_t maintenance_activation_gen() const { return static_cast<uint32_t>(maintenance_activation_gen_); }
-  [[nodiscard]] uint32_t pid_reuse_activation_gen() const { return static_cast<uint32_t>(pid_reuse_activation_gen_); }
+  [[nodiscard]] uint32_t maintenance_activation_gen() const {
+    return static_cast<uint32_t>(maintenance_activation_gen_);
+  }
+  [[nodiscard]] uint32_t pid_reuse_activation_gen() const {
+    return static_cast<uint32_t>(pid_reuse_activation_gen_);
+  }
 
   [[nodiscard]] int active_superblock_slot() const { return active_superblock_slot_; }
 
@@ -1211,8 +1215,11 @@ class QGUpdater {
   // or internal failure poisons.
   // Shared bundle preconditions (caller errors -- validated BEFORE any mutating work, so
   // they never poison). Kept in one place so the token + pair entries agree exactly.
-  void validate_bundle_preconditions(uint64_t txid, uint64_t applied_op_id, const float *vecs,
-                                     const uint64_t *labels, size_t n) {
+  void validate_bundle_preconditions(uint64_t txid,
+                                     uint64_t applied_op_id,
+                                     const float *vecs,
+                                     const uint64_t *labels,
+                                     size_t n) {
     if (!enable_wal_) {
       throw std::logic_error("QGUpdater::commit_physical_bundle requires enable_wal");
     }
@@ -1439,10 +1446,15 @@ class QGUpdater {
       // Every kind=7 precedes every kind=1 (the canonical replay lane poisons a kind=7 after
       // a kind=1), so the whole bind set is logged up front.
       for (size_t i = 0; i < n; ++i) {
-        wal_append(encode_label_bind(segment_uid_, superblock_.generation, txid,
-                                     static_cast<uint64_t>(i), result.rows[i].pid,
-                                     result.rows[i].pid_generation, labels[i]),
-                   alaya::wal::WalFile::Sync::buffered, txid);
+        wal_append(encode_label_bind(segment_uid_,
+                                     superblock_.generation,
+                                     txid,
+                                     static_cast<uint64_t>(i),
+                                     result.rows[i].pid,
+                                     result.rows[i].pid_generation,
+                                     labels[i]),
+                   alaya::wal::WalFile::Sync::buffered,
+                   txid);
         if (i == 0) {
           wal_failpoint(SegmentOpFailPoint::after_reuse_first_bind_append);  // R1a: partial bind
         }
@@ -1516,7 +1528,9 @@ class QGUpdater {
       std::vector<char> check_page(page_size_);
       for (const auto &tok : result.rows) {
         bundle_read_page_scratch(page_index(tok.pid), check_page.data());
-        const QGRowTrailer tr = qg_read_page_trailer(check_page.data(), page_size_, npp_,
+        const QGRowTrailer tr = qg_read_page_trailer(check_page.data(),
+                                                     page_size_,
+                                                     npp_,
                                                      static_cast<size_t>(tok.pid) % npp_);
         if ((tr.flags & (kQGRowTombstone | kQGRowFree)) != 0) {
           poison("canonical bundle: bound PID final trailer is not live (B-2C-02)");
@@ -1528,10 +1542,14 @@ class QGUpdater {
       // in the page cache -> recovery rolls forward (S_new); a power-loss that drops the
       // unforced tail loses it -> the whole bundle is discarded (S_old).
       wal_failpoint(SegmentOpFailPoint::before_tx_publish_append);
-      wal_append(encode_tx_publish(segment_uid_, superblock_.generation, txid,
-                                   static_cast<uint64_t>(new_hwm), static_cast<uint64_t>(n),
+      wal_append(encode_tx_publish(segment_uid_,
+                                   superblock_.generation,
+                                   txid,
+                                   static_cast<uint64_t>(new_hwm),
+                                   static_cast<uint64_t>(n),
                                    applied_op_id),
-                 alaya::wal::WalFile::Sync::buffered, txid);
+                 alaya::wal::WalFile::Sync::buffered,
+                 txid);
       wal_failpoint(SegmentOpFailPoint::after_reuse_tx_publish_append_before_fsync);
       force_wal();  // the single durable commit point of the bundle
       wal_failpoint(SegmentOpFailPoint::after_tx_publish_fsync);
@@ -1569,7 +1587,8 @@ class QGUpdater {
           clear_hidden(tok.pid);
           if (!cleared_one) {
             cleared_one = true;
-            wal_failpoint(SegmentOpFailPoint::after_reuse_hidden_clear_partial_before_commit);  // R8
+            wal_failpoint(
+                SegmentOpFailPoint::after_reuse_hidden_clear_partial_before_commit);  // R8
           }
         }
       }
@@ -2255,14 +2274,17 @@ class QGUpdater {
       }
     };
     if (enable_wal_ && !replaying_) {
-      // BLOCKER-3 (leg-8, r2 section 1) + B3 completion (leg-9): the constructed next image must pass
-      // the SAME pre-write transition validation replay applies, BEFORE it becomes a durable WAL
-      // flip. Rejects a generation overflow / geometry drift / file-length / capacity / count / label
-      // or activation-state regression the checkpoint should never mint, so replay never has to
-      // reconcile a base this build produced but cannot re-derive. The expected HWM is committed_
-      // (admission guaranteed allocated == committed above, and next.num_points == allocated), so
-      // this cross-checks the checkpoint filled num_points from the committed watermark.
-      validate_flip_transition(next, next.generation, static_cast<uint8_t>(next_slot),
+      // BLOCKER-3 (leg-8, r2 section 1) + B3 completion (leg-9): the constructed next image must
+      // pass the SAME pre-write transition validation replay applies, BEFORE it becomes a durable
+      // WAL flip. Rejects a generation overflow / geometry drift / file-length / capacity / count /
+      // label or activation-state regression the checkpoint should never mint, so replay never has
+      // to reconcile a base this build produced but cannot re-derive. The expected HWM is
+      // committed_ (admission guaranteed allocated == committed above, and next.num_points ==
+      // allocated), so this cross-checks the checkpoint filled num_points from the committed
+      // watermark.
+      validate_flip_transition(next,
+                               next.generation,
+                               static_cast<uint8_t>(next_slot),
                                committed_.load(std::memory_order_acquire));
       // Sequence (clause D): flip frame append+fsync (WAL) -> ftruncate + superblock
       // pwrite+fsync (index) -> reset WAL. Each boundary is a crash-matrix cut.
@@ -2298,7 +2320,8 @@ class QGUpdater {
         wal_failpoint(SegmentOpFailPoint::after_wal_reset);
         adopt_in_memory();
       } catch (...) {
-        poison_current_exception("checkpoint failed after the flip became durable (roll-forward on reopen)");
+        poison_current_exception(
+            "checkpoint failed after the flip became durable (roll-forward on reopen)");
       }
     } else {
       if (::ftruncate(fd_, static_cast<off_t>(file_size)) != 0) {
@@ -2412,7 +2435,9 @@ class QGUpdater {
   // The routing medoid vectors (design section 4): a separate cache that must agree with the
   // medoid PIDs' row data, so a routing-vector divergence a per-row fingerprint would miss is
   // caught (leg-7 BLOCKER-7).
-  [[nodiscard]] const std::vector<float> &debug_medoid_vectors() const { return qg_.medoids_vector_; }
+  [[nodiscard]] const std::vector<float> &debug_medoid_vectors() const {
+    return qg_.medoids_vector_;
+  }
 
   [[nodiscard]] size_t trailer_offset_in_page(PID id) const {
     return qg_page_trailer_offset(page_size_, npp_, id % npp_);
@@ -3056,8 +3081,7 @@ class QGUpdater {
     std::array<char, kSectorLen> header{};
     read_at(0, header.data(), header.size());
     QGSuperblockV2 sb;
-    const int slot =
-        select_qg_superblock_checked(header.data(), sb, kQgSupportedRequiredFeatures);
+    const int slot = select_qg_superblock_checked(header.data(), sb, kQgSupportedRequiredFeatures);
     if (slot == -2) {
       // Fail closed (codex B-2C-06): the highest-generation valid superblock is a
       // newer format this build cannot support; never downgrade to an older slot.
@@ -3109,8 +3133,10 @@ class QGUpdater {
   // the CURRENT committed range, seeded from the current entry. Used by tombstone() and
   // the post-replay rebuild -- byte-for-byte the historical behavior for 2A/2B (no reuse).
   void repair_routing_roots(PID newly_deleted) {
-    repair_routing_roots_seeded(qg_.entry_point_, committed_.load(std::memory_order_acquire),
-                                nullptr, newly_deleted);
+    repair_routing_roots_seeded(qg_.entry_point_,
+                                committed_.load(std::memory_order_acquire),
+                                nullptr,
+                                newly_deleted);
   }
 
   // Deterministic routing repair (BLOCKER-1 / MAJOR-2). `seed_entry` is the entry the
@@ -3123,7 +3149,8 @@ class QGUpdater {
   // live in the cache). A medoid is kept ONLY if it is live AND never reused (generation 0):
   // a reused medoid's immutable sidecar vector is stale, so recovery (which reloads it) and
   // the clean path (which dropped it at tombstone) both drop it -> they converge (MAJOR-2).
-  void repair_routing_roots_seeded(PID seed_entry, uint64_t scan_n,
+  void repair_routing_roots_seeded(PID seed_entry,
+                                   uint64_t scan_n,
                                    const std::unordered_set<PID> *force_live,
                                    PID newly_deleted = kPidMax) {
     const auto live = [&](PID id) -> bool {
@@ -3245,8 +3272,7 @@ class QGUpdater {
       throw std::logic_error("reserve_bundle_pids requires no staged backlinks");
     }
     const uint64_t free_now = free_count_.load(std::memory_order_acquire);
-    const size_t reuse_n =
-        allow_reuse ? static_cast<size_t>((std::min<uint64_t>)(n, free_now)) : 0;
+    const size_t reuse_n = allow_reuse ? static_cast<size_t>((std::min<uint64_t>)(n, free_now)) : 0;
     const size_t append_n = n - reuse_n;
     // Capacity check BEFORE the first pop (design B.2): a dense-append overflow is a
     // caller error, never a mid-reservation poison.
@@ -3873,16 +3899,17 @@ class QGUpdater {
   // Append one kind=1 whole-page after-image for the overlay page (maintenance
   // lane; serial). Returns its FrameLocation so a spilled page can be reloaded.
   alaya::wal::FrameLocation maint_log_page(size_t pi,
-                                          const char *bytes,
-                                          alaya::wal::WalFile::Sync sync) {
+                                           const char *bytes,
+                                           alaya::wal::WalFile::Sync sync) {
     const uint64_t offset = kSectorLen + pi * page_size_;
     const auto first_pid = static_cast<uint64_t>(pi * npp_);
-    auto payload = encode_row_patch(
-        segment_uid_,
-        superblock_.generation,
-        first_pid,
-        offset,
-        std::span<const std::byte>(reinterpret_cast<const std::byte *>(bytes), page_size_));
+    auto payload =
+        encode_row_patch(segment_uid_,
+                         superblock_.generation,
+                         first_pid,
+                         offset,
+                         std::span<const std::byte>(reinterpret_cast<const std::byte *>(bytes),
+                                                    page_size_));
     try {
       return op_wal_->append(kSegmentOpRecordType, 0, ++wal_op_id_, 0, payload, sync);
     } catch (const std::exception &error) {
@@ -3904,8 +3931,7 @@ class QGUpdater {
     const size_t cap = std::max<size_t>(1, params_.cache_cap_pages);
     // Clean (dependency-only) pages re-materialize from committed disk, so drop them
     // for free before spending WAL bytes on a dirty spill.
-    for (auto it = maint_pages_.begin();
-         it != maint_pages_.end() && maint_pages_.size() > cap;) {
+    for (auto it = maint_pages_.begin(); it != maint_pages_.end() && maint_pages_.size() > cap;) {
       if (it->first != pin_pi && maint_dirty_.count(it->first) == 0) {
         it = maint_pages_.erase(it);
       } else {
@@ -3914,8 +3940,7 @@ class QGUpdater {
     }
     // Then spill dirty pages: log the latest kind=1 (flushed so read_frame can
     // reload it), record its location, and release the page memory.
-    for (auto it = maint_pages_.begin();
-         it != maint_pages_.end() && maint_pages_.size() > cap;) {
+    for (auto it = maint_pages_.begin(); it != maint_pages_.end() && maint_pages_.size() > cap;) {
       const size_t pi = it->first;
       if (pi == pin_pi) {  // never spill the page whose RMW is in progress
         ++it;
@@ -4051,13 +4076,18 @@ class QGUpdater {
   // Append one kind=1 whole-page after-image for a bundle overlay page. Returns its
   // FrameLocation so a spilled page can be reloaded. Buffered by default; the kind=8
   // force makes the whole group (kind=7 + preimages + finals) durable at once.
-  alaya::wal::FrameLocation bundle_log_page(size_t pi, const char *bytes,
+  alaya::wal::FrameLocation bundle_log_page(size_t pi,
+                                            const char *bytes,
                                             alaya::wal::WalFile::Sync sync) {
     const uint64_t offset = kSectorLen + pi * page_size_;
     const auto first_pid = static_cast<uint64_t>(pi * npp_);
-    auto payload = encode_row_patch(
-        segment_uid_, superblock_.generation, first_pid, offset,
-        std::span<const std::byte>(reinterpret_cast<const std::byte *>(bytes), page_size_));
+    auto payload =
+        encode_row_patch(segment_uid_,
+                         superblock_.generation,
+                         first_pid,
+                         offset,
+                         std::span<const std::byte>(reinterpret_cast<const std::byte *>(bytes),
+                                                    page_size_));
     try {
       return op_wal_->append(kSegmentOpRecordType, 0, ++wal_op_id_, 0, payload, sync);
     } catch (const std::exception &error) {
@@ -4088,7 +4118,7 @@ class QGUpdater {
       // durable. A spill is flushed (Sync::flush -> OS page cache, survives a process crash),
       // but the kind=7 are only buffered (userspace, lost on SIGKILL). Without this force a
       // surviving spilled kind=1 could ORPHAN a lost kind=7, and recovery would apply that
-      // canonical page as a legacy row_patch (line ~replay_row_patch), mis-installing a torn
+      // canonical page as a legacy row_patch (line ~replay_row_patch), wrongly installing a torn
       // bundle. Forcing here makes the lane durable so a surviving spill is staged inside it
       // and discarded at EOF (S_old) -- the same guarantee consolidate gets by forcing BEGIN
       // before its spills. (The net WAL bytes are unchanged; only durability timing moves.)
@@ -4096,7 +4126,8 @@ class QGUpdater {
         force_wal();
         bundle_ctx_->binds_durable = true;
       }
-      const auto loc = bundle_log_page(it->first, it->second.data(), alaya::wal::WalFile::Sync::flush);
+      const auto loc =
+          bundle_log_page(it->first, it->second.data(), alaya::wal::WalFile::Sync::flush);
       bundle_ctx_->spilled[it->first] = loc;
       it = bundle_ctx_->pages.erase(it);
     }
@@ -4161,7 +4192,8 @@ class QGUpdater {
       if (it != bundle_ctx_->pages.end()) {
         bytes = it->second.data();
       } else {
-        const auto frame = alaya::wal::WalFile::read_frame(op_wal_->path(), bundle_ctx_->spilled[pi]);
+        const auto frame =
+            alaya::wal::WalFile::read_frame(op_wal_->path(), bundle_ctx_->spilled[pi]);
         const auto op = decode_segment_op(frame.payload);
         if (op.kind != SegmentOpKind::row_patch || op.bytes.size() != page_size_) {
           poison("bundle install reload got a non-page frame");
@@ -4218,8 +4250,7 @@ class QGUpdater {
   // row could be unreachable, so it poisons before the commit point.
   void bundle_force_edge(PID from, PID to, std::vector<char> &scratch) {
     read_rmw_page(to, scratch.data());  // overlay copy of `to`
-    const auto *to_vec =
-        reinterpret_cast<const float *>(scratch.data() + node_offset_in_page(to));
+    const auto *to_vec = reinterpret_cast<const float *>(scratch.data() + node_offset_in_page(to));
     std::vector<float> vec(to_vec, to_vec + full_dim_);
     const std::unordered_map<PID, const CapturedNode *> empty_captured;
     if (patch_reverse_edge_impl(from, to, vec.data(), empty_captured, /*force=*/true, nullptr) !=
@@ -4293,7 +4324,7 @@ class QGUpdater {
   // spill up to ~2x the touched page set to the .opwal. A shortfall is an ordinary
   // pre-transaction error (the epoch has not started, so nothing to roll back).
   void maint_statvfs_preflight(bool reclaim_slots) {
-    struct statvfs vfs {};
+    struct statvfs vfs{};
     wal_failpoint(SegmentOpFailPoint::before_consolidate_statvfs);
     if (::statvfs(op_wal_->path().c_str(), &vfs) != 0) {
       throw std::runtime_error("QGUpdater::consolidate: statvfs failed errno=" +
@@ -4312,7 +4343,7 @@ class QGUpdater {
     // union page conservatively.
     const uint64_t committed = committed_.load(std::memory_order_acquire);
     const uint64_t committed_pages = committed == 0 ? 0 : (committed + npp_ - 1) / npp_;
-    const uint64_t repair_pages = committed_pages;                    // <= all live rows' pages
+    const uint64_t repair_pages = committed_pages;  // <= all live rows' pages
     const uint64_t reclaim_pages = reclaim_slots ? committed_pages : 0;
     constexpr uint64_t kPerPageFrameOverhead =
         alaya::wal::kHeaderBytes + alaya::wal::kTrailerBytes + 19 + 20;  // == 79
@@ -4491,10 +4522,10 @@ class QGUpdater {
                                            SegmentOpKind::consolidate_begin,
                                            epoch),
                  alaya::wal::WalFile::Sync::buffered);
-      wal_failpoint(SegmentOpFailPoint::after_consolidate_begin_append);        // C1
-      wal_failpoint(SegmentOpFailPoint::before_consolidate_begin_fsync);        // C2
+      wal_failpoint(SegmentOpFailPoint::after_consolidate_begin_append);  // C1
+      wal_failpoint(SegmentOpFailPoint::before_consolidate_begin_fsync);  // C2
       force_wal();  // BEGIN durable before any page mutation
-      wal_failpoint(SegmentOpFailPoint::after_consolidate_begin_fsync);         // C3
+      wal_failpoint(SegmentOpFailPoint::after_consolidate_begin_fsync);  // C3
       maintenance_active_ = true;
       maint_in_build_phase_ = true;  // no index/arena write allowed until END durable
       consolidate_row_phase(r_target, bloom_consolidate);
@@ -4520,11 +4551,11 @@ class QGUpdater {
                  alaya::wal::WalFile::Sync::buffered);
       wal_failpoint(SegmentOpFailPoint::after_consolidate_end_append_before_fsync);  // C7
       force_wal();  // END durable: the single maintenance commit point
-      wal_failpoint(SegmentOpFailPoint::after_consolidate_end_fsync);                // C8
+      wal_failpoint(SegmentOpFailPoint::after_consolidate_end_fsync);  // C8
       // Commit point passed: leave the BUILD window so the install writes are allowed.
       maint_in_build_phase_ = false;
       maint_install_all();  // fires after_consolidate_install_page (C9) per page
-      wal_failpoint(SegmentOpFailPoint::after_consolidate_install_before_publish);   // C10
+      wal_failpoint(SegmentOpFailPoint::after_consolidate_install_before_publish);  // C10
       if (reclaim_slots) {
         free_list_head_.store(maint_local_free_head_, std::memory_order_release);
         free_count_.store(maint_local_free_count_, std::memory_order_release);
@@ -4532,7 +4563,7 @@ class QGUpdater {
       last_completed_consolidate_epoch_ = epoch;
       maintenance_active_ = false;
       maint_reset_overlay();
-      wal_failpoint(SegmentOpFailPoint::after_consolidate_publish);                  // C11
+      wal_failpoint(SegmentOpFailPoint::after_consolidate_publish);  // C11
     } catch (...) {
       // Design/checkpoint-admission ruling: a failure past BEGIN keeps the epoch
       // state and overlay intact and poisons the handle -- recovery rebuilds from
@@ -6094,8 +6125,11 @@ class QGUpdater {
       poison("label slot index out of range in the superblock");
     }
     active_label_slot_ = static_cast<int>(ls.slot);
-    auto lb = load_label_slot_bindings(label_slot_path_[ls.slot], ls.count, ls.checksum,
-                                       sb.num_points, pid_generation_activated_);
+    auto lb = load_label_slot_bindings(label_slot_path_[ls.slot],
+                                       ls.count,
+                                       ls.checksum,
+                                       sb.num_points,
+                                       pid_generation_activated_);
     // Activation summary cross-check (design 7.1 / JC-16, sixth fail-closed condition):
     // the slot's actual max non-zero generation and reuse-binding count must equal the
     // summary the writing checkpoint stamped. A mismatch means a slot swapped out from
@@ -6226,13 +6260,14 @@ class QGUpdater {
 
   // Append a whole-page after-image (row_patch). Under the armed reuse contract, the existing pid
   // field carries the logical PID actually touched by this RMW (I-2 line evidence); legacy double-
-  // false writers retain the historical page-first value byte-for-byte. The wire layout is unchanged.
+  // false writers retain the historical page-first value byte-for-byte. The wire layout is
+  // unchanged.
   void log_page_after_image(PID pid_in_page, const char *page_bytes) {
     const uint64_t offset = page_offset(pid_in_page);
     const auto first_pid = static_cast<uint64_t>(page_index(pid_in_page) * npp_);
-    const uint64_t evidence_pid =
-        (pid_generation_activated_ || enable_pid_reuse_) ? static_cast<uint64_t>(pid_in_page)
-                                                        : first_pid;
+    const uint64_t evidence_pid = (pid_generation_activated_ || enable_pid_reuse_)
+                                      ? static_cast<uint64_t>(pid_in_page)
+                                      : first_pid;
     auto payload =
         encode_row_patch(segment_uid_,
                          superblock_.generation,
@@ -6269,16 +6304,18 @@ class QGUpdater {
       // base, so the orphan is discardable -- checkpoint() below overwrites the WAL
       // via reset_to_single_frame. Guard: only flip frames are legal here; anything
       // else is unexpected (data on an unstamped base) and poisons (fail-closed).
-      alaya::wal::WalFile::visit_frames(
-          op_wal_->path(), [&](const alaya::wal::ScannedFrame &frame) -> bool {
+      alaya::wal::WalFile::
+          visit_frames(op_wal_->path(), [&](const alaya::wal::ScannedFrame &frame) -> bool {
             SegmentOp probe;
             try {
               probe = decode_segment_op(frame.payload);
             } catch (const std::exception &) {
-              poison("enable_wal on an unstamped superblock but the .opwal has an undecodable frame");
+              poison(
+                  "enable_wal on an unstamped superblock but the .opwal has an undecodable frame");
             }
             if (probe.kind != SegmentOpKind::superblock_flip) {
-              poison("enable_wal on an unstamped superblock but the .opwal has committed op frames");
+              poison(
+                  "enable_wal on an unstamped superblock but the .opwal has committed op frames");
             }
             return true;
           });
@@ -6292,7 +6329,7 @@ class QGUpdater {
     // Always converge through the full recovery pass (design section 2.1): even an
     // empty op-WAL must reach rebuild_state_after_replay so routing/free/hidden are
     // derived once from the on-disk trailers under the replaying_ guard.
-    replay_and_rebuild();  // promotes staged bundles into label_working_ (W3)
+    replay_and_rebuild();      // promotes staged bundles into label_working_ (W3)
     publish_label_snapshot();  // seal the recovered label state (tail convergence)
     precreate_label_slots();
   }
@@ -6398,13 +6435,17 @@ class QGUpdater {
     if (op.bytes.size() != page_size_) {
       poison("op-WAL canonical page after-image is not a whole page");
     }
-    return qg_read_page_trailer(reinterpret_cast<const char *>(op.bytes.data()), page_size_, npp_,
+    return qg_read_page_trailer(reinterpret_cast<const char *>(op.bytes.data()),
+                                page_size_,
+                                npp_,
                                 static_cast<size_t>(pid) % npp_);
   }
 
   // Open a canonical bundle lane on the first kind=7 of a reuse-generation transaction.
-  void canonical_open_lane(CanonicalBundleStage &st, const SegmentOp &op,
-                           const alaya::wal::ScannedFrame &frame, bool &in_canonical_bundle) {
+  void canonical_open_lane(CanonicalBundleStage &st,
+                           const SegmentOp &op,
+                           const alaya::wal::ScannedFrame &frame,
+                           bool &in_canonical_bundle) {
     if (frame.batch_id != op.tx_id) {
       poison("op-WAL canonical label_bind frame batch_id != payload tx_id");
     }
@@ -6419,8 +6460,10 @@ class QGUpdater {
   // One frame inside an open canonical lane. Legal frames: consecutive same-txid kind=7
   // (only before the first kind=1), reuse-preimage + final kind=1, the matching kind=8;
   // anything else poisons (design 3.5 / codex B.5).
-  void canonical_lane_step(CanonicalBundleStage &st, const SegmentOp &op,
-                           const alaya::wal::ScannedFrame &frame, bool &in_canonical_bundle,
+  void canonical_lane_step(CanonicalBundleStage &st,
+                           const SegmentOp &op,
+                           const alaya::wal::ScannedFrame &frame,
+                           bool &in_canonical_bundle,
                            uint64_t &committed_watermark) {
     switch (op.kind) {
       case SegmentOpKind::label_bind: {
@@ -6436,7 +6479,8 @@ class QGUpdater {
         if (frame.batch_id != op.tx_id) {
           poison("op-WAL canonical label_bind frame batch_id != payload tx_id");
         }
-        st.binds.push_back({op.row_op_id, canonical_checked_pid(op.pid), op.pid_generation, op.label});
+        st.binds.push_back(
+            {op.row_op_id, canonical_checked_pid(op.pid), op.pid_generation, op.label});
         break;
       }
       case SegmentOpKind::row_patch: {
@@ -6475,7 +6519,8 @@ class QGUpdater {
   // Validate a canonical bundle at its kind=8 and, for a NEW transaction, apply its final
   // pages + promote bindings (design 3.4/3.5, B-2C-02). Any inconsistency poisons. An
   // already-absorbed prefix (txid <= base) is validate-only and never re-applied.
-  void canonical_finalize_bundle(CanonicalBundleStage &st, const SegmentOp &op,
+  void canonical_finalize_bundle(CanonicalBundleStage &st,
+                                 const SegmentOp &op,
                                  uint64_t &committed_watermark) {
     if (op.binding_count == 0) {
       poison("op-WAL canonical tx_publish binding_count must be >= 1");
@@ -7038,7 +7083,8 @@ class QGUpdater {
                                             PID pid) const {
     const size_t slot = static_cast<size_t>(pid) % npp_;
     const size_t node_offset = slot * node_len_;
-    if (std::memcmp(lhs.bytes.data() + node_offset, rhs.bytes.data() + node_offset, node_len_) != 0) {
+    if (std::memcmp(lhs.bytes.data() + node_offset, rhs.bytes.data() + node_offset, node_len_) !=
+        0) {
       return false;
     }
     const size_t trailer_offset = qg_page_trailer_offset(page_size_, npp_, slot);
@@ -7061,7 +7107,8 @@ class QGUpdater {
         poison("op-WAL publish advances the HWM over a PID with no row allocation evidence");
       }
     }
-    // Validate each final page once and require every consumed evidence row to be structurally live.
+    // Validate each final page once and require every consumed evidence row to be structurally
+    // live.
     for (const auto &[page, pids] : unit.allocation_evidence) {
       const auto ref = unit.latest_refs.find(page);
       if (ref == unit.latest_refs.end()) {
@@ -7073,10 +7120,12 @@ class QGUpdater {
         if (raw < old_hwm || raw >= new_hwm) {
           continue;
         }
-        const QGRowTrailer trailer = qg_read_page_trailer(
-            reinterpret_cast<const char *>(final.bytes.data()), page_size_, npp_, pid % npp_);
-        if (trailer.valid_degree > deg_ ||
-            (trailer.flags & (kQGRowTombstone | kQGRowFree)) != 0) {
+        const QGRowTrailer trailer =
+            qg_read_page_trailer(reinterpret_cast<const char *>(final.bytes.data()),
+                                 page_size_,
+                                 npp_,
+                                 pid % npp_);
+        if (trailer.valid_degree > deg_ || (trailer.flags & (kQGRowTombstone | kQGRowFree)) != 0) {
           poison("op-WAL allocation evidence final row is not structurally live");
         }
       }
@@ -7420,7 +7469,8 @@ class QGUpdater {
       // B3 completion (leg-9, r3 section 1 point 4): the image's label bindings must equal the
       // bindings this replay reconstructed from the WAL prefix (label_working_). An install flip is
       // reached only after every preceding bundle was promoted, so an EMPTY image slot over a
-      // non-empty recovered set means the flip silently drops committed labels -- reject before write.
+      // non-empty recovered set means the flip silently drops committed labels -- reject before
+      // write.
       if (!label_working_.empty()) {
         poison("flip image: empty label slot but the recovered bindings are non-empty");
       }
@@ -7431,8 +7481,11 @@ class QGUpdater {
     }
     // Preload + fully validate the referenced slot file into a temp binding set (checksum,
     // count*16, ascending, pid < num_points, generation-vs-pid-active) -- pure read + poison.
-    auto lb = load_label_slot_bindings(label_slot_path_[ls.slot], ls.count, ls.checksum,
-                                       image.num_points, image_pid_active);
+    auto lb = load_label_slot_bindings(label_slot_path_[ls.slot],
+                                       ls.count,
+                                       ls.checksum,
+                                       image.num_points,
+                                       image_pid_active);
     if (image_pid_active) {
       uint32_t max_gen = 0;
       uint32_t nz_count = 0;
@@ -7450,11 +7503,11 @@ class QGUpdater {
     // B3 completion (leg-9, r3 section 1 point 4): the loaded slot must equal the bindings this
     // replay reconstructed from the WAL prefix (label_working_). A G+1 install flip is reached only
     // after every preceding bundle promoted into label_working_, and a legal checkpoint captured
-    // exactly that map into the slot; so a self-consistent-but-STALE slot (e.g. an older, still-valid
-    // label tuple with a rewound generation, or any slot that disagrees item-by-item with the
-    // recovered set) is forged. This is the "逐项等价" (item-by-item equivalence) closure -- stricter
-    // than the generation/count monotonicity in validate_flip_transition, and orphan-robust (a torn
-    // bundle's staged binds are in neither set, so both exclude them).
+    // exactly that map into the slot; so a self-consistent-but-STALE slot (e.g. an older,
+    // still-valid label tuple with a rewound generation, or any slot that disagrees item-by-item
+    // with the recovered set) is forged. This is the item-by-item equivalence closure
+    // -- stricter than the generation/count monotonicity in validate_flip_transition, and
+    // orphan-robust (a torn bundle's staged binds are in neither set, so both exclude them).
     if (lb.bindings != label_working_) {
       poison("flip image: label slot disagrees with the recovered bindings");
     }
@@ -7463,40 +7516,42 @@ class QGUpdater {
   // BLOCKER-3 (leg-8, r2 section 1): PURE pre-write validation of a flip TRANSITION. Poisons on any
   // violation and writes NOTHING (no pwrite/ftruncate) -- a crafted flip is rejected with the index
   // byte-for-byte unchanged. Runs before EVERY durable flip: replay_flip (before its
-  // write_superblock/ftruncate) AND checkpoint_locked (before wal_append(flip,fsync)). `image` is the
-  // NEXT base; `superblock_` is the current/selected base (the replay cursor); op_generation +
+  // write_superblock/ftruncate) AND checkpoint_locked (before wal_append(flip,fsync)). `image` is
+  // the NEXT base; `superblock_` is the current/selected base (the replay cursor); op_generation +
   // target_slot come from the flip op. qg_superblock_supported() (self-consistency, activation
-  // bounds) and validate_flip_label_state() (label slot) already ran on the replay path; this closes
-  // the geometry / file-length / target-slot / generation-transition / state-monotonicity window they
-  // do not cover -- exactly the dimension+1 clone, the file_size=kSectorLen truncation bomb, and the
-  // target_slot==active tear the r2 review reached.
-  void validate_flip_transition(const QGSuperblockV2 &image, uint64_t op_generation,
-                                uint8_t target_slot, uint64_t expected_num_points) {
-    // (1) The op's declared generation must match the image it carries: a CRC-legal flip whose frame
-    // generation disagrees with its payload generation is malformed.
+  // bounds) and validate_flip_label_state() (label slot) already ran on the replay path; this
+  // closes the geometry / file-length / target-slot / generation-transition / state-monotonicity
+  // window they do not cover -- exactly the dimension+1 clone, the file_size=kSectorLen truncation
+  // bomb, and the target_slot==active tear the r2 review reached.
+  void validate_flip_transition(const QGSuperblockV2 &image,
+                                uint64_t op_generation,
+                                uint8_t target_slot,
+                                uint64_t expected_num_points) {
+    // (1) The op's declared generation must match the image it carries: a CRC-legal flip whose
+    // frame generation disagrees with its payload generation is malformed.
     if (op_generation != image.generation) {
       poison("flip op generation != the image generation");
     }
     // (2) A flip MUST target the INACTIVE A/B slot. Overwriting the active slot would, on a torn
     // 512-byte pwrite, leave only the G-1 copy while the durable WAL still demands G+1 -- the next
-    // replay would face a two-generation jump and poison. (active_superblock_slot_ is -1 only before
-    // any base is loaded, which never reaches a flip.)
+    // replay would face a two-generation jump and poison. (active_superblock_slot_ is -1 only
+    // before any base is loaded, which never reaches a flip.)
     if (active_superblock_slot_ < 0 ||
         static_cast<int>(target_slot) != 1 - active_superblock_slot_) {
       poison("flip target slot is not the inactive A/B slot");
     }
-    // (3) Generation is the next legal step with NO overflow. (replay_flip already gated == +1 on its
-    // path; the checkpoint's next.generation == superblock_.generation+1 -- assert both here so a
-    // wraparound at UINT64_MAX can never mint generation 0.)
+    // (3) Generation is the next legal step with NO overflow. (replay_flip already gated == +1 on
+    // its path; the checkpoint's next.generation == superblock_.generation+1 -- assert both here so
+    // a wraparound at UINT64_MAX can never mint generation 0.)
     if (superblock_.generation == (std::numeric_limits<uint64_t>::max)()) {
       poison("flip generation overflow");
     }
     if (image.generation != superblock_.generation + 1) {
       poison("flip generation is not the next legal step (G+1)");
     }
-    // (4) Immutable geometry: dimension / node_len / node_per_page / page_size are fixed at build time
-    // (load_v2_state enforces the same identity on open). A clone that bumps the dimension by one
-    // would install and only fail closed on the NEXT open -- reject it before any write.
+    // (4) Immutable geometry: dimension / node_len / node_per_page / page_size are fixed at build
+    // time (load_v2_state enforces the same identity on open). A clone that bumps the dimension by
+    // one would install and only fail closed on the NEXT open -- reject it before any write.
     if (image.dimension != dim_ || image.node_len != node_len_ || image.node_per_page != npp_ ||
         image.page_size != page_size_) {
       poison("flip image geometry differs from the segment (immutable geometry)");
@@ -7517,8 +7572,8 @@ class QGUpdater {
     // checkpoint captures committed_ into image.num_points, and on replay the running committed
     // watermark just before the install flip equals that same value (all preceding publishes/
     // bundles/epochs were replayed). A G+1 install image whose num_points disagrees with the
-    // recovered prefix (e.g. an HWM rewind with an otherwise-exact file_size + in-range label tuple)
-    // is forged -- it would install a lower base and ftruncate live data pages away.
+    // recovered prefix (e.g. an HWM rewind with an otherwise-exact file_size + in-range label
+    // tuple) is forged -- it would install a lower base and ftruncate live data pages away.
     if (image.num_points != expected_num_points) {
       poison("flip image num_points != the expected recovered watermark");
     }
@@ -7544,8 +7599,8 @@ class QGUpdater {
       poison("flip image entry_point is out of range");
     }
     // (6) Exact file length: kSectorLen + ceil(num_points/npp)*page_size. A shrunk file_size (e.g.
-    // kSectorLen) would ftruncate away every data page after the superblock install; a grown one would
-    // leave the tail undefined. npp_ >= 1 by construction, so there is no divide-by-zero.
+    // kSectorLen) would ftruncate away every data page after the superblock install; a grown one
+    // would leave the tail undefined. npp_ >= 1 by construction, so there is no divide-by-zero.
     const uint64_t page_num = image.num_points == 0 ? 0 : (image.num_points + npp_ - 1) / npp_;
     if (image.file_size != static_cast<uint64_t>(kSectorLen) + page_num * page_size_) {
       poison("flip image file_size != kSectorLen + ceil(num_points/npp)*page_size");
@@ -7578,9 +7633,9 @@ class QGUpdater {
     // equals the recovered bindings); this closes the monotonicity/overflow window between the
     // CURRENT base's tuple and the image's. A label content change bumps the generation by one and
     // rewrites the inactive slot, so across one flip the label generation only moves forward, the
-    // binding count is append-only (never shrinks), and a same-generation tuple must be byte-for-byte
-    // identical (no content change without a generation bump). A rewound label generation would let a
-    // stale-but-self-consistent slot pose as the next base's bindings.
+    // binding count is append-only (never shrinks), and a same-generation tuple must be
+    // byte-for-byte identical (no content change without a generation bump). A rewound label
+    // generation would let a stale-but-self-consistent slot pose as the next base's bindings.
     const auto cur_label = read_superblock_label_state(superblock_);
     const auto img_label = read_superblock_label_state(image);
     if (img_label.generation < cur_label.generation) {
@@ -7926,11 +7981,11 @@ class QGUpdater {
   mutable std::mutex label_snapshot_mutex_;
   std::shared_ptr<const LabelBindings> label_snapshot_;
   std::map<PID, PidBinding> label_working_;  // recovery-only scratch (slot load + promotions)
-  std::string label_slot_path_[2];         // <index>.labels.slot0 / .slot1
-  int active_label_slot_ = 0;              // slot holding the persisted bindings
-  uint64_t label_generation_ = 0;     // persisted-slot generation (bumped on content checkpoint)
-  uint64_t label_count_ = 0;          // persisted-slot binding count (== superblock label_count)
-  uint64_t label_checksum_ = 0;       // persisted-slot checksum (low 32 = crc32, high 32 = 0)
+  std::string label_slot_path_[2];           // <index>.labels.slot0 / .slot1
+  int active_label_slot_ = 0;                // slot holding the persisted bindings
+  uint64_t label_generation_ = 0;  // persisted-slot generation (bumped on content checkpoint)
+  uint64_t label_count_ = 0;       // persisted-slot binding count (== superblock label_count)
+  uint64_t label_checksum_ = 0;    // persisted-slot checksum (low 32 = crc32, high 32 = 0)
   // Label-slot content revision (design 3.1 / execution pitfall 2): PID reuse rebinds
   // {generation,label} at an UNCHANGED key count, so "count grew" no longer implies
   // "slot dirty". Bump on every published binding-set mutation (bundle commit, replay
@@ -7939,7 +7994,7 @@ class QGUpdater {
   // this stays byte-identical to the old count gate (golden / 2A / 2B unchanged).
   uint64_t label_content_revision_ = 0;
   uint64_t persisted_label_content_revision_ = 0;
-  uint64_t last_committed_txid_ = 0;  // running: strictly increases per committed bundle
+  uint64_t last_committed_txid_ = 0;       // running: strictly increases per committed bundle
   uint64_t applied_collection_op_id_ = 0;  // running: caller op watermark (2B idempotency basis)
   uint64_t base_committed_txid_ = 0;       // adopted base's persisted txid (case (a)/(b) split)
   uint64_t base_applied_op_id_ = 0;        // adopted base's persisted applied op id
@@ -7989,24 +8044,25 @@ class QGUpdater {
   BundleInsertContext *bundle_ctx_ = nullptr;
   bool free_chain_rebuild_complete_ = true;  // false only mid-recovery; gates reserve_bundle_pids
   bool maintenance_active_ = false;
-  bool maintenance_activating_ = false;            // an activation checkpoint is in flight (emit v3)
-  bool pid_reuse_activating_ = false;              // a pid-reuse activation checkpoint is in flight
+  bool maintenance_activating_ = false;  // an activation checkpoint is in flight (emit v3)
+  bool pid_reuse_activating_ = false;    // a pid-reuse activation checkpoint is in flight
   uint64_t last_completed_consolidate_epoch_ = 0;  // adopted from base; advanced at END
   bool maintenance_activated_ = false;             // v3 maintenance features activated in the base
   bool pid_generation_activated_ = false;          // v3 pid-reuse feature activated (W2c)
-  uint64_t maintenance_activation_gen_ = 0;        // superblock generation of the activation checkpoint
-  uint64_t pid_reuse_activation_gen_ = 0;          // superblock gen when PID reuse activated (0 = never)
+  uint64_t maintenance_activation_gen_ = 0;  // superblock generation of the activation checkpoint
+  uint64_t pid_reuse_activation_gen_ = 0;    // superblock gen when PID reuse activated (0 = never)
   // Private overlay: page_index -> resident bytes; and evicted pages -> latest kind=1
   // frame location (reload via WalFile::read_frame). Union = every touched page.
   std::unordered_map<size_t, std::vector<char>> maint_pages_;
   std::unordered_set<size_t> maint_dirty_;  // overlay pages actually modified (need install)
   std::unordered_map<size_t, alaya::wal::FrameLocation> maint_spilled_;
-  uint64_t maint_epoch_ = 0;                        // the in-flight epoch id
-  PID maint_local_free_head_ = kPidMax;             // transaction-local free head (published at END)
+  uint64_t maint_epoch_ = 0;             // the in-flight epoch id
+  PID maint_local_free_head_ = kPidMax;  // transaction-local free head (published at END)
   uint64_t maint_local_free_count_ = 0;
   // True only inside the maintenance BUILD window [BEGIN durable, END durable):
   // the last-line steal guard in write_at() poisons on ANY index/arena write in
-  // this window (design section 9.1 / W1 acceptance: END-前 index/arena 维护写 == 0).
+  // this window (design section 9.1 / W1 acceptance: zero index/arena maintenance writes
+  // before END).
   bool maint_in_build_phase_ = false;
 };
 

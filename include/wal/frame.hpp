@@ -507,8 +507,8 @@ class WalFile {
   [[nodiscard]] static auto read_frame(const std::filesystem::path &path, FrameLocation location)
       -> ScannedFrame {
     if (location.size < kHeaderBytes + kTrailerBytes ||
-        location.size > static_cast<std::uint64_t>(kHeaderBytes) + kMaximumPayloadBytes +
-                            kTrailerBytes) {
+        location.size >
+            static_cast<std::uint64_t>(kHeaderBytes) + kMaximumPayloadBytes + kTrailerBytes) {
       throw std::invalid_argument("WalFile::read_frame: implausible frame size");
     }
     std::ifstream input(path, std::ios::binary);
@@ -517,8 +517,7 @@ class WalFile {
     }
     input.seekg(static_cast<std::streamoff>(location.offset));
     std::vector<std::byte> frame(static_cast<std::size_t>(location.size));
-    input.read(reinterpret_cast<char *>(frame.data()),
-               static_cast<std::streamsize>(frame.size()));
+    input.read(reinterpret_cast<char *>(frame.data()), static_cast<std::streamsize>(frame.size()));
     if (static_cast<std::uint64_t>(input.gcount()) != location.size) {
       throw std::runtime_error("WalFile::read_frame: short read");
     }

@@ -268,28 +268,28 @@ INSTANTIATE_TEST_SUITE_P(
 // distinguishing field is free_count: 0 until the END fsync commits the epoch,
 // then kTomb (roll-forward). No cut may poison; double replay is byte-stable.
 // ---------------------------------------------------------------------------
-constexpr size_t kConsolTomb = 4;
+constexpr size_t kConsolidateTomb = 4;
 
 struct ConsolidateKillCase {
   const char *name;
   SegmentOpFailPoint point;
-  bool expect_reclaimed;  // after recovery the free-list holds the kConsolTomb rows
+  bool expect_reclaimed;  // after recovery the free-list holds the kConsolidateTomb rows
   size_t cache_cap = 0;   // 0 = default (no spill); a small cap forces overlay spill (C4/C5)
 };
 
 class SegmentOpWalConsolidateSigkill : public ::testing::TestWithParam<ConsolidateKillCase> {};
 
 // wal-2c BLOCKER-2: the two definitive graph fingerprints this matrix must land on, built
-// once from the SAME base (seed 4343 + tombstone 0..kConsolTomb) as every cut. S_old drives
+// once from the SAME base (seed 4343 + tombstone 0..kConsolidateTomb) as every cut. S_old drives
 // the REAL activation checkpoint then aborts before the BEGIN append (identical disk state to
 // a C0 SIGKILL); S_new runs the full clean consolidate to its committed END.
-struct ConsolRefs {
+struct ConsolidateRefs {
   std::string s_old;
   std::string s_new;
 };
-const ConsolRefs &consol_refs() {
-  static const ConsolRefs refs = [] {
-    const auto root = battery_root("consol_refs");
+const ConsolidateRefs &consolidate_refs() {
+  static const ConsolidateRefs refs = [] {
+    const auto root = battery_root("consolidate_refs");
     std::filesystem::remove_all(root);
     const auto tmpl = root / "template";
     auto base = WalTinyIndex::build(tmpl, kBaseN, 4343);
@@ -311,7 +311,7 @@ const ConsolRefs &consol_refs() {
         }
       };
       QGUpdater upd(qg, params);
-      for (PID id = 0; id < static_cast<PID>(kConsolTomb); ++id) upd.tombstone(id);
+      for (PID id = 0; id < static_cast<PID>(kConsolidateTomb); ++id) upd.tombstone(id);
       try {
         upd.consolidate(1, 0, /*reclaim_slots=*/true, /*bloom_consolidate=*/false);
       } catch (const std::exception &) {
@@ -328,10 +328,10 @@ const ConsolRefs &consol_refs() {
       params.enable_wal = true;
       params.max_points = max_points;
       QGUpdater upd(qg, params);
-      for (PID id = 0; id < static_cast<PID>(kConsolTomb); ++id) upd.tombstone(id);
+      for (PID id = 0; id < static_cast<PID>(kConsolidateTomb); ++id) upd.tombstone(id);
       upd.consolidate(1, 0, /*reclaim_slots=*/true, /*bloom_consolidate=*/false);
     }
-    ConsolRefs r;
+    ConsolidateRefs r;
     r.s_old = recover((old_dir / "wal_base").string(), max_points).graph_fp;
     r.s_new = recover((new_dir / "wal_base").string(), max_points).graph_fp;
     std::filesystem::remove_all(root);
@@ -342,7 +342,7 @@ const ConsolRefs &consol_refs() {
 
 TEST_P(SegmentOpWalConsolidateSigkill, ReopenIsPrefixReachableAndDoubleReplayStable) {
   const auto param = GetParam();
-  const auto root = battery_root(std::string("consol_") + param.name);
+  const auto root = battery_root(std::string("consolidate_") + param.name);
   std::filesystem::remove_all(root);
   const auto template_dir = root / "template";
   auto base = WalTinyIndex::build(template_dir, kBaseN, 4343);
@@ -372,7 +372,7 @@ TEST_P(SegmentOpWalConsolidateSigkill, ReopenIsPrefixReachableAndDoubleReplaySta
         }
       };
       QGUpdater upd(qg, params);
-      for (PID id = 0; id < static_cast<PID>(kConsolTomb); ++id) upd.tombstone(id);
+      for (PID id = 0; id < static_cast<PID>(kConsolidateTomb); ++id) upd.tombstone(id);
       upd.consolidate(1, /*r_target=*/0, /*reclaim_slots=*/true, /*bloom_consolidate=*/false);
     } catch (...) {
       ::_exit(70);
@@ -390,15 +390,15 @@ TEST_P(SegmentOpWalConsolidateSigkill, ReopenIsPrefixReachableAndDoubleReplaySta
   const auto first = recover(case_prefix, max_points);
   ASSERT_FALSE(first.poisoned) << "recovery of " << param.name << " must not poison";
   EXPECT_EQ(first.num_points, kBaseN) << param.name << " HWM is unchanged by consolidate";
-  EXPECT_EQ(first.live_count, kBaseN - kConsolTomb)
+  EXPECT_EQ(first.live_count, kBaseN - kConsolidateTomb)
       << param.name << " tombstones durable via the activation checkpoint";
-  EXPECT_EQ(first.free_count, param.expect_reclaimed ? kConsolTomb : 0U)
+  EXPECT_EQ(first.free_count, param.expect_reclaimed ? kConsolidateTomb : 0U)
       << param.name << " free-list reflects the epoch commit point";
   // wal-2c BLOCKER-2: counts alone cannot distinguish a partially-repaired graph (e.g. a live
   // row's pre-END repair page installed while free flags stayed 0) from clean S_old. Require
   // the FULL recovered fingerprint (page content + PID sets + free chain + routing + epoch) to
   // equal exactly S_old or S_new.
-  const auto &refs = consol_refs();
+  const auto &refs = consolidate_refs();
   EXPECT_TRUE(first.graph_fp == refs.s_old || first.graph_fp == refs.s_new)
       << param.name << " recovered graph matches neither reference state";
   EXPECT_EQ(first.graph_fp, param.expect_reclaimed ? refs.s_new : refs.s_old)
@@ -443,7 +443,7 @@ INSTANTIATE_TEST_SUITE_P(
         ConsolidateKillCase{"c7_end_append_before_fsync",
                             SegmentOpFailPoint::after_consolidate_end_append_before_fsync, false},
         // C8-C11: the END force is the commit point; every later cut rolls forward to
-        // S_new (free-list holds the kConsolTomb reclaimed rows) via pure WAL redo.
+        // S_new (free-list holds the kConsolidateTomb reclaimed rows) via pure WAL redo.
         ConsolidateKillCase{"c8_end_fsync", SegmentOpFailPoint::after_consolidate_end_fsync, true},
         ConsolidateKillCase{"c9_install_page",
                             SegmentOpFailPoint::after_consolidate_install_page, true},

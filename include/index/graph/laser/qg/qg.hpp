@@ -197,9 +197,9 @@ constexpr uint32_t kQgFeatMutableLabelSlotV1 = 1U << 4U;
 // exists would let a new binary open a v3 pid base it cannot actually recover
 // (design B.1 / codex risk 1). A v3 base requiring a bit outside this mask (a future
 // phase) still fails closed.
-constexpr uint32_t kQgSupportedRequiredFeatures = kQgFeatMaintenanceTxV1 | kQgFeatPostRedoFreeListV1 |
-                                                  kQgFeatPidGenerationV1 | kQgFeatCanonicalPrebindV1 |
-                                                  kQgFeatMutableLabelSlotV1;
+constexpr uint32_t kQgSupportedRequiredFeatures =
+    kQgFeatMaintenanceTxV1 | kQgFeatPostRedoFreeListV1 | kQgFeatPidGenerationV1 |
+    kQgFeatCanonicalPrebindV1 | kQgFeatMutableLabelSlotV1;
 
 struct QGSuperblockV2 {
   uint64_t magic = 0;
@@ -318,9 +318,9 @@ inline bool qg_required_features_self_consistent(uint32_t required) {
   const bool pid = (required & kQgFeatPidGenerationV1) != 0;
   const bool canonical = (required & kQgFeatCanonicalPrebindV1) != 0;
   const bool mutable_label = (required & kQgFeatMutableLabelSlotV1) != 0;
-  if (maint != postredo) return false;                        // maintenance pair all-or-none
+  if (maint != postredo) return false;                         // maintenance pair all-or-none
   if (pid != canonical || pid != mutable_label) return false;  // pid triple all-or-none
-  if (pid && !maint) return false;                            // pid depends on the maintenance pair
+  if (pid && !maint) return false;  // pid depends on the maintenance pair
   return true;
 }
 
@@ -350,7 +350,8 @@ inline bool qg_superblock_supported(const QGSuperblockV2 &sb, uint32_t supported
     if ((required & kQgFeatMaintenanceTxV1) == 0) return false;
     if ((required & ~supported_mask) != 0) return false;
     // BLOCKER-3: the 2C reserved TAIL beyond the defined state fields must be zero in v3 too.
-    if (!qg_reserved_range_is_zero(sb, kWal2cReservedOffset + kWal2cStateBytes,
+    if (!qg_reserved_range_is_zero(sb,
+                                   kWal2cReservedOffset + kWal2cStateBytes,
                                    sb.reserved.size())) {
       return false;
     }

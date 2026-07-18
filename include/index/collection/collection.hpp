@@ -876,19 +876,18 @@ class Collection {
   // root: successor-active/building/manifest-published recovery reopens every source
   // before completing replacement. Keep those paths until a later idle open; an
   // already-open fd cannot make unlink safe across a second process crash.
-  static void sweep_orphan_active_laser_dirs(const std::filesystem::path &root,
-                                             const internal::collection::CollectionControlState
-                                                 &control_state) {
+  static void sweep_orphan_active_laser_dirs(
+      const std::filesystem::path &root,
+      const internal::collection::CollectionControlState &control_state) {
     std::error_code error;
     const auto active_root = root / ".alaya_internal" / "active_laser";
     if (!std::filesystem::is_directory(active_root, error)) {
       return;
     }
     std::set<std::filesystem::path> keep;
-    keep.insert(active_laser_dir(root,
-                                 control_state.active_segment_id,
-                                 control_state.active_generation)
-                    .filename());
+    keep.insert(
+        active_laser_dir(root, control_state.active_segment_id, control_state.active_generation)
+            .filename());
     if (control_state.phase == internal::collection::CollectionControlPhase::successor_active ||
         control_state.phase == internal::collection::CollectionControlPhase::building ||
         control_state.phase == internal::collection::CollectionControlPhase::manifest_published) {
@@ -1519,31 +1518,24 @@ class Collection {
       checkpoint_context.dirty_page_io_credits = context.io_credits;
       checkpoint_context.wal_io_credits = context.io_credits;
       checkpoint_context.durability_target = core::DurabilityTarget::full_checkpoint;
-      auto rotated =
-          implementation_->rotate_to_successor(std::move(successor).value(),
-                                               checkpoint_context,
-                                               [&](const internal::collection::ActiveRotationReceipt
-                                                       &receipt) {
-                                                 control_state_.active_segment_id =
-                                                     receipt.successor_segment_id;
-                                                 control_state_.active_generation =
-                                                     receipt.successor_generation;
-                                                 control_state_.wal_cut =
-                                                     receipt.checkpoint.wal_cut;
-                                                 control_state_.phase = internal::collection::
-                                                     CollectionControlPhase::successor_active;
-                                                 auto saved = internal::collection::
-                                                     CollectionControlStore::save(options_.root,
-                                                                                  control_state_);
-                                                 if (!saved.ok()) {
-                                                   return saved;
-                                                 }
-                                                 fire_seal_failpoint(
-                                                     options,
-                                                     CollectionSealFailPoint::
-                                                         after_active_control_publish_before_routing_install);
-                                                 return core::Status::success();
-                                               });
+      auto rotated = implementation_->rotate_to_successor(
+          std::move(successor).value(),
+          checkpoint_context,
+          [&](const internal::collection::ActiveRotationReceipt &receipt) {
+            control_state_.active_segment_id = receipt.successor_segment_id;
+            control_state_.active_generation = receipt.successor_generation;
+            control_state_.wal_cut = receipt.checkpoint.wal_cut;
+            control_state_.phase = internal::collection::CollectionControlPhase::successor_active;
+            auto saved =
+                internal::collection::CollectionControlStore::save(options_.root, control_state_);
+            if (!saved.ok()) {
+              return saved;
+            }
+            fire_seal_failpoint(options,
+                                CollectionSealFailPoint::
+                                    after_active_control_publish_before_routing_install);
+            return core::Status::success();
+          });
       if (!rotated.ok()) {
         return rotated.status();
       }

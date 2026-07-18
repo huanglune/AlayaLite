@@ -192,8 +192,7 @@ class MutableLaserSegment {
   [[nodiscard]] auto token_for_label(uint64_t label) -> std::optional<laser::PidToken> {
     const std::lock_guard<std::mutex> guard(mutex_);
     const auto it = label_to_pid_.find(label);
-    return it == label_to_pid_.end() ? std::nullopt
-                                     : std::optional<laser::PidToken>(it->second);
+    return it == label_to_pid_.end() ? std::nullopt : std::optional<laser::PidToken>(it->second);
   }
 
   // Back-compat: resolve a label to its live PID (drops the generation). Prefer
@@ -201,8 +200,7 @@ class MutableLaserSegment {
   [[nodiscard]] auto pid_for_label(uint64_t label) -> std::optional<laser::PID> {
     const std::lock_guard<std::mutex> guard(mutex_);
     const auto it = label_to_pid_.find(label);
-    return it == label_to_pid_.end() ? std::nullopt
-                                     : std::optional<laser::PID>(it->second.pid);
+    return it == label_to_pid_.end() ? std::nullopt : std::optional<laser::PID>(it->second.pid);
   }
 
   // Mark a raw PID deleted and force the tombstone durable (existing callers / tests).

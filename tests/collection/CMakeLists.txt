@@ -263,7 +263,11 @@ if(ALAYA_ENABLE_LASER)
   alaya_add_test(
     NAME collection_active_laser_maintenance_test
     TARGET collection_active_laser_maintenance_test
-    LABELS integration collection laser wal tsan
+    LABELS integration
+           collection
+           laser
+           wal
+           tsan
     TIMEOUT 300
   )
 
@@ -275,7 +279,11 @@ if(ALAYA_ENABLE_LASER)
   alaya_add_test(
     NAME collection_active_laser_recovery_test
     TARGET collection_active_laser_recovery_test
-    LABELS integration collection laser wal crash
+    LABELS integration
+           collection
+           laser
+           wal
+           crash
     TIMEOUT 300
   )
 endif()

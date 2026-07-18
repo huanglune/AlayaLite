@@ -299,9 +299,9 @@ alaya_cc_target(
 # while compiling them as one translation unit, as the original single-source target did.
 set_target_properties(bench_laser_update_sift PROPERTIES UNITY_BUILD ON)
 
-# wal-2c: W2 canonical PID-reuse writer functional tests (activation, all-reuse,
-# mixed, generation chain, no-reuse byte-invariance). The R0-R11 SIGKILL matrix
-# is test_segment_op_wal_reuse_crash.cpp (registered below in the same section).
+# wal-2c: W2 canonical PID-reuse writer functional tests (activation, all-reuse, mixed, generation chain, no-reuse
+# byte-invariance). The R0-R11 SIGKILL matrix is test_segment_op_wal_reuse_crash.cpp (registered below in the same
+# section).
 alaya_cc_target(
   test_qg_updater_reuse
   BARE GTEST
