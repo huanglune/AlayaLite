@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <sstream>
 #include <string>
@@ -91,6 +92,7 @@ enum class CollectionSealFailPoint : std::uint8_t {
   after_successor_switch = 2,
   during_export_build = 3,
   after_manifest_publish = 4,
+  after_active_control_publish_before_routing_install = 5,
 };
 
 struct CollectionSealOptions {
@@ -870,25 +872,33 @@ class Collection {
             std::to_string(generation));
   }
 
-  // B-09 orphan reclamation. On open, any directory under active_laser/ that is not
-  // the current active generation is unreferenced: either an old generation left
-  // behind by a completed seal/rotate (its rows now live in a sealed manifest
-  // segment) or an unrouted successor from a rotate that crashed before routing. A
-  // fresh open holds no writer flock on those, so removing them is safe. Idempotent
-  // and crash-safe (re-running the sweep is always sound), so it subsumes the
-  // pending-list / cut_pending-successor leaks without a STATE format change.
+  // B-09 orphan reclamation. The durable control state is part of the reachability
+  // root: successor-active/building/manifest-published recovery reopens every source
+  // before completing replacement. Keep those paths until a later idle open; an
+  // already-open fd cannot make unlink safe across a second process crash.
   static void sweep_orphan_active_laser_dirs(const std::filesystem::path &root,
-                                             std::uint64_t current_segment_id,
-                                             std::uint64_t current_generation) {
+                                             const internal::collection::CollectionControlState
+                                                 &control_state) {
     std::error_code error;
     const auto active_root = root / ".alaya_internal" / "active_laser";
     if (!std::filesystem::is_directory(active_root, error)) {
       return;
     }
-    const auto keep = active_laser_dir(root, current_segment_id, current_generation).filename();
+    std::set<std::filesystem::path> keep;
+    keep.insert(active_laser_dir(root,
+                                 control_state.active_segment_id,
+                                 control_state.active_generation)
+                    .filename());
+    if (control_state.phase == internal::collection::CollectionControlPhase::successor_active ||
+        control_state.phase == internal::collection::CollectionControlPhase::building ||
+        control_state.phase == internal::collection::CollectionControlPhase::manifest_published) {
+      for (const auto &source : control_state.sources) {
+        keep.insert(active_laser_dir(root, source.segment_id, source.generation).filename());
+      }
+    }
     std::vector<std::filesystem::path> orphans;
     for (const auto &entry : std::filesystem::directory_iterator(active_root, error)) {
-      if (entry.is_directory(error) && entry.path().filename() != keep) {
+      if (entry.is_directory(error) && !keep.contains(entry.path().filename())) {
         orphans.push_back(entry.path());
       }
     }
@@ -1058,9 +1068,7 @@ class Collection {
     }
 
     if (options.active_engine == core::algorithm::laser) {
-      sweep_orphan_active_laser_dirs(options.root,
-                                     control_state.active_segment_id,
-                                     control_state.active_generation);
+      sweep_orphan_active_laser_dirs(options.root, control_state);
     }
     auto active = make_active_registration(options,
                                            control_state.active_segment_id,
@@ -1524,9 +1532,17 @@ class Collection {
                                                      receipt.checkpoint.wal_cut;
                                                  control_state_.phase = internal::collection::
                                                      CollectionControlPhase::successor_active;
-                                                 return internal::collection::
+                                                 auto saved = internal::collection::
                                                      CollectionControlStore::save(options_.root,
                                                                                   control_state_);
+                                                 if (!saved.ok()) {
+                                                   return saved;
+                                                 }
+                                                 fire_seal_failpoint(
+                                                     options,
+                                                     CollectionSealFailPoint::
+                                                         after_active_control_publish_before_routing_install);
+                                                 return core::Status::success();
                                                });
       if (!rotated.ok()) {
         return rotated.status();
