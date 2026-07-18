@@ -5,6 +5,7 @@
 #include "index/disk/laser_segment_importer.hpp"
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/segment_manifest.hpp"
+#include "index/graph/laser/utils/rotator.hpp"
 #include "core/value_types.hpp"
 
 #include <gtest/gtest.h>
@@ -268,28 +269,41 @@ TEST_F(LaserSegmentImporterTest, rejects_cos_metric) {
   EXPECT_FALSE(std::filesystem::exists(target));
 }
 
-TEST(LaserSegmentImporterConstructorTest, rejects_dim_below_floor) {
-  try {
-    LaserSegmentImporter importer(64, core::Metric::l2, {});
-    (void)importer;
-    FAIL() << "expected dim floor rejection";
-  } catch (const std::runtime_error &e) {
-    const std::string msg = e.what();
-    EXPECT_TRUE(contains(msg, "64")) << msg;
-    EXPECT_TRUE(contains(msg, "128")) << msg;
+TEST(LaserSegmentImporterConstructorTest, accepts_boundaries_and_non_power_of_two_dim) {
+  for (const uint32_t dim : {33U, 63U, 64U, 96U, 768U, 2048U}) {
+    EXPECT_NO_THROW({
+      LaserSegmentImporter importer(dim, core::Metric::l2, {});
+      ::alaya::laser::FHTRotator rotator(dim);
+      (void)importer;
+      (void)rotator;
+    }) << "dim=" << dim;
   }
 }
 
-TEST(LaserSegmentImporterConstructorTest, rejects_dim_not_power_of_two) {
+TEST(LaserSegmentImporterConstructorTest, rejects_dim_below_fht_range) {
   try {
-    LaserSegmentImporter importer(300, core::Metric::l2, {});
+    LaserSegmentImporter importer(32, core::Metric::l2, {});
     (void)importer;
-    FAIL() << "expected power-of-two rejection";
+    FAIL() << "expected lower-bound rejection";
   } catch (const std::runtime_error &e) {
     const std::string msg = e.what();
-    EXPECT_TRUE(contains(msg, "300")) << msg;
-    EXPECT_TRUE(contains(msg, "power of two")) << msg;
+    EXPECT_TRUE(contains(msg, "32")) << msg;
+    EXPECT_TRUE(contains(msg, "[33, 2048]")) << msg;
   }
+  EXPECT_THROW({ ::alaya::laser::FHTRotator rotator(32); }, std::invalid_argument);
+}
+
+TEST(LaserSegmentImporterConstructorTest, rejects_dim_above_fht_range) {
+  try {
+    LaserSegmentImporter importer(2049, core::Metric::l2, {});
+    (void)importer;
+    FAIL() << "expected upper-bound rejection";
+  } catch (const std::runtime_error &e) {
+    const std::string msg = e.what();
+    EXPECT_TRUE(contains(msg, "2049")) << msg;
+    EXPECT_TRUE(contains(msg, "[33, 2048]")) << msg;
+  }
+  EXPECT_THROW({ ::alaya::laser::FHTRotator rotator(2049); }, std::invalid_argument);
 }
 
 TEST_F(LaserSegmentImporterTest, manifest_records_x_laser_extras) {

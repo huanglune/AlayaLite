@@ -778,8 +778,10 @@ class Collection {
     } else if (requested_algorithm == core::algorithm::laser && schema.metric != core::Metric::l2) {
       resolution.fallback_reason = "laser requires l2 metric; built Flat instead";
     } else if (requested_algorithm == core::algorithm::laser &&
-               (schema.dim < 128 || (schema.dim & (schema.dim - 1)) != 0)) {
-      resolution.fallback_reason = "laser requires a power-of-two dim >= 128; built Flat instead";
+               !::alaya::disk::laser_importer_detail::dimension_supported_v1(schema.dim)) {
+      resolution.fallback_reason =
+          "laser requires dim in [33, 2048]; non-power-of-two dims use FHT padding; built Flat "
+          "instead";
     } else {
       resolution.fallback_reason = "requested Collection target '" +
                                    std::string(registration->factory_key) +
@@ -856,8 +858,9 @@ class Collection {
     }
     // 2B active engine (ruling 7 / B-08). Default flat is always valid. The on-disk
     // mutable LASER active engine constrains the schema hard: L2 + float32 + rabitq +
-    // a power-of-two dim >= 128 + FastScan-legal max_neighbors in {32,64} (32-slot
-    // block packing, QGScanner cap 64) + target_algorithm=laser (v1 single engine).
+    // dim in [33,2048] (non-power-of-two dims use the same FHT padding as sealed
+    // LASER) + FastScan-legal max_neighbors in {32,64} (32-slot block packing,
+    // QGScanner cap 64) + target_algorithm=laser (v1 single engine).
     if (options.active_engine != core::algorithm::flat &&
         options.active_engine != core::algorithm::laser) {
       return error(core::StatusCode::not_supported,
@@ -877,16 +880,18 @@ class Collection {
     }
 #endif
     if (options.active_engine == core::algorithm::laser) {
-      const bool power_of_two = options.dim >= 128 && (options.dim & (options.dim - 1)) == 0;
+      const bool dimension_supported =
+          ::alaya::disk::laser_importer_detail::dimension_supported_v1(options.dim);
       if (options.metric != core::Metric::l2 || options.scalar_type != core::ScalarType::float32 ||
-          options.quantization != CollectionQuantization::rabitq || !power_of_two ||
+          options.quantization != CollectionQuantization::rabitq || !dimension_supported ||
           (options.max_neighbors != 32 && options.max_neighbors != 64) ||
           options.target_algorithm != core::algorithm::laser) {
         return error(core::StatusCode::invalid_argument,
                      stage,
                      core::StatusDetail::malformed_struct,
-                     "active LASER engine requires metric=l2, float32, quantization=rabitq, a "
-                     "power-of-two dim>=128, max_neighbors in {32,64}, target_algorithm=laser");
+                     "active LASER engine requires metric=l2, float32, quantization=rabitq, "
+                     "dim in [33,2048] (non-power-of-two dims use FHT padding), max_neighbors "
+                     "in {32,64}, target_algorithm=laser");
       }
     }
     return core::Status::success();

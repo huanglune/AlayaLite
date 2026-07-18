@@ -23,7 +23,7 @@
 namespace alaya {
 namespace {
 
-constexpr std::uint32_t kDim = 128;  // LASER floor: power-of-two, >= 128.
+constexpr std::uint32_t kDim = 128;  // Historical lifecycle fixture dimension.
 constexpr core::RowCount kRows = 200;
 constexpr std::uint64_t kTopK = 10;
 
@@ -68,10 +68,11 @@ struct Dataset {
   return result;
 }
 
-[[nodiscard]] auto active_laser_options(const std::filesystem::path &root) -> CollectionOptions {
+[[nodiscard]] auto active_laser_options(const std::filesystem::path &root,
+                                        std::uint32_t dimension = kDim) -> CollectionOptions {
   CollectionOptions options;
   options.root = root;
-  options.dim = kDim;
+  options.dim = dimension;
   options.metric = core::Metric::l2;
   options.scalar_type = core::ScalarType::float32;
   options.target_algorithm = core::algorithm::laser;
@@ -129,6 +130,34 @@ void insert_dataset(Collection &collection, const Dataset &dataset) {
     }
   }
   return found;
+}
+
+TEST(CollectionActiveLaserDimensionGate, NonPowerOfTwoDimensionCreatesAndReopens) {
+  TemporaryDirectory dir("dim-768");
+  auto created = Collection::create(active_laser_options(dir.path(), 768));
+  ASSERT_TRUE(created.ok()) << created.status().diagnostic();
+  auto collection = std::move(created).value();
+  EXPECT_EQ(collection->active_algorithm(), core::algorithm::laser);
+  ASSERT_TRUE(collection->close().ok());
+  collection.reset();
+
+  auto reopened = Collection::open(dir.path());
+  ASSERT_TRUE(reopened.ok()) << reopened.status().diagnostic();
+  auto restored = std::move(reopened).value();
+  EXPECT_EQ(restored->active_algorithm(), core::algorithm::laser);
+  EXPECT_TRUE(restored->close().ok());
+}
+
+TEST(CollectionActiveLaserDimensionGate, DimensionsOutsideFhtRangeRejectBeforePersistence) {
+  for (const std::uint32_t dimension : {32U, 2049U}) {
+    TemporaryDirectory dir("invalid-dim-" + std::to_string(dimension));
+    auto created = Collection::create(active_laser_options(dir.path(), dimension));
+    ASSERT_FALSE(created.ok()) << "dim=" << dimension;
+    EXPECT_EQ(created.status().code(), core::StatusCode::invalid_argument) << "dim=" << dimension;
+    EXPECT_NE(created.status().diagnostic().find("dim in [33,2048]"), std::string::npos)
+        << "dim=" << dimension << ": " << created.status().diagnostic();
+    EXPECT_FALSE(std::filesystem::exists(dir.path())) << "dim=" << dimension;
+  }
 }
 
 TEST(CollectionActiveLaser, CreateWriteSearchRemoveCloseReopen) {

@@ -5,7 +5,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 # RaBitQ format contracts
 
-AlayaLite has two mathematically equivalent RaBitQ graph pipelines with different storage
+AlayaLite has two RaBitQ graph pipelines with different rotation mathematics and storage
 contracts. Use **memory_qg** for the in-memory graph built around `RaBitQSpace`, and
 **disk_laser_qg** for LASER's disk-resident quantized graph. The compatibility aliases live in
 `include/index/graph/qg_naming.hpp`. The memory surface is the public
@@ -22,7 +22,7 @@ types or interchangeable wire formats.
 | Current version | v1, implicit (no format tag in the snapshot) | v1, implicit (no format tag in the index page) |
 | Graph surface | `alaya::memory_qg::Segment<RaBitQSpace<...>>` | `alaya::disk_laser_qg::{Builder, Graph}` |
 | Rotation | `RotatorType` is serialized in the snapshot. The default is `FhtKacRotator`: four sign-flip/FHT rounds (with Kac walks when padding requires them). `MatrixRotator` and the registered `FhtRotator` are selectable legacy alternatives. | The graph owns the concrete single-round `laser::FHTRotator`, corresponding to `RotatorType::FhtRotator`. Its sign-scaled vector is stored in the companion `_rotator` artifact. |
-| Padding | The selected rotator determines padding; the default path rounds up for 64-wide fast scan and supports the FhtKac padding/truncation rules. | `padded_dim = 2^ceil(log2(main_dim))`, and the current graph constructor requires `main_dim == padded_dim` (a power of two). Node/page tails are zero-filled. |
+| Padding | The selected rotator determines padding; the default path rounds up for 64-wide fast scan and supports the FhtKac padding/truncation rules. | The v1 public LASER path admits `33 <= main_dim <= 2048`: its single-round `laser::FHTRotator` selects orders 6 through 11 using `ceil(log2(main_dim))`, so dimensions 33 through 64 use the order-6 table and `main_dim` need not be a power of two. Raw/exact terms retain `main_dim`, while FHT, RaBitQ codes, and FastScan use `padded_dim = 2^ceil(log2(main_dim))`. At graph degree `R`, padding adds `R * (padded_dim - main_dim) / 8` code bytes per node before sector rounding and may therefore grow the page allocation; node/page tails are zero-filled. |
 | Binary sign convention | A residual component `> 0` produces bit 1. The initial per-vector byte is formed most-significant-bit first, then `fastscan::pack_codes` transposes groups of 32 codes into nibble/SIMD order and zero-pads missing lanes. | A residual component `> 0` produces bit 1. Bits are first packed through 64-bit words, then each word's byte order and each byte's nibbles are reversed before LASER's 32-code nibble transpose; missing lanes are zero-padded. The intermediate bit/byte order is therefore a separate contract even where the current final fast-scan blocks compare equal. |
 | Factors | Two structure-of-arrays blocks: `f_add[degree]`, then `f_rescale[degree]`. | Three structure-of-arrays blocks: `triple_x[degree]`, then `factor_dq[degree]`, then `factor_vq[degree]`. `laser::Factor` documents this field order; page storage is not an array of `Factor`. |
 | Serialization destination | `RaBitQSpace::save` snapshot. Each stored node is raw vector, packed neighbor codes, all `f_add`, all `f_rescale`, then neighbor IDs; rotator state is also embedded in the snapshot. | LASER `.index` pages after a 4096-byte metadata sector. Each node payload is raw main/residual vector, packed codes, all three factor arrays, then neighbor IDs. Rotation is a companion artifact. |

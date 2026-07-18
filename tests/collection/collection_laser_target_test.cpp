@@ -52,7 +52,7 @@
 namespace alaya {
 namespace {
 
-constexpr std::uint32_t kDim = 128;    // LASER v1 floor: power-of-two, >= 128.
+constexpr std::uint32_t kDim = 128;    // Historical lifecycle fixture dimension.
 constexpr core::RowCount kRows = 384;  // > RaBitQSpace<>::kDegreeBound (32).
 constexpr core::RowCount kQueryCount = 16;
 constexpr core::RowCount kTopK = 10;

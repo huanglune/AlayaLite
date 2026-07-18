@@ -248,12 +248,13 @@ inline constexpr std::array<CollectionTargetRegistration, 3> kCollectionTargetRe
 //   - metric: L2 only. The LASER kernel family is L2-only end to end (see
 //     include/index/graph/laser/space/, which has only l2.hpp -- unlike qg,
 //     which also supports inner_product via RaBitQSpace<>'s IP variant).
-//   - dim: LaserSegmentImporter's constructor hard-requires a power-of-two
-//     dim >= 128 (v1 LASER floor); gating on it here is what makes the
-//     "unsupported -> fall back to flat" contract actually hold, since
-//     without this check an incompatible dim would only be discovered
-//     inside build_laser_collection_target() (as a build-time Status
-//     failure, not a silent, graceful fallback).
+//   - dim: LaserSegmentImporter admits [33, 2048]. LASER's single-round
+//     FHTRotator pads a non-power-of-two dimension to 2^ceil(log2(dim)); the
+//     RaBitQ codebook and FastScan consume that padded width while raw/exact
+//     terms retain schema.dim. Gating on the same range here makes the
+//     "unsupported -> fall back to flat" contract hold; otherwise an
+//     incompatible dim would only be discovered inside
+//     build_laser_collection_target() as a build failure.
 // Any schema/row-count combination that fails this returns `unsupported`,
 // so resolve_build_algorithm() (collection.hpp) silently falls back to
 // flat -- this function's return value is the only signal that decides
@@ -263,8 +264,8 @@ inline constexpr std::array<CollectionTargetRegistration, 3> kCollectionTargetRe
                                                const CollectionTargetBuildParams &params)
     -> TargetSupport {
   constexpr std::uint8_t kRaBitQQuantization = 3;
-  const auto dim_is_power_of_two = schema.dim != 0 && (schema.dim & (schema.dim - 1)) == 0;
-  const auto dim_supported = schema.dim >= 128 && dim_is_power_of_two;
+  const auto dim_supported =
+      ::alaya::disk::laser_importer_detail::dimension_supported_v1(schema.dim);
   return static_cast<std::uint8_t>(params.quantization) == kRaBitQQuantization &&
                  schema.scalar_type == core::ScalarType::float32 &&
                  schema.metric == core::Metric::l2 && dim_supported &&

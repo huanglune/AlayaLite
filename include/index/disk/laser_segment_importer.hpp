@@ -22,12 +22,29 @@
   #include "platform/fs.hpp"
 #endif
 
+#include <cstdint>
 #include <filesystem>
 
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
 
 namespace alaya::disk {
+
+namespace laser_importer_detail {
+
+// LASER's concrete single-round FHTRotator selects helper tables by
+// ceil_log2(dim), with orders 6 through 11. Consequently the raw-dimension
+// interval is [2^5 + 1, 2^11] == [33, 2048]: dimensions 33 through 64 all pad
+// to the order-6 table. Unlike the retired importer gate, raw dim need not be
+// a power of two.
+inline constexpr uint32_t kMinDimensionV1 = (uint32_t{1} << 5U) + 1U;
+inline constexpr uint32_t kMaxDimensionV1 = uint32_t{1} << 11U;
+
+[[nodiscard]] constexpr auto dimension_supported_v1(uint32_t dim) noexcept -> bool {
+  return dim >= kMinDimensionV1 && dim <= kMaxDimensionV1;
+}
+
+}  // namespace laser_importer_detail
 
 #if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER != 0
 
@@ -70,8 +87,6 @@ struct Artifact {
   std::string manifest_key;
   bool present{true};
 };
-
-inline auto is_power_of_two(uint32_t v) -> bool { return v != 0 && (v & (v - 1U)) == 0; }
 
 inline auto metric_name(core::Metric metric) -> std::string {
   if (metric == core::Metric::inner_product) {
@@ -213,16 +228,18 @@ inline LaserSegmentImporter::LaserSegmentImporter(uint32_t dim,
                                                   core::Metric metric,
                                                   LaserSegmentImportParams params)
     : dim_(dim), metric_(metric), params_(params) {
-  if (dim == 0) {
-    throw std::runtime_error("LaserSegmentImporter: dim must be > 0");
-  }
-  if (!laser_importer_detail::is_power_of_two(dim)) {
+  // The raw/exact vector stays `dim` floats. FHT, RaBitQ codes, and FastScan
+  // use padded_dim = 2^ceil(log2(dim)); for degree R this adds
+  // R * (padded_dim - dim) / 8 persistent code bytes per row before sector
+  // rounding, plus padded query/rotator scratch. Example: 768 -> 1024 costs
+  // 2,048 code bytes per row at R=64. Page geometry remains derived from the
+  // resulting row length, so padding can also raise the on-disk 4 KiB page
+  // allocation.
+  if (!laser_importer_detail::dimension_supported_v1(dim)) {
     throw std::runtime_error("LaserSegmentImporter: dim " + std::to_string(dim) +
-                             " must be a power of two");
-  }
-  if (dim < 128) {
-    throw std::runtime_error("LaserSegmentImporter: dim " + std::to_string(dim) +
-                             " is below the v1 LASER floor of 128");
+                             " is outside the supported LASER FHT range [" +
+                             std::to_string(laser_importer_detail::kMinDimensionV1) + ", " +
+                             std::to_string(laser_importer_detail::kMaxDimensionV1) + "]");
   }
   if (params_.main_dim != 0 && params_.main_dim != dim_) {
     throw std::runtime_error("LaserSegmentImporter: main_dim must be 0 or equal dim (main_dim=" +
