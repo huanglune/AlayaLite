@@ -142,12 +142,12 @@ struct SegmentOp {
   std::uint64_t watermark{};       // publish
   std::uint8_t target_slot{};      // superblock_flip
   // 2A label transaction. tx_id mirrors the frame batch_id (validated on replay).
-  std::uint64_t tx_id{};                     // label_bind, tx_publish
-  std::uint64_t row_op_id{};                 // label_bind: 0..binding_count-1 within the bundle
-  std::uint32_t pid_generation{};  // label_bind: 0 without reuse; current non-zero on reuse
-  std::uint64_t label{};                     // label_bind: appended-row label (pid stored in `pid`)
-  std::uint64_t new_pid_watermark{};         // tx_publish: old_hwm + binding_count
-  std::uint64_t binding_count{};             // tx_publish: >= 1
+  std::uint64_t tx_id{};              // label_bind, tx_publish
+  std::uint64_t row_op_id{};          // label_bind: 0..binding_count-1 within the bundle
+  std::uint32_t pid_generation{};     // label_bind: 0 without reuse; current non-zero on reuse
+  std::uint64_t label{};              // label_bind: appended-row label (pid stored in `pid`)
+  std::uint64_t new_pid_watermark{};  // tx_publish: old_hwm + binding_count
+  std::uint64_t binding_count{};      // tx_publish: >= 1
   std::uint64_t applied_collection_op_id{};  // tx_publish: caller monotone op watermark
 };
 

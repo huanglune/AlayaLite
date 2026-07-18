@@ -4,9 +4,8 @@
 
 # AlayaLaser.cmake - the LASER disk-index module: backend wiring and the alaya_laser INTERFACE target.
 #
-# Backend selection (libaio / thread pool; the Windows IOCP backend was removed) is validated and
-# pinned in AlayaOptions.cmake; this module resolves the backend's system dependencies and defines
-# the consumer surface.
+# Backend selection (libaio / thread pool; the Windows IOCP backend was removed) is validated and pinned in
+# AlayaOptions.cmake; this module resolves the backend's system dependencies and defines the consumer surface.
 
 include_guard(GLOBAL)
 
