@@ -228,6 +228,14 @@ alone is a consistency device, not a durability claim.
 
 ### 8. Active engine — the mutable LASER segment as a Collection generation (2B)
 
+**Platform admission.** The writable path in this section is Linux-only
+(`ALAYA_COLLECTION_HAS_ACTIVE_LASER`: `ALAYA_ENABLE_LASER` on Linux). On any
+other platform or a non-LASER build, `active_engine=laser` must be rejected by
+options validation *before* the first filesystem mutation of `create()` — a
+capability failure never leaves a persisted schema/control layout behind.
+Sealed LASER keeps its own platform matrix and is not constrained by this
+section.
+
 A Collection's **active (writable) generation** may be a durable on-disk mutable
 LASER segment (`active_engine=laser`) instead of the in-memory flat table. The
 label-transaction op-WAL (kinds 7/8) is then the physical durability layer; the

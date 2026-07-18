@@ -47,12 +47,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The C++ `alaya::Collection` API can now select
   `CollectionOptions::active_engine=core::algorithm::laser` for its active
   writable generation. The persisted path covers create, write, search,
-  remove, close/reopen, seal, and rotation to a sealed LASER generation, with
-  orphan active directories reclaimed on the next open. This mode supports
-  `wal_fsync` durability and the LASER geometry contract (L2, float32, RaBitQ,
-  power-of-two dimension at least 128, `max_neighbors` 32 or 64, and a LASER
-  sealed target). This reachability is C++-only and Linux-only (the active
-  write stack needs flock, O_DIRECT and libaio); the canonical Python
+  remove, close/reopen, seal, and rotation to a sealed LASER generation.
+  Orphan active directories from a completed rotation are reclaimed on the
+  next open; sources referenced by an interrupted rotation are kept through
+  recovery and reclaimed on the first idle open after it completes. This mode
+  supports `wal_fsync` durability and the LASER geometry contract (L2,
+  float32, RaBitQ, power-of-two dimension at least 128, `max_neighbors` 32 or
+  64, and a LASER sealed target). This reachability is C++-only and
+  Linux-only: the active write stack needs Linux writer primitives (flock,
+  O_DIRECT, sync_file_range), while the LASER page reader works on either the
+  default libaio backend or the `ALAYA_LASER_USE_THREADPOOL` fallback. Builds
+  without the capability reject `active_engine=laser` during options
+  validation, before any on-disk layout is created. The canonical Python
   Collection binding continues to accept only `flat` and `qg`.
 - A shared bottom-layer `wal/frame.hpp` module owns the Physical WAL v1 framing
   (WAL7 envelope, CRC, scan, `WalFile`, byte `Decoder`) for both the collection
@@ -116,6 +122,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and its beam-search/disk-layout implementation. `algorithm::diskann`
   remains reserved and is rejected by the capability gate. The research
   line lives on in the `feat/diskann-delete-repair` branch.
+- The Windows LASER build. The never-completed IOCP PageReader backend was
+  removed, `ALAYA_ENABLE_LASER` now defaults to `OFF` on Windows, and
+  requesting it explicitly fails at configure time; the Windows x64 wheel
+  ships without the native LASER module (matching the ARM wheels). Earlier
+  releases documented Windows x64 sealed-LASER support; this release
+  withdraws it. macOS sealed LASER (thread-pool backend) is unchanged.
 
 ### Fixed
 
