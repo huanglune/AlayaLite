@@ -9,12 +9,12 @@
 ## W3 收尾状态（2026-07-18）
 
 - 开工锚点：`90631a090bf5c5988d6f85d3e5d8fae034d34e58`，分支与工作树均经核对；手册原坐标 `3ca919e` 仅作为历史对照。开工时 step 5–8、R0–R11、`EffectCommitUnit`、`validate_flip_transition`、逐 PID allocation evidence 与 standalone classifier 均已落地。
-- 当前 W3 代码/测试 HEAD：`8ed24b4`；最终文档提交与终验 HEAD 在验收完成后更新。
-- 环境：Linux 6.8 x86_64，GCC 11.4.0，`build/Release` 为 `Release`、`ALAYA_ENABLE_LASER=ON`、`BUILD_PYTHON=OFF`；增量构建使用满核。
+- 最终验证代码/测试 HEAD：`950852c5e67196b9ede10652b038d4c852cdcfc5`；其后的提交仅固定本节终验实录。交接最终 HEAD 以包含本段的报告提交及外部执行报告中的 `git rev-parse HEAD` 为准。
+- 环境：Linux `6.8.0-59-generic` x86_64，GCC 11.4.0，CMake 3.30.5；`build/Release` 为 `Release`、`ALAYA_ENABLE_LASER=ON`、`BUILD_PYTHON=OFF`，增量构建使用满核。
 - W0：恢复基座、v2/v3 fail-closed 选择、Bloom 映射修复完成。
 - W1：kinds 3/4 维护事务、private overlay、no-steal、流式 replay、canonical free-chain 与 C 矩阵完成；page worker 仍按 JC-8 串行。
 - W2：step 1–8 全部完成；canonical bundle-only PID reuse、v3 activation、token 化、R0–R11 与 leg10 reader/replay 收敛均为当前基线。
-- W3：Collection consolidate 接入、门禁链、poison 提升、双 v3 role handoff、B03/durability/B09/filter/flock/statvfs/ENOSPC/SI、active 搜索参数保真与 reuse 携带硬族均完成；release 全量与 TSan 结果在最终验收段实录。
+- W3：Collection consolidate 接入、门禁链、poison 提升、双 v3 role handoff、B03/durability/B09/filter/flock/statvfs/ENOSPC/SI、active 搜索参数保真与 reuse 携带硬族均完成；Release 91/91、标签集 50/50 与 TSan 最小面 3/3 均通过。
 
 ### W3 增量提交序
 
@@ -29,6 +29,8 @@
 | `27edbbd` | active/sealed 共用 LASER search extension 解析与 effort/beam 传递 |
 | `d80a15a` | active/sealed 参数准入与 active 展开量证据 |
 | `8ed24b4` | query 隔离、all-reuse×checkpoint、saturated-FREE、poison 2 |
+| `958cd5c` | W3 vocabulary、CHANGELOG 与本报告设计/批次记录 |
+| `950852c` | 测试 failpoint gate 的 TSan-safe 原子同步 |
 
 ### 3ca919e → 90631a0 重锚摘要
 
@@ -84,7 +86,12 @@
 
 - 开工基线：R/crash 31/31、reuse 55/55、Divergence 8/8、kind1–8 golden 2/2。
 - W3 聚焦：Collection 6/6 + 7/7，QG SI 6/6，B09 5/5，adapter 10/10，reuse 59/59；均为实际运行结果。
-- Release 标签全量、明确套件复跑、TSan override 与最终 HEAD：终验完成后填写；未运行项不标绿。
+- Release 全构建：`~/.local/bin/cmake --build build/Release -j$(nproc)` 退出码 0；mutable adapter、segmented/collection 和 disk LASER header-closure/相关目标均已编译。
+- Release 全 CTest：`ctest --preset release --output-on-failure -j$(nproc)` 为 91/91（27.32 s）。标签全量 `ctest --test-dir build/Release -L 'laser|wal|segment|crash|collection|canonical' --output-on-failure -j$(nproc)` 为 50/50（28.64 s）。
+- 明确套件：R0–R11/reuse crash 31/31（23.376 s），QG reuse 59/59（24.508 s），`Divergence/*` 8/8（3.871 s），kind1–8 golden 2/2；四个新增 Collection CTest targets 4/4（3.23 s）。
+- TSan 配置：`cmake --preset tsan -DALAYA_ENABLE_LASER=ON -DBUILD_PYTHON=OFF`；cache 为 Debug、LASER ON、Python OFF、`-fsanitize=thread -fno-omit-frame-pointer -O1`。三个手册指定 target 均编译成功；运行前 `aio-nr=0`、`aio-max-nr=65536`。
+- TSan 初跑分别暴露新增测试 condition-variable gate 的 double-lock 报告和既有 OpenMP Vamana builder 并行报告。测试 gate 改为 acquire/release 原子轮询后，以 `OMP_NUM_THREADS=1 OMP_THREAD_LIMIT=1` 隔离 deferred builder 并行面；最终 `setarch x86_64 -R env OMP_NUM_THREADS=1 OMP_THREAD_LIMIT=1 TSAN_OPTIONS='halt_on_error=1:history_size=7' ctest --test-dir build/TSan --output-on-failure -j1 -R 'collection_active_laser_maintenance|mutable_laser_adapter|qg_maintenance_concurrency'` 为 3/3（8.92 s），无 sanitizer 报告。测试自身 query/checkpoint/maintenance worker 仍并发；不声明覆盖 deferred OpenMP maintenance page workers。
+- 红线审计：`types.hpp` 仅 hook/receipt；`segment_op_wal.hpp` 仅 append-only failpoint；生产 encode/wire、STATE、descriptor 与持久文件集合不变；未触碰 `dispatch.hpp`、`detect.hpp`、ManifestGate 断言，未新增 kind 9 或 `.maint/.shadow/.pidgen`。
 
 ## W0-W2 历史执行记录
 
@@ -226,7 +233,7 @@
 
 1. **`close()` does not release the active LASER single-writer flock** -- only destroying the Collection does (RAII). Reopening the same path needs the old handle dropped; the exclusivity lease is by design.
 2. **Filter pushdown to the active LASER segment is not wired.** `MutableLaserSegment::search` drops the segment filter, so the adapter reports `approximate` (not `filtered`) and the Collection postfilters. Correct, less efficient; a follow-up can thread the filter through.
-3. **In-process immediate orphan reclamation** -- orphan active dirs are reclaimed on the next open (bounded); reclaiming them the instant a sealed source is GC-retired is a follow-up (the sealed adapter's flock is released on retirement regardless).
+6. **In-process immediate orphan reclamation** -- orphan active dirs are reclaimed on the next open (bounded); reclaiming them the instant a sealed source is GC-retired is a follow-up (the sealed adapter's flock is released on retirement regardless).
 
 ### 其它边界
 
@@ -240,13 +247,13 @@
 - W1 part 1:frame streaming/location API + consolidate failpoints。
 - W1 part 2:consolidate maintenance transaction(overlay + epoch state machine + free-list post-redo + v3 activation + SIGKILL 矩阵)。
 - W2:step 2–8 commits 见上表；leg6–10 继续以 fail-closed 状态机和真 SIGKILL 矩阵收敛。
-- W3:`451d490`、`50c9554`、`ada2b5a`、`cc768aa`、`ecd1be5`、`d96d6ef`、`27edbbd`、`d80a15a`、`8ed24b4`；文档/终验提交在最终 HEAD 处补记。
+- W3:`451d490`、`50c9554`、`ada2b5a`、`cc768aa`、`ecd1be5`、`d96d6ef`、`27edbbd`、`d80a15a`、`8ed24b4`、`958cd5c`、`950852c`，以及包含最终验收实录的报告提交。
 
 ## 七、完成项与剩余边界
 
 - **W1 hardening 完成**：C0–C11、掉电 roll-forward、statvfs 精确上界、oracle 等价、no-steal、流式 replay、install seqlock exception closure 均已落。
 - **W2 完成**：step 1–8、R0–R11、adapter token/ABA、activation/slot、三 poison 与全部携带硬族均有证据。JC-22 retained-kind6 前态模型仍是 robustness belt-and-suspenders 债务，不是可写入 corruption 路径。
-- **W3 完成**：Collection hook/门禁、dual-v3、B03/durability/B09/filter/flock/rerank/SI/statvfs/ENOSPC、搜索参数保真和文档均已落；最终 release/TSan 数字在验收结束后固定。
+- **W3 完成**：Collection hook/门禁、dual-v3、B03/durability/B09/filter/flock/rerank/SI/statvfs/ENOSPC、搜索参数保真和文档均已落；Release 91/91、标签集 50/50、TSan 3/3 与指定套件计数已固定在顶部验收段。
 - **仍 deferred**：JC-8 并行 OpenMP maintenance page workers；garden under WAL；active filter pushdown；in-process immediate orphan reclaim。上述均不影响当前串行维护事务的正确性。
 
 ---
