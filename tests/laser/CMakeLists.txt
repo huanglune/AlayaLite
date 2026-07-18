@@ -165,6 +165,20 @@ alaya_add_test(
   LABELS laser wal persistence
 )
 
+alaya_cc_target(
+  test_qg_maintenance_concurrency
+  BARE GTEST
+  SRCS qg/test_qg_maintenance_concurrency.cpp
+  LIBS alaya_laser
+  OPTS ${_laser_test_opts}
+)
+alaya_add_test(
+  NAME laser_test_qg_maintenance_concurrency
+  TARGET test_qg_maintenance_concurrency
+  LABELS laser wal persistence tsan
+  TIMEOUT 120
+)
+
 # G1 crash matrix: SIGKILL/failpoint cuts + a power-loss persistence model.
 alaya_cc_target(
   test_segment_op_wal_crash

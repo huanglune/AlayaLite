@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
@@ -16,6 +17,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "index/collection/detail/mutable_laser_collection_adapter.hpp"
@@ -337,6 +339,53 @@ TEST(MutableLaserAdapter, MaintenanceFlagRejectsPrepareWhileSearchContinues) {
 
   gate.release();
   EXPECT_TRUE(maintenance.get().ok());
+  std::filesystem::remove_all(dir);
+}
+
+TEST(MutableLaserAdapter, StatvfsFailureBeforeBeginClearsMaintenanceWithoutLatch) {
+  const auto dir = scratch("maintenance_statvfs");
+  std::atomic_bool armed{true};
+  auto seg = open_empty(dir, [&](laser::SegmentOpFailPoint point) {
+    if (point == laser::SegmentOpFailPoint::before_consolidate_statvfs &&
+        armed.exchange(false, std::memory_order_acq_rel)) {
+      throw std::system_error(std::make_error_code(std::errc::io_error),
+                              "injected statvfs failure");
+    }
+  });
+  MutableLaserCollectionAdapter adapter(seg, schema(), kSegId, kGen);
+
+  auto failed = adapter.consolidate(1, 0, true, false);
+  EXPECT_FALSE(failed.ok());
+  EXPECT_FALSE(adapter.is_latched());
+  const auto vector = ramp(70);
+  EXPECT_TRUE(drive(adapter, make_write(701, 70, vector, std::nullopt), 701, 701).ok());
+  core::CheckpointContext context;
+  core::CheckpointToken token;
+  EXPECT_TRUE(adapter.checkpoint(context, token).ok());
+  EXPECT_TRUE(adapter.consolidate(1, 0, true, false).ok());
+  EXPECT_FALSE(adapter.is_latched());
+  std::filesystem::remove_all(dir);
+}
+
+TEST(MutableLaserAdapter, FailureAfterDurableBeginLatchesAndGatesCheckpoint) {
+  const auto dir = scratch("maintenance_after_begin");
+  std::atomic_bool armed{true};
+  auto seg = open_empty(dir, [&](laser::SegmentOpFailPoint point) {
+    if (point == laser::SegmentOpFailPoint::after_consolidate_begin_fsync &&
+        armed.exchange(false, std::memory_order_acq_rel)) {
+      throw std::system_error(std::make_error_code(std::errc::no_space_on_device),
+                              "injected post-BEGIN ENOSPC");
+    }
+  });
+  MutableLaserCollectionAdapter adapter(seg, schema(), kSegId, kGen);
+
+  auto failed = adapter.consolidate(1, 0, true, false);
+  EXPECT_FALSE(failed.ok());
+  EXPECT_TRUE(adapter.is_latched());
+  core::CheckpointContext context;
+  core::CheckpointToken token;
+  EXPECT_FALSE(adapter.checkpoint(context, token).ok());
+  EXPECT_FALSE(adapter.consolidate(1, 0, true, false).ok());
   std::filesystem::remove_all(dir);
 }
 
