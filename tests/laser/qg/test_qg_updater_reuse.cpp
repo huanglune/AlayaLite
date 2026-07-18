@@ -563,6 +563,139 @@ TEST(QgUpdaterReuse, CraftedFlipTargetsActiveSlotFailsClosedBeforeWrite) {
   std::filesystem::remove_all(dir);
 }
 
+// B3 completion (leg-9, r3 section 1): the validate_flip_transition family the r3 review reached
+// that leg-8's three crafted flips (geometry/short-file/active-slot) did NOT cover. Each is CRC-legal
+// and passes the selector + label-slot self-consistency, yet must be rejected BEFORE any pwrite.
+TEST(QgUpdaterReuse, CraftedFlipCapacityExceededFailsClosedBeforeWrite) {
+  // num_points within kPidMax but beyond THIS handle's configured capacity (row_generations_ is
+  // sized to max_points == 4*kBaseN): a base with no backing PID/page state for the handle. leg-8
+  // only bounded num_points by kPidMax, so this installed and only failed the NEXT open.
+  assert_crafted_flip_fails_closed("flip_capacity", [](QGSuperblockV2 &image) {
+    image.num_points = 4 * kBaseN + 1;  // capacity == max(max_points, base_n) == 4*kBaseN
+  });
+}
+
+TEST(QgUpdaterReuse, CraftedFlipStaleLabelGenerationFailsClosedBeforeWrite) {
+  // A self-consistent image whose label tuple GENERATION is rewound below the current base's (the
+  // "reference an old valid label slot" input form): the loaded bindings still check out, but a
+  // rewound label generation lets a stale label state pose as the next base. validate_flip_transition
+  // catches the non-monotone label generation; leg-8 never compared the image's label tuple to the
+  // current base's.
+  assert_crafted_flip_fails_closed("flip_stale_label_gen", [](QGSuperblockV2 &image) {
+    // Label tuple lives at reserved+8: slot@0 gen@8 count@16 checksum@24 (matches the bad-label-slot
+    // test above); the label generation is therefore at reserved+8+8 == reserved+16.
+    uint64_t label_gen = 0;
+    std::memcpy(&label_gen, image.reserved.data() + 16, 8);
+    ASSERT_GE(label_gen, 1U) << "the activated base must have a bumped label generation to rewind";
+    label_gen -= 1;  // rewind below the current base's label generation
+    std::memcpy(image.reserved.data() + 16, &label_gen, 8);
+  });
+}
+
+TEST(QgUpdaterReuse, CraftedFlipWatermarkRegressionFailsClosedBeforeWrite) {
+  // The "HWM regression under the EXACT file-size formula" input form: an image whose num_points is
+  // BELOW the recovered watermark, but whose file_size / counts / label tuple are all internally
+  // consistent for that smaller N' (so the short-file and geometry checks do NOT fire). Only the
+  // expected-HWM check catches it; without it the lower base installs and ftruncate deletes the live
+  // data pages above N'. Needs an unlabeled-headroom base so a valid N' exists strictly between the
+  // top label pid and num_points.
+  const auto dir = scratch_dir("flip_hwm_regress");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/53);
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  uint64_t seg_uid = 0;
+  int active_slot = 0;
+  size_t page_size = 0;
+  size_t npp = 0;
+  uint64_t base_np = 0;
+  {
+    ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);
+    const auto v = waltest::make_data(1, kDim, 5);
+    const uint64_t l = 5;
+    s.upd->commit_physical_bundle(1, 1, v.data(), &l, 1);  // activate v3 pid, labels pid kBaseN
+    // Plain appends leave the TOP rows UNLABELED, opening headroom above the only label pid (kBaseN).
+    for (int i = 0; i < 3; ++i) {
+      const auto pv = waltest::make_data(1, kDim, 60 + i);
+      s.upd->insert(pv.data());
+    }
+    s.upd->checkpoint();
+    seg_uid = s.upd->segment_uid();
+    active_slot = s.upd->active_superblock_slot();
+    page_size = s.upd->debug_page_size();
+    npp = s.upd->debug_npp();
+    base_np = s.upd->num_points();
+  }
+  ASSERT_GE(base_np, kBaseN + 4);  // kBaseN base + 1 labeled + 3 unlabeled
+  const QGSuperblockV2 base_sb = read_active_superblock(index_path);
+  const auto index_before = read_all_bytes(index_path);
+
+  const uint64_t n_prime = kBaseN + 2;  // 128 < n' < base_np, and n' > the only label pid (kBaseN)
+  QGSuperblockV2 image = base_sb;
+  image.generation = base_sb.generation + 1;
+  image.num_points = n_prime;
+  const uint64_t page_num = (n_prime + npp - 1) / npp;
+  image.file_size = static_cast<uint64_t>(kSectorLen) + page_num * page_size;  // EXACT for n'
+  image.live_count = n_prime;   // all-live is consistent (<= num_points)
+  image.free_count = 0;
+  image.free_list_head = kPidMax;
+  image.entry_point = 0;  // < n'
+  image.checksum = qg_superblock_checksum(image);
+  const int target_slot = active_slot == 0 ? 1 : 0;
+  std::vector<std::byte> img_bytes(sizeof(image));
+  std::memcpy(img_bytes.data(), &image, sizeof(image));
+  {
+    alaya::wal::WalFile wal(wal_path);
+    wal.append(kSegmentOpRecordType, 0, 1, 0,
+               encode_superblock_flip(seg_uid, image.generation, static_cast<uint8_t>(target_slot),
+                                      std::span<const std::byte>(img_bytes.data(), img_bytes.size())),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  EXPECT_THROW({ ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true); },
+               std::exception)
+      << "an HWM-regressing flip (exact file_size) must poison on the expected-watermark check";
+  EXPECT_EQ(read_all_bytes(index_path), index_before)
+      << "the index must be byte-for-byte unchanged (flip rejected before any pwrite/ftruncate)";
+  std::filesystem::remove_all(dir);
+}
+
+TEST(QgUpdaterReuse, CraftedFlipSameGenerationOpImageMismatchFailsClosedBeforeWrite) {
+  // A SAME-generation retained flip whose FRAME generation is forged to G+1 while its 512-byte image
+  // payload stays at G (byte-identical to the selected base). leg-8 checked op-vs-image generation
+  // only inside validate_flip_transition, reached solely on the G+1 install path -- so this slipped
+  // past the same-generation byte-identical early return. leg-9 moved the check to the top of
+  // replay_flip so it runs for EVERY flip disposition.
+  const auto dir = scratch_dir("flip_opimg_mismatch");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/54);
+  const auto info = activate_v3_pid_base(base.prefix, kBaseN);
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  const QGSuperblockV2 base_sb = read_active_superblock(index_path);
+  const auto index_before = read_all_bytes(index_path);
+
+  // The image is byte-identical to the selected base (same generation G); only the FRAME op
+  // generation is forged to G+1 -- so if the op-vs-image check were still on the install path only,
+  // the same-generation early return would accept it.
+  std::vector<std::byte> img_bytes(sizeof(base_sb));
+  std::memcpy(img_bytes.data(), &base_sb, sizeof(base_sb));
+  const int target_slot = info.active_slot == 0 ? 1 : 0;
+  {
+    alaya::wal::WalFile wal(wal_path);
+    wal.append(kSegmentOpRecordType, 0, 1, 0,
+               encode_superblock_flip(info.seg_uid, base_sb.generation + 1,  // FRAME gen = G+1
+                                      static_cast<uint8_t>(target_slot),
+                                      std::span<const std::byte>(img_bytes.data(), img_bytes.size())),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  EXPECT_THROW({ ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true); },
+               std::exception)
+      << "a flip whose frame generation disagrees with its image generation must poison";
+  EXPECT_EQ(read_all_bytes(index_path), index_before)
+      << "the index must be byte-for-byte unchanged (rejected at the top of replay_flip)";
+  std::filesystem::remove_all(dir);
+}
+
 TEST(QgUpdaterReuse, ActivatedBaseLegacyCrossGenNewTxidPoisonsIndexUnchanged) {
   // NEW-BLOCKER-1: on a pid-ACTIVATED base, a legacy-lane label transaction (segment generation <
   // activation, so is_canonical_generation() routes it to the legacy path) that carries a NEW txid
@@ -781,6 +914,184 @@ TEST(QgUpdaterReuse, OrphanBindThenActivationCheckpointCrashReopenSurvives) {
   std::filesystem::remove_all(dir);
 }
 
+// Build a durable pid-activated v3 base and return the facts a forged-bundle test needs.
+struct ActivatedFacts {
+  uint64_t seg_uid = 0;
+  uint64_t activation_gen = 0;
+  uint64_t cursor_gen = 0;   // the base (replay-cursor) generation
+  uint64_t base_txid = 0;
+  uint64_t old_hwm = 0;
+  size_t page_size = 0;
+  size_t npp = 0;
+};
+ActivatedFacts activate_facts(const std::string &prefix, size_t base_n) {
+  ActivatedFacts f;
+  ReuseSession s(prefix, base_n, 4 * base_n, /*enable_reuse=*/true);
+  const auto v = waltest::make_data(1, kDim, 1);
+  const uint64_t l = 5;
+  s.upd->commit_physical_bundle(1, 1, v.data(), &l, 1);  // activate v3 pid
+  s.upd->checkpoint();
+  EXPECT_TRUE(s.upd->pid_generation_activated());
+  f.seg_uid = s.upd->segment_uid();
+  f.activation_gen = s.upd->pid_reuse_activation_gen();
+  f.cursor_gen = s.upd->generation();
+  f.base_txid = s.upd->last_committed_txid();
+  f.old_hwm = s.upd->num_points();
+  f.page_size = s.upd->debug_page_size();
+  f.npp = s.upd->debug_npp();
+  return f;
+}
+
+// NEW-BLOCKER-1 completion (leg-9, r3 section 2): the r3 case leg-8's test explicitly OMITTED -- a
+// forged legacy bundle with a CURRENT-generation row_patch spliced between the legacy kind=7 and
+// kind=8. leg-8 classified the kind=1 as kApply and wrote it IMMEDIATELY (index changed) before the
+// kind=8 poison; leg-9 STAGES it (pending unit) and applies only at a commit point the forge never
+// reaches, so the index stays byte-for-byte unchanged.
+TEST(QgUpdaterReuse, ActivatedBaseLegacyBundleWithCurrentGenRowPatchStaysUnchanged) {
+  const auto dir = scratch_dir("newb1_rowpatch_bundle");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/56);
+  const auto f = activate_facts(base.prefix, kBaseN);
+  ASSERT_GT(f.activation_gen, 0U);
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  const auto index_before = read_all_bytes(index_path);
+  const uint64_t forged_gen = f.activation_gen - 1;  // legacy lane
+  const uint64_t forged_txid = f.base_txid + 1;      // non-absorbed
+  // A CURRENT-generation (== cursor) whole-page after-image for page 0 with one payload byte flipped:
+  // classified kApply, so a pre-leg-9 build wrote it immediately. Stays staged in leg-9.
+  const size_t target_page = 0;
+  std::vector<char> forged_page(f.page_size);
+  {
+    std::ifstream in(index_path, std::ios::binary);
+    in.seekg(static_cast<std::streamoff>(kSectorLen + target_page * f.page_size));
+    in.read(forged_page.data(), static_cast<std::streamsize>(f.page_size));
+  }
+  forged_page[40] = static_cast<char>(forged_page[40] ^ 0x5A);
+  {
+    alaya::wal::WalFile wal(wal_path);
+    wal.append(kSegmentOpRecordType, 0, 1, forged_txid,
+               encode_label_bind(f.seg_uid, forged_gen, forged_txid, /*row_op=*/0,
+                                 static_cast<uint32_t>(f.old_hwm), /*gen=*/0, /*label=*/6),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType, 0, 2, 0,
+               encode_row_patch(f.seg_uid, f.cursor_gen, /*first_pid=*/target_page * f.npp,
+                                /*offset=*/kSectorLen + target_page * f.page_size,
+                                std::span<const std::byte>(
+                                    reinterpret_cast<const std::byte *>(forged_page.data()),
+                                    f.page_size)),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType, 0, 3, forged_txid,
+               encode_tx_publish(f.seg_uid, forged_gen, forged_txid, /*new_hwm=*/f.old_hwm + 1,
+                                 /*binding_count=*/1, /*applied=*/1),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  EXPECT_THROW({ ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true); },
+               std::exception)
+      << "the legacy cross-generation bundle must poison at the kind=8 commit";
+  EXPECT_EQ(read_all_bytes(index_path), index_before)
+      << "index unchanged: the current-generation kind=1 was STAGED, never applied before the poison";
+  std::filesystem::remove_all(dir);
+}
+
+// NEW-BLOCKER-1 (leg-9): two interleaved legacy transactions prove the staging does not cross tx
+// boundaries -- each kind=7 stages under its own tx_id, and the FIRST effectful legacy commit (a
+// non-absorbed kind=8 on a pid-active base) poisons before anything is applied.
+TEST(QgUpdaterReuse, ActivatedBaseTwoInterleavedLegacyTxPoisonIndexUnchanged) {
+  const auto dir = scratch_dir("newb1_two_tx");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/57);
+  const auto f = activate_facts(base.prefix, kBaseN);
+  ASSERT_GT(f.activation_gen, 0U);
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  const auto index_before = read_all_bytes(index_path);
+  const uint64_t g = f.activation_gen - 1;   // legacy lane for both
+  const uint64_t txa = f.base_txid + 1;      // both non-absorbed
+  const uint64_t txb = f.base_txid + 2;
+  {
+    alaya::wal::WalFile wal(wal_path);
+    wal.append(kSegmentOpRecordType, 0, 1, txa,
+               encode_label_bind(f.seg_uid, g, txa, 0, static_cast<uint32_t>(f.old_hwm), 0, 61),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType, 0, 2, txb,
+               encode_label_bind(f.seg_uid, g, txb, 0, static_cast<uint32_t>(f.old_hwm + 1), 0, 62),
+               alaya::wal::WalFile::Sync::buffered);  // interleaved: tx B's bind before tx A commits
+    wal.append(kSegmentOpRecordType, 0, 3, txa,
+               encode_tx_publish(f.seg_uid, g, txa, f.old_hwm + 1, 1, 1),
+               alaya::wal::WalFile::Sync::fsync);      // first effectful commit -> poison
+  }
+  EXPECT_THROW({ ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true); },
+               std::exception)
+      << "the first non-absorbed legacy commit must poison";
+  EXPECT_EQ(read_all_bytes(index_path), index_before)
+      << "index unchanged: both txs only staged (kind=7), nothing applied before the poison";
+  std::filesystem::remove_all(dir);
+}
+
+// I-2 (leg-9, r3 independent audit): a bare publish that advances the HWM over a row with NO
+// whole-page after-image must poison (a pre-leg-9 build fabricated a live row from a zero-filled
+// absent page on rebuild). Index unchanged (rejected at the publish, nothing applied).
+TEST(QgUpdaterReuse, StandalonePublishWithoutRowPatchPoisonsIndexUnchanged) {
+  const auto dir = scratch_dir("i2_bare_publish");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/58);
+  const auto f = activate_facts(base.prefix, kBaseN);
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  const auto index_before = read_all_bytes(index_path);
+  {
+    alaya::wal::WalFile wal(wal_path);  // a lone current-generation publish(old_hwm + 1), no kind=1
+    wal.append(kSegmentOpRecordType, 0, 1, 0,
+               encode_publish(f.seg_uid, f.cursor_gen, f.old_hwm + 1),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  EXPECT_THROW({ ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true); },
+               std::exception)
+      << "a publish with no page evidence for the new row must poison";
+  EXPECT_EQ(read_all_bytes(index_path), index_before) << "index must be byte-for-byte unchanged";
+  std::filesystem::remove_all(dir);
+}
+
+// I-2 (leg-9): a row_patch followed by a publish that advances PAST the covered page (a malformed
+// publish) -- the new row's page has no after-image in the unit, so the coverage check poisons and
+// the staged (uncommitted) page is never applied.
+TEST(QgUpdaterReuse, StandaloneRowPatchThenMalformedPublishPoisonsIndexUnchanged) {
+  const auto dir = scratch_dir("i2_malformed_publish");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/59);
+  const auto f = activate_facts(base.prefix, kBaseN);
+  ASSERT_GT(f.old_hwm, f.npp);  // page_index(old_hwm) != 0, so page 0 is NOT the new row's page
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  const auto index_before = read_all_bytes(index_path);
+  // Stage a valid whole-page after-image for page 0 (an existing page), then publish(old_hwm+1):
+  // the new row old_hwm lives in page_index(old_hwm) != 0, which the unit does NOT cover.
+  std::vector<char> page0(f.page_size);
+  {
+    std::ifstream in(index_path, std::ios::binary);
+    in.seekg(static_cast<std::streamoff>(kSectorLen));
+    in.read(page0.data(), static_cast<std::streamsize>(f.page_size));
+  }
+  {
+    alaya::wal::WalFile wal(wal_path);
+    wal.append(kSegmentOpRecordType, 0, 1, 0,
+               encode_row_patch(f.seg_uid, f.cursor_gen, /*first_pid=*/0, /*offset=*/kSectorLen,
+                                std::span<const std::byte>(
+                                    reinterpret_cast<const std::byte *>(page0.data()), f.page_size)),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType, 0, 2, 0,
+               encode_publish(f.seg_uid, f.cursor_gen, f.old_hwm + 1),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  EXPECT_THROW({ ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true); },
+               std::exception)
+      << "a publish advancing past the covered page must poison";
+  EXPECT_EQ(read_all_bytes(index_path), index_before)
+      << "index unchanged: the staged page 0 after-image was never applied";
+  std::filesystem::remove_all(dir);
+}
+
 // ---------------------------------------------------------------------------
 // garden() stays gated under reuse (it is still not a WAL maintenance transaction).
 // ---------------------------------------------------------------------------
@@ -869,6 +1180,99 @@ std::vector<PID> walk_free_chain(QGUpdater &upd) {
     ++guard;
   }
   return chain;
+}
+
+// ---------------------------------------------------------------------------
+// I-3 (leg-9, r3 independent audit): the compatibility contract for enable_pid_reuse=true on a base
+// that is NOT yet pid-activated. The classifier + staging are armed by the flag, so a legal
+// plain-append / tombstone crash-prefix must REPLAY to the same state as the legacy immediate-apply
+// path (JC-38 narrows the "legacy zero behavior change" claim to producer-equivalence after opt-in).
+// ---------------------------------------------------------------------------
+TEST(QgUpdaterReuse, LegacyV2PrefixUnderReuseFlagRecoversEquivalentToNoReuse) {
+  const auto dir = scratch_dir("i3_equiv");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/62);
+  // A v2 base + an UN-checkpointed kind1/2/5 crash-prefix. insert() never activates pid reuse, and
+  // ~QGUpdater closes without a checkpoint, so the frames stay in the WAL for replay.
+  {
+    ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);
+    for (int i = 0; i < 3; ++i) {
+      const auto v = waltest::make_data(1, kDim, 90 + i);
+      s.upd->insert(v.data());
+    }
+    s.upd->tombstone(static_cast<PID>(kBaseN));  // kind2 + its page kind1 (mid-prefix)
+    const auto v = waltest::make_data(1, kDim, 99);
+    s.upd->insert(v.data());  // a trailing publish commits the staged pending unit
+    EXPECT_FALSE(s.upd->pid_generation_activated()) << "plain inserts must not activate pid reuse";
+  }
+  // Recover two identical copies -- one with the classifier armed (reuse), one legacy -- and compare.
+  const auto dir_on = scratch_dir("i3_equiv_on");
+  const auto dir_off = scratch_dir("i3_equiv_off");
+  std::filesystem::remove_all(dir_on);
+  std::filesystem::remove_all(dir_off);
+  std::filesystem::copy(dir, dir_on, std::filesystem::copy_options::recursive);
+  std::filesystem::copy(dir, dir_off, std::filesystem::copy_options::recursive);
+  const std::string prefix_on = (dir_on / "wal_base").string();
+  const std::string prefix_off = (dir_off / "wal_base").string();
+  std::string fp_on;
+  std::string fp_off;
+  std::string fp_on2;
+  {
+    ReuseSession s(prefix_on, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);
+    fp_on = full_fp(*s.upd);
+  }
+  {
+    ReuseSession s(prefix_off, kBaseN, 4 * kBaseN, /*enable_reuse=*/false);
+    fp_off = full_fp(*s.upd);
+  }
+  {
+    ReuseSession s(prefix_on, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);  // double reopen
+    fp_on2 = full_fp(*s.upd);
+  }
+  EXPECT_EQ(fp_on, fp_off)
+      << "arming the classifier (staging) must recover the SAME state as legacy immediate-apply";
+  EXPECT_EQ(fp_on, fp_on2) << "double reopen under the reuse flag must be byte-stable";
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(dir_on);
+  std::filesystem::remove_all(dir_off);
+}
+
+// I-3 (leg-9): after the activation flip (pid-active base), post-activation plain appends replay via
+// staging and must recover correctly + be byte-stable across a double reopen.
+TEST(QgUpdaterReuse, ReuseActivatedPlainAppendPrefixDoubleReopenStable) {
+  const auto dir = scratch_dir("i3_activated");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/63);
+  uint64_t after_hwm = 0;
+  {
+    ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);
+    const auto v = waltest::make_data(1, kDim, 1);
+    const uint64_t l = 5;
+    s.upd->commit_physical_bundle(1, 1, v.data(), &l, 1);  // activation checkpoint (resets the WAL)
+    s.upd->checkpoint();
+    ASSERT_TRUE(s.upd->pid_generation_activated());
+    for (int i = 0; i < 3; ++i) {  // post-activation plain appends (kind1/kind5), un-checkpointed
+      const auto pv = waltest::make_data(1, kDim, 70 + i);
+      s.upd->insert(pv.data());
+    }
+    after_hwm = s.upd->num_points();
+  }
+  ASSERT_GE(after_hwm, kBaseN + 4);
+  std::string fp1;
+  std::string fp2;
+  {
+    ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);
+    EXPECT_TRUE(s.upd->pid_generation_activated());
+    EXPECT_EQ(s.upd->num_points(), after_hwm) << "post-activation plain appends survived replay";
+    EXPECT_TRUE(row_is_live(*s.upd, static_cast<PID>(after_hwm - 1)));
+    fp1 = full_fp(*s.upd);
+  }
+  {
+    ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);  // double reopen
+    fp2 = full_fp(*s.upd);
+  }
+  EXPECT_EQ(fp1, fp2) << "double reopen of the activated plain-append prefix must be byte-stable";
+  std::filesystem::remove_all(dir);
 }
 
 // ---------------------------------------------------------------------------
