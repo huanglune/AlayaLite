@@ -189,11 +189,13 @@ if(ALAYA_ENABLE_MUTABLE_LASER)
     LIBS alaya_laser
     OPTS ${_laser_test_opts}
   )
+  # 420s ceiling: coverage-instrumented runs put the crash matrix past the default 120s (CI-only timeouts on
+  # otherwise-green runs; instrumentation costs 2-4x).
   alaya_add_test(
     NAME laser_test_segment_op_wal_crash
     TARGET test_segment_op_wal_crash
     LABELS laser wal persistence crash
-    TIMEOUT 120
+    TIMEOUT 420
   )
 
   # MutableLaserSegment: durable single-writer mutable segment handle (W3).
@@ -268,11 +270,12 @@ alaya_cc_target(
   LIBS alaya_laser
   OPTS ${_laser_test_opts}
 )
+# 420s ceiling: 192-249s measured under ENABLE_COVERAGE instrumentation.
 alaya_add_test(
   NAME laser_test_qg_builder_oom_regression
   TARGET test_qg_builder_oom_regression
   LABELS laser
-  TIMEOUT 120
+  TIMEOUT 420
 )
 
 # Bench-only fbin mmap view used by update modes under cgroup RAM caps.
@@ -341,11 +344,13 @@ if(ALAYA_ENABLE_MUTABLE_LASER)
     LIBS alaya_laser
     OPTS ${_laser_test_opts}
   )
+  # 420s ceiling: same coverage-lane margin as the crash matrix above (53s+ measured instrumented; slower runners were
+  # within one variance step of the 120s default).
   alaya_add_test(
     NAME laser_test_segment_op_wal_reuse_crash
     TARGET test_segment_op_wal_reuse_crash
     LABELS laser wal persistence crash
-    TIMEOUT 120
+    TIMEOUT 420
   )
 endif()
 # laser-ip: LASER inner-product (IP) distance kernel tests. Appended by branch feat/laser-ip-kernel; integrate as an
