@@ -7198,11 +7198,14 @@ class QGUpdater {
     }
     // (5c) B3 completion (leg-9, r3 section 1 point 3): count-tuple JOINT invariants (the per-field
     // ranges above are necessary but not sufficient). live + free can never exceed num_points (both
-    // <= num_points <= kPidMax, so the sum cannot overflow u64), and the free-list head sentinel must
-    // agree with free_count: an empty free list carries the kPidMax sentinel, a non-empty one a real
-    // in-range head (already range-checked above).
+    // <= num_points <= kPidMax, so the sum cannot overflow u64), and the free-list head sentinel
+    // must agree with free_count: an empty free list carries the kPidMax sentinel, a non-empty one
+    // a real in-range head (already range-checked above).
     if (image.live_count + image.free_count > image.num_points) {
       poison("flip image live_count + free_count exceeds num_points");
+    }
+    if (image.free_list_head != kPidMax && image.free_list_head >= image.num_points) {
+      poison("flip image free_list_head is out of range");
     }
     if ((image.free_count == 0) != (image.free_list_head == kPidMax)) {
       poison("flip image free_count / free_list_head sentinel disagree");

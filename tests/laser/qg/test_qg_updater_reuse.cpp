@@ -439,9 +439,12 @@ ActivatedInfo activate_v3_pid_base(const std::string &prefix, size_t base_n) {
 
 // BLOCKER-3 (leg-7): craft a superblock_flip carrying a v3 image whose defect must be caught in
 // the PURE validation phase (selector) or the pre-pwrite label-slot validation. The reopen must
-// poison AND leave the .index byte-for-byte unchanged (the flip is rejected before write_superblock).
+// poison AND leave the .index byte-for-byte unchanged (the flip is rejected before
+// write_superblock).
 template <typename Corrupt>
-void assert_crafted_flip_fails_closed(const char *name, Corrupt corrupt) {
+void assert_crafted_flip_fails_closed(const char *name,
+                                      Corrupt corrupt,
+                                      const char *expected_reason = nullptr) {
   const auto dir = scratch_dir(name);
   std::filesystem::remove_all(dir);
   auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/47);
@@ -460,15 +463,28 @@ void assert_crafted_flip_fails_closed(const char *name, Corrupt corrupt) {
   std::memcpy(img_bytes.data(), &image, sizeof(image));
   {
     alaya::wal::WalFile wal(wal_path);  // scans the base flip, then appends the crafted flip
-    wal.append(kSegmentOpRecordType, 0, 1, 0,
-               encode_superblock_flip(info.seg_uid, image.generation,
+    wal.append(kSegmentOpRecordType,
+               0,
+               1,
+               0,
+               encode_superblock_flip(info.seg_uid,
+                                      image.generation,
                                       static_cast<uint8_t>(target_slot),
-                                      std::span<const std::byte>(img_bytes.data(), img_bytes.size())),
+                                      std::span<const std::byte>(img_bytes.data(),
+                                                                 img_bytes.size())),
                alaya::wal::WalFile::Sync::fsync);
   }
-  EXPECT_THROW({ ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true); },
-               std::exception)
-      << name << ": crafted flip must poison on replay";
+  bool rejected = false;
+  try {
+    ReuseSession s2(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);
+  } catch (const std::exception &error) {
+    rejected = true;
+    if (expected_reason != nullptr) {
+      EXPECT_NE(std::string(error.what()).find(expected_reason), std::string::npos)
+          << name << ": crafted flip hit a substitute rejection gate: " << error.what();
+    }
+  }
+  EXPECT_TRUE(rejected) << name << ": crafted flip must poison on replay";
   EXPECT_EQ(read_all_bytes(index_path), index_before)
       << name << ": index must be byte-for-byte unchanged (flip rejected before any pwrite)";
   std::filesystem::remove_all(dir);
@@ -564,23 +580,80 @@ TEST(QgUpdaterReuse, CraftedFlipTargetsActiveSlotFailsClosedBeforeWrite) {
 }
 
 // B3 completion (leg-9, r3 section 1): the validate_flip_transition family the r3 review reached
-// that leg-8's three crafted flips (geometry/short-file/active-slot) did NOT cover. Each is CRC-legal
-// and passes the selector + label-slot self-consistency, yet must be rejected BEFORE any pwrite.
+// that leg-8's three crafted flips (geometry/short-file/active-slot) did NOT cover. Each is
+// CRC-legal and passes the selector + label-slot self-consistency, yet must be rejected BEFORE any
+// pwrite.
 TEST(QgUpdaterReuse, CraftedFlipCapacityExceededFailsClosedBeforeWrite) {
   // num_points within kPidMax but beyond THIS handle's configured capacity (row_generations_ is
   // sized to max_points == 4*kBaseN): a base with no backing PID/page state for the handle. leg-8
   // only bounded num_points by kPidMax, so this installed and only failed the NEXT open.
-  assert_crafted_flip_fails_closed("flip_capacity", [](QGSuperblockV2 &image) {
-    image.num_points = 4 * kBaseN + 1;  // capacity == max(max_points, base_n) == 4*kBaseN
-  });
+  assert_crafted_flip_fails_closed(
+      "flip_capacity",
+      [](QGSuperblockV2 &image) {
+        image.num_points = 4 * kBaseN + 1;  // capacity == max(max_points, base_n) == 4*kBaseN
+        const uint64_t pages = (image.num_points + image.node_per_page - 1) / image.node_per_page;
+        image.file_size = static_cast<uint64_t>(kSectorLen) + pages * image.page_size;
+        image.live_count = image.num_points;
+        image.free_count = 0;
+        image.free_list_head = kPidMax;
+        image.entry_point = 0;
+      },
+      "configured handle capacity");
+}
+
+TEST(QgUpdaterReuse, CraftedFlipLivePlusFreeExceedsNumPointsFailsClosedBeforeWrite) {
+  assert_crafted_flip_fails_closed(
+      "flip_live_plus_free",
+      [](QGSuperblockV2 &image) {
+        ASSERT_GT(image.num_points, 0U);
+        image.live_count = image.num_points;
+        image.free_count = 1;
+        image.free_list_head = 0;
+      },
+      "live_count + free_count exceeds num_points");
+}
+
+TEST(QgUpdaterReuse, CraftedFlipEmptyFreeListHasRealHeadFailsClosedBeforeWrite) {
+  assert_crafted_flip_fails_closed(
+      "flip_empty_free_real_head",
+      [](QGSuperblockV2 &image) {
+        ASSERT_GT(image.num_points, 0U);
+        image.free_count = 0;
+        image.free_list_head = 0;
+      },
+      "free_count / free_list_head sentinel disagree");
+}
+
+TEST(QgUpdaterReuse, CraftedFlipNonEmptyFreeListHasSentinelHeadFailsClosedBeforeWrite) {
+  assert_crafted_flip_fails_closed(
+      "flip_nonempty_free_sentinel",
+      [](QGSuperblockV2 &image) {
+        ASSERT_GT(image.num_points, 0U);
+        image.live_count = image.num_points - 1;
+        image.free_count = 1;
+        image.free_list_head = kPidMax;
+      },
+      "free_count / free_list_head sentinel disagree");
+}
+
+TEST(QgUpdaterReuse, CraftedFlipFreeHeadEqualsNumPointsFailsClosedBeforeWrite) {
+  assert_crafted_flip_fails_closed(
+      "flip_free_head_at_hwm",
+      [](QGSuperblockV2 &image) {
+        ASSERT_GT(image.num_points, 0U);
+        image.live_count = image.num_points - 1;
+        image.free_count = 1;
+        image.free_list_head = image.num_points;
+      },
+      "free_list_head is out of range");
 }
 
 TEST(QgUpdaterReuse, CraftedFlipStaleLabelGenerationFailsClosedBeforeWrite) {
   // A self-consistent image whose label tuple GENERATION is rewound below the current base's (the
   // "reference an old valid label slot" input form): the loaded bindings still check out, but a
-  // rewound label generation lets a stale label state pose as the next base. validate_flip_transition
-  // catches the non-monotone label generation; leg-8 never compared the image's label tuple to the
-  // current base's.
+  // rewound label generation lets a stale label state pose as the next base.
+  // validate_flip_transition catches the non-monotone label generation; leg-8 never compared the
+  // image's label tuple to the current base's.
   assert_crafted_flip_fails_closed("flip_stale_label_gen", [](QGSuperblockV2 &image) {
     // Label tuple lives at reserved+8: slot@0 gen@8 count@16 checksum@24 (matches the bad-label-slot
     // test above); the label generation is therefore at reserved+8+8 == reserved+16.
