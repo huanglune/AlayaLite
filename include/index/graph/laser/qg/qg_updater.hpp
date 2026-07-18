@@ -2215,12 +2215,15 @@ class QGUpdater {
       }
     };
     if (enable_wal_ && !replaying_) {
-      // BLOCKER-3 (leg-8, r2 section 1): the constructed next image must pass the SAME pre-write
-      // transition validation replay applies, BEFORE it becomes a durable WAL flip. Rejects a
-      // generation overflow / geometry drift / file-length or activation-state regression the
-      // checkpoint should never mint, so replay never has to reconcile a base this build produced but
-      // cannot re-derive.
-      validate_flip_transition(next, next.generation, static_cast<uint8_t>(next_slot));
+      // BLOCKER-3 (leg-8, r2 section 1) + B3 completion (leg-9): the constructed next image must pass
+      // the SAME pre-write transition validation replay applies, BEFORE it becomes a durable WAL
+      // flip. Rejects a generation overflow / geometry drift / file-length / capacity / count / label
+      // or activation-state regression the checkpoint should never mint, so replay never has to
+      // reconcile a base this build produced but cannot re-derive. The expected HWM is committed_
+      // (admission guaranteed allocated == committed above, and next.num_points == allocated), so
+      // this cross-checks the checkpoint filled num_points from the committed watermark.
+      validate_flip_transition(next, next.generation, static_cast<uint8_t>(next_slot),
+                               committed_.load(std::memory_order_acquire));
       // Sequence (clause D): flip frame append+fsync (WAL) -> ftruncate + superblock
       // pwrite+fsync (index) -> reset WAL. Each boundary is a crash-matrix cut.
       const auto image =
@@ -6525,6 +6528,17 @@ class QGUpdater {
     // maintenance epoch above; dormant until reuse is activated (is_canonical_generation).
     bool in_canonical_bundle = false;
     CanonicalBundleStage cstage;
+    // Pending STANDALONE effect unit (I-2 + NEW-B1, leg-9, r3): once the reuse classifier is armed
+    // (pid_generation_activated_ || enable_pid_reuse_), a current-generation standalone row_patch
+    // after-image is STAGED here (page_index -> latest whole-page bytes) instead of being written
+    // immediately; it is applied only at its commit point -- a kind=5 publish (plain append) or a
+    // kind=8 tx_publish (labeled bundle). This (a) closes NEW-B1: a forged legacy [kind7,kind1,kind8]
+    // bundle's current-generation kind=1 no longer clobbers a committed page before the kind=8
+    // poison (nothing is written until a commit that the forge never reaches), and (b) closes I-2:
+    // a publish can no longer advance the HWM over a row that has no whole-page after-image (a
+    // phantom live row from a zero-filled page). A torn unit at EOF is discarded (index stays
+    // S_old). The legacy path (classifier disarmed) still applies kind=1 immediately (unchanged).
+    std::unordered_map<size_t, std::vector<std::byte>> pending_effect_pages;
     // wal-2c BLOCKER-3: stream the op-WAL one frame at a time (O(max frame), not O(WAL bytes)).
     alaya::wal::WalFile::visit_frames(
         op_wal_->path(), [&](const alaya::wal::ScannedFrame &frame) -> bool {
@@ -6604,7 +6618,15 @@ class QGUpdater {
           // clobbered a committed page permanently (the final ftruncate only trims beyond the HWM).
           switch (classify_standalone_effect(op.segment_generation)) {
             case StandaloneEffect::kApply:
-              replay_row_patch(op);
+              if (pid_generation_activated_ || enable_pid_reuse_) {
+                // I-2 / NEW-B1 (leg-9): armed -> STAGE the whole-page after-image (validate its
+                // geometry first); apply only at the commit point (kind=5 / kind=8). Latest-per-page
+                // wins, exactly like the maintenance epoch's staging.
+                const size_t page = replay_validate_row_patch_geometry(op);
+                pending_effect_pages[page].assign(op.bytes.begin(), op.bytes.end());
+              } else {
+                replay_row_patch(op);  // legacy 2A/2B: immediate apply, byte-for-byte unchanged
+              }
               break;
             case StandaloneEffect::kValidateOnly:
               // Absorbed/old-generation after-image: validate geometry (structural legality) but do
@@ -6642,7 +6664,14 @@ class QGUpdater {
         case SegmentOpKind::publish:
           switch (classify_standalone_effect(op.segment_generation)) {
             case StandaloneEffect::kApply:
-              committed_watermark = std::max(committed_watermark, op.watermark);
+              if (pid_generation_activated_ || enable_pid_reuse_) {
+                // I-2 (leg-9): the commit point of a plain-append pending unit -- bound the watermark
+                // to the handle capacity, require whole-page evidence for every new row, apply the
+                // staged pages, then advance the HWM.
+                commit_pending_effect_unit(op.watermark, committed_watermark, pending_effect_pages);
+              } else {
+                committed_watermark = std::max(committed_watermark, op.watermark);  // legacy
+              }
               break;
             case StandaloneEffect::kValidateOnly:
               // Do not advance the watermark from an absorbed/forged old-generation publish.
@@ -6653,7 +6682,16 @@ class QGUpdater {
           }
           break;
         case SegmentOpKind::superblock_flip:
-          replay_flip(op);
+          // A checkpoint flip is never legally preceded by an uncommitted standalone page unit
+          // (checkpoint admission requires allocated == committed, so every append published first).
+          // A staged-but-uncommitted unit here is a forged interleaving -- fail closed rather than
+          // let a later publish apply these (now stale, pre-flip-generation) pages to the post-flip
+          // base (leg-9).
+          if (!pending_effect_pages.empty()) {
+            replaying_ = false;
+            poison("op-WAL superblock_flip with an uncommitted standalone page unit");
+          }
+          replay_flip(op, committed_watermark);
           break;
         case SegmentOpKind::label_bind:
           if (is_canonical_generation(op.segment_generation)) {
@@ -6667,7 +6705,7 @@ class QGUpdater {
             replaying_ = false;
             poison("op-WAL canonical tx_publish with no open bundle (missing kind=7 prefix)");
           }
-          replay_tx_publish(op, frame.batch_id, committed_watermark);
+          replay_tx_publish(op, frame.batch_id, committed_watermark, pending_effect_pages);
           break;
         case SegmentOpKind::consolidate_begin: {
           if (op.epoch == 0 || op.epoch > last_completed_consolidate_epoch_ + 1) {
@@ -6677,12 +6715,33 @@ class QGUpdater {
           // wal-2c BLOCKER-5: every consolidate frame is written at the then-current base
           // generation (encode_consolidate_marker / encode_row_patch use superblock_.generation),
           // which cannot change inside an epoch -- a mid-epoch flip/other op poisons below. Bind
-          // the epoch to the cursor generation here and require BEGIN / kind=1 / END to all match
-          // it, so a spliced cross-generation frame (BEGIN(E,G) row_patch(G+9) END(E,G+4)) is
-          // rejected instead of applied.
-          if (op.segment_generation != superblock_.generation) {
+          // the epoch to the BEGIN generation and require kind=1 / END to all match it, so a
+          // spliced cross-generation frame (BEGIN(E,G) row_patch(G+9) END(E,G+4)) is rejected.
+          //
+          // I-1 (leg-9, r3 independent audit): classify the BEGIN generation against the replay
+          // cursor (superblock_.generation, advanced by replay_flip) with the SAME three-way split
+          // classify_standalone_effect uses, instead of demanding an exact cursor match:
+          //   gen  > cursor: impossible in a valid log (a frame is written at the then-current base,
+          //                  which only reaches G+1 after its flip is replayed) -> poison.
+          //   gen == cursor: a new epoch (op.epoch == last_completed+1) or a same-generation
+          //                  absorbed prefix -- epoch_apply below picks new vs absorbed.
+          //   gen  < cursor: an epoch written at an OLDER generation whose result a checkpoint flip
+          //                  has since carried into the higher-generation base (crash AFTER the
+          //                  checkpoint's superblock write, BEFORE the WAL reset). Legal ONLY as an
+          //                  absorbed prefix (op.epoch <= last_completed, so the base already
+          //                  reflects it) -> stage + validate-only. A new epoch (op.epoch >
+          //                  last_completed) at an old generation is impossible / forged -> poison.
+          // Without this split a legal consolidate->checkpoint->SB-fsync->crash-before-reset state
+          // (BEGIN(E,G) still in the WAL under a selected G+1 base) fail-closed forever.
+          const uint64_t cursor = superblock_.generation;
+          if (op.segment_generation > cursor) {
             replaying_ = false;
-            poison("op-WAL consolidate_begin generation != the replay cursor generation");
+            poison("op-WAL consolidate_begin generation is newer than the replay cursor");
+          }
+          if (op.segment_generation < cursor &&
+              op.epoch > last_completed_consolidate_epoch_) {
+            replaying_ = false;
+            poison("op-WAL consolidate_begin at an older generation is not an absorbed prefix");
           }
           // op.epoch <= last_completed => absorbed-by-base prefix (a checkpoint flip
           // already carried it); the redo below is byte-identical and idempotent.
@@ -6725,6 +6784,20 @@ class QGUpdater {
                error.what());
       }
     }
+    // I-2 / NEW-B1 (leg-9): a torn STANDALONE unit at EOF (staged row_patch after-images with no
+    // committing kind=5/kind=8) is discarded -- nothing was written, so the index is still S_old and
+    // the committed watermark below reflects only the committed prefix. The kind=1 frames stay in the
+    // WAL and re-stage/re-discard idempotently on the next open (exactly as the pre-leg-9 torn
+    // plain-append did: its immediate pages were ftruncated back by rebuild_state_after_replay).
+    pending_effect_pages.clear();
+    // I-4 (leg-9, r3): staged_binds_ is a REPLAY-LOCAL scratch (recovery-only, never read on the
+    // writer path). Any orphan kind=7 binds that never matched a kind=8 (a torn bundle whose commit
+    // was lost) are dropped here, explicitly and unconditionally -- adopt_label_state() only clears
+    // them on a G+1 install flip, so a SAME-generation activation flip (already the selected base,
+    // early-returns in replay_flip without re-adopting) previously left them dangling until the next
+    // recovery. Clearing at the single convergence point makes the "orphan dropped at EOF" comment in
+    // replay_label_bind literally true for every flip disposition.
+    staged_binds_.clear();
     committed_.store(committed_watermark, std::memory_order_release);
     // replaying_ stays true through the entire rebuild so no derived-state repair
     // (routing/free/indegree) re-enters the WAL write path (design section 2.1 /
@@ -6759,6 +6832,42 @@ class QGUpdater {
   void replay_row_patch(const SegmentOp &op) {
     (void)replay_validate_row_patch_geometry(op);
     write_at(op.offset, reinterpret_cast<const char *>(op.bytes.data()), op.bytes.size());
+  }
+
+  // I-2 / NEW-B1 (leg-9): apply every whole-page after-image staged in the pending standalone unit
+  // (distinct page indices, so the write order is irrelevant), then clear it. Shared by the kind=5
+  // publish commit and the kind=8 tx_publish commit.
+  void apply_pending_effect_pages(std::unordered_map<size_t, std::vector<std::byte>> &pending) {
+    for (const auto &[page, bytes] : pending) {
+      write_at(kSectorLen + static_cast<uint64_t>(page) * page_size_,
+               reinterpret_cast<const char *>(bytes.data()), bytes.size());
+    }
+    pending.clear();
+  }
+
+  // I-2 (leg-9, r3 independent audit): commit a plain-append pending unit at a kind=5 publish. A
+  // pre-leg-9 build advanced committed_watermark = max(committed_watermark, op.watermark) with no
+  // capacity bound and NO page evidence, so a bare publish(N+1) with no row_patch fabricated a live
+  // row from a zero-filled (absent) page on rebuild (read_at zero-fills past the file tail and a zero
+  // trailer scans as live). Now: bound the watermark to the handle capacity, require a staged
+  // whole-page after-image for every NEW row in [old_hwm, watermark), apply the staged pages, then
+  // advance. A publish that does not advance (watermark <= old_hwm) applies the staged pages (an
+  // idempotent same-generation rewrite) without regressing the watermark.
+  void commit_pending_effect_unit(uint64_t publish_watermark, uint64_t &committed_watermark,
+                                  std::unordered_map<size_t, std::vector<std::byte>> &pending) {
+    if (publish_watermark > static_cast<uint64_t>(kPidMax) ||
+        publish_watermark > row_generations_.size()) {
+      poison("op-WAL standalone publish watermark exceeds the PID capacity");
+    }
+    const uint64_t old_hwm = committed_watermark;
+    for (uint64_t p = old_hwm; p < publish_watermark; ++p) {
+      const size_t page = page_index(static_cast<PID>(p));
+      if (pending.find(page) == pending.end()) {
+        poison("op-WAL standalone publish advances the HWM over a row with no page after-image");
+      }
+    }
+    apply_pending_effect_pages(pending);
+    committed_watermark = (std::max)(committed_watermark, publish_watermark);
   }
 
   // Idempotently set the on-disk trailer tombstone bit for one row during replay
@@ -6799,8 +6908,11 @@ class QGUpdater {
     // pid-activation checkpoint that fsynced its G+1 superblock but crashed before the WAL reset.
     // On reopen the pid-active G+1 base is selected while the orphan (tx_id > base) still precedes
     // the activation flip in the WAL; poisoning here fail-closed a recoverable segment forever. The
-    // orphan is now staged and then dropped at EOF (no matching kind=8) or cleared when the
-    // activation flip re-adopts the base. Conviction of a forged NON-absorbed legacy transaction
+    // orphan is now staged and then dropped at the single end-of-replay clear (I-4): a G+1 install
+    // flip re-adopts the base and clears staged_binds_ in adopt_label_state, while a SAME-generation
+    // activation flip (already the selected base) early-returns without re-adopting, so the explicit
+    // staged_binds_.clear() at the end of replay_and_rebuild is what drops it in that case. Conviction
+    // of a forged NON-absorbed legacy transaction
     // moves to its effectful commit point (replay_tx_publish, tx_id > base), and its interleaved
     // row_patch after-images are validate-only by classify_standalone_effect -- so nothing the
     // forged bundle carries is ever applied before that commit-time poison (index stays unchanged).
@@ -6828,7 +6940,8 @@ class QGUpdater {
   // absorbed by the base (new superblock flipped, old WAL not yet reset).
   void replay_tx_publish(const SegmentOp &op,
                          uint64_t frame_batch_id,
-                         uint64_t &committed_watermark) {
+                         uint64_t &committed_watermark,
+                         std::unordered_map<size_t, std::vector<std::byte>> &pending) {
     if (frame_batch_id != op.tx_id) {
       poison("op-WAL tx_publish frame batch_id != payload tx_id");
     }
@@ -6874,6 +6987,10 @@ class QGUpdater {
         }
       }
       staged_binds_.erase(op.tx_id);
+      // I-2 / NEW-B1 (leg-9): the selected base already holds this bundle's durable pages, so any
+      // staged current-generation page unit for it is redundant (and could be a stale/forged
+      // after-image) -- discard it, never re-apply over the higher base (JC-22 validate-only spirit).
+      pending.clear();
       return;
     }
 
@@ -6922,6 +7039,21 @@ class QGUpdater {
       }
       pid_seen[pidx] = 1;
     }
+    // I-2 / NEW-B1 (leg-9): when the reuse classifier is armed, this bundle's row after-images were
+    // STAGED (not applied immediately), so apply them here -- AFTER the full B-04 validation set and
+    // the NEW-BLOCKER-1 absorbed-gate above, so a forged legacy bundle poisons before anything is
+    // written. Verify whole-page evidence for the new range (a phantom bound row with no after-image
+    // is rejected), then apply the pages before promoting the bindings. On the legacy path (classifier
+    // disarmed) kind=1 was applied immediately and `pending` is empty, so this is skipped (unchanged).
+    if (pid_generation_activated_ || enable_pid_reuse_) {
+      for (uint64_t p = old_hwm; p < new_hwm; ++p) {
+        const size_t page = page_index(static_cast<PID>(p));
+        if (pending.find(page) == pending.end()) {
+          poison("op-WAL tx_publish advances the HWM over a row with no page after-image");
+        }
+      }
+      apply_pending_effect_pages(pending);
+    }
     // Promote: install the bindings, advance committed + both tx watermarks.
     for (const auto &bind : staged) {
       const auto inserted = label_working_.emplace(bind.pid, PidBinding{0, bind.label});
@@ -6956,6 +7088,13 @@ class QGUpdater {
       if (ls.slot > 1) {
         poison("flip image: label slot index out of range (empty tuple)");
       }
+      // B3 completion (leg-9, r3 section 1 point 4): the image's label bindings must equal the
+      // bindings this replay reconstructed from the WAL prefix (label_working_). An install flip is
+      // reached only after every preceding bundle was promoted, so an EMPTY image slot over a
+      // non-empty recovered set means the flip silently drops committed labels -- reject before write.
+      if (!label_working_.empty()) {
+        poison("flip image: empty label slot but the recovered bindings are non-empty");
+      }
       return;  // canonical legacy empty: the slot file may be absent
     }
     if (ls.slot > 1) {
@@ -6979,6 +7118,17 @@ class QGUpdater {
         poison("flip image: label slot pid-generation summary does not match the image");
       }
     }
+    // B3 completion (leg-9, r3 section 1 point 4): the loaded slot must equal the bindings this
+    // replay reconstructed from the WAL prefix (label_working_). A G+1 install flip is reached only
+    // after every preceding bundle promoted into label_working_, and a legal checkpoint captured
+    // exactly that map into the slot; so a self-consistent-but-STALE slot (e.g. an older, still-valid
+    // label tuple with a rewound generation, or any slot that disagrees item-by-item with the
+    // recovered set) is forged. This is the "逐项等价" (item-by-item equivalence) closure -- stricter
+    // than the generation/count monotonicity in validate_flip_transition, and orphan-robust (a torn
+    // bundle's staged binds are in neither set, so both exclude them).
+    if (lb.bindings != label_working_) {
+      poison("flip image: label slot disagrees with the recovered bindings");
+    }
   }
 
   // BLOCKER-3 (leg-8, r2 section 1): PURE pre-write validation of a flip TRANSITION. Poisons on any
@@ -6992,7 +7142,7 @@ class QGUpdater {
   // do not cover -- exactly the dimension+1 clone, the file_size=kSectorLen truncation bomb, and the
   // target_slot==active tear the r2 review reached.
   void validate_flip_transition(const QGSuperblockV2 &image, uint64_t op_generation,
-                                uint8_t target_slot) {
+                                uint8_t target_slot, uint64_t expected_num_points) {
     // (1) The op's declared generation must match the image it carries: a CRC-legal flip whose frame
     // generation disagrees with its payload generation is malformed.
     if (op_generation != image.generation) {
@@ -7026,11 +7176,36 @@ class QGUpdater {
     if (image.num_points > static_cast<uint64_t>(kPidMax)) {
       poison("flip image num_points exceeds the PID capacity");
     }
+    // (5a) B3 completion (leg-9, r3 section 1 point 1): the REAL handle capacity. row_generations_
+    // is sized to UpdateParams::max_points, and every commit path bounds new_hwm by it (see
+    // replay_tx_publish / canonical_finalize_bundle). A flip whose num_points is within kPidMax but
+    // beyond this handle's configured capacity has no backing PID/page state -- reject before the
+    // write_superblock/ftruncate would install a base this handle cannot address.
+    if (image.num_points > row_generations_.size()) {
+      poison("flip image num_points exceeds the configured handle capacity (max_points)");
+    }
+    // (5b) B3 completion (leg-9, r3 section 1 point 2): the expected high-water mark. A legal
+    // checkpoint captures committed_ into image.num_points, and on replay the running committed
+    // watermark just before the install flip equals that same value (all preceding publishes/
+    // bundles/epochs were replayed). A G+1 install image whose num_points disagrees with the
+    // recovered prefix (e.g. an HWM rewind with an otherwise-exact file_size + in-range label tuple)
+    // is forged -- it would install a lower base and ftruncate live data pages away.
+    if (image.num_points != expected_num_points) {
+      poison("flip image num_points != the expected recovered watermark");
+    }
     if (image.live_count > image.num_points || image.free_count > image.num_points) {
       poison("flip image live/free count exceeds num_points");
     }
-    if (image.free_list_head != kPidMax && image.free_list_head >= image.num_points) {
-      poison("flip image free_list_head is out of range");
+    // (5c) B3 completion (leg-9, r3 section 1 point 3): count-tuple JOINT invariants (the per-field
+    // ranges above are necessary but not sufficient). live + free can never exceed num_points (both
+    // <= num_points <= kPidMax, so the sum cannot overflow u64), and the free-list head sentinel must
+    // agree with free_count: an empty free list carries the kPidMax sentinel, a non-empty one a real
+    // in-range head (already range-checked above).
+    if (image.live_count + image.free_count > image.num_points) {
+      poison("flip image live_count + free_count exceeds num_points");
+    }
+    if ((image.free_count == 0) != (image.free_list_head == kPidMax)) {
+      poison("flip image free_count / free_list_head sentinel disagree");
     }
     if (image.num_points != 0 && image.entry_point != static_cast<uint64_t>(kPidMax) &&
         image.entry_point >= image.num_points) {
@@ -7066,9 +7241,38 @@ class QGUpdater {
         img_w.pid_reuse_activation_sb_generation < cur_w.pid_reuse_activation_sb_generation) {
       poison("flip image maintenance/reuse activation state regressed");
     }
+    // (8) B3 completion (leg-9, r3 section 1 point 4): the label-tuple TRANSITION. validate_flip_
+    // label_state() proves the image's label slot is self-consistent (and, on the replay path,
+    // equals the recovered bindings); this closes the monotonicity/overflow window between the
+    // CURRENT base's tuple and the image's. A label content change bumps the generation by one and
+    // rewrites the inactive slot, so across one flip the label generation only moves forward, the
+    // binding count is append-only (never shrinks), and a same-generation tuple must be byte-for-byte
+    // identical (no content change without a generation bump). A rewound label generation would let a
+    // stale-but-self-consistent slot pose as the next base's bindings.
+    const auto cur_label = read_superblock_label_state(superblock_);
+    const auto img_label = read_superblock_label_state(image);
+    if (img_label.generation < cur_label.generation) {
+      poison("flip image label generation regressed");
+    }
+    if (img_label.count < cur_label.count) {
+      poison("flip image label count regressed");
+    }
+    if (img_label.generation == cur_label.generation &&
+        (img_label.slot != cur_label.slot || img_label.count != cur_label.count ||
+         img_label.checksum != cur_label.checksum)) {
+      poison("flip image same-generation label tuple differs (content changed without a bump)");
+    }
+    // Overflow: minting a NEW label tuple (a differing slot/count/checksum) once the label generation
+    // is already saturated is impossible (the checkpoint's label_generation_ + 1 would wrap to 0,
+    // which the regress check above also catches). Reject explicitly for clarity.
+    if (cur_label.generation == (std::numeric_limits<uint64_t>::max)() &&
+        (img_label.slot != cur_label.slot || img_label.generation != cur_label.generation ||
+         img_label.count != cur_label.count || img_label.checksum != cur_label.checksum)) {
+      poison("flip image label generation overflow (new tuple over a saturated generation)");
+    }
   }
 
-  void replay_flip(const SegmentOp &op) {
+  void replay_flip(const SegmentOp &op, uint64_t &committed_watermark) {
     if (op.bytes.size() != kSegmentSuperblockImageBytes) {
       poison("flip image is not 512 bytes");
     }
@@ -7088,6 +7292,15 @@ class QGUpdater {
     }
     const uint64_t disk_generation = superblock_.generation;
     const uint64_t image_generation = image.generation;
+    // B3 (leg-9, r3 section 1 point 5): the op's declared generation must match the image it
+    // carries for EVERY flip -- stale, same-generation retained marker, AND G+1 install. Checking
+    // it only inside validate_flip_transition (reached solely on the install path) let a
+    // same-generation retained flip whose frame generation is forged to G+1 slip past the
+    // byte-identical early return below. A frame header generation that disagrees with its 512-byte
+    // payload generation is malformed regardless of which transition it encodes.
+    if (op.segment_generation != image_generation) {
+      poison("flip op generation != the image generation");
+    }
     if (image_generation < disk_generation) {
       return;  // stale retained marker: it is an old base, replay only the tail
     }
@@ -7106,11 +7319,16 @@ class QGUpdater {
     // higher-generation superblock is ever installed on disk (which later reopens would keep
     // re-selecting). adopt_label_state() below re-runs the same checks and mutates the members.
     validate_flip_label_state(image);
-    // BLOCKER-3 (leg-8, r2 section 1): full structural transition validation (immutable geometry,
-    // exact file length, inactive target slot, generation step, state monotonicity) BEFORE any
-    // pwrite/ftruncate -- a crafted geometry/short-file/active-slot flip is rejected here with the
-    // index byte-for-byte unchanged, instead of installing and only failing closed on the next open.
-    validate_flip_transition(image, op.segment_generation, op.target_slot);
+    // BLOCKER-3 (leg-8, r2 section 1) + B3 completion (leg-9, r3 section 1): full structural
+    // transition validation (immutable geometry, exact file length, inactive target slot, generation
+    // step, state monotonicity, real handle capacity, expected HWM, count joint invariants, label
+    // tuple transition) BEFORE any pwrite/ftruncate -- a crafted geometry/short-file/active-slot/
+    // capacity+1/HWM-regress/old-label-slot flip is rejected here with the index byte-for-byte
+    // unchanged, instead of installing and only failing closed on the next open. The expected HWM is
+    // the replayed committed watermark at this flip: a legal checkpoint captured committed_ into
+    // image.num_points, so a G+1 install image whose num_points disagrees with the recovered prefix
+    // is forged.
+    validate_flip_transition(image, op.segment_generation, op.target_slot, committed_watermark);
     // Apply the next legal base: rewrite its slot and set the file length.
     const auto next_slot = static_cast<int>(op.target_slot);
     write_superblock(next_slot, image);
@@ -7121,6 +7339,11 @@ class QGUpdater {
     active_superblock_slot_ = next_slot;
     qg_.entry_point_ = static_cast<PID>(image.entry_point);
     committed_.store(image.num_points, std::memory_order_release);
+    // The new base is the replay cursor from here on; the local running watermark must track it
+    // (the final committed_.store uses this local). For a legal WAL the install flip is the last
+    // frame, so this equals the value validate_flip_transition just checked, but keeping it explicit
+    // (not a coincidence of "no frames follow the flip") is what makes the expected-HWM invariant sound.
+    committed_watermark = image.num_points;
     // Re-adopt the base's label + tx state: the flip carried a (possibly new)
     // label slot tuple and tx watermarks; load the persisted bindings from it so
     // any bundles it already absorbed are reflected without re-promotion.
