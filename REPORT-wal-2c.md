@@ -1,5 +1,21 @@
 # REPORT: WAL 第三波 2C 维护事务
 
+> **Erratum(2026-07-18,wave3 盲审修复,取代下文相应终态措辞;修复=
+> `97180fd`/`4db820f`/`0b6bde3`,详见 `REPORT-blind-failclosed.md`):**
+>
+> - **JC-50 已收窄**:pre-BEGIN 错误不再一律"清 flag、不 latch"。仅 statvfs 准入拒绝
+>   本身保持无写入、可重试;BEGIN 前的 baseline `flush_dirty`/pwrite 失败现在 poison
+>   handle 并提升 recovery-required(pwrite 报错不能证明零字节落盘),OpenMP worker
+>   统一首错聚合、异常不再越过 parallel region,任何写失败路径 seqlock 均"先 poison、
+>   后闭合 even",不再可能留下永久 odd。
+> - **JC-13"精确上界"与 JC-18 残余已被证伪并修复**:小 cache 下依赖页 reload→respill
+>   放大(盲审探针实测 8.9×)与 reclaim 相位整体绕过 page cap 使"每 touched 页每相位
+>   至多一帧"不成立。修复后:未再修改的重载页不再重复溢写(resident-dirty 与
+>   latest-spill 分离追踪)、reclaim 按物理页聚合并受 cap 约束(峰值 ≤ cap+1)、准入
+>   上界改为可证明的保守式 `committed_pages(reclaim 时再加一份)`——诚实但不再是
+>   逐 touched 页;探针同形回归断言实际帧数/字节 ≤ preflight 上界。JC-18 的
+>   "近满盘仍可能超 preflight"残余随之关闭。
+
 分支 `feat/wal-2c-maintenance`,基于 `wave2-integration@cf67680`。逐阶段累积:备忘裁决映射、7 BLOCKER 落地映射、判断调用、边界清单(含三条 non-goal)。
 
 阶段:W0(基座)→ W1(consolidate 事务)→ W2(PID reuse)→ W3(Collection 集成)。每阶段 = 实现 → 全量重编 disk LASER/searcher/builder/header-closure → laser/collection/wal/crash ctest 绿 → commit。
