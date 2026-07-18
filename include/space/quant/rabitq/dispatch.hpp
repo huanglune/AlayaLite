@@ -480,7 +480,7 @@ inline void scalar_quantize_optimized_generic(uint8_t *ALAYA_RESTRICT result,
 // ALAYA_TARGET_AVX512 nor ALAYA_TARGET_AVX512_BW declare (confirmed by
 // compiler error: "inlining failed ... target specific option mismatch" with
 // just F+BW+DQ) — add avx512vl explicitly for this one kernel.
-__attribute__((target("avx512f,avx512bw,avx512dq,avx512vl"))) inline void
+ALAYA_TARGET_AVX512_VL inline void
 scalar_quantize_optimized_avx512(uint8_t *ALAYA_RESTRICT result,
                                  const float *ALAYA_RESTRICT vec0,
                                  size_t dim,

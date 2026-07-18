@@ -42,6 +42,8 @@
   // x86-specific target attributes (only valid on x86 architecture)
   #if defined(ALAYA_ARCH_X86)
     #define ALAYA_TARGET_AVX512 __attribute__((target("avx512f,avx512bw,avx512dq")))
+    #define ALAYA_TARGET_AVX512_VL \
+      __attribute__((target("avx512f,avx512bw,avx512dq,avx512vl")))
     #define ALAYA_TARGET_AVX512_BW __attribute__((target("avx512f,avx512bw")))
     #define ALAYA_TARGET_AVX2 __attribute__((target("avx2,fma")))
     #define ALAYA_TARGET_SSE4 __attribute__((target("sse4.1")))
@@ -49,6 +51,7 @@
   #else
     // On non-x86 architectures, these are no-ops
     #define ALAYA_TARGET_AVX512
+    #define ALAYA_TARGET_AVX512_VL
     #define ALAYA_TARGET_AVX512_BW
     #define ALAYA_TARGET_AVX2
     #define ALAYA_TARGET_SSE4
@@ -69,6 +72,7 @@
   #define ALAYA_UNREACHABLE __builtin_unreachable()
 #elif defined(_MSC_VER)
   #define ALAYA_TARGET_AVX512
+  #define ALAYA_TARGET_AVX512_VL
   #define ALAYA_TARGET_AVX512_BW
   #define ALAYA_TARGET_AVX2
   #define ALAYA_TARGET_SSE4
@@ -83,6 +87,7 @@
   #define ALAYA_UNREACHABLE __assume(0)
 #else
   #define ALAYA_TARGET_AVX512
+  #define ALAYA_TARGET_AVX512_VL
   #define ALAYA_TARGET_AVX512_BW
   #define ALAYA_TARGET_AVX2
   #define ALAYA_TARGET_SSE4
