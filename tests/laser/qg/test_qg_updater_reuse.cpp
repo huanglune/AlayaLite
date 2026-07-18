@@ -1777,6 +1777,137 @@ TEST(QgUpdaterReuse, LegacyV2PrefixUnderReuseFlagRecoversEquivalentToNoReuse) {
   std::filesystem::remove_all(dir_off);
 }
 
+TEST(QgUpdaterReuse, PartialPublishReuseOnOffEquivalentAndDoubleReopenStable) {
+  const auto dir = scratch_dir("i3_partial_equiv");
+  const auto dir_on = scratch_dir("i3_partial_equiv_on");
+  const auto dir_off = scratch_dir("i3_partial_equiv_off");
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(dir_on);
+  std::filesystem::remove_all(dir_off);
+  WalTinyIndex::build(dir, kBaseN, /*seed=*/168);
+  std::filesystem::copy(dir, dir_on, std::filesystem::copy_options::recursive);
+  std::filesystem::copy(dir, dir_off, std::filesystem::copy_options::recursive);
+  const std::string prefix_on = (dir_on / "wal_base").string();
+  const std::string prefix_off = (dir_off / "wal_base").string();
+  const auto write_prefix = [](const std::string &prefix, bool enable_reuse) {
+    ReuseSession s(prefix, kBaseN, 4 * kBaseN, enable_reuse);
+    const uint64_t old_hwm = s.upd->num_points();
+    const auto rows = waltest::make_data(2, kDim, 169);
+    EXPECT_EQ(s.upd->allocate_and_insert(rows.data()), static_cast<PID>(old_hwm));
+    EXPECT_EQ(s.upd->allocate_and_insert(rows.data() + kDim), static_cast<PID>(old_hwm + 1));
+    s.upd->publish(old_hwm + 1);
+    s.upd->publish(old_hwm + 2);  // second boundary has no intervening kind=1
+  };
+  write_prefix(prefix_on, /*enable_reuse=*/true);
+  write_prefix(prefix_off, /*enable_reuse=*/false);
+
+  std::string on_first;
+  std::string off_first;
+  for (int pass = 0; pass < 2; ++pass) {
+    ReuseSession on(prefix_on, kBaseN, 4 * kBaseN, true);
+    ReuseSession off(prefix_off, kBaseN, 4 * kBaseN, false);
+    EXPECT_EQ(on.upd->num_points(), kBaseN + 2) << "on pass " << pass;
+    EXPECT_EQ(off.upd->num_points(), kBaseN + 2) << "off pass " << pass;
+    const std::string on_fp = full_fp(*on.upd);
+    const std::string off_fp = full_fp(*off.upd);
+    EXPECT_EQ(on_fp, off_fp) << "reuse opt-in changed legal partial-publish recovery";
+    if (pass == 0) {
+      on_first = on_fp;
+      off_first = off_fp;
+    } else {
+      EXPECT_EQ(on_fp, on_first) << "reuse-on second reopen diverged";
+      EXPECT_EQ(off_fp, off_first) << "reuse-off second reopen diverged";
+    }
+  }
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(dir_on);
+  std::filesystem::remove_all(dir_off);
+}
+
+TEST(QgUpdaterReuse, TombstoneSameHwmPublishReuseOnOffEquivalent) {
+  const auto dir = scratch_dir("i3_tombstone_same_hwm");
+  const auto dir_on = scratch_dir("i3_tombstone_same_hwm_on");
+  const auto dir_off = scratch_dir("i3_tombstone_same_hwm_off");
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(dir_on);
+  std::filesystem::remove_all(dir_off);
+  WalTinyIndex::build(dir, kBaseN, /*seed=*/170);
+  std::filesystem::copy(dir, dir_on, std::filesystem::copy_options::recursive);
+  std::filesystem::copy(dir, dir_off, std::filesystem::copy_options::recursive);
+  const std::string prefix_on = (dir_on / "wal_base").string();
+  const std::string prefix_off = (dir_off / "wal_base").string();
+  const auto write_prefix = [](const std::string &prefix, bool enable_reuse) {
+    ReuseSession s(prefix, kBaseN, 4 * kBaseN, enable_reuse);
+    const uint64_t hwm = s.upd->num_points();
+    s.upd->tombstone(0);
+    s.upd->publish(hwm);  // legal commit boundary with no HWM advance
+  };
+  write_prefix(prefix_on, /*enable_reuse=*/true);
+  write_prefix(prefix_off, /*enable_reuse=*/false);
+
+  std::string first;
+  for (int pass = 0; pass < 2; ++pass) {
+    ReuseSession on(prefix_on, kBaseN, 4 * kBaseN, true);
+    ReuseSession off(prefix_off, kBaseN, 4 * kBaseN, false);
+    EXPECT_FALSE(row_is_live(*on.upd, 0)) << "on pass " << pass;
+    EXPECT_FALSE(row_is_live(*off.upd, 0)) << "off pass " << pass;
+    EXPECT_EQ(full_fp(*on.upd), full_fp(*off.upd));
+    if (pass == 0) {
+      first = full_fp(*on.upd);
+    } else {
+      EXPECT_EQ(full_fp(*on.upd), first) << "same-HWM tombstone second reopen diverged";
+    }
+  }
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(dir_on);
+  std::filesystem::remove_all(dir_off);
+}
+
+TEST(QgUpdaterReuse, UnpublishedEofReuseOnOffEquivalentAndDoubleReopenStable) {
+  const auto dir = scratch_dir("i3_eof_equiv");
+  const auto dir_on = scratch_dir("i3_eof_equiv_on");
+  const auto dir_off = scratch_dir("i3_eof_equiv_off");
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(dir_on);
+  std::filesystem::remove_all(dir_off);
+  WalTinyIndex::build(dir, kBaseN, /*seed=*/171);
+  std::filesystem::copy(dir, dir_on, std::filesystem::copy_options::recursive);
+  std::filesystem::copy(dir, dir_off, std::filesystem::copy_options::recursive);
+  const std::string prefix_on = (dir_on / "wal_base").string();
+  const std::string prefix_off = (dir_off / "wal_base").string();
+  const auto write_prefix = [](const std::string &prefix, bool enable_reuse) {
+    ReuseSession s(prefix, kBaseN, 4 * kBaseN, enable_reuse);
+    const auto rows = waltest::make_data(2, kDim, 172);
+    (void)s.upd->allocate_and_insert(rows.data());
+    (void)s.upd->allocate_and_insert(rows.data() + kDim);
+    s.upd->writeback(1);  // force kind=1 prefix, deliberately omit kind=5 at EOF
+  };
+  write_prefix(prefix_on, /*enable_reuse=*/true);
+  write_prefix(prefix_off, /*enable_reuse=*/false);
+
+  std::string on_first;
+  std::string off_first;
+  for (int pass = 0; pass < 2; ++pass) {
+    ReuseSession on(prefix_on, kBaseN, 4 * kBaseN, true);
+    ReuseSession off(prefix_off, kBaseN, 4 * kBaseN, false);
+    EXPECT_EQ(on.upd->num_points(), kBaseN) << "on pass " << pass;
+    EXPECT_EQ(off.upd->num_points(), kBaseN) << "off pass " << pass;
+    const std::string on_fp = full_fp(*on.upd);
+    const std::string off_fp = full_fp(*off.upd);
+    EXPECT_EQ(on_fp, off_fp) << "unpublished EOF prefix changed committed semantics";
+    if (pass == 0) {
+      on_first = on_fp;
+      off_first = off_fp;
+    } else {
+      EXPECT_EQ(on_fp, on_first) << "reuse-on EOF second reopen diverged";
+      EXPECT_EQ(off_fp, off_first) << "reuse-off EOF second reopen diverged";
+    }
+  }
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(dir_on);
+  std::filesystem::remove_all(dir_off);
+}
+
 // I-3 (leg-9): after the activation flip (pid-active base), post-activation plain appends replay via
 // staging and must recover correctly + be byte-stable across a double reopen.
 TEST(QgUpdaterReuse, ReuseActivatedPlainAppendPrefixDoubleReopenStable) {

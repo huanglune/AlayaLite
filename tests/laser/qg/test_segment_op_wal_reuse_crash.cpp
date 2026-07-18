@@ -603,6 +603,109 @@ INSTANTIATE_TEST_SUITE_P(
                        prepare_samecount_template, commit_samecount_rebind_hooked}),
     [](const ::testing::TestParamInfo<CheckpointKill> &info) { return info.param.name; });
 
+// I-3 (leg-10/r4): a standalone tombstone emits kind=2 + kind=1 and is allowed to use the
+// following checkpoint as its durability/commit boundary (there is intentionally no kind=5).
+// A small committed bundle first dirties the label snapshot so all four checkpoint cuts, including
+// the pre-flip label-slot cut, are reachable. The four cases then differ only by where the
+// tombstone->checkpoint child is SIGKILLed.
+void commit_bundle_then_tombstone(const std::string &prefix,
+                                  size_t max_points,
+                                  bool checkpoint,
+                                  std::function<void(SegmentOpFailPoint)> hook = {}) {
+  QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+  qg.load_disk_index(prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+  qg.set_params(64, 1, 1);
+  QGUpdater upd(qg, reuse_params(max_points, std::move(hook)));
+  const auto labels = bundle_labels();
+  (void)upd.commit_physical_bundle(2, 2, bundle_vecs().data(), labels.data(), kFree);
+  upd.tombstone(static_cast<PID>(kFree));  // live base row; leaves kind=2+kind=1, no kind=5
+  if (checkpoint) {
+    upd.checkpoint();
+  } else {
+    upd.writeback(1);  // reference state immediately before the checkpoint flip
+  }
+}
+
+struct TombstoneCheckpointKill {
+  const char *name;
+  SegmentOpFailPoint point;
+  bool expect_checkpoint;
+};
+
+class TombstoneCheckpointCrash : public ::testing::TestWithParam<TombstoneCheckpointKill> {};
+
+TEST_P(TombstoneCheckpointCrash, SigkillRecoversAndDoubleReopensAtEveryCut) {
+  const auto param = GetParam();
+  const size_t max_points = kBaseN + 16;
+  const auto root = battery_root(std::string("tombstone_ckpt_") + param.name);
+  std::filesystem::remove_all(root);
+  const auto tmpl = root / "template";
+  auto base = WalTinyIndex::build(tmpl, kBaseN, 4242);
+  prepare_reuse_template(base.prefix, max_points);
+
+  const auto effect_dir = root / "effect";
+  copy_tree(tmpl, effect_dir);
+  commit_bundle_then_tombstone((effect_dir / "wal_base").string(), max_points,
+                               /*checkpoint=*/false);
+  const auto s_effect = recover((effect_dir / "wal_base").string(), max_points);
+  ASSERT_FALSE(s_effect.poisoned);
+
+  const auto checkpoint_dir = root / "checkpoint";
+  copy_tree(tmpl, checkpoint_dir);
+  commit_bundle_then_tombstone((checkpoint_dir / "wal_base").string(), max_points,
+                               /*checkpoint=*/true);
+  const auto s_checkpoint = recover((checkpoint_dir / "wal_base").string(), max_points);
+  ASSERT_FALSE(s_checkpoint.poisoned);
+  ASSERT_NE(s_effect.fp, s_checkpoint.fp) << "checkpoint generation must distinguish references";
+
+  const auto case_dir = root / "case";
+  copy_tree(tmpl, case_dir);
+  const std::string case_prefix = (case_dir / "wal_base").string();
+  const auto child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    try {
+      const SegmentOpFailPoint target = param.point;
+      commit_bundle_then_tombstone(case_prefix, max_points, /*checkpoint=*/true,
+                                   [target](SegmentOpFailPoint fp) {
+                                     if (fp == target) {
+                                       ::kill(::getpid(), SIGKILL);
+                                       ::_exit(99);
+                                     }
+                                   });
+    } catch (...) {
+      ::_exit(70);
+    }
+    ::_exit(0);
+  }
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+      << param.name << " child did not die of SIGKILL (status=" << status << ")";
+
+  const auto first = recover(case_prefix, max_points);
+  ASSERT_FALSE(first.poisoned) << param.name << " legal tombstone checkpoint must not poison";
+  EXPECT_EQ(first.fp, param.expect_checkpoint ? s_checkpoint.fp : s_effect.fp)
+      << param.name << " recovered the wrong side of the checkpoint boundary";
+  const auto second = recover(case_prefix, max_points);
+  EXPECT_EQ(first.fp, second.fp) << param.name << " second reopen diverged";
+  EXPECT_EQ(first.index_bytes, second.index_bytes) << param.name << " index not byte-stable";
+  EXPECT_EQ(first.wal_bytes, second.wal_bytes) << param.name << " WAL not byte-stable";
+  std::filesystem::remove_all(root);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    FourCuts, TombstoneCheckpointCrash,
+    ::testing::Values(
+        TombstoneCheckpointKill{"slot_fsync", SegmentOpFailPoint::label_slot_written_before_flip,
+                                false},
+        TombstoneCheckpointKill{"flip_fsync",
+                                SegmentOpFailPoint::after_flip_append_before_superblock_write, true},
+        TombstoneCheckpointKill{"superblock_fsync",
+                                SegmentOpFailPoint::after_superblock_write_before_wal_reset, true},
+        TombstoneCheckpointKill{"wal_reset", SegmentOpFailPoint::after_wal_reset, true}),
+    [](const ::testing::TestParamInfo<TombstoneCheckpointKill> &info) { return info.param.name; });
+
 // R8 (leg-7): the crash matrix on a MIXED reuse+append bundle -- fewer free PIDs than bundle rows,
 // so some binds REUSE a freed PID (generation>0) and some APPEND past the high-water mark
 // (generation 0). The all-reuse RMatrix above never exercises the append-past-HWM half. A cut
@@ -786,6 +889,10 @@ TEST(ReuseCrashStandalone, OrphanBindThenActivationCheckpointSigkillReopenSurviv
     EXPECT_EQ(upd.last_committed_txid(), 0U) << "pass " << pass << ": orphan never committed";
     EXPECT_EQ(upd.trailer(0).flags & (kQGRowTombstone | kQGRowFree), 0)
         << "pass " << pass << ": a base row is live";
+    const auto snap = upd.label_snapshot();
+    ASSERT_NE(snap, nullptr);
+    EXPECT_EQ(snap->find(static_cast<PID>(kBaseN)), nullptr)
+        << "pass " << pass << ": orphan PID must not enter the label snapshot";
   }
   std::filesystem::remove_all(root);
 }
@@ -811,8 +918,8 @@ TEST(ReuseCrashStandalone, ConsolidateThenCheckpointSigkillBeforeResetReopens) {
     upd.consolidate(1, /*r_target=*/0, /*reclaim=*/true, /*bloom=*/false);  // activates maintenance
     upd.checkpoint();
   }
-  // Reference: the SAME second epoch + checkpoint run cleanly (WAL reset). Recovery of the crashed
-  // case must reproduce this state exactly.
+  // Reference: tombstone another live row so the second epoch contains real kind=1 page images,
+  // then checkpoint cleanly. The crashed case must reproduce this state exactly.
   const auto ref_dir = root / "ref";
   copy_tree(tmpl, ref_dir);
   const std::string ref_prefix = (ref_dir / "wal_base").string();
@@ -821,7 +928,8 @@ TEST(ReuseCrashStandalone, ConsolidateThenCheckpointSigkillBeforeResetReopens) {
     qg.load_disk_index(ref_prefix.c_str(), 0.0F, /*recovery_mode=*/true);
     qg.set_params(64, 1, 1);
     QGUpdater upd(qg, reuse_params(max_points));
-    upd.consolidate(1, /*r_target=*/0, /*reclaim=*/false, /*bloom=*/false);  // epoch 2 (no-op)
+    upd.tombstone(10);
+    upd.consolidate(1, /*r_target=*/0, /*reclaim=*/false, /*bloom=*/false);  // non-empty epoch 2
     upd.checkpoint();  // absorbs epoch 2, resets the WAL -> the clean reference base
   }
   const std::string ref_fp = recover(ref_prefix, max_points).fp;
@@ -842,7 +950,9 @@ TEST(ReuseCrashStandalone, ConsolidateThenCheckpointSigkillBeforeResetReopens) {
                         ::_exit(99);
                       }
                     }));
-      upd.consolidate(1, /*r_target=*/0, /*reclaim=*/false, /*bloom=*/false);  // epoch 2 in the WAL
+      upd.tombstone(10);
+      upd.consolidate(1, /*r_target=*/0, /*reclaim=*/false,
+                      /*bloom=*/false);  // non-empty epoch 2 in the WAL
       upd.checkpoint();  // flips to G+1, SIGKILL after the SB write, before the WAL reset
     } catch (...) {
       ::_exit(70);
@@ -853,6 +963,29 @@ TEST(ReuseCrashStandalone, ConsolidateThenCheckpointSigkillBeforeResetReopens) {
   ASSERT_EQ(::waitpid(child, &status, 0), child);
   ASSERT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
       << "child must die of SIGKILL (status=" << status << ")";
+  size_t absorbed_epoch_pages = 0;
+  bool in_second_epoch = false;
+  bool saw_second_epoch_end = false;
+  uint64_t second_epoch_generation = 0;
+  const std::string case_wal = case_prefix + waltest::index_suffix() + ".opwal";
+  alaya::wal::WalFile::visit_frames(case_wal, [&](const alaya::wal::ScannedFrame &frame) -> bool {
+    if (frame.type != kSegmentOpRecordType) return true;
+    const SegmentOp op = decode_segment_op(frame.payload);
+    if (op.kind == SegmentOpKind::consolidate_begin && op.epoch == 2) {
+      in_second_epoch = true;
+      second_epoch_generation = op.segment_generation;
+    } else if (in_second_epoch && op.kind == SegmentOpKind::row_patch) {
+      EXPECT_EQ(op.segment_generation, second_epoch_generation);
+      ++absorbed_epoch_pages;
+    } else if (in_second_epoch && op.kind == SegmentOpKind::consolidate_end && op.epoch == 2) {
+      saw_second_epoch_end = true;
+      in_second_epoch = false;
+    }
+    return true;
+  });
+  EXPECT_TRUE(saw_second_epoch_end);
+  EXPECT_GT(absorbed_epoch_pages, 0U)
+      << "the retained absorbed epoch must contain old-generation kind=1 images";
   const auto first = recover(case_prefix, max_points);
   ASSERT_FALSE(first.poisoned)
       << "recovery must NOT poison (absorbed BEGIN(E,G) at the old generation is validate-only)";
