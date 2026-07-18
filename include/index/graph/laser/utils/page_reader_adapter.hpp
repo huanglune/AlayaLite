@@ -27,7 +27,10 @@ struct PageReadCompletions {
     -> std::unique_ptr<storage::io::PageReader> {
   const storage::io::ReaderOptions options{.mode = storage::io::OpenMode::automatic,
                                            .queue_depth = queue_depth};
-#if defined(__linux__)
+  // The backend must follow the build's compiled PageReader, not the host OS: a
+  // Linux tree configured with ALAYA_LASER_USE_THREADPOOL compiles no libaio
+  // implementation, so requesting it would throw on every QG open.
+#if defined(__linux__) && defined(ALAYA_LASER_USE_LIBAIO) && ALAYA_LASER_USE_LIBAIO
   return storage::io::open_page_reader(path, options, storage::io::PageReaderBackend::libaio);
 #else
   return storage::io::open_page_reader(path, options, storage::io::PageReaderBackend::threadpool);
