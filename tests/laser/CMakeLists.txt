@@ -170,6 +170,7 @@ alaya_cc_target(
   BARE GTEST
   SRCS qg/test_qg_maintenance_concurrency.cpp
   LIBS alaya_laser
+  DEFS ALAYA_LASER_TESTING
   OPTS ${_laser_test_opts}
 )
 alaya_add_test(

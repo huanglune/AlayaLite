@@ -2415,6 +2415,15 @@ class QGUpdater {
     std::memcpy(rows.data(), qg_.cache_nodes_.data() + first * node_len_, rows.size());
     return rows;
   }
+#if defined(ALAYA_LASER_TESTING)
+  // Direct callback seam for exception-safety tests of the ordinary cached RMW
+  // path. Production callers enter through the typed insert/tombstone helpers.
+  template <typename Fn>
+  bool debug_modify_node_page(PID id, Fn &&fn) {
+    const std::lock_guard<std::mutex> guard(page_lock(id));
+    return modify_node_page(id, std::forward<Fn>(fn));
+  }
+#endif
   // The routing medoid vectors (design section 4): a separate cache that must agree with the
   // medoid PIDs' row data, so a routing-vector divergence a per-row fingerprint would miss is
   // caught (leg-7 BLOCKER-7).
@@ -3494,6 +3503,8 @@ class QGUpdater {
       log_page_after_image(id, scratch.data());  // appended before the install
       {
         const std::lock_guard<std::mutex> bytes_guard(cached->bytes_mutex);
+        // No exception-capable work may be added between these bumps: std::memcpy
+        // is the sole operation and cannot throw a C++ exception.
         page_versions_[pi].fetch_add(1, std::memory_order_acq_rel);
         std::memcpy(cached->bytes.data(), scratch.data(), page_size_);
         page_versions_[pi].fetch_add(1, std::memory_order_release);
@@ -3537,9 +3548,9 @@ class QGUpdater {
     bool changed = false;
     {
       const std::lock_guard<std::mutex> bytes_guard(cached->bytes_mutex);
-      page_versions_[pi].fetch_add(1, std::memory_order_acq_rel);
-      changed = fn(cached->bytes.data());
-      page_versions_[pi].fetch_add(1, std::memory_order_release);
+      write_page_versioned(pi, [&] {
+        changed = fn(cached->bytes.data());
+      });
     }
     if (!changed) {
       return false;
@@ -3884,9 +3895,10 @@ class QGUpdater {
     stats_.page_writes++;
   }
 
-  // Close every page-version pair even when a pwrite or post-write failpoint
-  // throws. Poison is published first, so a reader released by the even store
-  // observes recovery-required at its exit gate instead of serving partial state.
+  // Close every page-version pair even when a cached RMW callback, pwrite, or
+  // post-write failpoint throws. Poison is published first, so a reader released
+  // by the even store observes recovery-required at its exit gate instead of
+  // serving partial state.
   template <typename Fn>
   void write_page_versioned(size_t pi, Fn &&write) {
     page_versions_[pi].fetch_add(1, std::memory_order_acq_rel);  // -> odd
@@ -4271,6 +4283,8 @@ class QGUpdater {
       }
       {
         const std::lock_guard<std::mutex> bytes_guard(cached->bytes_mutex);
+        // No exception-capable work may be added between these bumps: std::memcpy
+        // is the sole operation and cannot throw a C++ exception.
         page_versions_[pi].fetch_add(1, std::memory_order_acq_rel);  // -> odd
         std::memcpy(cached->bytes.data(), bytes, page_size_);
         page_versions_[pi].fetch_add(1, std::memory_order_release);  // -> even

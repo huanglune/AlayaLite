@@ -488,6 +488,55 @@ TEST(QgMaintenanceConcurrency, DirectPageWriteFailurePoisonsAndClosesEven) {
   EXPECT_EQ(reader.get(), updater.debug_read_page(0).size());
 }
 
+TEST(QgMaintenanceConcurrency, CachedModifyCallbackThrowPoisonsClosesEvenAndReopens) {
+  TemporaryDirectory root("cached-callback-throw");
+  auto base = WalTinyIndex::build(root.path(), kBaseN, 7553);
+  std::vector<char> disk_before;
+  {
+    Session session(base.prefix,
+                    {},
+                    /*cache_cap_pages=*/0,
+                    /*resident_arena=*/false,
+                    {},
+                    /*write_cache=*/true,
+                    /*enable_wal=*/false);
+    auto &updater = *session.updater;
+    disk_before = updater.debug_read_disk_page(0);
+
+    EXPECT_THROW(updater.debug_modify_node_page(1,
+                                                [](char *page) -> bool {
+                                                  page[0] ^= static_cast<char>(0x5a);
+                                                  throw std::bad_alloc();
+                                                }),
+                 std::bad_alloc);
+    EXPECT_TRUE(updater.is_poisoned());
+    EXPECT_EQ(updater.debug_page_version(0) & 1U, 0U);
+
+    // Bypass the poison gate to prove the seqlock itself was closed. The changed
+    // byte also proves the callback ran against the shared cached page before it
+    // threw, rather than failing at an earlier allocation boundary.
+    auto reader = std::async(std::launch::async, [&] {
+      return updater.debug_read_page(0);
+    });
+    EXPECT_EQ(reader.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    EXPECT_NE(reader.get(), disk_before);
+    EXPECT_THROW(updater.ensure_readable(), std::runtime_error);
+  }
+
+  // The poisoned cache is process-local and never became dirty. Reopening drops
+  // its partial image and reconstructs a readable handle from the durable base.
+  Session reopened(base.prefix,
+                   {},
+                   /*cache_cap_pages=*/0,
+                   /*resident_arena=*/false,
+                   {},
+                   /*write_cache=*/true,
+                   /*enable_wal=*/false);
+  EXPECT_FALSE(reopened.updater->is_poisoned());
+  EXPECT_NO_THROW(reopened.updater->ensure_readable());
+  EXPECT_EQ(reopened.updater->debug_read_page(0), disk_before);
+}
+
 TEST(QgMaintenanceConcurrency, ReclaimOverlayHonorsPageCap) {
   TemporaryDirectory root("reclaim-cap");
   auto base = WalTinyIndex::build(root.path(), kBaseN, 7553);
