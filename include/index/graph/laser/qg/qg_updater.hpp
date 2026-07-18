@@ -6794,15 +6794,13 @@ class QGUpdater {
     }
 
     // (a) a new transaction to promote. Full B-04 validation set.
-    // NEW-BLOCKER-1 (leg-7): a NON-absorbed legacy transaction is the WAL tail written at the
-    // current base with no intervening checkpoint (a checkpoint flips + resets the WAL and
-    // absorbs everything before it, and no non-absorbed frame follows a flip). Its generation
-    // therefore MUST equal the replay cursor (superblock_.generation); a mismatch is a spliced
-    // cross-generation frame. This binds the legacy lane to the cursor exactly as the canonical
-    // and maintenance lanes already are.
-    if (op.segment_generation != superblock_.generation) {
-      poison("op-WAL legacy tx_publish generation != the replay cursor generation");
-    }
+    // NEW-BLOCKER-1 (leg-7): the classifier downgrade is closed by the pid-activated absorbed-gate
+    // above (a post-activation legacy tx_publish with tx_id > base is poisoned before reaching
+    // here). A cursor-generation bind is deliberately NOT imposed on the legacy lane: for a
+    // pid-activated base every non-absorbed legacy tx is already rejected (stronger than a cursor
+    // bind), and for a v2/2A base the legacy generation field was never cursor-bound (2A frames
+    // legitimately carry an older/arbitrary generation), so binding it would fail-closed on legal
+    // 2A traffic and mask the malformed-bundle divergence tests.
     if (op.tx_id <= last_committed_txid_) {
       poison("op-WAL tx_publish tx_id is not strictly increasing");
     }
