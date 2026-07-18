@@ -466,6 +466,39 @@ TEST(QgMaintenanceConcurrency, ReclaimOverlayHonorsPageCap) {
   EXPECT_LE(updater.stats().maintenance_peak_overlay_pages, updater.cache_cap_pages() + 1);
 }
 
+TEST(QgMaintenanceConcurrency, DependencyReloadFramesStayWithinPreflightBound) {
+  TemporaryDirectory root("frame-bound");
+  auto base = WalTinyIndex::build(root.path(), kBaseN, 7554);
+  Session session(base.prefix, {}, /*cache_cap_pages=*/1);
+  auto &updater = *session.updater;
+  ASSERT_NO_THROW(updater.consolidate(1, 0, false, false));
+  for (size_t raw_id = 0; raw_id < kBaseN; raw_id += 2) {
+    updater.tombstone(static_cast<PID>(raw_id));
+  }
+
+  const auto wal_path = base.prefix + waltest::index_suffix() + ".opwal";
+  const auto counts_before = kind_counts(base.prefix);
+  const auto bytes_before = std::filesystem::file_size(wal_path);
+  const auto stats_before = updater.stats();
+  ASSERT_NO_THROW(updater.consolidate(1, 0, true, false));
+  const auto stats_after = updater.stats();
+  const auto counts_after = kind_counts(base.prefix);
+  const auto bytes_after = std::filesystem::file_size(wal_path);
+
+  const uint64_t actual_frames =
+      stats_after.maintenance_page_frames - stats_before.maintenance_page_frames;
+  const uint64_t scanned_frames = counts_after[static_cast<size_t>(SegmentOpKind::row_patch)] -
+                                  counts_before[static_cast<size_t>(SegmentOpKind::row_patch)];
+  const uint64_t actual_wal_bytes = bytes_after - bytes_before;
+  EXPECT_GT(actual_frames, 0U);
+  EXPECT_EQ(actual_frames, scanned_frames);
+  EXPECT_EQ(stats_after.maintenance_last_preflight_page_frames, updater.file_pages() * 2);
+  EXPECT_LE(actual_frames, stats_after.maintenance_last_preflight_page_frames);
+  EXPECT_LE(actual_wal_bytes, stats_after.maintenance_last_preflight_wal_bytes);
+  EXPECT_LE(stats_after.maintenance_page_frame_bytes - stats_before.maintenance_page_frame_bytes,
+            stats_after.maintenance_last_preflight_wal_bytes);
+}
+
 TEST(QgMaintenanceConcurrency, EnospcAfterBeginPoisonsAndReopenRollsBack) {
   TemporaryDirectory root("enospc");
   auto base = WalTinyIndex::build(root.path(), kBaseN, 7601);

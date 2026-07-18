@@ -399,6 +399,10 @@ struct UpdateStats {
   uint64_t garden_all_turnover_rows = 0;
   uint64_t maintenance_peak_pool_pages = 0;
   uint64_t maintenance_peak_overlay_pages = 0;
+  uint64_t maintenance_page_frames = 0;
+  uint64_t maintenance_page_frame_bytes = 0;
+  uint64_t maintenance_last_preflight_page_frames = 0;
+  uint64_t maintenance_last_preflight_wal_bytes = 0;
   uint64_t garden_skipped = 0;
 };
 
@@ -873,6 +877,10 @@ class QGUpdater {
     s.garden_all_turnover_rows = stats_.garden_all_turnover_rows.load();
     s.maintenance_peak_pool_pages = stats_.maintenance_peak_pool_pages.load();
     s.maintenance_peak_overlay_pages = stats_.maintenance_peak_overlay_pages.load();
+    s.maintenance_page_frames = stats_.maintenance_page_frames.load();
+    s.maintenance_page_frame_bytes = stats_.maintenance_page_frame_bytes.load();
+    s.maintenance_last_preflight_page_frames = stats_.maintenance_last_preflight_page_frames.load();
+    s.maintenance_last_preflight_wal_bytes = stats_.maintenance_last_preflight_wal_bytes.load();
     s.garden_skipped = stats_.garden_skipped.load();
     return s;
   }
@@ -2587,6 +2595,10 @@ class QGUpdater {
     std::atomic<uint64_t> garden_all_turnover_rows{0};
     std::atomic<uint64_t> maintenance_peak_pool_pages{0};
     std::atomic<uint64_t> maintenance_peak_overlay_pages{0};
+    std::atomic<uint64_t> maintenance_page_frames{0};
+    std::atomic<uint64_t> maintenance_page_frame_bytes{0};
+    std::atomic<uint64_t> maintenance_last_preflight_page_frames{0};
+    std::atomic<uint64_t> maintenance_last_preflight_wal_bytes{0};
     std::atomic<uint64_t> garden_skipped{0};
   };
 
@@ -3421,6 +3433,7 @@ class QGUpdater {
       const bool changed = fn(page);
       if (changed) {
         maint_dirty_.insert(pi);
+        maint_resident_dirty_.insert(pi);
         stats_.logical_row_writes++;
         maint_spill_over_cap(pi);  // wal-2c BLOCKER-1: pin the page just modified
       }
@@ -3924,7 +3937,6 @@ class QGUpdater {
         poison("maintenance overlay reload got a non-page frame");
       }
       std::memcpy(bytes.data(), op.bytes.data(), page_size_);
-      maint_spilled_.erase(sp);
     } else {
       read_at(kSectorLen + pi * page_size_, bytes.data(), page_size_);
     }
@@ -3949,7 +3961,11 @@ class QGUpdater {
                          std::span<const std::byte>(reinterpret_cast<const std::byte *>(bytes),
                                                     page_size_));
     try {
-      return op_wal_->append(kSegmentOpRecordType, 0, ++wal_op_id_, 0, payload, sync);
+      const auto location =
+          op_wal_->append(kSegmentOpRecordType, 0, ++wal_op_id_, 0, payload, sync);
+      stats_.maintenance_page_frames.fetch_add(1, std::memory_order_relaxed);
+      stats_.maintenance_page_frame_bytes.fetch_add(location.size, std::memory_order_relaxed);
+      return location;
     } catch (const std::exception &error) {
       poison(std::string("maintenance WAL append failed: ") + error.what());
     }
@@ -3967,10 +3983,10 @@ class QGUpdater {
   // page is ever pinned, so cap (>= 1) is always reachable.
   void maint_spill_over_cap(size_t pin_pi) {
     const size_t cap = std::max<size_t>(1, params_.cache_cap_pages);
-    // Clean (dependency-only) pages re-materialize from committed disk, so drop them
-    // for free before spending WAL bytes on a dirty spill.
+    // A page clean since its latest spill can be dropped for free. This includes
+    // dependency-only disk pages and dirty-history pages reloaded from latest_spill.
     for (auto it = maint_pages_.begin(); it != maint_pages_.end() && maint_pages_.size() > cap;) {
-      if (it->first != pin_pi && maint_dirty_.count(it->first) == 0) {
+      if (it->first != pin_pi && maint_resident_dirty_.count(it->first) == 0) {
         it = maint_pages_.erase(it);
       } else {
         ++it;
@@ -3987,6 +4003,7 @@ class QGUpdater {
       wal_failpoint(SegmentOpFailPoint::after_consolidate_overlay_modify_before_spill);  // C4
       const auto loc = maint_log_page(pi, it->second.data(), alaya::wal::WalFile::Sync::flush);
       maint_spilled_[pi] = loc;
+      maint_resident_dirty_.erase(pi);
       wal_failpoint(SegmentOpFailPoint::after_consolidate_spill_flush);  // C5
       it = maint_pages_.erase(it);
     }
@@ -3997,7 +4014,7 @@ class QGUpdater {
   // enforce the ordinary cap without pinning it so its latest image can spill.
   void maint_release_dependency_page(size_t pi) {
     auto it = maint_pages_.find(pi);
-    if (it != maint_pages_.end() && maint_dirty_.count(pi) == 0) {
+    if (it != maint_pages_.end() && maint_resident_dirty_.count(pi) == 0) {
       maint_pages_.erase(it);
     }
     maint_spill_over_cap((std::numeric_limits<size_t>::max)());
@@ -4008,18 +4025,7 @@ class QGUpdater {
   // -> even) so a concurrent search never copies a half-installed page. Honors the
   // after_consolidate_install_page failpoint after each page.
   void maint_install_all() {
-    std::vector<size_t> pages;
-    pages.reserve(maint_pages_.size() + maint_spilled_.size());
-    for (const auto &[pi, unused] : maint_pages_) {
-      (void)unused;
-      if (maint_dirty_.count(pi) != 0) {
-        pages.push_back(pi);  // spilled pages are always dirty (only dirty pages spill)
-      }
-    }
-    for (const auto &[pi, unused] : maint_spilled_) {
-      (void)unused;
-      pages.push_back(pi);
-    }
+    std::vector<size_t> pages(maint_dirty_.begin(), maint_dirty_.end());
     std::sort(pages.begin(), pages.end());
     for (size_t pi : pages) {
       std::vector<char> reload;
@@ -4028,7 +4034,11 @@ class QGUpdater {
       if (it != maint_pages_.end()) {
         bytes = it->second.data();
       } else {
-        const auto frame = alaya::wal::WalFile::read_frame(op_wal_->path(), maint_spilled_[pi]);
+        const auto spilled = maint_spilled_.find(pi);
+        if (spilled == maint_spilled_.end()) {
+          poison("maintenance dirty page has neither resident nor spilled bytes");
+        }
+        const auto frame = alaya::wal::WalFile::read_frame(op_wal_->path(), spilled->second);
         const auto op = decode_segment_op(frame.payload);
         if (op.kind != SegmentOpKind::row_patch || op.bytes.size() != page_size_) {
           poison("maintenance install reload got a non-page frame");
@@ -4052,6 +4062,7 @@ class QGUpdater {
     maint_pages_.clear();
     maint_spilled_.clear();
     maint_dirty_.clear();
+    maint_resident_dirty_.clear();
     maint_local_free_head_ = kPidMax;
     maint_local_free_count_ = 0;
   }
@@ -4356,10 +4367,22 @@ class QGUpdater {
     maintenance_activated_ = true;
   }
 
-  // BEGIN-time headroom preflight (design section 1.2): a maintenance epoch may
-  // spill up to ~2x the touched page set to the .opwal. A shortfall is an ordinary
-  // pre-transaction error (the epoch has not started, so nothing to roll back).
-  void maint_statvfs_preflight(bool reclaim_slots) {
+  [[nodiscard]] size_t cached_dirty_page_count() {
+    size_t dirty = 0;
+    for (size_t si = 0; si < PageWriteCache::kShards; ++si) {
+      auto &shard = write_cache_.shard(si);
+      const std::lock_guard<std::mutex> guard(shard.mutex);
+      for (const auto &[pi, page] : shard.pages) {
+        (void)pi;
+        dirty += page->dirty ? 1 : 0;
+      }
+    }
+    return dirty;
+  }
+
+  // BEGIN-time headroom preflight. A shortfall is an ordinary pre-transaction
+  // error (the epoch has not started, so nothing needs rollback).
+  void maint_statvfs_preflight(bool reclaim_slots, uint64_t baseline_dirty_pages) {
     struct statvfs vfs{};
     wal_failpoint(SegmentOpFailPoint::before_consolidate_statvfs);
     if (::statvfs(op_wal_->path().c_str(), &vfs) != 0) {
@@ -4367,16 +4390,11 @@ class QGUpdater {
                                std::to_string(errno));
     }
     const uint64_t available = static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize;
-    // Precise headroom bound (design section 1.3; supersedes the old file_pages*2
-    // heuristic / JC-10). Every touched page is logged at most once per phase: rows
-    // are visited in page order and a completed page is never revisited within a
-    // phase, so the total kind=1 frame count <= repair_pages + reclaim_pages (a page
-    // touched by both phases is counted twice -- exactly its at-most-two logs). Per
-    // page-frame overhead = WAL7 header/trailer (kHeaderBytes 36 + kTrailerBytes 4)
-    // + SEGMENT_OP header (19) + row_patch fixed fields (pid 8 + offset 8 + len 4 =
-    // 20) = 79; each consolidate marker frame = 40 + 19 + 8 (epoch) = 67. A CoW
-    // filesystem also duplicates every installed index page, so add page_size per
-    // union page conservatively.
+    // Proven frame bound: the row phase visits target pages in physical order and
+    // pins the current target; dependency reloads are clean relative to latest_spill
+    // and evict without a frame. Reclaim first reads eligibility, then writes FREE
+    // trailers and next pointers together in one physical-page pass. Therefore each
+    // page contributes at most one repair frame plus one reclaim frame.
     const uint64_t committed = committed_.load(std::memory_order_acquire);
     const uint64_t committed_pages = committed == 0 ? 0 : (committed + npp_ - 1) / npp_;
     const uint64_t repair_pages = committed_pages;  // <= all live rows' pages
@@ -4397,11 +4415,17 @@ class QGUpdater {
       return a > (std::numeric_limits<uint64_t>::max)() - b ? (std::numeric_limits<uint64_t>::max)()
                                                             : a + b;
     };
-    const uint64_t wal_growth =
-        sat_add(sat_mul(sat_add(repair_pages, reclaim_pages), per_page), 2 * kMarkerFrameBytes);
-    const uint64_t index_cow_growth = sat_mul(committed_pages, page_size_);
+    const uint64_t page_frame_upper = sat_add(repair_pages, reclaim_pages);
+    const uint64_t wal_growth = sat_add(sat_mul(page_frame_upper, per_page), 2 * kMarkerFrameBytes);
+    // Baseline writeback happens after this admission and before BEGIN; the
+    // post-END install can rewrite every committed page. Count both CoW events.
+    const uint64_t index_write_pages = sat_add(baseline_dirty_pages, committed_pages);
+    const uint64_t index_cow_growth = sat_mul(index_write_pages, page_size_);
     const uint64_t base = sat_add(wal_growth, index_cow_growth);
     const uint64_t needed = sat_add(base, (std::max<uint64_t>)(uint64_t{16} << 20U, base / 20));
+    stats_.maintenance_last_preflight_page_frames.store(page_frame_upper,
+                                                        std::memory_order_relaxed);
+    stats_.maintenance_last_preflight_wal_bytes.store(wal_growth, std::memory_order_relaxed);
     if (available < needed) {
       throw std::runtime_error(
           "QGUpdater::consolidate: insufficient free space for the maintenance WAL");
@@ -4494,33 +4518,28 @@ class QGUpdater {
                                                (std::numeric_limits<uint32_t>::max)();
                                   }),
                    eligible.end());
+    // Inspect eligibility read-only first. The final free set is then known, so
+    // FREE trailers and canonical next pointers can be written together in one
+    // physical-page pass (one reclaim frame per page).
+    std::vector<PID> newly_free;
+    newly_free.reserve(eligible.size());
     for (size_t begin = 0; begin < eligible.size();) {
       const size_t pi = page_index(eligible[begin]);
       size_t end = begin + 1;
       while (end < eligible.size() && page_index(eligible[end]) == pi) {
         ++end;
       }
-      char *page = maint_overlay_page(pi);
-      bool changed = false;
+      const char *page = maint_overlay_page(pi);
       for (size_t i = begin; i < end; ++i) {
         const PID id = eligible[i];
-        QGRowTrailer trailer = qg_read_page_trailer(page, page_size_, npp_, id % npp_);
+        const QGRowTrailer trailer = qg_read_page_trailer(page, page_size_, npp_, id % npp_);
         if ((trailer.flags & kQGRowTombstone) == 0 || (trailer.flags & kQGRowFree) != 0) {
           continue;  // only tombstoned, not-yet-free rows are eligible
         }
-        trailer.valid_degree = 0;
-        trailer.flags |= kQGRowFree;
-        qg_write_page_trailer(page, page_size_, npp_, id % npp_, trailer);
+        newly_free.push_back(id);
         all_free.push_back(id);
-        stats_.freed_slots++;
-        changed = true;
       }
-      if (changed) {
-        maint_dirty_.insert(pi);
-        maint_spill_over_cap(pi);
-      } else {
-        maint_release_dependency_page(pi);
-      }
+      maint_release_dependency_page(pi);
       begin = end;
     }
 
@@ -4537,10 +4556,18 @@ class QGUpdater {
       char *page = maint_overlay_page(pi);
       for (size_t i = begin; i < end; ++i) {
         const PID id = all_free[i];
+        if (std::binary_search(newly_free.begin(), newly_free.end(), id)) {
+          QGRowTrailer trailer = qg_read_page_trailer(page, page_size_, npp_, id % npp_);
+          trailer.valid_degree = 0;
+          trailer.flags |= kQGRowFree;
+          qg_write_page_trailer(page, page_size_, npp_, id % npp_, trailer);
+          stats_.freed_slots++;
+        }
         const uint64_t next64 = i + 1 < all_free.size() ? all_free[i + 1] : kPidMax;
         std::memcpy(page + node_offset_in_page(id), &next64, sizeof(next64));
       }
       maint_dirty_.insert(pi);  // rewritten next pointers must be logged + installed
+      maint_resident_dirty_.insert(pi);
       maint_spill_over_cap(pi);
       begin = end;
     }
@@ -4571,7 +4598,7 @@ class QGUpdater {
     // Admission must precede every baseline pwrite that may allocate filesystem
     // blocks. A statvfs rejection is still a clean, retryable pre-transaction
     // error because no page write and no BEGIN has happened.
-    maint_statvfs_preflight(reclaim_slots);
+    maint_statvfs_preflight(reclaim_slots, cached_dirty_page_count());
     // Baseline normalization (design section 1.2 step 2): flush committed dirty
     // pages, then empty the shared cache so a concurrent search reads only committed
     // disk state during the epoch and the private overlay is the sole mutation store.
@@ -4611,14 +4638,17 @@ class QGUpdater {
       if (reclaim_slots) {
         maint_reclaim_phase();
       }
-      // Finalize: log every remaining resident DIRTY page (buffered; the END fsync
-      // forces the whole group, including earlier spills, durable).
+      // Finalize only resident bytes changed since their latest spill. A dirty-history
+      // page reloaded solely for dependency reads already has a current WAL image and
+      // must not be appended again.
       wal_failpoint(SegmentOpFailPoint::before_consolidate_end_append);
       for (auto &[pi, bytes] : maint_pages_) {
-        if (maint_dirty_.count(pi) != 0) {
-          maint_log_page(pi, bytes.data(), alaya::wal::WalFile::Sync::buffered);
+        if (maint_resident_dirty_.count(pi) != 0) {
+          maint_spilled_[pi] =
+              maint_log_page(pi, bytes.data(), alaya::wal::WalFile::Sync::buffered);
         }
       }
+      maint_resident_dirty_.clear();
       // END: buffered append -> torn-END window (C7) -> the single durable commit
       // point (C8). Splitting append from force lets the harness cut a torn END; the
       // net WAL bytes + observer notify are identical to one Sync::fsync append.
@@ -8131,6 +8161,9 @@ class QGUpdater {
   // frame location (reload via WalFile::read_frame). Union = every touched page.
   std::unordered_map<size_t, std::vector<char>> maint_pages_;
   std::unordered_set<size_t> maint_dirty_;  // overlay pages actually modified (need install)
+  // Resident bytes newer than their latest spill (or than disk if never spilled).
+  // Reloading a latest spill for dependency reads does not enter this set.
+  std::unordered_set<size_t> maint_resident_dirty_;
   std::unordered_map<size_t, alaya::wal::FrameLocation> maint_spilled_;
   uint64_t maint_epoch_ = 0;             // the in-flight epoch id
   PID maint_local_free_head_ = kPidMax;  // transaction-local free head (published at END)
