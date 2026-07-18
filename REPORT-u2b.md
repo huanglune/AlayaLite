@@ -61,6 +61,9 @@ admission 路径与 exclude-set 路径耗时基本相等（比值稳定在 0.99-
 ## 遗留边界
 
 - **`LaserSegment`（AnySegment 面）目前只能走 paged pool 驻留**：`LaserSegment::open()`/`open_directory()` 硬编码构造 legacy `LaserSegmentSearcher`，从不读取 `x_laser_residency` manifest 字段选择 `UnifiedLaserSegmentSearcher`。这意味着契约验收 3（bitmap 过滤 recall）在 Collection 端到端层面只能实际验证 paged pool 一种驻留；resident arena 驻留的 admission 正确性已在磁盘层（`UnifiedLaserSegmentSearcher` 直连测试，两种驻留都覆盖）与内核层完全验证，只是"经 Collection"这条链路目前物理上够不到 arena 驻留。这是本次改动前就存在的架构现状（`segment_factory.hpp::load_segment_from_manifest` 虽支持按 manifest 选驻留，但没有任何生产代码路径调用它），不在手册决议清单内，未做扩展。
+  **［勘误，U2-c 后过时］**：U2-c 已落地驻留选择接线——`laser_segment.hpp` 现在读取
+  `x_laser_residency` manifest extra 并按其构造 `UnifiedLaserSegmentSearcher`
+  （resident arena 经 Collection 链路已可达）。本条仅保留为当时的历史现状记录。
 - **`sorted_rows` filter kind 的具体 wire format 系本次实现时定义**（`payload` = 连续 `uint64_t` 行/PID 数组，`payload_size` = 字节数），因为手册与代码库中此前均无先例可循；已在 `row_admission.hpp`/`unified_laser_segment_searcher.hpp` 注释中写明，`admission_from_sorted_rows` 单测覆盖，但 `unified_laser_segment_searcher.hpp` 里 `kind=sorted_rows` 分支未被任何集成测试实际经过（`segmented_collection.hpp` 只发 `kind=bitmap`，不发 `kind=sorted_rows`）。
 - **RowAdmission.popcount 未接入 planner**：按决议 8 保留字段不接线，符合手册。
 
