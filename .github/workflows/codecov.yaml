@@ -63,10 +63,12 @@ jobs:
         key: >-
           codecov-python-portable-v3-${{ runner.os }}-${{ runner.arch }}-gcc-Release-${{ hashFiles('conanfile.py',
           'pyproject.toml', 'uv.lock', 'cmake/AlayaConan.cmake', 'cmake/vendor/conan_provider.cmake') }}
+        # ccache-action adds the timestamp separator to restore keys; a trailing
+        # dash here would produce a double-dash prefix that cannot match.
         restore-keys: |
-          codecov-python-portable-v3-${{ runner.os }}-${{ runner.arch }}-gcc-Release-
-          codecov-python-portable-v3-${{ runner.os }}-${{ runner.arch }}-Release-
-          py-unit-portable-v2-${{ runner.os }}-${{ runner.arch }}-Release-
+          codecov-python-portable-v3-${{ runner.os }}-${{ runner.arch }}-gcc-Release
+          codecov-python-portable-v3-${{ runner.os }}-${{ runner.arch }}-Release
+          py-unit-portable-v2-${{ runner.os }}-${{ runner.arch }}-Release
         max-size: 2G
 
     - name: Install system dependencies
@@ -150,9 +152,11 @@ jobs:
         key: >-
           codecov-cpp-portable-v2-${{ runner.os }}-${{ runner.arch }}-gcc-13-Debug-${{ hashFiles('conanfile.py',
           'pyproject.toml', 'uv.lock', 'cmake/AlayaConan.cmake', 'cmake/vendor/conan_provider.cmake') }}
+        # ccache-action adds the timestamp separator to restore keys; a trailing
+        # dash here would produce a double-dash prefix that cannot match.
         restore-keys: |
-          codecov-cpp-portable-v2-${{ runner.os }}-${{ runner.arch }}-gcc-13-Debug-
-          codecov-cpp-portable-v2-${{ runner.os }}-${{ runner.arch }}-Debug-
+          codecov-cpp-portable-v2-${{ runner.os }}-${{ runner.arch }}-gcc-13-Debug
+          codecov-cpp-portable-v2-${{ runner.os }}-${{ runner.arch }}-Debug
         max-size: 2G
 
     - name: Install system dependencies

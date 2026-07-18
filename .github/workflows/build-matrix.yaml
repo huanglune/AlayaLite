@@ -29,9 +29,11 @@ jobs:
           build-matrix-v1-${{ runner.os }}-${{ runner.arch }}-gcc-Release-${{ matrix.case }}-${{
           hashFiles('conanfile.py', 'pyproject.toml', 'uv.lock', 'cmake/AlayaConan.cmake',
           'cmake/vendor/conan_provider.cmake') }}
+        # ccache-action adds the timestamp separator to restore keys; a trailing
+        # dash here would produce a double-dash prefix that cannot match.
         restore-keys: |
-          build-matrix-v1-${{ runner.os }}-${{ runner.arch }}-gcc-Release-${{ matrix.case }}-
-          build-matrix-v1-${{ runner.os }}-${{ runner.arch }}-gcc-Release-
+          build-matrix-v1-${{ runner.os }}-${{ runner.arch }}-gcc-Release-${{ matrix.case }}
+          build-matrix-v1-${{ runner.os }}-${{ runner.arch }}-gcc-Release
         max-size: 2G
 
     - name: Install LASER system dependency
