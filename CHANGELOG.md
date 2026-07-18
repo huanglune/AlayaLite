@@ -38,6 +38,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after durable BEGIN poisons the active LASER/Collection handle; destroy and
   reopen it before further writes or checkpoints. Gardening remains gated under
   the WAL. This adds no WAL envelope, record kind, or persistent stream/file.
+- Label-aware physical transactions for the LASER op-WAL. `kind=7`
+  `label_bind` and `kind=8` `tx_publish` atomically commit row after-images
+  with explicit labels; the superblock persists the label/transaction tuple,
+  while double-buffered copy-on-write label snapshots preserve the mapping
+  across checkpoint and reopen. Replay validates transaction ordering, PID and
+  binding bijection, and label-slot integrity before publishing recovered state.
+- The C++ `alaya::Collection` API can now select
+  `CollectionOptions::active_engine=core::algorithm::laser` for its active
+  writable generation. The persisted path covers create, write, search,
+  remove, close/reopen, seal, and rotation to a sealed LASER generation, with
+  orphan active directories reclaimed on the next open. This mode supports
+  `wal_fsync` durability and the LASER geometry contract (L2, float32, RaBitQ,
+  power-of-two dimension at least 128, `max_neighbors` 32 or 64, and a LASER
+  sealed target). This reachability is C++-only: the canonical Python
+  Collection binding continues to accept only `flat` and `qg`.
 - A shared bottom-layer `wal/frame.hpp` module owns the Physical WAL v1 framing
   (WAL7 envelope, CRC, scan, `WalFile`, byte `Decoder`) for both the collection
   logical WAL and the segment op-WAL — one frame format, no divergence.
@@ -65,6 +80,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same as the already-retired nsg/fusion/vamana/diskann ids. At the Python
   layer, `index_type="hnsw"` is now rejected before ever reaching the native
   layer at all (`common.py`'s valid `index_type` set dropped `"hnsw"`).
+- When a requested sealed LASER target falls back to Flat, the reported reason
+  now distinguishes the live-row floor, unsupported metric, and invalid
+  dimension instead of returning only a generic LASER fallback message.
+- Internally, LASER's STL-backed query, rotation, search-buffer, result-buffer,
+  and hash-table allocations now share `alaya::AlignedAlloc<T>`. Fixed-alignment
+  `align_allocate`/`align_free` remains for small O_DIRECT scratch buffers; this
+  consolidation does not change the public API or on-disk format.
 
 ### Removed
 
@@ -93,6 +115,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and its beam-search/disk-layout implementation. `algorithm::diskann`
   remains reserved and is rejected by the capability gate. The research
   line lives on in the `feat/diskann-delete-repair` branch.
+
+### Fixed
+
+- LASER WAL recovery now fails closed on divergent label transactions,
+  malformed label snapshots, and conflicting live label/PID ownership before
+  exposing recovered state, while safely de-duplicating a legal same-transaction
+  retry after a torn large bundle.
+- Failures after a physical commit in the active LASER path now latch the
+  adapter before returning and gate search, mutation, checkpoint, and stats;
+  the Collection's post-logical-COMMIT `RecoveryGuard` also blocks subsequent
+  writes, erases, checkpoints, and rotations until recovery by reopen.
 
 ## [1.1.0] - 2026-07-15
 
