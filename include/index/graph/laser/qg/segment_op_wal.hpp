@@ -102,6 +102,13 @@ enum class SegmentOpFailPoint : std::uint8_t {
   after_reuse_install_before_snapshot,            // R6b: kind=8 durable + pages installed, pre-snapshot
   after_reuse_routing_before_hidden_clear,        // R7: snapshot+routing published, before hidden clear
   after_reuse_hidden_clear_partial_before_commit,  // R8: first reused hidden cleared, before committed
+  // leg-7 BLOCKER-7: real independent pre-commit cuts (appended so every prior value is
+  // preserved). Both land on S_old (no durable kind=8 yet). The R11 canonical-checkpoint cuts
+  // reuse the existing checkpoint failpoints (label_slot_written_before_flip /
+  // after_flip_append_before_superblock_write / after_superblock_write_before_wal_reset /
+  // after_wal_reset).
+  after_reuse_free_preimage_before_build,   // R2: reused-page FREE preimages logged, before build
+  after_reuse_partial_final_page,           // R3: the FIRST final (build/spine) page logged, before rest
 };
 
 // Test-only observer for the persistence-model (power-loss) crash layer. It is

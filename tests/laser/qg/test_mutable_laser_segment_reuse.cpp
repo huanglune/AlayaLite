@@ -11,6 +11,10 @@
 
 #include <gtest/gtest.h>
 
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <csignal>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -164,6 +168,64 @@ TEST(MutableLaserSegmentReuse, StaleTokenTombstoneIsNoOpFutureTokenThrows) {
   // A token from the future (generation ahead of durable) is corruption.
   laser::PidToken future{fresh->pid, fresh->pid_generation + 5};
   EXPECT_THROW(seg.tombstone(future), std::exception);
+  std::filesystem::remove_all(dir);
+}
+
+// R9 (leg-7): the label -> (pid, generation) reverse map is IN-MEMORY, rebuilt from the durable
+// label snapshot on every open. A SIGKILL after the canonical bundle's kind=8 is durable but
+// BEFORE the segment updates its reverse map (label_to_pid_.insert_or_assign, which runs only
+// after the QGUpdater commit returns) must recover a reverse map consistent with the durable
+// bindings: the new label resolves to the reused PID's fresh incarnation, the old label is gone,
+// and the reused row is searchable. This proves the reverse map is DERIVED, never a separate
+// durable structure a crash could desync from the committed bindings.
+TEST(MutableLaserSegmentReuse, ReverseMapRecoversAfterSigkillBeforeAdapterUpdate) {
+  const auto dir = scratch("r9_reverse_map");
+  std::filesystem::remove_all(dir);
+  auto base = build_segment(dir, 909);
+  const auto newvec = waltest::make_data(1, kDim, 0x9A9);
+  const uint64_t victim_label = kLabelBase + 5;  // base PID 5
+  const uint64_t new_label = 88888;
+
+  const auto child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    try {
+      laser::UpdateParams params = reuse_params();
+      // Arm the SIGKILL at the canonical kind=8 fsync (R6): the bundle is durable, but the
+      // segment's reverse-map update (after the QGUpdater commit returns) never runs.
+      params.failpoint_hook = [](laser::SegmentOpFailPoint fp) {
+        if (fp == laser::SegmentOpFailPoint::after_tx_publish_fsync) {
+          ::kill(::getpid(), SIGKILL);
+          ::_exit(99);
+        }
+      };
+      MutableLaserSegment seg(dir, params, ResidencyMode::kPagedPool);
+      auto tok = seg.token_for_label(victim_label);
+      if (!tok.has_value()) {
+        ::_exit(71);
+      }
+      seg.tombstone(*tok);
+      seg.consolidate(1, /*r_target=*/0, /*reclaim=*/true, /*bloom=*/false);
+      const uint64_t labels[1] = {new_label};
+      (void)seg.commit_physical_bundle(1, 1, newvec.data(), labels, 1);  // SIGKILL at kind=8 fsync
+    } catch (...) {
+      ::_exit(70);
+    }
+    ::_exit(0);
+  }
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+      << "child must die of SIGKILL at the durable kind=8 (status=" << status << ")";
+
+  // Reopen: rebuild_reverse_index derives the reverse map from the durable (rolled-forward) snapshot.
+  MutableLaserSegment seg(dir, reuse_params(), ResidencyMode::kPagedPool);
+  auto tok = seg.token_for_label(new_label);
+  ASSERT_TRUE(tok.has_value()) << "the reverse map must recover the new label -> reused-PID token";
+  EXPECT_EQ(tok->pid, static_cast<laser::PID>(5)) << "reused the freed base PID";
+  EXPECT_EQ(tok->pid_generation, 1U) << "reuse bumped the generation to 1";
+  EXPECT_FALSE(seg.token_for_label(victim_label).has_value()) << "the old label is gone";
+  EXPECT_EQ(nearest_label(seg, newvec.data()), new_label) << "the reused row is searchable";
   std::filesystem::remove_all(dir);
 }
 

@@ -1425,6 +1425,7 @@ class QGUpdater {
         const char *page = bundle_overlay_page(pi);  // committed FREE image (reused row FREE)
         bundle_log_page(pi, page, alaya::wal::WalFile::Sync::buffered);
       }
+      wal_failpoint(SegmentOpFailPoint::after_reuse_free_preimage_before_build);  // R2
       // (4) build every row + reverse edges into the private overlay. A per-row seed
       // spine (last_built -> current) keeps each row reachable DURING construction; the
       // authoritative bidirectional spine is installed as a FINAL pass below (a later
@@ -2322,6 +2323,21 @@ class QGUpdater {
     const auto *ids = reinterpret_cast<const PID *>(row.data() + neighbor_off_bytes());
     return std::vector<PID>(ids, ids + tr.valid_degree);
   }
+
+  // Full page bytes (rows + trailers + any inter-row/trailer padding) for the crash-matrix
+  // fingerprint: captures the "unused page bytes" a per-row read misses (leg-7 BLOCKER-7). Reads
+  // through the CACHE (query_read: never the writer overlay), so it reflects the committed
+  // SEMANTIC state and is idempotent across the crash-recovery path -- unlike a raw file read,
+  // which would capture non-idempotent partial-crash bytes beyond the committed watermark.
+  [[nodiscard]] std::vector<char> debug_read_page(size_t page_index) {
+    AlignedBuf page(page_size_);
+    read_node_page(static_cast<PID>(page_index * npp_), page.data(), /*query_read=*/true);
+    return std::vector<char>(page.data(), page.data() + page_size_);
+  }
+  // The routing medoid vectors (design section 4): a separate cache that must agree with the
+  // medoid PIDs' row data, so a routing-vector divergence a per-row fingerprint would miss is
+  // caught (leg-7 BLOCKER-7).
+  [[nodiscard]] const std::vector<float> &debug_medoid_vectors() const { return qg_.medoids_vector_; }
 
   [[nodiscard]] size_t trailer_offset_in_page(PID id) const {
     return qg_page_trailer_offset(page_size_, npp_, id % npp_);
@@ -4038,9 +4054,14 @@ class QGUpdater {
   // Spilled pages already carry a final kind=1 from their spill, so only resident dirty
   // pages need a fresh frame here.
   void bundle_finalize_pages() {
+    bool first_final = true;
     for (auto &[pi, bytes] : bundle_ctx_->pages) {
       if (bundle_ctx_->dirty.count(pi) != 0) {
         bundle_log_page(pi, bytes.data(), alaya::wal::WalFile::Sync::buffered);
+        if (first_final) {
+          first_final = false;
+          wal_failpoint(SegmentOpFailPoint::after_reuse_partial_final_page);  // R3
+        }
       }
     }
   }

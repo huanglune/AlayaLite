@@ -58,6 +58,19 @@ std::vector<char> read_file(const std::filesystem::path &path) {
   std::ifstream in(path, std::ios::binary);
   return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
+void write_file(const std::filesystem::path &path, const std::vector<char> &bytes) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+// The complete length of the LAST frame in a WAL (the kind=8 END of a just-appended bundle).
+uint64_t wal_last_frame_size(const std::string &wal_path) {
+  uint64_t sz = 0;
+  alaya::wal::WalFile::visit_frames(wal_path, [&](const alaya::wal::ScannedFrame &f) -> bool {
+    sz = f.size;  // last frame wins
+    return true;
+  });
+  return sz;
+}
 
 UpdateParams reuse_params(size_t max_points,
                           std::function<void(SegmentOpFailPoint)> hook = {},
@@ -117,6 +130,14 @@ std::string capture_fp(QGUpdater &upd) {
   put(upd.applied_collection_op_id());
   put(upd.last_completed_consolidate_epoch());
   put(static_cast<uint64_t>(upd.entry_point()));
+  // leg-7 BLOCKER-7: the superblock's SEMANTIC (uid-independent) fields -- generation, format
+  // version, and both activation generations. The raw superblock image cannot be compared across
+  // independently-built reference/case templates (each stamps a RANDOM segment_uid), so the
+  // portable activation/generation state stands in for "superblock image" in the fingerprint.
+  put(upd.generation());
+  put(static_cast<uint64_t>(upd.superblock_format_version()));
+  put(static_cast<uint64_t>(upd.maintenance_activation_gen()));
+  put(static_cast<uint64_t>(upd.pid_reuse_activation_gen()));
   put(upd.medoids().size());
   for (PID m : upd.medoids()) put(static_cast<uint64_t>(m));
   for (PID id = 0; id < n; ++id) {
@@ -146,8 +167,29 @@ std::string capture_fp(QGUpdater &upd) {
       put(binding.label);
     }
   }
+  // leg-7 BLOCKER-7: FULL page bytes (rows + trailers + inter-row/trailer padding) for every
+  // committed page -- the per-row bytes above miss the "unused page bytes", so a divergence in
+  // padding / a torn trailer region would otherwise pass. And the routing medoid VECTORS, a
+  // cache that must agree with the medoid rows (a routing-vector divergence a per-row scan misses).
+  const size_t pages = n == 0 ? 0 : (static_cast<size_t>(n) + upd.debug_npp() - 1) / upd.debug_npp();
+  put(pages);
+  for (size_t pi = 0; pi < pages; ++pi) {
+    const auto page = upd.debug_read_page(pi);
+    fp.append(page.data(), page.size());
+  }
+  const auto &mv = upd.debug_medoid_vectors();
+  put(mv.size());
+  fp.append(reinterpret_cast<const char *>(mv.data()), mv.size() * sizeof(float));
   return fp;
 }
+
+// The persisted label-slot state is captured SEMANTICALLY by capture_fp's label_snapshot loop
+// (pid -> generation -> label): recovery loads the durable active slot into label_working_ (a
+// checksum mismatch poisons before we get here), so the in-memory bindings equal the durable
+// slot content. Hashing the raw slot FILES additionally would false-fail on a legal orphan
+// inactive-slot write (a checkpoint that fsynced the inactive slot then crashed before the flip
+// leaves a differing-but-unreferenced slot1), so the binding capture is the authoritative,
+// orphan-robust "label slots" fingerprint (leg-7 BLOCKER-7).
 
 struct Recovered {
   bool poisoned = false;
@@ -176,8 +218,8 @@ Recovered recover(const std::string &prefix, size_t max_points) {
 // S_old = the template (bundle never applied); S_new = template + the all-reuse bundle.
 // Built once from a pristine copy of the SAME template each case uses.
 struct Refs {
-  std::string s_old;
-  std::string s_new;
+  std::string s_old;  // the FULL durable fingerprint (pages + medoids + superblock + label slots)
+  std::string s_new;  // of S_old / S_new -- recovery must land on one of them (leg-7 BLOCKER-7).
   size_t max_points;
 };
 const Refs &refs() {
@@ -264,6 +306,13 @@ TEST_P(ReuseCrash, ReopenLandsOnSoldOrSnewAndDoubleReplayStable) {
 
   const auto first = recover(case_prefix, ref.max_points);
   ASSERT_FALSE(first.poisoned) << param.name << " recovery must not poison";
+  // leg-7 BLOCKER-7: the fingerprint now reference-compares the FULL durable image -- committed
+  // page bytes (rows + trailers + padding, via the cache), the medoid vectors, the superblock
+  // image, and BOTH label-slot files -- against the S_old / S_new reference, not merely two-reopen
+  // stability. A wrong-but-stable base image (routing / medoid / slot / superblock divergence)
+  // that the earlier fingerprint missed now fails here. (Raw file bytes past the committed
+  // watermark are non-idempotent across the crash path, so the cache-view fingerprint is the
+  // authoritative durable-image reference.)
   EXPECT_EQ(first.fp, param.expect_new ? ref.s_new : ref.s_old)
       << param.name << " landed on the wrong graph (expected " << (param.expect_new ? "S_new" : "S_old")
       << ")";
@@ -284,7 +333,11 @@ INSTANTIATE_TEST_SUITE_P(
         ReuseKill{"R1a_partial_bind", SegmentOpFailPoint::after_reuse_first_bind_append, false},
         // R1b: all kind=7 buffered, no kind=1/kind=8 -> canonical lane EOF discards.
         ReuseKill{"R1b_all_binds", SegmentOpFailPoint::after_label_bind_append, false},
-        // R2-R4: preimage + final kind=1 all buffered, before the kind=8 append.
+        // R2: the reused pages' FREE preimages logged, before the overlay build/finalize -> S_old.
+        ReuseKill{"R2_free_preimage", SegmentOpFailPoint::after_reuse_free_preimage_before_build, false},
+        // R3: the FIRST final (build/spine) page logged, before the rest + kind=8 -> S_old.
+        ReuseKill{"R3_partial_final", SegmentOpFailPoint::after_reuse_partial_final_page, false},
+        // R4: preimage + ALL final kind=1 buffered, before the kind=8 append.
         ReuseKill{"R4_before_publish", SegmentOpFailPoint::before_tx_publish_append, false},
         // R4 with a tiny cache cap: the build spills overlay pages (Sync::flush, survives
         // SIGKILL), but the FIRST spill forces the kind=7 lane durable, so a surviving spill
@@ -309,52 +362,355 @@ INSTANTIATE_TEST_SUITE_P(
                   true}),
     [](const ::testing::TestParamInfo<ReuseKill> &info) { return info.param.name; });
 
-// R5 three states materialized directly on the committed WAL bytes (no invalid "delete an
-// fsync'd tx" model). Run the bundle to its committed END, then:
-//   (1) leave the complete END      -> recovery rolls forward   -> S_new
-//   (2) cut the last frame mid-write -> a real torn power-loss   -> S_old
-//   (3) drop the whole END frame     -> the lane sees no kind=8   -> S_old
-class ReuseEndTail : public ::testing::TestWithParam<int> {};
+// R5 (leg-7 redo): the three power-loss END states materialized from a LEGAL persistence
+// snapshot -- the pre-bundle FORCED prefix (W0 = the template's single flip) plus the bundle's
+// UNFORCED tail, truncated at the frame level. Nothing already fsync'd is deleted: W0 is written
+// intact in every state, and only the never-forced bundle tail is partially/fully materialized,
+// exactly as an OS flush interrupted by power loss would leave it. Each state is written as a
+// FRESH WAL over a fresh template copy (no fsync-then-delete of the case WAL).
+//   complete: W0 ++ [kind7.., kind1.., COMPLETE kind8]  (a complete but never-forced END) -> S_new
+//   torn:     W0 ++ [.., kind8 cut mid-frame]            (the END flush was interrupted)   -> S_old
+//   absent:   W0 ++ [kind7.., kind1..] (no kind8)        (the END never reached disk)      -> S_old
+enum class EndState { kComplete, kTorn, kAbsent };
 
-TEST_P(ReuseEndTail, PowerLossEndStates) {
-  const int cut = GetParam();  // 0 = keep complete, >0 = bytes to cut off the tail
+class ReuseEndTail : public ::testing::TestWithParam<EndState> {};
+
+TEST_P(ReuseEndTail, PowerLossEndStatesFromLegalSnapshot) {
+  const EndState state = GetParam();
   const auto &ref = refs();
-  const auto root = battery_root("endtail" + std::to_string(cut));
+  const auto root = battery_root("endtail");
   std::filesystem::remove_all(root);
   const auto tmpl = root / "template";
   auto base = WalTinyIndex::build(tmpl, kBaseN, 4242);
   prepare_reuse_template(base.prefix, ref.max_points);
-  const auto case_dir = root / "case";
-  copy_tree(tmpl, case_dir);
-  const std::string case_prefix = (case_dir / "wal_base").string();
-  const std::string case_wal = case_prefix + waltest::index_suffix() + ".opwal";
+  // W0 = the durable pre-bundle WAL (the single flip from prepare's checkpoint reset). This is
+  // the FORCED prefix; it appears intact in every materialized state below.
+  const std::string tmpl_wal = (tmpl / "wal_base").string() + waltest::index_suffix() + ".opwal";
+  const auto w0 = read_file(tmpl_wal);
+  // Run the bundle in a SCRATCH copy to capture the exact unforced tail bytes + the END frame size.
+  const auto scratch = root / "scratch";
+  copy_tree(tmpl, scratch);
+  const std::string scratch_prefix = (scratch / "wal_base").string();
+  const std::string scratch_wal = scratch_prefix + waltest::index_suffix() + ".opwal";
   {
     QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
-    qg.load_disk_index(case_prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+    qg.load_disk_index(scratch_prefix.c_str(), 0.0F, /*recovery_mode=*/true);
     qg.set_params(64, 1, 1);
     QGUpdater upd(qg, reuse_params(ref.max_points));
     const auto labels = bundle_labels();
     (void)upd.commit_physical_bundle(2, 2, bundle_vecs().data(), labels.data(), kFree);
   }
-  const auto full_len = static_cast<std::uintmax_t>(read_file(case_wal).size());
-  if (cut > 0) {
-    ASSERT_GT(full_len, static_cast<std::uintmax_t>(cut));
-    std::filesystem::resize_file(case_wal, full_len - static_cast<std::uintmax_t>(cut));
+  const auto full_wal = read_file(scratch_wal);
+  ASSERT_GT(full_wal.size(), w0.size()) << "the bundle must append a tail past W0";
+  ASSERT_EQ(std::vector<char>(full_wal.begin(), full_wal.begin() + static_cast<long>(w0.size())), w0)
+      << "W0 must be a prefix of the post-bundle WAL (the bundle appends, never rewrites)";
+  const uint64_t end_size = wal_last_frame_size(scratch_wal);  // the kind=8 END frame
+  ASSERT_GT(end_size, 4U);
+  ASSERT_LE(w0.size() + end_size, full_wal.size());
+
+  std::vector<char> materialized;
+  bool expect_new = false;
+  switch (state) {
+    case EndState::kComplete:
+      materialized = full_wal;  // W0 ++ complete-but-never-forced tail
+      expect_new = true;
+      break;
+    case EndState::kTorn:
+      materialized.assign(full_wal.begin(), full_wal.end() - 4);  // END cut mid-frame
+      break;
+    case EndState::kAbsent:
+      materialized.assign(full_wal.begin(),
+                          full_wal.end() - static_cast<long>(end_size));  // whole END frame dropped
+      break;
   }
+  const auto case_dir = root / "case";
+  copy_tree(tmpl, case_dir);  // fresh template: durable W0 index + slots, W0 WAL (about to be overwritten)
+  const std::string case_prefix = (case_dir / "wal_base").string();
+  write_file(case_prefix + waltest::index_suffix() + ".opwal", materialized);
+
   const auto rec = recover(case_prefix, ref.max_points);
-  ASSERT_FALSE(rec.poisoned) << "power-loss recovery must not poison (cut=" << cut << ")";
-  EXPECT_EQ(rec.fp, cut == 0 ? ref.s_new : ref.s_old)
-      << "cut=" << cut << " landed on the wrong graph";
+  ASSERT_FALSE(rec.poisoned) << "a power-loss END state must recover, not poison";
+  EXPECT_EQ(rec.fp, expect_new ? ref.s_new : ref.s_old) << "END state landed on the wrong graph";
   std::filesystem::remove_all(root);
 }
 
 INSTANTIATE_TEST_SUITE_P(EndStates, ReuseEndTail,
-                         // 0 = complete END (S_new); 4 = last frame trailer cut (torn -> S_old);
-                         // 40 = whole END frame dropped (absent -> S_old).
-                         ::testing::Values(0, 4, 40),
-                         [](const ::testing::TestParamInfo<int> &info) {
-                           return "cut" + std::to_string(info.param);
+                         ::testing::Values(EndState::kComplete, EndState::kTorn, EndState::kAbsent),
+                         [](const ::testing::TestParamInfo<EndState> &info) {
+                           switch (info.param) {
+                             case EndState::kComplete: return "complete_unforced_end";
+                             case EndState::kTorn: return "torn_end";
+                             case EndState::kAbsent: return "absent_end";
+                           }
+                           return "unknown";
                          });
+
+// R11 (leg-7): the canonical CHECKPOINT that ABSORBS a durable reuse bundle into the base, with a
+// forced SIGKILL at each of its four cut points (label-slot fsync / flip fsync / superblock fsync
+// / WAL reset). A cut BEFORE the flip is durable leaves the pre-checkpoint canonical state
+// (S_bundle: the bundle is still in the WAL; an orphan inactive-slot write is unreferenced); a
+// cut at/after the durable flip rolls forward to the post-checkpoint base (S_ckpt: the bundle is
+// ABSORBED, its prefix validate-only). Both fingerprints carry the identical (pid, generation,
+// label) bindings + pages (they differ only in the superblock generation the checkpoint bumps),
+// proving the canonical bundle is WAL-vs-base equivalent across the checkpoint boundary.
+// A bundle profile = (prepare the template, commit the bundle with an optional failpoint hook).
+// R11 uses the all-reuse profile (a count-INCREASE checkpoint slot write); R10 uses a same-count
+// rebind profile (design 3.1: reuse PIDs that already carry an explicit binding, rebinding them to
+// NEW labels so the binding COUNT is UNCHANGED and only the content revision moves -- the
+// same-count-dirty checkpoint slot branch, never exercised by the count-increase profile).
+using PrepareFn = void (*)(const std::string &prefix, size_t max_points);
+using CommitFn = void (*)(const std::string &prefix, size_t max_points,
+                          std::function<void(SegmentOpFailPoint)> hook);
+
+void commit_reuse_bundle_hooked(const std::string &prefix, size_t max_points,
+                                std::function<void(SegmentOpFailPoint)> hook) {
+  QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+  qg.load_disk_index(prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+  qg.set_params(64, 1, 1);
+  QGUpdater upd(qg, reuse_params(max_points, std::move(hook)));
+  const auto labels = bundle_labels();
+  (void)upd.commit_physical_bundle(2, 2, bundle_vecs().data(), labels.data(), kFree);
+}
+
+// --- same-count rebind profile (R10) ---
+constexpr size_t kSC = 3;  // rows bound explicitly, then reused with new labels (COUNT unchanged)
+void prepare_samecount_template(const std::string &prefix, size_t max_points) {
+  QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+  qg.load_disk_index(prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+  qg.set_params(64, 1, 1);
+  QGUpdater upd(qg, reuse_params(max_points));
+  const auto vecs = waltest::make_data(kSC, kDim, 0xC0C);
+  std::vector<uint64_t> labels(kSC);
+  for (size_t i = 0; i < kSC; ++i) labels[i] = 300000 + i;
+  (void)upd.commit_physical_bundle(1, 1, vecs.data(), labels.data(), kSC);  // activate + bind kSC
+  for (size_t i = 0; i < kSC; ++i) {
+    upd.tombstone(static_cast<PID>(kBaseN + i));  // forward bindings RETAINED (count stays kSC)
+  }
+  upd.consolidate(1, /*r_target=*/0, /*reclaim=*/true, /*bloom=*/false);  // reclaim the kSC PIDs
+  upd.checkpoint();  // persisted count == kSC, kSC free PIDs
+}
+void commit_samecount_rebind_hooked(const std::string &prefix, size_t max_points,
+                                    std::function<void(SegmentOpFailPoint)> hook) {
+  QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+  qg.load_disk_index(prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+  qg.set_params(64, 1, 1);
+  QGUpdater upd(qg, reuse_params(max_points, std::move(hook)));
+  const auto vecs = waltest::make_data(kSC, kDim, 0xD0D);
+  std::vector<uint64_t> labels(kSC);
+  for (size_t i = 0; i < kSC; ++i) labels[i] = 400000 + i;  // NEW labels -> same-count rebind
+  (void)upd.commit_physical_bundle(2, 2, vecs.data(), labels.data(), kSC);
+}
+
+struct CheckpointKill {
+  const char *name;
+  SegmentOpFailPoint point;
+  bool expect_ckpt;  // the flip is durable at/after this cut -> the post-checkpoint base
+  PrepareFn prepare;
+  CommitFn commit;
+};
+
+class ReuseCheckpointCrash : public ::testing::TestWithParam<CheckpointKill> {};
+
+TEST_P(ReuseCheckpointCrash, CanonicalCheckpointCutsLandOnBundleOrCheckpointed) {
+  const auto param = GetParam();
+  const size_t max_points = kBaseN + 16;
+  const auto root = battery_root(std::string("ckpt_") + param.name);
+  std::filesystem::remove_all(root);
+  const auto tmpl = root / "template";
+  auto base = WalTinyIndex::build(tmpl, kBaseN, 4242);
+  param.prepare((tmpl / "wal_base").string(), max_points);
+
+  // Reference S_bundle: template + committed bundle (no checkpoint).
+  const auto bundle_dir = root / "bundle";
+  copy_tree(tmpl, bundle_dir);
+  param.commit((bundle_dir / "wal_base").string(), max_points, {});
+  const auto s_bundle = recover((bundle_dir / "wal_base").string(), max_points);
+  ASSERT_FALSE(s_bundle.poisoned);
+  // Reference S_ckpt: the same bundle then a CLEAN checkpoint that absorbs it into the base.
+  const auto ckpt_dir = root / "ckpt";
+  copy_tree(tmpl, ckpt_dir);
+  param.commit((ckpt_dir / "wal_base").string(), max_points, {});
+  {
+    const std::string prefix = (ckpt_dir / "wal_base").string();
+    QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+    qg.load_disk_index(prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+    qg.set_params(64, 1, 1);
+    QGUpdater upd(qg, reuse_params(max_points));
+    upd.checkpoint();  // absorb the (already-durable) bundle into the base
+  }
+  const auto s_ckpt = recover((ckpt_dir / "wal_base").string(), max_points);
+  ASSERT_FALSE(s_ckpt.poisoned);
+  ASSERT_NE(s_bundle.fp, s_ckpt.fp) << "the checkpoint must change the durable fingerprint";
+
+  // Case: commit the bundle, then checkpoint with a forced SIGKILL at the cut point. Commit is a
+  // separate durable session so the SIGKILL lands purely on the CHECKPOINT frames.
+  const auto case_dir = root / "case";
+  copy_tree(tmpl, case_dir);
+  const std::string case_prefix = (case_dir / "wal_base").string();
+  param.commit(case_prefix, max_points, {});
+  const auto child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    try {
+      QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+      qg.load_disk_index(case_prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+      qg.set_params(64, 1, 1);
+      const SegmentOpFailPoint target = param.point;
+      QGUpdater upd(qg, reuse_params(max_points, [target](SegmentOpFailPoint fp) {
+                      if (fp == target) {
+                        ::kill(::getpid(), SIGKILL);
+                        ::_exit(99);
+                      }
+                    }));
+      upd.checkpoint();  // the bundle is already durable; the SIGKILL is on the checkpoint cut
+    } catch (...) {
+      ::_exit(70);
+    }
+    ::_exit(0);
+  }
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+      << param.name << " child did not die of SIGKILL at the checkpoint cut (status=" << status << ")";
+
+  const auto first = recover(case_prefix, max_points);
+  ASSERT_FALSE(first.poisoned) << param.name << " checkpoint recovery must not poison";
+  EXPECT_EQ(first.fp, param.expect_ckpt ? s_ckpt.fp : s_bundle.fp)
+      << param.name << " landed on the wrong state (expected "
+      << (param.expect_ckpt ? "S_ckpt" : "S_bundle") << ")";
+  const auto second = recover(case_prefix, max_points);
+  EXPECT_EQ(first.fp, second.fp) << param.name << " second reopen diverged";
+  std::filesystem::remove_all(root);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    CheckpointCuts, ReuseCheckpointCrash,
+    ::testing::Values(
+        // R11 all-reuse (count-increase slot write): the four checkpoint cuts.
+        CheckpointKill{"reuse_slot_fsync", SegmentOpFailPoint::label_slot_written_before_flip, false,
+                       prepare_reuse_template, commit_reuse_bundle_hooked},
+        CheckpointKill{"reuse_flip_fsync", SegmentOpFailPoint::after_flip_append_before_superblock_write,
+                       true, prepare_reuse_template, commit_reuse_bundle_hooked},
+        CheckpointKill{"reuse_sb_fsync", SegmentOpFailPoint::after_superblock_write_before_wal_reset,
+                       true, prepare_reuse_template, commit_reuse_bundle_hooked},
+        CheckpointKill{"reuse_reset", SegmentOpFailPoint::after_wal_reset, true, prepare_reuse_template,
+                       commit_reuse_bundle_hooked},
+        // R10 same-count rebind (same-count-dirty slot write): the slot-write and roll-forward cuts.
+        CheckpointKill{"samecount_slot_fsync", SegmentOpFailPoint::label_slot_written_before_flip, false,
+                       prepare_samecount_template, commit_samecount_rebind_hooked},
+        CheckpointKill{"samecount_flip_fsync",
+                       SegmentOpFailPoint::after_flip_append_before_superblock_write, true,
+                       prepare_samecount_template, commit_samecount_rebind_hooked}),
+    [](const ::testing::TestParamInfo<CheckpointKill> &info) { return info.param.name; });
+
+// R8 (leg-7): the crash matrix on a MIXED reuse+append bundle -- fewer free PIDs than bundle rows,
+// so some binds REUSE a freed PID (generation>0) and some APPEND past the high-water mark
+// (generation 0). The all-reuse RMatrix above never exercises the append-past-HWM half. A cut
+// before the kind=8 fsync discards the whole bundle (S_old); a cut at/after it rolls the mixed
+// bundle forward (S_new), the two halves committing atomically.
+constexpr size_t kMixFree = 2;    // freed base PIDs (the reuse half)
+constexpr size_t kMixBundle = 4;  // 2 reuse + 2 append
+
+void prepare_mixed_template(const std::string &prefix, size_t max_points) {
+  QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+  qg.load_disk_index(prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+  qg.set_params(64, 1, 1);
+  QGUpdater upd(qg, reuse_params(max_points));
+  const auto seed = waltest::make_data(1, kDim, 0xB0B);
+  const uint64_t seed_label = 222222;
+  (void)upd.commit_physical_bundle(1, 1, seed.data(), &seed_label, 1);  // activate v3 pid
+  for (PID id = 0; id < static_cast<PID>(kMixFree); ++id) upd.tombstone(id);
+  upd.consolidate(1, /*r_target=*/0, /*reclaim=*/true, /*bloom=*/false);
+  upd.checkpoint();  // durable v3 pid base with kMixFree free PIDs (< kMixBundle)
+}
+
+const std::vector<float> &mixed_vecs() {
+  static const std::vector<float> v = waltest::make_data(kMixBundle, kDim, 0x3EED);
+  return v;
+}
+std::vector<uint64_t> mixed_labels() {
+  std::vector<uint64_t> l(kMixBundle);
+  for (size_t i = 0; i < kMixBundle; ++i) l[i] = 900000 + i;
+  return l;
+}
+void commit_mixed_bundle(const std::string &prefix, size_t max_points,
+                         std::function<void(SegmentOpFailPoint)> hook = {}) {
+  QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+  qg.load_disk_index(prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+  qg.set_params(64, 1, 1);
+  QGUpdater upd(qg, reuse_params(max_points, std::move(hook)));
+  const auto labels = mixed_labels();
+  (void)upd.commit_physical_bundle(2, 2, mixed_vecs().data(), labels.data(), kMixBundle);
+}
+
+struct MixKill {
+  const char *name;
+  SegmentOpFailPoint point;
+  bool expect_new;
+};
+class MixedReuseCrash : public ::testing::TestWithParam<MixKill> {};
+
+TEST_P(MixedReuseCrash, MixedBundleReopenLandsOnSoldOrSnew) {
+  const auto param = GetParam();
+  const size_t max_points = kBaseN + 16;
+  const auto root = battery_root(std::string("mix_") + param.name);
+  std::filesystem::remove_all(root);
+  const auto tmpl = root / "template";
+  auto base = WalTinyIndex::build(tmpl, kBaseN, 4242);
+  prepare_mixed_template((tmpl / "wal_base").string(), max_points);
+
+  const auto old_dir = root / "old";
+  copy_tree(tmpl, old_dir);
+  const auto s_old = recover((old_dir / "wal_base").string(), max_points).fp;
+  const auto new_dir = root / "new";
+  copy_tree(tmpl, new_dir);
+  commit_mixed_bundle((new_dir / "wal_base").string(), max_points);
+  const auto s_new = recover((new_dir / "wal_base").string(), max_points).fp;
+  ASSERT_NE(s_old, s_new) << "the mixed bundle must change the durable fingerprint";
+
+  const auto case_dir = root / "case";
+  copy_tree(tmpl, case_dir);
+  const std::string case_prefix = (case_dir / "wal_base").string();
+  const auto child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    try {
+      const SegmentOpFailPoint target = param.point;
+      commit_mixed_bundle(case_prefix, max_points, [target](SegmentOpFailPoint fp) {
+        if (fp == target) {
+          ::kill(::getpid(), SIGKILL);
+          ::_exit(99);
+        }
+      });
+    } catch (...) {
+      ::_exit(70);
+    }
+    ::_exit(0);
+  }
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+      << param.name << " child did not die of SIGKILL at the cut (status=" << status << ")";
+
+  const auto first = recover(case_prefix, max_points);
+  ASSERT_FALSE(first.poisoned) << param.name << " mixed recovery must not poison";
+  EXPECT_EQ(first.fp, param.expect_new ? s_new : s_old)
+      << param.name << " landed on the wrong graph (expected " << (param.expect_new ? "S_new" : "S_old")
+      << ")";
+  const auto second = recover(case_prefix, max_points);
+  EXPECT_EQ(first.fp, second.fp) << param.name << " second reopen diverged";
+  std::filesystem::remove_all(root);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    MixedCuts, MixedReuseCrash,
+    ::testing::Values(
+        MixKill{"R2_free_preimage", SegmentOpFailPoint::after_reuse_free_preimage_before_build, false},
+        MixKill{"R4_before_publish", SegmentOpFailPoint::before_tx_publish_append, false},
+        MixKill{"R6_after_fsync", SegmentOpFailPoint::after_tx_publish_fsync, true},
+        MixKill{"R8_hidden_partial", SegmentOpFailPoint::after_reuse_hidden_clear_partial_before_commit,
+                true}),
+    [](const ::testing::TestParamInfo<MixKill> &info) { return info.param.name; });
 
 }  // namespace
 }  // namespace alaya::laser
