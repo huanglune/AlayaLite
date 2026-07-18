@@ -83,9 +83,7 @@ namespace alaya::laser::space {
  * @param dim  Vector dimension
  * @return -<vec0, vec1>  (smaller == more similar). NOT a squared quantity.
  */
-inline float ip(const float *ALAYA_RESTRICT vec0,
-                const float *ALAYA_RESTRICT vec1,
-                size_t dim) {
+inline float ip(const float *ALAYA_RESTRICT vec0, const float *ALAYA_RESTRICT vec1, size_t dim) {
   return ::alaya::simd::ip_sqr<float, float>(vec0, vec1, dim);
 }
 
@@ -132,7 +130,7 @@ inline auto laser_ip_factors(const float *ALAYA_RESTRICT residual,
   const double a = residual_norm_sqr / residual_dot_signed;  // A = ||r||^2 / <r,s>
   return {
       static_cast<float>((1.0 - residual_dot_centroid) + (a * centroid_dot_signed)),  // triple_x
-      static_cast<float>(-a),                                                          // factor_dq
+      static_cast<float>(-a),                                                         // factor_dq
   };
 }
 

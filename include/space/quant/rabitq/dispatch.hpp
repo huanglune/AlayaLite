@@ -480,12 +480,12 @@ inline void scalar_quantize_optimized_generic(uint8_t *ALAYA_RESTRICT result,
 // ALAYA_TARGET_AVX512 nor ALAYA_TARGET_AVX512_BW declare (confirmed by
 // compiler error: "inlining failed ... target specific option mismatch" with
 // just F+BW+DQ) — add avx512vl explicitly for this one kernel.
-ALAYA_TARGET_AVX512_VL inline void
-scalar_quantize_optimized_avx512(uint8_t *ALAYA_RESTRICT result,
-                                 const float *ALAYA_RESTRICT vec0,
-                                 size_t dim,
-                                 float lo,
-                                 float delta) {
+ALAYA_TARGET_AVX512_VL inline void scalar_quantize_optimized_avx512(uint8_t *ALAYA_RESTRICT result,
+                                                                    const float *ALAYA_RESTRICT
+                                                                        vec0,
+                                                                    size_t dim,
+                                                                    float lo,
+                                                                    float delta) {
   size_t mul16 = dim - (dim & 0b1111);
   size_t i = 0;
   float one_over_delta = 1 / delta;
