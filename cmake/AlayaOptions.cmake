@@ -43,6 +43,18 @@ else()
 endif()
 option(ALAYA_ENABLE_LASER "Build the Laser disk-index module" ${ALAYA_ENABLE_LASER_DEFAULT})
 
+# Keep the default/platform admission aligned with collection.hpp's ALAYA_COLLECTION_HAS_ACTIVE_LASER condition
+# (ALAYA_ENABLE_LASER && __linux__). Linux may explicitly disable this test capability; explicitly enabling it on
+# another platform is an error.
+set(ALAYA_ENABLE_MUTABLE_LASER_DEFAULT OFF)
+if(ALAYA_ENABLE_LASER AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(ALAYA_ENABLE_MUTABLE_LASER_DEFAULT ON)
+endif()
+option(ALAYA_ENABLE_MUTABLE_LASER
+       "Build Linux-only mutable LASER test targets (requires LASER; non-Linux ON is an error)"
+       ${ALAYA_ENABLE_MUTABLE_LASER_DEFAULT}
+)
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   set(ALAYA_LASER_USE_THREADPOOL_DEFAULT ON)
 else()
@@ -72,4 +84,14 @@ if(ALAYA_ENABLE_LASER)
         "Configure with -DALAYA_ENABLE_LASER=OFF to skip the Laser module."
     )
   endif()
+endif()
+
+if(ALAYA_ENABLE_MUTABLE_LASER AND NOT ALAYA_ENABLE_LASER)
+  message(FATAL_ERROR "ALAYA_ENABLE_MUTABLE_LASER=ON requires ALAYA_ENABLE_LASER=ON.")
+elseif(ALAYA_ENABLE_MUTABLE_LASER AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  message(
+    FATAL_ERROR
+      "ALAYA_ENABLE_MUTABLE_LASER=ON is supported only on Linux; the mutable updater uses Linux-only APIs. "
+      "Keep ALAYA_ENABLE_LASER=ON for sealed LASER support and configure with -DALAYA_ENABLE_MUTABLE_LASER=OFF."
+  )
 endif()

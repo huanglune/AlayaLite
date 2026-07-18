@@ -122,108 +122,110 @@ alaya_add_test(
   LABELS laser rabitq contract
 )
 
-# Streaming-update research prototype (qg_updater.hpp): patch primitives, builder byte-equality, insert/tombstone
-# end-to-end on a tiny index.
-alaya_cc_target(
-  test_qg_updater_unit
-  BARE GTEST
-  SRCS qg/test_qg_updater_unit.cpp
-  LIBS alaya_laser
-  OPTS ${_laser_test_opts}
-)
-alaya_add_test(
-  NAME laser_test_qg_updater_unit
-  TARGET test_qg_updater_unit
-  LABELS laser
-)
+if(ALAYA_ENABLE_MUTABLE_LASER)
+  # Streaming-update research prototype (qg_updater.hpp): patch primitives, builder byte-equality, insert/tombstone
+  # end-to-end on a tiny index.
+  alaya_cc_target(
+    test_qg_updater_unit
+    BARE GTEST
+    SRCS qg/test_qg_updater_unit.cpp
+    LIBS alaya_laser
+    OPTS ${_laser_test_opts}
+  )
+  alaya_add_test(
+    NAME laser_test_qg_updater_unit
+    TARGET test_qg_updater_unit
+    LABELS laser
+  )
 
-# SEGMENT_OP op-WAL payload codec (segment_op_wal.hpp): round-trip + validation.
-alaya_cc_target(
-  test_segment_op_wal
-  BARE GTEST
-  SRCS qg/test_segment_op_wal.cpp
-  LIBS alaya_laser
-  OPTS ${_laser_test_opts}
-)
-alaya_add_test(
-  NAME laser_test_segment_op_wal
-  TARGET test_segment_op_wal
-  LABELS laser wal persistence
-)
+  # SEGMENT_OP op-WAL payload codec (segment_op_wal.hpp): round-trip + validation.
+  alaya_cc_target(
+    test_segment_op_wal
+    BARE GTEST
+    SRCS qg/test_segment_op_wal.cpp
+    LIBS alaya_laser
+    OPTS ${_laser_test_opts}
+  )
+  alaya_add_test(
+    NAME laser_test_segment_op_wal
+    TARGET test_segment_op_wal
+    LABELS laser wal persistence
+  )
 
-# QGUpdater op-WAL functional durability (enable_wal): reopen/recovery round-trips.
-alaya_cc_target(
-  test_qg_updater_wal
-  BARE GTEST
-  SRCS qg/test_qg_updater_wal.cpp
-  LIBS alaya_laser
-  OPTS ${_laser_test_opts}
-)
-alaya_add_test(
-  NAME laser_test_qg_updater_wal
-  TARGET test_qg_updater_wal
-  LABELS laser wal persistence
-)
+  # QGUpdater op-WAL functional durability (enable_wal): reopen/recovery round-trips.
+  alaya_cc_target(
+    test_qg_updater_wal
+    BARE GTEST
+    SRCS qg/test_qg_updater_wal.cpp
+    LIBS alaya_laser
+    OPTS ${_laser_test_opts}
+  )
+  alaya_add_test(
+    NAME laser_test_qg_updater_wal
+    TARGET test_qg_updater_wal
+    LABELS laser wal persistence
+  )
 
-alaya_cc_target(
-  test_qg_maintenance_concurrency
-  BARE GTEST
-  SRCS qg/test_qg_maintenance_concurrency.cpp
-  LIBS alaya_laser
-  DEFS ALAYA_LASER_TESTING
-  OPTS ${_laser_test_opts}
-)
-alaya_add_test(
-  NAME laser_test_qg_maintenance_concurrency
-  TARGET test_qg_maintenance_concurrency
-  LABELS laser wal persistence tsan
-  TIMEOUT 120
-)
+  alaya_cc_target(
+    test_qg_maintenance_concurrency
+    BARE GTEST
+    SRCS qg/test_qg_maintenance_concurrency.cpp
+    LIBS alaya_laser
+    DEFS ALAYA_LASER_TESTING
+    OPTS ${_laser_test_opts}
+  )
+  alaya_add_test(
+    NAME laser_test_qg_maintenance_concurrency
+    TARGET test_qg_maintenance_concurrency
+    LABELS laser wal persistence tsan
+    TIMEOUT 120
+  )
 
-# G1 crash matrix: SIGKILL/failpoint cuts + a power-loss persistence model.
-alaya_cc_target(
-  test_segment_op_wal_crash
-  BARE GTEST
-  SRCS qg/test_segment_op_wal_crash.cpp
-  LIBS alaya_laser
-  OPTS ${_laser_test_opts}
-)
-alaya_add_test(
-  NAME laser_test_segment_op_wal_crash
-  TARGET test_segment_op_wal_crash
-  LABELS laser wal persistence crash
-  TIMEOUT 120
-)
+  # G1 crash matrix: SIGKILL/failpoint cuts + a power-loss persistence model.
+  alaya_cc_target(
+    test_segment_op_wal_crash
+    BARE GTEST
+    SRCS qg/test_segment_op_wal_crash.cpp
+    LIBS alaya_laser
+    OPTS ${_laser_test_opts}
+  )
+  alaya_add_test(
+    NAME laser_test_segment_op_wal_crash
+    TARGET test_segment_op_wal_crash
+    LABELS laser wal persistence crash
+    TIMEOUT 120
+  )
 
-# MutableLaserSegment: durable single-writer mutable segment handle (W3).
-alaya_cc_target(
-  test_mutable_laser_segment
-  BARE GTEST
-  SRCS qg/test_mutable_laser_segment.cpp
-  LIBS alaya_laser
-  OPTS ${_laser_test_opts}
-)
-alaya_add_test(
-  NAME laser_test_mutable_laser_segment
-  TARGET test_mutable_laser_segment
-  LABELS laser wal disk persistence
-  TIMEOUT 120
-)
+  # MutableLaserSegment: durable single-writer mutable segment handle (W3).
+  alaya_cc_target(
+    test_mutable_laser_segment
+    BARE GTEST
+    SRCS qg/test_mutable_laser_segment.cpp
+    LIBS alaya_laser
+    OPTS ${_laser_test_opts}
+  )
+  alaya_add_test(
+    NAME laser_test_mutable_laser_segment
+    TARGET test_mutable_laser_segment
+    LABELS laser wal disk persistence
+    TIMEOUT 120
+  )
 
-# Residency seams behind UnifiedLaserSegment: prefetch budget default, ResidencyProvider dispatch, ensure_resident_arena
-# file materialization, and the QGUpdater write_at -> arena mirror.
-alaya_cc_target(
-  test_unified_residency
-  BARE GTEST
-  SRCS qg/test_unified_residency.cpp
-  LIBS alaya_laser
-  OPTS ${_laser_test_opts}
-)
-alaya_add_test(
-  NAME laser_test_unified_residency
-  TARGET test_unified_residency
-  LABELS laser
-)
+  # Residency seams behind UnifiedLaserSegment: prefetch budget default, ResidencyProvider dispatch,
+  # ensure_resident_arena file materialization, and the QGUpdater write_at -> arena mirror.
+  alaya_cc_target(
+    test_unified_residency
+    BARE GTEST
+    SRCS qg/test_unified_residency.cpp
+    LIBS alaya_laser
+    OPTS ${_laser_test_opts}
+  )
+  alaya_add_test(
+    NAME laser_test_unified_residency
+    TARGET test_unified_residency
+    LABELS laser
+  )
+endif()
 
 # RowAdmission (segment admission contract v1): the bitmap POD view + its factories (bitmap payload wrap, sorted-rows
 # materialization, exclude-set complement, AND composition). Pure kernel-level unit test -- no QuantizedGraph/disk index
@@ -287,63 +289,65 @@ alaya_add_test(
   LABELS laser
 )
 
-# SIFT-scale update experiment harness (build / insert / delete / eval modes). Not a ctest — run manually; see the usage
-# string in the source.
-alaya_cc_target(
-  bench_laser_update_sift
-  BARE
-  SRCS bench_laser_update_sift.cpp bench_laser_oracles.cpp
-  LIBS alaya_laser
-  OPTS ${_laser_test_opts}
-)
-# The vendored FFHT header contains non-inline helper definitions. Keep the bench's split source files maintainable
-# while compiling them as one translation unit, as the original single-source target did.
-set_target_properties(bench_laser_update_sift PROPERTIES UNITY_BUILD ON)
+if(ALAYA_ENABLE_MUTABLE_LASER)
+  # SIFT-scale update experiment harness (build / insert / delete / eval modes). Not a ctest — run manually; see the
+  # usage string in the source.
+  alaya_cc_target(
+    bench_laser_update_sift
+    BARE
+    SRCS bench_laser_update_sift.cpp bench_laser_oracles.cpp
+    LIBS alaya_laser
+    OPTS ${_laser_test_opts}
+  )
+  # The vendored FFHT header contains non-inline helper definitions. Keep the bench's split source files maintainable
+  # while compiling them as one translation unit, as the original single-source target did.
+  set_target_properties(bench_laser_update_sift PROPERTIES UNITY_BUILD ON)
 
-# wal-2c: W2 canonical PID-reuse writer functional tests (activation, all-reuse, mixed, generation chain, no-reuse
-# byte-invariance). The R0-R11 SIGKILL matrix is test_segment_op_wal_reuse_crash.cpp (registered below in the same
-# section).
-alaya_cc_target(
-  test_qg_updater_reuse
-  BARE GTEST
-  SRCS qg/test_qg_updater_reuse.cpp
-  LIBS alaya_laser
-  OPTS ${_laser_test_opts}
-)
-alaya_add_test(
-  NAME laser_test_qg_updater_reuse
-  TARGET test_qg_updater_reuse
-  LABELS laser wal persistence
-)
+  # wal-2c: W2 canonical PID-reuse writer functional tests (activation, all-reuse, mixed, generation chain, no-reuse
+  # byte-invariance). The R0-R11 SIGKILL matrix is test_segment_op_wal_reuse_crash.cpp (registered below in the same
+  # section).
+  alaya_cc_target(
+    test_qg_updater_reuse
+    BARE GTEST
+    SRCS qg/test_qg_updater_reuse.cpp
+    LIBS alaya_laser
+    OPTS ${_laser_test_opts}
+  )
+  alaya_add_test(
+    NAME laser_test_qg_updater_reuse
+    TARGET test_qg_updater_reuse
+    LABELS laser wal persistence
+  )
 
-# wal-2c: W2 step 7 MutableLaserSegment token-ization + tombstone ABA + base reuse.
-alaya_cc_target(
-  test_mutable_laser_segment_reuse
-  BARE GTEST
-  SRCS qg/test_mutable_laser_segment_reuse.cpp
-  LIBS alaya_laser
-  OPTS ${_laser_test_opts}
-)
-alaya_add_test(
-  NAME laser_test_mutable_laser_segment_reuse
-  TARGET test_mutable_laser_segment_reuse
-  LABELS laser wal persistence
-)
+  # wal-2c: W2 step 7 MutableLaserSegment token-ization + tombstone ABA + base reuse.
+  alaya_cc_target(
+    test_mutable_laser_segment_reuse
+    BARE GTEST
+    SRCS qg/test_mutable_laser_segment_reuse.cpp
+    LIBS alaya_laser
+    OPTS ${_laser_test_opts}
+  )
+  alaya_add_test(
+    NAME laser_test_mutable_laser_segment_reuse
+    TARGET test_mutable_laser_segment_reuse
+    LABELS laser wal persistence
+  )
 
-# wal-2c: W2 step 8 canonical PID-reuse R0-R11 SIGKILL/power-loss crash matrix.
-alaya_cc_target(
-  test_segment_op_wal_reuse_crash
-  BARE GTEST
-  SRCS qg/test_segment_op_wal_reuse_crash.cpp
-  LIBS alaya_laser
-  OPTS ${_laser_test_opts}
-)
-alaya_add_test(
-  NAME laser_test_segment_op_wal_reuse_crash
-  TARGET test_segment_op_wal_reuse_crash
-  LABELS laser wal persistence crash
-  TIMEOUT 120
-)
+  # wal-2c: W2 step 8 canonical PID-reuse R0-R11 SIGKILL/power-loss crash matrix.
+  alaya_cc_target(
+    test_segment_op_wal_reuse_crash
+    BARE GTEST
+    SRCS qg/test_segment_op_wal_reuse_crash.cpp
+    LIBS alaya_laser
+    OPTS ${_laser_test_opts}
+  )
+  alaya_add_test(
+    NAME laser_test_segment_op_wal_reuse_crash
+    TARGET test_segment_op_wal_reuse_crash
+    LABELS laser wal persistence crash
+    TIMEOUT 120
+  )
+endif()
 # laser-ip: LASER inner-product (IP) distance kernel tests. Appended by branch feat/laser-ip-kernel; integrate as an
 # append-only region on top of 2C's file. Both targets read the immutable official fixture ip_official_fixture.tsv,
 # located via the ALAYA_IP_FIXTURE_DIR compile-def (source tree, so it is committable and read-only in CI). Core-space
