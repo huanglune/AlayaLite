@@ -13,8 +13,10 @@
 # header from a target with an identical compile profile.
 #
 # alaya_add_test(NAME <name> TARGET <target> [FILTER <gtest-filter>] [LABELS <labels...>] [TIMEOUT <seconds>]
-# [WORKING_DIRECTORY <dir>] [RUN_SERIAL]) Registers one ctest entry for an alaya_cc_target executable. A target may be
-# registered several times with different FILTERs (e.g. one ctest entry per GTest suite in a binary).
+# [WORKING_DIRECTORY <dir>] [RUN_SERIAL] [COVERAGE_RUN_SERIAL]) Registers one ctest entry for an alaya_cc_target
+# executable. COVERAGE_RUN_SERIAL applies only when ENABLE_COVERAGE=ON, so memory-bound coverage tests can avoid
+# destructive CPU contention without serializing the Release gate. A target may be registered several times with
+# different FILTERs (e.g. one ctest entry per GTest suite in a binary).
 #
 # Target names, test names, and labels are part of the project's external contract — CI scripts build targets by name
 # and select tests by label — so helpers take both names explicitly instead of deriving one from the other.
@@ -119,7 +121,7 @@ function(alaya_cc_target target_name)
 endfunction()
 
 function(alaya_add_test)
-  set(flag_keywords RUN_SERIAL)
+  set(flag_keywords RUN_SERIAL COVERAGE_RUN_SERIAL)
   set(one_value_keywords
       NAME
       TARGET
@@ -158,7 +160,7 @@ function(alaya_add_test)
   if(ARG_WORKING_DIRECTORY)
     set_tests_properties(${ARG_NAME} PROPERTIES WORKING_DIRECTORY ${ARG_WORKING_DIRECTORY})
   endif()
-  if(ARG_RUN_SERIAL)
+  if(ARG_RUN_SERIAL OR (ARG_COVERAGE_RUN_SERIAL AND ENABLE_COVERAGE))
     set_tests_properties(${ARG_NAME} PROPERTIES RUN_SERIAL TRUE)
   endif()
 endfunction()

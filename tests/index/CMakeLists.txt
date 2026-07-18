@@ -57,7 +57,7 @@ alaya_add_test(
 alaya_add_test(
   NAME index_test_rabitq
   TARGET rabitq_test
-  LABELS unit
+  LABELS unit COVERAGE_RUN_SERIAL
 )
 alaya_add_test(
   NAME index_test_rabitq_performance
