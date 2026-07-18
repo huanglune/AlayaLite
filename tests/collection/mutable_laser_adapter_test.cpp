@@ -8,14 +8,18 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -386,6 +390,99 @@ TEST(MutableLaserAdapter, FailureAfterDurableBeginLatchesAndGatesCheckpoint) {
   core::CheckpointToken token;
   EXPECT_FALSE(adapter.checkpoint(context, token).ok());
   EXPECT_FALSE(adapter.consolidate(1, 0, true, false).ok());
+  std::filesystem::remove_all(dir);
+}
+
+TEST(MutableLaserAdapter, SharedExtensionsResolveSameForActiveAndSealedDefaults) {
+  ::alaya::disk::LaserSegmentSearchExtension parameters;
+  parameters.effort = 37;
+  parameters.beam_width = 7;
+  auto extension = ::alaya::disk::make_laser_segment_search_extension(parameters);
+  core::SearchOptions request_options(5);
+  request_options.extensions =
+      std::span<const core::AlgorithmSearchExtension>(&extension, 1);
+
+  ::alaya::disk::DiskSearchOptions active_defaults;
+  active_defaults.ef = 128;
+  active_defaults.beam_width = 4;
+  ::alaya::disk::DiskSearchOptions sealed_defaults;
+  sealed_defaults.ef = 100;
+  sealed_defaults.beam_width = 4;
+  auto active = ::alaya::disk::resolve_laser_search_extensions(request_options, active_defaults);
+  auto sealed = ::alaya::disk::resolve_laser_search_extensions(request_options, sealed_defaults);
+  ASSERT_TRUE(active.ok());
+  ASSERT_TRUE(sealed.ok());
+  EXPECT_EQ(active.value().top_k, sealed.value().top_k);
+  EXPECT_EQ(active.value().ef, sealed.value().ef);
+  EXPECT_EQ(active.value().beam_width, sealed.value().beam_width);
+  EXPECT_EQ(active.value().ef, parameters.effort);
+  EXPECT_EQ(active.value().beam_width, parameters.beam_width);
+  EXPECT_FALSE(active.value().exact_rerank);
+  EXPECT_FALSE(sealed.value().exact_rerank);
+
+  extension.algorithm_id = core::algorithm::qg;
+  auto active_rejected =
+      ::alaya::disk::resolve_laser_search_extensions(request_options, active_defaults);
+  auto sealed_rejected =
+      ::alaya::disk::resolve_laser_search_extensions(request_options, sealed_defaults);
+  ASSERT_FALSE(active_rejected.ok());
+  ASSERT_FALSE(sealed_rejected.ok());
+  EXPECT_EQ(active_rejected.status().detail(), core::StatusDetail::unknown_extension);
+  EXPECT_EQ(sealed_rejected.status().detail(), core::StatusDetail::unknown_extension);
+}
+
+TEST(MutableLaserAdapter, SearchExtensionChangesActiveExpansionEffort) {
+  const auto dir = scratch("search_extensions");
+  auto seg = open_empty(dir);
+  constexpr size_t kRows = 256;
+  std::vector<float> vectors(kRows * kDim);
+  std::vector<std::uint64_t> labels(kRows);
+  for (size_t row = 0; row < kRows; ++row) {
+    labels[row] = 10'000 + row;
+    for (size_t column = 0; column < kDim; ++column) {
+      vectors[row * kDim + column] =
+          static_cast<float>((row * 131 + column * 17 + row * column) % 1009) / 1009.0F;
+    }
+  }
+  (void)seg->commit_physical_bundle(801, 801, vectors.data(), labels.data(), labels.size());
+  MutableLaserCollectionAdapter adapter(seg, schema(), kSegId, kGen);
+
+  const auto run = [&](std::uint32_t effort, std::uint32_t beam_width) {
+    std::array<core::SearchHit, 1> hits{};
+    std::array<core::RowCount, 2> offsets{};
+    std::array<core::RowCount, 1> counts{};
+    std::array<core::Status, 1> statuses{};
+    std::array<core::SearchCompleteness, 1> completeness{};
+    core::SearchResponse response;
+    response.hits = hits;
+    response.offsets = offsets;
+    response.valid_counts = counts;
+    response.statuses = statuses;
+    response.completeness = completeness;
+    ::alaya::disk::LaserSegmentSearchExtension parameters;
+    parameters.effort = effort;
+    parameters.beam_width = beam_width;
+    auto extension = ::alaya::disk::make_laser_segment_search_extension(parameters);
+    core::SearchContext context;
+    core::SearchRequest request;
+    request.queries = core::TypedTensorView::contiguous(vectors.data() + 173 * kDim, 1, kDim);
+    request.options.top_k = 1;
+    request.options.extensions =
+        std::span<const core::AlgorithmSearchExtension>(&extension, 1);
+    request.context = &context;
+    request.response = &response;
+    const auto before = seg->search_stats().query_page_reads;
+    const auto status = adapter.search(request);
+    const auto after = seg->search_stats().query_page_reads;
+    EXPECT_TRUE(status.ok()) << status.diagnostic();
+    EXPECT_EQ(counts[0], 1U);
+    return after - before;
+  };
+
+  const auto low_effort_expansions = run(/*effort=*/1, /*beam_width=*/1);
+  const auto high_effort_expansions = run(/*effort=*/128, /*beam_width=*/16);
+  EXPECT_GT(high_effort_expansions, low_effort_expansions)
+      << "the active adapter must pass extension effort into QG traversal";
   std::filesystem::remove_all(dir);
 }
 

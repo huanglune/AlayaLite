@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -480,6 +481,45 @@ TEST(CollectionActiveLaserMaintenance, DurabilityModesRejectSearchableWithoutPen
       collection.reset();
     }
   }
+}
+
+TEST(CollectionActiveLaserMaintenance, SearchExtensionAdmissionMatchesActiveAndSealed) {
+  TemporaryDirectory root("search-extension-parity");
+  auto created = Collection::create(options(root.path()));
+  ASSERT_TRUE(created.ok()) << created.status().diagnostic();
+  auto collection = std::move(created).value();
+  for (std::uint64_t row = 0; row < 64; ++row) {
+    const auto vector = vector_with(static_cast<float>(row) * 0.125F);
+    ASSERT_TRUE(collection->add(item("extension-" + std::to_string(row), vector)).ok());
+  }
+  const auto query = vector_with(3.0F);
+  const auto run = [&](std::uint32_t effort, std::uint32_t beam_width) {
+    disk::LaserSegmentSearchExtension parameters;
+    parameters.effort = effort;
+    parameters.beam_width = beam_width;
+    auto extension = disk::make_laser_segment_search_extension(parameters);
+    core::SearchOptions search_options(5);
+    search_options.extensions =
+        std::span<const core::AlgorithmSearchExtension>(&extension, 1);
+    core::SearchContext context;
+    return collection->search(
+        core::TypedTensorView::contiguous(query.data(), 1, query.size()), search_options, context);
+  };
+
+  ASSERT_TRUE(run(/*effort=*/5, /*beam_width=*/2).ok());
+  ASSERT_TRUE(run(/*effort=*/96, /*beam_width=*/8).ok());
+  auto invalid_active = run(/*effort=*/0, /*beam_width=*/2);
+  ASSERT_FALSE(invalid_active.ok());
+  EXPECT_EQ(invalid_active.status().detail(), core::StatusDetail::malformed_struct);
+
+  auto sealed = collection->seal();
+  ASSERT_TRUE(sealed.ok()) << sealed.status().diagnostic();
+  ASSERT_TRUE(run(/*effort=*/5, /*beam_width=*/2).ok());
+  ASSERT_TRUE(run(/*effort=*/96, /*beam_width=*/8).ok());
+  auto invalid_sealed = run(/*effort=*/0, /*beam_width=*/2);
+  ASSERT_FALSE(invalid_sealed.ok());
+  EXPECT_EQ(invalid_sealed.status().code(), invalid_active.status().code());
+  EXPECT_EQ(invalid_sealed.status().detail(), invalid_active.status().detail());
 }
 
 }  // namespace
