@@ -39,8 +39,8 @@ class TemporaryDirectory {
   explicit TemporaryDirectory(std::string name) {
     static std::atomic_uint64_t serial{};
     path_ = std::filesystem::temp_directory_path() /
-            ("qg-maintenance-concurrency-" + std::move(name) + "-" +
-             std::to_string(::getpid()) + "-" + std::to_string(++serial));
+            ("qg-maintenance-concurrency-" + std::move(name) + "-" + std::to_string(::getpid()) +
+             "-" + std::to_string(++serial));
     std::filesystem::remove_all(path_);
   }
   ~TemporaryDirectory() {
@@ -99,7 +99,10 @@ struct Session {
   explicit Session(const std::string &prefix,
                    std::function<void(SegmentOpFailPoint)> hook = {},
                    size_t cache_cap_pages = 0,
-                   bool resident_arena = false)
+                   bool resident_arena = false,
+                   std::function<void(uint64_t, size_t)> before_index_write_hook = {},
+                   bool write_cache = true,
+                   bool enable_wal = true)
       : qg(kBaseN, kDeg, kDim, kDim) {
     qg.load_disk_index(prefix.c_str(), 0.0F, /*recovery_mode=*/true);
     if (resident_arena) {
@@ -107,16 +110,17 @@ struct Session {
     }
     qg.set_params(64, 1, 1);
     UpdateParams params;
-    params.enable_wal = true;
+    params.enable_wal = enable_wal;
     params.max_points = kMaxPoints;
+    params.write_cache = write_cache;
     params.cache_cap_pages = cache_cap_pages == 0 ? params.cache_cap_pages : cache_cap_pages;
     params.failpoint_hook = std::move(hook);
+    params.before_index_write_hook = std::move(before_index_write_hook);
     updater = std::make_unique<QGUpdater>(qg, std::move(params));
   }
 };
 
-[[nodiscard]] auto checked_search(QGUpdater &updater, const float *query)
-    -> std::vector<PID> {
+[[nodiscard]] auto checked_search(QGUpdater &updater, const float *query) -> std::vector<PID> {
   updater.ensure_readable();
   auto result = updater.search(query, 16, kBaseN);
   updater.ensure_readable();
@@ -126,13 +130,11 @@ struct Session {
 [[nodiscard]] auto kind_counts(const std::string &prefix) -> std::array<size_t, 9> {
   std::array<size_t, 9> counts{};
   const auto wal_path = prefix + waltest::index_suffix() + ".opwal";
-  alaya::wal::WalFile::visit_frames(
-      wal_path,
-      [&](const alaya::wal::ScannedFrame &frame) {
-        const auto op = decode_segment_op(frame.payload);
-        ++counts[static_cast<size_t>(op.kind)];
-        return true;
-      });
+  alaya::wal::WalFile::visit_frames(wal_path, [&](const alaya::wal::ScannedFrame &frame) {
+    const auto op = decode_segment_op(frame.payload);
+    ++counts[static_cast<size_t>(op.kind)];
+    return true;
+  });
   return counts;
 }
 
@@ -364,21 +366,100 @@ TEST(QgMaintenanceConcurrency, StatvfsFailureBeforeBeginDoesNotLatch) {
   EXPECT_EQ(updater.free_count(), 1U);
 }
 
+TEST(QgMaintenanceConcurrency, BaselineFlushFailurePoisonsClosesEvenAndPrecedesBegin) {
+  TemporaryDirectory root("baseline-flush");
+  auto base = WalTinyIndex::build(root.path(), kBaseN, 7551);
+  std::atomic_bool armed{};
+  std::atomic_bool preflight_seen{};
+  Session session(
+      base.prefix,
+      [&](SegmentOpFailPoint point) {
+        if (point == SegmentOpFailPoint::before_consolidate_statvfs &&
+            armed.load(std::memory_order_acquire)) {
+          preflight_seen.store(true, std::memory_order_release);
+        }
+      },
+      /*cache_cap_pages=*/0,
+      /*resident_arena=*/false,
+      [&](uint64_t, size_t) {
+        if (armed.exchange(false, std::memory_order_acq_rel)) {
+          throw std::system_error(std::make_error_code(std::errc::no_space_on_device),
+                                  "injected baseline pwrite ENOSPC");
+        }
+      });
+  auto &updater = *session.updater;
+
+  // Activate maintenance first, then leave a committed tombstone page dirty in
+  // the shared write cache so the next consolidate has real baseline work.
+  ASSERT_NO_THROW(updater.consolidate(1, 0, true, false));
+  updater.tombstone(1);
+  const auto counts_before = kind_counts(base.prefix);
+  preflight_seen.store(false, std::memory_order_release);
+  armed.store(true, std::memory_order_release);
+
+  EXPECT_THROW(updater.consolidate(1, 0, true, false), std::system_error);
+  EXPECT_TRUE(preflight_seen.load(std::memory_order_acquire));
+  EXPECT_TRUE(updater.is_poisoned());
+  EXPECT_EQ(updater.debug_page_version(0) & 1U, 0U);
+  const auto counts_after = kind_counts(base.prefix);
+  EXPECT_EQ(counts_after[static_cast<size_t>(SegmentOpKind::consolidate_begin)],
+            counts_before[static_cast<size_t>(SegmentOpKind::consolidate_begin)]);
+
+  // The raw page reader bypasses the poison gate and therefore proves the
+  // seqlock itself was closed instead of merely observing ensure_readable().
+  auto reader = std::async(std::launch::async, [&] {
+    return updater.debug_read_page(0).size();
+  });
+  EXPECT_EQ(reader.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+  EXPECT_EQ(reader.get(), updater.debug_read_page(0).size());
+  EXPECT_THROW(updater.ensure_readable(), std::runtime_error);
+}
+
+TEST(QgMaintenanceConcurrency, DirectPageWriteFailurePoisonsAndClosesEven) {
+  TemporaryDirectory root("direct-write");
+  auto base = WalTinyIndex::build(root.path(), kBaseN, 7552);
+  std::atomic_bool armed{};
+  Session session(
+      base.prefix,
+      {},
+      /*cache_cap_pages=*/0,
+      /*resident_arena=*/false,
+      [&](uint64_t, size_t) {
+        if (armed.exchange(false, std::memory_order_acq_rel)) {
+          throw std::system_error(std::make_error_code(std::errc::io_error),
+                                  "injected direct page pwrite failure");
+        }
+      },
+      /*write_cache=*/false,
+      /*enable_wal=*/false);
+  auto &updater = *session.updater;
+  armed.store(true, std::memory_order_release);
+
+  EXPECT_THROW(updater.tombstone(1), std::system_error);
+  EXPECT_TRUE(updater.is_poisoned());
+  EXPECT_EQ(updater.debug_page_version(0) & 1U, 0U);
+  auto reader = std::async(std::launch::async, [&] {
+    return updater.debug_read_page(0).size();
+  });
+  EXPECT_EQ(reader.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+  EXPECT_EQ(reader.get(), updater.debug_read_page(0).size());
+}
+
 TEST(QgMaintenanceConcurrency, EnospcAfterBeginPoisonsAndReopenRollsBack) {
   TemporaryDirectory root("enospc");
   auto base = WalTinyIndex::build(root.path(), kBaseN, 7601);
   {
     std::atomic_bool armed{true};
-    Session session(base.prefix,
-                    [&](SegmentOpFailPoint point) {
-                      if (point ==
-                              SegmentOpFailPoint::after_consolidate_overlay_modify_before_spill &&
-                          armed.exchange(false, std::memory_order_acq_rel)) {
-                        throw std::system_error(std::make_error_code(std::errc::no_space_on_device),
-                                                "injected maintenance WAL ENOSPC");
-                      }
-                    },
-                    /*cache_cap_pages=*/1);
+    Session session(
+        base.prefix,
+        [&](SegmentOpFailPoint point) {
+          if (point == SegmentOpFailPoint::after_consolidate_overlay_modify_before_spill &&
+              armed.exchange(false, std::memory_order_acq_rel)) {
+            throw std::system_error(std::make_error_code(std::errc::no_space_on_device),
+                                    "injected maintenance WAL ENOSPC");
+          }
+        },
+        /*cache_cap_pages=*/1);
     auto &updater = *session.updater;
     updater.tombstone(1);
     EXPECT_THROW(updater.consolidate(1, 0, true, false), std::system_error);
