@@ -398,6 +398,7 @@ struct UpdateStats {
   uint64_t garden_all_turnover_sum = 0;
   uint64_t garden_all_turnover_rows = 0;
   uint64_t maintenance_peak_pool_pages = 0;
+  uint64_t maintenance_peak_overlay_pages = 0;
   uint64_t garden_skipped = 0;
 };
 
@@ -871,6 +872,7 @@ class QGUpdater {
     s.garden_all_turnover_sum = stats_.garden_all_turnover_sum.load();
     s.garden_all_turnover_rows = stats_.garden_all_turnover_rows.load();
     s.maintenance_peak_pool_pages = stats_.maintenance_peak_pool_pages.load();
+    s.maintenance_peak_overlay_pages = stats_.maintenance_peak_overlay_pages.load();
     s.garden_skipped = stats_.garden_skipped.load();
     return s;
   }
@@ -2584,6 +2586,7 @@ class QGUpdater {
     std::atomic<uint64_t> garden_all_turnover_sum{0};
     std::atomic<uint64_t> garden_all_turnover_rows{0};
     std::atomic<uint64_t> maintenance_peak_pool_pages{0};
+    std::atomic<uint64_t> maintenance_peak_overlay_pages{0};
     std::atomic<uint64_t> garden_skipped{0};
   };
 
@@ -3889,7 +3892,19 @@ class QGUpdater {
   // reload a spilled one from its kind=1 frame, or copy the committed image from
   // disk on first touch. Single-threaded within an epoch. unordered_map guarantees
   // reference stability, so a char* returned here stays valid across later inserts
-  // (only maint_spill_over_cap, run after the caller's fn returns, ever erases).
+  // (the cap/release helpers erase only after the caller finishes using it).
+  void note_maintenance_overlay_resident() noexcept {
+    const uint64_t pages = maint_pages_.size();
+    uint64_t peak = stats_.maintenance_peak_overlay_pages.load(std::memory_order_relaxed);
+    while (
+        peak < pages &&
+        !stats_.maintenance_peak_overlay_pages.compare_exchange_weak(peak,
+                                                                     pages,
+                                                                     std::memory_order_relaxed,
+                                                                     std::memory_order_relaxed)) {
+    }
+  }
+
   char *maint_overlay_page(size_t pi) {
     auto it = maint_pages_.find(pi);
     if (it != maint_pages_.end()) {
@@ -3915,6 +3930,7 @@ class QGUpdater {
     }
     auto [ins, unused] = maint_pages_.emplace(pi, std::move(bytes));
     (void)unused;
+    note_maintenance_overlay_resident();
     return ins->second.data();
   }
 
@@ -3974,6 +3990,17 @@ class QGUpdater {
       wal_failpoint(SegmentOpFailPoint::after_consolidate_spill_flush);  // C5
       it = maint_pages_.erase(it);
     }
+  }
+
+  // A dependency-only page has no reason to occupy the overlay after its last
+  // read. Drop a clean page immediately; if a prior maintenance phase dirtied it,
+  // enforce the ordinary cap without pinning it so its latest image can spill.
+  void maint_release_dependency_page(size_t pi) {
+    auto it = maint_pages_.find(pi);
+    if (it != maint_pages_.end() && maint_dirty_.count(pi) == 0) {
+      maint_pages_.erase(it);
+    }
+    maint_spill_over_cap((std::numeric_limits<size_t>::max)());
   }
 
   // END-durable install (design section 1.2 step 6): write every touched page's
@@ -4417,9 +4444,8 @@ class QGUpdater {
   // Reclaim (MAJOR-3: runtime free chain must be GLOBALLY canonical, not just the new
   // set): collect the FULL final free set = the pre-existing chain UNION the newly-freed
   // rows, then rewrite EVERY free row's next pointer in ascending PID order (head = the
-  // smallest free PID). Prepending the new set onto the old chain produced a runtime order
-  // (e.g. 5 -> 1) that a reopen's ascending rebuild (1 -> 5) contradicts, so the next
-  // bundle would reuse a different PID clean vs after reopen. Published at END.
+  // smallest free PID). Every overlay access below is grouped by physical page and
+  // enforces the maintenance cap before moving on. Published at END.
   void maint_reclaim_phase() {
     const size_t n = committed_.load(std::memory_order_acquire);
     // 1. Walk the EXISTING free chain (canonical ascending or empty) to collect its PIDs.
@@ -4435,7 +4461,12 @@ class QGUpdater {
         const char *page = maint_overlay_page(page_index(cur));
         uint64_t next64 = kPidMax;
         std::memcpy(&next64, page + node_offset_in_page(cur), sizeof(next64));
-        cur = next64 == kPidMax ? kPidMax : static_cast<PID>(next64);
+        const PID next = next64 == kPidMax ? kPidMax : static_cast<PID>(next64);
+        const size_t pi = page_index(cur);
+        if (next == kPidMax || page_index(next) != pi) {
+          maint_release_dependency_page(pi);
+        }
+        cur = next;
       }
     }
     if (all_free.size() != maint_local_free_count_) {
@@ -4451,40 +4482,69 @@ class QGUpdater {
     }
     std::vector<PID> eligible = deleted_snapshot();
     std::sort(eligible.begin(), eligible.end());
-    for (PID id : eligible) {
-      if (id >= n || existing.count(static_cast<uint64_t>(id)) != 0) {
-        continue;
+    eligible.erase(std::remove_if(eligible.begin(),
+                                  eligible.end(),
+                                  [&](PID id) {
+                                    if (id >= n || existing.count(static_cast<uint64_t>(id)) != 0) {
+                                      return true;
+                                    }
+                                    const auto *b = reclaim_snap->find_binding(id);
+                                    return b != nullptr &&
+                                           b->pid_generation ==
+                                               (std::numeric_limits<uint32_t>::max)();
+                                  }),
+                   eligible.end());
+    for (size_t begin = 0; begin < eligible.size();) {
+      const size_t pi = page_index(eligible[begin]);
+      size_t end = begin + 1;
+      while (end < eligible.size() && page_index(eligible[end]) == pi) {
+        ++end;
       }
-      const auto *b = reclaim_snap->find_binding(id);
-      if (b != nullptr && b->pid_generation == (std::numeric_limits<uint32_t>::max)()) {
-        continue;  // saturated generation: never reclaim
+      char *page = maint_overlay_page(pi);
+      bool changed = false;
+      for (size_t i = begin; i < end; ++i) {
+        const PID id = eligible[i];
+        QGRowTrailer trailer = qg_read_page_trailer(page, page_size_, npp_, id % npp_);
+        if ((trailer.flags & kQGRowTombstone) == 0 || (trailer.flags & kQGRowFree) != 0) {
+          continue;  // only tombstoned, not-yet-free rows are eligible
+        }
+        trailer.valid_degree = 0;
+        trailer.flags |= kQGRowFree;
+        qg_write_page_trailer(page, page_size_, npp_, id % npp_, trailer);
+        all_free.push_back(id);
+        stats_.freed_slots++;
+        changed = true;
       }
-      char *page = maint_overlay_page(page_index(id));
-      QGRowTrailer trailer = qg_read_page_trailer(page, page_size_, npp_, id % npp_);
-      if ((trailer.flags & kQGRowTombstone) == 0 || (trailer.flags & kQGRowFree) != 0) {
-        continue;  // only tombstoned, not-yet-free rows are eligible
+      if (changed) {
+        maint_dirty_.insert(pi);
+        maint_spill_over_cap(pi);
+      } else {
+        maint_release_dependency_page(pi);
       }
-      trailer.valid_degree = 0;
-      trailer.flags |= kQGRowFree;
-      qg_write_page_trailer(page, page_size_, npp_, id % npp_, trailer);
-      maint_dirty_.insert(page_index(id));
-      all_free.push_back(id);
-      stats_.freed_slots++;
+      begin = end;
     }
+
     // 3. Canonicalize the WHOLE free set ascending -- byte-identical to the recovery
     // rebuild (rebuild_state_after_replay), so a reopen never re-orders the chain.
     std::sort(all_free.begin(), all_free.end());
     all_free.erase(std::unique(all_free.begin(), all_free.end()), all_free.end());
-    PID head = kPidMax;
-    for (auto it = all_free.rbegin(); it != all_free.rend(); ++it) {
-      const PID id = *it;
-      char *page = maint_overlay_page(page_index(id));
-      const uint64_t next64 = head;
-      std::memcpy(page + node_offset_in_page(id), &next64, sizeof(next64));
-      maint_dirty_.insert(page_index(id));  // the rewritten next pointer must be logged + installed
-      head = id;
+    for (size_t begin = 0; begin < all_free.size();) {
+      const size_t pi = page_index(all_free[begin]);
+      size_t end = begin + 1;
+      while (end < all_free.size() && page_index(all_free[end]) == pi) {
+        ++end;
+      }
+      char *page = maint_overlay_page(pi);
+      for (size_t i = begin; i < end; ++i) {
+        const PID id = all_free[i];
+        const uint64_t next64 = i + 1 < all_free.size() ? all_free[i + 1] : kPidMax;
+        std::memcpy(page + node_offset_in_page(id), &next64, sizeof(next64));
+      }
+      maint_dirty_.insert(pi);  // rewritten next pointers must be logged + installed
+      maint_spill_over_cap(pi);
+      begin = end;
     }
-    maint_local_free_head_ = head;
+    maint_local_free_head_ = all_free.empty() ? kPidMax : all_free.front();
     maint_local_free_count_ = all_free.size();
   }
 

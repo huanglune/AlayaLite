@@ -445,6 +445,27 @@ TEST(QgMaintenanceConcurrency, DirectPageWriteFailurePoisonsAndClosesEven) {
   EXPECT_EQ(reader.get(), updater.debug_read_page(0).size());
 }
 
+TEST(QgMaintenanceConcurrency, ReclaimOverlayHonorsPageCap) {
+  TemporaryDirectory root("reclaim-cap");
+  auto base = WalTinyIndex::build(root.path(), kBaseN, 7553);
+  Session session(base.prefix, {}, /*cache_cap_pages=*/1);
+  auto &updater = *session.updater;
+  for (size_t raw_id = 0; raw_id < kBaseN; ++raw_id) {
+    updater.tombstone(static_cast<PID>(raw_id));
+  }
+
+  ASSERT_NO_THROW(updater.consolidate(1, 0, true, false));
+  EXPECT_EQ(updater.free_count(), kBaseN);
+  EXPECT_GE(updater.stats().maintenance_peak_overlay_pages, 1U);
+  EXPECT_LE(updater.stats().maintenance_peak_overlay_pages, updater.cache_cap_pages() + 1);
+
+  // A second epoch exercises the existing free-chain dependency walk as well
+  // as the canonical next-pointer rewrite, with no newly eligible rows.
+  ASSERT_NO_THROW(updater.consolidate(1, 0, true, false));
+  EXPECT_EQ(updater.free_count(), kBaseN);
+  EXPECT_LE(updater.stats().maintenance_peak_overlay_pages, updater.cache_cap_pages() + 1);
+}
+
 TEST(QgMaintenanceConcurrency, EnospcAfterBeginPoisonsAndReopenRollsBack) {
   TemporaryDirectory root("enospc");
   auto base = WalTinyIndex::build(root.path(), kBaseN, 7601);
