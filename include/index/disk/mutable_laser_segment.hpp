@@ -69,6 +69,10 @@ class MutableLaserSegment {
       throw std::runtime_error("MutableLaserSegment: segment is not disk_laser: " +
                                seg_dir.string());
     }
+    if (manifest.metric != core::Metric::l2) {
+      throw std::runtime_error(
+          "MutableLaserSegment: active mutation remains L2-only; non-L2 is sealed/read-only");
+    }
     if (manifest.dim == 0 || (manifest.count == 0 && !allow_empty)) {
       throw std::runtime_error("MutableLaserSegment: manifest dim/count is zero: " +
                                seg_dir.string());
@@ -344,6 +348,10 @@ class MutableLaserSegment {
                            uint32_t r,
                            core::Metric metric,
                            const std::string &prefix = "active_laser") {
+    if (metric != core::Metric::l2) {
+      throw std::invalid_argument(
+          "MutableLaserSegment::create_empty: active mutation remains L2-only");
+    }
     std::filesystem::create_directories(seg_dir);
     // Geometry: mirror QuantizedGraph's ctor (qg.hpp:491-516). No public accessor
     // exposes node_len_/page geometry; load_disk_index re-derives and hard-checks

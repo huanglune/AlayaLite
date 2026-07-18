@@ -110,7 +110,7 @@ class QGBuilder {
         num_nodes_{qg_.num_vertices()},
         dim_{qg_.dimension()},
         degree_bound_(qg_.degree_bound()),
-        dist_func_{space::l2_sqr},
+        dist_func_{qg_.metric() == core::Metric::l2 ? space::l2_sqr : space::ip},
         new_neighbors_(qg_.num_vertices()),
         pruned_neighbors_(qg_.num_vertices()),
         visited_list_(num_threads_,
@@ -231,6 +231,11 @@ class QGBuilder {
     metas[2] = qg_.entry_point_;    // Graph entry point for search
     metas[3] = qg_.node_len_;       // Bytes per node (vector + codes + factors + neighbors)
     metas[4] = qg_.node_per_page_;  // Nodes packed per disk page
+
+    qg_write_native_semantics(metas.data(),
+                              metas.size() * sizeof(metas.front()),
+                              qg_.metric(),
+                              qg_.preprocessing());
 
     // Calculate total file size for integrity verification
     size_t page_num = (qg_.num_points_ + qg_.node_per_page_ - 1) / qg_.node_per_page_;

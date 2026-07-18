@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -243,11 +244,9 @@ inline constexpr std::array<CollectionTargetRegistration, 3> kCollectionTargetRe
 
 // Mirrors qg_target_support's shape (same quantization/scalar/row-count
 // gauge -- RaBitQSpace<>::kDegreeBound -- since laser is the on-disk sibling
-// of the same RaBitQ-quantized-graph family), narrowed to what LASER itself
-// additionally requires:
-//   - metric: L2 only. The LASER kernel family is L2-only end to end (see
-//     include/index/graph/laser/space/, which has only l2.hpp -- unlike qg,
-//     which also supports inner_product via RaBitQSpace<>'s IP variant).
+// of the same RaBitQ-quantized-graph family). L2 is native; inner_product
+// dispatches the LASER IP factor/exact kernels; cosine stores normalized rows
+// and wraps query normalization at the Collection boundary.
 //   - dim: LaserSegmentImporter admits [33, 2048]. LASER's single-round
 //     FHTRotator pads a non-power-of-two dimension to 2^ceil(log2(dim)); the
 //     RaBitQ codebook and FastScan consume that padded width while raw/exact
@@ -266,10 +265,12 @@ inline constexpr std::array<CollectionTargetRegistration, 3> kCollectionTargetRe
   constexpr std::uint8_t kRaBitQQuantization = 3;
   const auto dim_supported =
       ::alaya::disk::laser_importer_detail::dimension_supported_v1(schema.dim);
+  const auto metric_supported = schema.metric == core::Metric::l2 ||
+                                schema.metric == core::Metric::inner_product ||
+                                schema.metric == core::Metric::cosine;
   return static_cast<std::uint8_t>(params.quantization) == kRaBitQQuantization &&
-                 schema.scalar_type == core::ScalarType::float32 &&
-                 schema.metric == core::Metric::l2 && dim_supported &&
-                 row_count > ::alaya::RaBitQSpace<>::kDegreeBound
+                 schema.scalar_type == core::ScalarType::float32 && metric_supported &&
+                 dim_supported && row_count > ::alaya::RaBitQSpace<>::kDegreeBound
              ? TargetSupport::supported
              : TargetSupport::unsupported;
 }
@@ -463,6 +464,19 @@ template <typename Scalar>
 #if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER != 0
 namespace laser_target_detail {
 
+[[nodiscard]] inline auto validate_finite_vectors(std::span<const float> vectors) -> core::Status {
+  for (const float value : vectors) {
+    const auto bits = std::bit_cast<std::uint32_t>(value);
+    if ((bits & 0x7f800000U) == 0x7f800000U) {
+      return core::Status::error(core::StatusCode::invalid_argument,
+                                 core::OperationStage::build,
+                                 core::StatusDetail::malformed_struct,
+                                 "Collection LASER target rejects non-finite source vectors");
+    }
+  }
+  return core::Status::success();
+}
+
 // Streams `vectors` (row-major, `row_count * dim` floats) to
 // "{prefix}_pca_base.fbin" in the two-int32-header layout
 // QGBuilder::build() requires as input (see qg_builder.hpp's doc comment on
@@ -490,6 +504,34 @@ inline auto write_pca_base_fbin(const std::string &prefix,
     throw std::runtime_error("Collection LASER target: failed writing pca_base scratch file: " +
                              prefix);
   }
+}
+
+[[nodiscard]] inline auto build_memory_qg_topology(std::span<const float> vectors,
+                                                   std::uint32_t count,
+                                                   std::uint32_t dim,
+                                                   core::Metric metric,
+                                                   const CollectionTargetBuildParams &params,
+                                                   core::BuildContext &context)
+    -> ::alaya::FrozenGraphSnapshot {
+  using Space = ::alaya::RaBitQSpace<>;
+  using Segment = ::alaya::QgSegment<Space>;
+
+  auto space = std::make_shared<Space>(count, dim, metric);
+  space->fit(vectors.data(), count);
+  typename Segment::BuildInput input(core::TypedTensorView::contiguous(vectors.data(), count, dim),
+                                     std::move(space));
+  ::alaya::QgBuildOptions options;
+  options.ef_build = params.ef_construction;
+  options.thread_count = params.thread_count;
+  auto segment = Segment::build(std::move(input), options, context);
+  auto source = segment->export_graph_snapshot();
+  if (source.max_degree() == params.max_neighbors) {
+    return source;
+  }
+  ::alaya::FrozenGraphSnapshot::Adjacency adjacency(source.adjacency());
+  return ::alaya::FrozenGraphSnapshot(std::move(adjacency),
+                                      source.entry_point(),
+                                      params.max_neighbors);
 }
 
 // RAII scratch directory for the raw native LASER files (Vamana graph +
@@ -564,22 +606,29 @@ struct ScratchDir {
                              core::StatusDetail::operation_slot_absent,
                              "Collection LASER target builder requires ALAYA_ENABLE_LASER");
 #else
-  // TODO(topology-faithful-rotate): a Collection rotate() that already has a
-  // live LASER predecessor could hand a FrozenGraphSnapshot of its existing
-  // topology to QGBuilder::build_from_graph() here instead of re-deriving
-  // Vamana topology from scratch every time (see
-  // include/index/graph/frozen_graph_snapshot.hpp and
-  // QGBuilder::build_from_graph()). This wave always rebuilds from the
-  // harvested raw vectors below; a future change would thread an optional
-  // source-graph snapshot through this function's signature at this point
-  // and, when present, skip straight past the VamanaBuilder step.
+  // L2 keeps the established Vamana topology path byte-for-byte. IP/cosine
+  // build a metric-aware memory-QG topology below and pass its frozen snapshot
+  // to the same LASER packer; a future rotate optimization can still thread a
+  // predecessor snapshot here to avoid rebuilding either topology.
 
   auto harvested = harvest_memory_graph_vectors<float>(schema, rows, "LASER");
   if (!harvested.ok()) {
     return harvested.status();
   }
-  const auto vectors = std::move(harvested).value();
+  auto vectors = std::move(harvested).value();
   const auto count = static_cast<std::uint32_t>(vectors.size() / schema.dim);
+
+  auto finite_status = laser_target_detail::validate_finite_vectors(vectors);
+  if (!finite_status.ok()) {
+    return finite_status;
+  }
+  if (schema.metric == core::Metric::cosine) {
+    auto normalize_status =
+        l2_normalize_float_rows(vectors, schema.dim, core::OperationStage::build);
+    if (!normalize_status.ok()) {
+      return normalize_status;
+    }
+  }
 
   try {
     const auto tick = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -597,23 +646,44 @@ struct ScratchDir {
     vamana_params.alpha = params.alpha;
     vamana_params.num_threads = params.thread_count;
     vamana_params.seed = params.seed;
-    alaya::vamana::VamanaBuilder vamana_builder(vectors.data(), count, schema.dim, vamana_params);
-    vamana_builder.build();
     const std::string vamana_path = raw_prefix + "_vamana.index";
-    alaya::vamana::save_graph(vamana_builder.graph(),
-                              vamana_path,
-                              vamana_params.R,
-                              vamana_builder.medoid());
+    std::optional<::alaya::FrozenGraphSnapshot> metric_topology;
+    if (schema.metric == core::Metric::l2) {
+      alaya::vamana::VamanaBuilder vamana_builder(vectors.data(), count, schema.dim, vamana_params);
+      vamana_builder.build();
+      alaya::vamana::save_graph(vamana_builder.graph(),
+                                vamana_path,
+                                vamana_params.R,
+                                vamana_builder.medoid());
+    } else {
+      // VamanaBuilder is intentionally L2-only. Reuse the existing memqg
+      // metric-aware topology and hand its finalized graph to the LASER
+      // packer instead of feeding negative-IP distances into L2 pruning.
+      metric_topology.emplace(laser_target_detail::build_memory_qg_topology(vectors,
+                                                                            count,
+                                                                            schema.dim,
+                                                                            schema.metric,
+                                                                            params,
+                                                                            context));
+    }
 
+    const auto native_preprocessing = ::alaya::laser::qg_expected_preprocessing(schema.metric);
     alaya::laser::QuantizedGraph quantized_graph(count,
                                                  vamana_params.R,
                                                  schema.dim,
                                                  schema.dim,
-                                                 /*rotator_seed=*/params.seed);
+                                                 /*rotator_seed=*/params.seed,
+                                                 /*rotator_dump_path=*/{},
+                                                 schema.metric,
+                                                 native_preprocessing);
     alaya::laser::QGBuilder qg_builder(quantized_graph,
                                        /*ef_build=*/params.ef_construction,
                                        /*num_threads=*/params.thread_count);
-    qg_builder.build(vamana_path.c_str(), raw_prefix.c_str());
+    if (metric_topology.has_value()) {
+      qg_builder.build_from_graph(*metric_topology, raw_prefix.c_str());
+    } else {
+      qg_builder.build(vamana_path.c_str(), raw_prefix.c_str());
+    }
 
     // Post-seal row IDs are already dense 0..N-1 in vector order
     // (harvest_memory_graph_vectors() verified this above), and that dense
@@ -638,7 +708,7 @@ struct ScratchDir {
       import_params.residency = residency_env;
     }
 
-    ::alaya::disk::LaserSegmentImporter importer(schema.dim, core::Metric::l2, import_params);
+    ::alaya::disk::LaserSegmentImporter importer(schema.dim, schema.metric, import_params);
     const auto seg_dir = publication.collection_root / "segments" / publication.segment_id;
     // LaserSegmentImporter::import_from() requires seg_dir's parent to
     // already exist (it deliberately does not create ancestor directories,
@@ -671,14 +741,22 @@ struct ScratchDir {
       return publish_status;
     }
 
-    auto erased = ::alaya::disk::LaserSegment::into_any(std::move(laser_segment));
-    if (!erased.ok()) {
-      return erased.status();
+    auto erased_result = ::alaya::disk::LaserSegment::into_any(std::move(laser_segment));
+    if (!erased_result.ok()) {
+      return erased_result.status();
+    }
+    auto erased = std::move(erased_result).value();
+    if (schema.metric == core::Metric::cosine) {
+      auto normalized = make_l2_normalized_query_segment(std::move(erased));
+      if (!normalized.ok()) {
+        return normalized.status();
+      }
+      erased = std::move(normalized).value();
     }
 
     const auto *registration = find_collection_target_registration(core::algorithm::laser);
     CollectionTargetBuildResult result;
-    result.segment = std::move(erased).value();
+    result.segment = std::move(erased);
     result.requested_algorithm = core::algorithm::laser;
     result.built_algorithm = core::algorithm::laser;
     result.implementation_key = registration->implementation_key;
@@ -915,7 +993,9 @@ template <typename Segment>
   if (entry.algorithm_id != core::algorithm::laser ||
       entry.format_version != ::alaya::disk::LaserSegment::kFormatVersion ||
       entry.lifecycle == SegmentLifecycleV2::retired ||
-      schema.scalar_type != core::ScalarType::float32 || schema.metric != core::Metric::l2) {
+      schema.scalar_type != core::ScalarType::float32 ||
+      (schema.metric != core::Metric::l2 && schema.metric != core::Metric::inner_product &&
+       schema.metric != core::Metric::cosine)) {
     return core::Status::error(core::StatusCode::not_supported,
                                core::OperationStage::open,
                                core::StatusDetail::operation_slot_absent,
@@ -929,13 +1009,29 @@ template <typename Segment>
     return opened.status();
   }
   const auto descriptor = opened.value()->descriptor();
-  if (descriptor.dim != schema.dim) {
+  if (descriptor.dim != schema.dim || descriptor.metric != schema.metric ||
+      descriptor.stored_scalar_type != schema.scalar_type ||
+      descriptor.preprocessing != core::MetricPreprocessing::none) {
     return core::Status::error(core::StatusCode::corruption,
                                core::OperationStage::open,
                                core::StatusDetail::malformed_struct,
                                "LASER replacement descriptor disagrees with the Collection schema");
   }
-  return ::alaya::disk::LaserSegment::into_any(std::move(opened).value());
+  if (schema.metric != core::Metric::l2) {
+    const auto preprocessing = entry.extensions.find("preprocessing");
+    const auto expected = schema.metric == core::Metric::cosine ? "l2_normalized" : "none";
+    if (preprocessing == entry.extensions.end() || preprocessing->second != expected) {
+      return core::Status::error(core::StatusCode::corruption,
+                                 core::OperationStage::open,
+                                 core::StatusDetail::malformed_struct,
+                                 "LASER replacement manifest lacks its preprocessing proof");
+    }
+  }
+  auto erased = ::alaya::disk::LaserSegment::into_any(std::move(opened).value());
+  if (!erased.ok() || schema.metric != core::Metric::cosine) {
+    return erased;
+  }
+  return make_l2_normalized_query_segment(std::move(erased).value());
 }
 
 [[nodiscard]] inline auto build_collection_target(core::AlgorithmId requested_algorithm,

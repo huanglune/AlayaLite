@@ -12,7 +12,9 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
 #include <iterator>
@@ -52,10 +54,23 @@ void write_bytes(const std::filesystem::path &path, std::string_view bytes) {
   ASSERT_TRUE(out.good()) << path;
 }
 
-void write_index(const std::filesystem::path &path, uint64_t count, std::string_view payload) {
+void write_index(const std::filesystem::path &path,
+                 uint64_t count,
+                 std::string_view payload,
+                 core::Metric metric = core::Metric::l2) {
   std::ofstream out(path, std::ios::binary | std::ios::out | std::ios::trunc);
   ASSERT_TRUE(out.is_open()) << path;
-  out.write(reinterpret_cast<const char *>(&count), sizeof(count));
+  if (metric == core::Metric::l2) {
+    out.write(reinterpret_cast<const char *>(&count), sizeof(count));
+  } else {
+    std::array<char, laser::kSectorLen> header{};
+    std::memcpy(header.data(), &count, sizeof(count));
+    laser::qg_write_native_semantics(header.data(),
+                                     header.size(),
+                                     metric,
+                                     laser::qg_expected_preprocessing(metric));
+    out.write(header.data(), static_cast<std::streamsize>(header.size()));
+  }
   out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
   ASSERT_TRUE(out.good()) << path;
 }
@@ -112,11 +127,12 @@ class LaserSegmentImporterTest : public ::testing::Test {
   auto populate_artifacts(std::string_view seg_basename,
                           uint64_t index_count = kCount,
                           bool optional = true,
-                          LaserSegmentImportParams params = {}) const -> std::filesystem::path {
+                          LaserSegmentImportParams params = {},
+                          core::Metric metric = core::Metric::l2) const -> std::filesystem::path {
     const auto prefix = prefix_for(seg_basename);
     const auto index_name = index_filename(seg_basename, params);
     const auto index_path = src_dir_ / index_name;
-    write_index(index_path, index_count, "index-payload");
+    write_index(index_path, index_count, "index-payload", metric);
     write_bytes(src_dir_ / (index_name + "_rotator"), "rotator-payload");
     write_bytes(src_dir_ / (index_name + "_cache_ids"), "cache-ids-payload");
     write_bytes(src_dir_ / (index_name + "_cache_nodes"), "cache-nodes-payload");
@@ -240,31 +256,43 @@ TEST_F(LaserSegmentImporterTest, rejects_count_mismatch) {
   EXPECT_FALSE(std::filesystem::exists(target));
 }
 
-TEST_F(LaserSegmentImporterTest, rejects_ip_metric) {
+TEST_F(LaserSegmentImporterTest, imports_ip_metric_with_matching_native_proof) {
+  skip_if_laser_gate_not_ready();
   const auto target = seg_dir();
+  populate_artifacts(target.filename().string(),
+                     kCount,
+                     true,
+                     {},
+                     core::Metric::inner_product);
+  auto ids = labels();
+  LaserSegmentImporter importer(kDim, core::Metric::inner_product, {});
+  const auto manifest = importer.import_from(src_dir_, ids.data(), ids.size(), target);
+  EXPECT_EQ(manifest.metric, core::Metric::inner_product);
+  EXPECT_EQ(manifest.x_extras.at("x_laser_preprocessing"), "none");
+}
+
+TEST_F(LaserSegmentImporterTest, imports_cosine_metric_with_matching_native_proof) {
+  skip_if_laser_gate_not_ready();
+  const auto target = seg_dir();
+  populate_artifacts(target.filename().string(), kCount, true, {}, core::Metric::cosine);
+  auto ids = labels();
+  LaserSegmentImporter importer(kDim, core::Metric::cosine, {});
+  const auto manifest = importer.import_from(src_dir_, ids.data(), ids.size(), target);
+  EXPECT_EQ(manifest.metric, core::Metric::cosine);
+  EXPECT_EQ(manifest.x_extras.at("x_laser_preprocessing"), "l2_normalized");
+}
+
+TEST_F(LaserSegmentImporterTest, rejects_non_l2_manifest_over_implicit_l2_artifact) {
+  skip_if_laser_gate_not_ready();
+  const auto target = seg_dir();
+  populate_artifacts(target.filename().string());
   LaserSegmentImporter importer(kDim, core::Metric::inner_product, {});
   try {
     (void)importer.import_from(src_dir_, labels().data(), kCount, target);
-    FAIL() << "expected IP metric rejection";
+    FAIL() << "expected native metric proof rejection";
   } catch (const std::runtime_error &e) {
     const std::string msg = e.what();
-    EXPECT_TRUE(contains(msg, "ip")) << msg;
-    EXPECT_TRUE(contains(msg, "not implemented in v1")) << msg;
-  }
-  EXPECT_FALSE(std::filesystem::exists(target));
-  expect_no_tmp_debris(seg_parent_);
-}
-
-TEST_F(LaserSegmentImporterTest, rejects_cos_metric) {
-  const auto target = seg_dir();
-  LaserSegmentImporter importer(kDim, core::Metric::cosine, {});
-  try {
-    (void)importer.import_from(src_dir_, labels().data(), kCount, target);
-    FAIL() << "expected COS metric rejection";
-  } catch (const std::runtime_error &e) {
-    const std::string msg = e.what();
-    EXPECT_TRUE(contains(msg, "cos")) << msg;
-    EXPECT_TRUE(contains(msg, "not implemented in v1")) << msg;
+    EXPECT_TRUE(contains(msg, "native metric/preprocessing proof")) << msg;
   }
   EXPECT_FALSE(std::filesystem::exists(target));
 }

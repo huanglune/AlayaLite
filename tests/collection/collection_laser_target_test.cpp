@@ -6,8 +6,8 @@
 // -> seal -> plain search + filter search -> close -> reopen (through the
 // manifest-driven CollectionSegmentFactory::open_entry() registry path,
 // i.e. open_laser_collection_target()) -> search still works -> one
-// rotate_to_successor -> metric=inner_product falls back to flat (LASER is
-// L2-only).
+// rotate_to_successor, plus an inner_product admission check proving LASER no
+// longer silently falls back to flat.
 //
 // This exercises build_laser_collection_target()/open_laser_collection_target()
 // end to end (collection_target_builder.hpp), unlike
@@ -181,17 +181,6 @@ void expect_laser_manifest(const std::filesystem::path &root) {
   EXPECT_EQ(target->factory_key, "laser");
   EXPECT_EQ(target->reader_compatibility.required_features,
             (std::vector<std::string>{"disk_laser_segment"}));
-}
-
-void expect_flat_manifest(const std::filesystem::path &root) {
-  const auto manifest = internal::collection::ArtifactManifestV2::load(
-      root / internal::collection::kCollectionManifestFilename);
-  const auto target = std::ranges::find_if(manifest.segments, [](const auto &entry) {
-    return entry.lifecycle == internal::collection::SegmentLifecycleV2::sealed;
-  });
-  ASSERT_NE(target, manifest.segments.end());
-  EXPECT_EQ(target->algorithm_id, core::algorithm::flat);
-  EXPECT_EQ(target->factory_key, "flat");
 }
 
 // Every hit's logical id must be a known dataset row, and (when queries.rows
@@ -437,12 +426,8 @@ TEST(CollectionLaserTargetTest, ResidentArenaResidencyViaEnvOverrideThroughColle
   ASSERT_TRUE(reopened->close().ok());
 }
 
-TEST(CollectionLaserTargetFallback, InnerProductMetricFallsBackToFlat) {
-  // LASER is L2-only (include/index/graph/laser/space/ has only l2.hpp);
-  // laser_target_support() must reject any other metric so
-  // resolve_build_algorithm() falls back to flat instead of attempting (and
-  // failing) a LASER build.
-  TemporaryDirectory temporary("ip-fallback");
+TEST(CollectionLaserTargetMetricAdmission, InnerProductMetricBuildsLaser) {
+  TemporaryDirectory temporary("ip-native");
   const auto dataset = make_dataset(kRows, /*seed=*/4104U);
 
   auto created = Collection::create(make_options(temporary.path(), core::Metric::inner_product));
@@ -452,11 +437,16 @@ TEST(CollectionLaserTargetFallback, InnerProductMetricFallsBackToFlat) {
 
   auto sealed = collection->seal();
   ASSERT_TRUE(sealed.ok()) << sealed.status().diagnostic();
-  EXPECT_EQ(sealed.value().built_algorithm, core::algorithm::flat);
-  EXPECT_TRUE(sealed.value().flat_fallback);
-  EXPECT_NE(sealed.value().fallback_reason.find("laser"), std::string::npos)
-      << sealed.value().fallback_reason;
-  expect_flat_manifest(temporary.path());
+  EXPECT_EQ(sealed.value().built_algorithm, core::algorithm::laser);
+  EXPECT_FALSE(sealed.value().flat_fallback) << sealed.value().fallback_reason;
+  expect_laser_manifest(temporary.path());
+
+  const auto seg_dir = temporary.path() / "segments" /
+                       internal::collection::detail::collection_segment_name(
+                           sealed.value().sealed_segment_id);
+  const auto native = ::alaya::disk::SegmentManifest::load(seg_dir / "manifest.txt");
+  EXPECT_EQ(native.metric, core::Metric::inner_product);
+  EXPECT_EQ(native.x_extras.at("x_laser_preprocessing"), "none");
 
   ASSERT_TRUE(collection->close().ok());
 }

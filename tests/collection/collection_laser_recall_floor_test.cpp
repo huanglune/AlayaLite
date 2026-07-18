@@ -10,15 +10,10 @@
 // self-match on a tiny random dataset), not a locked recall@10 number.
 //
 // Differences from the qg fixture this mirrors:
-//  - l2 only, no ip tier. LASER's kernel family is L2-only end to end (see
-//    include/index/graph/laser/space/, which has only l2.hpp -- unlike qg,
-//    which also has an inner_product variant), and
-//    collection_target_builder.hpp's laser_target_support() rejects any
-//    other metric outright. Faking an "ip" tier to match qg's 4-case shape
-//    would just be a flat-fallback test wearing a recall-floor costume --
-//    the same "silent fallback flat false green" trap this file's engine
-//    identity check (below) guards against, just at *tier selection* rather
-//    than *assertion*. So there are two tiers (l2 unit/nonunit), not four.
+//  - this remains the established L2 regression lane (unit/nonunit plus
+//    residency parity). IP same-data memqg parity and cosine normalization
+//    semantics live in collection_laser_metric_wiring_test.cpp, so this file
+//    keeps its historical two-tier dataset and thresholds unchanged.
 //  - the baseline tiers retain dim=128 so their historical floor stays
 //    comparable. A dedicated dim=768 tier below proves the non-power-of-two
 //    Collection path (build -> importer -> open -> search) and checks recall
@@ -217,7 +212,7 @@ struct Dataset {
   CollectionOptions options;
   options.root = root;
   options.dim = dimension;
-  options.metric = core::Metric::l2;  // LASER is l2-only.
+  options.metric = core::Metric::l2;
   options.scalar_type = core::ScalarType::float32;
   options.target_algorithm = core::algorithm::laser;
   options.quantization = CollectionQuantization::rabitq;

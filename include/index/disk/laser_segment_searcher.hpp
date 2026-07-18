@@ -43,16 +43,34 @@ namespace alaya::disk {
 
 namespace detail {
 
-inline auto laser_metric_name(core::Metric metric) -> std::string {
-  switch (metric) {
-    case core::Metric::l2:
-      return "l2";
-    case core::Metric::inner_product:
-      return "ip";
-    case core::Metric::cosine:
-      return "cos";
+inline auto laser_manifest_preprocessing(const SegmentManifest &manifest,
+                                         const std::filesystem::path &seg_dir)
+    -> core::MetricPreprocessing {
+  const auto expected = ::alaya::laser::qg_expected_preprocessing(manifest.metric);
+  const auto found = manifest.x_extras.find("x_laser_preprocessing");
+  if (found == manifest.x_extras.end()) {
+    if (manifest.metric == core::Metric::l2) {
+      return core::MetricPreprocessing::none;
+    }
+    throw std::runtime_error(
+        "LaserSegmentSearcher: x_laser_preprocessing missing for non-L2 segment " +
+        seg_dir.string());
   }
-  return "unknown";
+  core::MetricPreprocessing actual{};
+  if (found->second == "none") {
+    actual = core::MetricPreprocessing::none;
+  } else if (found->second == "l2_normalized") {
+    actual = core::MetricPreprocessing::l2_normalized;
+  } else {
+    throw std::runtime_error("LaserSegmentSearcher: unknown x_laser_preprocessing '" +
+                             found->second + "' in segment " + seg_dir.string());
+  }
+  if (actual != expected) {
+    throw std::runtime_error(
+        "LaserSegmentSearcher: metric and x_laser_preprocessing disagree in segment " +
+        seg_dir.string());
+  }
+  return actual;
 }
 
 inline auto laser_required_extra(const SegmentManifest &manifest,
@@ -194,13 +212,7 @@ class LaserSegmentSearcher : public SegmentSearcher {
                                std::to_string(manifest_.count) + ") in segment " +
                                seg_dir.string());
     }
-    if (manifest_.metric != core::Metric::l2) {
-      throw std::runtime_error("LaserSegmentSearcher: metric '" +
-                               detail::laser_metric_name(manifest_.metric) +
-                               "' not implemented in v1 (disk_laser adapter v1 supports L2 only) "
-                               "in segment " +
-                               seg_dir.string());
-    }
+    const auto preprocessing = detail::laser_manifest_preprocessing(manifest_, seg_dir);
     if (!engine_supported_v1(DiskIndexType::Laser)) {
       throw std::runtime_error("LaserSegmentSearcher: engine 'disk_laser' not implemented in v1");
     }
@@ -258,7 +270,9 @@ class LaserSegmentSearcher : public SegmentSearcher {
                                                          static_cast<size_t>(main_dim),
                                                          static_cast<size_t>(manifest_.dim),
                                                          0,
-                                                         std::string{});
+                                                         std::string{},
+                                                         manifest_.metric,
+                                                         preprocessing);
     } catch (const std::exception &e) {
       throw std::runtime_error("LaserSegmentSearcher: QuantizedGraph construction failed for " +
                                seg_dir.string() + ": " + e.what());

@@ -366,7 +366,7 @@ class LaserSegment {
     descriptor.format_version = kFormatVersion;
     descriptor.factory_version = 1;
     descriptor.dim = searcher_dim();
-    descriptor.metric = core::Metric::l2;
+    descriptor.metric = native_.metric;
     descriptor.stored_scalar_type = core::ScalarType::float32;
     descriptor.medium = core::Medium::disk;
     descriptor.preprocessing = core::MetricPreprocessing::none;
@@ -586,9 +586,20 @@ class LaserSegment {
     if (native.index_type != DiskIndexType::Laser) {
       return unavailable(stage, "LaserSegment received a non-LASER native manifest");
     }
-    if (native.metric != core::Metric::l2) {
-      return unavailable(stage, "LaserSegment first version supports L2 only");
+#if ALAYA_DISK_LASER_SEGMENT_SUPPORTED
+    try {
+      (void)detail::laser_manifest_preprocessing(native, native.segment_id);
+    } catch (const std::exception &error) {
+      return core::Status::error(core::StatusCode::corruption,
+                                 stage,
+                                 core::StatusDetail::malformed_struct,
+                                 error.what());
     }
+#else
+    if (native.metric != core::Metric::l2) {
+      return unavailable(stage, "non-L2 LaserSegment requires LASER support");
+    }
+#endif
     if (native.version != kFormatVersion || native.dim == 0 || native.count == 0 ||
         native.dim > std::numeric_limits<std::uint32_t>::max() ||
         !detail::is_valid_segment_id(native.segment_id) ||
@@ -830,7 +841,7 @@ class LaserSegment {
                                : core::ResultFlag::approximate;
     auto &response = *request.response;
     response.score_kind = core::ScoreKind::rank_only;
-    response.comparable_metric = core::Metric::l2;
+    response.comparable_metric = native_.metric;
     response.result_flags = hit_flags;
     if (request.options.top_k == 0 || request.queries.rows == 0) {
       core::initialize_empty_response(response,
@@ -873,7 +884,7 @@ class LaserSegment {
               core::SearchHit(core::SegmentRowId(hits[index].label),
                               hits[index].distance,
                               core::ScoreKind::rank_only,
-                              core::Metric::l2,
+                              native_.metric,
                               hit_flags);
         }
         if (direct_results != nullptr) {
@@ -1009,7 +1020,7 @@ class LaserSegment {
 #endif
   }
 
-  [[nodiscard]] static auto make_segment_entry(const LaserSegmentReferenceOptions &options)
+  [[nodiscard]] auto make_segment_entry(const LaserSegmentReferenceOptions &options) const
       -> internal::collection::SegmentEntryV2 {
     internal::collection::SegmentEntryV2 entry;
     entry.segment_id = options.segment_id;
@@ -1033,6 +1044,15 @@ class LaserSegment {
     entry.extensions.emplace("score_kind", "rank_only");
     entry.extensions.emplace("numeric_score_comparable", "false");
     entry.extensions.emplace("native_payload", "read_only_reference");
+#if ALAYA_DISK_LASER_SEGMENT_SUPPORTED
+    if (native_.metric != core::Metric::l2) {
+      const auto preprocessing = detail::laser_manifest_preprocessing(native_, directory_);
+      entry.extensions.emplace("preprocessing",
+                               preprocessing == core::MetricPreprocessing::l2_normalized
+                                   ? "l2_normalized"
+                                   : "none");
+    }
+#endif
     return entry;
   }
 
@@ -1055,7 +1075,7 @@ class LaserSegment {
     }
     if (manifest.collection.dim != 0 &&
         (manifest.collection.dim != searcher_dim() ||
-         manifest.collection.metric != core::Metric::l2 ||
+         manifest.collection.metric != native_.metric ||
          manifest.collection.scalar_type != core::ScalarType::float32)) {
       return core::Status::error(core::StatusCode::invalid_argument,
                                  core::OperationStage::save,
@@ -1063,7 +1083,7 @@ class LaserSegment {
                                  "LaserSegment publication disagrees with collection schema");
     }
     manifest.collection.dim = searcher_dim();
-    manifest.collection.metric = core::Metric::l2;
+    manifest.collection.metric = native_.metric;
     manifest.collection.scalar_type = core::ScalarType::float32;
     manifest.collection.logical_id_encoding =
         internal::collection::LogicalIdEncodingV2::legacy_u64_le;

@@ -18,6 +18,7 @@
   #include <vector>
 
   #include "index/disk/disk_flat_builder.hpp"
+  #include "index/graph/laser/qg/qg.hpp"
   #include "index/graph/laser/qg/residency.hpp"
   #include "platform/fs.hpp"
 #endif
@@ -88,15 +89,14 @@ struct Artifact {
   bool present{true};
 };
 
-inline auto metric_name(core::Metric metric) -> std::string {
-  if (metric == core::Metric::inner_product) {
-    return "ip";
-  }
-  if (metric == core::Metric::cosine) {
-    return "cos";
-  }
-  if (metric == core::Metric::l2) {
-    return "l2";
+inline auto preprocessing_name(core::MetricPreprocessing preprocessing) -> std::string_view {
+  switch (preprocessing) {
+    case core::MetricPreprocessing::none:
+      return "none";
+    case core::MetricPreprocessing::l2_normalized:
+      return "l2_normalized";
+    case core::MetricPreprocessing::engine_quantized:
+      return "engine_quantized";
   }
   return "unknown";
 }
@@ -228,6 +228,7 @@ inline LaserSegmentImporter::LaserSegmentImporter(uint32_t dim,
                                                   core::Metric metric,
                                                   LaserSegmentImportParams params)
     : dim_(dim), metric_(metric), params_(params) {
+  (void)::alaya::laser::qg_expected_preprocessing(metric_);
   // The raw/exact vector stays `dim` floats. FHT, RaBitQ codes, and FastScan
   // use padded_dim = 2^ceil(log2(dim)); for degree R this adds
   // R * (padded_dim - dim) / 8 persistent code bytes per row before sector
@@ -263,11 +264,6 @@ inline auto LaserSegmentImporter::import_from(const std::filesystem::path &src_d
   }
   laser_importer_detail::reject_existing_segment_dir(seg_dir);
 
-  if (metric_ != core::Metric::l2) {
-    const auto m = laser_importer_detail::metric_name(metric_);
-    throw std::runtime_error("LaserSegmentImporter: metric '" + m +
-                             "' not implemented in v1 (laser adapter v1 supports L2 only)");
-  }
   if (!engine_supported_v1(DiskIndexType::Laser)) {
     throw std::runtime_error("LaserSegmentImporter: engine 'disk_laser' not implemented in v1");
   }
@@ -314,6 +310,13 @@ inline auto LaserSegmentImporter::import_from(const std::filesystem::path &src_d
                              index_src.string() + " (index num_points=" +
                              std::to_string(index_count) + ", import n=" + std::to_string(n) + ")");
   }
+  const auto preprocessing = ::alaya::laser::qg_expected_preprocessing(metric_);
+  try {
+    ::alaya::laser::qg_validate_native_semantics_file(index_src, metric_, preprocessing);
+  } catch (const std::exception &error) {
+    throw std::runtime_error("LaserSegmentImporter: native metric/preprocessing proof failed for " +
+                             index_src.string() + ": " + error.what());
+  }
 
   const auto tmp_dir = laser_importer_detail::make_tmp_dir(parent, seg_basename);
   detail::TmpDirGuard guard(tmp_dir);
@@ -340,7 +343,7 @@ inline auto LaserSegmentImporter::import_from(const std::filesystem::path &src_d
   manifest.version = kManifestVersion;
   manifest.segment_id = seg_basename;
   manifest.index_type = DiskIndexType::Laser;
-  manifest.metric = core::Metric::l2;
+  manifest.metric = metric_;
   manifest.dim = dim_;
   manifest.count = n;
   manifest.ids_file = "ids.u64.bin";
@@ -359,6 +362,10 @@ inline auto LaserSegmentImporter::import_from(const std::filesystem::path &src_d
   manifest.x_extras["x_default_ef"] = std::to_string(params_.default_ef);
   manifest.x_extras["x_default_beam_width"] = std::to_string(params_.default_beam_width);
   manifest.x_extras["x_laser_native_format_version"] = "1";
+  if (metric_ != core::Metric::l2) {
+    manifest.x_extras["x_laser_preprocessing"] =
+        std::string(laser_importer_detail::preprocessing_name(preprocessing));
+  }
   if (!params_.residency.empty()) {
     // Validate eagerly so a typo fails at import time, not at first load.
     (void)::alaya::laser::residency_mode_from_string(params_.residency);

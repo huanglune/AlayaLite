@@ -34,11 +34,13 @@
 #include <utility>
 #include <vector>
 
+#include "core/value_types.hpp"
 #include "index/graph/laser/common.hpp"
 #include "index/graph/laser/qg/qg_query.hpp"
 #include "index/graph/laser/qg/qg_scanner.hpp"
 #include "index/graph/laser/qg/row_admission.hpp"
 #include "index/graph/laser/quantization/rabitq.hpp"
+#include "index/graph/laser/space/ip.hpp"
 #include "index/graph/laser/space/l2.hpp"
 #include "index/graph/laser/utils/aligned_file_reader.hpp"
 #if defined(_WIN32)
@@ -246,6 +248,150 @@ inline uint32_t qg_superblock_checksum(const QGSuperblockV2 &sb) {
   return qg_crc32(&copy, sizeof(copy));
 }
 
+// Immutable QG v1 files predate metric persistence: metadata words [5..7]
+// were reserved and canonical-zero, while word 8 stores file_size. Keep that
+// zero encoding as the backward-compatible proof for L2 so existing L2
+// artifacts remain byte-identical. Non-L2 files must carry this checksummed
+// proof; a manifest alone is not allowed to reinterpret a physically-L2 QG as
+// IP/cosine.
+constexpr std::size_t kQGNativeSemanticsOffset = 5 * sizeof(std::uint64_t);
+constexpr std::uint64_t kQGNativeSemanticsMagic = 0x3154454d47514cULL;  // "LQGMET1"
+constexpr std::uint32_t kQGNativeSemanticsVersion = 1;
+
+struct QGNativeSemanticsProofV1 {
+  std::uint64_t magic{};
+  std::uint64_t payload{};
+  std::uint64_t checksum{};
+};
+static_assert(sizeof(QGNativeSemanticsProofV1) == 3 * sizeof(std::uint64_t));
+
+struct QGNativeSemantics {
+  core::Metric metric{core::Metric::l2};
+  core::MetricPreprocessing preprocessing{core::MetricPreprocessing::none};
+  bool explicit_proof{};
+};
+
+[[nodiscard]] inline auto qg_expected_preprocessing(core::Metric metric)
+    -> core::MetricPreprocessing {
+  switch (metric) {
+    case core::Metric::l2:
+    case core::Metric::inner_product:
+      return core::MetricPreprocessing::none;
+    case core::Metric::cosine:
+      return core::MetricPreprocessing::l2_normalized;
+  }
+  throw std::invalid_argument("QuantizedGraph: unsupported metric");
+}
+
+inline void qg_validate_metric_configuration(core::Metric metric,
+                                             core::MetricPreprocessing preprocessing) {
+  if (preprocessing != qg_expected_preprocessing(metric)) {
+    throw std::invalid_argument("QuantizedGraph: metric and native preprocessing proof disagree");
+  }
+}
+
+[[nodiscard]] inline auto qg_native_semantics_payload(core::Metric metric,
+                                                      core::MetricPreprocessing preprocessing)
+    -> std::uint64_t {
+  qg_validate_metric_configuration(metric, preprocessing);
+  return static_cast<std::uint64_t>(kQGNativeSemanticsVersion) |
+         (static_cast<std::uint64_t>(metric) << 32U) |
+         (static_cast<std::uint64_t>(preprocessing) << 40U);
+}
+
+[[nodiscard]] inline auto qg_native_semantics_checksum(std::uint64_t magic, std::uint64_t payload)
+    -> std::uint64_t {
+  const std::array<std::uint64_t, 2> words{magic, payload};
+  const auto crc = qg_crc32(words.data(), sizeof(words));
+  return static_cast<std::uint64_t>(crc) | (static_cast<std::uint64_t>(~crc) << 32U);
+}
+
+inline void qg_write_native_semantics(void *header,
+                                      std::size_t header_size,
+                                      core::Metric metric,
+                                      core::MetricPreprocessing preprocessing) {
+  qg_validate_metric_configuration(metric, preprocessing);
+  if (metric == core::Metric::l2) {
+    // Canonical legacy encoding. QGBuilder zero-initializes the metadata
+    // sector, so deliberately writing nothing preserves every L2 byte.
+    return;
+  }
+  if (header == nullptr ||
+      header_size < kQGNativeSemanticsOffset + sizeof(QGNativeSemanticsProofV1)) {
+    throw std::invalid_argument("QG native semantics metadata is truncated");
+  }
+  QGNativeSemanticsProofV1 proof;
+  proof.magic = kQGNativeSemanticsMagic;
+  proof.payload = qg_native_semantics_payload(metric, preprocessing);
+  proof.checksum = qg_native_semantics_checksum(proof.magic, proof.payload);
+  std::memcpy(static_cast<char *>(header) + kQGNativeSemanticsOffset, &proof, sizeof(proof));
+}
+
+[[nodiscard]] inline auto qg_read_native_semantics(const void *header, std::size_t header_size)
+    -> QGNativeSemantics {
+  if (header == nullptr || header_size < sizeof(std::uint64_t)) {
+    throw std::invalid_argument("QG native semantics metadata is truncated");
+  }
+
+  // Mutable v2/v3 superblocks have no non-L2 codec today. Their first metric
+  // implementation remains the canonical implicit L2 encoding.
+  std::uint64_t magic_a{};
+  std::memcpy(&magic_a, header, sizeof(magic_a));
+  std::uint64_t magic_b{};
+  if (header_size >= kQGSuperblockSize + sizeof(magic_b)) {
+    std::memcpy(&magic_b, static_cast<const char *>(header) + kQGSuperblockSize, sizeof(magic_b));
+  }
+  if (magic_a == kQGSuperblockMagic || magic_b == kQGSuperblockMagic) {
+    return {};
+  }
+
+  if (header_size < kQGNativeSemanticsOffset + sizeof(QGNativeSemanticsProofV1)) {
+    return {};
+  }
+  QGNativeSemanticsProofV1 proof;
+  std::memcpy(&proof, static_cast<const char *>(header) + kQGNativeSemanticsOffset, sizeof(proof));
+  if (proof.magic == 0 && proof.payload == 0 && proof.checksum == 0) {
+    return {};
+  }
+  if (proof.magic != kQGNativeSemanticsMagic ||
+      proof.checksum != qg_native_semantics_checksum(proof.magic, proof.payload) ||
+      static_cast<std::uint32_t>(proof.payload) != kQGNativeSemanticsVersion ||
+      (proof.payload >> 48U) != 0) {
+    throw std::invalid_argument("QG native metric/preprocessing proof is malformed");
+  }
+  const auto metric = static_cast<core::Metric>((proof.payload >> 32U) & 0xffU);
+  const auto preprocessing = static_cast<core::MetricPreprocessing>((proof.payload >> 40U) & 0xffU);
+  qg_validate_metric_configuration(metric, preprocessing);
+  return {metric, preprocessing, true};
+}
+
+inline void qg_validate_native_semantics(const void *header,
+                                         std::size_t header_size,
+                                         core::Metric expected_metric,
+                                         core::MetricPreprocessing expected_preprocessing) {
+  qg_validate_metric_configuration(expected_metric, expected_preprocessing);
+  const auto actual = qg_read_native_semantics(header, header_size);
+  if ((!actual.explicit_proof && expected_metric != core::Metric::l2) ||
+      actual.metric != expected_metric || actual.preprocessing != expected_preprocessing) {
+    throw std::invalid_argument(
+        "QG native metric/preprocessing proof disagrees with the requested semantics");
+  }
+}
+
+inline void qg_validate_native_semantics_file(const std::filesystem::path &path,
+                                              core::Metric expected_metric,
+                                              core::MetricPreprocessing expected_preprocessing) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    throw std::runtime_error("cannot open QG native artifact for semantics validation: " +
+                             path.string());
+  }
+  std::array<char, kSectorLen> header{};
+  input.read(header.data(), static_cast<std::streamsize>(header.size()));
+  const auto bytes = static_cast<std::size_t>(input.gcount());
+  qg_validate_native_semantics(header.data(), bytes, expected_metric, expected_preprocessing);
+}
+
 // Structural (not-corrupt) integrity: correct magic and a matching checksum ONLY.
 // BLOCKER-3: the outer format version is deliberately NOT part of structural validity.
 // A checksum-legal block of a FUTURE outer version (v4+) must count as structurally
@@ -441,7 +587,9 @@ class QuantizedGraph {
   size_t dimension_ = 0;     // dimension
   size_t residual_dimension_ = 0;
   size_t padded_dim_ = 0;  // padded dimension
-  PID entry_point_ = 0;    // Entry point of graph
+  core::Metric metric_ = core::Metric::l2;
+  core::MetricPreprocessing preprocessing_ = core::MetricPreprocessing::none;
+  PID entry_point_ = 0;  // Entry point of graph
 
   // Dead field: grep confirms no other reference to `data_` in this class
   // (see REPORT-allocator-merge.md W1 audit). AlignedAlloc's 2MB tier is
@@ -564,13 +712,20 @@ class QuantizedGraph {
                        const char *pf_base = nullptr,
                        size_t pf_lines = 0) const;
 
+  [[nodiscard]] auto exact_distance(const float *lhs, const float *rhs, size_t dim) const -> float {
+    return metric_ == core::Metric::l2 ? space::l2_sqr(lhs, rhs, dim) : space::ip(lhs, rhs, dim);
+  }
+
  public:
-  explicit QuantizedGraph(size_t num,
-                          size_t max_deg,
-                          size_t main_dim,
-                          size_t dim,
-                          uint64_t rotator_seed = 0,
-                          std::string rotator_dump_path = "");
+  explicit QuantizedGraph(
+      size_t num,
+      size_t max_deg,
+      size_t main_dim,
+      size_t dim,
+      uint64_t rotator_seed = 0,
+      std::string rotator_dump_path = "",
+      core::Metric metric = core::Metric::l2,
+      core::MetricPreprocessing preprocessing = core::MetricPreprocessing::none);
 
   ~QuantizedGraph();
 
@@ -579,6 +734,10 @@ class QuantizedGraph {
   [[nodiscard]] auto dimension() const { return this->dimension_; }
 
   [[nodiscard]] auto residual_dimension() const { return this->residual_dimension_; }
+
+  [[nodiscard]] auto metric() const noexcept { return metric_; }
+
+  [[nodiscard]] auto preprocessing() const noexcept { return preprocessing_; }
 
   [[nodiscard]] auto degree_bound() const { return this->degree_bound_; }
 
@@ -681,7 +840,9 @@ inline QuantizedGraph::QuantizedGraph(size_t num,
                                       size_t main_dim,
                                       size_t dim,
                                       uint64_t rotator_seed,
-                                      std::string rotator_dump_path)
+                                      std::string rotator_dump_path,
+                                      core::Metric metric,
+                                      core::MetricPreprocessing preprocessing)
     : num_points_(num),
       degree_bound_(max_deg),
       dimension_(main_dim),
@@ -689,6 +850,8 @@ inline QuantizedGraph::QuantizedGraph(size_t num,
                                              // representation (e.g., for GIST dataset)
       ,
       padded_dim_(1 << ceil_log2(dimension_)),
+      metric_(metric),
+      preprocessing_(preprocessing),
       scanner_(padded_dim_, degree_bound_),
       rotator_(dimension_, rotator_seed),
 #if defined(_WIN32)
@@ -697,6 +860,11 @@ inline QuantizedGraph::QuantizedGraph(size_t num,
       node_len_((32 * dimension_ + 32 * residual_dimension_ + 128 * degree_bound_ +
                  degree_bound_ * padded_dim_) /
                 8) {
+  qg_validate_metric_configuration(metric_, preprocessing_);
+  if (metric_ != core::Metric::l2 && residual_dimension_ != 0) {
+    throw std::invalid_argument(
+        "QuantizedGraph: IP/cosine require main_dim == dim (no L2 residual tail)");
+  }
   // Dump the rotator's sign-scaled mat_ vector BEFORE any consumer
   // (RaBitQ training, search path) reads from it. When `rotator_dump_path`
   // is empty, no file is written and the on-disk dsqg.index is unchanged.
@@ -859,9 +1027,9 @@ inline void QuantizedGraph::arena_search_with(ThreadData &data,
     float best_dist = FLT_MAX;
     for (size_t cur_m = 0; cur_m < medoids_.size(); cur_m++) {
       float cur_expanded_dist =
-          space::l2_sqr(transformed_query,
-                        medoids_vector_.data() + (dimension_ + residual_dimension_) * cur_m,
-                        dimension_);
+          exact_distance(transformed_query,
+                         medoids_vector_.data() + (dimension_ + residual_dimension_) * cur_m,
+                         dimension_);
       if (cur_expanded_dist < best_dist) {
         best_medoid = medoids_[cur_m];
         best_dist = cur_expanded_dist;
@@ -898,7 +1066,7 @@ inline void QuantizedGraph::arena_search_with(ThreadData &data,
                                  pf_base,
                                  pf_lines);
     if (residual_dimension_ > 0) {
-      sqr_y += space::l2_sqr(cur_data + dimension_, residual_query, residual_dimension_);
+      sqr_y += exact_distance(cur_data + dimension_, residual_query, residual_dimension_);
     }
     const bool admit = admission != nullptr
                            ? admission->test(cur_node)
@@ -1039,9 +1207,9 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
     // Linear scan through medoids to find the closest one
     for (size_t cur_m = 0; cur_m < medoids_.size(); cur_m++) {
       float cur_expanded_dist =
-          space::l2_sqr(transformed_query,
-                        medoids_vector_.data() + (dimension_ + residual_dimension_) * cur_m,
-                        dimension_);
+          exact_distance(transformed_query,
+                         medoids_vector_.data() + (dimension_ + residual_dimension_) * cur_m,
+                         dimension_);
       if (cur_expanded_dist < best_dist) {
         best_medoid = medoids_[cur_m];
         best_dist = cur_expanded_dist;
@@ -1111,9 +1279,9 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
     // Add residual dimension distance if applicable (e.g., for GIST dataset)
     if (residual_dimension_ > 0) {
       float *residual_data = cur_data + dimension_;
-      sqr_y += space::l2_sqr(reinterpret_cast<const float *>(residual_data),
-                             residual_query,
-                             residual_dimension_);
+      sqr_y += exact_distance(reinterpret_cast<const float *>(residual_data),
+                              residual_query,
+                              residual_dimension_);
     }
     // Insert current node with exact distance into result pool (unless the
     // node is filtered out: tombstoned, or excluded by a per-call admission
@@ -1308,7 +1476,7 @@ inline float QuantizedGraph::scan_neighbors(const QGQuery &q_obj,
                                             size_t pf_lines) const {
   ALAYA_KSP_COUNT(pops);
   ALAYA_KSP_BEGIN(exact);
-  float sqr_y = space::l2_sqr(q_obj.query_data(), cur_data, dimension_);
+  float sqr_y = exact_distance(q_obj.query_data(), cur_data, dimension_);
   ALAYA_KSP_END(exact);
 
   /* Compute approximate distance by Fast Scan */
@@ -1468,7 +1636,7 @@ inline void QuantizedGraph::update_qg_out_of_memory(
   float *triple_x = fac_ptr;
   float *factor_dq = triple_x + this->degree_bound_;
   float *factor_vq = factor_dq + this->degree_bound_;
-  rabitq_codes(x_rotated, c_rotated, packed_code_ptr, triple_x, factor_dq, factor_vq);
+  rabitq_codes(x_rotated, c_rotated, packed_code_ptr, triple_x, factor_dq, factor_vq, metric_);
 
   // Add ||x_r||^2 (residual dimensions) directly to triple_x for improved precision
   // This avoids storing a separate sqr_xr array and saves computation during search
@@ -1500,6 +1668,7 @@ inline void QuantizedGraph::load_disk_index(const char *filename,
   if (!input) {
     throw std::runtime_error("QuantizedGraph::load_disk_index: short metadata sector");
   }
+  qg_validate_native_semantics(header.data(), header.size(), metric_, preprocessing_);
 
   QGSuperblockV2 sb;
   const int sb_slot = select_qg_superblock_checked(header.data(), sb, kQgSupportedRequiredFeatures);

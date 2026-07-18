@@ -465,14 +465,14 @@ TEST_F(LaserSegmentSearcherTest, works_without_optional_medoids_or_pca) {
   EXPECT_FALSE(hits.empty());
 }
 
-TEST_F(LaserSegmentSearcherTest, cos_metric_rejected) {
+TEST_F(LaserSegmentSearcherTest, cos_metric_without_preprocessing_proof_rejected) {
   write_manifest(base_manifest(core::Metric::cosine));
 
   expect_runtime_message_contains(
       [&] {
         LaserSegmentSearcher searcher(seg_dir_);
       },
-      {"cos", "not implemented in v1"});
+      {"x_laser_preprocessing", "non-L2"});
 }
 
 TEST_F(LaserSegmentSearcherTest, x_laser_filename_prefix_missing_throws) {

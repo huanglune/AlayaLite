@@ -7,13 +7,9 @@
  * @brief LASER inner-product (IP) distance kernel: exact wrapper + full-sign
  *        RaBitQ IP factor helper.
  *
- * DORMANT (W1). This header is intentionally included by NO production
- * translation unit -- only by tests/laser/space/ip_kernel_test.cpp. The IP metric
- * is wired into the production estimator chain (rabitq.hpp / qg_scanner.hpp /
- * laser_dispatch.hpp / qg.hpp / searcher / segment / importer / target build+open)
- * only in the post-WAL-2C atomic phase (see REPORT-laser-ip.md section 6). Landing
- * this kernel alone cannot produce a physically-IP LASER segment, so it stays off
- * the production include graph until that phase.
+ * Production wiring dispatches this kernel from rabitq.hpp and qg.hpp for both
+ * inner_product and cosine's normalized negative-dot inner. Collection owns
+ * cosine row/query normalization; the LASER kernel itself remains IP-only.
  *
  * Two pieces:
  *   1. ip(): the exact distance wrapper. Returns the NEGATIVE inner product

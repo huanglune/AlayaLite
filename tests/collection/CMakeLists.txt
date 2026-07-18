@@ -190,7 +190,7 @@ if(ALAYA_ENABLE_LASER)
 
   # End-to-end coverage for LASER as a Collection target algorithm (U2-c W1):
   # create/upsert/seal/search/filter-search/close/reopen/rotate_to_successor through the public Collection facade, plus
-  # the metric=inner_product -> flat fallback.
+  # native inner_product admission (the deeper metric semantics live in collection_laser_metric_wiring_test below).
   alaya_cc_target(
     collection_laser_target_test
     GTEST LASER
@@ -215,6 +215,20 @@ if(ALAYA_ENABLE_LASER)
   alaya_add_test(
     NAME collection_laser_recall_floor_test
     TARGET collection_laser_recall_floor_test
+    LABELS integration collection laser
+    TIMEOUT 300
+  )
+
+  # Sealed/read-only LASER metric production wiring: same-data IP parity with memory QG, cosine normalization semantics,
+  # native proofs, and reopen.
+  alaya_cc_target(
+    collection_laser_metric_wiring_test
+    GTEST LASER
+    SRCS collection_laser_metric_wiring_test.cpp
+  )
+  alaya_add_test(
+    NAME collection_laser_metric_wiring_test
+    TARGET collection_laser_metric_wiring_test
     LABELS integration collection laser
     TIMEOUT 300
   )

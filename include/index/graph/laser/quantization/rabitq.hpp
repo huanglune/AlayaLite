@@ -34,11 +34,14 @@
 #include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
+#include "core/value_types.hpp"
 #include "index/graph/laser/common.hpp"
 #include "index/graph/laser/quantization/fastscan_impl.hpp"
 #include "index/graph/laser/space/bitwise.hpp"
+#include "index/graph/laser/space/ip.hpp"
 #include "space/quant/rabitq_core.hpp"
 
 namespace alaya::laser {
@@ -48,7 +51,8 @@ static inline void rabitq_factors(const kernels::linalg::RowMajorMatrix<float> &
                                   const kernels::linalg::RowMajorMatrix<int> &bin_x,
                                   float *triple_x,
                                   float *factor_dq,
-                                  float *factor_vq);
+                                  float *factor_vq,
+                                  core::Metric metric = core::Metric::l2);
 
 /**
  * @brief Computes RaBitQ binary codes and correction factors for neighbor vectors.
@@ -65,7 +69,8 @@ inline void rabitq_codes(kernels::linalg::RowMajorMatrix<float> &rotated_data,
                          uint8_t *packed_code,
                          float *triple_x,
                          float *factor_dq,
-                         float *factor_vq) {
+                         float *factor_vq,
+                         core::Metric metric = core::Metric::l2) {
   int64_t num_points = rotated_data.rows();
   int64_t dim = rotated_data.cols();
 
@@ -93,7 +98,7 @@ inline void rabitq_codes(kernels::linalg::RowMajorMatrix<float> &rotated_data,
   pack_codes(dim, binary.data(), num_points, packed_code);
 
   // compute factors for RaBitQ
-  rabitq_factors(rotated_data, rotated_centroid, bin_x, triple_x, factor_dq, factor_vq);
+  rabitq_factors(rotated_data, rotated_centroid, bin_x, triple_x, factor_dq, factor_vq, metric);
 }
 
 static inline void rabitq_factors(
@@ -102,18 +107,29 @@ static inline void rabitq_factors(
     const kernels::linalg::RowMajorMatrix<int> &bin_x,
     float *triple_x,
     float *factor_dq,
-    float *factor_vq) {
+    float *factor_vq,
+    core::Metric metric) {
   int64_t num_points = rotated_data_residual.rows();
   int64_t dim = rotated_data_residual.cols();
 
   float fac_norm = 1.F / std::sqrt(static_cast<float>(dim));
 
+  if (metric != core::Metric::l2 && metric != core::Metric::inner_product &&
+      metric != core::Metric::cosine) {
+    throw std::invalid_argument("rabitq_factors: unsupported metric");
+  }
   for (int64_t j = 0; j < num_points; ++j) {
-    const auto factors = RaBitQCore::laser_l2_factors(rotated_data_residual.row(j).data(),
-                                                      rotated_centroid.data(),
-                                                      bin_x.row(j).data(),
-                                                      dim,
-                                                      fac_norm);
+    const auto factors = metric == core::Metric::l2
+                             ? RaBitQCore::laser_l2_factors(rotated_data_residual.row(j).data(),
+                                                            rotated_centroid.data(),
+                                                            bin_x.row(j).data(),
+                                                            dim,
+                                                            fac_norm)
+                             : space::laser_ip_factors(rotated_data_residual.row(j).data(),
+                                                       rotated_centroid.data(),
+                                                       bin_x.row(j).data(),
+                                                       dim,
+                                                       fac_norm);
     triple_x[j] = factors.base;
     factor_dq[j] = factors.signed_query_scale;
     factor_vq[j] = static_cast<float>(factors.signed_query_scale *

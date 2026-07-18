@@ -98,8 +98,9 @@ class L2NormalizedQuerySegment {
 
   [[nodiscard]] auto descriptor() const noexcept -> core::Descriptor { return descriptor_; }
 
-  [[nodiscard]] static auto operations() noexcept -> const core::AnySegmentOperationTable & {
-    static const core::AnySegmentOperationTable value = [] {
+  [[nodiscard]] static auto operations(bool supports_save) noexcept
+      -> const core::AnySegmentOperationTable & {
+    static const core::AnySegmentOperationTable with_save = [] {
       core::AnySegmentOperationTable table;
       table.table_size = sizeof(core::AnySegmentOperationTable);
       table.table_version = core::kOperationTableVersion;
@@ -109,7 +110,12 @@ class L2NormalizedQuerySegment {
       table.stats = &stats;
       return table;
     }();
-    return value;
+    static const core::AnySegmentOperationTable without_save = [] {
+      auto table = with_save;
+      table.save = nullptr;
+      return table;
+    }();
+    return supports_save ? with_save : without_save;
   }
 
  private:
@@ -226,14 +232,15 @@ class L2NormalizedQuerySegment {
   const auto inner_capabilities = inner.capabilities();
   if (!inner_capabilities.supports(core::OperationCapability::search) ||
       !inner_capabilities.supports(core::OperationCapability::batch_search) ||
-      !inner_capabilities.supports(core::OperationCapability::save) ||
       !inner_capabilities.supports(core::OperationCapability::stats)) {
-    return core::Status::error(core::StatusCode::not_supported,
-                               core::OperationStage::admission,
-                               core::StatusDetail::operation_slot_absent,
-                               "L2-normalized query adapter inner segment lacks required slots");
+    return core::Status::
+        error(core::StatusCode::not_supported,
+              core::OperationStage::admission,
+              core::StatusDetail::operation_slot_absent,
+              "L2-normalized query adapter inner segment lacks search/stats slots");
   }
 
+  const bool supports_save = inner_capabilities.supports(core::OperationCapability::save);
   auto adapter = std::make_shared<L2NormalizedQuerySegment>(std::move(inner));
   const auto adapted_descriptor = adapter->descriptor();
   core::SegmentInstanceConfig config;
@@ -241,7 +248,8 @@ class L2NormalizedQuerySegment {
   config.concurrency = inner_capabilities.concurrency;
   config.concurrency.explicit_drain = false;
   return core::AnySegment::from_raw(std::move(adapter),
-                                    std::addressof(L2NormalizedQuerySegment::operations()),
+                                    std::addressof(
+                                        L2NormalizedQuerySegment::operations(supports_save)),
                                     adapted_descriptor,
                                     std::move(config));
 }
