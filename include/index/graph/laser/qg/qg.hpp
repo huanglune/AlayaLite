@@ -357,6 +357,13 @@ inline bool qg_superblock_supported(const QGSuperblockV2 &sb, uint32_t supported
     const uint64_t maint_gen = qg_read_maintenance_activation_gen(sb);
     const uint64_t pid_gen = qg_read_pid_reuse_activation_gen(sb);
     const bool pid = (required & kQgFeatPidGenerationV1) != 0;
+    // BLOCKER-3 (leg-7): maintenance is REQUIRED for every v3 (checked above), so its
+    // activation generation must be in (0, sb.generation] in the PURE validation phase.
+    // The struct carries sb.generation, so the <= own-generation upper bound is enforced
+    // HERE too -- a read-only QuantizedGraph open never calls the loader's adopt_label_state(),
+    // so this selector is the only gate that stops a maintenance-gen-zero / activation-gen-future
+    // v3 from being adopted as the highest-generation base and re-selected on every later open.
+    if (maint_gen == 0 || maint_gen > sb.generation) return false;
     if (!pid) {
       // BLOCKER-3 inactive-state: a maintenance-only v3 carries NO pid-reuse state, so its
       // activation generation + reuse summary must be canonical-zero.
@@ -365,10 +372,9 @@ inline bool qg_superblock_supported(const QGSuperblockV2 &sb, uint32_t supported
         return false;
       }
     } else {
-      // BLOCKER-3 activation ordering: pid reuse activates at or after maintenance, and both
-      // stamp a non-zero generation. (The <= own-generation upper bound is enforced by the
-      // loader, which knows sb.generation.)
-      if (maint_gen == 0 || pid_gen == 0 || pid_gen < maint_gen) return false;
+      // BLOCKER-3 activation ordering: pid reuse activates at or after maintenance, both
+      // stamp a non-zero generation, and neither is newer than the block's own generation.
+      if (pid_gen == 0 || pid_gen < maint_gen || pid_gen > sb.generation) return false;
     }
     return true;
   }

@@ -2222,15 +2222,19 @@ class QGUpdater {
                                                next.generation,
                                                static_cast<uint8_t>(next_slot),
                                                image);
-      wal_append(flip, alaya::wal::WalFile::Sync::fsync);
-      // BLOCKER-4: from the instant the flip is durable through the in-memory adoption,
-      // ANY exception (superblock pwrite/fsync, WAL reset, a post-flip observer/failpoint,
-      // or an allocation inside the adoption) must poison this handle. A durable G+1 flip
-      // already exists in the WAL; a surviving handle that threw WITHOUT poisoning could
-      // retry checkpoint() and write a SECOND, different G+1 flip that replay cannot
-      // reconcile ("same generation image differs"). A process crash still rolls forward
-      // (replay applies the single durable flip); only a live handle must stop here.
+      // BLOCKER-4 (leg-7): the flip append + fsync + on_wal_fsync observer live INSIDE the same
+      // catch-all as the superblock write / WAL reset / in-memory adoption. wal_append(fsync)
+      // fsyncs the flip (a durable G+1 flip now exists in the WAL) and THEN calls
+      // notify_wal_fsync(); a one-shot observer that throws there -- or ANY exception once the
+      // flip is durable (superblock pwrite/fsync, WAL reset, a post-flip observer/failpoint, or
+      // an allocation inside the adoption) -- must poison this handle. A surviving handle that
+      // threw WITHOUT poisoning could retry checkpoint() and write a SECOND, different G+1 flip
+      // that replay cannot reconcile ("same generation image differs"). A process crash still
+      // rolls forward (replay applies the single durable flip); only a live handle must stop
+      // here. Poisoning on an append failure BEFORE durability is conservative and safe (a crash
+      // there just rolls back to the old base).
       try {
+        wal_append(flip, alaya::wal::WalFile::Sync::fsync);
         wal_failpoint(SegmentOpFailPoint::after_flip_append_before_superblock_write);
         if (::ftruncate(fd_, static_cast<off_t>(file_size)) != 0) {
           poison("checkpoint ftruncate failed");
@@ -2706,6 +2710,16 @@ class QGUpdater {
     assert_no_maintenance_steal("superblock pwrite");  // wal-2c MAJOR-8
     if (slot < 0 || slot >= static_cast<int>(kQGSuperblockCopies) || !qg_superblock_valid(sb)) {
       throw std::invalid_argument("QGUpdater::write_superblock invalid slot/block");
+    }
+    // BLOCKER-3 (leg-7): defensive full-image gate -- never persist a superblock this build
+    // cannot reopen (unsupported / self-inconsistent feature set, out-of-range activation
+    // generations, or a stray non-zero 2C reserved byte). Every legitimate caller (checkpoint,
+    // migrate_v1, replay_flip after its pre-write validation) builds a supported image; a
+    // violation here is an internal invariant break and must fail closed rather than write a
+    // base whose own next open would fail closed.
+    if (!qg_superblock_supported(sb, kQgSupportedRequiredFeatures)) {
+      throw std::runtime_error(
+          "QGUpdater::write_superblock refusing an unsupported/full-image-invalid superblock");
     }
     const off_t off = static_cast<off_t>(slot * kQGSuperblockSize);
     ssize_t written;
@@ -5764,7 +5778,8 @@ class QGUpdater {
   LabelBindings load_label_slot_bindings(const std::string &path,
                                          uint64_t count,
                                          uint64_t checksum,
-                                         uint64_t num_points) {  // wal-2c MAJOR-9
+                                         uint64_t num_points,
+                                         bool pid_active) {  // wal-2c MAJOR-9
     if ((checksum >> 32) != 0) {
       poison("label slot checksum high 32 bits must be zero");
     }
@@ -5811,8 +5826,10 @@ class QGUpdater {
         poison("label slot entry references a pid at or beyond the committed high-water mark");
       }
       // W2c relaxes this once pid_generation_v1 is activated; until then (append-only)
-      // every slot entry must carry generation 0 (fail-closed on a forged non-zero).
-      if (gen != 0 && !pid_generation_activated_) {
+      // every slot entry must carry generation 0 (fail-closed on a forged non-zero). The
+      // caller passes the pid-reuse state OF THE IMAGE being validated (leg-7 BLOCKER-3: a
+      // flip image is validated against its own pid state before it becomes the base).
+      if (gen != 0 && !pid_active) {
         poison("label slot entry has a non-zero generation before pid-reuse activation");
       }
       if (!first && pid <= prev_pid) {
@@ -5975,7 +5992,7 @@ class QGUpdater {
     }
     active_label_slot_ = static_cast<int>(ls.slot);
     auto lb = load_label_slot_bindings(label_slot_path_[ls.slot], ls.count, ls.checksum,
-                                       sb.num_points);
+                                       sb.num_points, pid_generation_activated_);
     // Activation summary cross-check (design 7.1 / JC-16, sixth fail-closed condition):
     // the slot's actual max non-zero generation and reuse-binding count must equal the
     // summary the writing checkpoint stamped. A mismatch means a slot swapped out from
@@ -6677,6 +6694,17 @@ class QGUpdater {
     if (frame_batch_id != op.tx_id) {
       poison("op-WAL label_bind frame batch_id != payload tx_id");
     }
+    // NEW-BLOCKER-1 (leg-7): once pid reuse is activated, EVERY new writer transaction goes
+    // through the canonical lane (segment_generation >= activation). Reaching this legacy lane
+    // means is_canonical_generation() is false, i.e. segment_generation < activation, so this
+    // frame can only belong to the absorbed historical prefix (tx_id <= base). A legacy label
+    // transaction with tx_id > base is a forged cross-generation classifier downgrade -- poison
+    // NOW, BEFORE staging or any following row_patch apply (index bytes stay unchanged).
+    if (pid_generation_activated_ && op.tx_id > base_committed_txid_) {
+      poison(
+          "op-WAL post-activation legacy label_bind is not an absorbed prefix "
+          "(cross-generation classifier downgrade)");
+    }
     // Idempotent de-dup by (tx_id, row_op_id): a same-txid retry after a torn bundle
     // whose earlier binds survived in the OS page cache (process crash on a bundle
     // larger than the WAL userspace buffer) re-appends identical binds. Collapse
@@ -6706,6 +6734,14 @@ class QGUpdater {
     }
     if (op.binding_count == 0) {
       poison("op-WAL tx_publish binding_count must be >= 1");
+    }
+    // NEW-BLOCKER-1 (leg-7): mirror the label_bind gate at the commit point (defense in depth,
+    // and it also catches a kind=8 with no preceding kind=7). Once pid reuse is activated a
+    // legacy tx_publish (segment_generation < activation) must be absorbed by the base.
+    if (pid_generation_activated_ && op.tx_id > base_committed_txid_) {
+      poison(
+          "op-WAL post-activation legacy tx_publish is not an absorbed prefix "
+          "(cross-generation classifier downgrade)");
     }
     const auto it = staged_binds_.find(op.tx_id);
     static const std::vector<LabelBindStage> kNoStaged;
@@ -6737,6 +6773,15 @@ class QGUpdater {
     }
 
     // (a) a new transaction to promote. Full B-04 validation set.
+    // NEW-BLOCKER-1 (leg-7): a NON-absorbed legacy transaction is the WAL tail written at the
+    // current base with no intervening checkpoint (a checkpoint flips + resets the WAL and
+    // absorbs everything before it, and no non-absorbed frame follows a flip). Its generation
+    // therefore MUST equal the replay cursor (superblock_.generation); a mismatch is a spliced
+    // cross-generation frame. This binds the legacy lane to the cursor exactly as the canonical
+    // and maintenance lanes already are.
+    if (op.segment_generation != superblock_.generation) {
+      poison("op-WAL legacy tx_publish generation != the replay cursor generation");
+    }
     if (op.tx_id <= last_committed_txid_) {
       poison("op-WAL tx_publish tx_id is not strictly increasing");
     }
@@ -6788,6 +6833,51 @@ class QGUpdater {
     staged_binds_.erase(op.tx_id);
   }
 
+  // BLOCKER-3 (leg-7): validate a flip image's label tuple + slot file + pid-generation
+  // summary into TEMP objects BEFORE any pwrite. adopt_label_state() runs these checks too,
+  // but only AFTER write_superblock() has already persisted the (higher-generation) image;
+  // a crafted flip whose only defect is in the label slot / summary would install and then
+  // poison, and every later reopen would keep re-selecting the installed illegal base.
+  // Rejecting here writes nothing (index bytes stay byte-for-byte unchanged). The activation
+  // generation bounds/ordering are already covered by qg_superblock_supported() at the top of
+  // replay_flip; this closes the remaining label-slot / summary window.
+  void validate_flip_label_state(const QGSuperblockV2 &image) {
+    const auto ls = read_superblock_label_state(image);
+    const auto w2c = read_superblock_wal2c_state(image);
+    const bool image_pid_active = image.format_version == kQGFormatVersionV3 &&
+                                  (w2c.required_feature_flags & kQgFeatPidGenerationV1) != 0;
+    if (ls.generation == 0 && ls.count == 0 && ls.checksum == 0) {
+      if (w2c.max_pid_generation != 0 || w2c.nonzero_pid_generation_count != 0) {
+        poison("flip image: empty label slot but a non-zero pid-generation summary");
+      }
+      if (ls.slot > 1) {
+        poison("flip image: label slot index out of range (empty tuple)");
+      }
+      return;  // canonical legacy empty: the slot file may be absent
+    }
+    if (ls.slot > 1) {
+      poison("flip image: label slot index out of range");
+    }
+    // Preload + fully validate the referenced slot file into a temp binding set (checksum,
+    // count*16, ascending, pid < num_points, generation-vs-pid-active) -- pure read + poison.
+    auto lb = load_label_slot_bindings(label_slot_path_[ls.slot], ls.count, ls.checksum,
+                                       image.num_points, image_pid_active);
+    if (image_pid_active) {
+      uint32_t max_gen = 0;
+      uint32_t nz_count = 0;
+      for (const auto &[pid, binding] : lb.bindings) {
+        (void)pid;
+        if (binding.pid_generation != 0) {
+          ++nz_count;
+          max_gen = (std::max)(max_gen, binding.pid_generation);
+        }
+      }
+      if (max_gen != w2c.max_pid_generation || nz_count != w2c.nonzero_pid_generation_count) {
+        poison("flip image: label slot pid-generation summary does not match the image");
+      }
+    }
+  }
+
   void replay_flip(const SegmentOp &op) {
     if (op.bytes.size() != kSegmentSuperblockImageBytes) {
       poison("flip image is not 512 bytes");
@@ -6821,6 +6911,11 @@ class QGUpdater {
     if (image_generation != disk_generation + 1) {
       poison("flip generation transition is not the next legal step");
     }
+    // BLOCKER-3 (leg-7): fully validate the image's label slot + pid-generation summary BEFORE
+    // any pwrite. A crafted flip whose label state is illegal must be rejected here so no
+    // higher-generation superblock is ever installed on disk (which later reopens would keep
+    // re-selecting). adopt_label_state() below re-runs the same checks and mutates the members.
+    validate_flip_label_state(image);
     // Apply the next legal base: rewrite its slot and set the file length.
     const auto next_slot = static_cast<int>(op.target_slot);
     write_superblock(next_slot, image);
