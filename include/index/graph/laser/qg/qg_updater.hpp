@@ -6151,16 +6151,19 @@ class QGUpdater {
     notify_wal_fsync();
   }
 
-  // Append a whole-page after-image (row_patch). `pid_in_page` is any PID on the
-  // page; the recorded pid is the page's first PID (informational — replay
-  // rewrites purely by absolute offset).
+  // Append a whole-page after-image (row_patch). Under the armed reuse contract, the existing pid
+  // field carries the logical PID actually touched by this RMW (I-2 line evidence); legacy double-
+  // false writers retain the historical page-first value byte-for-byte. The wire layout is unchanged.
   void log_page_after_image(PID pid_in_page, const char *page_bytes) {
     const uint64_t offset = page_offset(pid_in_page);
     const auto first_pid = static_cast<uint64_t>(page_index(pid_in_page) * npp_);
+    const uint64_t evidence_pid =
+        (pid_generation_activated_ || enable_pid_reuse_) ? static_cast<uint64_t>(pid_in_page)
+                                                        : first_pid;
     auto payload =
         encode_row_patch(segment_uid_,
                          superblock_.generation,
-                         first_pid,
+                         evidence_pid,
                          offset,
                          std::span<const std::byte>(reinterpret_cast<const std::byte *>(page_bytes),
                                                     page_size_));
@@ -6253,10 +6256,12 @@ class QGUpdater {
     uint64_t legacy_txid = 0;  // 0 => standalone/unowned; legacy producer txids are strictly > 0
     bool saw_standalone_tombstone = false;
     std::map<size_t, alaya::wal::FrameLocation> latest_refs;
+    std::map<size_t, std::set<PID>> allocation_evidence;  // page -> un-published touched PIDs
     std::set<PID> staged_legacy_tombstones;
 
     [[nodiscard]] bool has_staged_effects() const {
-      return !latest_refs.empty() || !staged_legacy_tombstones.empty();
+      return !latest_refs.empty() || !allocation_evidence.empty() ||
+             !staged_legacy_tombstones.empty();
     }
     [[nodiscard]] bool active() const { return has_staged_effects() || saw_standalone_tombstone; }
     void clear() { *this = EffectCommitUnit{}; }
@@ -6646,7 +6651,7 @@ class QGUpdater {
                   // Absorbed/old-generation after-image: validate geometry (structural legality)
                   // but do NOT write -- the base at the cursor generation already holds the
                   // authoritative page.
-                  (void)replay_validate_row_patch_geometry(op);
+                  (void)replay_validate_row_patch_geometry(op, /*touched_pid_evidence=*/true);
                   break;
                 case StandaloneEffect::kPoison:
                   replaying_ = false;
@@ -6807,7 +6812,8 @@ class QGUpdater {
 
   // Validate a row_patch's whole-page geometry (clause F) and return its page
   // index. Shared by the immediate-apply path and the maintenance-epoch staging.
-  size_t replay_validate_row_patch_geometry(const SegmentOp &op) {
+  size_t replay_validate_row_patch_geometry(const SegmentOp &op,
+                                            bool touched_pid_evidence = false) {
     if (op.offset < kSectorLen) {
       poison("row_patch offset overlaps the A/B metadata sector");
     }
@@ -6822,7 +6828,12 @@ class QGUpdater {
     if (page >= page_versions_.size()) {
       poison("row_patch page exceeds the configured capacity");
     }
-    if (op.pid != static_cast<uint64_t>(page) * npp_) {
+    if (touched_pid_evidence) {
+      if (op.pid >= static_cast<uint64_t>(kPidMax) || op.pid >= row_generations_.size() ||
+          op.pid / npp_ != page) {
+        poison("row_patch touched-pid evidence does not belong to the patched page");
+      }
+    } else if (op.pid != static_cast<uint64_t>(page) * npp_) {
       poison("row_patch pid/offset geometry mismatch");
     }
     return page;
@@ -6868,6 +6879,9 @@ class QGUpdater {
     // redundant with the immediately persisted trailer/rebuild state and must not become owned by a
     // later legacy bind merely because kind=1 has no txid.
     if (unit.saw_standalone_tombstone) {
+      if (!unit.allocation_evidence.empty()) {
+        poison("op-WAL unpublished allocation evidence crosses into a legacy label unit");
+      }
       validate_effect_unit_pages(unit);
       unit.clear();
       return;
@@ -6888,13 +6902,34 @@ class QGUpdater {
                          const SegmentOp &op,
                          const alaya::wal::ScannedFrame &frame,
                          uint64_t committed_watermark) {
-    (void)committed_watermark;  // row-level allocation evidence is added in the I-2 unit below
-    const size_t page = replay_validate_row_patch_geometry(op);
+    const size_t page = replay_validate_row_patch_geometry(op, /*touched_pid_evidence=*/true);
     begin_or_check_effect_unit(unit, op.segment_generation, frame.offset);
     if (unit.legacy_txid == 0 && !unit.saw_standalone_tombstone) {
       unit.legacy_txid = single_staged_legacy_txid();
     }
+    // Latest-wins is safe only if it does not silently roll back a row that supplied allocation
+    // evidence. Re-read the prior final image and retain each PID's evidence only when that PID's
+    // row+trailer is byte-identical in the replacement image, or when this frame explicitly says it
+    // touched that same PID (in which case the evidence is refreshed below).
+    const auto previous = unit.latest_refs.find(page);
+    auto evidence = unit.allocation_evidence.find(page);
+    if (previous != unit.latest_refs.end() && evidence != unit.allocation_evidence.end()) {
+      const SegmentOp old = reread_effect_page(previous->second, unit.generation, page);
+      for (auto it = evidence->second.begin(); it != evidence->second.end();) {
+        if (static_cast<uint64_t>(*it) != op.pid && !effect_row_image_equal(old, op, *it)) {
+          it = evidence->second.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      if (evidence->second.empty()) {
+        unit.allocation_evidence.erase(evidence);
+      }
+    }
     unit.latest_refs[page] = alaya::wal::FrameLocation{frame.offset, frame.size};
+    if (op.pid >= committed_watermark) {
+      unit.allocation_evidence[page].insert(static_cast<PID>(op.pid));
+    }
   }
 
   [[nodiscard]] SegmentOp reread_effect_page(const alaya::wal::FrameLocation &ref,
@@ -6919,10 +6954,84 @@ class QGUpdater {
         op.segment_generation != expected_generation) {
       poison("op-WAL effect page reference changed identity or generation");
     }
-    if (replay_validate_row_patch_geometry(op) != expected_page) {
+    if (replay_validate_row_patch_geometry(op, /*touched_pid_evidence=*/true) != expected_page) {
       poison("op-WAL effect page reference changed page identity");
     }
     return op;
+  }
+
+  [[nodiscard]] bool effect_row_image_equal(const SegmentOp &lhs,
+                                            const SegmentOp &rhs,
+                                            PID pid) const {
+    const size_t slot = static_cast<size_t>(pid) % npp_;
+    const size_t node_offset = slot * node_len_;
+    if (std::memcmp(lhs.bytes.data() + node_offset, rhs.bytes.data() + node_offset, node_len_) != 0) {
+      return false;
+    }
+    const size_t trailer_offset = qg_page_trailer_offset(page_size_, npp_, slot);
+    return std::memcmp(lhs.bytes.data() + trailer_offset,
+                       rhs.bytes.data() + trailer_offset,
+                       sizeof(QGRowTrailer)) == 0;
+  }
+
+  [[nodiscard]] bool has_allocation_evidence(const EffectCommitUnit &unit, PID pid) const {
+    const auto page_it = unit.allocation_evidence.find(page_index(pid));
+    return page_it != unit.allocation_evidence.end() && page_it->second.count(pid) != 0;
+  }
+
+  void validate_allocation_evidence(const EffectCommitUnit &unit,
+                                    uint64_t old_hwm,
+                                    uint64_t new_hwm) {
+    for (uint64_t raw = old_hwm; raw < new_hwm; ++raw) {
+      const PID pid = static_cast<PID>(raw);
+      if (!has_allocation_evidence(unit, pid)) {
+        poison("op-WAL publish advances the HWM over a PID with no row allocation evidence");
+      }
+    }
+    // Validate each final page once and require every consumed evidence row to be structurally live.
+    for (const auto &[page, pids] : unit.allocation_evidence) {
+      const auto ref = unit.latest_refs.find(page);
+      if (ref == unit.latest_refs.end()) {
+        poison("op-WAL row allocation evidence has no final page image");
+      }
+      const SegmentOp final = reread_effect_page(ref->second, unit.generation, page);
+      for (PID pid : pids) {
+        const uint64_t raw = static_cast<uint64_t>(pid);
+        if (raw < old_hwm || raw >= new_hwm) {
+          continue;
+        }
+        const QGRowTrailer trailer = qg_read_page_trailer(
+            reinterpret_cast<const char *>(final.bytes.data()), page_size_, npp_, pid % npp_);
+        if (trailer.valid_degree > deg_ ||
+            (trailer.flags & (kQGRowTombstone | kQGRowFree)) != 0) {
+          poison("op-WAL allocation evidence final row is not structurally live");
+        }
+      }
+    }
+  }
+
+  void consume_published_allocation_evidence(EffectCommitUnit &unit, uint64_t new_hwm) {
+    for (auto page_it = unit.allocation_evidence.begin();
+         page_it != unit.allocation_evidence.end();) {
+      auto &pids = page_it->second;
+      for (auto pid_it = pids.begin(); pid_it != pids.end();) {
+        if (static_cast<uint64_t>(*pid_it) < new_hwm) {
+          pid_it = pids.erase(pid_it);
+        } else {
+          ++pid_it;
+        }
+      }
+      if (pids.empty()) {
+        unit.latest_refs.erase(page_it->first);
+        page_it = unit.allocation_evidence.erase(page_it);
+      } else {
+        ++page_it;
+      }
+    }
+    unit.saw_standalone_tombstone = false;  // its same-HWM page effects were just installed
+    if (unit.allocation_evidence.empty()) {
+      unit.clear();
+    }
   }
 
   void validate_effect_unit_pages(const EffectCommitUnit &unit) {
@@ -6978,7 +7087,8 @@ class QGUpdater {
     if (!unit.active()) {
       return;
     }
-    if (unit.legacy_txid != 0 || (!unit.latest_refs.empty() && !unit.saw_standalone_tombstone)) {
+    if (unit.legacy_txid != 0 || !unit.allocation_evidence.empty() ||
+        (!unit.latest_refs.empty() && !unit.saw_standalone_tombstone)) {
       poison(std::string("op-WAL unresolved effect unit crosses into the ") + lane + " lane");
     }
     // A standalone tombstone was already installed idempotently. Validate its referenced final
@@ -6998,16 +7108,14 @@ class QGUpdater {
       poison("op-WAL standalone publish watermark exceeds the PID capacity");
     }
     const uint64_t old_hwm = committed_watermark;
-    for (uint64_t p = old_hwm; p < publish_watermark; ++p) {
-      const size_t page = page_index(static_cast<PID>(p));
-      if (unit.latest_refs.find(page) == unit.latest_refs.end()) {
-        poison("op-WAL standalone publish advances the HWM over a row with no page after-image");
-      }
+    if (publish_watermark < old_hwm) {
+      poison("op-WAL standalone publish watermark regressed below the committed HWM");
     }
+    validate_allocation_evidence(unit, old_hwm, publish_watermark);
     validate_effect_unit_pages(unit);  // complete validation before the first page write
     apply_effect_unit_pages(unit);
-    committed_watermark = (std::max)(committed_watermark, publish_watermark);
-    unit.clear();
+    committed_watermark = publish_watermark;
+    consume_published_allocation_evidence(unit, publish_watermark);
   }
 
   // Idempotently set the on-disk trailer tombstone bit for one row during replay
@@ -7193,18 +7301,14 @@ class QGUpdater {
     // path (classifier disarmed) kind=1 was applied immediately and `pending` is empty, so this is
     // skipped (unchanged).
     if (pid_generation_activated_ || enable_pid_reuse_) {
-      for (uint64_t p = old_hwm; p < new_hwm; ++p) {
-        const size_t page = page_index(static_cast<PID>(p));
-        if (!owns_effect_unit || unit.latest_refs.find(page) == unit.latest_refs.end()) {
-          poison("op-WAL tx_publish advances the HWM over a row with no page after-image");
-        }
+      if (!owns_effect_unit) {
+        poison("op-WAL tx_publish has no owned effect unit for its appended PID range");
       }
-      if (owns_effect_unit) {
-        validate_effect_unit_pages(unit);  // full unit validation before the first page write
-        apply_effect_unit_pages(unit);
-        apply_staged_legacy_tombstones(unit);
-        unit.clear();
-      }
+      validate_allocation_evidence(unit, old_hwm, new_hwm);
+      validate_effect_unit_pages(unit);  // full unit validation before the first page write
+      apply_effect_unit_pages(unit);
+      apply_staged_legacy_tombstones(unit);
+      unit.clear();
     }
     // Promote: install the bindings, advance committed + both tx watermarks.
     for (const auto &bind : staged) {
@@ -7542,6 +7646,9 @@ class QGUpdater {
     if (unit.active()) {
       if (unit.legacy_txid != 0) {
         poison("op-WAL flip cannot consume a legacy-owned effect unit");
+      }
+      if (!unit.allocation_evidence.empty()) {
+        poison("op-WAL flip cannot absorb unpublished allocation evidence");
       }
       if (prepared.disposition != ReplayFlipDisposition::kInstall && unit.has_staged_effects()) {
         poison("op-WAL retained/stale flip has an unresolved current effect unit");

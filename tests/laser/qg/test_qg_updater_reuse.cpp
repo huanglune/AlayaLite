@@ -1498,6 +1498,137 @@ TEST(QgUpdaterReuse, StandaloneRowPatchThenMalformedPublishPoisonsIndexUnchanged
   std::filesystem::remove_all(dir);
 }
 
+TEST(QgUpdaterReuse, StandaloneSamePageOldImageCannotEvidenceNewPid) {
+  const auto dir = scratch_dir("i2_same_page_old_image");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/163);
+  const auto f = activate_facts(base.prefix, kBaseN);
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  const auto index_before = read_all_bytes(index_path);
+  const PID new_pid = static_cast<PID>(f.old_hwm);
+  const size_t page = static_cast<size_t>(new_pid) / f.npp;
+  const PID existing_pid = static_cast<PID>(page * f.npp);
+  ASSERT_LT(existing_pid, new_pid) << "the test needs an existing row in the new PID's page";
+  const auto old_page = read_index_page(index_path, f.page_size, page);
+  {
+    alaya::wal::WalFile wal(wal_path);
+    wal.append(kSegmentOpRecordType, 0, 1, 0,
+               encode_row_patch(f.seg_uid, f.cursor_gen, existing_pid,
+                                kSectorLen + page * f.page_size,
+                                std::span<const std::byte>(
+                                    reinterpret_cast<const std::byte *>(old_page.data()),
+                                    old_page.size())),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType, 0, 2, 0,
+               encode_publish(f.seg_uid, f.cursor_gen, f.old_hwm + 1),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  EXPECT_THROW({ ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, true); }, std::exception);
+  EXPECT_EQ(read_all_bytes(index_path), index_before)
+      << "an old image of the same physical page is not row allocation evidence for the new PID";
+  std::filesystem::remove_all(dir);
+}
+
+TEST(QgUpdaterReuse, StandaloneLatestPageRollbackDropsPriorRowEvidence) {
+  const auto dir = scratch_dir("i2_latest_wins_rollback");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/164);
+  const auto f = activate_facts(base.prefix, kBaseN);
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  const auto index_before = read_all_bytes(index_path);
+  const QGSuperblockV2 sb = read_active_superblock(index_path);
+  const PID new_pid = static_cast<PID>(f.old_hwm);
+  const size_t page = static_cast<size_t>(new_pid) / f.npp;
+  const PID existing_pid = static_cast<PID>(page * f.npp);
+  ASSERT_LT(existing_pid, new_pid);
+  const auto old_page = read_index_page(index_path, f.page_size, page);
+  auto new_page = old_page;
+  const size_t new_slot = static_cast<size_t>(new_pid) % f.npp;
+  new_page[new_slot * sb.node_len] = static_cast<char>(0x5A);  // explicit non-old row content
+  {
+    alaya::wal::WalFile wal(wal_path);
+    wal.append(kSegmentOpRecordType, 0, 1, 0,
+               encode_row_patch(f.seg_uid, f.cursor_gen, new_pid,
+                                kSectorLen + page * f.page_size,
+                                std::span<const std::byte>(
+                                    reinterpret_cast<const std::byte *>(new_page.data()),
+                                    new_page.size())),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType, 0, 2, 0,
+               encode_row_patch(f.seg_uid, f.cursor_gen, existing_pid,
+                                kSectorLen + page * f.page_size,
+                                std::span<const std::byte>(
+                                    reinterpret_cast<const std::byte *>(old_page.data()),
+                                    old_page.size())),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType, 0, 3, 0,
+               encode_publish(f.seg_uid, f.cursor_gen, f.old_hwm + 1),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  EXPECT_THROW({ ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, true); }, std::exception);
+  EXPECT_EQ(read_all_bytes(index_path), index_before)
+      << "latest-wins rollback must invalidate the earlier new-row evidence before any pwrite";
+  std::filesystem::remove_all(dir);
+}
+
+TEST(QgUpdaterReuse, StandalonePublishWatermarkRegressionPoisonsIndexUnchanged) {
+  const auto dir = scratch_dir("i2_publish_regression");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/165);
+  const auto f = activate_facts(base.prefix, kBaseN);
+  ASSERT_GT(f.old_hwm, 0U);
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  const auto index_before = read_all_bytes(index_path);
+  auto page = read_index_page(index_path, f.page_size, 0);
+  page[40] = static_cast<char>(page[40] ^ 0x67);
+  {
+    alaya::wal::WalFile wal(wal_path);
+    wal.append(kSegmentOpRecordType, 0, 1, 0,
+               encode_row_patch(f.seg_uid, f.cursor_gen, /*touched_pid=*/0, kSectorLen,
+                                std::span<const std::byte>(
+                                    reinterpret_cast<const std::byte *>(page.data()), page.size())),
+               alaya::wal::WalFile::Sync::buffered);
+    wal.append(kSegmentOpRecordType, 0, 2, 0,
+               encode_publish(f.seg_uid, f.cursor_gen, f.old_hwm - 1),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  EXPECT_THROW({ ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, true); }, std::exception);
+  EXPECT_EQ(read_all_bytes(index_path), index_before);
+  std::filesystem::remove_all(dir);
+}
+
+TEST(QgUpdaterReuse, TwoStepPartialPublishRetainsFutureRowEvidence) {
+  const auto dir = scratch_dir("i2_partial_publish");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/166);
+  uint64_t final_hwm = 0;
+  {
+    ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, true);
+    const auto seed = waltest::make_data(1, kDim, 1);
+    const uint64_t label = 5;
+    s.upd->commit_physical_bundle(1, 1, seed.data(), &label, 1);  // activate
+    s.upd->checkpoint();
+    const uint64_t old_hwm = s.upd->num_points();
+    const auto rows = waltest::make_data(2, kDim, 167);
+    EXPECT_EQ(s.upd->allocate_and_insert(rows.data()), static_cast<PID>(old_hwm));
+    EXPECT_EQ(s.upd->allocate_and_insert(rows.data() + kDim), static_cast<PID>(old_hwm + 1));
+    s.upd->flush(1);
+    s.upd->publish(old_hwm + 1);
+    s.upd->publish(old_hwm + 2);  // no intervening kind=1: consumes retained evidence
+    final_hwm = old_hwm + 2;
+  }
+  for (int reopen = 0; reopen < 2; ++reopen) {
+    ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, true);
+    EXPECT_EQ(s.upd->num_points(), final_hwm) << "reopen " << reopen;
+    EXPECT_TRUE(row_is_live(*s.upd, static_cast<PID>(final_hwm - 2)));
+    EXPECT_TRUE(row_is_live(*s.upd, static_cast<PID>(final_hwm - 1)));
+  }
+  std::filesystem::remove_all(dir);
+}
+
 // ---------------------------------------------------------------------------
 // garden() stays gated under reuse (it is still not a WAL maintenance transaction).
 // ---------------------------------------------------------------------------
@@ -1597,21 +1728,9 @@ std::vector<PID> walk_free_chain(QGUpdater &upd) {
 TEST(QgUpdaterReuse, LegacyV2PrefixUnderReuseFlagRecoversEquivalentToNoReuse) {
   const auto dir = scratch_dir("i3_equiv");
   std::filesystem::remove_all(dir);
-  auto base = WalTinyIndex::build(dir, kBaseN, /*seed=*/62);
-  // A v2 base + an UN-checkpointed kind1/2/5 crash-prefix. insert() never activates pid reuse, and
-  // ~QGUpdater closes without a checkpoint, so the frames stay in the WAL for replay.
-  {
-    ReuseSession s(base.prefix, kBaseN, 4 * kBaseN, /*enable_reuse=*/true);
-    for (int i = 0; i < 3; ++i) {
-      const auto v = waltest::make_data(1, kDim, 90 + i);
-      s.upd->insert(v.data());
-    }
-    s.upd->tombstone(static_cast<PID>(kBaseN));  // kind2 + its page kind1 (mid-prefix)
-    const auto v = waltest::make_data(1, kDim, 99);
-    s.upd->insert(v.data());  // a trailing publish commits the staged pending unit
-    EXPECT_FALSE(s.upd->pid_generation_activated()) << "plain inserts must not activate pid reuse";
-  }
-  // Recover two identical copies -- one with the classifier armed (reuse), one legacy -- and compare.
+  WalTinyIndex::build(dir, kBaseN, /*seed=*/62);
+  // Start both producers from the same v2 base. The armed producer records row-level evidence in
+  // kind1.pid, while the legacy producer must retain the historical page-first value byte-for-byte.
   const auto dir_on = scratch_dir("i3_equiv_on");
   const auto dir_off = scratch_dir("i3_equiv_off");
   std::filesystem::remove_all(dir_on);
@@ -1620,6 +1739,21 @@ TEST(QgUpdaterReuse, LegacyV2PrefixUnderReuseFlagRecoversEquivalentToNoReuse) {
   std::filesystem::copy(dir, dir_off, std::filesystem::copy_options::recursive);
   const std::string prefix_on = (dir_on / "wal_base").string();
   const std::string prefix_off = (dir_off / "wal_base").string();
+  const auto write_prefix = [](const std::string &prefix, bool enable_reuse) {
+    ReuseSession s(prefix, kBaseN, 4 * kBaseN, enable_reuse);
+    for (int i = 0; i < 3; ++i) {
+      const auto v = waltest::make_data(1, kDim, 90 + i);
+      s.upd->insert(v.data());
+    }
+    s.upd->tombstone(static_cast<PID>(kBaseN));  // kind2 + its page kind1 (mid-prefix)
+    const auto v = waltest::make_data(1, kDim, 99);
+    s.upd->insert(v.data());  // a trailing publish commits the staged pending unit
+    EXPECT_FALSE(s.upd->pid_generation_activated()) << "plain inserts must not activate pid reuse";
+  };
+  write_prefix(prefix_on, /*enable_reuse=*/true);
+  write_prefix(prefix_off, /*enable_reuse=*/false);
+
+  // Recover each prefix through its matching lane and compare the resulting semantic state.
   std::string fp_on;
   std::string fp_off;
   std::string fp_on2;
