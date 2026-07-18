@@ -712,5 +712,155 @@ INSTANTIATE_TEST_SUITE_P(
                 true}),
     [](const ::testing::TestParamInfo<MixKill> &info) { return info.param.name; });
 
+// ---------------------------------------------------------------------------
+// leg-9 real-SIGKILL regressions (r3 independent audit): NEW-BLOCKER-2 and I-1 both require a genuine
+// process-death crash grid (the leg-8 versions used an in-process C++ exception). Both fork a child
+// that self-SIGKILLs at after_superblock_write_before_wal_reset (superblock durable, WAL not reset),
+// then the parent asserts WIFSIGNALED && SIGKILL and double-reopens.
+// ---------------------------------------------------------------------------
+
+// NEW-BLOCKER-2 (leg-9, r3 section 3): a legacy orphan kind=7 (torn bundle, kind=8 lost) survives; the
+// first reuse call runs a pid-activation checkpoint that fsyncs its G+1 superblock, then the child
+// SELF-SIGKILLs before the WAL reset. On reopen the pid-active G+1 base is selected while the orphan
+// (tx_id > base) still precedes the activation flip. leg-7 poisoned the orphan at the kind=7 gate;
+// leg-9 stages it (dropped at the end-of-replay clear) so recovery succeeds with the data intact.
+TEST(ReuseCrashStandalone, OrphanBindThenActivationCheckpointSigkillReopenSurvives) {
+  const auto root = battery_root("newb2_sigkill");
+  std::filesystem::remove_all(root);
+  const auto tmpl = root / "template";
+  auto base = WalTinyIndex::build(tmpl, kBaseN, 4242);
+  const size_t max_points = kBaseN + 16;
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  uint64_t seg_uid = 0;
+  uint64_t base_gen = 0;
+  {  // stamp the uid; base stays v2 (no bundle -> no pid activation yet)
+    QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+    qg.load_disk_index(base.prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+    qg.set_params(64, 1, 1);
+    QGUpdater upd(qg, reuse_params(max_points));
+    seg_uid = upd.segment_uid();
+    base_gen = upd.generation();
+    ASSERT_FALSE(upd.pid_generation_activated());
+  }
+  {  // plant an orphan kind=7 (tx_id=1 > base committed 0), legacy generation, no matching kind=8
+    alaya::wal::WalFile wal(wal_path);
+    wal.append(kSegmentOpRecordType, 0, 1, /*batch_id=*/1,
+               encode_label_bind(seg_uid, base_gen, /*txid=*/1, /*row_op=*/0,
+                                 static_cast<uint32_t>(kBaseN), /*gen=*/0, /*label=*/700),
+               alaya::wal::WalFile::Sync::fsync);
+  }
+  const auto child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    try {
+      QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+      qg.load_disk_index(base.prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+      qg.set_params(64, 1, 1);
+      QGUpdater upd(qg, reuse_params(max_points, [](SegmentOpFailPoint fp) {
+                      if (fp == SegmentOpFailPoint::after_superblock_write_before_wal_reset) {
+                        ::kill(::getpid(), SIGKILL);
+                        ::_exit(99);
+                      }
+                    }));
+      const auto v = waltest::make_data(1, kDim, 3);
+      const uint64_t l = 800;
+      (void)upd.commit_physical_bundle(1, 1, v.data(), &l, 1);  // activation checkpoint -> SIGKILL
+    } catch (...) {
+      ::_exit(70);
+    }
+    ::_exit(0);
+  }
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+      << "child must die of SIGKILL at after_superblock_write_before_wal_reset (status=" << status
+      << ")";
+  for (int pass = 0; pass < 2; ++pass) {  // double reopen: must NOT poison, base intact
+    QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+    qg.load_disk_index(base.prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+    qg.set_params(64, 1, 1);
+    QGUpdater upd(qg, reuse_params(max_points));
+    EXPECT_TRUE(upd.pid_generation_activated()) << "pass " << pass << ": durable pid-active base";
+    EXPECT_EQ(upd.num_points(), kBaseN) << "pass " << pass << ": base rows survived intact";
+    EXPECT_EQ(upd.last_committed_txid(), 0U) << "pass " << pass << ": orphan never committed";
+    EXPECT_EQ(upd.trailer(0).flags & (kQGRowTombstone | kQGRowFree), 0)
+        << "pass " << pass << ": a base row is live";
+  }
+  std::filesystem::remove_all(root);
+}
+
+// I-1 (leg-9, r3 independent audit): a maintenance base completes a consolidate epoch (BEGIN/END
+// retained in the WAL), then a checkpoint carries the epoch into a G+1 base and fsyncs the
+// superblock; the child SELF-SIGKILLs before the WAL reset. On reopen the G+1 base is selected but
+// the WAL still holds BEGIN(E,G) at the OLD generation. Without the three-way maintenance-BEGIN split
+// this fail-closed forever; with it the absorbed prefix is validate-only and recovery lands exactly
+// on the clean checkpoint base.
+TEST(ReuseCrashStandalone, ConsolidateThenCheckpointSigkillBeforeResetReopens) {
+  const auto root = battery_root("i1_consolidate_ckpt");
+  std::filesystem::remove_all(root);
+  const size_t max_points = kBaseN + 16;
+  const auto tmpl = root / "template";
+  auto base = WalTinyIndex::build(tmpl, kBaseN, 4242);
+  {  // maintenance-activate + one completed reclaiming epoch + checkpoint -> durable v3 maint base
+    QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+    qg.load_disk_index(base.prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+    qg.set_params(64, 1, 1);
+    QGUpdater upd(qg, reuse_params(max_points));
+    for (PID id = 0; id < 3; ++id) upd.tombstone(id);
+    upd.consolidate(1, /*r_target=*/0, /*reclaim=*/true, /*bloom=*/false);  // activates maintenance
+    upd.checkpoint();
+  }
+  // Reference: the SAME second epoch + checkpoint run cleanly (WAL reset). Recovery of the crashed
+  // case must reproduce this state exactly.
+  const auto ref_dir = root / "ref";
+  copy_tree(tmpl, ref_dir);
+  const std::string ref_prefix = (ref_dir / "wal_base").string();
+  {
+    QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+    qg.load_disk_index(ref_prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+    qg.set_params(64, 1, 1);
+    QGUpdater upd(qg, reuse_params(max_points));
+    upd.consolidate(1, /*r_target=*/0, /*reclaim=*/false, /*bloom=*/false);  // epoch 2 (no-op)
+    upd.checkpoint();  // absorbs epoch 2, resets the WAL -> the clean reference base
+  }
+  const std::string ref_fp = recover(ref_prefix, max_points).fp;
+
+  const auto case_dir = root / "case";
+  copy_tree(tmpl, case_dir);
+  const std::string case_prefix = (case_dir / "wal_base").string();
+  const auto child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    try {
+      QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+      qg.load_disk_index(case_prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+      qg.set_params(64, 1, 1);
+      QGUpdater upd(qg, reuse_params(max_points, [](SegmentOpFailPoint fp) {
+                      if (fp == SegmentOpFailPoint::after_superblock_write_before_wal_reset) {
+                        ::kill(::getpid(), SIGKILL);
+                        ::_exit(99);
+                      }
+                    }));
+      upd.consolidate(1, /*r_target=*/0, /*reclaim=*/false, /*bloom=*/false);  // epoch 2 in the WAL
+      upd.checkpoint();  // flips to G+1, SIGKILL after the SB write, before the WAL reset
+    } catch (...) {
+      ::_exit(70);
+    }
+    ::_exit(0);
+  }
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+      << "child must die of SIGKILL (status=" << status << ")";
+  const auto first = recover(case_prefix, max_points);
+  ASSERT_FALSE(first.poisoned)
+      << "recovery must NOT poison (absorbed BEGIN(E,G) at the old generation is validate-only)";
+  EXPECT_EQ(first.fp, ref_fp) << "recovery must land exactly on the clean consolidate+checkpoint base";
+  const auto second = recover(case_prefix, max_points);
+  EXPECT_EQ(first.fp, second.fp) << "double reopen must be byte-stable";
+  std::filesystem::remove_all(root);
+}
+
 }  // namespace
 }  // namespace alaya::laser
