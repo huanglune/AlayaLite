@@ -157,14 +157,17 @@ def test_codecov_cpp_covers_laser_simd_dispatch_via_labels() -> None:
     assert '-L "${CTEST_LABELS}"' in codecov_script
 
     cpp_env = _yaml(WORKFLOWS / "codecov.yaml")["jobs"]["codecov-cpp"]["env"]
-    coverage_labels = set(str(cpp_env["CTEST_LABELS"]).split("|"))
+    # `ctest -L` treats the expression as a regex matched against each label of a
+    # test, selecting the test if any label matches -- model that, not a literal
+    # set intersection (the current expression "." matches every labeled test).
+    coverage_expr = re.compile(str(cpp_env["CTEST_LABELS"]))
 
     laser_cmake = (ROOT / "tests" / "laser" / "CMakeLists.txt").read_text(encoding="utf-8")
     registration = re.search(r"alaya_add_test\([^)]*laser_simd_dispatch_test[^)]*\)", laser_cmake)
     assert registration, "laser_simd_dispatch_test is not registered as a CTest"
     labels = re.search(r"LABELS\s+([A-Za-z0-9_ ]+)", registration.group(0))
     assert labels, "laser_simd_dispatch_test has no LABELS"
-    assert set(labels.group(1).split()) & coverage_labels, (
+    assert any(coverage_expr.search(label) for label in labels.group(1).split()), (
         "laser_simd_dispatch_test is not selected by the C++ coverage CTest labels"
     )
 

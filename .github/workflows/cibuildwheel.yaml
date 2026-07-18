@@ -14,9 +14,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 5-platform release wheel matrix. Windows uses LASER's IOCP backend
-        # (see openspec/changes/add-windows-portability-layer); Linux ARM
-        # builds with LASER OFF by default (tracked in a separate change).
+        # 5-platform release wheel matrix. The Windows and Linux ARM wheels
+        # ship without the LASER module (Windows lost its IOCP backend when
+        # that dead code was removed; ARM was never enabled); macOS ships
+        # sealed LASER via the portable thread-pool backend.
         include:
         - os: ubuntu-latest
           arch: x86_64

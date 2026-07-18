@@ -30,12 +30,12 @@ if(BUILD_PYTHON
 endif()
 
 # ---------------------------------------------------------------------------------------------------------------------
-# Laser on-disk QG index module. Linux x86_64 defaults to libaio; macOS defaults to the portable thread-pool backend;
-# Windows x64 defaults to the IOCP backend. Other platforms skip it silently by default.
+# Laser on-disk QG index module. Linux x86_64 defaults to libaio; macOS defaults to the portable thread-pool backend.
+# Windows is excluded since the IOCP backend was removed (the module no longer compiles there); other platforms skip it
+# silently by default.
 # ---------------------------------------------------------------------------------------------------------------------
-if((CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-   OR CMAKE_SYSTEM_NAME STREQUAL "Darwin"
-   OR (CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
+if((CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64") OR CMAKE_SYSTEM_NAME STREQUAL
+                                                                                             "Darwin"
 )
   set(ALAYA_ENABLE_LASER_DEFAULT ON)
 else()
@@ -52,39 +52,23 @@ option(ALAYA_LASER_USE_THREADPOOL "Use the portable thread-pool LASER I/O backen
        ${ALAYA_LASER_USE_THREADPOOL_DEFAULT}
 )
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
-  set(ALAYA_LASER_USE_IOCP_DEFAULT ON)
-else()
-  set(ALAYA_LASER_USE_IOCP_DEFAULT OFF)
-endif()
-option(ALAYA_LASER_USE_IOCP "Use the Windows IOCP LASER I/O backend" ${ALAYA_LASER_USE_IOCP_DEFAULT})
-
-if(ALAYA_LASER_USE_IOCP AND NOT (CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64"
-                                )
-)
-  message(FATAL_ERROR "ALAYA_LASER_USE_IOCP=ON requires Windows AMD64/x86_64. On other platforms use "
-                      "-DALAYA_LASER_USE_THREADPOOL=ON or the libaio default."
-  )
-endif()
+# The Windows IOCP LASER backend was removed; the option is kept only so an explicit -DALAYA_LASER_USE_IOCP=ON fails
+# loudly in AlayaLaser.cmake instead of silently selecting a backend that no longer exists.
+option(ALAYA_LASER_USE_IOCP "Removed Windows IOCP LASER I/O backend (unsupported)" OFF)
 
 if(ALAYA_ENABLE_LASER)
-  # Pin the backend per platform. macOS and Windows have exactly one supported backend, so force it; anything else must
-  # be Linux x86_64 (libaio or thread pool).
+  # Pin the backend per platform. macOS has exactly one supported backend, so force it; anything else must be Linux
+  # x86_64 (libaio or thread pool). Windows lost its only backend when IOCP was removed.
   if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(ALAYA_LASER_USE_THREADPOOL
         ON
         CACHE BOOL "Use the portable thread-pool LASER I/O backend" FORCE
     )
-  elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows" AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
-    set(ALAYA_LASER_USE_IOCP
-        ON
-        CACHE BOOL "Use the Windows IOCP LASER I/O backend" FORCE
-    )
   elseif(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     message(
       FATAL_ERROR
-        "ALAYA_ENABLE_LASER=ON but this platform is not supported yet. "
-        "Supported platforms: Linux x86_64 (libaio), macOS (thread pool), Windows x64 (IOCP). "
+        "ALAYA_ENABLE_LASER=ON but this platform is not supported. "
+        "Supported platforms: Linux x86_64 (libaio or thread pool), macOS (thread pool). "
         "Configure with -DALAYA_ENABLE_LASER=OFF to skip the Laser module."
     )
   endif()

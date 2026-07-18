@@ -53,6 +53,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -271,10 +272,16 @@ inline auto algebra_ip_factors(const float *data, const float *centroid, size_t 
   if (ip_resi_xucb == 0.0F) {
     ip_resi_xucb = std::numeric_limits<float>::infinity();  // rabitq_impl.hpp:103-105
   }
-  const float tmp_error =
-      l2_norm * static_cast<float>(kOfficialEpsilon) *
-      std::sqrt((((l2_sqr * xucb_sqr) / (ip_resi_xucb * ip_resi_xucb)) - 1.0F) /
-                (static_cast<float>(dim) - 1.0F));
+  // Cauchy-Schwarz guarantees l2_sqr*xucb_sqr >= <residual,xu_cb>^2, so the
+  // sqrt argument is mathematically >= 0; at the equality case (residual
+  // exactly parallel to xu_cb, e.g. constant vectors) float rounding under a
+  // scalar/portable reduction order can land just below 1 and hand sqrt a
+  // negative. Clamp to 0: that IS the exact value there, and the official
+  // formula (rabitq_impl.hpp:131) is otherwise preserved verbatim.
+  const float cs_ratio_minus_one =
+      std::max(0.0F, ((l2_sqr * xucb_sqr) / (ip_resi_xucb * ip_resi_xucb)) - 1.0F);
+  const float tmp_error = l2_norm * static_cast<float>(kOfficialEpsilon) *
+                          std::sqrt(cs_ratio_minus_one / (static_cast<float>(dim) - 1.0F));
   AlgebraIpFactors f{};
   f.f_add = 1.0F - resi_cent + (l2_sqr * ip_cent_xucb / ip_resi_xucb);  // :128
   f.f_rescale = -l2_sqr / ip_resi_xucb;                                 // :130

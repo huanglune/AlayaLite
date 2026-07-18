@@ -28,8 +28,15 @@
 #include "index/collection/detail/canonical_flat_segment.hpp"
 #include "index/collection/detail/collection_segment_factory.hpp"
 #include "index/collection/detail/collection_target_builder.hpp"
-#if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER != 0
+// The active (writable) LASER stack -- MutableLaserSegment/QGUpdater -- is
+// Linux-only: it needs flock, O_DIRECT, libaio and sync_file_range. Sealed
+// LASER segments stay available on every platform ALAYA_ENABLE_LASER covers;
+// only active_engine=laser is gated to Linux builds.
+#if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER != 0 && defined(__linux__)
+  #define ALAYA_COLLECTION_HAS_ACTIVE_LASER 1
   #include "index/collection/detail/mutable_laser_collection_adapter.hpp"
+#else
+  #define ALAYA_COLLECTION_HAS_ACTIVE_LASER 0
 #endif
 #include "index/collection/segmented_collection.hpp"
 #include "index/collection/sha256.hpp"
@@ -927,7 +934,7 @@ class Collection {
   [[nodiscard]] static auto create_active_laser_segment(const CollectionOptions &options,
                                                         std::uint64_t segment_id,
                                                         std::uint64_t generation) -> core::Status {
-#if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER != 0
+#if ALAYA_COLLECTION_HAS_ACTIVE_LASER
     try {
       ::alaya::disk::MutableLaserSegment::
           create_empty(active_laser_dir(options.root, segment_id, generation),
@@ -947,7 +954,7 @@ class Collection {
     return error(core::StatusCode::not_supported,
                  core::OperationStage::build,
                  core::StatusDetail::operation_slot_absent,
-                 "active LASER engine requires a build with ALAYA_ENABLE_LASER");
+                 "active LASER engine requires a Linux build with ALAYA_ENABLE_LASER");
 #endif
   }
 
@@ -969,7 +976,7 @@ class Collection {
                                                                             segment_id,
                                                                             generation);
     }
-#if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER != 0
+#if ALAYA_COLLECTION_HAS_ACTIVE_LASER
     const auto dir = active_laser_dir(options.root, segment_id, generation);
     if (!std::filesystem::exists(dir / "manifest.txt")) {
       return error(core::StatusCode::corruption,
@@ -997,7 +1004,7 @@ class Collection {
     return error(core::StatusCode::not_supported,
                  core::OperationStage::open,
                  core::StatusDetail::operation_slot_absent,
-                 "active LASER engine requires a build with ALAYA_ENABLE_LASER");
+                 "active LASER engine requires a Linux build with ALAYA_ENABLE_LASER");
 #endif
   }
 

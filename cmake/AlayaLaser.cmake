@@ -24,11 +24,9 @@ if(NOT TARGET OpenMP::OpenMP_CXX)
 endif()
 
 if(ALAYA_LASER_USE_IOCP)
-  # CreateIoCompletionPort / GetQueuedCompletionStatusEx / ReadFile live in kernel32, which MSVC links implicitly; no
-  # extra link libraries are required.
-  set(_alaya_laser_backend_libs)
-  set(_alaya_laser_backend_definition ALAYA_LASER_USE_IOCP=1)
-  set(_alaya_laser_backend_message "IOCP (Windows x64)")
+  message(FATAL_ERROR "The Windows IOCP LASER backend was removed; LASER is unavailable on Windows. "
+                      "Configure with -DALAYA_ENABLE_LASER=OFF instead."
+  )
 elseif(ALAYA_LASER_USE_THREADPOOL)
   set(_alaya_laser_backend_libs)
   set(_alaya_laser_backend_definition ALAYA_LASER_USE_THREADPOOL=1)

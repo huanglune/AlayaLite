@@ -51,7 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   orphan active directories reclaimed on the next open. This mode supports
   `wal_fsync` durability and the LASER geometry contract (L2, float32, RaBitQ,
   power-of-two dimension at least 128, `max_neighbors` 32 or 64, and a LASER
-  sealed target). This reachability is C++-only: the canonical Python
+  sealed target). This reachability is C++-only and Linux-only (the active
+  write stack needs flock, O_DIRECT and libaio); the canonical Python
   Collection binding continues to accept only `flat` and `qg`.
 - A shared bottom-layer `wal/frame.hpp` module owns the Physical WAL v1 framing
   (WAL7 envelope, CRC, scan, `WalFile`, byte `Decoder`) for both the collection
