@@ -14,7 +14,7 @@
  *      tools/gen_ip_official_fixture.cpp actually linking RaBitQ-Library at commit
  *      b1f613d7412a041000d1e71aaa323d3e7554e733 and calling
  *      one_bit_code_with_factor(..., METRIC_IP). CI here only READS the fixture; a
- *      missing / truncated / commit-mismatched / unparseable fixture is a HARD
+ *      missing / truncated / commit-mismatched / unparsable fixture is a HARD
  *      FAILURE. There is no regeneration path in the test (B-LIP-08).
  *   2. The in-repo memqg path: RaBitQCore::memory_factors(..., inner_product) and
  *      the RaBitQSpace fastscan estimator (space/rabitq_space.hpp).

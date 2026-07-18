@@ -19,7 +19,7 @@
  *      cross-stdlib drift (codex review item 4 / B-LIP-08).
  *
  *   2. A read-only fixture reader (load_ip_fixture). CI tests ONLY read the
- *      immutable fixture; a missing / truncated / unparseable fixture is a HARD
+ *      immutable fixture; a missing / truncated / unparsable fixture is a HARD
  *      FAILURE, never a skip and never a regeneration (B-LIP-08). Regeneration
  *      lives solely in the offline generator tool, off the CI build graph.
  *
@@ -72,7 +72,7 @@ inline constexpr double kOfficialEpsilon = 1.9;
 // records the same string; load_ip_fixture cross-checks it so a fixture generated
 // against a different commit is a hard failure.
 inline constexpr const char *kPinnedRabitqCommit =
-    "b1f613d7412a041000d1e71aaa323d3e7554e733";
+    "b1f613d7412a041000d1e71aaa323d3e7554e733";  // pragma: allowlist secret
 
 // ---------------------------------------------------------------------------
 // Deterministic input generator (integer LCG -> exactly-representable floats).
@@ -158,7 +158,7 @@ inline auto fixture_path() -> std::string {
 }
 
 // Reads the fixture. On ANY problem (missing file, wrong/absent commit pin,
-// truncated header, unparseable row, zero rows) returns {} and sets *err. The
+// truncated header, unparsable row, zero rows) returns {} and sets *err. The
 // caller MUST treat a non-empty *err as a hard failure. There is no regeneration
 // path here by design.
 inline auto load_ip_fixture(std::string *err) -> std::vector<FixtureRow> {
