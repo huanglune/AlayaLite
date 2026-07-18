@@ -266,4 +266,16 @@ if(ALAYA_ENABLE_LASER)
     LABELS integration collection laser wal tsan
     TIMEOUT 300
   )
+
+  alaya_cc_target(
+    collection_active_laser_recovery_test
+    GTEST LASER
+    SRCS collection_active_laser_recovery_test.cpp
+  )
+  alaya_add_test(
+    NAME collection_active_laser_recovery_test
+    TARGET collection_active_laser_recovery_test
+    LABELS integration collection laser wal crash
+    TIMEOUT 300
+  )
 endif()
