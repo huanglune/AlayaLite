@@ -489,6 +489,189 @@ class QGUpdaterIndexTest : public ::testing::Test {
 };
 TinyIndex *QGUpdaterIndexTest::tiny_ = nullptr;
 
+// codex B-2C-06: the fail-closed A/B superblock selector. A checksum-corrupt newer
+// slot is skippable (fall back to the older valid slot); a checksum-VALID but
+// UNSUPPORTED newer slot (unknown required feature bits / newer format) rejects the
+// whole file (-2) rather than silently downgrading to the older supported slot.
+namespace {
+QGSuperblockV2 make_v2_slot(uint64_t gen) {
+  QGSuperblockV2 sb{};
+  sb.magic = kQGSuperblockMagic;
+  sb.format_version = kQGFormatVersion;
+  sb.generation = gen;
+  sb.free_list_head = kPidMax;
+  sb.checksum = qg_superblock_checksum(sb);
+  return sb;
+}
+QGSuperblockV2 make_v3_slot(uint64_t gen, uint32_t required) {
+  QGSuperblockV2 sb{};
+  sb.magic = kQGSuperblockMagic;
+  sb.format_version = kQGFormatVersionV3;
+  sb.generation = gen;
+  sb.free_list_head = kPidMax;
+  const uint64_t magic = kWal2cMagic;
+  std::memcpy(sb.reserved.data() + kWal2cReservedOffset, &magic, 8);
+  const uint32_t layout = kWal2cLayoutVersion;
+  std::memcpy(sb.reserved.data() + kWal2cReservedOffset + 8, &layout, 4);
+  std::memcpy(sb.reserved.data() + kWal2cReservedOffset + 12, &required, 4);
+  // leg-7 BLOCKER-3: maintenance is required for every v3, so a self-consistent v3 must carry
+  // a maintenance activation generation in (0, gen]. A maint_gen==0 v3 is now (correctly)
+  // rejected by qg_superblock_supported in the pure validation phase, so stamp a valid one.
+  const uint64_t maint_gen = gen;
+  std::memcpy(sb.reserved.data() + kWal2cReservedOffset + 24, &maint_gen, 8);
+  sb.checksum = qg_superblock_checksum(sb);
+  return sb;
+}
+std::array<char, 2 * kQGSuperblockSize> pack_header(const QGSuperblockV2 &a, const QGSuperblockV2 &b) {
+  std::array<char, 2 * kQGSuperblockSize> header{};
+  std::memcpy(header.data(), &a, sizeof(a));
+  std::memcpy(header.data() + kQGSuperblockSize, &b, sizeof(b));
+  return header;
+}
+}  // namespace
+
+TEST(QGSuperblockSelector, FailsClosedOnUnsupportedNewerSlot) {
+  QGSuperblockV2 out{};
+  // Two valid v2 slots: highest generation wins (unchanged legacy behavior).
+  {
+    const auto header = pack_header(make_v2_slot(1), make_v2_slot(2));
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kQgSupportedRequiredFeatures), 1);
+    EXPECT_EQ(out.generation, 2U);
+    EXPECT_EQ(select_qg_superblock(header.data(), out), 1);  // legacy path agrees on v2
+  }
+  // Corrupt newer slot: fall back to the older VALID slot (corruption is skippable).
+  {
+    auto b = make_v2_slot(9);
+    b.checksum ^= 0x1U;  // break B's checksum
+    const auto header = pack_header(make_v2_slot(5), b);
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kQgSupportedRequiredFeatures), 0);
+    EXPECT_EQ(out.generation, 5U);
+  }
+  // The maintenance pair (maintenance_tx + post_redo_free_list) travels together on every
+  // real v3 base, so a self-consistent v3 requires BOTH (wal-2c BLOCKER-5).
+  constexpr uint32_t kMaintPair = kQgFeatMaintenanceTxV1 | kQgFeatPostRedoFreeListV1;
+  // Highest-gen slot is a checksum-VALID v3 with an unsupported required set: reject
+  // the whole file (-2), never downgrade to the older v2 (the core fail-closed rule).
+  {
+    const auto header = pack_header(make_v2_slot(10), make_v3_slot(11, kMaintPair));
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, /*supported=*/0U), -2);
+  }
+  // A v3 whose required bits ARE supported is selected normally.
+  {
+    const auto header = pack_header(make_v2_slot(10), make_v3_slot(11, kMaintPair));
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kMaintPair), 1);
+    EXPECT_EQ(out.format_version, kQGFormatVersionV3);
+  }
+  // A v3 carrying only maintenance_tx WITHOUT its post_redo_free_list pair is
+  // self-inconsistent -> unsupported -> fail closed even if that bit is nominally supported.
+  {
+    const auto header = pack_header(make_v2_slot(10), make_v3_slot(11, kQgFeatMaintenanceTxV1));
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, 0xFFFFFFFFU), -2);
+  }
+  // A v3 requiring pid_generation WITHOUT its canonical_prebind + mutable_label_slot
+  // dependencies is self-inconsistent -> unsupported -> fail closed even if the
+  // caller nominally supports the pid_generation bit.
+  {
+    const auto header = pack_header(make_v2_slot(10), make_v3_slot(11, kQgFeatPidGenerationV1));
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, 0xFFFFFFFFU), -2);
+  }
+  // Both slots unsupported v3: fail closed (the two-v3 old-reader case).
+  {
+    const auto header =
+        pack_header(make_v3_slot(11, kMaintPair), make_v3_slot(12, kMaintPair));
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, 0U), -2);
+  }
+  // Neither slot structurally valid: -1 (distinct from the -2 fail-closed signal).
+  {
+    const auto header = pack_header(QGSuperblockV2{}, QGSuperblockV2{});
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kQgSupportedRequiredFeatures), -1);
+  }
+}
+
+// BLOCKER-3: the extended fail-closed matrix. Structural validity is magic+checksum ONLY, so
+// a checksum-legal FUTURE outer version is picked as highest-gen then rejected (-2) instead of
+// downgraded; v2/v3 canonical-zero, inactive-state, and activation ordering are enforced.
+namespace {
+QGSuperblockV2 make_future_version_slot(uint64_t gen, uint32_t outer_version) {
+  QGSuperblockV2 sb{};
+  sb.magic = kQGSuperblockMagic;
+  sb.format_version = outer_version;  // e.g. 4: a format this build does not know
+  sb.generation = gen;
+  sb.free_list_head = kPidMax;
+  sb.checksum = qg_superblock_checksum(sb);  // checksum-legal, so structurally valid
+  return sb;
+}
+QGSuperblockV2 make_v3_full(uint64_t gen, uint32_t required, uint64_t maint_gen, uint64_t pid_gen,
+                            uint32_t max_gen, uint32_t nz) {
+  QGSuperblockV2 sb{};
+  sb.magic = kQGSuperblockMagic;
+  sb.format_version = kQGFormatVersionV3;
+  sb.generation = gen;
+  sb.free_list_head = kPidMax;
+  auto *b = sb.reserved.data() + kWal2cReservedOffset;
+  const uint64_t magic = kWal2cMagic;
+  std::memcpy(b + 0, &magic, 8);
+  const uint32_t layout = kWal2cLayoutVersion;
+  std::memcpy(b + 8, &layout, 4);
+  std::memcpy(b + 12, &required, 4);
+  std::memcpy(b + 24, &maint_gen, 8);
+  std::memcpy(b + 32, &pid_gen, 8);
+  std::memcpy(b + 40, &max_gen, 4);
+  std::memcpy(b + 44, &nz, 4);
+  sb.checksum = qg_superblock_checksum(sb);
+  return sb;
+}
+}  // namespace
+
+TEST(QGSuperblockSelector, FailsClosedOnFutureVersionAndCraftedReservedState) {
+  QGSuperblockV2 out{};
+  constexpr uint32_t kMaintPair = kQgFeatMaintenanceTxV1 | kQgFeatPostRedoFreeListV1;
+  constexpr uint32_t kPidTriple =
+      kQgFeatPidGenerationV1 | kQgFeatCanonicalPrebindV1 | kQgFeatMutableLabelSlotV1;
+
+  // A checksum-legal FUTURE outer version (v4) in the newer slot rejects the WHOLE file --
+  // NOT a silent downgrade to the older v2 (the BLOCKER-3 core: structural validity ignores
+  // the version so the newest slot is the one the support gate judges).
+  {
+    const auto header = pack_header(make_v2_slot(10), make_future_version_slot(11, 4));
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kQgSupportedRequiredFeatures), -2);
+  }
+  // A v2 whose 2C reserved region is NOT canonical-zero (a stray activation generation at
+  // reserved[80]) is rejected -- a forged v2 cannot smuggle 2C state.
+  {
+    auto dirty = make_v2_slot(11);
+    const uint64_t stray = 7;
+    std::memcpy(dirty.reserved.data() + kWal2cReservedOffset + 24, &stray, 8);
+    dirty.checksum = qg_superblock_checksum(dirty);
+    const auto header = pack_header(make_v2_slot(10), dirty);
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kQgSupportedRequiredFeatures), -2);
+  }
+  // A maintenance-only v3 (no pid triple) MUST have zero pid activation gen + summary; a stray
+  // pid_reuse_activation_gen is an inactive-state violation -> reject.
+  {
+    const auto bad = make_v3_full(11, kMaintPair, /*maint_gen=*/5, /*pid_gen=*/6,
+                                  /*max_gen=*/0, /*nz=*/0);
+    const auto header = pack_header(make_v2_slot(10), bad);
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kQgSupportedRequiredFeatures), -2);
+  }
+  // A full pid-triple v3 whose pid activation generation PRECEDES maintenance activation is an
+  // impossible ordering -> reject.
+  {
+    const auto bad = make_v3_full(11, kMaintPair | kPidTriple, /*maint_gen=*/5, /*pid_gen=*/3,
+                                  /*max_gen=*/1, /*nz=*/1);
+    const auto header = pack_header(make_v2_slot(10), bad);
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kQgSupportedRequiredFeatures), -2);
+  }
+  // A well-formed pid-triple v3 (pid_gen >= maint_gen, summary present) is accepted.
+  {
+    const auto ok = make_v3_full(11, kMaintPair | kPidTriple, /*maint_gen=*/5, /*pid_gen=*/5,
+                                 /*max_gen=*/2, /*nz=*/1);
+    const auto header = pack_header(make_v2_slot(10), ok);
+    EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kQgSupportedRequiredFeatures), 1);
+    EXPECT_EQ(out.format_version, kQGFormatVersionV3);
+  }
+}
+
 TEST_F(QGUpdaterIndexTest, MigratesV1DegreesAndPreservesSearchExactly) {
   const std::string prefix = (tiny_->dir / "migrate").string();
   copy_index_artifact(tiny_->v1_prefix, prefix);

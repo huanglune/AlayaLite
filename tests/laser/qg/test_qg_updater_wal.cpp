@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -54,6 +55,85 @@ std::filesystem::path scratch_dir(const std::string &name) {
 bool row_is_live(QGUpdater &upd, PID id) {
   const auto flags = upd.trailer(id).flags;
   return (flags & (kQGRowTombstone | kQGRowFree)) == 0;
+}
+
+std::vector<char> read_file_bytes(const std::string &path) {
+  std::ifstream in(path, std::ios::binary);
+  return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+// True iff the LAST decodable frame in the op-WAL is a superblock_flip. Used to fire the
+// BLOCKER-4 observer at exactly the checkpoint flip's on_wal_fsync (the only flip appended
+// during a checkpoint; earlier forces see a data/publish frame as the tail).
+bool wal_last_frame_is_flip(const std::string &wal_path) {
+  bool is_flip = false;
+  alaya::wal::WalFile::visit_frames(wal_path, [&](const alaya::wal::ScannedFrame &frame) -> bool {
+    try {
+      is_flip = decode_segment_op(frame.payload).kind == SegmentOpKind::superblock_flip;
+    } catch (...) {
+      is_flip = false;
+    }
+    return true;  // keep visiting; the last frame's verdict wins
+  });
+  return is_flip;
+}
+
+// BLOCKER-4 (leg-7): once the checkpoint flip is durable (append+fsync), its on_wal_fsync
+// observer is inside the same catch-all as the superblock write / WAL reset / adoption. An
+// exception there must poison the handle so it can never retry checkpoint() and write a
+// SECOND, different G+1 flip that replay cannot reconcile ("same generation image differs").
+TEST(QgUpdaterWal, DurableFlipThenWalFsyncObserverThrowPoisonsHandle) {
+  const auto dir = scratch_dir("b4_flip_observer");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, 4242);
+  const std::string index_path = base.prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+
+  SegmentIoObserver observer;
+  bool armed = false;
+  bool observer_threw = false;
+  observer.on_wal_fsync = [&] {
+    if (armed && !observer_threw && wal_last_frame_is_flip(wal_path)) {
+      observer_threw = true;
+      throw std::runtime_error("injected on_wal_fsync failure after the durable G+1 flip");
+    }
+  };
+  {
+    QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+    qg.load_disk_index(base.prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+    qg.set_params(64, 1, 1);
+    UpdateParams params;
+    params.enable_wal = true;
+    params.ef_insert = 64;
+    params.max_points = kBaseN + 64;
+    params.io_observer = &observer;
+    QGUpdater upd(qg, params);
+    // Publish some inserts first so the WAL tail before the checkpoint flip is a data/publish
+    // frame (not a flip) -- the observer then fires at the flip's own fsync.
+    auto inserted = waltest::make_data(4, kDim, 99);
+    for (size_t i = 0; i < 4; ++i) upd.allocate_and_insert(inserted.data() + i * kDim);
+    upd.publish(upd.allocated_points());
+    armed = true;
+    EXPECT_THROW(upd.checkpoint(), std::exception) << "the flip-fsync observer throw must propagate";
+    EXPECT_TRUE(observer_threw) << "the observer must have fired at the durable flip's fsync";
+    // The handle is poisoned: it must refuse to write a second G+1 flip.
+    EXPECT_THROW(upd.checkpoint(), std::exception)
+        << "a poisoned handle must not checkpoint a conflicting second G+1 flip";
+  }
+  // Recovery rolls the single durable flip forward; it never sees two conflicting G+1 flips,
+  // and the published inserts (durable in the WAL) survive.
+  {
+    QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+    qg.load_disk_index(base.prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+    qg.set_params(64, 1, 1);
+    UpdateParams params;
+    params.enable_wal = true;
+    params.ef_insert = 64;
+    params.max_points = kBaseN + 64;
+    QGUpdater upd(qg, params);  // must NOT poison
+    EXPECT_EQ(upd.num_points(), kBaseN + 4);
+  }
+  std::filesystem::remove_all(dir);
 }
 
 TEST(QgUpdaterWal, FreshEnableStampsLineageAndCreatesWal) {
@@ -200,15 +280,205 @@ TEST(QgUpdaterWal, ForeignLineageIsRejected) {
   std::filesystem::remove_all(dir);
 }
 
-TEST(QgUpdaterWal, ReclaimAndConsolidateAreRejectedUnderWal) {
+// W1: consolidate is now a real maintenance transaction under enable_wal (four
+// parameters unblocked). garden stays gated (its page rewrites still need their own
+// transaction). The old "both rejected" scope test becomes "consolidate runs,
+// garden still throws".
+TEST(QgUpdaterWal, ConsolidateRunsButGardenStillRejectedUnderWal) {
   const auto dir = scratch_dir("scope");
   std::filesystem::remove_all(dir);
   auto base = WalTinyIndex::build(dir, kBaseN, 66);
   Session s(base.prefix, kBaseN + kInsert + 16);
-  EXPECT_THROW(s.upd->consolidate(1), std::logic_error);
+  for (PID id = 0; id < static_cast<PID>(kTomb); ++id) {
+    s.upd->tombstone(id);
+  }
+  EXPECT_NO_THROW(s.upd->consolidate(1, /*r_target=*/0, /*reclaim_slots=*/false,
+                                     /*bloom_consolidate=*/false));
   EXPECT_THROW(s.upd->garden(1, GardenParams{}), std::logic_error);
   std::filesystem::remove_all(dir);
 }
+
+// W1 reclaim: a consolidate epoch with reclaim frees every tombstoned row, and a
+// reopen with NO checkpoint recovers the whole transaction by op-WAL replay alone
+// (the epoch state machine redoes the final after-image). The four consolidate
+// parameter combinations all commit as one transaction.
+TEST(QgUpdaterWal, ConsolidateReclaimTransactionRecoversByReplay) {
+  const auto dir = scratch_dir("consolidate_reclaim");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, 77);
+  {
+    Session s(base.prefix, kBaseN + 64);
+    for (PID id = 0; id < static_cast<PID>(kTomb); ++id) {
+      s.upd->tombstone(id);
+    }
+    s.upd->consolidate(1, /*r_target=*/0, /*reclaim_slots=*/true, /*bloom_consolidate=*/false);
+    EXPECT_EQ(s.upd->free_count(), kTomb) << "every tombstoned row reclaimed";
+    EXPECT_EQ(s.upd->live_count(), kBaseN - kTomb);
+    // A live search still returns results (routing survived the purge).
+    const auto q = waltest::make_data(1, kDim, 0x321);
+    const auto hits = s.upd->search(q.data(), 10, 64);
+    EXPECT_FALSE(hits.empty());
+    // NO checkpoint: the transaction lives purely in the op-WAL tail.
+  }
+  {
+    Session s(base.prefix, kBaseN + 64);
+    EXPECT_EQ(s.upd->live_count(), kBaseN - kTomb) << "epoch redone from the WAL";
+    EXPECT_EQ(s.upd->free_count(), kTomb) << "free set derived from recovered trailers";
+    for (PID id = 0; id < static_cast<PID>(kTomb); ++id) {
+      EXPECT_FALSE(row_is_live(*s.upd, id));
+    }
+    const auto q = waltest::make_data(1, kDim, 0x321);
+    EXPECT_FALSE(s.upd->search(q.data(), 10, 64).empty());
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// W1 checkpoint absorbs a consolidate epoch into a v3 base and resets the WAL; a
+// subsequent reopen sees the v3 superblock and an empty (single-flip) WAL.
+TEST(QgUpdaterWal, ConsolidateThenCheckpointFlipsV3AndReopens) {
+  const auto dir = scratch_dir("consolidate_ckpt");
+  std::filesystem::remove_all(dir);
+  auto base = WalTinyIndex::build(dir, kBaseN, 88);
+  {
+    Session s(base.prefix, kBaseN + 64);
+    for (PID id = 0; id < static_cast<PID>(kTomb); ++id) {
+      s.upd->tombstone(id);
+    }
+    s.upd->consolidate(1, 0, true, true);  // bloom + reclaim
+    s.upd->checkpoint();
+    EXPECT_EQ(s.upd->live_count(), kBaseN - kTomb);
+  }
+  {
+    Session s(base.prefix, kBaseN + 64);
+    EXPECT_EQ(s.upd->live_count(), kBaseN - kTomb);
+    EXPECT_EQ(s.upd->free_count(), kTomb);
+    const auto q = waltest::make_data(1, kDim, 0x654);
+    EXPECT_FALSE(s.upd->search(q.data(), 10, 64).empty());
+  }
+  std::filesystem::remove_all(dir);
+}
+
+// W1 oracle equivalence: a WAL maintenance transaction must produce the SAME
+// consolidation result as the trusted non-WAL path for every (reclaim x bloom x
+// r_target) combination -- the live graph byte-for-byte, and the same tombstone /
+// free sets. The free-row next-free linkage is intentionally NOT compared: the WAL
+// path builds the canonical ascending chain (recovery byte-stability, clause 11)
+// while the non-WAL runtime path builds a LIFO chain, so only the free SET matches.
+struct OracleCase {
+  const char *name;
+  bool reclaim;
+  bool bloom;
+  size_t r_target;
+};
+class QgUpdaterWalOracle : public ::testing::TestWithParam<OracleCase> {};
+
+TEST_P(QgUpdaterWalOracle, WalConsolidateMatchesNonWalOracle) {
+  const auto param = GetParam();
+  const auto root = scratch_dir(std::string("oracle_") + param.name);
+  std::filesystem::remove_all(root);
+  const auto tmpl = root / "template";
+  auto base = WalTinyIndex::build(tmpl, kBaseN, 4242);
+  auto clone = [&](const char *sub) {
+    const auto dst = root / sub;
+    std::filesystem::copy(tmpl, dst,
+                          std::filesystem::copy_options::recursive |
+                              std::filesystem::copy_options::overwrite_existing);
+    return (dst / "wal_base").string();
+  };
+  std::vector<PID> tomb;
+  for (PID id = 3; id < static_cast<PID>(kBaseN); id += 17) tomb.push_back(id);
+
+  // --- non-WAL oracle: tombstone + consolidate + checkpoint, then snapshot ---
+  std::vector<std::vector<char>> oracle_rows(kBaseN);
+  std::vector<uint16_t> oracle_flags(kBaseN, 0);
+  std::vector<uint16_t> oracle_degree(kBaseN, 0);  // wal-2c MAJOR-7: full-trailer compare
+  uint64_t oracle_free = 0;
+  uint64_t oracle_live = 0;
+  {
+    const std::string prefix = clone("oracle");
+    QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+    qg.load_disk_index(prefix.c_str(), 0.0F);
+    qg.set_params(64, 1, 1);
+    UpdateParams params;  // enable_wal defaults to false: the trusted in-place path
+    params.ef_insert = 64;
+    params.max_points = kBaseN + 64;
+    QGUpdater upd(qg, params);
+    for (PID id : tomb) upd.tombstone(id);
+    upd.consolidate(1, param.r_target, param.reclaim, param.bloom);
+    upd.checkpoint();
+    for (PID id = 0; id < static_cast<PID>(kBaseN); ++id) {
+      const auto tr = upd.trailer(id);
+      oracle_flags[id] = tr.flags;
+      oracle_degree[id] = tr.valid_degree;
+      if ((oracle_flags[id] & (kQGRowTombstone | kQGRowFree)) == 0) {
+        oracle_rows[id] = upd.debug_read_row(id);
+      }
+    }
+    oracle_free = upd.free_count();
+    oracle_live = upd.live_count();
+  }
+
+  // --- WAL path: identical operations as one maintenance transaction ---
+  {
+    const std::string prefix = clone("wal");
+    Session s(prefix, kBaseN + 64);
+    for (PID id : tomb) s.upd->tombstone(id);
+    s.upd->consolidate(1, param.r_target, param.reclaim, param.bloom);
+    s.upd->checkpoint();
+    EXPECT_EQ(s.upd->free_count(), oracle_free) << "free set size differs from the oracle";
+    EXPECT_EQ(s.upd->live_count(), oracle_live) << "live count differs from the oracle";
+    for (PID id = 0; id < static_cast<PID>(kBaseN); ++id) {
+      const auto tr = s.upd->trailer(id);
+      const uint16_t flags = tr.flags;
+      const uint16_t mask = kQGRowTombstone | kQGRowFree;
+      ASSERT_EQ(flags & mask, oracle_flags[id] & mask)
+          << "pid " << id << " tombstone/free disagrees with the oracle";
+      // wal-2c MAJOR-7: valid_degree lives in the page trailer, outside debug_read_row's
+      // node_len_ window -- a live row with correct bytes but a wrong degree would slip by.
+      EXPECT_EQ(tr.valid_degree, oracle_degree[id])
+          << "pid " << id << " valid_degree disagrees with the oracle";
+      if ((flags & mask) == 0) {
+        EXPECT_EQ(s.upd->debug_read_row(id), oracle_rows[id])
+            << "live row " << id << " bytes differ from the non-WAL oracle";
+      }
+    }
+    // wal-2c MAJOR-7: the WAL path must publish the CANONICAL free chain (recovery
+    // byte-stability, clause 11): head == min(FREE set), strictly ascending, next(last)
+    // == kPidMax, exactly free_count() links, and the linked set == the FREE trailer set.
+    if (param.reclaim) {
+      std::vector<PID> free_set;
+      for (PID id = 0; id < static_cast<PID>(kBaseN); ++id) {
+        if ((s.upd->trailer(id).flags & kQGRowFree) != 0) free_set.push_back(id);
+      }
+      std::vector<PID> chain;
+      PID cur = s.upd->free_list_head();
+      while (cur != kPidMax && chain.size() <= free_set.size()) {
+        chain.push_back(cur);
+        const auto row = s.upd->debug_read_row(cur);
+        ASSERT_GE(row.size(), sizeof(uint64_t));
+        uint64_t next = 0;
+        std::memcpy(&next, row.data(), sizeof(next));
+        cur = static_cast<PID>(next);
+      }
+      EXPECT_EQ(cur, kPidMax) << "free chain did not terminate at kPidMax (cycle/overrun)";
+      EXPECT_EQ(chain.size(), s.upd->free_count()) << "free chain length != free_count";
+      std::vector<PID> sorted_free = free_set;
+      std::sort(sorted_free.begin(), sorted_free.end());
+      EXPECT_EQ(chain, sorted_free)
+          << "free chain is not the ascending canonical order of the FREE set";
+    }
+  }
+  std::filesystem::remove_all(root);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    ConsolidateParamGrid, QgUpdaterWalOracle,
+    ::testing::Values(OracleCase{"purge_only", false, false, 0},
+                      OracleCase{"reclaim", true, false, 0},
+                      OracleCase{"bloom_reclaim", true, true, 0},
+                      OracleCase{"reclaim_rtarget", true, false, kDeg / 2},
+                      OracleCase{"bloom_reclaim_rtarget", true, true, kDeg / 2}),
+    [](const ::testing::TestParamInfo<OracleCase> &info) { return info.param.name; });
 
 // ---------------------------------------------------------------------------
 // W3: label transaction functional durability (commit_physical_bundle + replay

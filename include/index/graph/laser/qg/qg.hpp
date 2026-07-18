@@ -165,6 +165,42 @@ constexpr uint32_t kQGFormatVersion = 2;
 constexpr size_t kQGSuperblockSize = 512;
 constexpr size_t kQGSuperblockCopies = 2;
 
+// v3 outer format: the 2C maintenance/reuse features are activated. The 512-byte
+// struct, page layout, and kind=6 image size are UNCHANGED from v2; only
+// format_version flips and the reserved[56..408) 2C extension carries magic +
+// feature bits. create_empty / the immutable builder keep producing v2; only an
+// activation checkpoint writes v3 (design section 7.2, codex B-2C-06).
+constexpr uint32_t kQGFormatVersionV3 = 3;
+
+// 2C superblock extension sub-layout inside QGSuperblockV2::reserved[408]
+// (host-endian). See qg_updater.hpp kWal2c* for the absolute struct offsets.
+//   reserved[56..64) wal2c_magic (u64)
+//   reserved[64..68) wal2c_layout_version (u32)
+//   reserved[68..72) required_feature_flags (u32)
+constexpr size_t kWal2cReservedOffset = 56;
+constexpr uint64_t kWal2cMagic = 0x57414C32435F5631ULL;  // "WAL2C_V1"
+constexpr uint32_t kWal2cLayoutVersion = 1;
+
+// required_feature_flags bits (design section 7.1). "required" == a reader that
+// does not understand the bit MUST fail closed rather than open the segment.
+constexpr uint32_t kQgFeatMaintenanceTxV1 = 1U << 0U;
+constexpr uint32_t kQgFeatPostRedoFreeListV1 = 1U << 1U;
+constexpr uint32_t kQgFeatPidGenerationV1 = 1U << 2U;
+constexpr uint32_t kQgFeatCanonicalPrebindV1 = 1U << 3U;
+constexpr uint32_t kQgFeatMutableLabelSlotV1 = 1U << 4U;
+
+// The required-feature bitmask THIS build understands. It grows per 2C phase:
+// W1 understands the maintenance-transaction features (consolidate under WAL); W2
+// adds the pid-reuse triple (pid_generation + canonical_prebind + mutable_label).
+// This mask MUST grow in the SAME commit that lands the canonical writer (step 5)
+// AND the canonical replay lane (step 3) -- extending it before the recovery path
+// exists would let a new binary open a v3 pid base it cannot actually recover
+// (design B.1 / codex risk 1). A v3 base requiring a bit outside this mask (a future
+// phase) still fails closed.
+constexpr uint32_t kQgSupportedRequiredFeatures =
+    kQgFeatMaintenanceTxV1 | kQgFeatPostRedoFreeListV1 | kQgFeatPidGenerationV1 |
+    kQgFeatCanonicalPrebindV1 | kQgFeatMutableLabelSlotV1;
+
 struct QGSuperblockV2 {
   uint64_t magic = 0;
   uint32_t format_version = 0;
@@ -210,9 +246,140 @@ inline uint32_t qg_superblock_checksum(const QGSuperblockV2 &sb) {
   return qg_crc32(&copy, sizeof(copy));
 }
 
+// Structural (not-corrupt) integrity: correct magic and a matching checksum ONLY.
+// BLOCKER-3: the outer format version is deliberately NOT part of structural validity.
+// A checksum-legal block of a FUTURE outer version (v4+) must count as structurally
+// valid so the fail-closed selector picks it as the highest-generation copy and then
+// REJECTS the whole file (version/feature unsupported) -- rather than treating it as
+// "corrupt" and silently downgrading to an older, supported slot. The version/support
+// decision lives entirely in qg_superblock_supported below.
 inline bool qg_superblock_valid(const QGSuperblockV2 &sb) {
-  return sb.magic == kQGSuperblockMagic && sb.format_version == kQGFormatVersion &&
-         sb.checksum == qg_superblock_checksum(sb);
+  return sb.magic == kQGSuperblockMagic && sb.checksum == qg_superblock_checksum(sb);
+}
+
+// Read the 2C extension fields out of the reserved area (host-endian).
+inline uint64_t qg_read_wal2c_magic(const QGSuperblockV2 &sb) {
+  uint64_t magic = 0;
+  std::memcpy(&magic, sb.reserved.data() + kWal2cReservedOffset, sizeof(magic));
+  return magic;
+}
+inline uint32_t qg_read_wal2c_layout_version(const QGSuperblockV2 &sb) {
+  uint32_t v = 0;
+  std::memcpy(&v, sb.reserved.data() + kWal2cReservedOffset + 8, sizeof(v));
+  return v;
+}
+inline uint32_t qg_read_required_feature_flags(const QGSuperblockV2 &sb) {
+  uint32_t v = 0;
+  std::memcpy(&v, sb.reserved.data() + kWal2cReservedOffset + 12, sizeof(v));
+  return v;
+}
+inline uint64_t qg_read_maintenance_activation_gen(const QGSuperblockV2 &sb) {
+  uint64_t v = 0;
+  std::memcpy(&v, sb.reserved.data() + kWal2cReservedOffset + 24, sizeof(v));
+  return v;
+}
+inline uint64_t qg_read_pid_reuse_activation_gen(const QGSuperblockV2 &sb) {
+  uint64_t v = 0;
+  std::memcpy(&v, sb.reserved.data() + kWal2cReservedOffset + 32, sizeof(v));
+  return v;
+}
+inline uint32_t qg_read_max_pid_generation(const QGSuperblockV2 &sb) {
+  uint32_t v = 0;
+  std::memcpy(&v, sb.reserved.data() + kWal2cReservedOffset + 40, sizeof(v));
+  return v;
+}
+inline uint32_t qg_read_nonzero_pid_generation_count(const QGSuperblockV2 &sb) {
+  uint32_t v = 0;
+  std::memcpy(&v, sb.reserved.data() + kWal2cReservedOffset + 44, sizeof(v));
+  return v;
+}
+// The 2C reserved sub-layout defines exactly [kWal2cReservedOffset, +kWal2cStateBytes);
+// every byte from there to the end of reserved[] must stay zero in EVERY version.
+constexpr size_t kWal2cStateBytes = 48;
+inline bool qg_reserved_range_is_zero(const QGSuperblockV2 &sb, size_t from, size_t to) {
+  for (size_t i = from; i < to && i < sb.reserved.size(); ++i) {
+    if (sb.reserved[i] != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Feature-dependency invariant (design section 7.1, codex BLOCKER-5): the maintenance
+// pair (maintenance_tx + post_redo_free_list) is all-or-none; the pid-reuse triple
+// (pid_generation + canonical_prebind + mutable_label_slot) is all-or-none AND depends
+// on the maintenance pair. A partial set (e.g. pid without maintenance) is a forged /
+// corrupt v3 base -- accepting it would let a reader treat the base as pid-active but
+// maintenance-inactive, whose next checkpoint would revert to a v2 image carrying stale
+// non-zero 2C reserved bytes and self-lock the file on the following open.
+inline bool qg_required_features_self_consistent(uint32_t required) {
+  const bool maint = (required & kQgFeatMaintenanceTxV1) != 0;
+  const bool postredo = (required & kQgFeatPostRedoFreeListV1) != 0;
+  const bool pid = (required & kQgFeatPidGenerationV1) != 0;
+  const bool canonical = (required & kQgFeatCanonicalPrebindV1) != 0;
+  const bool mutable_label = (required & kQgFeatMutableLabelSlotV1) != 0;
+  if (maint != postredo) return false;                         // maintenance pair all-or-none
+  if (pid != canonical || pid != mutable_label) return false;  // pid triple all-or-none
+  if (pid && !maint) return false;  // pid depends on the maintenance pair
+  return true;
+}
+
+// Whether THIS build supports a structurally-valid block. v2 requires the 2C
+// extension to be canonical-zero; v3 requires the 2C magic, a supported layout
+// version, self-consistent deps, and (required & ~supported)==0.
+inline bool qg_superblock_supported(const QGSuperblockV2 &sb, uint32_t supported_mask) {
+  if (sb.format_version == kQGFormatVersion) {
+    // BLOCKER-3: the WHOLE 2C reserved region must be canonical-zero for a v2 base (not
+    // just the first three fields). A forged v2 carrying a stray activation generation or
+    // pid-generation summary in [72..408) would otherwise be accepted and then misroute
+    // its own next reopen into the canonical lane ("self-locking" the file).
+    return qg_reserved_range_is_zero(sb, kWal2cReservedOffset, sb.reserved.size());
+  }
+  if (sb.format_version == kQGFormatVersionV3) {
+    if (qg_read_wal2c_magic(sb) != kWal2cMagic) return false;
+    if (qg_read_wal2c_layout_version(sb) == 0 ||
+        qg_read_wal2c_layout_version(sb) > kWal2cLayoutVersion) {
+      return false;
+    }
+    const uint32_t required = qg_read_required_feature_flags(sb);
+    if (!qg_required_features_self_consistent(required)) return false;
+    // BLOCKER-5: a v3 base is only ever produced by an activation checkpoint, which always
+    // carries the maintenance pair. A v3 image lacking it is forged; rejecting it here keeps
+    // maintenance_activated_ true for every accepted v3 base (so a checkpoint never reverts
+    // to a v2 image carrying stale 2C reserved bytes).
+    if ((required & kQgFeatMaintenanceTxV1) == 0) return false;
+    if ((required & ~supported_mask) != 0) return false;
+    // BLOCKER-3: the 2C reserved TAIL beyond the defined state fields must be zero in v3 too.
+    if (!qg_reserved_range_is_zero(sb,
+                                   kWal2cReservedOffset + kWal2cStateBytes,
+                                   sb.reserved.size())) {
+      return false;
+    }
+    const uint64_t maint_gen = qg_read_maintenance_activation_gen(sb);
+    const uint64_t pid_gen = qg_read_pid_reuse_activation_gen(sb);
+    const bool pid = (required & kQgFeatPidGenerationV1) != 0;
+    // BLOCKER-3 (leg-7): maintenance is REQUIRED for every v3 (checked above), so its
+    // activation generation must be in (0, sb.generation] in the PURE validation phase.
+    // The struct carries sb.generation, so the <= own-generation upper bound is enforced
+    // HERE too -- a read-only QuantizedGraph open never calls the loader's adopt_label_state(),
+    // so this selector is the only gate that stops a maintenance-gen-zero / activation-gen-future
+    // v3 from being adopted as the highest-generation base and re-selected on every later open.
+    if (maint_gen == 0 || maint_gen > sb.generation) return false;
+    if (!pid) {
+      // BLOCKER-3 inactive-state: a maintenance-only v3 carries NO pid-reuse state, so its
+      // activation generation + reuse summary must be canonical-zero.
+      if (pid_gen != 0 || qg_read_max_pid_generation(sb) != 0 ||
+          qg_read_nonzero_pid_generation_count(sb) != 0) {
+        return false;
+      }
+    } else {
+      // BLOCKER-3 activation ordering: pid reuse activates at or after maintenance, both
+      // stamp a non-zero generation, and neither is newer than the block's own generation.
+      if (pid_gen == 0 || pid_gen < maint_gen || pid_gen > sb.generation) return false;
+    }
+    return true;
+  }
+  return false;
 }
 
 // Returns 0 (A), 1 (B), or -1 when neither copy is valid.
@@ -226,6 +393,34 @@ inline int select_qg_superblock(const char *header, QGSuperblockV2 &selected) {
   const int slot = valid_b && (!valid_a || copies[1].generation > copies[0].generation) ? 1 : 0;
   selected = copies[slot];
   return slot;
+}
+
+// Fail-closed A/B selector (codex B-2C-06). Returns the selected slot (0/1), -1
+// when NEITHER copy is structurally valid, or -2 when the highest-generation
+// structurally-valid copy is a newer format this build does NOT support (unknown
+// required feature bits / unsupported layout version / broken feature deps) -- the
+// whole file must then be rejected, never silently downgraded to an older
+// supported slot. A merely checksum-corrupt newer slot is skippable (fall back to
+// the older valid slot); a checksum-VALID but unsupported newer slot is not.
+inline int select_qg_superblock_checked(const char *header,
+                                        QGSuperblockV2 &selected,
+                                        uint32_t supported_mask) {
+  QGSuperblockV2 copies[kQGSuperblockCopies];
+  std::memcpy(&copies[0], header, sizeof(QGSuperblockV2));
+  std::memcpy(&copies[1], header + kQGSuperblockSize, sizeof(QGSuperblockV2));
+  const bool valid_a = qg_superblock_valid(copies[0]);
+  const bool valid_b = qg_superblock_valid(copies[1]);
+  if (!valid_a && !valid_b) {
+    return -1;
+  }
+  // Highest-generation structurally-valid copy (A wins ties, matching the legacy
+  // selector so a torn same-generation B re-adopt stays on A).
+  const int best = valid_b && (!valid_a || copies[1].generation > copies[0].generation) ? 1 : 0;
+  if (!qg_superblock_supported(copies[best], supported_mask)) {
+    return -2;
+  }
+  selected = copies[best];
+  return best;
 }
 
 inline bool qg_header_has_v2_magic(const char *header) {
@@ -1307,7 +1502,12 @@ inline void QuantizedGraph::load_disk_index(const char *filename,
   }
 
   QGSuperblockV2 sb;
-  const int sb_slot = select_qg_superblock(header.data(), sb);
+  const int sb_slot = select_qg_superblock_checked(header.data(), sb, kQgSupportedRequiredFeatures);
+  if (sb_slot == -2) {
+    throw std::runtime_error(
+        "QuantizedGraph::load_disk_index: superblock is a newer format this build does not "
+        "support (fail closed)");
+  }
   if (sb_slot >= 0) {
     if (sb.dimension != dimension_ || sb.node_len != node_len_ ||
         sb.node_per_page != node_per_page_ || sb.page_size != page_size_) {

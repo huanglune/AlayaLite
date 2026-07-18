@@ -173,47 +173,106 @@ class MutableLaserSegment {
     if (n == 0) {
       throw std::invalid_argument("MutableLaserSegment::commit_physical_bundle: empty bundle");
     }
-    const auto range =
-        updater_->commit_physical_bundle(txid, applied_collection_op_id, vecs, labels, n);
-    // Ruling 10: keep the segment-layer label->PID reverse index in step with the
-    // freshly-bound rows so the adapter resolves erase/previous targets in O(1).
+    // W2 (design 3.3 / codex B.7): bind label -> (pid, generation) TOKEN from the
+    // returned rows, never a guessed dense [base, base+n) range -- a mixed / all-reuse
+    // bundle is not dense, and a reused row carries a fresh generation.
+    const auto result =
+        updater_->commit_physical_bundle_tokens(txid, applied_collection_op_id, vecs, labels, n);
     for (size_t i = 0; i < n; ++i) {
-      label_to_pid_[labels[i]] = static_cast<laser::PID>(range.first + i);
+      label_to_pid_.insert_or_assign(labels[i], result.rows[i]);
     }
-    return range;
+    return {static_cast<laser::PID>(result.old_hwm), static_cast<laser::PID>(result.new_hwm)};
   }
 
-  // Ruling 10: resolve a logical label to its live PID in O(1) for the Collection
-  // adapter's erase / previous-tombstone path. Returns nullopt when the label has
-  // no live PID (never bound, or already tombstoned) -- the adapter reads that as
-  // an idempotent hit on replay and a high-severity diagnostic at runtime.
+  // Resolve a logical label to its live (pid, generation) TOKEN in O(1) for the
+  // Collection adapter's erase / previous-tombstone path (design 3.3 / codex B.7).
+  // Returns nullopt when the label has no live token (never bound, or already
+  // tombstoned). The adapter captures the token BEFORE its write bundle and tombstones
+  // the captured token afterwards, so a same-txid rebind cannot alias a new incarnation.
+  [[nodiscard]] auto token_for_label(uint64_t label) -> std::optional<laser::PidToken> {
+    const std::lock_guard<std::mutex> guard(mutex_);
+    const auto it = label_to_pid_.find(label);
+    return it == label_to_pid_.end() ? std::nullopt : std::optional<laser::PidToken>(it->second);
+  }
+
+  // Back-compat: resolve a label to its live PID (drops the generation). Prefer
+  // token_for_label on the reuse path so the tombstone ABA check has the incarnation.
   [[nodiscard]] auto pid_for_label(uint64_t label) -> std::optional<laser::PID> {
     const std::lock_guard<std::mutex> guard(mutex_);
     const auto it = label_to_pid_.find(label);
-    return it == label_to_pid_.end() ? std::nullopt : std::optional<laser::PID>(it->second);
+    return it == label_to_pid_.end() ? std::nullopt : std::optional<laser::PID>(it->second.pid);
   }
 
-  // Mark a row deleted and force the tombstone durable (its own next fsync).
+  // Mark a raw PID deleted and force the tombstone durable (existing callers / tests).
   void tombstone(laser::PID id) {
     const std::lock_guard<std::mutex> guard(mutex_);  // single-writer handle mutex (W0)
-    // Ruling 10: drop this PID's label from the reverse index before hiding the row
-    // so a later erase/previous of the same label correctly resolves to nullopt.
     const uint64_t lbl = effective_label(id, updater_->label_snapshot());
     const auto it = label_to_pid_.find(lbl);
-    if (it != label_to_pid_.end() && it->second == id) {
+    if (it != label_to_pid_.end() && it->second.pid == id) {
       label_to_pid_.erase(it);
     }
     updater_->tombstone(id);
     updater_->publish(updater_->num_points());  // group-commit the tombstone
   }
 
+  // Tombstone a captured TOKEN with an ABA incarnation check (design 3.3 / codex B.7):
+  //  - current generation > expected  => the PID was reused by a newer incarnation; the
+  //    token is stale, so this is an idempotent no-op (never kill the new incarnation);
+  //  - current generation < expected  => the token claims a future incarnation => corruption;
+  //  - equal => tombstone (unless the row is already dead, still idempotent).
+  // The forward PID binding is retained after tombstone/free; the reverse map entry is
+  // erased ONLY when it still maps the label to this exact token (full-token equality).
+  void tombstone(laser::PidToken expected) {
+    const std::lock_guard<std::mutex> guard(mutex_);
+    const uint32_t current = updater_->durable_generation(expected.pid);
+    if (current > expected.pid_generation) {
+      return;  // stale token: a newer incarnation owns this PID -- idempotent no-op
+    }
+    if (current < expected.pid_generation) {
+      throw std::runtime_error(
+          "MutableLaserSegment::tombstone: token generation is from the future (corruption)");
+    }
+    const uint64_t lbl = effective_label(expected.pid, updater_->label_snapshot());
+    const auto erase_reverse_if_equal = [&] {
+      const auto it = label_to_pid_.find(lbl);
+      if (it != label_to_pid_.end() && it->second == expected) {
+        label_to_pid_.erase(it);
+      }
+    };
+    if (!updater_->row_is_live(expected.pid)) {
+      erase_reverse_if_equal();  // already dead: idempotent
+      return;
+    }
+    updater_->tombstone(expected.pid);
+    updater_->publish(updater_->num_points());  // group-commit the tombstone
+    erase_reverse_if_equal();
+  }
+
   void flush() {
     const std::lock_guard<std::mutex> guard(mutex_);  // single-writer handle mutex (W0)
     updater_->writeback(1);                           // persist dirty pages + mirror the arena
   }
+
+  // Run a consolidate maintenance transaction (2C): purge dead out-edges and, when
+  // reclaim is set, free tombstoned rows into the canonical free-list so a later
+  // commit_physical_bundle can reuse their PIDs. Held under the single-writer handle
+  // mutex; the Collection maintenance hook (W3) drives the full admission chain on top.
+  void consolidate(size_t num_threads,
+                   size_t r_target,
+                   bool reclaim_slots,
+                   bool bloom_consolidate) {
+    const std::lock_guard<std::mutex> guard(mutex_);
+    updater_->consolidate(num_threads, r_target, reclaim_slots, bloom_consolidate);
+  }
+  [[nodiscard]] auto free_count() const -> uint64_t { return updater_->free_count(); }
+  [[nodiscard]] auto pid_generation_activated() const -> bool {
+    return updater_->pid_generation_activated();
+  }
+  [[nodiscard]] auto recovery_required() const noexcept -> bool { return updater_->is_poisoned(); }
   void checkpoint() {
     const std::lock_guard<std::mutex> guard(mutex_);  // single-writer handle mutex (W0)
     updater_->checkpoint();
+    updater_->require_dual_v3_if_activated();
   }
 
   [[nodiscard]] auto search(const float *query, const DiskSearchOptions &opts)
@@ -221,9 +280,13 @@ class MutableLaserSegment {
     if (opts.top_k == 0) {
       throw std::invalid_argument("MutableLaserSegment: top_k must be > 0");
     }
+    if (opts.beam_width == 0 ||
+        opts.beam_width > static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
+      throw std::invalid_argument("MutableLaserSegment: beam_width is invalid");
+    }
     updater_->ensure_readable();  // entry poison gate (B-02); lock-free
     const size_t ef = std::max<size_t>(opts.ef, opts.top_k);
-    const auto pids = updater_->search(query, opts.top_k, ef);
+    const auto pids = updater_->search(query, opts.top_k, ef, opts.beam_width);
     // Acquire the label snapshot AFTER search took its committed watermark: the
     // snapshot is published before committed, so it covers every committed PID's
     // binding, and identity fallback never fires spuriously (B-02).
@@ -265,6 +328,7 @@ class MutableLaserSegment {
   [[nodiscard]] auto last_committed_txid() const -> uint64_t {
     return updater_->last_committed_txid();
   }
+  [[nodiscard]] auto search_stats() const -> laser::UpdateStats { return updater_->stats(); }
 
   // Create a brand-new EMPTY (count=0) active LASER segment directory: a
   // checksum-valid v2 superblock (num_points=0), a matching FHT rotator, two
@@ -391,11 +455,19 @@ class MutableLaserSegment {
   [[nodiscard]] auto effective_label(laser::PID pid,
                                      const std::shared_ptr<const laser::LabelBindings> &snap) const
       -> uint64_t {
+    // W2 (design section 3.2): an explicit binding is the override for ALL PIDs, not
+    // just appended ones -- a reused base PID carries a fresh binding that supersedes
+    // its immutable-sidecar label. Order: explicit binding, then base sidecar, then
+    // identity. (Before pid-reuse activation no base PID has a binding, so this is a
+    // no-op vs the old base-first order.)
+    const uint64_t *bound = snap ? snap->find(pid) : nullptr;
+    if (bound != nullptr) {
+      return *bound;
+    }
     if (static_cast<uint64_t>(pid) < base_count_) {
       return ids_view_[pid];
     }
-    const uint64_t *bound = snap ? snap->find(pid) : nullptr;
-    return bound != nullptr ? *bound : static_cast<uint64_t>(pid);
+    return static_cast<uint64_t>(pid);
   }
 
   // B-06: over ALL committed live PIDs, the effective label (base sidecar U legacy
@@ -411,6 +483,24 @@ class MutableLaserSegment {
   void rebuild_reverse_index() {
     const auto snap = updater_->label_snapshot();
     const size_t committed = updater_->num_points();
+    // JC-17 base-region shadowing (codex B.7 / MAJOR-9): a binding on a base-region PID
+    // (pid < base_count_) is legal ONLY as a reused base row -- it must carry a non-zero
+    // generation AND pid reuse must be activated. A gen-0 binding shadowing a base
+    // identity label, or any base-region binding before activation, is a forged/corrupt
+    // slot -> fail closed. (The QG loader already rejects pid >= num_points and a
+    // non-zero generation before activation; this adds the base-identity guard.)
+    for (const auto &[pid, binding] : snap->bindings) {
+      if (static_cast<uint64_t>(pid) < base_count_) {
+        if (binding.pid_generation == 0) {
+          throw std::runtime_error("MutableLaserSegment: base-region PID " + std::to_string(pid) +
+                                   " has a generation-0 binding (illegal base-label shadowing)");
+        }
+        if (!updater_->pid_generation_activated()) {
+          throw std::runtime_error("MutableLaserSegment: base-region PID " + std::to_string(pid) +
+                                   " carries a binding before pid-reuse activation");
+        }
+      }
+    }
     label_to_pid_.clear();
     label_to_pid_.reserve(committed);
     for (size_t p = 0; p < committed; ++p) {
@@ -419,11 +509,12 @@ class MutableLaserSegment {
         continue;
       }
       const uint64_t lbl = effective_label(pid, snap);
-      const auto [it, inserted] = label_to_pid_.emplace(lbl, pid);
+      const laser::PidToken token{pid, updater_->durable_generation(pid)};
+      const auto [it, inserted] = label_to_pid_.emplace(lbl, token);
       if (!inserted) {
         throw std::runtime_error("MutableLaserSegment: label " + std::to_string(lbl) +
-                                 " maps to two live PIDs (" + std::to_string(it->second) + " and " +
-                                 std::to_string(pid) + ")");
+                                 " maps to two live PIDs (" + std::to_string(it->second.pid) +
+                                 " and " + std::to_string(pid) + ")");
       }
     }
   }
@@ -457,11 +548,12 @@ class MutableLaserSegment {
   alaya::storage::MMapFile ids_mmap_;
   const uint64_t *ids_view_ = nullptr;
   int wal_lock_fd_ = -1;
-  // Ruling 10: segment-layer label->live-PID reverse index. In-memory only (never
-  // persisted): rebuilt from the label snapshot on open (rebuild_reverse_index)
-  // and maintained on commit_physical_bundle (add) / tombstone (remove). Guarded
-  // by mutex_ like every other mutating-path member.
-  std::unordered_map<uint64_t, laser::PID> label_to_pid_{};
+  // Ruling 10 / W2 (design 3.3): segment-layer label -> live (pid, generation) TOKEN
+  // reverse index. In-memory only (never persisted): rebuilt from the label snapshot on
+  // open (rebuild_reverse_index) and maintained on commit_physical_bundle (add) /
+  // tombstone (remove). The token generation lets the adapter's tombstone ABA check
+  // reject a stale incarnation. Guarded by mutex_ like every other mutating-path member.
+  std::unordered_map<uint64_t, laser::PidToken> label_to_pid_{};
   // Single-writer handle mutex (W0): every public mutating method holds it, so
   // add/add_batch/tombstone/flush/checkpoint/commit_physical_bundle never race
   // each other. search/batch_search stay lock-free and use the poison read gate.

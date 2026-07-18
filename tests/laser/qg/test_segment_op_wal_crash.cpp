@@ -22,7 +22,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <csignal>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -80,12 +82,56 @@ struct Recovered {
   bool poisoned = false;
   size_t num_points = 0;
   uint64_t live_count = 0;
+  uint64_t free_count = 0;
   uint64_t last_txid = 0;
   uint64_t applied_op = 0;
   std::optional<uint64_t> appended_label;  // label of pid == kBaseN, when committed
   std::vector<char> index_bytes;           // whole .index (both superblocks + all pages)
   std::vector<char> wal_bytes;             // whole .opwal
+  uint64_t epoch = 0;                       // wal-2c BLOCKER-2: last committed maint epoch
+  std::string graph_fp;                     // wal-2c BLOCKER-2: full S_old/S_new graph fingerprint
 };
+
+// wal-2c BLOCKER-2: a generation-independent fingerprint of the recovered GRAPH -- per-pid
+// trailer (flags+valid_degree), the page bytes of every LIVE row, the walked canonical free
+// chain, the maintenance epoch, and a routing probe. Two recovered states are the SAME graph
+// iff their fingerprints match. This lifts the consolidate crash matrix from "counts + within-
+// case byte stability" to "the recovery landed on exactly S_old or S_new" (page content +
+// hidden/free PID sets + free chain + routing + epoch, per codex BLOCKER-2).
+std::string capture_graph_fp(QGUpdater &upd) {
+  std::string fp;
+  auto put = [&](uint64_t v) { fp.append(reinterpret_cast<const char *>(&v), sizeof(v)); };
+  const auto n = static_cast<PID>(upd.num_points());
+  put(upd.num_points());
+  put(upd.live_count());
+  put(upd.free_count());
+  put(upd.last_completed_consolidate_epoch());
+  for (PID id = 0; id < n; ++id) {
+    const auto tr = upd.trailer(id);
+    put(tr.flags);
+    put(tr.valid_degree);
+    if ((tr.flags & (kQGRowTombstone | kQGRowFree)) == 0) {
+      const auto row = upd.debug_read_row(id);
+      fp.append(row.data(), row.size());  // live-row page content
+    }
+  }
+  PID cur = upd.free_list_head();
+  size_t guard = 0;
+  while (cur != kPidMax && guard <= upd.num_points()) {
+    put(cur);
+    const auto row = upd.debug_read_row(cur);
+    uint64_t nx = 0;
+    std::memcpy(&nx, row.data(), sizeof(nx));
+    cur = static_cast<PID>(nx);
+    ++guard;
+  }
+  put(cur);  // terminal (kPidMax on a well-formed chain)
+  const auto q = waltest::make_data(1, kDim, 0xC0FFEEU);
+  auto hits = upd.search(q.data(), 10, 64);
+  std::sort(hits.begin(), hits.end());
+  for (PID h : hits) put(h);
+  return fp;
+}
 
 Recovered recover(const std::string &prefix, size_t max_points) {
   Recovered r;
@@ -100,6 +146,7 @@ Recovered recover(const std::string &prefix, size_t max_points) {
     QGUpdater upd(qg, params);
     r.num_points = upd.num_points();
     r.live_count = upd.live_count();
+    r.free_count = upd.free_count();
     r.last_txid = upd.last_committed_txid();
     r.applied_op = upd.applied_collection_op_id();
     if (upd.num_points() > kBaseN) {
@@ -109,6 +156,8 @@ Recovered recover(const std::string &prefix, size_t max_points) {
         if (found != nullptr) r.appended_label = *found;
       }
     }
+    r.epoch = upd.last_completed_consolidate_epoch();
+    r.graph_fp = capture_graph_fp(upd);
   } catch (const std::exception &) {
     r.poisoned = true;
   }
@@ -172,6 +221,10 @@ TEST_P(SegmentOpWalSigkill, ReopenIsPrefixReachableAndDoubleReplayStable) {
   }
   int status = 0;
   ASSERT_EQ(::waitpid(child, &status, 0), child);
+  // wal-2c BLOCKER-2: reject a child that died from a CAUGHT exception before the cut (a
+  // _exit(70) could let a stale-count recovery pass spuriously).
+  ASSERT_FALSE(WIFEXITED(status) && WEXITSTATUS(status) == 70)
+      << param.name << " child threw before reaching the cut";
 
   const auto first = recover(case_prefix, max_points);
   ASSERT_FALSE(first.poisoned) << "recovery of " << param.name << " must not poison";
@@ -206,6 +259,199 @@ INSTANTIATE_TEST_SUITE_P(
                  SegmentOpFailPoint::after_superblock_write_before_wal_reset, true, true},
         KillCase{"after_wal_reset", SegmentOpFailPoint::after_wal_reset, true, true}),
     [](const ::testing::TestParamInfo<KillCase> &info) { return info.param.name; });
+
+// ---------------------------------------------------------------------------
+// Layer 1 (consolidate transaction, W1): SIGKILL at the maintenance-epoch cuts.
+// The op is tombstone(kTomb rows) + consolidate(reclaim). The activation
+// checkpoint (which makes the tombstones + the v3 base durable) runs BEFORE any
+// consolidate failpoint, so live_count is always kBaseN-kTomb after recovery; the
+// distinguishing field is free_count: 0 until the END fsync commits the epoch,
+// then kTomb (roll-forward). No cut may poison; double replay is byte-stable.
+// ---------------------------------------------------------------------------
+constexpr size_t kConsolidateTomb = 4;
+
+struct ConsolidateKillCase {
+  const char *name;
+  SegmentOpFailPoint point;
+  bool expect_reclaimed;  // after recovery the free-list holds the kConsolidateTomb rows
+  size_t cache_cap = 0;   // 0 = default (no spill); a small cap forces overlay spill (C4/C5)
+};
+
+class SegmentOpWalConsolidateSigkill : public ::testing::TestWithParam<ConsolidateKillCase> {};
+
+// wal-2c BLOCKER-2: the two definitive graph fingerprints this matrix must land on, built
+// once from the SAME base (seed 4343 + tombstone 0..kConsolidateTomb) as every cut. S_old drives
+// the REAL activation checkpoint then aborts before the BEGIN append (identical disk state to
+// a C0 SIGKILL); S_new runs the full clean consolidate to its committed END.
+struct ConsolidateRefs {
+  std::string s_old;
+  std::string s_new;
+};
+const ConsolidateRefs &consolidate_refs() {
+  static const ConsolidateRefs refs = [] {
+    const auto root = battery_root("consolidate_refs");
+    std::filesystem::remove_all(root);
+    const auto tmpl = root / "template";
+    auto base = WalTinyIndex::build(tmpl, kBaseN, 4343);
+    const size_t max_points = kBaseN + kInsert + 16;
+    prepare_wal_base(base.prefix, max_points);
+    const auto old_dir = root / "old";
+    copy_tree(tmpl, old_dir);
+    {
+      const std::string prefix = (old_dir / "wal_base").string();
+      QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+      qg.load_disk_index(prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+      qg.set_params(64, 1, 1);
+      UpdateParams params;
+      params.enable_wal = true;
+      params.max_points = max_points;
+      params.failpoint_hook = [](SegmentOpFailPoint fp) {
+        if (fp == SegmentOpFailPoint::before_consolidate_begin_append) {
+          throw std::runtime_error("abort-after-activation");
+        }
+      };
+      QGUpdater upd(qg, params);
+      for (PID id = 0; id < static_cast<PID>(kConsolidateTomb); ++id) upd.tombstone(id);
+      try {
+        upd.consolidate(1, 0, /*reclaim_slots=*/true, /*bloom_consolidate=*/false);
+      } catch (const std::exception &) {
+      }  // handle poisoned; disk = [flip(activation)] only
+    }
+    const auto new_dir = root / "new";
+    copy_tree(tmpl, new_dir);
+    {
+      const std::string prefix = (new_dir / "wal_base").string();
+      QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+      qg.load_disk_index(prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+      qg.set_params(64, 1, 1);
+      UpdateParams params;
+      params.enable_wal = true;
+      params.max_points = max_points;
+      QGUpdater upd(qg, params);
+      for (PID id = 0; id < static_cast<PID>(kConsolidateTomb); ++id) upd.tombstone(id);
+      upd.consolidate(1, 0, /*reclaim_slots=*/true, /*bloom_consolidate=*/false);
+    }
+    ConsolidateRefs r;
+    r.s_old = recover((old_dir / "wal_base").string(), max_points).graph_fp;
+    r.s_new = recover((new_dir / "wal_base").string(), max_points).graph_fp;
+    std::filesystem::remove_all(root);
+    return r;
+  }();
+  return refs;
+}
+
+TEST_P(SegmentOpWalConsolidateSigkill, ReopenIsPrefixReachableAndDoubleReplayStable) {
+  const auto param = GetParam();
+  const auto root = battery_root(std::string("consolidate_") + param.name);
+  std::filesystem::remove_all(root);
+  const auto template_dir = root / "template";
+  auto base = WalTinyIndex::build(template_dir, kBaseN, 4343);
+  const size_t max_points = kBaseN + kInsert + 16;
+  prepare_wal_base(base.prefix, max_points);
+
+  const auto case_dir = root / "case";
+  copy_tree(template_dir, case_dir);
+  const std::string case_prefix = (case_dir / "wal_base").string();
+
+  const auto child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    try {
+      QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+      qg.load_disk_index(case_prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+      qg.set_params(64, 1, 1);
+      UpdateParams params;
+      params.enable_wal = true;
+      params.max_points = max_points;
+      if (param.cache_cap != 0) params.cache_cap_pages = param.cache_cap;  // force overlay spill
+      const SegmentOpFailPoint target = param.point;
+      params.failpoint_hook = [target](SegmentOpFailPoint fp) {
+        if (fp == target) {
+          ::kill(::getpid(), SIGKILL);
+          ::_exit(99);
+        }
+      };
+      QGUpdater upd(qg, params);
+      for (PID id = 0; id < static_cast<PID>(kConsolidateTomb); ++id) upd.tombstone(id);
+      upd.consolidate(1, /*r_target=*/0, /*reclaim_slots=*/true, /*bloom_consolidate=*/false);
+    } catch (...) {
+      ::_exit(70);
+    }
+    ::_exit(0);
+  }
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  // wal-2c BLOCKER-2: the child must have died AT the cut (SIGKILL), not from a caught
+  // exception before it -- a BUILD steal-guard poison that _exit(70)s could otherwise let a
+  // stale-count recovery pass spuriously.
+  ASSERT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL)
+      << param.name << " child did not SIGKILL at the cut (status=" << status << ")";
+
+  const auto first = recover(case_prefix, max_points);
+  ASSERT_FALSE(first.poisoned) << "recovery of " << param.name << " must not poison";
+  EXPECT_EQ(first.num_points, kBaseN) << param.name << " HWM is unchanged by consolidate";
+  EXPECT_EQ(first.live_count, kBaseN - kConsolidateTomb)
+      << param.name << " tombstones durable via the activation checkpoint";
+  EXPECT_EQ(first.free_count, param.expect_reclaimed ? kConsolidateTomb : 0U)
+      << param.name << " free-list reflects the epoch commit point";
+  // wal-2c BLOCKER-2: counts alone cannot distinguish a partially-repaired graph (e.g. a live
+  // row's pre-END repair page installed while free flags stayed 0) from clean S_old. Require
+  // the FULL recovered fingerprint (page content + PID sets + free chain + routing + epoch) to
+  // equal exactly S_old or S_new.
+  const auto &refs = consolidate_refs();
+  EXPECT_TRUE(first.graph_fp == refs.s_old || first.graph_fp == refs.s_new)
+      << param.name << " recovered graph matches neither reference state";
+  EXPECT_EQ(first.graph_fp, param.expect_reclaimed ? refs.s_new : refs.s_old)
+      << param.name << " recovered graph is not the expected "
+      << (param.expect_reclaimed ? "S_new" : "S_old");
+  const auto second = recover(case_prefix, max_points);
+  EXPECT_EQ(first.num_points, second.num_points);
+  EXPECT_EQ(first.live_count, second.live_count);
+  EXPECT_EQ(first.free_count, second.free_count);
+  EXPECT_EQ(first.graph_fp, second.graph_fp) << param.name << " graph fingerprint not stable";
+  EXPECT_EQ(first.index_bytes, second.index_bytes) << param.name << " index not byte-stable";
+  EXPECT_EQ(first.wal_bytes, second.wal_bytes) << param.name << " wal not byte-stable";
+
+  std::filesystem::remove_all(root);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    ConsolidateKillPoints, SegmentOpWalConsolidateSigkill,
+    ::testing::Values(
+        // C0-C7: every cut before the END *force* loses the buffered END (SIGKILL keeps
+        // the OS page cache but not this process's userspace stream buffer), so recovery
+        // sees an unmatched BEGIN, truncates the epoch, and converges to S_old (free 0).
+        ConsolidateKillCase{"c0_before_begin_append",
+                            SegmentOpFailPoint::before_consolidate_begin_append, false},
+        ConsolidateKillCase{"c1_after_begin_append",
+                            SegmentOpFailPoint::after_consolidate_begin_append, false},
+        ConsolidateKillCase{"c2_before_begin_fsync",
+                            SegmentOpFailPoint::before_consolidate_begin_fsync, false},
+        ConsolidateKillCase{"c3_after_begin_fsync",
+                            SegmentOpFailPoint::after_consolidate_begin_fsync, false},
+        ConsolidateKillCase{"c4_overlay_before_spill",
+                            SegmentOpFailPoint::after_consolidate_overlay_modify_before_spill, false,
+                            /*cache_cap=*/2},
+        ConsolidateKillCase{"c5_after_spill_flush",
+                            SegmentOpFailPoint::after_consolidate_spill_flush, false,
+                            /*cache_cap=*/2},
+        ConsolidateKillCase{"c6_live_repair_before_free",
+                            SegmentOpFailPoint::after_consolidate_live_repair_before_free_image,
+                            false},
+        ConsolidateKillCase{"before_end_append",
+                            SegmentOpFailPoint::before_consolidate_end_append, false},
+        ConsolidateKillCase{"c7_end_append_before_fsync",
+                            SegmentOpFailPoint::after_consolidate_end_append_before_fsync, false},
+        // C8-C11: the END force is the commit point; every later cut rolls forward to
+        // S_new (free-list holds the kConsolidateTomb reclaimed rows) via pure WAL redo.
+        ConsolidateKillCase{"c8_end_fsync", SegmentOpFailPoint::after_consolidate_end_fsync, true},
+        ConsolidateKillCase{"c9_install_page",
+                            SegmentOpFailPoint::after_consolidate_install_page, true},
+        ConsolidateKillCase{"c10_install_before_publish",
+                            SegmentOpFailPoint::after_consolidate_install_before_publish, true},
+        ConsolidateKillCase{"c11_after_publish",
+                            SegmentOpFailPoint::after_consolidate_publish, true}),
+    [](const ::testing::TestParamInfo<ConsolidateKillCase> &info) { return info.param.name; });
 
 // Layer 1 (label transaction, B-07): SIGKILL at the four new bundle/checkpoint
 // cuts. A torn bundle (kill before the kind=8 fsync) loses its whole buffered
@@ -262,6 +508,9 @@ TEST_P(SegmentOpWalBundleSigkill, BundleReopenIsPrefixReachableAndDoubleReplaySt
   }
   int status = 0;
   ASSERT_EQ(::waitpid(child, &status, 0), child);
+  // wal-2c BLOCKER-2: reject a child that died from a CAUGHT exception before the cut.
+  ASSERT_FALSE(WIFEXITED(status) && WEXITSTATUS(status) == 70)
+      << "bundle_" << param.name << " child threw before reaching the cut";
 
   const auto first = recover(case_prefix, max_points);
   ASSERT_FALSE(first.poisoned) << "recovery of bundle_" << param.name << " must not poison";
@@ -400,10 +649,10 @@ void assert_power_loss_matrix(const std::string &name,
         EXPECT_FALSE(first.appended_label.has_value());
       }
     }
-    // Double replay of the materialized state is byte + state stable.
-    const auto dst2 = root / "state2";
-    const auto second = recover_power_loss_state(template_dir, dst2, state.index, state.wal,
-                                                 max_points);
+    // Double replay is byte + state stable. wal-2c BLOCKER-2: the second replay must reopen the
+    // FIRST recovery's OUTPUT (dst), not re-materialize the original crash image into a fresh
+    // dir -- a non-idempotent second recovery would otherwise be missed.
+    const auto second = recover((dst / "wal_base").string(), max_points);
     EXPECT_EQ(first.num_points, second.num_points);
     EXPECT_EQ(first.live_count, second.live_count);
     EXPECT_EQ(first.index_bytes, second.index_bytes) << "index not byte-stable on double replay";
@@ -475,6 +724,173 @@ TEST(SegmentOpWalPowerLoss, BundleWithLabelsIsAtomicAcrossPowerLoss) {
         upd.writeback(1);  // pwrite pages (unforced) after the kind=8 fsync
       },
       kBaseN + kInsert, /*label_when_committed=*/70000U);
+}
+
+// A consolidate maintenance transaction is atomic across power loss (W1 backfill /
+// design section 6.3): the END fsync is the single commit point, so once it is
+// durable recovery must roll forward to S_new over an index that installed NONE of
+// the pages (the forced snapshot -- install pwrites are unforced) or ALL of them
+// (the current file). The SIGKILL C9 cut covers the partial-install middle.
+TEST(SegmentOpWalPowerLoss, ConsolidateRollsForwardAcrossUnforcedIndexLoss) {
+  constexpr size_t kTomb = 4;
+  const auto root = battery_root("consolidate_rollforward");
+  std::filesystem::remove_all(root);
+  const auto template_dir = root / "template";
+  auto base = WalTinyIndex::build(template_dir, kBaseN, 7373);
+  const size_t max_points = kBaseN + kInsert + 16;
+  prepare_wal_base(base.prefix, max_points);
+  const auto run_dir = root / "run";
+  copy_tree(template_dir, run_dir);
+  const std::string run_prefix = (run_dir / "wal_base").string();
+  const std::string index_path = run_prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+
+  std::vector<char> forced_index;  // last index fsync == the activation checkpoint (pre-install)
+  {
+    QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+    qg.load_disk_index(run_prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+    qg.set_params(64, 1, 1);
+    UpdateParams params;
+    params.enable_wal = true;
+    params.max_points = max_points;
+    SegmentIoObserver observer;
+    observer.on_index_fsync = [&] { forced_index = read_file(index_path); };
+    params.io_observer = &observer;
+    QGUpdater upd(qg, params);
+    for (PID id = 0; id < static_cast<PID>(kTomb); ++id) upd.tombstone(id);
+    upd.consolidate(1, /*r_target=*/0, /*reclaim_slots=*/true, /*bloom_consolidate=*/false);
+  }
+  const auto current_index = read_file(index_path);
+  const auto current_wal = read_file(wal_path);  // [flip, begin, pages..., end] (END durable)
+  ASSERT_FALSE(forced_index.empty()) << "the activation checkpoint must fsync the index once";
+  EXPECT_NE(forced_index, current_index) << "install pwrites are unforced (no index fsync)";
+
+  struct IndexState {
+    const char *label;
+    const std::vector<char> &index;
+  };
+  const std::vector<IndexState> states = {
+      {"drop-all-install", forced_index},
+      {"keep-all-install", current_index},
+  };
+  std::string s_new_fp;  // wal-2c BLOCKER-2: both install states must land on the same S_new graph
+  for (const auto &st : states) {
+    SCOPED_TRACE(std::string("consolidate power-loss: ") + st.label);
+    const auto first =
+        recover_power_loss_state(template_dir, root / "state", st.index, current_wal, max_points);
+    ASSERT_FALSE(first.poisoned) << "END durable => must roll forward, not poison";
+    EXPECT_EQ(first.num_points, kBaseN);
+    EXPECT_EQ(first.live_count, kBaseN - kTomb);
+    EXPECT_EQ(first.free_count, kTomb) << "the reclaimed rows land on the free-list (S_new)";
+    // wal-2c BLOCKER-2: whether the index dropped ALL installs (forced snapshot) or kept them
+    // (current file), the WAL redo must reconstruct the IDENTICAL S_new graph.
+    if (s_new_fp.empty()) {
+      s_new_fp = first.graph_fp;
+    } else {
+      EXPECT_EQ(first.graph_fp, s_new_fp) << st.label << " diverged from the S_new graph";
+    }
+    // wal-2c BLOCKER-2: reopen the FIRST recovery's OUTPUT for the stability check.
+    const auto second = recover((root / "state" / "wal_base").string(), max_points);
+    EXPECT_EQ(first.index_bytes, second.index_bytes) << "index not byte-stable on double replay";
+    EXPECT_EQ(first.wal_bytes, second.wal_bytes) << "wal not byte-stable on double replay";
+    EXPECT_EQ(first.graph_fp, second.graph_fp) << "graph fingerprint not stable on double replay";
+  }
+  std::filesystem::remove_all(root);
+}
+
+// wal-2c MAJOR-6: the C7 SIGKILL cut relies on a buffered END staying in THIS process's
+// userspace stream buffer -- not portable (std::filebuf may push it to the kernel, so a SIGKILL
+// could leave a complete, CRC-valid, un-fsynced END and legitimately recover S_new). This test
+// EXPLICITLY materializes the torn-END disk states: a truncated END and a bad-CRC END must both
+// truncate the epoch back to S_old, while a structurally complete END rolls forward to S_new.
+// It proves the commit point is 'a complete END frame on disk', independent of stream buffering.
+TEST(SegmentOpWalPowerLoss, ConsolidateTornEndMaterialization) {
+  constexpr size_t kTomb = 4;
+  const auto root = battery_root("torn_end");
+  std::filesystem::remove_all(root);
+  const auto template_dir = root / "template";
+  auto base = WalTinyIndex::build(template_dir, kBaseN, 8484);
+  const size_t max_points = kBaseN + kInsert + 16;
+  prepare_wal_base(base.prefix, max_points);
+  const auto run_dir = root / "run";
+  copy_tree(template_dir, run_dir);
+  const std::string run_prefix = (run_dir / "wal_base").string();
+  const std::string index_path = run_prefix + waltest::index_suffix();
+  const std::string wal_path = index_path + ".opwal";
+  std::vector<char> forced_index;  // pre-install snapshot (activation ckpt; install pwrites unforced)
+  {
+    QuantizedGraph qg(kBaseN, kDeg, kDim, kDim);
+    qg.load_disk_index(run_prefix.c_str(), 0.0F, /*recovery_mode=*/true);
+    qg.set_params(64, 1, 1);
+    UpdateParams params;
+    params.enable_wal = true;
+    params.max_points = max_points;
+    SegmentIoObserver observer;
+    observer.on_index_fsync = [&] { forced_index = read_file(index_path); };
+    params.io_observer = &observer;
+    QGUpdater upd(qg, params);
+    for (PID id = 0; id < static_cast<PID>(kTomb); ++id) upd.tombstone(id);
+    upd.consolidate(1, /*r_target=*/0, /*reclaim_slots=*/true, /*bloom_consolidate=*/false);
+  }
+  const auto complete_wal = read_file(wal_path);   // [flip, begin, pages..., END] (END complete)
+  const auto complete_index = read_file(index_path);
+  ASSERT_GT(complete_wal.size(), 80U);
+  ASSERT_FALSE(forced_index.empty()) << "the activation checkpoint must fsync the index once";
+  EXPECT_NE(forced_index, complete_index) << "install pwrites are unforced (no index fsync)";
+
+  // Torn-END variants must be materialized over the PRE-INSTALL (forced) index: the FREE
+  // trailers only exist on disk after the (unforced) install, so a torn WAL over the post-
+  // install index would spuriously read S_new straight off the trailers.
+  auto materialize_and_recover = [&](const std::vector<char> &index,
+                                     const std::vector<char> &wal) {
+    const auto dst = root / "state";
+    copy_tree(template_dir, dst);
+    const std::string p = (dst / "wal_base").string();
+    write_file(p + waltest::index_suffix(), index);
+    write_file(p + waltest::index_suffix() + ".opwal", wal);
+    const auto a = recover(p, max_points);
+    const auto b = recover(p, max_points);  // reopen a's OUTPUT (idempotence)
+    EXPECT_EQ(a.graph_fp, b.graph_fp) << "torn-end recovery not idempotent";
+    return a;
+  };
+
+  // 1) Truncated END: drop the trailer -> the scan stops before the END frame boundary.
+  {
+    auto wal = complete_wal;
+    wal.resize(wal.size() - 6);
+    const auto r = materialize_and_recover(forced_index, wal);
+    ASSERT_FALSE(r.poisoned) << "truncated END must recover to S_old, not poison";
+    EXPECT_EQ(r.free_count, 0U) << "torn END => epoch truncated => S_old";
+    EXPECT_EQ(r.live_count, kBaseN - kTomb);
+    EXPECT_EQ(r.epoch, 0U) << "the uncommitted epoch never advances the cursor";
+  }
+  // 2) Bad-CRC END: flip a byte inside the END payload -> CRC fails, scan stops.
+  {
+    auto wal = complete_wal;
+    wal[wal.size() - 10] = static_cast<char>(wal[wal.size() - 10] ^ 0xFF);
+    const auto r = materialize_and_recover(forced_index, wal);
+    ASSERT_FALSE(r.poisoned) << "bad-CRC END must recover to S_old, not poison";
+    EXPECT_EQ(r.free_count, 0U);
+    EXPECT_EQ(r.live_count, kBaseN - kTomb);
+    EXPECT_EQ(r.epoch, 0U);
+  }
+  // 3) Complete END over the PRE-INSTALL index: the redo re-applies the pages => S_new.
+  {
+    const auto r = materialize_and_recover(forced_index, complete_wal);
+    ASSERT_FALSE(r.poisoned);
+    EXPECT_EQ(r.free_count, kTomb) << "a complete END frame on disk is the commit point => S_new";
+    EXPECT_EQ(r.live_count, kBaseN - kTomb);
+    EXPECT_EQ(r.epoch, 1U) << "the committed epoch advances the cursor";
+  }
+  // 4) Complete END over the POST-INSTALL index: redo is idempotent over installed pages.
+  {
+    const auto r = materialize_and_recover(complete_index, complete_wal);
+    ASSERT_FALSE(r.poisoned);
+    EXPECT_EQ(r.free_count, kTomb);
+    EXPECT_EQ(r.live_count, kBaseN - kTomb);
+    EXPECT_EQ(r.epoch, 1U);
+  }
+  std::filesystem::remove_all(root);
 }
 
 // The label-snapshot checkpoint flip is atomic across power loss (B-07): over an

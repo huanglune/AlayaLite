@@ -8,10 +8,19 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <vector>
 
 #include "index/collection/detail/mutable_laser_collection_adapter.hpp"
@@ -31,16 +40,50 @@ std::filesystem::path scratch(const std::string &name) {
          ("mutable_laser_adapter_" + name + "_" + std::to_string(::getpid()));
 }
 
-std::shared_ptr<::alaya::disk::MutableLaserSegment> open_empty(const std::filesystem::path &dir) {
+std::shared_ptr<::alaya::disk::MutableLaserSegment> open_empty(
+    const std::filesystem::path &dir,
+    std::function<void(laser::SegmentOpFailPoint)> failpoint_hook = {}) {
   std::filesystem::remove_all(dir);
-  ::alaya::disk::MutableLaserSegment::create_empty(dir, "seg_00000002", kDim, kDim, kR,
+  ::alaya::disk::MutableLaserSegment::create_empty(dir,
+                                                   "seg_00000002",
+                                                   kDim,
+                                                   kDim,
+                                                   kR,
                                                    core::Metric::l2);
   laser::UpdateParams params;
   params.max_points = 4096;
   params.ef_insert = 64;
-  return std::make_shared<::alaya::disk::MutableLaserSegment>(
-      dir, params, laser::ResidencyMode::kPagedPool, /*allow_empty=*/true);
+  params.failpoint_hook = std::move(failpoint_hook);
+  return std::make_shared<::alaya::disk::MutableLaserSegment>(dir,
+                                                              params,
+                                                              laser::ResidencyMode::kPagedPool,
+                                                              /*allow_empty=*/true);
 }
+
+class Gate {
+ public:
+  void wait() {
+    entered_.store(true, std::memory_order_release);
+    while (!released_.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+  }
+  [[nodiscard]] auto wait_until_entered() -> bool {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!entered_.load(std::memory_order_acquire)) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return false;
+      }
+      std::this_thread::yield();
+    }
+    return true;
+  }
+  void release() { released_.store(true, std::memory_order_release); }
+
+ private:
+  std::atomic_bool entered_{};
+  std::atomic_bool released_{};
+};
 
 CollectionSchema schema() {
   CollectionSchema s;
@@ -208,6 +251,233 @@ TEST(MutableLaserAdapter, RejectsNonDurableWriteWithoutPendingLeak) {
   const auto v41 = ramp(41);
   ASSERT_TRUE(drive(adapter, make_write(402, 41, v41, std::nullopt), 402, 402).ok());
   EXPECT_EQ(seg->live_count(), 1U);
+  std::filesystem::remove_all(dir);
+}
+
+TEST(MutableLaserAdapter, PendingMutationRejectsMaintenanceWithoutLatch) {
+  const auto dir = scratch("maintenance_pending");
+  auto seg = open_empty(dir);
+  MutableLaserCollectionAdapter adapter(seg, schema(), kSegId, kGen);
+  const auto vector = ramp(50);
+  const auto payload = make_write(501, 50, vector, std::nullopt);
+  WalMutationTransaction transaction;
+  transaction.durability = WriteDurability::wal_fsync;
+  core::OpaqueOperationRequest request;
+  request.payload = &payload;
+  request.payload_size = sizeof(payload);
+  core::MutationContext context;
+  context.transaction_token = &transaction;
+  context.transaction_id = 501;
+  context.max_row_op_id = 501;
+  core::MutationToken token;
+  ASSERT_TRUE(adapter.prepare_mutation(request, context, token).ok());
+
+  auto conflict = adapter.consolidate(1, 0, true, false);
+  ASSERT_FALSE(conflict.ok());
+  EXPECT_EQ(conflict.code(), core::StatusCode::conflict);
+  EXPECT_FALSE(adapter.is_latched());
+  ASSERT_TRUE(adapter.abort_mutation(token, context).ok());
+  EXPECT_TRUE(adapter.consolidate(1, 0, true, false).ok());
+  EXPECT_FALSE(adapter.is_latched());
+  std::filesystem::remove_all(dir);
+}
+
+TEST(MutableLaserAdapter, MaintenanceFlagRejectsPrepareWhileSearchContinues) {
+  const auto dir = scratch("maintenance_active");
+  Gate gate;
+  auto seg = open_empty(dir, [&](laser::SegmentOpFailPoint point) {
+    if (point == laser::SegmentOpFailPoint::after_consolidate_begin_fsync) {
+      gate.wait();
+    }
+  });
+  MutableLaserCollectionAdapter adapter(seg, schema(), kSegId, kGen);
+  const auto seed = ramp(60);
+  ASSERT_TRUE(drive(adapter, make_write(601, 60, seed, std::nullopt), 601, 601).ok());
+
+  auto maintenance = std::async(std::launch::async, [&] {
+    return adapter.consolidate(1, 0, true, false);
+  });
+  ASSERT_TRUE(gate.wait_until_entered());
+
+  const auto next = ramp(61);
+  const auto payload = make_write(602, 61, next, std::nullopt);
+  WalMutationTransaction transaction;
+  transaction.durability = WriteDurability::wal_fsync;
+  core::OpaqueOperationRequest opaque;
+  opaque.payload = &payload;
+  opaque.payload_size = sizeof(payload);
+  core::MutationContext mutation_context;
+  mutation_context.transaction_token = &transaction;
+  mutation_context.transaction_id = 602;
+  mutation_context.max_row_op_id = 602;
+  core::MutationToken token;
+  auto rejected = adapter.prepare_mutation(opaque, mutation_context, token);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.code(), core::StatusCode::conflict);
+  EXPECT_FALSE(adapter.is_latched());
+
+  std::vector<core::SearchHit> hits(4);
+  std::array<core::RowCount, 2> offsets{};
+  std::array<core::RowCount, 1> counts{};
+  std::array<core::Status, 1> statuses{};
+  std::array<core::SearchCompleteness, 1> completeness{};
+  core::SearchResponse response;
+  response.hits = hits;
+  response.offsets = offsets;
+  response.valid_counts = counts;
+  response.statuses = statuses;
+  response.completeness = completeness;
+  core::SearchContext search_context;
+  core::SearchRequest search_request;
+  search_request.queries = core::TypedTensorView::contiguous(seed.data(), 1, seed.size());
+  search_request.options.top_k = 4;
+  search_request.context = &search_context;
+  search_request.response = &response;
+  EXPECT_TRUE(adapter.search(search_request).ok());
+  EXPECT_GE(counts[0], 1U);
+
+  gate.release();
+  EXPECT_TRUE(maintenance.get().ok());
+  std::filesystem::remove_all(dir);
+}
+
+TEST(MutableLaserAdapter, StatvfsFailureBeforeBeginClearsMaintenanceWithoutLatch) {
+  const auto dir = scratch("maintenance_statvfs");
+  std::atomic_bool armed{true};
+  auto seg = open_empty(dir, [&](laser::SegmentOpFailPoint point) {
+    if (point == laser::SegmentOpFailPoint::before_consolidate_statvfs &&
+        armed.exchange(false, std::memory_order_acq_rel)) {
+      throw std::system_error(std::make_error_code(std::errc::io_error),
+                              "injected statvfs failure");
+    }
+  });
+  MutableLaserCollectionAdapter adapter(seg, schema(), kSegId, kGen);
+
+  auto failed = adapter.consolidate(1, 0, true, false);
+  EXPECT_FALSE(failed.ok());
+  EXPECT_FALSE(adapter.is_latched());
+  const auto vector = ramp(70);
+  EXPECT_TRUE(drive(adapter, make_write(701, 70, vector, std::nullopt), 701, 701).ok());
+  core::CheckpointContext context;
+  core::CheckpointToken token;
+  EXPECT_TRUE(adapter.checkpoint(context, token).ok());
+  EXPECT_TRUE(adapter.consolidate(1, 0, true, false).ok());
+  EXPECT_FALSE(adapter.is_latched());
+  std::filesystem::remove_all(dir);
+}
+
+TEST(MutableLaserAdapter, FailureAfterDurableBeginLatchesAndGatesCheckpoint) {
+  const auto dir = scratch("maintenance_after_begin");
+  std::atomic_bool armed{true};
+  auto seg = open_empty(dir, [&](laser::SegmentOpFailPoint point) {
+    if (point == laser::SegmentOpFailPoint::after_consolidate_begin_fsync &&
+        armed.exchange(false, std::memory_order_acq_rel)) {
+      throw std::system_error(std::make_error_code(std::errc::no_space_on_device),
+                              "injected post-BEGIN ENOSPC");
+    }
+  });
+  MutableLaserCollectionAdapter adapter(seg, schema(), kSegId, kGen);
+
+  auto failed = adapter.consolidate(1, 0, true, false);
+  EXPECT_FALSE(failed.ok());
+  EXPECT_TRUE(adapter.is_latched());
+  core::CheckpointContext context;
+  core::CheckpointToken token;
+  EXPECT_FALSE(adapter.checkpoint(context, token).ok());
+  EXPECT_FALSE(adapter.consolidate(1, 0, true, false).ok());
+  std::filesystem::remove_all(dir);
+}
+
+TEST(MutableLaserAdapter, SharedExtensionsResolveSameForActiveAndSealedDefaults) {
+  ::alaya::disk::LaserSegmentSearchExtension parameters;
+  parameters.effort = 37;
+  parameters.beam_width = 7;
+  auto extension = ::alaya::disk::make_laser_segment_search_extension(parameters);
+  core::SearchOptions request_options(5);
+  request_options.extensions =
+      std::span<const core::AlgorithmSearchExtension>(&extension, 1);
+
+  ::alaya::disk::DiskSearchOptions active_defaults;
+  active_defaults.ef = 128;
+  active_defaults.beam_width = 4;
+  ::alaya::disk::DiskSearchOptions sealed_defaults;
+  sealed_defaults.ef = 100;
+  sealed_defaults.beam_width = 4;
+  auto active = ::alaya::disk::resolve_laser_search_extensions(request_options, active_defaults);
+  auto sealed = ::alaya::disk::resolve_laser_search_extensions(request_options, sealed_defaults);
+  ASSERT_TRUE(active.ok());
+  ASSERT_TRUE(sealed.ok());
+  EXPECT_EQ(active.value().top_k, sealed.value().top_k);
+  EXPECT_EQ(active.value().ef, sealed.value().ef);
+  EXPECT_EQ(active.value().beam_width, sealed.value().beam_width);
+  EXPECT_EQ(active.value().ef, parameters.effort);
+  EXPECT_EQ(active.value().beam_width, parameters.beam_width);
+  EXPECT_FALSE(active.value().exact_rerank);
+  EXPECT_FALSE(sealed.value().exact_rerank);
+
+  extension.algorithm_id = core::algorithm::qg;
+  auto active_rejected =
+      ::alaya::disk::resolve_laser_search_extensions(request_options, active_defaults);
+  auto sealed_rejected =
+      ::alaya::disk::resolve_laser_search_extensions(request_options, sealed_defaults);
+  ASSERT_FALSE(active_rejected.ok());
+  ASSERT_FALSE(sealed_rejected.ok());
+  EXPECT_EQ(active_rejected.status().detail(), core::StatusDetail::unknown_extension);
+  EXPECT_EQ(sealed_rejected.status().detail(), core::StatusDetail::unknown_extension);
+}
+
+TEST(MutableLaserAdapter, SearchExtensionChangesActiveExpansionEffort) {
+  const auto dir = scratch("search_extensions");
+  auto seg = open_empty(dir);
+  constexpr size_t kRows = 256;
+  std::vector<float> vectors(kRows * kDim);
+  std::vector<std::uint64_t> labels(kRows);
+  for (size_t row = 0; row < kRows; ++row) {
+    labels[row] = 10'000 + row;
+    for (size_t column = 0; column < kDim; ++column) {
+      vectors[row * kDim + column] =
+          static_cast<float>((row * 131 + column * 17 + row * column) % 1009) / 1009.0F;
+    }
+  }
+  (void)seg->commit_physical_bundle(801, 801, vectors.data(), labels.data(), labels.size());
+  MutableLaserCollectionAdapter adapter(seg, schema(), kSegId, kGen);
+
+  const auto run = [&](std::uint32_t effort, std::uint32_t beam_width) {
+    std::array<core::SearchHit, 1> hits{};
+    std::array<core::RowCount, 2> offsets{};
+    std::array<core::RowCount, 1> counts{};
+    std::array<core::Status, 1> statuses{};
+    std::array<core::SearchCompleteness, 1> completeness{};
+    core::SearchResponse response;
+    response.hits = hits;
+    response.offsets = offsets;
+    response.valid_counts = counts;
+    response.statuses = statuses;
+    response.completeness = completeness;
+    ::alaya::disk::LaserSegmentSearchExtension parameters;
+    parameters.effort = effort;
+    parameters.beam_width = beam_width;
+    auto extension = ::alaya::disk::make_laser_segment_search_extension(parameters);
+    core::SearchContext context;
+    core::SearchRequest request;
+    request.queries = core::TypedTensorView::contiguous(vectors.data() + 173 * kDim, 1, kDim);
+    request.options.top_k = 1;
+    request.options.extensions =
+        std::span<const core::AlgorithmSearchExtension>(&extension, 1);
+    request.context = &context;
+    request.response = &response;
+    const auto before = seg->search_stats().query_page_reads;
+    const auto status = adapter.search(request);
+    const auto after = seg->search_stats().query_page_reads;
+    EXPECT_TRUE(status.ok()) << status.diagnostic();
+    EXPECT_EQ(counts[0], 1U);
+    return after - before;
+  };
+
+  const auto low_effort_expansions = run(/*effort=*/1, /*beam_width=*/1);
+  const auto high_effort_expansions = run(/*effort=*/128, /*beam_width=*/16);
+  EXPECT_GT(high_effort_expansions, low_effort_expansions)
+      << "the active adapter must pass extension effort into QG traversal";
   std::filesystem::remove_all(dir);
 }
 

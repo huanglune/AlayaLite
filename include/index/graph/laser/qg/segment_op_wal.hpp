@@ -78,6 +78,42 @@ enum class SegmentOpFailPoint : std::uint8_t {
   before_tx_publish_append,        // snapshot pre-built, immediately before the kind=8 append
   after_tx_publish_fsync,          // kind=8 durable, before the snapshot swap + committed store
   label_slot_written_before_flip,  // inactive label slot durable, before the checkpoint flip frame
+  // 2C consolidate-transaction cuts (design section 6.1; appended so every prior
+  // value is preserved). C0-C11 map onto these + the whole-page install loop.
+  after_consolidate_begin_append,            // kind=3 begin buffered, before its fsync
+  after_consolidate_begin_fsync,             // begin durable, before any page mutation
+  after_consolidate_spill_flush,             // an overlay page spilled (kind=1) + flushed
+  before_consolidate_end_append,             // all pages staged, immediately before kind=4
+  after_consolidate_end_fsync,               // kind=4 durable (the commit point), before install
+  after_consolidate_install_page,            // one index page installed post-commit
+  after_consolidate_install_before_publish,  // all pages installed, before free-list/epoch publish
+  // 2C W1-backfill completion of the C0-C11 matrix (appended so every prior value
+  // is preserved; the logical time order no longer matches the numeric order).
+  before_consolidate_begin_append,                // C0: active epoch set, before the kind=3 append
+  before_consolidate_begin_fsync,                 // C2: kind=3 buffered, before its force
+  after_consolidate_overlay_modify_before_spill,  // C4: an overlay page dirtied, before its spill
+  after_consolidate_live_repair_before_free_image,  // C6: live repair done, before any FREE image
+  after_consolidate_end_append_before_fsync,  // C7: kind=4 buffered, before its force (torn END)
+  after_consolidate_publish,                  // C11: free-list/epoch/idle all published
+  // 2C W2 canonical PID-reuse bundle cuts (appended so every prior value is preserved).
+  after_reuse_reserve_before_binds,            // R0: tokens reserved (free popped), before kind=7
+  after_reuse_first_bind_append,               // R1a: exactly ONE kind=7 bind buffered (partial)
+  after_reuse_tx_publish_append_before_fsync,  // R5: kind=8 buffered, before its force (torn END)
+  after_reuse_install_before_snapshot,      // R6b: kind=8 durable + pages installed, pre-snapshot
+  after_reuse_routing_before_hidden_clear,  // R7: snapshot+routing published, before hidden clear
+  after_reuse_hidden_clear_partial_before_commit,  // R8: first reused hidden cleared, before
+                                                   // committed
+  // leg-7 BLOCKER-7: real independent pre-commit cuts (appended so every prior value is
+  // preserved). Both land on S_old (no durable kind=8 yet). The R11 canonical-checkpoint cuts
+  // reuse the existing checkpoint failpoints (label_slot_written_before_flip /
+  // after_flip_append_before_superblock_write / after_superblock_write_before_wal_reset /
+  // after_wal_reset).
+  after_reuse_free_preimage_before_build,  // R2: reused-page FREE preimages logged, before build
+  after_reuse_partial_final_page,  // R3: the FIRST final (build/spine) page logged, before rest
+  // W3 maintenance admission/install cuts. Append-only: every earlier value is frozen.
+  before_consolidate_statvfs,
+  after_consolidate_install_version_odd,
+  after_consolidate_install_write_before_even,
 };
 
 // Test-only observer for the persistence-model (power-loss) crash layer. It is

@@ -39,6 +39,7 @@
 #include "core/algorithm_registry.hpp"
 #include "index/collection/mutation_wal_codec.hpp"
 #include "index/collection/types.hpp"
+#include "index/disk/laser_segment.hpp"
 #include "index/disk/mutable_laser_segment.hpp"
 
 namespace alaya::internal::collection::detail {
@@ -120,6 +121,12 @@ class MutableLaserCollectionAdapter {
                        "active LASER mutation context carries no physical transaction id");
       }
       const std::lock_guard<std::mutex> lock(mutex_);
+      if (maintenance_active_) {
+        return failure(core::OperationStage::mutation_prepare,
+                       core::StatusCode::conflict,
+                       core::StatusDetail::none,
+                       "active LASER mutation conflicts with consolidate maintenance");
+      }
       transactions_.insert_or_assign(pending.txid, std::move(pending));
       token.value = context.transaction_id;
       return core::Status::success();
@@ -134,6 +141,12 @@ class MutableLaserCollectionAdapter {
       return gate;
     }
     const std::lock_guard<std::mutex> lock(mutex_);
+    if (maintenance_active_) {
+      return latch(failure(core::OperationStage::mutation_stage,
+                           core::StatusCode::internal,
+                           core::StatusDetail::readonly_instance,
+                           "active LASER staged mutation interleaved with maintenance"));
+    }
     const auto found = transactions_.find(token.value);
     if (found == transactions_.end()) {
       return failure(core::OperationStage::mutation_stage,
@@ -153,6 +166,12 @@ class MutableLaserCollectionAdapter {
     Pending pending;
     {
       const std::lock_guard<std::mutex> lock(mutex_);
+      if (maintenance_active_) {
+        return latch(failure(core::OperationStage::mutation_publish,
+                             core::StatusCode::internal,
+                             core::StatusDetail::readonly_instance,
+                             "active LASER publish interleaved with maintenance"));
+      }
       const auto found = transactions_.find(token.value);
       if (found == transactions_.end() || !found->second.staged) {
         return failure(core::OperationStage::mutation_publish,
@@ -205,12 +224,15 @@ class MutableLaserCollectionAdapter {
     if (auto gate = ensure_live(core::OperationStage::checkpoint); !gate.ok()) {
       return gate;
     }
-    const std::lock_guard<std::mutex> lock(mutex_);
-    if (!transactions_.empty()) {
-      return failure(core::OperationStage::checkpoint,
-                     core::StatusCode::conflict,
-                     core::StatusDetail::none,
-                     "active LASER checkpoint observed a staged transaction");
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      if (maintenance_active_ || !transactions_.empty()) {
+        return failure(core::OperationStage::checkpoint,
+                       core::StatusCode::conflict,
+                       core::StatusDetail::none,
+                       "active LASER checkpoint conflicts with maintenance or a staged "
+                       "transaction");
+      }
     }
     try {
       segment_->checkpoint();
@@ -219,6 +241,44 @@ class MutableLaserCollectionAdapter {
     }
     token.value = segment_->applied_collection_op_id();
     return core::Status::success();
+  }
+
+  [[nodiscard]] auto consolidate(std::size_t num_threads,
+                                 std::size_t r_target,
+                                 bool reclaim_slots,
+                                 bool bloom_consolidate) -> core::Status {
+    if (auto gate = ensure_live(core::OperationStage::checkpoint); !gate.ok()) {
+      return gate;
+    }
+    {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      if (failed_.load(std::memory_order_acquire)) {
+        return ensure_live(core::OperationStage::checkpoint);
+      }
+      if (maintenance_active_ || !transactions_.empty()) {
+        return failure(core::OperationStage::checkpoint,
+                       core::StatusCode::conflict,
+                       core::StatusDetail::none,
+                       "active LASER consolidate conflicts with maintenance or a staged "
+                       "transaction");
+      }
+      maintenance_active_ = true;
+    }
+
+    const auto clear_active = [this] {
+      const std::lock_guard<std::mutex> lock(mutex_);
+      maintenance_active_ = false;
+    };
+    try {
+      segment_->consolidate(num_threads, r_target, reclaim_slots, bloom_consolidate);
+      clear_active();
+      return core::Status::success();
+    } catch (...) {
+      const bool recovery = segment_->recovery_required();
+      clear_active();
+      auto status = core::status_from_exception(core::OperationStage::checkpoint);
+      return recovery ? latch(std::move(status)) : status;
+    }
   }
 
   // ---- StatsProvider ------------------------------------------------------
@@ -269,6 +329,9 @@ class MutableLaserCollectionAdapter {
   void gate_next_publish() { publish_gate_.arm(); }
   void release_publish() { publish_gate_.release(); }
   [[nodiscard]] auto is_latched() const -> bool { return failed_.load(std::memory_order_acquire); }
+  [[nodiscard]] auto recovery_required() const noexcept -> bool {
+    return failed_.load(std::memory_order_acquire) || segment_->recovery_required();
+  }
 
  private:
   struct Row {
@@ -481,6 +544,15 @@ class MutableLaserCollectionAdapter {
     }
 
     try {
+      // B-2C-07 / codex B.7: capture every tombstone target's TOKEN (pid, generation)
+      // BEFORE the write bundle rebinds any label, so a same-txid rebind + PID reuse can
+      // never make us tombstone a freshly-written incarnation. The captured token drives
+      // the segment's ABA check (stale token => idempotent no-op; future => corruption).
+      std::vector<std::optional<::alaya::laser::PidToken>> captured;
+      captured.reserve(tombstones.size());
+      for (const std::uint64_t label : tombstones) {
+        captured.push_back(segment_->token_for_label(label));
+      }
       if (!labels.empty()) {
         const std::uint64_t applied = segment_->applied_collection_op_id();
         const std::uint64_t last = segment_->last_committed_txid();
@@ -509,7 +581,7 @@ class MutableLaserCollectionAdapter {
                              "injected active LASER publish failure (post-commit)"));
       }
       int tombstone_index = 0;
-      for (const std::uint64_t label : tombstones) {
+      for (std::size_t i = 0; i < tombstones.size(); ++i) {
         if (!is_replay && fail_tombstone_at_.load(std::memory_order_acquire) == tombstone_index) {
           fail_tombstone_at_.store(-1, std::memory_order_release);
           return latch(failure(core::OperationStage::mutation_publish,
@@ -518,15 +590,16 @@ class MutableLaserCollectionAdapter {
                                "injected active LASER tombstone failure (post-commit)"));
         }
         ++tombstone_index;
-        const auto pid = segment_->pid_for_label(label);
-        if (pid.has_value()) {
-          segment_->tombstone(*pid);
+        if (captured[i].has_value()) {
+          // ABA-safe: the segment no-ops a stale token (the PID was reused by a newer
+          // incarnation) and only erases the reverse map on full-token equality.
+          segment_->tombstone(*captured[i]);
         } else if (!is_replay) {
           // Ruling 10: a runtime previous/erase miss is a high-severity diagnostic,
-          // but the end state is already correct (the label has no live PID), so it
+          // but the end state is already correct (the label has no live token), so it
           // is idempotent success -- do not latch. Replay misses stay silent.
           const std::lock_guard<std::mutex> lock(diag_mutex_);
-          last_runtime_miss_ = label;
+          last_runtime_miss_ = tombstones[i];
         }
       }
     } catch (...) {
@@ -569,8 +642,12 @@ class MutableLaserCollectionAdapter {
     }
 
     ::alaya::disk::DiskSearchOptions options;
-    options.top_k = static_cast<std::uint32_t>(request.options.top_k);
     options.ef = std::max<std::uint32_t>(static_cast<std::uint32_t>(request.options.top_k), 128U);
+    auto resolved = ::alaya::disk::resolve_laser_search_extensions(request.options, options);
+    if (!resolved.ok()) {
+      return resolved.status();
+    }
+    options = std::move(resolved).value();
 
     auto &response = *request.response;
     response.query_count = request.queries.rows;
@@ -615,6 +692,7 @@ class MutableLaserCollectionAdapter {
 
   mutable std::mutex mutex_{};                       // guards transactions_
   std::map<std::uint64_t, Pending> transactions_{};  // keyed by physical txid
+  bool maintenance_active_{};
 
   std::atomic<bool> failed_{false};  // B-04 latch (lock-free)
   mutable std::mutex diag_mutex_{};  // guards diagnostic strings
@@ -645,7 +723,7 @@ class MutableLaserCollectionAdapter {
   config.concurrency.native_async = false;
   config.concurrency.cooperative_cancel = false;
   config.concurrency.explicit_drain = false;
-  auto erased = core::AnySegment::from_sync(std::move(adapter), std::move(config));
+  auto erased = core::AnySegment::from_sync(adapter, std::move(config));
   if (!erased.ok()) {
     return erased.status();
   }
@@ -655,6 +733,15 @@ class MutableLaserCollectionAdapter {
   registration.role = SegmentRole::active_mutable;
   registration.segment = std::move(erased).value();
   registration.atomic_mutation_bundle = true;
+  registration.maintenance.consolidate = [adapter](std::size_t num_threads,
+                                                   std::size_t r_target,
+                                                   bool reclaim_slots,
+                                                   bool bloom_consolidate) {
+    return adapter->consolidate(num_threads, r_target, reclaim_slots, bloom_consolidate);
+  };
+  registration.maintenance.recovery_required = [adapter] {
+    return adapter->recovery_required();
+  };
   return registration;
 }
 

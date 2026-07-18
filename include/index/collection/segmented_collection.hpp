@@ -23,6 +23,7 @@
 #include <shared_mutex>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -587,6 +588,65 @@ class SegmentedCollection {
     return receipt;
   }
 
+  [[nodiscard]] auto consolidate(std::size_t num_threads,
+                                 std::size_t r_target,
+                                 bool reclaim_slots,
+                                 bool bloom_consolidate)
+      -> core::Result<SegmentMaintenanceReceipt> {
+    std::lock_guard checkpoint_lock(checkpoint_mutex_);
+    auto admission = admit();
+    if (!admission.has_value()) {
+      return closed_status(core::OperationStage::checkpoint);
+    }
+    if (auto guard = ensure_not_recovery_required(core::OperationStage::checkpoint); !guard.ok()) {
+      return guard;
+    }
+    if (num_threads == 0) {
+      return core::Status::error(core::StatusCode::invalid_argument,
+                                 core::OperationStage::checkpoint,
+                                 core::StatusDetail::malformed_struct,
+                                 "Collection consolidate requires num_threads > 0");
+    }
+
+    std::lock_guard mutation_lock(mutation_mutex_);
+    // A logical writer can latch recovery-required while this call waits for the
+    // post-COMMIT mutation window. Recheck after taking the mutation barrier and
+    // before resolving or invoking the active hook.
+    if (auto guard = ensure_not_recovery_required(core::OperationStage::checkpoint); !guard.ok()) {
+      return guard;
+    }
+    const auto snapshot = load_snapshot();
+    const auto active = snapshot->find_active_mutable();
+    if (active == nullptr || !active->maintenance.consolidate) {
+      return core::Status::error(core::StatusCode::not_supported,
+                                 core::OperationStage::checkpoint,
+                                 core::StatusDetail::operation_slot_absent,
+                                 "active mutable segment has no consolidate maintenance hook");
+    }
+
+    core::Status status;
+    try {
+      status =
+          active->maintenance.consolidate(num_threads, r_target, reclaim_slots, bloom_consolidate);
+    } catch (...) {
+      status = core::status_from_exception(core::OperationStage::checkpoint);
+    }
+    if (!status.ok()) {
+      bool recovery_required = false;
+      try {
+        recovery_required =
+            active->maintenance.recovery_required && active->maintenance.recovery_required();
+      } catch (...) {
+        recovery_required = true;
+      }
+      if (recovery_required) {
+        latch_recovery_required(status.diagnostic());
+      }
+      return status;
+    }
+    return SegmentMaintenanceReceipt{active->segment_id, active->generation};
+  }
+
   static void apply_checkpoint_to_manifest(const CheckpointReceipt &checkpoint,
                                            ArtifactManifestV2 &manifest) {
     CollectionCheckpointStore::apply_to_manifest(checkpoint, manifest);
@@ -678,7 +738,8 @@ class SegmentedCollection {
                                                source->segment,
                                                source->exact_rerank,
                                                source->next_row_id.load(std::memory_order_acquire),
-                                               source->atomic_mutation_bundle);
+                                               source->atomic_mutation_bundle,
+                                               SegmentMaintenanceHook{});
         break;
       }
     }
@@ -688,7 +749,8 @@ class SegmentedCollection {
                                                             std::move(successor.segment),
                                                             std::move(successor.exact_rerank),
                                                             successor.next_row_id,
-                                                            successor.atomic_mutation_bundle));
+                                                            successor.atomic_mutation_bundle,
+                                                            std::move(successor.maintenance)));
     next->generation = current->generation + 1;
 
     auto stored = CollectionCheckpointStore::write(wal_->directory(),
@@ -753,6 +815,10 @@ class SegmentedCollection {
 
   [[nodiscard]] auto outstanding_search_leases() const noexcept -> std::uint64_t {
     return outstanding_search_leases_.load(std::memory_order_acquire);
+  }
+
+  [[nodiscard]] auto recovery_gate(core::OperationStage stage) const -> core::Status {
+    return ensure_not_recovery_required(stage);
   }
 
  private:
@@ -874,12 +940,8 @@ class SegmentedCollection {
       if (owner_ == nullptr) {
         return;
       }
-      owner_->recovery_required_.store(true, std::memory_order_release);
-      const std::lock_guard<std::mutex> lock(owner_->recovery_diag_mutex_);
-      if (owner_->recovery_diagnostic_.empty()) {
-        owner_->recovery_diagnostic_ =
-            "a committed transaction failed to publish (post-COMMIT window)";
-      }
+      owner_->latch_recovery_required(
+          "a committed transaction failed to publish (post-COMMIT window)");
     }
     void disarm() { owner_ = nullptr; }
 
@@ -1018,7 +1080,8 @@ class SegmentedCollection {
                                                     std::move(target.segment),
                                                     std::move(target.exact_rerank),
                                                     target.next_row_id,
-                                                    false);
+                                                    false,
+                                                    SegmentMaintenanceHook{});
     }
 
     std::set<RowAddress> mapped_sources;
@@ -1171,7 +1234,8 @@ class SegmentedCollection {
                                          std::move(registration.segment),
                                          std::move(registration.exact_rerank),
                                          first_unused,
-                                         registration.atomic_mutation_bundle));
+                                         registration.atomic_mutation_bundle,
+                                         std::move(registration.maintenance)));
     }
     recalculate_counts(*snapshot);
     snapshot->visibility_watermark =
@@ -1310,6 +1374,17 @@ class SegmentedCollection {
                                                     bool prefer_exact)
       -> core::Result<core::FilterExecution> {
     if (!request.filter.active()) {
+      return core::FilterExecution::postfilter;
+    }
+    // The active mutable LASER adapter intentionally does not thread a segment
+    // filter into MutableLaserSegment::search. Keep the aggregate capability
+    // report honest: an active LASER route therefore executes the logical
+    // predicate only after candidate retrieval. Sealed LASER remains eligible
+    // for its existing bitmap traversal path.
+    if (std::ranges::any_of(snapshot.segments, [](const auto &entry) {
+          return entry->role == SegmentRole::active_mutable &&
+                 entry->segment.descriptor().algorithm_id == core::algorithm::laser;
+        })) {
       return core::FilterExecution::postfilter;
     }
     if (prefer_exact || request.options.filter_policy == core::FilterPolicy::strict) {
@@ -2371,6 +2446,19 @@ class SegmentedCollection {
   // B-03: reject write/erase/checkpoint/seal/rotate once the Collection has latched a
   // recovery-required state (a post-COMMIT window exited abnormally). Only a reopen
   // (WAL/checkpoint replay) clears it.
+  void latch_recovery_required(std::string_view diagnostic) noexcept {
+    recovery_required_.store(true, std::memory_order_release);
+    try {
+      const std::lock_guard<std::mutex> lock(recovery_diag_mutex_);
+      if (recovery_diagnostic_.empty()) {
+        recovery_diagnostic_.assign(diagnostic);
+      }
+    } catch (...) {
+      // The atomic latch is authoritative; a diagnostic allocation failure must
+      // never make the recovery gate reopen.
+    }
+  }
+
   [[nodiscard]] auto ensure_not_recovery_required(core::OperationStage stage) const
       -> core::Status {
     if (!recovery_required_.load(std::memory_order_acquire)) {

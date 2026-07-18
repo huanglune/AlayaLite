@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <sstream>
 #include <string>
@@ -91,11 +92,24 @@ enum class CollectionSealFailPoint : std::uint8_t {
   after_successor_switch = 2,
   during_export_build = 3,
   after_manifest_publish = 4,
+  after_active_control_publish_before_routing_install = 5,
 };
 
 struct CollectionSealOptions {
   CollectionSealFailPoint fail_point{CollectionSealFailPoint::none};
   std::function<void(CollectionSealFailPoint)> failpoint_hook{};
+};
+
+struct CollectionConsolidateOptions {
+  std::uint32_t num_threads{1};
+  std::uint32_t r_target{0};
+  bool reclaim_slots{true};
+  bool bloom_consolidate{false};
+};
+
+struct CollectionConsolidateReceipt {
+  std::uint64_t active_segment_id{};
+  std::uint64_t active_generation{};
 };
 
 struct CollectionSealReceipt {
@@ -538,6 +552,20 @@ class Collection {
     return checkpoint(context);
   }
 
+  [[nodiscard]] auto consolidate(CollectionConsolidateOptions options = {})
+      -> core::Result<CollectionConsolidateReceipt> {
+    std::lock_guard lock(control_mutex_);
+    auto receipt = implementation_->consolidate(options.num_threads,
+                                                options.r_target,
+                                                options.reclaim_slots,
+                                                options.bloom_consolidate);
+    if (!receipt.ok()) {
+      return receipt.status();
+    }
+    return CollectionConsolidateReceipt{receipt.value().active_segment_id,
+                                        receipt.value().active_generation};
+  }
+
   [[nodiscard]] auto seal(CollectionSealOptions options = {})
       -> core::Result<CollectionSealReceipt> {
     core::SealContext context;
@@ -844,25 +872,32 @@ class Collection {
             std::to_string(generation));
   }
 
-  // B-09 orphan reclamation. On open, any directory under active_laser/ that is not
-  // the current active generation is unreferenced: either an old generation left
-  // behind by a completed seal/rotate (its rows now live in a sealed manifest
-  // segment) or an unrouted successor from a rotate that crashed before routing. A
-  // fresh open holds no writer flock on those, so removing them is safe. Idempotent
-  // and crash-safe (re-running the sweep is always sound), so it subsumes the
-  // pending-list / cut_pending-successor leaks without a STATE format change.
-  static void sweep_orphan_active_laser_dirs(const std::filesystem::path &root,
-                                             std::uint64_t current_segment_id,
-                                             std::uint64_t current_generation) {
+  // B-09 orphan reclamation. The durable control state is part of the reachability
+  // root: successor-active/building/manifest-published recovery reopens every source
+  // before completing replacement. Keep those paths until a later idle open; an
+  // already-open fd cannot make unlink safe across a second process crash.
+  static void sweep_orphan_active_laser_dirs(
+      const std::filesystem::path &root,
+      const internal::collection::CollectionControlState &control_state) {
     std::error_code error;
     const auto active_root = root / ".alaya_internal" / "active_laser";
     if (!std::filesystem::is_directory(active_root, error)) {
       return;
     }
-    const auto keep = active_laser_dir(root, current_segment_id, current_generation).filename();
+    std::set<std::filesystem::path> keep;
+    keep.insert(
+        active_laser_dir(root, control_state.active_segment_id, control_state.active_generation)
+            .filename());
+    if (control_state.phase == internal::collection::CollectionControlPhase::successor_active ||
+        control_state.phase == internal::collection::CollectionControlPhase::building ||
+        control_state.phase == internal::collection::CollectionControlPhase::manifest_published) {
+      for (const auto &source : control_state.sources) {
+        keep.insert(active_laser_dir(root, source.segment_id, source.generation).filename());
+      }
+    }
     std::vector<std::filesystem::path> orphans;
     for (const auto &entry : std::filesystem::directory_iterator(active_root, error)) {
-      if (entry.is_directory(error) && entry.path().filename() != keep) {
+      if (entry.is_directory(error) && !keep.contains(entry.path().filename())) {
         orphans.push_back(entry.path());
       }
     }
@@ -945,6 +980,7 @@ class Collection {
     try {
       laser::UpdateParams params;
       params.max_points = active_laser_capacity(options);
+      params.enable_pid_reuse = true;
       auto segment =
           std::make_shared<::alaya::disk::MutableLaserSegment>(dir,
                                                                params,
@@ -1031,9 +1067,7 @@ class Collection {
     }
 
     if (options.active_engine == core::algorithm::laser) {
-      sweep_orphan_active_laser_dirs(options.root,
-                                     control_state.active_segment_id,
-                                     control_state.active_generation);
+      sweep_orphan_active_laser_dirs(options.root, control_state);
     }
     auto active = make_active_registration(options,
                                            control_state.active_segment_id,
@@ -1373,6 +1407,9 @@ class Collection {
 
   [[nodiscard]] auto seal_locked(core::SealContext &context, const CollectionSealOptions &options)
       -> core::Result<CollectionSealReceipt> {
+    if (auto gate = implementation_->recovery_gate(core::OperationStage::freeze); !gate.ok()) {
+      return gate;
+    }
     auto handle = prepare_successor_locked(context, options);
     if (!handle.ok()) {
       return handle.status();
@@ -1395,6 +1432,9 @@ class Collection {
   [[nodiscard]] auto prepare_successor_locked(core::SealContext &context,
                                               const CollectionSealOptions &options)
       -> core::Result<CollectionRotationHandle> {
+    if (auto gate = implementation_->recovery_gate(core::OperationStage::freeze); !gate.ok()) {
+      return gate;
+    }
     if (pending_rotation_.has_value()) {
       return error(core::StatusCode::conflict,
                    core::OperationStage::freeze,
@@ -1478,23 +1518,24 @@ class Collection {
       checkpoint_context.dirty_page_io_credits = context.io_credits;
       checkpoint_context.wal_io_credits = context.io_credits;
       checkpoint_context.durability_target = core::DurabilityTarget::full_checkpoint;
-      auto rotated =
-          implementation_->rotate_to_successor(std::move(successor).value(),
-                                               checkpoint_context,
-                                               [&](const internal::collection::ActiveRotationReceipt
-                                                       &receipt) {
-                                                 control_state_.active_segment_id =
-                                                     receipt.successor_segment_id;
-                                                 control_state_.active_generation =
-                                                     receipt.successor_generation;
-                                                 control_state_.wal_cut =
-                                                     receipt.checkpoint.wal_cut;
-                                                 control_state_.phase = internal::collection::
-                                                     CollectionControlPhase::successor_active;
-                                                 return internal::collection::
-                                                     CollectionControlStore::save(options_.root,
-                                                                                  control_state_);
-                                               });
+      auto rotated = implementation_->rotate_to_successor(
+          std::move(successor).value(),
+          checkpoint_context,
+          [&](const internal::collection::ActiveRotationReceipt &receipt) {
+            control_state_.active_segment_id = receipt.successor_segment_id;
+            control_state_.active_generation = receipt.successor_generation;
+            control_state_.wal_cut = receipt.checkpoint.wal_cut;
+            control_state_.phase = internal::collection::CollectionControlPhase::successor_active;
+            auto saved =
+                internal::collection::CollectionControlStore::save(options_.root, control_state_);
+            if (!saved.ok()) {
+              return saved;
+            }
+            fire_seal_failpoint(options,
+                                CollectionSealFailPoint::
+                                    after_active_control_publish_before_routing_install);
+            return core::Status::success();
+          });
       if (!rotated.ok()) {
         return rotated.status();
       }
@@ -1659,6 +1700,9 @@ class Collection {
   [[nodiscard]] auto rotate_to_successor_locked(const CollectionRotationHandle &handle,
                                                 core::SealContext &context)
       -> core::Result<CollectionSealReceipt> {
+    if (auto gate = implementation_->recovery_gate(core::OperationStage::save); !gate.ok()) {
+      return gate;
+    }
     if (!pending_rotation_.has_value() ||
         control_state_.phase != internal::collection::CollectionControlPhase::manifest_published ||
         handle.successor_segment_id != control_state_.target_segment_id ||
@@ -1819,6 +1863,9 @@ class Collection {
 
   [[nodiscard]] auto compact_locked(core::SealContext &context)
       -> core::Result<CollectionCompactReceipt> {
+    if (auto gate = implementation_->recovery_gate(core::OperationStage::build); !gate.ok()) {
+      return gate;
+    }
     auto status = core::validate_runtime_control(context.deadline,
                                                  context.cancellation,
                                                  core::OperationStage::build);
@@ -2059,6 +2106,9 @@ class Collection {
   }
 
   [[nodiscard]] auto gc_locked() -> core::Result<CollectionGcReceipt> {
+    if (auto gate = implementation_->recovery_gate(core::OperationStage::save); !gate.ok()) {
+      return gate;
+    }
     auto loaded = internal::collection::load_manifest_v2_if_present(options_.root);
     if (!loaded.ok()) {
       return loaded.status();

@@ -8,6 +8,7 @@
 // collection layer's loud rejection of a foreign record type.
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <array>
 #include <cstddef>
@@ -236,6 +237,150 @@ TEST(CollectionScanCrossFamily, TornTailStillTruncatesToVerifiedBoundary) {
   const auto opened = CollectionLogicalWal::open(root);
   ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
   EXPECT_EQ(slurp(wal_path).size(), clean_size) << "torn tail should be healed to the boundary";
+  std::filesystem::remove_all(root);
+}
+
+// B-2C-04: append() reports each frame's FrameLocation, visit_frames streams them
+// back one at a time (bounded memory), and read_frame re-reads exactly one frame
+// with full CRC re-validation. Wire is unchanged (the golden test above still
+// pins make_frame).
+TEST(WalFileStreamingApi, AppendLocationsVisitAndReadFrame) {
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("wal_frame_stream_" + std::to_string(::getpid()));
+  std::filesystem::create_directories(root);
+  const auto path = root / "seg.opwal";
+  std::vector<FrameLocation> locations;
+  std::vector<std::vector<std::byte>> payloads;
+  {
+    WalFile wal(path);
+    for (unsigned i = 0; i < 5; ++i) {
+      auto payload = bytes_of({i, static_cast<unsigned>(i * 7 + 1), 0xAB, 0xCD});
+      const auto loc = wal.append(/*type=*/5, /*flags=*/0, /*op_id=*/i, /*batch_id=*/i * 2,
+                                  payload, WalFile::Sync::flush);
+      locations.push_back(loc);
+      payloads.push_back(std::move(payload));
+    }
+  }
+  // Locations are contiguous and ascending.
+  EXPECT_EQ(locations.front().offset, 0U);
+  for (std::size_t i = 1; i < locations.size(); ++i) {
+    EXPECT_EQ(locations[i].offset, locations[i - 1].offset + locations[i - 1].size);
+  }
+  // visit_frames streams every frame in order; stop early on demand.
+  std::vector<ScannedFrame> visited;
+  WalFile::visit_frames(path, [&](const ScannedFrame &f) {
+    visited.push_back(f);
+    return true;
+  });
+  ASSERT_EQ(visited.size(), payloads.size());
+  for (std::size_t i = 0; i < visited.size(); ++i) {
+    EXPECT_EQ(visited[i].op_id, i);
+    EXPECT_EQ(visited[i].batch_id, i * 2);
+    EXPECT_EQ(visited[i].offset, locations[i].offset);
+    EXPECT_EQ(visited[i].size, locations[i].size);
+    EXPECT_EQ(visited[i].payload, payloads[i]);
+  }
+  std::size_t seen = 0;
+  WalFile::visit_frames(path, [&](const ScannedFrame &) {
+    ++seen;
+    return seen < 2;  // ask to stop after the second frame
+  });
+  EXPECT_EQ(seen, 2U);
+  // read_frame re-reads exactly one frame at its location, CRC-validated.
+  for (std::size_t i = 0; i < locations.size(); ++i) {
+    const auto f = WalFile::read_frame(path, locations[i]);
+    EXPECT_EQ(f.op_id, i);
+    EXPECT_EQ(f.payload, payloads[i]);
+  }
+  // A mangled location fails closed (wrong size / off-boundary offset).
+  EXPECT_THROW((void)WalFile::read_frame(path, FrameLocation{locations[1].offset + 1,
+                                                             locations[1].size}),
+               std::exception);
+  EXPECT_THROW((void)WalFile::read_frame(path, FrameLocation{locations[1].offset, 3}),
+               std::exception);
+  // Re-open continues appending after the recovered boundary (append cursor is
+  // restored from the last verified frame).
+  {
+    WalFile wal(path);
+    auto payload = bytes_of({0xEE});
+    const auto loc = wal.append(6, 0, 99, 0, payload, WalFile::Sync::fsync);
+    EXPECT_EQ(loc.offset, locations.back().offset + locations.back().size);
+    const auto f = WalFile::read_frame(path, loc);
+    EXPECT_EQ(f.op_id, 99U);
+  }
+  std::filesystem::remove_all(root);
+}
+
+// wal-2c BLOCKER-3: scan_structure_streaming must agree with scan_path on the last
+// verified boundary and the torn-tail flag, while holding at most one frame in memory
+// (it never retains payloads). This is the recovery-open path the QG op-WAL now uses so a
+// multi-GiB log opens in O(max frame) instead of O(file).
+TEST(WalFileStreamingApi, StructureStreamingScanMatchesEagerScan) {
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("wal_frame_streamscan_" + std::to_string(::getpid()));
+  std::filesystem::create_directories(root);
+  const auto path = root / "seg.opwal";
+  {
+    WalFile wal(path);
+    for (unsigned i = 0; i < 7; ++i) {
+      wal.append(/*type=*/5, 0, i, i, bytes_of({i, 0xAA, 0xBB, static_cast<unsigned>(i)}),
+                 WalFile::Sync::fsync);
+    }
+  }
+  // Clean log: streaming and eager agree on valid_bytes; streaming keeps no frames.
+  const auto eager_clean = WalFile::scan_path(path);
+  const auto stream_clean = WalFile::scan_structure_streaming(path);
+  EXPECT_FALSE(eager_clean.stopped_at_corrupt_or_torn_tail);
+  EXPECT_FALSE(stream_clean.stopped_at_corrupt_or_torn_tail);
+  EXPECT_EQ(stream_clean.valid_bytes, eager_clean.valid_bytes);
+  EXPECT_TRUE(stream_clean.frames.empty()) << "streaming scan must not retain payloads";
+  EXPECT_EQ(eager_clean.frames.size(), 7U);
+  // Append a partial (torn) trailing frame: both must stop at the same verified boundary.
+  {
+    std::ofstream out(path, std::ios::binary | std::ios::app);
+    const char junk[9] = {'W', 'A', 'L', '7', 1, 5, 0, 0, 0};
+    out.write(junk, sizeof(junk));
+  }
+  const auto eager_torn = WalFile::scan_path(path);
+  const auto stream_torn = WalFile::scan_structure_streaming(path);
+  EXPECT_TRUE(eager_torn.stopped_at_corrupt_or_torn_tail);
+  EXPECT_TRUE(stream_torn.stopped_at_corrupt_or_torn_tail);
+  EXPECT_EQ(stream_torn.valid_bytes, eager_torn.valid_bytes);
+  EXPECT_EQ(stream_torn.valid_bytes, stream_clean.valid_bytes) << "torn tail heals to the boundary";
+  EXPECT_TRUE(stream_torn.frames.empty());
+  std::filesystem::remove_all(root);
+}
+
+// wal-2c MAJOR-4: truncate_to() on a stream-recovery WalFile must re-scan the tail with the
+// PAYLOAD-FREE streaming scan (not the eager scan_path that retains every frame). Otherwise a
+// torn canonical/maintenance tail truncation on a multi-GiB log would reintroduce O(WAL bytes)
+// recovery memory. A default (eager) WalFile keeps the old behavior (frames retained).
+TEST(WalFileStreamingApi, StreamTruncateToDoesNotRetainPayload) {
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("wal_frame_streamtrunc_" + std::to_string(::getpid()));
+  std::filesystem::create_directories(root);
+  const auto path = root / "seg.opwal";
+  std::vector<FrameLocation> locs;
+  {
+    WalFile wal(path, /*stream_recovery=*/true);
+    for (unsigned i = 0; i < 8; ++i) {
+      locs.push_back(wal.append(/*type=*/5, 0, i, i, bytes_of({i, 0xAA, 0xBB, 0xCC}),
+                                WalFile::Sync::fsync));
+    }
+    // Truncate back to the 4th frame boundary (as a torn-tail semantic truncation would).
+    wal.truncate_to(locs[4].offset);
+    EXPECT_EQ(wal.recovery_scan().valid_bytes, locs[4].offset);
+    EXPECT_TRUE(wal.recovery_scan().frames.empty())
+        << "stream-mode truncate_to must not retain frame payloads";
+  }
+  // An eager (default) WalFile truncated to the same boundary DOES retain the frames -- proves
+  // the streaming path is the one that changed, and the wire/behavior of the default is intact.
+  {
+    WalFile wal(path, /*stream_recovery=*/false);  // reopens at the truncated boundary (4 frames)
+    EXPECT_EQ(wal.recovery_scan().frames.size(), 4U);
+    wal.truncate_to(locs[2].offset);
+    EXPECT_EQ(wal.recovery_scan().frames.size(), 2U) << "eager truncate_to retains frames";
+  }
   std::filesystem::remove_all(root);
 }
 
