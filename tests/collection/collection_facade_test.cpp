@@ -505,6 +505,29 @@ TEST(CollectionFacade, PersistedAutoSealRowsOverflowIsRejectedBeforeWalRecovery)
   }
 }
 
+#if !ALAYA_COLLECTION_HAS_ACTIVE_LASER
+TEST(CollectionFacade, ActiveLaserCreateWithoutCapabilityRejectsBeforePersisting) {
+  TemporaryDirectory temporary;
+  auto configured = options(temporary.path());
+  configured.dim = 128;
+  configured.target_algorithm = core::algorithm::laser;
+  configured.quantization = CollectionQuantization::rabitq;
+  configured.max_neighbors = 32;
+  configured.active_engine = core::algorithm::laser;
+
+  auto rejected = Collection::create(configured);
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.status().code(), core::StatusCode::not_supported);
+  EXPECT_EQ(rejected.status().detail(), core::StatusDetail::operation_slot_absent);
+  EXPECT_FALSE(std::filesystem::exists(temporary.path()));
+  EXPECT_FALSE(internal::collection::CollectionControlStore::exists(temporary.path()));
+
+  auto flat = Collection::create(flat_options(temporary.path()));
+  ASSERT_TRUE(flat.ok()) << flat.status().diagnostic();
+  ASSERT_TRUE(flat.value()->close().ok());
+}
+#endif
+
 #ifndef _WIN32
 TEST(CollectionFacade, SealFourPointSigkillRecoveryRollsBackOrForward) {
   const std::array cases{CollectionSealFailPoint::after_cut_before_successor,

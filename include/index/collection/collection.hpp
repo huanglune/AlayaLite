@@ -865,6 +865,17 @@ class Collection {
                    core::StatusDetail::operation_slot_absent,
                    "canonical Collection active engine is unsupported");
     }
+#if !ALAYA_COLLECTION_HAS_ACTIVE_LASER
+    // Capability admission must precede every filesystem mutation in create():
+    // rejecting only inside create_active_laser_segment() would leave a persisted
+    // schema/control layout that later blocks a flat retry with already_exists.
+    if (options.active_engine == core::algorithm::laser) {
+      return error(core::StatusCode::not_supported,
+                   stage,
+                   core::StatusDetail::operation_slot_absent,
+                   "active LASER engine requires a Linux build with ALAYA_ENABLE_LASER");
+    }
+#endif
     if (options.active_engine == core::algorithm::laser) {
       const bool power_of_two = options.dim >= 128 && (options.dim & (options.dim - 1)) == 0;
       if (options.metric != core::Metric::l2 || options.scalar_type != core::ScalarType::float32 ||
