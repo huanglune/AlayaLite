@@ -30,8 +30,8 @@
 namespace alaya::laser {
 
 // SEGMENT_OP record type in the shared WAL7 envelope. Cross-reference:
-// docs/design/unified-wal-vocabulary.md section 2, and the "5 is reserved for
-// SEGMENT_OP" note on LogicalWalRecordType in
+// docs/design/unified-wal-vocabulary.md section 2, and the type-5 SEGMENT_OP
+// note on LogicalWalRecordType in
 // include/index/collection/logical_wal.hpp.
 inline constexpr std::uint8_t kSegmentOpRecordType = 5;
 
@@ -144,7 +144,7 @@ struct SegmentOp {
   // 2A label transaction. tx_id mirrors the frame batch_id (validated on replay).
   std::uint64_t tx_id{};                     // label_bind, tx_publish
   std::uint64_t row_op_id{};                 // label_bind: 0..binding_count-1 within the bundle
-  std::uint32_t pid_generation{};            // label_bind: must be 0 (non-zero => poison)
+  std::uint32_t pid_generation{};  // label_bind: 0 without reuse; current non-zero on reuse
   std::uint64_t label{};                     // label_bind: appended-row label (pid stored in `pid`)
   std::uint64_t new_pid_watermark{};         // tx_publish: old_hwm + binding_count
   std::uint64_t binding_count{};             // tx_publish: >= 1

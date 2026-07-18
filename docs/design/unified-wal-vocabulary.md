@@ -42,7 +42,7 @@ header's id fields keep their v1 meanings (op id, batch op id).
 | type | meaning | status |
 |---:|---|---|
 | 1–4 | `PREPARE`/`COMMIT`/`PUBLISH_MARKER`/`CHECKPOINT` | shipped |
-| **5** | **`SEGMENT_OP`** — segment-physical operation | **reserved by this contract** |
+| **5** | **`SEGMENT_OP`** — segment-physical operation | **shipped with 2C** |
 | 6–15 | future collection-level records | reserved |
 | 16+ | unassigned | — |
 
@@ -176,11 +176,10 @@ frame regardless of family.
 
 ### 5. Codec reuse
 
-The `SEGMENT_OP` payload codec uses `logical_wal_detail` primitives
-(`put_u*/get_u*/crc32`). The byte `Decoder` currently in
-`mutation_wal_codec_detail` is hoisted into `logical_wal_detail` when the
-segment codec first needs it (mechanical move, no format impact). **No
-third primitive set.**
+The `SEGMENT_OP` payload codec uses the shared primitives in
+`include/wal/frame.hpp`, under `alaya::wal` (`put_u*`, `get_u*`, `crc32`, and
+`Decoder`). The collection logical codec delegates to the same delivered
+primitive set. **No third primitive set.**
 
 ### 6. What is *not* a WAL op
 
