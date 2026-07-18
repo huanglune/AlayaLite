@@ -6,6 +6,8 @@
 #include <csignal>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -89,6 +91,14 @@ class TemporaryDirectory {
 [[nodiscard]] auto id_string(const core::LogicalId &id) -> std::string {
   const auto bytes = id.canonical_bytes();
   return {reinterpret_cast<const char *>(bytes.data()), bytes.size()};
+}
+
+[[nodiscard]] auto logical_wal_bytes(const std::filesystem::path &root) -> std::vector<char> {
+  const auto path = root / ".alaya_internal" /
+                    std::string(internal::collection::kCollectionWalNamespace) /
+                    std::string(internal::collection::kCollectionWalFilename);
+  std::ifstream input(path, std::ios::binary);
+  return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
 TEST(CollectionFacade, CanonicalResultsReceiptsStatsCheckpointAndReopen) {
@@ -432,6 +442,67 @@ TEST(CollectionFacade, AutoSealRotatesAtConfiguredRowThreshold) {
   EXPECT_EQ(reopened.value()->options().auto_seal_rows, 2U);
   EXPECT_EQ(reopened.value()->size(), 2U);
   ASSERT_TRUE(reopened.value()->close().ok());
+}
+
+TEST(CollectionFacade, AutoSealRowsCapacityArithmeticAcceptsMaximumSafeValue) {
+  TemporaryDirectory temporary;
+  constexpr auto max_safe =
+      (std::numeric_limits<std::size_t>::max() - std::size_t{4096}) / std::size_t{2};
+  auto configured = flat_options(temporary.path());
+  configured.auto_seal_rows = max_safe;
+
+  auto created = Collection::create(configured);
+  ASSERT_TRUE(created.ok()) << created.status().diagnostic();
+  ASSERT_TRUE(created.value()->close().ok());
+  created.value().reset();
+
+  auto reopened = Collection::open(temporary.path());
+  ASSERT_TRUE(reopened.ok()) << reopened.status().diagnostic();
+  EXPECT_EQ(reopened.value()->options().auto_seal_rows, max_safe);
+  ASSERT_TRUE(reopened.value()->close().ok());
+}
+
+TEST(CollectionFacade, AutoSealRowsCapacityOverflowIsRejectedBeforeWalCreation) {
+  constexpr auto max_safe =
+      (std::numeric_limits<std::size_t>::max() - std::size_t{4096}) / std::size_t{2};
+  for (const auto invalid :
+       {static_cast<std::uint64_t>(max_safe) + 1U, std::numeric_limits<std::uint64_t>::max()}) {
+    TemporaryDirectory temporary;
+    auto configured = flat_options(temporary.path());
+    configured.auto_seal_rows = invalid;
+
+    auto rejected = Collection::create(configured);
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.status().code(), core::StatusCode::invalid_argument);
+    EXPECT_EQ(rejected.status().detail(), core::StatusDetail::arithmetic_overflow);
+    EXPECT_FALSE(std::filesystem::exists(temporary.path()));
+  }
+}
+
+TEST(CollectionFacade, PersistedAutoSealRowsOverflowIsRejectedBeforeWalRecovery) {
+  constexpr auto max_safe =
+      (std::numeric_limits<std::size_t>::max() - std::size_t{4096}) / std::size_t{2};
+  for (const auto invalid :
+       {static_cast<std::uint64_t>(max_safe) + 1U, std::numeric_limits<std::uint64_t>::max()}) {
+    TemporaryDirectory temporary;
+    auto created = Collection::create(flat_options(temporary.path()));
+    ASSERT_TRUE(created.ok()) << created.status().diagnostic();
+    ASSERT_TRUE(created.value()->close().ok());
+    created.value().reset();
+
+    auto loaded = internal::collection::CollectionControlStore::load(temporary.path());
+    ASSERT_TRUE(loaded.ok()) << loaded.status().diagnostic();
+    auto state = std::move(loaded).value();
+    state.auto_seal_rows = invalid;
+    ASSERT_TRUE(internal::collection::CollectionControlStore::save(temporary.path(), state).ok());
+    const auto wal_before = logical_wal_bytes(temporary.path());
+
+    auto rejected = Collection::open(temporary.path());
+    ASSERT_FALSE(rejected.ok());
+    EXPECT_EQ(rejected.status().code(), core::StatusCode::invalid_argument);
+    EXPECT_EQ(rejected.status().detail(), core::StatusDetail::arithmetic_overflow);
+    EXPECT_EQ(logical_wal_bytes(temporary.path()), wal_before);
+  }
 }
 
 #ifndef _WIN32

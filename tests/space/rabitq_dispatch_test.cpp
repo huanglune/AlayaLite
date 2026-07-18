@@ -24,9 +24,10 @@
 namespace alaya {
 namespace {
 
-auto has_avx512_bw() -> bool {
+auto has_avx512_vl_target() -> bool {
   const auto &features = simd::get_cpu_features();
-  return features.avx512f_ && features.avx512bw_;
+  return features.avx512f_ && features.avx512bw_ && features.avx512dq_ && features.avx512vl_ &&
+         features.avx512_os_state_;
 }
 
 auto has_avx2_fma() -> bool {
@@ -36,7 +37,7 @@ auto has_avx2_fma() -> bool {
 
 TEST(RabitqDispatchTest, FactoriesSelectHighestSupportedIsa) {
 #ifdef ALAYA_ARCH_X86
-  if (has_avx512_bw()) {
+  if (has_avx512_vl_target()) {
     EXPECT_STREQ(rabitq_simd::get_rabitq_simd_name(), "avx512");
     EXPECT_EQ(rabitq_simd::get_accumulate_func(), ::alaya::simd::fastscan::accumulate_avx512);
     EXPECT_EQ(rabitq_simd::get_estimate_distances_func(),
@@ -76,6 +77,23 @@ TEST(RabitqDispatchTest, FactoriesSelectHighestSupportedIsa) {
   EXPECT_EQ(rabitq_simd::get_kacs_walk_func(), rabitq_simd::detail::kacs_walk_generic);
   EXPECT_EQ(rabitq_simd::get_scalar_quantize_optimized_func(),
             rabitq_simd::detail::scalar_quantize_optimized_generic);
+}
+
+TEST(RabitqDispatchTest, Avx512RequiresFullVlTargetFeatureSetAndOsState) {
+  simd::CpuFeatures features;
+  features.avx512f_ = true;
+  features.avx512bw_ = true;
+  features.avx2_ = true;
+  features.fma_ = true;
+
+  EXPECT_EQ(rabitq_simd::select_rabitq_simd_level(features), rabitq_simd::RabitqSimdLevel::kAvx2);
+
+  features.avx512dq_ = true;
+  features.avx512vl_ = true;
+  EXPECT_EQ(rabitq_simd::select_rabitq_simd_level(features), rabitq_simd::RabitqSimdLevel::kAvx2);
+
+  features.avx512_os_state_ = true;
+  EXPECT_EQ(rabitq_simd::select_rabitq_simd_level(features), rabitq_simd::RabitqSimdLevel::kAvx512);
 }
 
 TEST(RabitqDispatchTest, AccumulateDifferentialFuzz) {

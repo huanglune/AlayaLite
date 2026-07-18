@@ -36,13 +36,19 @@ TEST(CpuFeaturesTest, GetSimdLevelNameMatchesEachEnum) {
   EXPECT_STREQ(get_simd_level_name(SimdLevel::kAvx512), "AVX-512");
 }
 
-TEST(CpuFeaturesTest, ExposesAvx512BwCapability) {
+TEST(CpuFeaturesTest, ExposesAvx512VlTargetCapabilitiesAndOsState) {
   CpuFeatures features;
   features.avx512f_ = true;
   features.avx512bw_ = true;
+  features.avx512dq_ = true;
+  features.avx512vl_ = true;
+  features.avx512_os_state_ = true;
 
   EXPECT_TRUE(features.avx512f_);
   EXPECT_TRUE(features.avx512bw_);
+  EXPECT_TRUE(features.avx512dq_);
+  EXPECT_TRUE(features.avx512vl_);
+  EXPECT_TRUE(features.avx512_os_state_);
 }
 
 TEST(CpuFeaturesTest, RuntimeHelpersStayConsistent) {

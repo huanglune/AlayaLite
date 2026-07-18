@@ -315,11 +315,15 @@ class Collection {
             return loaded_state.status();
           }
           auto state = std::move(loaded_state).value();
-          auto status = normalize_control_state_before_open(root, state);
+          options.value().auto_seal_rows = state.auto_seal_rows;
+          auto status = validate_options(options.value(), core::OperationStage::open);
           if (!status.ok()) {
             return status;
           }
-          options.value().auto_seal_rows = state.auto_seal_rows;
+          status = normalize_control_state_before_open(root, state);
+          if (!status.ok()) {
+            return status;
+          }
           auto opened = open_segmented(options.value(), state);
           if (!opened.ok()) {
             return opened.status();
@@ -795,6 +799,12 @@ class Collection {
                    core::StatusDetail::malformed_struct,
                    "canonical Collection schema/root/build parameters are invalid");
     }
+    if (!checked_active_laser_capacity(options.auto_seal_rows).has_value()) {
+      return error(core::StatusCode::invalid_argument,
+                   stage,
+                   core::StatusDetail::arithmetic_overflow,
+                   "canonical Collection auto_seal_rows exceeds the active LASER capacity limit");
+    }
     const auto metric_valid = options.metric == core::Metric::l2 ||
                               options.metric == core::Metric::inner_product ||
                               options.metric == core::Metric::cosine;
@@ -923,11 +933,28 @@ class Collection {
   // Ruling 12: physical row capacity of the active LASER segment. Default 4096; when
   // auto_seal_rows is set, keep the capacity strictly above it (churn headroom) so
   // the auto-seal threshold can never exceed the physical capacity.
-  static auto active_laser_capacity(const CollectionOptions &options) -> std::size_t {
-    if (options.auto_seal_rows == 0) {
+  [[nodiscard]] static auto checked_active_laser_capacity(std::uint64_t auto_seal_rows)
+      -> std::optional<std::size_t> {
+    if (auto_seal_rows == 0) {
       return 4096;
     }
-    return static_cast<std::size_t>(options.auto_seal_rows) * 2 + 4096;
+    if constexpr (sizeof(std::size_t) < sizeof(std::uint64_t)) {
+      if (auto_seal_rows > std::numeric_limits<std::size_t>::max()) {
+        return std::nullopt;
+      }
+    }
+    const auto threshold = static_cast<std::size_t>(auto_seal_rows);
+    std::size_t doubled{};
+    std::size_t capacity{};
+    if (alaya_mul_overflow(threshold, std::size_t{2}, &doubled) ||
+        alaya_add_overflow(doubled, std::size_t{4096}, &capacity) || capacity <= threshold) {
+      return std::nullopt;
+    }
+    return capacity;
+  }
+
+  static auto active_laser_capacity(const CollectionOptions &options) -> std::size_t {
+    return checked_active_laser_capacity(options.auto_seal_rows).value();
   }
 
   // Materialize a fresh empty active LASER segment directory (create-time / rotate).
