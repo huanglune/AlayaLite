@@ -94,6 +94,11 @@ format, while parsed fields make failures diagnosable.
 serializer through `PyIndex`; a representative byte corpus is used rather than
 checking in 33 redundant copies.
 
+Terminal-state note (2026-07-19): the table immediately below records the
+pre-migration coverage map. Memory-QG serving and its v1 golden family have
+since retired; current qg persistence is the `collection_qg_laser` family, and
+`memory_qg::Builder` survives only as an IP/cosine topology producer.
+
 | type | Python behavior | C++ compile surface | persistence format |
 |---|---:|---:|---:|
 | HNSW memory | yes (`Index`) | yes | yes, raw and SQ8 graph/data/quant representatives |
@@ -113,12 +118,12 @@ checking in 33 redundant copies.
 Regenerate and compare artifacts with:
 
 ```bash
-cmake --build build/Release --target artifact_diskann_generator \
+cmake --build --preset release --target \
   artifact_disk_flat_segment_generator \
-  artifact_disk_vamana_segment_generator \
-  artifact_memory_qg_generator artifact_memory_vamana_generator
-PYTHONPATH=python/src:build/Release/python \
-  python scripts/golden/generate_artifact_baseline.py
+  artifact_collection_qg_laser_generator \
+  laser_fixture_builder _alayalitepy
+uv run --locked python tests/golden/generate_artifact_baseline.py \
+  --build-dir build/Release
 ```
 
 Use `--write` only when intentionally accepting a format change.  The size map
