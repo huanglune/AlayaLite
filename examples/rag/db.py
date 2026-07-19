@@ -32,7 +32,7 @@ def insert_text(
     print(f"Embedding {len(chunks)} chunks into vectors")
 
     if embeddings is None:
-        print("Fail to embed chunks. Not to insert")
+        print("Embedding failed; no chunks were inserted")
         return False
 
     print(f"Inserting {len(chunks)} chunks")

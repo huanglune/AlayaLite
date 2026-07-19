@@ -1,6 +1,6 @@
 # Try Your Own RAG App with AlayaLite
 
-This tutorial gives a step-by-step guidance to deploy a RAG web app uing AlayaLite.
+This tutorial gives step-by-step guidance for deploying a RAG web app using AlayaLite.
 
 
 ## 0. Project Overview
@@ -9,7 +9,7 @@ There are only 4 core files:
 - `ui.py`: Defines webpage frontend, using [streamlit](https://streamlit.io/);
 - `db.py`: Includes core interfaces to manage documents. It has two key APIs: `insert_text` put text into database, and `query_text` get the related documents for the query from the database;
 - `llm.py`: Creates prompt and generates response from LLM;
-- `utils.py`: Includes util functions, i.e., `splitter` and `embedder`, to process text.
+- `utils.py`: Provides the `splitter` and `embedder` text-processing utilities.
 
 The overview is shown below
 
@@ -31,7 +31,7 @@ docker build -t try-rag-image .
 ```
 
 It will take several minutes to download and install packages.
-If success, you will see `Successfully tagged try-rag-image:latest`.
+If the build succeeds, you will see `Successfully tagged try-rag-image:latest`.
 Then you can start a container to run it.
 
 ```bash
@@ -61,7 +61,7 @@ streamlit run ui.py
 ```
 
 Your app will start at the port `8501`.
-You CANNOT visit the webpage by using the URL shown in the terminal, but `Github Codespaces` will forward the service to a public location.
+In GitHub Codespaces, use the forwarded port rather than the terminal's local URL.
 You can switch to the tab `PORT` to see the forwarded URL.
 
 ![PORT](https://github.com/AlayaDB-AI/AlayaLite/blob/main/examples/rag/figures/port.png?raw=true)
