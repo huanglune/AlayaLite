@@ -43,13 +43,13 @@ def _require_complete_v2_surface() -> None:
         pytest.skip("SDK v2 public core has not landed; contract goldens are dormant")
 
 
-@pytest.fixture
-def sdk() -> Any:
+@pytest.fixture(name="sdk")
+def sdk_fixture() -> Any:
     return importlib.import_module("alayalite")
 
 
-@pytest.fixture
-def flat_config(sdk: Any) -> Any:
+@pytest.fixture(name="flat_config")
+def flat_config_fixture(sdk: Any) -> Any:
     return sdk.CollectionConfig(
         dimension=3,
         dtype="float32",
