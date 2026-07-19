@@ -4,7 +4,7 @@
 .PHONY: help build build-debug build-release build-san build-coverage \
         test test-cpp test-cpp-debug test-san test-py test-py-integration test-py-cov \
         lint format configure \
-        install dev-install wheel clean clean-release clean-debug clean-all codegen \
+        install dev-install wheel clean clean-release clean-debug clean-all \
         bump-version release-dry version
 
 # Configuration. Build flavors are defined once in CMakePresets.json; the *_DIR variables mirror the presets'
@@ -106,9 +106,6 @@ lint: ## Run all pre-commit checks
 format: ## Auto-format C++/Python sources (uses pre-commit pinned versions)
 	@uvx pre-commit run clang-format -a
 	@uvx pre-commit run ruff-format -a
-
-codegen: ## Regenerate Python-binding dispatch header from tools/codegen/dispatch.yaml
-	@uv run python tools/codegen/gen.py
 
 # ============================================================================
 # Install & Package

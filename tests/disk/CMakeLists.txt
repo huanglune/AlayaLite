@@ -122,7 +122,6 @@ if(ALAYA_ENABLE_LASER)
   set(ALAYA_LASER_SEGMENT_TEST_CANDIDATES
       test_laser_segment_importer.cpp
       test_laser_segment_searcher.cpp
-      test_segment_factory_laser.cpp
       test_laser_searcher_thread_safety.cpp
       test_laser_arena_reentrancy.cpp
       laser_segment_test.cpp
@@ -177,9 +176,7 @@ if(ALAYA_ENABLE_LASER)
     add_custom_target(test_laser_segment DEPENDS ${ALAYA_LASER_SEGMENT_TEST_TARGETS})
   endif()
 else()
-  set(ALAYA_LASER_NEGATIVE_TEST_CANDIDATES test_laser_segment_importer.cpp test_laser_segment_searcher.cpp
-                                           test_segment_factory_laser.cpp
-  )
+  set(ALAYA_LASER_NEGATIVE_TEST_CANDIDATES test_laser_segment_importer.cpp test_laser_segment_searcher.cpp)
   set(ALAYA_LASER_NEGATIVE_TEST_TARGETS)
   foreach(laser_negative_test_source IN LISTS ALAYA_LASER_NEGATIVE_TEST_CANDIDATES)
     if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${laser_negative_test_source})
