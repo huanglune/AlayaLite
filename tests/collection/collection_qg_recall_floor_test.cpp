@@ -26,6 +26,7 @@
 #include <gtest/gtest.h>
 
 #include "alaya/collection.hpp"
+#include "index/collection/artifact_manifest_v2.hpp"
 #include "platform/detect.hpp"
 #include "utils/evaluate.hpp"
 
@@ -197,6 +198,26 @@ void insert_dataset(Collection &collection, const Dataset &dataset) {
   return static_cast<double>(matches) / static_cast<double>(kQueryCount * kTopK);
 }
 
+// Engine identity must come from the segment that seal() actually published.
+// The algorithm id intentionally cannot distinguish this wave's same-id swap,
+// and Collection::target_implementation_key() describes configured intent,
+// not the implementation that won support resolution.
+void expect_memory_qg_engine_identity(const std::filesystem::path &root) {
+  const auto manifest = internal::collection::ArtifactManifestV2::load(
+      root / internal::collection::kCollectionManifestFilename);
+  const auto target = std::ranges::find_if(manifest.segments, [](const auto &entry) {
+    return entry.lifecycle == internal::collection::SegmentLifecycleV2::sealed;
+  });
+  ASSERT_NE(target, manifest.segments.end());
+  EXPECT_EQ(target->factory_key, "qg");
+  EXPECT_EQ(target->reader_compatibility.required_features,
+            (std::vector<std::string>{"qg_segment"}));
+  EXPECT_NE(target->factory_key, "flat");
+  EXPECT_EQ(std::ranges::find(target->reader_compatibility.required_features,
+                             "disk_flat_segment"),
+            target->reader_compatibility.required_features.end());
+}
+
 // Builds a QG-target Collection, seals it, searches with `queries`, and
 // returns recall@kTopK against `oracle_row_ids`.
 [[nodiscard]] auto measure_qg_recall(std::string_view name,
@@ -222,6 +243,7 @@ void insert_dataset(Collection &collection, const Dataset &dataset) {
       << name << ": expected a real qg segment, not a flat fallback ("
       << sealed.value().fallback_reason << ")";
   EXPECT_FALSE(sealed.value().flat_fallback) << name << ": " << sealed.value().fallback_reason;
+  expect_memory_qg_engine_identity(temporary.path());
 
   auto response =
       collection->batch_search(core::TypedTensorView::contiguous(queries.data(), kQueryCount, kDim),
