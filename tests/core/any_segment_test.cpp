@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -10,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -60,6 +62,8 @@ auto make_request(const float *data,
 
 struct CountingSegment {
   std::atomic_uint32_t calls{};
+  mutable std::mutex execution_mutex{};
+  std::thread::id last_execution_thread{};
 
   auto descriptor() const noexcept -> Descriptor {
     Descriptor descriptor;
@@ -78,9 +82,19 @@ struct CountingSegment {
     return Status::success();
   }
 
+  [[nodiscard]] auto execution_thread() const -> std::thread::id {
+    std::lock_guard lock(execution_mutex);
+    return last_execution_thread;
+  }
+
  private:
   auto execute(const SearchRequest &request) const -> Status {
-    const_cast<CountingSegment *>(this)->calls.fetch_add(1, std::memory_order_relaxed);
+    auto *mutable_self = const_cast<CountingSegment *>(this);
+    mutable_self->calls.fetch_add(1, std::memory_order_relaxed);
+    {
+      std::lock_guard lock(execution_mutex);
+      mutable_self->last_execution_thread = std::this_thread::get_id();
+    }
     auto &response = *request.response;
     RowCount cursor = 0;
     response.offsets[0] = 0;
@@ -129,6 +143,7 @@ struct BudgetSegment {
 struct SlowGate {
   std::mutex mutex;
   std::condition_variable condition;
+  Deadline *operation_deadline{};
   bool entered{};
   bool release{};
 };
@@ -141,8 +156,9 @@ struct SlowSegment {
     descriptor.dim = 2;
     return descriptor;
   }
-  auto search(const SearchRequest &) const -> Status {
+  auto search(const SearchRequest &request) const -> Status {
     std::unique_lock lock(gate->mutex);
+    gate->operation_deadline = std::addressof(request.context->deadline);
     gate->entered = true;
     gate->condition.notify_all();
     gate->condition.wait(lock, [&] {
@@ -240,6 +256,48 @@ TEST(AnySegmentV3, WritesFlattenedPerQueryResponseWithoutSentinels) {
   EXPECT_EQ(static_cast<std::uint64_t>(storage.hits[1].row_id), 1U);
 }
 
+TEST(AnySegmentV3, SyncWaitRunsSyncAdapterOnCallingThread) {
+  auto producer = std::make_shared<CountingSegment>();
+  auto erased = AnySegment::from_sync(producer);
+  ASSERT_TRUE(erased.ok());
+  auto segment = std::move(erased).value();
+  std::array<float, 2> query{};
+  SearchContext context;
+  ResponseStorage storage(1, 1);
+  auto request = make_request(query.data(), 1, 2, 1, context, storage);
+  const auto caller = std::this_thread::get_id();
+
+  const auto status = segment.search(std::move(request));
+
+  EXPECT_TRUE(status.ok());
+  EXPECT_EQ(producer->execution_thread(), caller);
+  EXPECT_EQ(storage.counts[0], 1U);
+  EXPECT_TRUE(storage.statuses[0].ok());
+}
+
+TEST(AnySegmentV3, AsyncStartRunsSyncAdapterOffCallingThread) {
+  auto producer = std::make_shared<CountingSegment>();
+  auto erased = AnySegment::from_sync(producer);
+  ASSERT_TRUE(erased.ok());
+  auto segment = std::move(erased).value();
+  std::array<float, 2> query{};
+  SearchContext context;
+  ResponseStorage storage(1, 1);
+  auto request = make_request(query.data(), 1, 2, 1, context, storage);
+  auto waiter = std::make_shared<CompletionWaiter>();
+  const auto caller = std::this_thread::get_id();
+
+  auto started = segment.start_search(std::move(request), SearchCompletion([waiter](Status status) {
+                                        waiter->complete(std::move(status));
+                                      }));
+  ASSERT_TRUE(started.ok());
+  auto handle = std::move(started).value();
+  EXPECT_TRUE(handle.valid());
+  EXPECT_TRUE(waiter->wait().ok());
+  EXPECT_NE(producer->execution_thread(), caller);
+  EXPECT_EQ(storage.counts[0], 1U);
+}
+
 TEST(AnySegmentV3, ConvertsEngineExceptionToStatusAndInvalidatesWholeSink) {
   auto erased = AnySegment::from_sync(std::make_shared<ThrowingSegment>());
   ASSERT_TRUE(erased.ok());
@@ -306,6 +364,11 @@ TEST(AnySegmentV3, CancelKeepsExternalPinUntilExactlyOnceCompletion) {
   EXPECT_FALSE(weak_pin.expired());
   handle.cancel();
   handle.cancel();
+  EXPECT_FALSE(weak_pin.expired());
+  {
+    std::lock_guard lock(waiter->mutex);
+    EXPECT_FALSE(waiter->done);
+  }
   {
     std::lock_guard lock(gate->mutex);
     gate->release = true;
@@ -337,6 +400,53 @@ TEST(AnySegmentV3, DeadlineBeforeExecutionCompletesSafelyWithoutCallingEngine) {
   EXPECT_EQ(status.code(), StatusCode::deadline_exceeded);
   EXPECT_EQ(producer->calls.load(), 0U);
   EXPECT_EQ(storage.statuses[0].code(), StatusCode::deadline_exceeded);
+}
+
+TEST(AnySegmentV3, DeadlineDuringExecutionWaitsForEngineThenInvalidatesResponse) {
+  auto gate = std::make_shared<SlowGate>();
+  auto erased = AnySegment::from_sync(std::make_shared<SlowSegment>(SlowSegment{gate}));
+  ASSERT_TRUE(erased.ok());
+  auto segment = std::move(erased).value();
+  std::array<float, 2> query{};
+  SearchContext context;
+  ResponseStorage storage(1, 1);
+  auto request = make_request(query.data(), 1, 2, 1, context, storage);
+  Status status;
+
+  std::thread caller([&] {
+    status = segment.search(std::move(request));
+  });
+  bool entered{};
+  {
+    std::unique_lock lock(gate->mutex);
+    entered = gate->condition.wait_for(lock, 5s, [&] {
+      return gate->entered;
+    });
+  }
+  if (!entered) {
+    {
+      std::lock_guard lock(gate->mutex);
+      gate->release = true;
+    }
+    gate->condition.notify_all();
+    caller.join();
+    FAIL() << "sync adapter did not enter the engine";
+  }
+  {
+    std::lock_guard lock(gate->mutex);
+    EXPECT_NE(gate->operation_deadline, nullptr);
+    if (gate->operation_deadline != nullptr) {
+      *gate->operation_deadline = Deadline::at(std::chrono::steady_clock::now() - 1ms);
+    }
+    gate->release = true;
+  }
+  gate->condition.notify_all();
+  caller.join();
+
+  EXPECT_EQ(status.code(), StatusCode::deadline_exceeded);
+  EXPECT_EQ(storage.counts[0], 0U);
+  EXPECT_EQ(storage.statuses[0].code(), StatusCode::deadline_exceeded);
+  EXPECT_EQ(storage.completeness[0], SearchCompleteness::failed);
 }
 
 struct ManualLane {
@@ -372,6 +482,40 @@ TEST(AnySegmentV3, CompletionUsesRequestedLaneAndNeverRunsInline) {
                                         completed.store(true, std::memory_order_release);
                                       }));
   ASSERT_TRUE(started.ok());
+  EXPECT_FALSE(completed.load(std::memory_order_acquire));
+  RuntimeLane::Task task;
+  {
+    std::unique_lock lock(lane.mutex);
+    ASSERT_TRUE(lane.ready.wait_for(lock, 5s, [&] {
+      return static_cast<bool>(lane.task);
+    }));
+    task = std::move(lane.task);
+  }
+  EXPECT_FALSE(completed.load(std::memory_order_acquire));
+  task();
+  EXPECT_TRUE(completed.load(std::memory_order_acquire));
+}
+
+TEST(AnySegmentV3, ImmediateCompletionUsesRequestedLaneAndNeverRunsInline) {
+  auto producer = std::make_shared<CountingSegment>();
+  auto erased = AnySegment::from_sync(producer);
+  ASSERT_TRUE(erased.ok());
+  auto segment = std::move(erased).value();
+  std::array<float, 2> query{};
+  SearchContext context;
+  ManualLane lane;
+  context.lane.state = &lane;
+  context.lane.post = &ManualLane::post;
+  ResponseStorage storage(1, 0);
+  auto request = make_request(query.data(), 1, 2, 0, context, storage);
+  std::atomic_bool completed{};
+
+  auto started = segment.start_search(std::move(request), SearchCompletion([&](Status status) {
+                                        EXPECT_TRUE(status.ok());
+                                        completed.store(true, std::memory_order_release);
+                                      }));
+  ASSERT_TRUE(started.ok());
+  EXPECT_EQ(producer->calls.load(), 0U);
   EXPECT_FALSE(completed.load(std::memory_order_acquire));
   RuntimeLane::Task task;
   {

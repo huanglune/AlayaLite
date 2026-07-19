@@ -53,10 +53,13 @@ types.
   `budget_denied` detail. Gate 10 strengthens accounting policy without
   changing these signatures.
 
-The sync-engine adapter schedules work off the caller stack, dispatches the
-completion through the request lane, catches engine exceptions at the erased
-boundary, and holds the request lifetime pin until the completion callback.
-Cancel and timeout never authorize early buffer release.
+The sync-engine adapter keeps the public asynchronous `start_search` family off
+the caller stack on a bounded reusable executor. The synchronous `search`
+start-then-wait wrapper executes that same adapter inline because it cannot
+abandon its wait. Both paths dispatch completion through the request lane,
+catch engine exceptions at the erased boundary, and hold the request lifetime
+pin until the completion callback. Cancel and timeout never authorize early
+buffer release.
 
 Gate 2 does not introduce Collection routing, LogicalId persistence, WAL,
 manifest v2, or Python facade switching. Those remain Gates 4 and later.

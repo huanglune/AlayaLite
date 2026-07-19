@@ -4,16 +4,20 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "core/capabilities.hpp"
 
@@ -104,6 +108,120 @@ struct AnySegmentOperationTable {
 };
 
 namespace detail {
+
+// The public start_* surface must return while a synchronous engine is still
+// running, so its adapter work cannot run on the caller stack. Reuse a bounded
+// set of workers instead of creating and detaching one thread per operation.
+class SyncAdapterExecutor {
+ public:
+  using Task = std::function<void()>;
+
+  SyncAdapterExecutor(const SyncAdapterExecutor &) = delete;
+  auto operator=(const SyncAdapterExecutor &) -> SyncAdapterExecutor & = delete;
+
+  static auto instance() -> SyncAdapterExecutor & {
+    static SyncAdapterExecutor executor;
+    return executor;
+  }
+
+  void submit(Task task) {
+    {
+      std::lock_guard lock(mutex_);
+      if (stopping_) {
+        throw std::runtime_error("AnySegment sync adapter executor is stopping");
+      }
+      tasks_.push_back(std::move(task));
+    }
+    ready_.notify_one();
+  }
+
+  ~SyncAdapterExecutor() {
+    {
+      std::lock_guard lock(mutex_);
+      stopping_ = true;
+    }
+    ready_.notify_all();
+    for (auto &worker : workers_) {
+      worker.join();
+    }
+  }
+
+ private:
+  static constexpr std::size_t kMaxWorkers = 16;
+
+  SyncAdapterExecutor() {
+    const auto hardware = std::thread::hardware_concurrency();
+    const auto worker_count =
+        std::clamp<std::size_t>(hardware == 0 ? 1U : hardware, 1U, kMaxWorkers);
+    workers_.reserve(worker_count);
+    try {
+      for (std::size_t index = 0; index < worker_count; ++index) {
+        workers_.emplace_back([this] {
+          worker_loop();
+        });
+      }
+    } catch (...) {
+      {
+        std::lock_guard lock(mutex_);
+        stopping_ = true;
+      }
+      ready_.notify_all();
+      for (auto &worker : workers_) {
+        worker.join();
+      }
+      throw;
+    }
+  }
+
+  void worker_loop() noexcept {
+    for (;;) {
+      Task task;
+      {
+        std::unique_lock lock(mutex_);
+        ready_.wait(lock, [this] {
+          return stopping_ || !tasks_.empty();
+        });
+        if (stopping_ && tasks_.empty()) {
+          return;
+        }
+        task = std::move(tasks_.front());
+        tasks_.pop_front();
+      }
+      try {
+        task();
+      } catch (...) {
+        // Adapter tasks own their exception-to-Status boundary. Keep a bad
+        // task from terminating a shared worker if that invariant regresses.
+      }
+    }
+  }
+
+  std::mutex mutex_{};
+  std::condition_variable ready_{};
+  std::deque<Task> tasks_{};
+  std::vector<std::thread> workers_{};
+  bool stopping_{};
+};
+
+// AnySegment::search is a start-then-unconditional-wait wrapper. It marks only
+// the immediate adapter dispatch so a from_sync engine can execute on that
+// caller stack. start_search/start_batch_search never set this marker and keep
+// their asynchronous execution semantics through SyncAdapterExecutor.
+inline thread_local bool sync_adapter_inline_requested{};
+
+class SyncAdapterInlineScope {
+ public:
+  explicit SyncAdapterInlineScope(bool requested) noexcept
+      : previous_(std::exchange(sync_adapter_inline_requested, requested)) {}
+
+  SyncAdapterInlineScope(const SyncAdapterInlineScope &) = delete;
+  auto operator=(const SyncAdapterInlineScope &) -> SyncAdapterInlineScope & = delete;
+
+  ~SyncAdapterInlineScope() { sync_adapter_inline_requested = previous_; }
+
+ private:
+  bool previous_{};
+};
 
 struct AsyncOperationState {
   std::atomic_bool cancelled{};
@@ -226,9 +344,14 @@ auto start_sync_search(const std::shared_ptr<void> &instance,
     state->request = std::move(request);
     state->completion = std::move(completion);
     state->bind_context();
-    std::thread([state] {
+    if (sync_adapter_inline_requested) {
+      SyncAdapterInlineScope suspend_inline_request(false);
       state->run(state);
-    }).detach();
+    } else {
+      SyncAdapterExecutor::instance().submit([state] {
+        state->run(state);
+      });
+    }
     return OperationHandle(state, [](void *raw) noexcept {
       static_cast<SyncSearchState<Segment, Batch> *>(raw)->cancel();
     });
@@ -245,7 +368,7 @@ inline auto start_immediate(SearchRequest request,
     state->request = std::move(request);
     state->completion = std::move(completion);
     state->bind_context();
-    std::thread([state, status = std::move(status)]() mutable {
+    auto finish = [state, status = std::move(status)]() mutable {
       auto delivered = status;
       if (state->cancelled.load(std::memory_order_acquire) && delivered.ok()) {
         delivered = Status::error(StatusCode::cancelled,
@@ -255,7 +378,13 @@ inline auto start_immediate(SearchRequest request,
         invalidate_failed_response(state->request, delivered);
       }
       state->finish(std::move(delivered), state);
-    }).detach();
+    };
+    if (sync_adapter_inline_requested) {
+      SyncAdapterInlineScope suspend_inline_request(false);
+      finish();
+    } else {
+      SyncAdapterExecutor::instance().submit(std::move(finish));
+    }
     return OperationHandle(state, [](void *raw) noexcept {
       static_cast<AsyncOperationState *>(raw)->cancel();
     });
@@ -521,9 +650,12 @@ class AnySegment {
       }
       wait->ready.notify_one();
     });
-    auto started = request.queries.rows == 1
-                       ? start_search(std::move(request), std::move(completion))
-                       : start_batch_search(std::move(request), std::move(completion));
+    auto started = [&] {
+      detail::SyncAdapterInlineScope inline_sync_adapter(true);
+      return request.queries.rows == 1
+                 ? start_search(std::move(request), std::move(completion))
+                 : start_batch_search(std::move(request), std::move(completion));
+    }();
     if (!started.ok()) {
       return started.status();
     }
