@@ -11,7 +11,7 @@
 //
 // Differences from the qg fixture this mirrors:
 //  - this remains the established L2 regression lane (unit/nonunit plus
-//    residency parity). IP same-data memqg parity and cosine normalization
+//    residency parity). IP same-data public-qg parity and cosine normalization
 //    semantics live in collection_laser_metric_wiring_test.cpp, so this file
 //    keeps its historical two-tier dataset and thresholds unchanged.
 //  - the baseline tiers retain dim=128 so their historical floor stays

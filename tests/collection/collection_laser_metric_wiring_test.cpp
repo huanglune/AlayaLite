@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 // Production metric wiring for the sealed/read-only LASER Collection target.
-// IP is compared with the existing memory-QG path on identical non-unit data;
+// IP compares the direct LASER id with the public qg-to-LASER route on
+// identical non-unit data;
 // cosine includes a high-norm distractor that wins raw IP but must lose after
 // row normalization. Both cases verify native/Collection proofs and reopen.
 
@@ -309,11 +310,11 @@ void expect_native_result_contract(Searcher &searcher,
       ASSERT_TRUE(normalize_status.ok()) << normalize_status.diagnostic();
       native_candidate = normalized_candidate.data();
     }
-    const auto memqg_domain =
+    const auto qg_distance_domain =
         ::alaya::simd::ip_sqr<float, float>(native_query, native_candidate, kDim);
     EXPECT_TRUE(std::isfinite(hit.distance));
     EXPECT_NEAR(hit.distance, expected, 2.0e-4F);
-    EXPECT_FLOAT_EQ(hit.distance, memqg_domain);
+    EXPECT_FLOAT_EQ(hit.distance, qg_distance_domain);
     EXPECT_LE(previous, hit.distance);
     previous = hit.distance;
   }
@@ -441,7 +442,7 @@ void expect_target_numeric_result_contract(
   }
 }
 
-TEST(CollectionLaserMetricWiring, InnerProductMatchesMemoryQgOnSameNonUnitDataAndReopens) {
+TEST(CollectionLaserMetricWiring, InnerProductMatchesPublicQgRouteOnSameNonUnitDataAndReopens) {
   const auto dataset = make_ip_dataset();
   const auto queries = make_ip_queries(dataset);
   const auto oracle = exact_oracle(dataset, queries, core::Metric::inner_product);
@@ -525,9 +526,10 @@ TEST(CollectionLaserMetricWiring, InnerProductMatchesMemoryQgOnSameNonUnitDataAn
   std::cout << "measured_collection_laser_ip_reopen_recall_at_10=" << reopened_recall << '\n';
   std::cout << "measured_collection_qg_same_data_ip_recall_at_10=" << qg_recall << '\n';
 
-  // Same-data memqg is the topology/quality comparator. The absolute floor
-  // catches a shared collapse; the relative margin tolerates disk traversal
-  // scheduling while still preventing a materially weaker LASER path.
+  // The same-data public qg route is the topology/quality comparator. The
+  // absolute floor catches a shared collapse; the relative margin tolerates
+  // disk traversal scheduling while still preventing a materially weaker
+  // LASER path.
   EXPECT_GE(laser_recall, 0.70);
   EXPECT_GE(reopened_recall, 0.70);
   EXPECT_GE(laser_recall, qg_recall - 0.20);

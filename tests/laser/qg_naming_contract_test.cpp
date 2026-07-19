@@ -10,6 +10,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "core/capabilities.hpp"
 #include "index/graph/qg_naming.hpp"
 #include "space/rabitq_space.hpp"
 
@@ -17,20 +18,20 @@ namespace alaya {
 namespace {
 
 using MemorySpace = RaBitQSpace<>;
-using MemorySegment = memory_qg::Segment<MemorySpace>;
+using MemoryBuilder = memory_qg::Builder<MemorySpace>;
 
-static_assert(std::is_same_v<MemorySegment, QgSegment<MemorySpace>>);
 static_assert(std::is_same_v<disk_laser_qg::Builder, laser::QGBuilder>);
 static_assert(std::is_same_v<disk_laser_qg::Graph, laser::QuantizedGraph>);
 
-static_assert(core::Searchable<MemorySegment>);
-static_assert(!core::Mutable<MemorySegment>);
-static_assert(!std::is_constructible_v<MemorySegment, disk_laser_qg::Graph &, uint32_t, size_t>);
+static_assert(!core::Searchable<MemoryBuilder>);
+static_assert(!core::Saveable<MemoryBuilder>);
+static_assert(!core::Mutable<MemoryBuilder>);
+static_assert(!std::is_constructible_v<MemoryBuilder, disk_laser_qg::Graph &, uint32_t, size_t>);
 static_assert(
     std::is_constructible_v<disk_laser_qg::Builder, disk_laser_qg::Graph &, uint32_t, size_t>);
 static_assert(!std::is_constructible_v<disk_laser_qg::Builder,
-                                       typename MemorySegment::BuildInput,
-                                       QgBuildOptions,
+                                       typename MemoryBuilder::BuildInput,
+                                       memory_qg::BuildOptions,
                                        core::BuildContext &>);
 
 // Golden anchors for the LASER v1 factor field order. The disk payload stores
@@ -42,7 +43,7 @@ static_assert(offsetof(disk_laser_qg::Factor, triple_x) == 0);
 static_assert(offsetof(disk_laser_qg::Factor, factor_dq) == sizeof(float));
 static_assert(offsetof(disk_laser_qg::Factor, factor_vq) == 2 * sizeof(float));
 
-TEST(QGNamingContract, MemoryV1FactorArraysKeepSerializedOrder) {
+TEST(QGNamingContract, MemoryBuilderScratchFactorArraysKeepOrder) {
   constexpr size_t kDim = 64;
   MemorySpace space(/*capacity=*/1, kDim, core::Metric::l2);
   std::vector<float> data(kDim, 0.0F);

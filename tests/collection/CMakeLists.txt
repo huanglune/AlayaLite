@@ -213,8 +213,8 @@ alaya_add_test(
 )
 
 # Collection-level end-to-end tests for the segment admission contract (docs/design/segment-admission-contract.md): a
-# real LASER segment executing a bitmap traversal filter, and the auto-policy fallback when a qg memory segment in the
-# same collection still rejects the filter kind.
+# real LASER segment executing a bitmap traversal filter, and the auto-policy fallback when a Flat segment in the same
+# collection rejects the filter kind.
 if(ALAYA_ENABLE_LASER)
   alaya_cc_target(
     segmented_collection_laser_filter_test
@@ -259,7 +259,7 @@ if(ALAYA_ENABLE_LASER)
     TIMEOUT 300
   )
 
-  # Sealed/read-only LASER metric production wiring: same-data IP parity with memory QG, cosine normalization semantics,
+  # Sealed/read-only LASER metric production wiring: same-data IP parity with the public qg face, cosine normalization,
   # native proofs, and reopen.
   alaya_cc_target(
     collection_laser_metric_wiring_test

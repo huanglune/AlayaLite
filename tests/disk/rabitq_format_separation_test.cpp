@@ -3,35 +3,24 @@
 
 #include <gtest/gtest.h>
 
-#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <memory>
-#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "index/disk/laser_segment.hpp"
-#include "index/graph/qg/qg_segment.hpp"
+#include "index/graph/qg/qg_builder.hpp"
 #include "space/rabitq_space.hpp"
-#include "core/value_types.hpp"
 #include "platform/detect.hpp"
-
-#ifndef ALAYA_LASER_FIXTURE_DIR
-  #define ALAYA_LASER_FIXTURE_DIR ""
-#endif
-
-#ifndef ALAYA_LASER_FIXTURE_PREFIX
-  #define ALAYA_LASER_FIXTURE_PREFIX "dsqg_seg_00000001"
-#endif
 
 namespace alaya::disk {
 namespace {
 
 using MemorySpace = RaBitQSpace<>;
-using MemorySegment = QgSegment<MemorySpace>;
+using MemoryBuilder = memory_qg::Builder<MemorySpace>;
 
 constexpr std::uint32_t kRows = 128;
 constexpr std::uint32_t kCapacity = 144;
@@ -71,26 +60,21 @@ auto make_vectors() -> std::vector<float> {
   return vectors;
 }
 
-void build_memory_qg(const std::filesystem::path &artifact) {
+void build_legacy_memory_qg(const std::filesystem::path &artifact) {
   const auto vectors = make_vectors();
   auto space = std::make_shared<MemorySpace>(kCapacity, kDim, core::Metric::l2);
   space->fit(vectors.data(), kRows);
   core::BuildContext build_context;
-  QgBuildOptions build_options;
+  memory_qg::BuildOptions build_options;
   build_options.ef_build = 64;
   build_options.thread_count = 1;
-  auto segment =
-      MemorySegment::build({core::TypedTensorView::contiguous(vectors.data(), kRows, kDim), space},
-                           build_options,
-                           build_context);
-  const auto artifact_string = artifact.string();
-  const std::array locations{core::ArtifactLocation(MemorySegment::kArtifactName, artifact_string)};
-  core::ArtifactWriter writer{std::span<const core::ArtifactLocation>(locations)};
-  core::ArtifactManifest manifest;
-  const auto status = segment->save(writer, {}, manifest);
-  if (!status.ok()) {
-    throw std::runtime_error(status.diagnostic());
-  }
+  (void)MemoryBuilder::build(
+      {core::TypedTensorView::contiguous(vectors.data(), kRows, kDim), space},
+      build_options,
+      build_context);
+  // Deliberately mint the retired codec directly as hostile input. The
+  // builder itself exports only FrozenGraphSnapshot and has no save surface.
+  space->save(artifact.string());
 }
 
 void write_nonempty(const std::filesystem::path &path) {
@@ -142,16 +126,11 @@ void wrap_memory_qg_as_laser_segment(const std::filesystem::path &memory_artifac
   manifest.save(segment_directory / "manifest.txt");
 }
 
-auto fixture_index() -> std::filesystem::path {
-  const std::string prefix(ALAYA_LASER_FIXTURE_PREFIX);
-  return std::filesystem::path(ALAYA_LASER_FIXTURE_DIR) / (prefix + "_R64_MD128.index");
-}
-
-TEST(RaBitQFormatSeparation, MemoryWireFormatIsRejectedByLaserOpen) {
+TEST(RaBitQFormatSeparation, RetiredMemoryWireFormatIsRejectedByLaserOpen) {
   TemporaryDirectory temporary;
   const auto memory_artifact = temporary.path() / "memory.qg";
   const auto laser_directory = temporary.path() / "seg_00000001";
-  build_memory_qg(memory_artifact);
+  build_legacy_memory_qg(memory_artifact);
   wrap_memory_qg_as_laser_segment(memory_artifact, laser_directory);
 
   core::OpenContext context;
@@ -161,24 +140,6 @@ TEST(RaBitQFormatSeparation, MemoryWireFormatIsRejectedByLaserOpen) {
   EXPECT_NE(opened.status().diagnostic().find("disagrees with LASER index metadata count"),
             std::string::npos)
       << opened.status().diagnostic();
-}
-
-TEST(RaBitQFormatSeparation, LaserWireFormatIsRejectedByMemoryOpen) {
-  const auto laser_artifact = fixture_index();
-  if (!std::filesystem::is_regular_file(laser_artifact)) {
-    GTEST_SKIP() << "LASER fixture is unavailable: " << laser_artifact;
-  }
-  const auto artifact_string = laser_artifact.string();
-  const std::array locations{core::ArtifactLocation(MemorySegment::kArtifactName, artifact_string)};
-  core::OpenContext context;
-  try {
-    (void)MemorySegment::open(core::ArtifactView(locations), {}, context);
-    FAIL() << "LASER wire format was accepted as memory RaBitQ";
-  } catch (const std::invalid_argument &error) {
-    EXPECT_NE(std::string(error.what()).find("artifact is not memory RaBitQ format"),
-              std::string::npos)
-        << error.what();
-  }
 }
 
 }  // namespace

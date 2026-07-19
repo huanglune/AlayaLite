@@ -211,11 +211,10 @@ class L2NormalizedQuerySegment {
 [[nodiscard]] inline auto make_l2_normalized_query_segment(core::AnySegment inner)
     -> core::Result<core::AnySegment> {
   const auto descriptor = inner.descriptor();
-  // `none` covers an unquantized cosine segment (raw storage, no engine-
-  // side quantization); `engine_quantized` covers QG, which always
-  // RaBitQ-quantizes internally regardless of metric (see
-  // QgSegment::descriptor()) -- that internal quantization is orthogonal
-  // to whether this external l2-normalization wrap has already been applied.
+  // `none` covers current unwrapped cosine segments. Keep accepting the
+  // generic `engine_quantized` descriptor state as well: engine-side
+  // quantization is orthogonal to whether this external l2-normalization wrap
+  // has already been applied.
   // The only state that must never be re-wrapped is l2_normalized itself
   // (double-normalizing queries would be wrong).
   const auto inner_not_yet_normalized =

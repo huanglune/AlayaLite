@@ -17,21 +17,19 @@
 
 namespace alaya::detail {
 
-// Segment-owned QG graph authority. Memory QG format v1 interleaves neighbor
-// IDs with vectors, packed codes, and factors in RaBitQSpace. This view keeps
-// those codec bytes in place while moving the graph API and entry point into
-// QgSegment. RaBitQSpace retains graph codec hooks plus its legacy public API;
-// Segment build/search reach them only through this graph authority.
+// Transient QG build graph. RaBitQSpace provides the builder's interleaved
+// neighbor/code/factor scratch storage; no artifact reader or serving segment
+// owns this view.
 template <typename SpaceType>
   requires Space<SpaceType> && is_rabitq_space_v<SpaceType>
-class QgGraph {
+class QgBuildGraph {
  public:
   using DistanceType = typename SpaceType::DistanceTypeAlias;
   using IDType = typename SpaceType::IDTypeAlias;
 
   static constexpr std::size_t kDegreeBound = SpaceType::kDegreeBound;
 
-  explicit QgGraph(std::shared_ptr<SpaceType> codec_space, IDType entry_point = IDType{})
+  explicit QgBuildGraph(std::shared_ptr<SpaceType> codec_space, IDType entry_point = IDType{})
       : codec_space_(std::move(codec_space)), entry_point_(entry_point) {
     if (codec_space_ == nullptr) {
       throw std::invalid_argument("QG graph requires a RaBitQ codec space");
@@ -40,8 +38,7 @@ class QgGraph {
 
   void set_ep(IDType entry_point) {
     entry_point_ = entry_point;
-    // Format v1 persists this codec mirror in RaBitQSpace. Segment search never
-    // reads it; legacy search continues to do so unchanged.
+    // QgBuilderKernel also reaches the entry point through the space facade.
     codec_space_->set_ep(entry_point);
   }
 
@@ -54,8 +51,8 @@ class QgGraph {
   [[nodiscard]] auto get_edges(IDType id) -> IDType * { return codec_space_->get_edges(id); }
 
   void update_nei(IDType id, const std::vector<Neighbor<IDType, DistanceType>> &new_neighbors) {
-    // Keep the retained quantization implementation and interleaved v1 layout
-    // byte-for-byte: it writes neighbor IDs, codes, and factors together.
+    // Keep the measured builder algorithm unchanged: RaBitQSpace writes the
+    // neighbor IDs, codes, and factors together.
     codec_space_->update_nei(id, new_neighbors);
   }
 
@@ -64,12 +61,11 @@ class QgGraph {
   IDType entry_point_{};
 };
 
-// Compatibility facade used only by QgSegment to inject its graph authority
-// into the retained builder/search kernels. The underlying RaBitQSpace remains
-// the vector/quantization owner; graph operations are routed to QgGraph.
+// Builder-only facade that routes graph operations to QgBuildGraph while the
+// underlying RaBitQSpace owns vectors and quantization scratch.
 template <typename SpaceType>
   requires Space<SpaceType> && is_rabitq_space_v<SpaceType>
-class QgSegmentSpaceView {
+class QgBuilderSpaceView {
  public:
   using DataTypeAlias = typename SpaceType::DataTypeAlias;
   using DistanceTypeAlias = typename SpaceType::DistanceTypeAlias;
@@ -78,7 +74,7 @@ class QgSegmentSpaceView {
 
   static constexpr std::size_t kDegreeBound = SpaceType::kDegreeBound;
 
-  QgSegmentSpaceView(SpaceType &space, QgGraph<SpaceType> &graph)
+  QgBuilderSpaceView(SpaceType &space, QgBuildGraph<SpaceType> &graph)
       : space_(std::addressof(space)), graph_(std::addressof(graph)) {}
 
   [[nodiscard]] auto get_dim() const -> std::uint32_t { return space_->get_dim(); }
@@ -121,7 +117,7 @@ class QgSegmentSpaceView {
 
  private:
   SpaceType *space_;
-  QgGraph<SpaceType> *graph_;
+  QgBuildGraph<SpaceType> *graph_;
 };
 
 }  // namespace alaya::detail
@@ -129,6 +125,6 @@ class QgSegmentSpaceView {
 namespace alaya {
 
 template <typename SpaceType>
-struct is_rabitq_space<detail::QgSegmentSpaceView<SpaceType>> : std::true_type {};
+struct is_rabitq_space<detail::QgBuilderSpaceView<SpaceType>> : std::true_type {};
 
 }  // namespace alaya

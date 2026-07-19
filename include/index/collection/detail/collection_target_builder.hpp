@@ -19,18 +19,17 @@
 #include <span>
 #include <string>
 #include <string_view>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "core/algorithm_registry.hpp"
 #include "core/any_segment.hpp"
+#include "index/collection/artifact_transaction.hpp"
 #include "index/collection/detail/collection_flat_target.hpp"
-#include "index/collection/detail/collection_memory_target.hpp"
 #include "index/collection/detail/collection_normalized_segment.hpp"
 #include "index/disk/laser_segment.hpp"
 #include "index/disk/laser_segment_importer.hpp"
-#include "index/graph/qg/qg_segment.hpp"
+#include "index/graph/qg/qg_builder.hpp"
 #include "platform/fs.hpp"
 
 #if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER != 0
@@ -46,6 +45,23 @@ enum class CollectionQuantization : std::uint8_t;
 namespace alaya::internal::collection::detail {
 
 inline constexpr std::string_view kQgLaserImplementationKey{"qg_laser_segment"};
+
+struct CollectionTargetPublication {
+  std::filesystem::path collection_root{};
+  std::string segment_id{};
+  std::uint64_t segment_generation{1};
+  std::uint64_t manifest_generation{1};
+  std::string publication_parent{};
+  std::uint64_t metadata_epoch{};
+  std::string metadata_checkpoint{};
+  std::uint64_t wal_cut{};
+  RowVersionRangeV2 row_versions{};
+  std::string id_map_checkpoint{};
+  CollectionFeatureFlags collection_features{};
+  ArtifactAbortPolicy abort_policy{ArtifactAbortPolicy::eager_cleanup};
+  ArtifactTransactionFailPoint fail_point{ArtifactTransactionFailPoint::none};
+  std::optional<ArtifactManifestV2> base_manifest{};
+};
 
 struct CollectionTargetBuildParams {
   CollectionQuantization quantization{};
@@ -100,11 +116,6 @@ struct CollectionTargetRegistration {
                                               core::RowCount,
                                               const CollectionTargetBuildParams &) -> TargetSupport;
 
-[[nodiscard]] inline auto unsupported_target_support(const CollectionSchema &,
-                                                     core::RowCount,
-                                                     const CollectionTargetBuildParams &)
-    -> TargetSupport;
-
 [[nodiscard]] inline auto qg_target_support(const CollectionSchema &schema,
                                             core::RowCount row_count,
                                             const CollectionTargetBuildParams &params)
@@ -121,20 +132,6 @@ struct CollectionTargetRegistration {
     const CollectionTargetBuildParams &params,
     const CollectionTargetPublication &publication,
     core::BuildContext &context) -> core::Result<CollectionTargetBuildResult>;
-
-[[nodiscard]] inline auto build_unsupported_collection_target(
-    const CollectionSchema &schema,
-    std::span<const RegisteredRow> rows,
-    const CollectionTargetBuildParams &params,
-    const CollectionTargetPublication &publication,
-    core::BuildContext &context) -> core::Result<CollectionTargetBuildResult>;
-
-[[nodiscard]] inline auto build_qg_collection_target(const CollectionSchema &schema,
-                                                     std::span<const RegisteredRow> rows,
-                                                     const CollectionTargetBuildParams &params,
-                                                     const CollectionTargetPublication &publication,
-                                                     core::BuildContext &context)
-    -> core::Result<CollectionTargetBuildResult>;
 
 [[nodiscard]] inline auto build_qg_laser_collection_target(
     const CollectionSchema &schema,
@@ -154,12 +151,6 @@ struct CollectionTargetRegistration {
                                                       const SegmentEntryV2 &entry,
                                                       const CollectionSchema &schema,
                                                       core::OpenContext &context)
-    -> core::Result<core::AnySegment>;
-
-[[nodiscard]] inline auto open_unsupported_collection_target(const std::filesystem::path &root,
-                                                             const SegmentEntryV2 &entry,
-                                                             const CollectionSchema &schema,
-                                                             core::OpenContext &context)
     -> core::Result<core::AnySegment>;
 
 [[nodiscard]] inline auto open_qg_collection_target(const std::filesystem::path &root,
@@ -221,13 +212,6 @@ inline constexpr std::array<CollectionTargetRegistration, 3> kCollectionTargetRe
                                               const CollectionTargetBuildParams &)
     -> TargetSupport {
   return TargetSupport::supported;
-}
-
-[[nodiscard]] inline auto unsupported_target_support(const CollectionSchema &,
-                                                     core::RowCount,
-                                                     const CollectionTargetBuildParams &)
-    -> TargetSupport {
-  return TargetSupport::unsupported;
 }
 
 [[nodiscard]] inline auto qg_target_support(const CollectionSchema &schema,
@@ -385,96 +369,6 @@ template <typename Scalar>
   return result;
 }
 
-[[nodiscard]] inline auto build_qg_collection_target(const CollectionSchema &schema,
-                                                     std::span<const RegisteredRow> rows,
-                                                     const CollectionTargetBuildParams &params,
-                                                     const CollectionTargetPublication &publication,
-                                                     core::BuildContext &context)
-    -> core::Result<CollectionTargetBuildResult> {
-  // Retained only as the topology/compatibility producer while memqg remains
-  // builder-only. kCollectionTargetRegistrations no longer routes new qg
-  // targets here; keeping the legacy feature string is what lets tests mint an
-  // old artifact and prove the new reader still accepts it.
-  constexpr std::string_view kLegacyImplementationKey{"qg_segment"};
-  using Space = ::alaya::RaBitQSpace<>;
-  using Segment = ::alaya::QgSegment<Space>;
-
-  auto harvested = harvest_memory_graph_vectors<float>(schema, rows, "QG");
-  if (!harvested.ok()) {
-    return harvested.status();
-  }
-  auto vectors = std::move(harvested).value();
-  if (schema.metric == core::Metric::cosine) {
-    auto status = l2_normalize_float_rows(vectors, schema.dim, core::OperationStage::build);
-    if (!status.ok()) {
-      return status;
-    }
-  }
-  core::AnySegment erased;
-  try {
-    const auto count = static_cast<std::uint32_t>(vectors.size() / schema.dim);
-    auto space = std::make_shared<Space>(count, schema.dim, schema.metric);
-    space->fit(vectors.data(), count);
-    typename Segment::BuildInput input(core::TypedTensorView::contiguous(vectors.data(),
-                                                                         count,
-                                                                         schema.dim),
-                                       std::move(space));
-    ::alaya::QgBuildOptions options;
-    options.ef_build = params.ef_construction;
-    options.thread_count = params.thread_count;
-    auto built = Segment::build(std::move(input), options, context);
-    auto erased_result = Segment::into_any(std::move(built));
-    if (!erased_result.ok()) {
-      return erased_result.status();
-    }
-    erased = std::move(erased_result).value();
-  } catch (...) {
-    return core::status_from_exception(core::OperationStage::build);
-  }
-  if (schema.metric == core::Metric::cosine) {
-    // QgSegment::descriptor() always reports engine_quantized (RaBitQ is the
-    // only quantization QG has), so the wrap below relies on
-    // make_l2_normalized_query_segment() accepting engine_quantized inner
-    // segments, not just none -- see collection_normalized_segment.hpp.
-    auto normalized = make_l2_normalized_query_segment(std::move(erased));
-    if (!normalized.ok()) {
-      return normalized.status();
-    }
-    erased = std::move(normalized).value();
-  }
-
-  const auto *registration = find_collection_target_registration(core::algorithm::qg);
-  MemoryCollectionTargetDefinition definition;
-  definition.algorithm_id = core::algorithm::qg;
-  definition.implementation_key = kLegacyImplementationKey;
-  definition.factory_key = registration->factory_key;
-  definition.format_version = Segment::kFormatVersion;
-  definition.preprocessing = schema.metric == core::Metric::cosine
-                                 ? core::MetricPreprocessing::l2_normalized
-                                 : core::MetricPreprocessing::engine_quantized;
-  definition.entry_extensions.emplace("quantization", "rabitq");
-  definition.entry_extensions.emplace("ef_build", std::to_string(params.ef_construction));
-  definition.entry_extensions.emplace("thread_count", std::to_string(params.thread_count));
-  definition.artifacts = {
-      {std::string(Segment::kArtifactName), "qg.bin", true, {}},
-  };
-  auto published =
-      publish_memory_collection_target(erased, schema, publication, std::move(definition), context);
-  if (!published.ok()) {
-    return published.status();
-  }
-
-  CollectionTargetBuildResult result;
-  result.segment = std::move(erased);
-  result.requested_algorithm = core::algorithm::qg;
-  result.built_algorithm = core::algorithm::qg;
-  result.implementation_key = kLegacyImplementationKey;
-  result.factory_key = registration->factory_key;
-  result.artifact_bytes = published.value();
-  result.effective_ef_construction = params.ef_construction;
-  return result;
-}
-
 #if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER != 0
 namespace laser_target_detail {
 
@@ -520,26 +414,25 @@ inline auto write_pca_base_fbin(const std::string &prefix,
   }
 }
 
-[[nodiscard]] inline auto build_memory_qg_topology(std::span<const float> vectors,
-                                                   std::uint32_t count,
-                                                   std::uint32_t dim,
-                                                   core::Metric metric,
-                                                   std::uint32_t max_degree,
-                                                   const CollectionTargetBuildParams &params,
-                                                   core::BuildContext &context)
+[[nodiscard]] inline auto build_memqg_topology(std::span<const float> vectors,
+                                               std::uint32_t count,
+                                               std::uint32_t dim,
+                                               core::Metric metric,
+                                               std::uint32_t max_degree,
+                                               const CollectionTargetBuildParams &params,
+                                               core::BuildContext &context)
     -> ::alaya::FrozenGraphSnapshot {
   using Space = ::alaya::RaBitQSpace<>;
-  using Segment = ::alaya::QgSegment<Space>;
+  using Builder = ::alaya::memory_qg::Builder<Space>;
 
   auto space = std::make_shared<Space>(count, dim, metric);
   space->fit(vectors.data(), count);
-  typename Segment::BuildInput input(core::TypedTensorView::contiguous(vectors.data(), count, dim),
+  typename Builder::BuildInput input(core::TypedTensorView::contiguous(vectors.data(), count, dim),
                                      std::move(space));
-  ::alaya::QgBuildOptions options;
+  ::alaya::memory_qg::BuildOptions options;
   options.ef_build = params.ef_construction;
   options.thread_count = params.thread_count;
-  auto segment = Segment::build(std::move(input), options, context);
-  auto source = segment->export_graph_snapshot();
+  auto source = Builder::build(std::move(input), options, context);
   if (source.max_degree() == max_degree) {
     return source;
   }
@@ -606,9 +499,9 @@ struct ScratchDir {
 
 // Builds a native on-disk LASER segment from this Collection's currently
 // live rows and registers it into the Collection's manifest-v2 control
-// plane. The legacy qg memory builder above remains only as the topology
-// producer and old-artifact compatibility fixture; both public qg and direct
-// LASER targets arrive here. LASER's on-disk packer (VamanaBuilder ->
+// plane. The memory-QG builder remains only as the topology producer for the
+// IP/cosine bridge; both public qg and direct LASER targets arrive here.
+// LASER's on-disk packer (VamanaBuilder ->
 // QGBuilder -> LaserSegmentImporter) is inherently file-oriented, so this
 // function's shape is: harvest vectors -> build raw native files in a scratch
 // dir -> import them into
@@ -704,13 +597,13 @@ struct ScratchDir {
       // VamanaBuilder is intentionally L2-only. Reuse the existing memqg
       // metric-aware topology and hand its finalized graph to the LASER
       // packer instead of feeding negative-IP distances into L2 pruning.
-      metric_topology.emplace(laser_target_detail::build_memory_qg_topology(vectors,
-                                                                            count,
-                                                                            schema.dim,
-                                                                            schema.metric,
-                                                                            vamana_params.R,
-                                                                            params,
-                                                                            context));
+      metric_topology.emplace(laser_target_detail::build_memqg_topology(vectors,
+                                                                        count,
+                                                                        schema.dim,
+                                                                        schema.metric,
+                                                                        vamana_params.R,
+                                                                        params,
+                                                                        context));
     }
 
     const auto native_preprocessing = ::alaya::laser::qg_expected_preprocessing(schema.metric);
@@ -765,10 +658,9 @@ struct ScratchDir {
     const auto seg_dir = publication.collection_root / "segments" / publication.segment_id;
     // LaserSegmentImporter::import_from() requires seg_dir's parent to
     // already exist (it deliberately does not create ancestor directories,
-    // only its own atomic tmp-dir + rename at that level) -- unlike the
-    // memory targets above, which go through ArtifactControlPlaneTransaction
-    // and get "segments/" created for them. This is the first LASER build
-    // for a fresh Collection root, so "segments/" may not exist yet.
+    // only its own atomic tmp-dir + rename at that level). This can be the
+    // first sealed build for a fresh Collection root, so "segments/" may not
+    // exist yet.
     std::filesystem::create_directories(seg_dir.parent_path());
     (void)importer.import_from(raw_dir.path, labels.data(), labels.size(), seg_dir);
 
@@ -858,210 +750,12 @@ struct ScratchDir {
                                             context);
 }
 
-[[nodiscard]] inline auto build_unsupported_collection_target(const CollectionSchema &,
-                                                              std::span<const RegisteredRow>,
-                                                              const CollectionTargetBuildParams &,
-                                                              const CollectionTargetPublication &,
-                                                              core::BuildContext &)
-    -> core::Result<CollectionTargetBuildResult> {
-  return core::Status::error(core::StatusCode::not_supported,
-                             core::OperationStage::build,
-                             core::StatusDetail::operation_slot_absent,
-                             "Collection target builder is not enabled in this rollout phase");
-}
-
 [[nodiscard]] inline auto open_flat_collection_target(const std::filesystem::path &root,
                                                       const SegmentEntryV2 &entry,
                                                       const CollectionSchema &schema,
                                                       core::OpenContext &context)
     -> core::Result<core::AnySegment> {
   return open_collection_flat_entry(root, entry, schema.scalar_type, context);
-}
-
-[[nodiscard]] inline auto open_unsupported_collection_target(const std::filesystem::path &,
-                                                             const SegmentEntryV2 &,
-                                                             const CollectionSchema &,
-                                                             core::OpenContext &)
-    -> core::Result<core::AnySegment> {
-  return core::Status::error(core::StatusCode::not_supported,
-                             core::OperationStage::open,
-                             core::StatusDetail::operation_slot_absent,
-                             "Collection target opener is not enabled in this rollout phase");
-}
-
-struct PersistedMemoryGraphTarget {
-  core::ScalarType stored_scalar_type{core::ScalarType::float32};
-  core::MetricPreprocessing preprocessing{core::MetricPreprocessing::none};
-  std::string_view quantization{};
-};
-
-[[nodiscard]] inline auto persisted_memory_graph_target(const SegmentEntryV2 &entry)
-    -> core::Result<PersistedMemoryGraphTarget> {
-  const auto scalar = entry.extensions.find("stored_scalar_type");
-  const auto preprocessing = entry.extensions.find("preprocessing");
-  const auto quantization = entry.extensions.find("quantization");
-  if (scalar == entry.extensions.end() || preprocessing == entry.extensions.end() ||
-      quantization == entry.extensions.end()) {
-    return core::Status::error(core::StatusCode::corruption,
-                               core::OperationStage::open,
-                               core::StatusDetail::malformed_struct,
-                               "memory graph replacement manifest is missing persisted type "
-                               "metadata");
-  }
-
-  PersistedMemoryGraphTarget target;
-  if (scalar->second == "float32") {
-    target.stored_scalar_type = core::ScalarType::float32;
-  } else if (scalar->second == "int8") {
-    target.stored_scalar_type = core::ScalarType::int8;
-  } else if (scalar->second == "uint8") {
-    target.stored_scalar_type = core::ScalarType::uint8;
-  } else {
-    return core::Status::error(core::StatusCode::corruption,
-                               core::OperationStage::open,
-                               core::StatusDetail::malformed_struct,
-                               "memory graph replacement manifest has an unknown stored scalar "
-                               "type");
-  }
-  if (preprocessing->second == "none") {
-    target.preprocessing = core::MetricPreprocessing::none;
-  } else if (preprocessing->second == "l2_normalized") {
-    target.preprocessing = core::MetricPreprocessing::l2_normalized;
-  } else if (preprocessing->second == "engine_quantized") {
-    target.preprocessing = core::MetricPreprocessing::engine_quantized;
-  } else {
-    return core::Status::error(core::StatusCode::corruption,
-                               core::OperationStage::open,
-                               core::StatusDetail::malformed_struct,
-                               "memory graph replacement manifest has unknown preprocessing");
-  }
-  if (quantization->second != "none" && quantization->second != "sq8" &&
-      quantization->second != "sq4") {
-    return core::Status::error(core::StatusCode::corruption,
-                               core::OperationStage::open,
-                               core::StatusDetail::malformed_struct,
-                               "memory graph replacement manifest has unknown quantization");
-  }
-  target.quantization = quantization->second;
-  return target;
-}
-
-template <typename Segment>
-[[nodiscard]] inline auto open_typed_memory_graph_segment(const std::filesystem::path &root,
-                                                          const SegmentEntryV2 &entry,
-                                                          core::OpenContext &context)
-    -> core::Result<core::AnySegment> {
-  constexpr bool kQuantized = !std::is_same_v<typename Segment::SearchSpaceTypeAlias,
-                                              typename Segment::BuildSpaceTypeAlias>;
-  std::array<std::string, 3> paths{};
-  for (const auto &artifact : entry.artifacts) {
-    if (artifact.logical_name == Segment::kGraphArtifactName) {
-      paths[0] = (root / artifact.relative_path).string();
-    } else if (artifact.logical_name == Segment::kDataArtifactName) {
-      paths[1] = (root / artifact.relative_path).string();
-    } else if (artifact.logical_name == Segment::kQuantArtifactName) {
-      paths[2] = (root / artifact.relative_path).string();
-    }
-  }
-  if (paths[0].empty() || paths[1].empty() || (kQuantized && paths[2].empty()) ||
-      (!kQuantized && !paths[2].empty())) {
-    return core::Status::error(core::StatusCode::corruption,
-                               core::OperationStage::open,
-                               core::StatusDetail::malformed_struct,
-                               "memory graph replacement manifest has incompatible native "
-                               "artifacts");
-  }
-  const std::array<core::ArtifactLocation, 3> locations{
-      core::ArtifactLocation(Segment::kGraphArtifactName, paths[0]),
-      core::ArtifactLocation(Segment::kDataArtifactName, paths[1]),
-      core::ArtifactLocation(Segment::kQuantArtifactName, paths[2]),
-  };
-  const auto artifact_count = kQuantized ? std::size_t{3} : std::size_t{2};
-  try {
-    auto opened =
-        Segment::open(core::ArtifactView(std::span<const core::ArtifactLocation>(locations.data(),
-                                                                                 artifact_count)),
-                      core::OpenOptions{},
-                      context);
-    return Segment::into_any(std::move(opened));
-  } catch (...) {
-    return core::status_from_exception(core::OperationStage::open);
-  }
-}
-
-[[nodiscard]] inline auto open_memory_qg_collection_target(const std::filesystem::path &root,
-                                                           const SegmentEntryV2 &entry,
-                                                           const CollectionSchema &schema,
-                                                           core::OpenContext &context)
-    -> core::Result<core::AnySegment> {
-  using Space = ::alaya::RaBitQSpace<>;
-  using Segment = ::alaya::QgSegment<Space>;
-
-  if (entry.algorithm_id != core::algorithm::qg ||
-      entry.format_version != Segment::kFormatVersion ||
-      entry.lifecycle == SegmentLifecycleV2::retired ||
-      schema.scalar_type != core::ScalarType::float32 ||
-      (schema.metric != core::Metric::l2 && schema.metric != core::Metric::inner_product &&
-       schema.metric != core::Metric::cosine)) {
-    return core::Status::error(core::StatusCode::not_supported,
-                               core::OperationStage::open,
-                               core::StatusDetail::operation_slot_absent,
-                               "Collection QG opener received an incompatible segment entry");
-  }
-
-  const auto scalar = entry.extensions.find("stored_scalar_type");
-  const auto preprocessing = entry.extensions.find("preprocessing");
-  const auto quantization = entry.extensions.find("quantization");
-  // QG always RaBitQ-quantizes internally, so only cosine (external l2
-  // normalization on top of that internal quantization) needs to diverge
-  // from the plain engine_quantized tag -- mirrors
-  // build_qg_collection_target()'s write side.
-  const auto expected_preprocessing =
-      schema.metric == core::Metric::cosine ? "l2_normalized" : "engine_quantized";
-  if (scalar == entry.extensions.end() || scalar->second != "float32" ||
-      preprocessing == entry.extensions.end() || preprocessing->second != expected_preprocessing ||
-      quantization == entry.extensions.end() || quantization->second != "rabitq") {
-    return core::Status::error(core::StatusCode::corruption,
-                               core::OperationStage::open,
-                               core::StatusDetail::malformed_struct,
-                               "QG replacement manifest has incompatible persisted type metadata");
-  }
-
-  std::string artifact_path;
-  for (const auto &artifact : entry.artifacts) {
-    if (artifact.logical_name == Segment::kArtifactName) {
-      artifact_path = (root / artifact.relative_path).string();
-    }
-  }
-  if (artifact_path.empty()) {
-    return core::Status::error(core::StatusCode::corruption,
-                               core::OperationStage::open,
-                               core::StatusDetail::malformed_struct,
-                               "QG replacement manifest is missing its native artifact");
-  }
-
-  const std::array<core::ArtifactLocation, 1> locations{
-      core::ArtifactLocation(Segment::kArtifactName, artifact_path),
-  };
-  try {
-    auto opened = Segment::open(core::ArtifactView(locations), core::OpenOptions{}, context);
-    const auto descriptor = opened->descriptor();
-    if (descriptor.dim != schema.dim || descriptor.metric != schema.metric ||
-        descriptor.stored_scalar_type != schema.scalar_type ||
-        descriptor.preprocessing != core::MetricPreprocessing::engine_quantized) {
-      return core::Status::error(core::StatusCode::corruption,
-                                 core::OperationStage::open,
-                                 core::StatusDetail::malformed_struct,
-                                 "QG replacement descriptor disagrees with the Collection schema");
-    }
-    auto erased_result = Segment::into_any(std::move(opened));
-    if (!erased_result.ok() || schema.metric != core::Metric::cosine) {
-      return erased_result;
-    }
-    return make_l2_normalized_query_segment(std::move(erased_result).value());
-  } catch (...) {
-    return core::status_from_exception(core::OperationStage::open);
-  }
 }
 
 // Manifest-driven reopen: CollectionSegmentFactory::open_entry() (see
@@ -1160,7 +854,12 @@ template <typename Segment>
                                              context);
   }
   if (has_feature("qg_segment")) {
-    return open_memory_qg_collection_target(root, entry, schema, context);
+    return core::Status::error(core::StatusCode::not_supported,
+                               core::OperationStage::open,
+                               core::StatusDetail::operation_slot_absent,
+                               "legacy qg_segment artifacts are no longer supported; re-seal the "
+                               "Collection with the "
+                               "current version");
   }
   return core::Status::error(core::StatusCode::not_supported,
                              core::OperationStage::open,

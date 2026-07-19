@@ -208,8 +208,8 @@ inline auto get_estimate_distances_func() -> EstimateDistancesFn {
 }
 
 // ============================================================================
-// 3. accumulate_and_estimate_distances — the fused hot kernel memqg actually
-//    calls per candidate node (rabitq_space.hpp QueryComputer::batch_est_dist).
+// 3. accumulate_and_estimate_distances — the fused hot kernel the memory-QG
+//    builder calls per candidate node (rabitq_space.hpp QueryComputer::batch_est_dist).
 //    Float-only. The pre-refactor generic branch composed the (separately
 //    dispatched) accumulate() and estimate_distances() rather than having its
 //    own scalar body; we preserve that exactly, including its side effect of

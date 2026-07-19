@@ -524,68 +524,26 @@ INSTANTIATE_TEST_SUITE_P(QgFloat32,
                            return info.param == core::Metric::l2 ? "L2" : "InnerProduct";
                          });
 
-TEST(CollectionQgCompatibility, NewReaderOpensLegacyMemoryQgArtifact) {
-  TemporaryDirectory temporary("legacy-reader");
-  constexpr core::RowCount kLegacyRows = 96;
-  const auto dataset = make_float_dataset(kLegacyRows);
-  const auto vectors = core::TypedTensorView::contiguous(dataset.vectors.data(),
-                                                         kLegacyRows,
-                                                         kDim);
-  std::vector<internal::collection::RegisteredRow> rows;
-  rows.reserve(kLegacyRows);
-  for (core::RowCount row = 0; row < kLegacyRows; ++row) {
-    auto owned = internal::collection::OwnedVector::copy_row(vectors, row);
-    ASSERT_TRUE(owned.ok()) << owned.status().diagnostic();
-    internal::collection::RegisteredRow registered;
-    registered.logical_id = dataset.ids[static_cast<std::size_t>(row)];
-    registered.row_id = core::SegmentRowId(row);
-    registered.upsert_sequence = row + 1;
-    registered.payload.vector = std::move(owned).value();
-    rows.push_back(std::move(registered));
-  }
-
-  internal::collection::detail::CollectionTargetBuildParams params;
-  params.quantization = CollectionQuantization::rabitq;
-  params.max_neighbors = 32;
-  params.thread_count = 1;
-  internal::collection::detail::CollectionTargetPublication publication;
-  publication.collection_root = temporary.path();
-  publication.segment_id = "seg_00000001";
-  publication.wal_cut = kLegacyRows;
-  publication.row_versions = {1, kLegacyRows};
-  publication.collection_features.manifest_v2_writer = true;
-  core::BuildContext build_context;
+TEST(CollectionQgCompatibility, NewReaderExplicitlyRejectsLegacyMemoryQgArtifact) {
+  TemporaryDirectory temporary("legacy-reader-rejection");
+  internal::collection::SegmentEntryV2 entry;
+  entry.segment_id = "seg_00000001";
+  entry.algorithm_id = core::algorithm::qg;
+  entry.format_version = 1;
+  entry.factory_key = "qg";
+  entry.reader_compatibility.required_features = {"qg_segment"};
   const internal::collection::CollectionSchema schema{kDim,
                                                       core::Metric::l2,
                                                       core::ScalarType::float32};
-  auto built = internal::collection::detail::build_qg_collection_target(schema,
-                                                                        rows,
-                                                                        params,
-                                                                        publication,
-                                                                        build_context);
-  ASSERT_TRUE(built.ok()) << built.status().diagnostic();
-  EXPECT_EQ(built.value().implementation_key, "qg_segment");
-
-  const auto manifest = internal::collection::ArtifactManifestV2::load(
-      temporary.path() / internal::collection::kCollectionManifestFilename);
-  ASSERT_EQ(manifest.segments.size(), 1U);
-  const auto &entry = manifest.segments.front();
-  EXPECT_EQ(entry.reader_compatibility.required_features,
-            (std::vector<std::string>{"qg_segment"}));
-
   core::OpenContext open_context;
   auto opened = internal::collection::detail::open_qg_collection_target(temporary.path(),
                                                                         entry,
                                                                         schema,
                                                                         open_context);
-  ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
-  const auto descriptor = opened.value().descriptor();
-  EXPECT_EQ(descriptor.algorithm_id, core::algorithm::qg);
-  EXPECT_EQ(descriptor.engine_factory_id, core::algorithm::qg);
-  EXPECT_EQ(descriptor.medium, core::Medium::memory);
-  core::SegmentStats stats;
-  ASSERT_TRUE(opened.value().stats(stats).ok());
-  EXPECT_EQ(stats.live_rows, kLegacyRows);
+  ASSERT_FALSE(opened.ok());
+  EXPECT_EQ(opened.status().code(), core::StatusCode::not_supported);
+  EXPECT_NE(opened.status().diagnostic().find("legacy qg_segment"), std::string::npos);
+  EXPECT_NE(opened.status().diagnostic().find("re-seal"), std::string::npos);
 }
 
 TEST(CollectionQgCosineSeal, NormalizesRecallsReopensHandlesZeroAndMergesWithActiveFlat) {

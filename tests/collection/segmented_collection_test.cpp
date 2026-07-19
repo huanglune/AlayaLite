@@ -20,9 +20,6 @@
 #include <gtest/gtest.h>
 
 #include "fake_mutable_segment.hpp"
-#include "index/graph/qg/qg_segment.hpp"
-#include "space/rabitq_space.hpp"
-#include "space/raw_space.hpp"
 
 namespace alaya::internal::collection {
 namespace {
@@ -804,39 +801,29 @@ TEST(SegmentedCollection, StrictMissingVectorAndBudgetDenialHaveZeroEffectAndRel
   EXPECT_EQ(collection->outstanding_search_leases(), 0U);
 }
 
-TEST(SegmentedCollection, CrossSegmentQgUpsertDeleteSuppressesOldVersions) {
-  using Space = RaBitQSpace<>;
-  using Segment = QgSegment<Space>;
-  // QgSegment::build() requires more live rows than its fixed degree bound
-  // (32); dim stays 2 to keep pairing with FakeMutableSegment, whose wire
-  // format/distance math is hardcoded to dim=2 (see fake_mutable_segment.hpp)
-  // -- MatrixRotator (unlike the default FhtKacRotator) has no dim floor, so
-  // it can rotate a dim=2 space same as any other.
+TEST(SegmentedCollection, CrossSegmentFlatUpsertDeleteSuppressesOldVersions) {
+  // The sealed side only needs to return stable physical rows; version routing,
+  // duplicate suppression, and tombstone ownership are Collection contracts.
+  // StaticSegment is the exact in-memory Flat test double used throughout this
+  // file and keeps this test independent of any retired serving engine.
   constexpr std::uint32_t kRows = 40;
   std::vector<float> data(kRows * 2);
+  StaticSegment::Rows flat_rows;
   for (std::uint32_t row = 0; row < kRows; ++row) {
     data[row * 2] = static_cast<float>(row);
     data[row * 2 + 1] = static_cast<float>(row);
+    flat_rows.emplace(row,
+                      std::array<float, 2>{data[row * 2], data[row * 2 + 1]});
   }
-  auto space = std::make_shared<Space>(kRows, 2, core::Metric::l2, RotatorType::MatrixRotator);
-  space->fit(data.data(), kRows);
-  core::BuildContext build_context;
-  QgBuildOptions build_options;
-  build_options.ef_build = 100;
-  build_options.thread_count = 1;
-  auto qg = Segment::build({core::TypedTensorView::contiguous(data.data(), kRows, 2), space},
-                           build_options,
-                           build_context);
-  auto qg_any = Segment::into_any(std::move(qg));
-  ASSERT_TRUE(qg_any.ok());
+  auto flat = std::make_shared<StaticSegment>(std::move(flat_rows));
 
   SegmentRegistration sealed;
   sealed.segment_id = 1;
   sealed.role = SegmentRole::sealed;
-  sealed.segment = std::move(qg_any).value();
+  sealed.segment = readonly_any(flat);
   for (std::uint32_t row = 0; row < kRows; ++row) {
     const std::array<float, 2> vector{data[row * 2], data[row * 2 + 1]};
-    sealed.rows.push_back({core::LogicalId::from_utf8("qg-" + std::to_string(row)),
+    sealed.rows.push_back({core::LogicalId::from_utf8("flat-" + std::to_string(row)),
                            core::SegmentRowId(row),
                            0,
                            VersionState::live,
@@ -847,7 +834,7 @@ TEST(SegmentedCollection, CrossSegmentQgUpsertDeleteSuppressesOldVersions) {
                                           {std::move(sealed), fake_registration(mutable_producer)});
   ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
   const auto collection = std::move(opened).value();
-  const auto id = core::LogicalId::from_utf8("qg-0");
+  const auto id = core::LogicalId::from_utf8("flat-0");
   const std::array<float, 2> replacement{20.0F, 20.0F};
   core::MutationContext mutation_context;
   auto updated = collection->write(write_request(id, replacement), mutation_context);

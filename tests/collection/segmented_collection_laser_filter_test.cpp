@@ -8,8 +8,8 @@
 //     Gate10 planner's mid-band (traversal) route, on a real LASER
 //     segment -- not_supported no longer occurs, results satisfy the
 //     predicate, and ResultFlag::filtered is set.
-//   - the auto-policy fallback (decision 7): a mixed collection (a QG
-//     memory segment, which still rejects any non-none filter kind, plus
+//   - the auto-policy fallback (decision 7): a mixed collection (a Flat
+//     segment, which rejects any non-none filter kind, plus
 //     the LASER segment) does not fail the whole query under the default
 //     `automatic` filter policy.
 //
@@ -24,14 +24,13 @@
 // reachable that way (paged pool).
 
 #include "index/collection/segmented_collection.hpp"
+#include "index/disk/disk_flat_segment.hpp"
 #include "index/disk/laser_segment.hpp"
 #include "index/disk/laser_segment_importer.hpp"
 #include "index/graph/laser/qg/qg_builder.hpp"
-#include "index/graph/qg/qg_segment.hpp"
 #include "index/graph/vamana/vamana_builder.hpp"
 #include "index/graph/vamana/vamana_writer.hpp"
 #include "platform/detect.hpp"
-#include "space/rabitq_space.hpp"
 
 #include <gtest/gtest.h>
 
@@ -41,6 +40,7 @@
 #include <memory>
 #include <numeric>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -51,10 +51,9 @@ constexpr std::uint32_t kDim = 128;
 constexpr std::uint64_t kLaserCount = 512;
 constexpr std::uint32_t kR = 64;
 constexpr std::uint64_t kLaserLabelBase = 500'000;
-constexpr std::uint32_t kQgRows = 200;
-constexpr std::uint32_t kQgCapacity = 256;
+constexpr std::uint32_t kFlatRows = 200;
 constexpr std::uint64_t kLaserSegmentId = 1;
-constexpr std::uint64_t kQgSegmentId = 2;
+constexpr std::uint64_t kFlatSegmentId = 2;
 
 std::vector<float> make_data(std::uint64_t n, std::uint32_t dim, std::uint32_t seed) {
   std::mt19937 gen(seed);
@@ -225,33 +224,45 @@ struct LaserFixture {
   return registration;
 }
 
-using QgSpace = RaBitQSpace<>;
-using QgMemorySegment = QgSegment<QgSpace>;
+[[nodiscard]] auto build_flat_registration(const LaserFixture &fixture,
+                                           std::vector<float> &flat_data)
+    -> SegmentRegistration {
+  static std::uint64_t serial{};
+  flat_data = make_data(kFlatRows, kDim, /*seed=*/777);
+  std::vector<std::uint64_t> row_ids(kFlatRows);
+  std::iota(row_ids.begin(), row_ids.end(), std::uint64_t{0});
 
-[[nodiscard]] auto build_qg_registration(std::vector<float> &qg_data) -> SegmentRegistration {
-  qg_data = make_data(kQgRows, kDim, /*seed=*/777);
-  auto space = std::make_shared<QgSpace>(kQgCapacity, kDim, core::Metric::l2);
-  space->fit(qg_data.data(), kQgRows);
+  ::alaya::disk::DiskFlatPublicationOptions options;
+  options.collection_root = fixture.root / ("flat-fallback-" + std::to_string(++serial));
+  options.segment_id = "seg_00000002";
   core::BuildContext build_context;
-  auto segment = QgMemorySegment::build(
-      {core::TypedTensorView::contiguous(qg_data.data(), kQgRows, kDim), space},
-      {.ef_build = 64, .thread_count = 1},
+  auto built = ::alaya::disk::DiskFlatSegmentFactory::build(
+      {core::TypedTensorView::contiguous(flat_data.data(), kFlatRows, kDim), row_ids},
+      core::Metric::l2,
+      options,
       build_context);
-  auto any = QgMemorySegment::into_any(std::move(segment));
-  EXPECT_TRUE(any.ok()) << any.status().diagnostic();
+  if (!built.ok()) {
+    throw std::runtime_error("cannot build Flat fallback fixture: " +
+                             built.status().diagnostic());
+  }
+  auto any = ::alaya::disk::DiskFlatSegment::into_any(std::move(built).value());
+  if (!any.ok()) {
+    throw std::runtime_error("cannot erase Flat fallback fixture: " +
+                             any.status().diagnostic());
+  }
 
   SegmentRegistration registration;
-  registration.segment_id = kQgSegmentId;
+  registration.segment_id = kFlatSegmentId;
   registration.role = SegmentRole::sealed;
   registration.segment = std::move(any).value();
-  registration.rows.reserve(kQgRows);
-  for (std::uint32_t row = 0; row < kQgRows; ++row) {
+  registration.rows.reserve(kFlatRows);
+  for (std::uint32_t row = 0; row < kFlatRows; ++row) {
     registration.rows.push_back(
-        {core::LogicalId::from_utf8("qg-" + std::to_string(row)),
+        {core::LogicalId::from_utf8("flat-" + std::to_string(row)),
          core::SegmentRowId(row),
          row + 1,
          VersionState::live,
-         row_payload(qg_data.data() + row * kDim, kDim, selected_for_row(row))});
+         row_payload(flat_data.data() + row * kDim, kDim, selected_for_row(row))});
   }
   return registration;
 }
@@ -343,18 +354,18 @@ TEST_F(LaserFilterCollectionTest, StrictPolicyStillWorksViaPrefilterNotTraversal
 }
 
 // ---------------------------------------------------------------------------
-// Decision 7's auto-policy fallback: a mixed collection (a QG memory
-// segment, which still rejects any non-none filter kind, plus the LASER
+// Decision 7's auto-policy fallback: a mixed collection (an exact Flat
+// segment, which rejects any non-none filter kind, plus the LASER
 // segment, which executes it) must not fail the whole query.
 // ---------------------------------------------------------------------------
 
-TEST_F(LaserFilterCollectionTest, MixedQgAndLaserAutoPolicyDoesNotFailOverall) {
-  std::vector<float> qg_data;
-  auto qg_registration = build_qg_registration(qg_data);
+TEST_F(LaserFilterCollectionTest, MixedFlatAndLaserAutoPolicyDoesNotFailOverall) {
+  std::vector<float> flat_data;
+  auto flat_registration = build_flat_registration(*fixture_, flat_data);
   auto laser_registration = open_laser_registration(*fixture_);
   auto opened =
       SegmentedCollection::open({kDim, core::Metric::l2, core::ScalarType::float32},
-                                {std::move(qg_registration), std::move(laser_registration)});
+                                {std::move(flat_registration), std::move(laser_registration)});
   ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
   const auto collection = std::move(opened).value();
 
@@ -370,7 +381,7 @@ TEST_F(LaserFilterCollectionTest, MixedQgAndLaserAutoPolicyDoesNotFailOverall) {
 
   auto result = collection->search(request);
   ASSERT_TRUE(result.ok()) << result.status().diagnostic()
-                           << " (auto policy must fall back on the qg segment's not_supported "
+                           << " (auto policy must fall back on the Flat segment's not_supported "
                               "rather than failing the whole query)";
   EXPECT_EQ(stats.filter_execution, core::FilterExecution::traversal);
   ASSERT_FALSE(result.value().queries.empty());
@@ -386,13 +397,13 @@ TEST_F(LaserFilterCollectionTest, MixedQgAndLaserAutoPolicyDoesNotFailOverall) {
       pid = row_id_value - kLaserLabelBase;
       saw_laser_hit = true;
     } else {
-      ASSERT_EQ(hit.source.segment_id, kQgSegmentId);
+      ASSERT_EQ(hit.source.segment_id, kFlatSegmentId);
       pid = row_id_value;
     }
     // Every surviving hit must satisfy the predicate regardless of which
     // segment it came from: the LASER segment actually executed the
-    // bitmap (traversal-filtered), and the qg segment's rows (returned
-    // unfiltered after the automatic-policy retry, since qg still rejects
+    // bitmap (traversal-filtered), and the Flat segment's rows (returned
+    // unfiltered after the automatic-policy retry, since Flat rejects
     // any non-none filter kind) were weeded out by Collection's own
     // traversal re-verify step -- the same safety net that already runs
     // unconditionally for every traversal hit.
@@ -411,13 +422,13 @@ TEST_F(LaserFilterCollectionTest, MixedQgAndLaserAutoPolicyDoesNotFailOverall) {
 // this change did not disturb that pre-existing path: the query must
 // still not fail overall, via that older mechanism rather than the new
 // retry.
-TEST_F(LaserFilterCollectionTest, MixedQgAndLaserAllowPartialAlsoSucceeds) {
-  std::vector<float> qg_data;
-  auto qg_registration = build_qg_registration(qg_data);
+TEST_F(LaserFilterCollectionTest, MixedFlatAndLaserAllowPartialAlsoSucceeds) {
+  std::vector<float> flat_data;
+  auto flat_registration = build_flat_registration(*fixture_, flat_data);
   auto laser_registration = open_laser_registration(*fixture_);
   auto opened =
       SegmentedCollection::open({kDim, core::Metric::l2, core::ScalarType::float32},
-                                {std::move(qg_registration), std::move(laser_registration)});
+                                {std::move(flat_registration), std::move(laser_registration)});
   ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
   const auto collection = std::move(opened).value();
 
@@ -438,7 +449,7 @@ TEST_F(LaserFilterCollectionTest, MixedQgAndLaserAllowPartialAlsoSucceeds) {
       ASSERT_GE(row_id_value, kLaserLabelBase);
       EXPECT_TRUE(selected_for_row(row_id_value - kLaserLabelBase));
     } else {
-      ASSERT_EQ(hit.source.segment_id, kQgSegmentId);
+      ASSERT_EQ(hit.source.segment_id, kFlatSegmentId);
       EXPECT_TRUE(selected_for_row(row_id_value));
     }
   }

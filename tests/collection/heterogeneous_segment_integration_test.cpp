@@ -18,19 +18,11 @@
 
 #include "index/collection/segmented_collection.hpp"
 #include "index/disk/disk_flat_segment.hpp"
-#include "index/graph/qg/qg_segment.hpp"
 #include "platform/detect.hpp"
-#include "space/rabitq_space.hpp"
-#include "space/raw_space.hpp"
 
 namespace alaya::internal::collection {
 namespace {
 
-using Qg = QgSegment<RaBitQSpace<>>;
-
-// QG's FhtKacRotator requires floor_log2(dim) in [6,11] (dim >= 64), and
-// QgSegment::build() requires more live rows than its fixed degree bound
-// (32).
 constexpr std::uint32_t kDim = 64;
 constexpr std::uint64_t kRowsPerSegment = 40;
 constexpr std::uint64_t kLiveDuplicateId = 4242;
@@ -76,19 +68,6 @@ struct Rows {
     }
   }
   return rows;
-}
-
-[[nodiscard]] auto build_qg(const Rows &rows) -> std::unique_ptr<Qg> {
-  auto space = std::make_shared<RaBitQSpace<>>(kRowsPerSegment + 8, kDim, core::Metric::l2);
-  space->fit(rows.vectors.data(), kRowsPerSegment);
-  core::BuildContext context;
-  QgBuildOptions options;
-  options.ef_build = 100;
-  options.thread_count = 1;
-  return Qg::build({core::TypedTensorView::contiguous(rows.vectors.data(), kRowsPerSegment, kDim),
-                    space},
-                   options,
-                   context);
 }
 
 [[nodiscard]] auto build_flat(const Rows &rows,
@@ -258,51 +237,56 @@ class PerQueryFailureProxy {
   return std::move(erased).value();
 }
 
-TEST(HeterogeneousSegmentIntegration, QgAndFlatMatchFlatOracleAndSuppressStaleDiskVersions) {
+TEST(HeterogeneousSegmentIntegration, FlatSegmentsMatchOracleAndSuppressStaleDiskVersions) {
   TemporaryDirectory temporary;
-  auto qg_rows = make_rows(1000, 101);
-  auto flat_rows = make_rows(2000, 202);
-  flat_rows.physical_ids[kRowsPerSegment - 2] = 91'001;
-  flat_rows.physical_ids[kRowsPerSegment - 1] = 91'002;
+  auto first_rows = make_rows(1000, 101);
+  auto second_rows = make_rows(2000, 202);
+  second_rows.physical_ids[kRowsPerSegment - 2] = 91'001;
+  second_rows.physical_ids[kRowsPerSegment - 1] = 91'002;
 
-  auto qg = build_qg(qg_rows);
-  auto flat = build_flat(flat_rows, temporary.path() / "flat", "seg_00000001");
+  // The contract under test is cross-segment version arbitration, not an
+  // engine-specific approximation. Two independently published Flat segments
+  // preserve distinct segment identities and provide an exact oracle.
+  auto first = build_flat(first_rows, temporary.path() / "first", "seg_00000001");
+  auto second = build_flat(second_rows, temporary.path() / "second", "seg_00000002");
 
   std::vector<float> queries;
-  queries.insert(queries.end(), qg_rows.vectors.begin(), qg_rows.vectors.begin() + kDim);
+  queries.insert(queries.end(), first_rows.vectors.begin(), first_rows.vectors.begin() + kDim);
   queries.insert(queries.end(),
-                 flat_rows.vectors.begin() + 7 * kDim,
-                 flat_rows.vectors.begin() + 8 * kDim);
-  expect_truncated_batch_contract(*qg, queries.data());
-  expect_truncated_batch_contract(*flat, queries.data());
+                 second_rows.vectors.begin() + 7 * kDim,
+                 second_rows.vectors.begin() + 8 * kDim);
+  expect_truncated_batch_contract(*first, queries.data());
+  expect_truncated_batch_contract(*second, queries.data());
 
-  auto qg_any = Qg::into_any(std::move(qg));
-  auto flat_any = ::alaya::disk::DiskFlatSegment::into_any(std::move(flat));
-  ASSERT_TRUE(qg_any.ok()) << qg_any.status().diagnostic();
-  ASSERT_TRUE(flat_any.ok()) << flat_any.status().diagnostic();
+  auto first_any = ::alaya::disk::DiskFlatSegment::into_any(std::move(first));
+  auto second_any = ::alaya::disk::DiskFlatSegment::into_any(std::move(second));
+  ASSERT_TRUE(first_any.ok()) << first_any.status().diagnostic();
+  ASSERT_TRUE(second_any.ok()) << second_any.status().diagnostic();
 
-  auto qg_registration = normal_registration(1, std::move(qg_any).value(), qg_rows, true);
-  auto flat_registration = normal_registration(2, std::move(flat_any).value(), flat_rows, false);
+  auto first_registration =
+      normal_registration(1, std::move(first_any).value(), first_rows, false);
+  auto second_registration =
+      normal_registration(2, std::move(second_any).value(), second_rows, false);
 
-  // qg claims the same two logical ids as flat, at a newer upsert_sequence,
-  // so it wins the live duplicate and supersedes flat's copy with a tombstone.
-  flat_registration.rows[kRowsPerSegment - 2].logical_id =
+  // The first segment claims the same two logical ids at a newer sequence, so
+  // it wins the live duplicate and supersedes the second copy with a tombstone.
+  second_registration.rows[kRowsPerSegment - 2].logical_id =
       core::LogicalId::from_legacy_uint64(kLiveDuplicateId);
-  flat_registration.rows[kRowsPerSegment - 2].upsert_sequence = 1;
-  flat_registration.rows[kRowsPerSegment - 1].logical_id =
+  second_registration.rows[kRowsPerSegment - 2].upsert_sequence = 1;
+  second_registration.rows[kRowsPerSegment - 1].logical_id =
       core::LogicalId::from_legacy_uint64(kDeletedId);
-  flat_registration.rows[kRowsPerSegment - 1].upsert_sequence = 1;
-  qg_registration.rows[kRowsPerSegment - 2].logical_id =
+  second_registration.rows[kRowsPerSegment - 1].upsert_sequence = 1;
+  first_registration.rows[kRowsPerSegment - 2].logical_id =
       core::LogicalId::from_legacy_uint64(kLiveDuplicateId);
-  qg_registration.rows[kRowsPerSegment - 2].upsert_sequence = 2;
-  qg_registration.rows[kRowsPerSegment - 1].logical_id =
+  first_registration.rows[kRowsPerSegment - 2].upsert_sequence = 2;
+  first_registration.rows[kRowsPerSegment - 1].logical_id =
       core::LogicalId::from_legacy_uint64(kDeletedId);
-  qg_registration.rows[kRowsPerSegment - 1].upsert_sequence = 2;
-  qg_registration.rows[kRowsPerSegment - 1].state = VersionState::tombstone;
+  first_registration.rows[kRowsPerSegment - 1].upsert_sequence = 2;
+  first_registration.rows[kRowsPerSegment - 1].state = VersionState::tombstone;
 
   auto opened =
       SegmentedCollection::open({kDim, core::Metric::l2, core::ScalarType::float32},
-                                {std::move(qg_registration), std::move(flat_registration)});
+                                {std::move(first_registration), std::move(second_registration)});
   ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
   auto collection = std::move(opened).value();
   EXPECT_EQ(collection->stats().size, 2 * kRowsPerSegment - 3);
@@ -317,11 +301,11 @@ TEST(HeterogeneousSegmentIntegration, QgAndFlatMatchFlatOracleAndSuppressStaleDi
                                     source.physical_ids.begin() +
                                         static_cast<std::ptrdiff_t>(rows));
   };
-  append(qg_rows, kRowsPerSegment - 2);
-  append(flat_rows, kRowsPerSegment - 2);
+  append(first_rows, kRowsPerSegment - 2);
+  append(second_rows, kRowsPerSegment - 2);
   oracle_rows.vectors.insert(oracle_rows.vectors.end(),
-                             qg_rows.vectors.end() - 2 * kDim,
-                             qg_rows.vectors.end() - kDim);
+                             first_rows.vectors.end() - 2 * kDim,
+                             first_rows.vectors.end() - kDim);
   oracle_rows.physical_ids.push_back(kLiveDuplicateId);
 
   ::alaya::disk::DiskFlatPublicationOptions oracle_options;

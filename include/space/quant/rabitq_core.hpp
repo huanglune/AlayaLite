@@ -107,9 +107,8 @@ struct RaBitQCore {
     // approximation error is algebraically zero, so a "||o||=1 bug" and a
     // "candidate-independent constant" are exactly distinguishable.)
     // Calibrating the *value* to the true -<q,o> would need K=0 here instead
-    // of K=1, but nothing downstream needs that: search only needs order, and
-    // QG re-ranks returned candidates with an exact score before it reaches
-    // the caller (index/graph/laser/qg/qg_segment.hpp's response path).
+    // of K=1, but the memory-QG builder needs only candidate order while it
+    // constructs topology. Serving uses LASER's separate factor/score path.
     //
     // K=1 (this literal) is the upstream RaBitQ-Library convention, not
     // something introduced by this port: the reference implementation's

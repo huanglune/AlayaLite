@@ -108,7 +108,7 @@ inline void accumulate_and_estimate_distances(const uint8_t *ALAYA_RESTRICT code
                                               T lut_bias,
                                               T *ALAYA_RESTRICT result,
                                               size_t dim) {
-  // Keep this AVX-512 fused memory-QG hot path separate from LASER's dispatched
+  // Keep this AVX-512 fused memory-QG builder path separate from LASER's dispatched
   // accumulate -> convert -> distance pipeline.  Sharing the standalone integer
   // accumulate kernel does not justify adding an intermediate store/load here;
   // the two consumers intentionally retain their individually optimized pipelines.

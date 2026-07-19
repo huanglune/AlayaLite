@@ -4,22 +4,14 @@
 
 #pragma once
 
-#include "index/graph/qg/qg_segment.hpp"
+#include "index/graph/qg/qg_builder.hpp"
 #if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER
   #include "index/graph/laser/qg/qg_builder.hpp"
 #endif
 
-// These facade names disambiguate AlayaLite's two unrelated QG surfaces without
-// changing their historical names or physical include paths.
-namespace alaya::memory_qg {
-
-template <typename SpaceType>
-using Segment = ::alaya::QgSegment<SpaceType>;
-
-template <typename DataType>
-using Quantizer = ::alaya::RaBitQQuantizer<DataType>;
-
-}  // namespace alaya::memory_qg
+// These facade names disambiguate the topology-only in-memory builder from
+// LASER's persisted and searchable QG implementation. memory_qg intentionally
+// exposes no Segment or artifact reader.
 
 namespace alaya::disk_laser_qg {
 

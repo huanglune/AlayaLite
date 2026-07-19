@@ -6,18 +6,12 @@
 # (concepts, traits). This directory is only added when ALAYA_ENABLE_LASER=OFF.
 
 alaya_cc_target(no_laser_header_closure SRCS no_laser_header_closure.cpp)
-alaya_cc_target(public_graph_closure SRCS public_graph_header.cpp)
 alaya_cc_target(public_space_closure SRCS public_space_header.cpp)
 alaya_cc_target(public_disk_closure SRCS public_disk_header.cpp)
 
 alaya_add_test(
   NAME compile_check_no_laser
   TARGET no_laser_header_closure
-  LABELS compile
-)
-alaya_add_test(
-  NAME compile_check_graph
-  TARGET public_graph_closure
   LABELS compile
 )
 alaya_add_test(

@@ -28,6 +28,9 @@
 #include "utils/openmp.hpp"
 
 namespace alaya::detail {
+
+// Builder-internal implementation. There is deliberately no serving consumer;
+// the public memory_qg::Builder exports only a FrozenGraphSnapshot.
 template <typename DistanceSpaceType>
   requires Space<DistanceSpaceType>
 class QgBuilderKernel {

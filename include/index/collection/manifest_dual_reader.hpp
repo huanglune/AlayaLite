@@ -32,6 +32,8 @@ struct UnifiedManifestView {
 struct ManifestReaderOptions {
   std::uint32_t reader_version{kArtifactManifestV2SchemaVersion};
   bool verify_artifacts{true};
+  // Keep qg_segment recognizable so dispatch can return the deliberate
+  // legacy/re-seal diagnostic instead of an unknown-feature error.
   std::set<std::string> available_features{"manifest_v2",
                                            "disk_flat_segment",
                                            "qg_segment",
