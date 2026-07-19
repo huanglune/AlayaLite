@@ -69,10 +69,9 @@ class Builder {
     validate_budget(input, context);
 
     auto graph = std::make_shared<detail::QgBuildGraph<SpaceType>>(input.space);
-    auto space_view =
-        std::make_shared<detail::QgBuilderSpaceView<SpaceType>>(*input.space, *graph);
+    auto space_view = std::make_shared<detail::QgBuilderSpaceView<SpaceType>>(*input.space, *graph);
     detail::QgBuilderKernel<detail::QgBuilderSpaceView<SpaceType>> builder(space_view,
-                                                                          options.thread_count);
+                                                                           options.thread_count);
     builder.set_ef_build(options.ef_build);
     builder.build_graph();
     validate_graph(*input.space, *graph);
@@ -133,8 +132,10 @@ class Builder {
         !core::checked_multiply(elements, sizeof(DataType), bytes)) {
       throw std::invalid_argument("memory QG build input byte size overflows uint64");
     }
-    const auto budget = context.growing_reservation.ensure(
-        bytes, core::OperationStage::build, "memory QG build reservation is too small");
+    const auto budget =
+        context.growing_reservation.ensure(bytes,
+                                           core::OperationStage::build,
+                                           "memory QG build reservation is too small");
     if (!budget.ok()) {
       throw std::runtime_error("memory QG resource_exhausted: build reservation is too small");
     }
