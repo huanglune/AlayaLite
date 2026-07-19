@@ -135,7 +135,8 @@ class CollectionLogicalWal {
   }
 
   [[nodiscard]] static auto open(const std::filesystem::path &root,
-                                 std::string_view namespace_name = kCollectionWalNamespace)
+                                 std::string_view namespace_name = kCollectionWalNamespace,
+                                 bool read_only = false)
       -> core::Result<std::unique_ptr<CollectionLogicalWal>> {
     if (root.empty() || namespace_name != kCollectionWalNamespace) {
       return core::Status::error(core::StatusCode::invalid_argument,
@@ -144,10 +145,18 @@ class CollectionLogicalWal {
                                  "collection WAL requires its fixed new namespace");
     }
     try {
-      auto wal = std::unique_ptr<CollectionLogicalWal>(new CollectionLogicalWal(
-          root / ".alaya_internal" / std::string(kCollectionWalNamespace)));
-      std::filesystem::create_directories(wal->directory_);
-      if (!std::filesystem::exists(wal->path_)) {
+      auto wal = std::unique_ptr<CollectionLogicalWal>(
+          new CollectionLogicalWal(root / ".alaya_internal" / std::string(kCollectionWalNamespace),
+                                   read_only));
+      if (read_only && (!std::filesystem::is_directory(wal->directory_) ||
+                        !std::filesystem::is_regular_file(wal->path_))) {
+        return readonly_status(
+            "read-only Collection open cannot create a missing logical WAL/checkpoint layout");
+      }
+      if (!read_only) {
+        std::filesystem::create_directories(wal->directory_);
+      }
+      if (!read_only && !std::filesystem::exists(wal->path_)) {
         std::ofstream create(wal->path_, std::ios::binary | std::ios::trunc);
         if (!create) {
           return logical_wal_detail::io_error(core::OperationStage::open,
@@ -162,10 +171,17 @@ class CollectionLogicalWal {
       }
       wal->recovery_scan_ = std::move(scanned).value();
       if (wal->recovery_scan_.stopped_at_corrupt_or_torn_tail) {
+        if (read_only) {
+          return readonly_status(
+              "read-only Collection open found a torn WAL tail; open in read-write mode to "
+              "repair it first");
+        }
         std::filesystem::resize_file(wal->path_, wal->recovery_scan_.valid_bytes);
         platform::sync_file_or_throw(wal->path_);
       }
-      wal->open_stream();
+      if (!read_only) {
+        wal->open_stream();
+      }
       return wal;
     } catch (const std::exception &error) {
       return logical_wal_detail::io_error(core::OperationStage::open, error.what());
@@ -180,6 +196,9 @@ class CollectionLogicalWal {
                             std::uint64_t batch_id,
                             std::span<const std::byte> payload,
                             LogicalWalSync sync) -> core::Status {
+    if (read_only_) {
+      return readonly_status("read-only Collection WAL cannot append records");
+    }
     try {
       const auto frame = logical_wal_detail::make_frame(type, flags, op_id, batch_id, payload);
       std::lock_guard lock(mutex_);
@@ -211,6 +230,9 @@ class CollectionLogicalWal {
   // durable. Replacing the WAL with one fsynced CHECKPOINT frame is therefore
   // the physical cut; recovery starts after the checkpoint watermark.
   [[nodiscard]] auto reset_to_checkpoint(std::uint64_t wal_cut) -> core::Status {
+    if (read_only_) {
+      return readonly_status("read-only Collection WAL cannot publish a checkpoint");
+    }
     try {
       std::lock_guard lock(mutex_);
       if (stream_.is_open()) {
@@ -295,8 +317,17 @@ class CollectionLogicalWal {
   }
 
  private:
-  explicit CollectionLogicalWal(std::filesystem::path directory)
-      : directory_(std::move(directory)), path_(directory_ / kCollectionWalFilename) {}
+  explicit CollectionLogicalWal(std::filesystem::path directory, bool read_only)
+      : directory_(std::move(directory)),
+        path_(directory_ / kCollectionWalFilename),
+        read_only_(read_only) {}
+
+  [[nodiscard]] static auto readonly_status(std::string diagnostic) -> core::Status {
+    return core::Status::error(core::StatusCode::not_supported,
+                               core::OperationStage::open,
+                               core::StatusDetail::readonly_instance,
+                               std::move(diagnostic));
+  }
 
   void open_stream() {
     // Keeping weak searchable frames in this userspace buffer makes the
@@ -312,6 +343,7 @@ class CollectionLogicalWal {
 
   std::filesystem::path directory_{};
   std::filesystem::path path_{};
+  bool read_only_{};
   LogicalWalScan recovery_scan_{};
   mutable std::mutex mutex_{};
   std::array<char, 1U << 20U> write_buffer_{};

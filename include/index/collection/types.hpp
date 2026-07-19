@@ -463,6 +463,7 @@ struct CollectionConfig {
   PersistenceOptions persistence{};
   WalPersistenceOptions wal{};
   CollectionRecoveryOptions recovery{};
+  bool read_only{};
   MutationFailPoint fail_point{MutationFailPoint::none};
   std::function<void(MutationFailPoint)> failpoint_hook{};
 };

@@ -154,3 +154,44 @@ def test_private_response_fields_match_the_checked_in_stub():
         runtime_type = getattr(native_module, class_name)
         runtime_fields = {name for name in vars(runtime_type) if not name.startswith("_")}
         assert runtime_fields == expected_fields, class_name
+
+
+def test_binding_read_only_open_is_native_and_byte_stable(tmp_path):
+    root = tmp_path / "read-only"
+    writer = _Collection.create(
+        str(root),
+        3,
+        "l2",
+        np.dtype(np.float32),
+        "flat",
+        "none",
+    )
+    writer.mutate_typed(
+        ["a"],
+        ["A"],
+        np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
+        [{"kind": "keep"}],
+        "add",
+    )
+    writer.close()
+    before = {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+    reader = _Collection.open(str(root), True)
+    assert reader.read_only is True
+    assert reader.options_typed().read_only is True
+    assert reader.get_by_id_typed("a", include_vector=False).document == "A"
+    with pytest.raises(native_module.CollectionNotSupportedError) as captured:
+        reader.mutate_typed(
+            ["b"],
+            ["B"],
+            np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32),
+            [{}],
+            "add",
+        )
+    assert captured.value.status_detail == 15
+    with pytest.raises(native_module.CollectionNotSupportedError):
+        reader.checkpoint_typed()
+    reader.close()
+
+    after = {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    assert after == before

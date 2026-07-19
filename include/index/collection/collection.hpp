@@ -5,6 +5,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -28,6 +29,7 @@
 #include "index/collection/detail/canonical_flat_segment.hpp"
 #include "index/collection/detail/collection_segment_factory.hpp"
 #include "index/collection/detail/collection_target_builder.hpp"
+#include "index/collection/process_lock.hpp"
 // The active (writable) LASER stack -- MutableLaserSegment/QGUpdater -- is
 // Linux-only: it needs flock, O_DIRECT, libaio and sync_file_range. Sealed
 // LASER segments stay available on every platform ALAYA_ENABLE_LASER covers;
@@ -91,6 +93,10 @@ struct CollectionOptions {
   // Zero disables automatic rotation. A positive value rotates after the
   // active generation reaches this many physical rows.
   std::uint64_t auto_seal_rows{};
+};
+
+struct CollectionOpenOptions {
+  bool read_only{};
 };
 
 enum class CollectionSealFailPoint : std::uint8_t {
@@ -259,6 +265,11 @@ class Collection {
                      "canonical Collection target already contains a collection layout");
       }
       std::filesystem::create_directories(options.root);
+      auto process_lock =
+          internal::collection::CollectionProcessLock::acquire(options.root, false, true);
+      if (!process_lock.ok()) {
+        return process_lock.status();
+      }
       status = write_facade_schema(options);
       if (!status.ok()) {
         return status;
@@ -281,8 +292,11 @@ class Collection {
       if (!opened.ok()) {
         return opened.status();
       }
-      auto result = std::shared_ptr<Collection>(
-          new Collection(std::move(options), std::move(opened).value(), std::move(state)));
+      auto result = std::shared_ptr<Collection>(new Collection(std::move(options),
+                                                               std::move(opened).value(),
+                                                               std::move(state),
+                                                               false,
+                                                               std::move(process_lock).value()));
       core::CheckpointContext context;
       context.durability_target = core::DurabilityTarget::full_checkpoint;
       auto checkpoint = result->checkpoint(context);
@@ -297,6 +311,12 @@ class Collection {
 
   [[nodiscard]] static auto open(const std::filesystem::path &root)
       -> core::Result<std::shared_ptr<Collection>> {
+    return open(root, CollectionOpenOptions{});
+  }
+
+  [[nodiscard]] static auto open(const std::filesystem::path &root,
+                                 CollectionOpenOptions open_options)
+      -> core::Result<std::shared_ptr<Collection>> {
     if (root.empty()) {
       return error(core::StatusCode::invalid_argument,
                    core::OperationStage::open,
@@ -305,6 +325,13 @@ class Collection {
     }
     try {
       if (std::filesystem::is_regular_file(facade_schema_path(root))) {
+        auto process_lock =
+            internal::collection::CollectionProcessLock::acquire(root,
+                                                                 open_options.read_only,
+                                                                 !open_options.read_only);
+        if (!process_lock.ok()) {
+          return process_lock.status();
+        }
         auto options = read_facade_schema(root);
         if (!options.ok()) {
           return options.status();
@@ -320,26 +347,48 @@ class Collection {
           if (!status.ok()) {
             return status;
           }
-          status = normalize_control_state_before_open(root, state);
-          if (!status.ok()) {
-            return status;
+          if (open_options.read_only) {
+            if (state.phase != internal::collection::CollectionControlPhase::idle) {
+              return readonly_open_requires_recovery(
+                  "Collection control state is not idle; open in read-write mode to recover it "
+                  "first");
+            }
+            if (options.value().active_engine == core::algorithm::laser) {
+              return readonly_open_requires_recovery(
+                  "read-only open of an active LASER mutation engine is not supported");
+            }
+          } else {
+            status = normalize_control_state_before_open(root, state);
+            if (!status.ok()) {
+              return status;
+            }
           }
-          auto opened = open_segmented(options.value(), state);
+          auto opened = open_segmented(options.value(), state, open_options.read_only);
           if (!opened.ok()) {
             return opened.status();
           }
-          auto result = std::shared_ptr<Collection>(new Collection(std::move(options).value(),
-                                                                   std::move(opened).value(),
-                                                                   std::move(state)));
-          status = result->recover_control_state();
-          if (!status.ok()) {
-            return status;
+          auto result =
+              std::shared_ptr<Collection>(new Collection(std::move(options).value(),
+                                                         std::move(opened).value(),
+                                                         std::move(state),
+                                                         open_options.read_only,
+                                                         std::move(process_lock).value()));
+          if (!open_options.read_only) {
+            status = result->recover_control_state();
+            if (!status.ok()) {
+              return status;
+            }
           }
           return result;
         }
+        if (open_options.read_only) {
+          return readonly_open_requires_recovery(
+              "read-only Collection open cannot initialize missing control state; open in "
+              "read-write mode first");
+        }
         internal::collection::CollectionControlState state;
         state.auto_seal_rows = options.value().auto_seal_rows;
-        auto opened = open_segmented(options.value(), state);
+        auto opened = open_segmented(options.value(), state, false);
         if (!opened.ok()) {
           return opened.status();
         }
@@ -349,7 +398,9 @@ class Collection {
         }
         return std::shared_ptr<Collection>(new Collection(std::move(options).value(),
                                                           std::move(opened).value(),
-                                                          std::move(state)));
+                                                          std::move(state),
+                                                          false,
+                                                          std::move(process_lock).value()));
       }
 
       return error(core::StatusCode::not_found,
@@ -384,6 +435,9 @@ class Collection {
 
   [[nodiscard]] auto remove(const core::LogicalId &logical_id, CollectionWriteOptions options = {})
       -> core::Result<CollectionMutationReceipt> {
+    if (const auto writable = ensure_writable(core::OperationStage::admission); !writable.ok()) {
+      return writable;
+    }
     core::MutationContext context;
     return implementation_->erase(logical_id, context, std::move(options));
   }
@@ -392,6 +446,9 @@ class Collection {
       std::span<const CollectionBatchRow> rows,
       CollectionBatchMutationMode mode = CollectionBatchMutationMode::per_row_independent,
       CollectionWriteOptions options = {}) -> core::Result<CollectionBatchMutationReceipt> {
+    if (const auto writable = ensure_writable(core::OperationStage::admission); !writable.ok()) {
+      return writable;
+    }
     std::vector<internal::collection::BatchRowMutation> native_rows;
     native_rows.reserve(rows.size());
     for (const auto &row : rows) {
@@ -560,6 +617,9 @@ class Collection {
 
   [[nodiscard]] auto checkpoint(core::CheckpointContext &context)
       -> core::Result<CollectionCheckpointReceipt> {
+    if (const auto writable = ensure_writable(core::OperationStage::checkpoint); !writable.ok()) {
+      return writable;
+    }
     std::lock_guard lock(control_mutex_);
     return checkpoint_locked(context);
   }
@@ -572,6 +632,9 @@ class Collection {
 
   [[nodiscard]] auto consolidate(CollectionConsolidateOptions options = {})
       -> core::Result<CollectionConsolidateReceipt> {
+    if (const auto writable = ensure_writable(core::OperationStage::checkpoint); !writable.ok()) {
+      return writable;
+    }
     std::lock_guard lock(control_mutex_);
     auto receipt = implementation_->consolidate(options.num_threads,
                                                 options.r_target,
@@ -592,6 +655,9 @@ class Collection {
 
   [[nodiscard]] auto seal(core::SealContext &context, CollectionSealOptions options = {})
       -> core::Result<CollectionSealReceipt> {
+    if (const auto writable = ensure_writable(core::OperationStage::freeze); !writable.ok()) {
+      return writable;
+    }
     std::lock_guard lock(control_mutex_);
     return seal_locked(context, options);
   }
@@ -620,6 +686,9 @@ class Collection {
   [[nodiscard]] auto prepare_successor(core::SealContext &context,
                                        CollectionSealOptions options = {})
       -> core::Result<CollectionRotationHandle> {
+    if (const auto writable = ensure_writable(core::OperationStage::freeze); !writable.ok()) {
+      return writable;
+    }
     std::lock_guard lock(control_mutex_);
     return prepare_successor_locked(context, options);
   }
@@ -633,6 +702,9 @@ class Collection {
   [[nodiscard]] auto rotate_to_successor(const CollectionRotationHandle &handle,
                                          core::SealContext &context)
       -> core::Result<CollectionSealReceipt> {
+    if (const auto writable = ensure_writable(core::OperationStage::freeze); !writable.ok()) {
+      return writable;
+    }
     std::lock_guard lock(control_mutex_);
     return rotate_to_successor_locked(handle, context);
   }
@@ -643,11 +715,17 @@ class Collection {
   }
 
   [[nodiscard]] auto compact(core::SealContext &context) -> core::Result<CollectionCompactReceipt> {
+    if (const auto writable = ensure_writable(core::OperationStage::freeze); !writable.ok()) {
+      return writable;
+    }
     std::lock_guard lock(control_mutex_);
     return compact_locked(context);
   }
 
   [[nodiscard]] auto gc() -> core::Result<CollectionGcReceipt> {
+    if (const auto writable = ensure_writable(core::OperationStage::save); !writable.ok()) {
+      return writable;
+    }
     std::lock_guard lock(control_mutex_);
     return gc_locked();
   }
@@ -702,6 +780,7 @@ class Collection {
   [[nodiscard]] auto size() const -> core::RowCount { return stats().size; }
   [[nodiscard]] auto options() const -> const CollectionOptions & { return options_; }
   [[nodiscard]] auto root() const -> const std::filesystem::path & { return options_.root; }
+  [[nodiscard]] auto read_only() const noexcept -> bool { return read_only_; }
   [[nodiscard]] auto target_algorithm() const noexcept -> core::AlgorithmId {
     return options_.target_algorithm;
   }
@@ -720,11 +799,17 @@ class Collection {
   }
 
   [[nodiscard]] auto close() -> core::Status {
+    std::lock_guard lock(control_mutex_);
     auto status = implementation_->close();
     if (!status.ok()) {
       return status;
     }
-    return implementation_->drain();
+    status = implementation_->drain();
+    if (status.ok()) {
+      closed_.store(true, std::memory_order_release);
+      process_lock_.reset();
+    }
+    return status;
   }
 
  private:
@@ -737,16 +822,44 @@ class Collection {
 
   Collection(CollectionOptions options,
              std::shared_ptr<internal::collection::SegmentedCollection> implementation,
-             internal::collection::CollectionControlState control_state)
+             internal::collection::CollectionControlState control_state,
+             bool read_only,
+             std::unique_ptr<internal::collection::CollectionProcessLock> process_lock)
       : options_(std::move(options)),
+        process_lock_(std::move(process_lock)),
         implementation_(std::move(implementation)),
-        control_state_(std::move(control_state)) {}
+        control_state_(std::move(control_state)),
+        read_only_(read_only) {}
 
   [[nodiscard]] static auto error(core::StatusCode code,
                                   core::OperationStage stage,
                                   core::StatusDetail detail,
                                   std::string diagnostic) -> core::Status {
     return core::Status::error(code, stage, detail, std::move(diagnostic));
+  }
+
+  [[nodiscard]] static auto readonly_open_requires_recovery(std::string diagnostic)
+      -> core::Status {
+    return error(core::StatusCode::not_supported,
+                 core::OperationStage::open,
+                 core::StatusDetail::readonly_instance,
+                 std::move(diagnostic));
+  }
+
+  [[nodiscard]] auto ensure_writable(core::OperationStage stage) const -> core::Status {
+    if (closed_.load(std::memory_order_acquire)) {
+      return error(core::StatusCode::closed,
+                   stage,
+                   core::StatusDetail::operation_slot_absent,
+                   "Collection handle is closed");
+    }
+    if (!read_only_) {
+      return core::Status::success();
+    }
+    return error(core::StatusCode::not_supported,
+                 stage,
+                 core::StatusDetail::readonly_instance,
+                 "operation is unavailable on a read-only Collection handle");
   }
 
   struct BuildAlgorithmResolution {
@@ -1065,7 +1178,8 @@ class Collection {
 
   [[nodiscard]] static auto open_segmented(
       const CollectionOptions &options,
-      const internal::collection::CollectionControlState &control_state)
+      const internal::collection::CollectionControlState &control_state,
+      bool read_only = false)
       -> core::Result<std::shared_ptr<internal::collection::SegmentedCollection>> {
     internal::collection::CollectionSchema schema{options.dim,
                                                   options.metric,
@@ -1121,7 +1235,7 @@ class Collection {
       }
     }
 
-    if (options.active_engine == core::algorithm::laser) {
+    if (!read_only && options.active_engine == core::algorithm::laser) {
       sweep_orphan_active_laser_dirs(options.root, control_state);
     }
     auto active = make_active_registration(options,
@@ -1134,6 +1248,7 @@ class Collection {
     config.features.wal_coordinator = true;
     config.features.manifest_v2_writer = true;
     config.wal.root = options.root;
+    config.read_only = read_only;
     registrations.push_back(std::move(active).value());
     return internal::collection::SegmentedCollection::open(schema,
                                                            std::move(registrations),
@@ -2275,6 +2390,9 @@ class Collection {
                            internal::collection::WriteMode mode,
                            CollectionWriteOptions options)
       -> core::Result<CollectionMutationReceipt> {
+    if (const auto writable = ensure_writable(core::OperationStage::admission); !writable.ok()) {
+      return writable;
+    }
     internal::collection::WriteRequest request;
     request.logical_id = item.logical_id;
     request.vector = item.vector;
@@ -2481,11 +2599,14 @@ class Collection {
   }
 
   CollectionOptions options_{};
+  std::unique_ptr<internal::collection::CollectionProcessLock> process_lock_{};
   std::shared_ptr<internal::collection::SegmentedCollection> implementation_{};
   mutable std::mutex control_mutex_{};
   internal::collection::CollectionControlState control_state_{};
   std::vector<PendingGcCandidate> pending_gc_{};
   std::optional<PendingRotation> pending_rotation_{};
+  bool read_only_{};
+  std::atomic<bool> closed_{false};
 };
 
 }  // namespace alaya

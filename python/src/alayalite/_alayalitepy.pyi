@@ -145,6 +145,7 @@ class _StatsResponse:
 
 class _OptionsResponse:
     root: str
+    read_only: bool
     dim: int
     metric: str
     dtype: np.dtype[Any]
@@ -166,6 +167,8 @@ class _CapabilitiesResponse:
 def capabilities() -> _CapabilitiesResponse: ...
 
 class _Collection:
+    read_only: bool
+
     @staticmethod
     def create(
         root: str,
@@ -180,7 +183,7 @@ class _Collection:
         auto_seal_rows: int = ...,
     ) -> _Collection: ...
     @staticmethod
-    def open(root: str) -> _Collection: ...
+    def open(root: str, read_only: bool = ...) -> _Collection: ...
     def mutate(
         self,
         ids: list[str],

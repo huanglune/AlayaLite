@@ -166,6 +166,9 @@ class SegmentedCollection {
 
   [[nodiscard]] auto write(const WriteRequest &request, core::MutationContext &context)
       -> core::Result<MutationReceipt> {
+    if (const auto writable = ensure_writable(core::OperationStage::admission); !writable.ok()) {
+      return writable;
+    }
     auto admission = admit();
     if (!admission.has_value()) {
       return closed_status(core::OperationStage::admission);
@@ -230,6 +233,9 @@ class SegmentedCollection {
   [[nodiscard]] auto erase(const core::LogicalId &logical_id,
                            core::MutationContext &context,
                            WriteOptions options = {}) -> core::Result<MutationReceipt> {
+    if (const auto writable = ensure_writable(core::OperationStage::admission); !writable.ok()) {
+      return writable;
+    }
     auto admission = admit();
     if (!admission.has_value()) {
       return closed_status(core::OperationStage::admission);
@@ -261,6 +267,9 @@ class SegmentedCollection {
 
   [[nodiscard]] auto delete_by_filter(const LogicalFilter &filter, core::MutationContext &context)
       -> core::Result<std::vector<MutationReceipt>> {
+    if (const auto writable = ensure_writable(core::OperationStage::admission); !writable.ok()) {
+      return writable;
+    }
     auto admission = admit();
     if (!admission.has_value()) {
       return closed_status(core::OperationStage::admission);
@@ -305,6 +314,9 @@ class SegmentedCollection {
   [[nodiscard]] auto mutate_batch(const BatchMutationRequest &request,
                                   core::MutationContext &context)
       -> core::Result<BatchMutationReceipt> {
+    if (const auto writable = ensure_writable(core::OperationStage::admission); !writable.ok()) {
+      return writable;
+    }
     auto admission = admit();
     if (!admission.has_value()) {
       return closed_status(core::OperationStage::admission);
@@ -400,6 +412,9 @@ class SegmentedCollection {
 
   [[nodiscard]] auto retire_segment(std::uint64_t segment_id, std::uint64_t generation)
       -> core::Status {
+    if (const auto writable = ensure_writable(core::OperationStage::admission); !writable.ok()) {
+      return writable;
+    }
     auto admission = admit();
     if (!admission.has_value()) {
       return closed_status(core::OperationStage::admission);
@@ -517,6 +532,9 @@ class SegmentedCollection {
   }
 
   [[nodiscard]] auto persist_experimental_snapshot() const -> core::Status {
+    if (const auto writable = ensure_writable(core::OperationStage::save); !writable.ok()) {
+      return writable;
+    }
     if (!config_.features.experimental_persistence_writer) {
       return core::Status::error(core::StatusCode::not_supported,
                                  core::OperationStage::save,
@@ -528,6 +546,9 @@ class SegmentedCollection {
 
   [[nodiscard]] auto checkpoint(core::CheckpointContext &context)
       -> core::Result<CheckpointReceipt> {
+    if (const auto writable = ensure_writable(core::OperationStage::checkpoint); !writable.ok()) {
+      return writable;
+    }
     std::lock_guard checkpoint_lock(checkpoint_mutex_);
     auto admission = admit();
     if (!admission.has_value()) {
@@ -594,6 +615,9 @@ class SegmentedCollection {
                                  bool reclaim_slots,
                                  bool bloom_consolidate)
       -> core::Result<SegmentMaintenanceReceipt> {
+    if (const auto writable = ensure_writable(core::OperationStage::checkpoint); !writable.ok()) {
+      return writable;
+    }
     std::lock_guard checkpoint_lock(checkpoint_mutex_);
     auto admission = admit();
     if (!admission.has_value()) {
@@ -659,6 +683,9 @@ class SegmentedCollection {
                                          core::CheckpointContext &context,
                                          RotationDurableCallback durable_switch)
       -> core::Result<ActiveRotationReceipt> {
+    if (const auto writable = ensure_writable(core::OperationStage::freeze); !writable.ok()) {
+      return writable;
+    }
     std::lock_guard checkpoint_lock(checkpoint_mutex_);
     auto admission = admit();
     if (!admission.has_value()) {
@@ -786,6 +813,9 @@ class SegmentedCollection {
                                                  SegmentRegistration target,
                                                  std::span<const SegmentReplacement> replacements)
       -> core::Status {
+    if (const auto writable = ensure_writable(core::OperationStage::save); !writable.ok()) {
+      return writable;
+    }
     auto admission = admit();
     if (!admission.has_value()) {
       return closed_status(core::OperationStage::save);
@@ -799,6 +829,9 @@ class SegmentedCollection {
                                                 std::uint64_t target_generation,
                                                 std::span<const SegmentReplacement> replacements)
       -> core::Status {
+    if (const auto writable = ensure_writable(core::OperationStage::open); !writable.ok()) {
+      return writable;
+    }
     auto admission = admit();
     if (!admission.has_value()) {
       return closed_status(core::OperationStage::open);
@@ -1243,7 +1276,9 @@ class SegmentedCollection {
         std::max(maximum_sequence, config_.recovery.minimum_visibility_watermark);
     snapshot->durable_watermark = 0;
     if (config_.features.wal_coordinator) {
-      auto opened = CollectionLogicalWal::open(config_.wal.root, config_.wal.namespace_name);
+      auto opened = CollectionLogicalWal::open(config_.wal.root,
+                                               config_.wal.namespace_name,
+                                               config_.read_only);
       if (!opened.ok()) {
         return opened.status();
       }
@@ -3083,7 +3118,7 @@ class SegmentedCollection {
                                  *snapshot,
                                  entry.durable ? DurabilityState::wal_fsync
                                                : DurabilityState::searchable_not_durable);
-      if (!entry.publish_marker) {
+      if (!entry.publish_marker && !config_.read_only) {
         const auto status = wal_->append(LogicalWalRecordType::publish_marker,
                                          entry.durable ? 1U : 0U,
                                          entry.transaction_id,
@@ -3275,6 +3310,16 @@ class SegmentedCollection {
                                stage,
                                core::StatusDetail::operation_slot_absent,
                                "collection admission is closed");
+  }
+
+  [[nodiscard]] auto ensure_writable(core::OperationStage stage) const -> core::Status {
+    if (!config_.read_only) {
+      return core::Status::success();
+    }
+    return core::Status::error(core::StatusCode::not_supported,
+                               stage,
+                               core::StatusDetail::readonly_instance,
+                               "operation is unavailable on a read-only Collection handle");
   }
 
   [[nodiscard]] static auto not_found(std::string diagnostic) -> core::Status {

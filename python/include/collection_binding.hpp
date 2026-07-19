@@ -672,6 +672,7 @@ struct PyStatsResponse {
 
 struct PyOptionsResponse {
   std::string root{};
+  bool read_only{};
   std::uint32_t dim{};
   std::string metric{};
   py::dtype dtype{};
@@ -972,10 +973,13 @@ class PyCollection {
     return std::make_shared<PyCollection>(std::move(collection));
   }
 
-  [[nodiscard]] static auto open(const std::string &root) -> std::shared_ptr<PyCollection> {
+  [[nodiscard]] static auto open(const std::string &root, bool read_only = false)
+      -> std::shared_ptr<PyCollection> {
+    CollectionOpenOptions options;
+    options.read_only = read_only;
     auto collection = [&] {
       py::gil_scoped_release release;
-      return unwrap(Collection::open(root));
+      return unwrap(Collection::open(root, options));
     }();
     return std::make_shared<PyCollection>(std::move(collection));
   }
@@ -1506,6 +1510,7 @@ class PyCollection {
   [[nodiscard]] auto options_typed() const -> PyOptionsResponse {
     const auto &options = collection_->options();
     return {options.root.string(),
+            collection_->read_only(),
             options.dim,
             metric_name(options.metric),
             scalar_dtype(options.scalar_type),
@@ -1524,6 +1529,8 @@ class PyCollection {
     py::gil_scoped_release release;
     throw_status(collection_->close());
   }
+
+  [[nodiscard]] auto read_only() const noexcept -> bool { return collection_->read_only(); }
 
   [[nodiscard]] auto collection() const -> const std::shared_ptr<Collection> & {
     return collection_;
@@ -1641,6 +1648,7 @@ inline void register_response_types(py::module_ &module) {
 
   py::class_<PyOptionsResponse>(module, "_OptionsResponse")
       .def_readonly("root", &PyOptionsResponse::root)
+      .def_readonly("read_only", &PyOptionsResponse::read_only)
       .def_readonly("dim", &PyOptionsResponse::dim)
       .def_readonly("metric", &PyOptionsResponse::metric)
       .def_readonly("dtype", &PyOptionsResponse::dtype)
@@ -1688,7 +1696,7 @@ inline void register_collection(py::module_ &module) {
                   py::arg("max_neighbors") = 32,
                   py::arg("ef_construction") = 400,
                   py::arg("auto_seal_rows") = 0)
-      .def_static("open", &PyCollection::open, py::arg("root"))
+      .def_static("open", &PyCollection::open, py::arg("root"), py::arg("read_only") = false)
       .def("mutate",
            &PyCollection::mutate,
            py::arg("ids"),
@@ -1805,6 +1813,7 @@ inline void register_collection(py::module_ &module) {
       .def("stats_typed", &PyCollection::stats_typed)
       .def("options", &PyCollection::options)
       .def("options_typed", &PyCollection::options_typed)
+      .def_property_readonly("read_only", &PyCollection::read_only)
       .def("close", &PyCollection::close);
 }
 

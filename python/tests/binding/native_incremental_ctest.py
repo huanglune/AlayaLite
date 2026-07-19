@@ -55,6 +55,20 @@ def main() -> None:
         assert isinstance(collection.search(np.zeros(3, dtype=np.float32), 2), dict)
         collection.close()
 
+        root = Path(directory) / "collection"
+        before = {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+        reader = module._Collection.open(str(root), True)  # pylint: disable=protected-access
+        assert reader.read_only is True
+        try:
+            reader.remove_typed(["a"])
+        except module.CollectionNotSupportedError as error:
+            assert error.status_detail == 15
+        else:
+            raise AssertionError("read-only mutation unexpectedly succeeded")
+        reader.close()
+        after = {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+        assert after == before
+
 
 if __name__ == "__main__":
     main()
