@@ -76,6 +76,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   LASER callers retain the rank-only default unless they opt into distances.
   New readers continue to open legacy `qg_segment` artifacts, while the new
   feature marker makes older readers reject the new physical format clearly.
+  On LASER-capable builds the qg support gate now mirrors the LASER dimension
+  envelope (`33 <= dim <= 2048`); a qg seal outside that range follows the
+  established unsupported-target contract and publishes Flat with the
+  `flat_fallback` flag and reason set, where memory QG previously accepted any
+  dimension. Existing sealed artifacts are unaffected.
 - A qg seal on a build without LASER now fails with `not_supported` and names
   the unavailable implementation; it never silently publishes a Flat target.
   This is the deliberate transition policy for Linux aarch64 and Windows
@@ -120,6 +125,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- The `cross-platform-perf` GitHub workflow and its helper script. It compared
+  Linux libaio against the Windows IOCP LASER backend, which this release
+  removes (see below), and its benchmark scripts were already gone.
 - The HNSW in-memory graph engine (`hnsw_segment`) and its build kernel,
   including the hand-rolled `hnswlib.hpp` it was built on. `algorithm::hnsw`
   (id `2`) remains reserved and is rejected by the capability gate, matching

@@ -126,13 +126,12 @@ Supported platforms:
 
 - Linux x86_64: uses the `libaio` backend by default.
 - macOS arm64 and x86_64: uses the portable thread-pool backend by default.
-- Windows x64 with MSVC 2022: uses the IOCP (I/O Completion Ports) backend by default.
-- Linux ARM is not supported yet.
+- Windows and Linux aarch64 are not supported; their wheels ship without LASER.
 
 Build options:
 
 - `ALAYA_ENABLE_LASER` controls whether LASER is built.
-- It is ON by default on Linux x86_64, macOS, and Windows x64, and OFF elsewhere.
+- It is ON by default on Linux x86_64 and macOS, and OFF elsewhere.
 - On Linux, install `libaio` or use the thread-pool fallback.
 
 Platform dependencies:
@@ -146,10 +145,6 @@ sudo dnf install libaio-devel
 
 # macOS (Homebrew)
 brew install libomp
-
-# Windows
-# Install Visual Studio 2022 with the Desktop development with C++ workload.
-# MSVC ships the OpenMP runtime used by LASER; no extra package is required.
 ```
 
 For a package install, add the LASER runtime dependencies to the same environment:
@@ -172,9 +167,6 @@ cmake -B build/Release -DALAYA_ENABLE_LASER=ON
 
 # macOS default
 cmake -B build/Release -DALAYA_ENABLE_LASER=ON
-
-# Windows x64 default, run from a VS 2022 developer shell
-cmake -B build/Release -G "Visual Studio 17 2022" -A x64 -DALAYA_ENABLE_LASER=ON
 
 # Linux fallback without libaio
 cmake -B build/Release -DALAYA_ENABLE_LASER=ON -DALAYA_LASER_USE_THREADPOOL=ON
