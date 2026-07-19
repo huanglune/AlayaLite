@@ -14,8 +14,8 @@ set(_laser_benchmark_opts
     ${_ALAYA_LASER_CONSUMER_OPTIONS}
 )
 
-# SIFT-scale update experiment harness (build / insert / delete / eval modes). Not a ctest — run manually; see the
-# usage string in the source.
+# SIFT-scale update experiment harness (build / insert / delete / eval modes). Not a ctest — run manually; see the usage
+# string in the source.
 alaya_cc_target(
   bench_laser_update_sift
   BARE
