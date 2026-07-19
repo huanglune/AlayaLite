@@ -151,7 +151,7 @@ if(ALAYA_ENABLE_LASER)
       alaya_add_test(
         NAME ${_laser_segment_test_target}
         TARGET ${_laser_segment_test_target}
-        LABELS laser segment
+        LABELS laser segment long
         TIMEOUT 180
       )
     elseif(_laser_segment_test_target MATCHES
@@ -160,7 +160,11 @@ if(ALAYA_ENABLE_LASER)
       alaya_add_test(
         NAME ${_laser_segment_test_target}
         TARGET ${_laser_segment_test_target}
-        LABELS laser segment stress tsan
+        LABELS laser
+               segment
+               stress
+               tsan
+               long
         TIMEOUT 180
       )
     else()

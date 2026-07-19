@@ -76,7 +76,7 @@ if(ALAYA_ENABLE_LASER)
   alaya_add_test(
     NAME collection_qg_seal_test
     TARGET collection_qg_seal_test
-    LABELS integration collection laser
+    LABELS integration collection laser long
     TIMEOUT 300
   )
 
@@ -88,7 +88,7 @@ if(ALAYA_ENABLE_LASER)
   alaya_add_test(
     NAME collection_qg_ip_norm_test
     TARGET collection_qg_ip_norm_test
-    LABELS integration collection laser
+    LABELS integration collection laser long
     TIMEOUT 300
   )
 
@@ -100,7 +100,7 @@ if(ALAYA_ENABLE_LASER)
   alaya_add_test(
     NAME collection_qg_recall_floor_test
     TARGET collection_qg_recall_floor_test
-    LABELS integration collection laser
+    LABELS integration collection laser long
     TIMEOUT 300
   )
 endif()
@@ -127,7 +127,7 @@ alaya_cc_target(manifest_v2_header_closure SRCS manifest_v2_header_closure.cpp)
 alaya_cc_target(
   manifest_v2_test
   SRCS manifest_v2_test.cpp
-  GTEST
+  GTEST PCH_REUSE_FROM alaya_collection_test_pch
 )
 alaya_add_test(
   NAME manifest_v2_test
@@ -139,7 +139,7 @@ alaya_add_test(
 alaya_cc_target(
   logical_wal_test
   SRCS logical_wal_test.cpp
-  GTEST
+  GTEST PCH_REUSE_FROM alaya_collection_test_pch
 )
 alaya_add_test(
   NAME logical_wal_test
@@ -151,7 +151,7 @@ alaya_add_test(
 alaya_cc_target(
   wal_coordinator_test
   SRCS wal_coordinator_test.cpp
-  GTEST
+  GTEST PCH_REUSE_FROM alaya_collection_test_pch
 )
 alaya_add_test(
   NAME wal_coordinator_test
@@ -167,7 +167,7 @@ alaya_add_test(
 alaya_cc_target(
   segmented_collection_test
   SRCS segmented_collection_test.cpp
-  GTEST
+  GTEST PCH_REUSE_FROM alaya_collection_test_pch
 )
 alaya_add_test(
   NAME segmented_collection_test
@@ -179,7 +179,7 @@ alaya_add_test(
 alaya_cc_target(
   segmented_collection_stress_test
   SRCS segmented_collection_stress_test.cpp
-  GTEST
+  GTEST PCH_REUSE_FROM alaya_collection_test_pch
 )
 alaya_add_test(
   NAME segmented_collection_stress_test
@@ -191,7 +191,7 @@ alaya_add_test(
 alaya_cc_target(
   collection_maintenance_interleaving_test
   SRCS collection_maintenance_interleaving_test.cpp
-  GTEST
+  GTEST PCH_REUSE_FROM alaya_collection_test_pch
 )
 alaya_add_test(
   NAME collection_maintenance_interleaving_test
@@ -203,12 +203,16 @@ alaya_add_test(
 alaya_cc_target(
   heterogeneous_segment_integration_test
   SRCS heterogeneous_segment_integration_test.cpp
-  GTEST
+  GTEST PCH_REUSE_FROM alaya_collection_test_pch
 )
 alaya_add_test(
   NAME heterogeneous_segment_integration_test
   TARGET heterogeneous_segment_integration_test
-  LABELS integration collection disk segment
+  LABELS integration
+         collection
+         disk
+         segment
+         long
   TIMEOUT 180
 )
 
@@ -218,7 +222,7 @@ alaya_add_test(
 if(ALAYA_ENABLE_LASER)
   alaya_cc_target(
     segmented_collection_laser_filter_test
-    GTEST LASER
+    GTEST LASER PCH_REUSE_FROM alaya_collection_laser_test_pch
     SRCS segmented_collection_laser_filter_test.cpp
   )
   alaya_add_test(
@@ -239,7 +243,7 @@ if(ALAYA_ENABLE_LASER)
   alaya_add_test(
     NAME collection_laser_target_test
     TARGET collection_laser_target_test
-    LABELS integration collection laser
+    LABELS integration collection laser long
     TIMEOUT 180
   )
 
@@ -255,7 +259,7 @@ if(ALAYA_ENABLE_LASER)
   alaya_add_test(
     NAME collection_laser_recall_floor_test
     TARGET collection_laser_recall_floor_test
-    LABELS integration collection laser
+    LABELS integration collection laser long
     TIMEOUT 300
   )
 
@@ -263,13 +267,13 @@ if(ALAYA_ENABLE_LASER)
   # native proofs, and reopen.
   alaya_cc_target(
     collection_laser_metric_wiring_test
-    GTEST LASER
+    GTEST LASER PCH_REUSE_FROM alaya_collection_laser_test_pch
     SRCS collection_laser_metric_wiring_test.cpp
   )
   alaya_add_test(
     NAME collection_laser_metric_wiring_test
     TARGET collection_laser_metric_wiring_test
-    LABELS integration collection laser
+    LABELS integration collection laser long
     TIMEOUT 300
   )
 
@@ -306,7 +310,7 @@ if(ALAYA_ENABLE_LASER)
     alaya_add_test(
       NAME collection_active_laser_test
       TARGET collection_active_laser_test
-      LABELS integration collection laser
+      LABELS integration collection laser long
       TIMEOUT 180
     )
 
@@ -321,6 +325,7 @@ if(ALAYA_ENABLE_LASER)
       LABELS integration
              collection
              laser
+             long
              wal
              tsan
       TIMEOUT 300 RUN_SERIAL
@@ -337,6 +342,7 @@ if(ALAYA_ENABLE_LASER)
       LABELS integration
              collection
              laser
+             long
              wal
              crash
       TIMEOUT 300

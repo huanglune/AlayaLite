@@ -85,6 +85,7 @@ cmake --build "${BUILD_DIR}" --parallel "${BUILD_JOBS}" --target "${COVERAGE_TAR
 ctest_cmd=(
   ctest
   --test-dir "${BUILD_DIR}"
+  --progress
   --output-on-failure
   -L "${CTEST_LABELS}"
   -j"${CTEST_JOBS}"

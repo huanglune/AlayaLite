@@ -54,7 +54,8 @@ run_case() {
   fi
   case "$name" in
     core-only|portable-no-avx512|portable-no-avx2)
-      ctest --test-dir "$dir" --output-on-failure -R 'simd_test_(cpu_features|l2_sqr|ip|fht)' >>"$log" 2>&1 || return 1
+      ctest --test-dir "$dir" --progress --output-on-failure -R 'simd_test_(cpu_features|l2_sqr|ip|fht)' >>"$log" 2>&1 \
+        || return 1
       ;;
   esac
 }

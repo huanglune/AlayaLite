@@ -88,6 +88,7 @@ alaya_add_test(
          paged
          determinism
          disk
+         long
          tsan
          ${_laser_paged_backend_label}
   TIMEOUT 180 RUN_SERIAL
@@ -177,7 +178,7 @@ if(ALAYA_ENABLE_MUTABLE_LASER_TESTS)
   alaya_add_test(
     NAME laser_test_qg_updater_unit
     TARGET test_qg_updater_unit
-    LABELS laser
+    LABELS laser long
   )
 
   # SEGMENT_OP op-WAL payload codec (segment_op_wal.hpp): round-trip + validation.
@@ -236,7 +237,11 @@ if(ALAYA_ENABLE_MUTABLE_LASER_TESTS)
   alaya_add_test(
     NAME laser_test_segment_op_wal_crash
     TARGET test_segment_op_wal_crash
-    LABELS laser wal persistence crash
+    LABELS laser
+           wal
+           persistence
+           crash
+           long
     TIMEOUT 420 COVERAGE_RUN_SERIAL
   )
 
@@ -316,7 +321,7 @@ alaya_cc_target(
 alaya_add_test(
   NAME laser_test_qg_builder_oom_regression
   TARGET test_qg_builder_oom_regression
-  LABELS laser
+  LABELS laser long
   TIMEOUT 420
 )
 
@@ -391,7 +396,11 @@ if(ALAYA_ENABLE_MUTABLE_LASER_TESTS)
   alaya_add_test(
     NAME laser_test_segment_op_wal_reuse_crash
     TARGET test_segment_op_wal_reuse_crash
-    LABELS laser wal persistence crash
+    LABELS laser
+           wal
+           persistence
+           crash
+           long
     TIMEOUT 420
   )
 endif()

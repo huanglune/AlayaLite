@@ -79,13 +79,13 @@ configure: ## Configure only; override with BUILD_TYPE=Debug
 test: test-cpp test-py ## Run all tests (C++ release + Python)
 
 test-cpp: build-release ## Run C++ tests (release build)
-	@ctest --test-dir $(BUILD_RELEASE_DIR) $(CTEST_FLAGS) -j$(JOBS)
+	@ctest --test-dir $(BUILD_RELEASE_DIR) --progress $(CTEST_FLAGS) -j$(JOBS)
 
 test-cpp-debug: build-debug ## Run C++ tests (debug build)
-	@ctest --test-dir $(BUILD_DEBUG_DIR) $(CTEST_FLAGS) -j$(JOBS)
+	@ctest --test-dir $(BUILD_DEBUG_DIR) --progress $(CTEST_FLAGS) -j$(JOBS)
 
 test-san: build-san ## Run C++ tests under ASan + UBSan (single-threaded)
-	@ASAN_OPTIONS=detect_leaks=1 ctest --test-dir $(BUILD_SAN_DIR) $(CTEST_FLAGS) -j1
+	@ASAN_OPTIONS=detect_leaks=1 ctest --test-dir $(BUILD_SAN_DIR) --progress $(CTEST_FLAGS) -j1
 
 test-py: ## Run Python unit/mock tests (fast, excludes integration)
 	@uv run pytest $(PYTEST_FLAGS)
