@@ -15,7 +15,7 @@ Gate tiers (see openspec/changes/port-laser-disk-index/tasks.md 3.5):
              the sweep.
 
 CLI:
-    uv run tests/laser/test_laser_alignment.py \\
+    uv run benchmarks/laser/tools/test_laser_alignment.py \\
         --dataset synth_100k_512d \\
         --vamana alayaV \\
         --data-root /path/to/data \\

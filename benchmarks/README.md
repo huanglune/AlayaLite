@@ -8,7 +8,9 @@ benchmarks/
 ├── result_contract_benchmark.cpp
 ├── simd/                          # SIMD microbenchmarks
 ├── rabitq/                        # RaBitQ dispatch benchmark only
-├── laser/alignment/               # Offline LASER artifact comparators and data generators
+├── laser/                         # Native LASER benchmarks and manual research tools
+│   ├── alignment/                 # Offline artifact comparators and data generators
+│   └── tools/                     # Manual alignment and dataset-preparation runners
 ├── perf/baselines/                # Historical, machine-specific captures
 ├── size_map/                      # Native module/wheel size tracking
 └── README.md
