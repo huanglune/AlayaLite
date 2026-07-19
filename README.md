@@ -34,6 +34,7 @@
 
 ## Documentation
 
+- [Documentation map](https://github.com/AlayaDB-AI/AlayaLite/blob/main/docs/README.md)
 - [Client User Guide](https://github.com/AlayaDB-AI/AlayaLite/blob/main/docs/user/CLIENT_USER_MANUAL.md)
 - [Build Guide](https://github.com/AlayaDB-AI/AlayaLite/blob/main/docs/user/BUILDING.md)
 - [LASER implementation guide](https://github.com/AlayaDB-AI/AlayaLite/blob/main/docs/design/LASER.md)
