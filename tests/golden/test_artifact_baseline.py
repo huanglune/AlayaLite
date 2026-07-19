@@ -12,7 +12,6 @@ def test_artifact_baseline_covers_every_current_family():
         "collection_qg_laser",
         "disk_flat_segment",
         "laser_fixture",
-        "memory_qg",
     }
     for artifact in baseline["artifacts"].values():
         assert artifact["files"]

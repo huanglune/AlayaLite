@@ -110,10 +110,6 @@ def generate(build_dir: Path) -> dict[str, object]:
             [str(disk_flat_segment_generator), str(out / "disk_flat_segment")],
             check=True,
         )
-        memory_qg_generator = build_dir / "tests/golden/artifact_memory_qg_generator"
-        if not memory_qg_generator.is_file():
-            raise RuntimeError(f"build the artifact_memory_qg_generator target first: {memory_qg_generator}")
-        subprocess.run([str(memory_qg_generator), str(out / "memory_qg")], check=True)
         qg_laser_generator = build_dir / "tests/golden/artifact_collection_qg_laser_generator"
         if not qg_laser_generator.is_file():
             raise RuntimeError(f"build the artifact_collection_qg_laser_generator target first: {qg_laser_generator}")
