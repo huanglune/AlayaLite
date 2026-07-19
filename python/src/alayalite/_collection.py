@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import os
 import shutil
+import sys
 import threading
 import uuid
 import warnings
@@ -496,8 +497,7 @@ class Collection:
         if not expression:
             raise ValueError("delete_where requires a non-empty filter")
         size = positive_int(batch_size, "batch_size")
-        scan_limit = max(1, int(native.stats_typed().size))
-        records = native.scan(metadata_filter=expression, limit=scan_limit, include_vector=False)
+        records = native.scan(metadata_filter=expression, limit=sys.maxsize, include_vector=False)
         matched_ids = [str(record.id) for record in records]
         deleted = 0
         not_found = 0
