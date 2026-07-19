@@ -21,6 +21,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -75,18 +76,57 @@ struct Factor {
   float factor_vq;  // Factor of v_l * ||q_r||
 };
 
-struct ThreadData {
+// Graph-independent search workspace. It deliberately owns only ordinary
+// containers: no graph pointer, file descriptor, IOContext, page-reader
+// completion state, or buffer whose layout is tied to a particular graph.
+// That makes one instance safe to retain in thread_local storage and reuse
+// across collections; ensure() re-establishes every capacity needed by the
+// current (graph, ef, dimension) tuple before a query touches it.
+struct ArenaScratch {
   HashBasedBooleanSet visited_;
   buffer::SearchBuffer search_pool_;
+  std::vector<float> pca_query_scratch_;
+
+  void ensure(size_t num_points, size_t ef_search, size_t query_dimension) {
+    search_pool_.resize(ef_search);
+
+    const size_t max_size = std::numeric_limits<size_t>::max();
+    const size_t ef_squared =
+        ef_search != 0 && ef_search > max_size / ef_search ? max_size : ef_search * ef_search;
+    // HashBasedBooleanSet(0) still creates a small table, but an untouched
+    // default instance has no table at all. Normalize the requested capacity
+    // to one so even tiny graphs initialize it before get()/set().
+    const size_t visited_capacity = std::max<size_t>(1, std::min(num_points / 10, ef_squared));
+    if (visited_capacity_ < visited_capacity) {
+      visited_ = HashBasedBooleanSet(visited_capacity);
+      visited_capacity_ = visited_capacity;
+    } else {
+      visited_.clear();
+    }
+
+    if (pca_query_scratch_.size() < query_dimension) {
+      pca_query_scratch_.resize(query_dimension);
+    }
+  }
+
+ private:
+  size_t visited_capacity_ = 0;
+};
+
+// Per-graph paged-search lease. Unlike ArenaScratch, these members are bound
+// to the graph's page reader / registered file and must never live in a
+// process-wide thread_local. The embedded graph-free scratch remains here for
+// the legacy paged queue; resident-arena search uses ArenaScratch directly.
+struct ThreadData {
+  ArenaScratch search_scratch_;
   IOContext ctx_;
 #if !defined(_WIN32)
   std::shared_ptr<PageReadCompletions> completions_ = std::make_shared<PageReadCompletions>();
 #endif
   char *sector_scratch_ = nullptr;
+  size_t sector_scratch_slots_ = 0;
   char *neighbor_vector_scratch_ = nullptr;
   char *cur_page_scratch_ = nullptr;
-  float *pca_query_scratch_ = nullptr;  // Buffer for PCA-transformed query
-  std::shared_ptr<std::vector<float>> pca_query_scratch_storage_;
 };
 
 struct ClusterStats {
@@ -607,7 +647,9 @@ class QuantizedGraph {
 #endif
   ConcurrentQueue<ThreadData> thread_data_;
   int dc_count_;
-  size_t ef_search_ = 200;
+  // Defaults used only by the source-compatible set_params()/legacy overloads.
+  // New production entries carry ef/beam per call and never read this state.
+  size_t compat_ef_search_ = 200;
 
   size_t node_len_;
   size_t page_size_;
@@ -615,7 +657,7 @@ class QuantizedGraph {
 
   // workspace for disk-based quantized graph
   size_t min_beam_width_ = 2;
-  size_t max_beam_width_ = 16;
+  size_t compat_max_beam_width_ = 16;
   std::string index_file_name_;
 
   std::vector<PID> medoids_;
@@ -647,8 +689,6 @@ class QuantizedGraph {
 
   std::vector<PID> mem_graph_enter_points_;
 
-  size_t nthreads_ = 1;
-
   // Optional tombstone filter (research prototype): ids in this set are
   // traversed for routing but excluded from search results. Owned by the
   // caller (see QGUpdater); must outlive searches. nullptr = no filtering.
@@ -677,6 +717,8 @@ class QuantizedGraph {
   void disk_search_qg(const float *ALAYA_RESTRICT query,
                       uint32_t knn,
                       uint32_t *ALAYA_RESTRICT results,
+                      size_t ef_search,
+                      size_t beam_width,
                       const RowAdmission *admission,
                       float *ALAYA_RESTRICT distances);
 
@@ -771,6 +813,13 @@ class QuantizedGraph {
               uint32_t *ALAYA_RESTRICT results,
               const RowAdmission *admission = nullptr,
               float *ALAYA_RESTRICT distances = nullptr);
+  void search(const float *ALAYA_RESTRICT query,
+              uint32_t knn,
+              uint32_t *ALAYA_RESTRICT results,
+              size_t ef_search,
+              size_t beam_width,
+              const RowAdmission *admission = nullptr,
+              float *ALAYA_RESTRICT distances = nullptr);
 
   // Full-cache probe: same scan_neighbors kernel on a resident arena — direct
   // pid*node_len addressing over cache_nodes_, no beam/AIO orchestration.
@@ -779,16 +828,32 @@ class QuantizedGraph {
                        uint32_t *ALAYA_RESTRICT results,
                        const RowAdmission *admission = nullptr,
                        float *ALAYA_RESTRICT distances = nullptr);
-  void arena_search_with(ThreadData &data,
+  void arena_search_qg(const float *ALAYA_RESTRICT query,
+                       uint32_t knn,
+                       uint32_t *ALAYA_RESTRICT results,
+                       size_t ef_search,
+                       size_t beam_width,
+                       const RowAdmission *admission = nullptr,
+                       float *ALAYA_RESTRICT distances = nullptr);
+  void arena_search_with(ArenaScratch &scratch,
                          const float *ALAYA_RESTRICT query,
                          uint32_t knn,
                          uint32_t *ALAYA_RESTRICT results,
+                         size_t ef_search,
                          const RowAdmission *admission = nullptr,
                          float *ALAYA_RESTRICT distances = nullptr);
   void arena_batch_search(const float *ALAYA_RESTRICT query,
                           uint32_t knn,
                           uint32_t *ALAYA_RESTRICT results,
                           size_t num_queries,
+                          const RowAdmission *admission = nullptr,
+                          float *ALAYA_RESTRICT distances = nullptr);
+  void arena_batch_search(const float *ALAYA_RESTRICT query,
+                          uint32_t knn,
+                          uint32_t *ALAYA_RESTRICT results,
+                          size_t num_queries,
+                          size_t ef_search,
+                          size_t beam_width,
                           const RowAdmission *admission = nullptr,
                           float *ALAYA_RESTRICT distances = nullptr);
 
@@ -813,6 +878,14 @@ class QuantizedGraph {
                     size_t num_queries,
                     const RowAdmission *admission = nullptr,
                     float *ALAYA_RESTRICT distances = nullptr);
+  void batch_search(const float *ALAYA_RESTRICT query,
+                    uint32_t knn,
+                    uint32_t *ALAYA_RESTRICT results,
+                    size_t num_queries,
+                    size_t ef_search,
+                    size_t beam_width,
+                    const RowAdmission *admission = nullptr,
+                    float *ALAYA_RESTRICT distances = nullptr);
 
   void destroy_thread_data() {
     while (thread_data_.size() > 0) {
@@ -823,10 +896,6 @@ class QuantizedGraph {
       }
       if (data.sector_scratch_ != nullptr) {
         memory::align_free(data.sector_scratch_);
-      }
-      if (data.pca_query_scratch_ != nullptr) {
-        data.pca_query_scratch_storage_.reset();
-        data.pca_query_scratch_ = nullptr;
       }
     }
     // close() must run first: under the ThreadPool backend it joins worker
@@ -916,9 +985,11 @@ inline QuantizedGraph::QuantizedGraph(size_t num,
 inline QuantizedGraph::~QuantizedGraph() { destroy_thread_data(); }
 
 inline void QuantizedGraph::set_params(size_t ef_search, size_t num_threads, int beam_width) {
-  this->nthreads_ = num_threads;
-  this->max_beam_width_ = beam_width;
-  this->ef_search_ = ef_search;
+  // Compatibility shell for bindings and native benches. New search entries
+  // receive ef/beam directly; num_threads is consumed here to size legacy
+  // paged leases and is not retained as independent graph state.
+  compat_max_beam_width_ = static_cast<size_t>(beam_width);
+  compat_ef_search_ = ef_search;
   destroy_thread_data();
   if (index_file_name_ == "") {
     throw std::logic_error("QuantizedGraph::set_params: call load_disk_index() first");
@@ -929,7 +1000,7 @@ inline void QuantizedGraph::set_params(size_t ef_search, size_t num_threads, int
   page_reader_ = make_laser_page_reader(index_file_name_);
 #endif
 
-  const int nthreads_signed = static_cast<int>(nthreads_);
+  const int nthreads_signed = static_cast<int>(num_threads);
 #pragma omp parallel for num_threads(nthreads_signed)
   for (int thread = 0; thread < nthreads_signed; thread++) {
 #pragma omp critical
@@ -939,20 +1010,15 @@ inline void QuantizedGraph::set_params(size_t ef_search, size_t num_threads, int
       this->aligned_file_reader_->register_thread();
       data.ctx_ = aligned_file_reader_->get_ctx();
 #endif
-      data.search_pool_.resize(ef_search_);
-      data.visited_ =
-          HashBasedBooleanSet(std::min(this->num_points_ / 10, ef_search_ * ef_search_));
+      data.search_scratch_.ensure(num_points_, compat_ef_search_, dimension_ + residual_dimension_);
 #if defined(_WIN32)
       data.sector_scratch_ = reinterpret_cast<char *>(
-          memory::align_allocate<kSectorLen>(2 * max_beam_width_ * page_size_));
+          memory::align_allocate<kSectorLen>(2 * compat_max_beam_width_ * page_size_));
 #else
       data.sector_scratch_ = static_cast<char *>(
-          allocate_page_read_buffer(*page_reader_, 2 * max_beam_width_ * page_size_));
+          allocate_page_read_buffer(*page_reader_, 2 * compat_max_beam_width_ * page_size_));
 #endif
-      data.pca_query_scratch_storage_ =
-          std::make_shared<std::vector<float>>(dimension_ + residual_dimension_);
-      data.pca_query_scratch_ =
-          data.pca_query_scratch_storage_->data();  // Allocate PCA query buffer
+      data.sector_scratch_slots_ = 2 * compat_max_beam_width_;
       this->thread_data_.push(data);
     }
   }
@@ -966,7 +1032,17 @@ inline void QuantizedGraph::search(const float *ALAYA_RESTRICT query,
                                    uint32_t *ALAYA_RESTRICT results,
                                    const RowAdmission *admission,
                                    float *ALAYA_RESTRICT distances) {
-  disk_search_qg(query, knn, results, admission, distances);
+  search(query, knn, results, compat_ef_search_, compat_max_beam_width_, admission, distances);
+}
+
+inline void QuantizedGraph::search(const float *ALAYA_RESTRICT query,
+                                   uint32_t knn,
+                                   uint32_t *ALAYA_RESTRICT results,
+                                   size_t ef_search,
+                                   size_t beam_width,
+                                   const RowAdmission *admission,
+                                   float *ALAYA_RESTRICT distances) {
+  disk_search_qg(query, knn, results, ef_search, beam_width, admission, distances);
 }
 
 inline void QuantizedGraph::batch_search(const float *ALAYA_RESTRICT query,
@@ -976,13 +1052,37 @@ inline void QuantizedGraph::batch_search(const float *ALAYA_RESTRICT query,
                                          const RowAdmission *admission,
                                          float *ALAYA_RESTRICT distances) {
   const int64_t num_queries_signed = static_cast<int64_t>(num_queries);
-  const int nthreads_signed = static_cast<int>(nthreads_);
+  // set_params() materializes exactly one paged lease per requested legacy
+  // worker. Derive the old native-batch team size from those compatibility
+  // resources instead of retaining num_threads as independent graph state.
+  const int nthreads_signed = static_cast<int>(thread_data_.size());
 #pragma omp parallel for schedule(dynamic) num_threads(nthreads_signed)
   for (int64_t ii = 0; ii < num_queries_signed; ++ii) {
     const size_t i = static_cast<size_t>(ii);
     disk_search_qg(query + i * (dimension_ + residual_dimension_),
                    knn,
                    results + i * knn,
+                   compat_ef_search_,
+                   compat_max_beam_width_,
+                   admission,
+                   distances == nullptr ? nullptr : distances + i * knn);
+  }
+}
+
+inline void QuantizedGraph::batch_search(const float *ALAYA_RESTRICT query,
+                                         uint32_t knn,
+                                         uint32_t *ALAYA_RESTRICT results,
+                                         size_t num_queries,
+                                         size_t ef_search,
+                                         size_t beam_width,
+                                         const RowAdmission *admission,
+                                         float *ALAYA_RESTRICT distances) {
+  for (size_t i = 0; i < num_queries; ++i) {
+    disk_search_qg(query + i * (dimension_ + residual_dimension_),
+                   knn,
+                   results + i * knn,
+                   ef_search,
+                   beam_width,
                    admission,
                    distances == nullptr ? nullptr : distances + i * knn);
   }
@@ -993,35 +1093,45 @@ inline void QuantizedGraph::arena_search_qg(const float *ALAYA_RESTRICT query,
                                             uint32_t *ALAYA_RESTRICT results,
                                             const RowAdmission *admission,
                                             float *ALAYA_RESTRICT distances) {
-  ThreadData data = thread_data_.pop();
-  while (data.sector_scratch_ == nullptr) {
-    this->thread_data_.wait_for_push_notify();
-    data = thread_data_.pop();
-  }
-  arena_search_with(data, query, knn, results, admission, distances);
-  thread_data_.push(data);
-  thread_data_.push_notify_all();
+  arena_search_qg(query,
+                  knn,
+                  results,
+                  compat_ef_search_,
+                  compat_max_beam_width_,
+                  admission,
+                  distances);
 }
 
-inline void QuantizedGraph::arena_search_with(ThreadData &data,
+inline void QuantizedGraph::arena_search_qg(const float *ALAYA_RESTRICT query,
+                                            uint32_t knn,
+                                            uint32_t *ALAYA_RESTRICT results,
+                                            size_t ef_search,
+                                            size_t /*beam_width*/,
+                                            const RowAdmission *admission,
+                                            float *ALAYA_RESTRICT distances) {
+  static thread_local ArenaScratch scratch;
+  arena_search_with(scratch, query, knn, results, ef_search, admission, distances);
+}
+
+inline void QuantizedGraph::arena_search_with(ArenaScratch &scratch,
                                               const float *ALAYA_RESTRICT query,
                                               uint32_t knn,
                                               uint32_t *ALAYA_RESTRICT results,
+                                              size_t ef_search,
                                               const RowAdmission *admission,
                                               float *ALAYA_RESTRICT distances) {
   if (!arena_identity_) {
     throw std::runtime_error(
         "arena_search_qg: requires a 100% identity-ordered node cache sidecar");
   }
-  data.visited_.clear();
-  data.search_pool_.clear();
+  scratch.ensure(num_points_, ef_search, dimension_ + residual_dimension_);
 
   ALAYA_KSP_COUNT(queries);
   ALAYA_KSP_BEGIN(prep);
   const float *transformed_query = query;
   if (pca_transform_.is_loaded()) {
-    pca_transform_.transform(query, data.pca_query_scratch_);
-    transformed_query = data.pca_query_scratch_;
+    pca_transform_.transform(query, scratch.pca_query_scratch_.data());
+    transformed_query = scratch.pca_query_scratch_.data();
   }
 
   QGQuery q_obj(transformed_query, padded_dim_);
@@ -1046,9 +1156,9 @@ inline void QuantizedGraph::arena_search_with(ThreadData &data,
         best_dist = cur_expanded_dist;
       }
     }
-    data.search_pool_.insert(best_medoid, FLT_MAX);
+    scratch.search_pool_.insert(best_medoid, FLT_MAX);
   }
-  data.search_pool_.insert(entry_point_, FLT_MAX);
+  scratch.search_pool_.insert(entry_point_, FLT_MAX);
   ALAYA_KSP_END(prep);
 
   buffer::ResultBuffer res_pool(knn);
@@ -1060,20 +1170,20 @@ inline void QuantizedGraph::arena_search_with(ThreadData &data,
     prefetch_row_l1(arena + static_cast<size_t>(entry_point_) * node_len_, pf_lines);
   }
 
-  while (data.search_pool_.has_next()) {
-    const PID cur_node = data.search_pool_.pop();
-    if (data.visited_.get(cur_node)) {
+  while (scratch.search_pool_.has_next()) {
+    const PID cur_node = scratch.search_pool_.pop();
+    if (scratch.visited_.get(cur_node)) {
       continue;
     }
-    data.visited_.set(cur_node);
+    scratch.visited_.set(cur_node);
     const auto *cur_data =
         reinterpret_cast<const float *>(arena + static_cast<size_t>(cur_node) * node_len_);
     float sqr_y = scan_neighbors(q_obj,
                                  cur_data,
                                  appro_dist.data(),
-                                 data.search_pool_,
+                                 scratch.search_pool_,
                                  this->degree_bound_,
-                                 data.visited_,
+                                 scratch.visited_,
                                  pf_base,
                                  pf_lines);
     if (residual_dimension_ > 0) {
@@ -1098,34 +1208,46 @@ inline void QuantizedGraph::arena_batch_search(const float *ALAYA_RESTRICT query
                                                const RowAdmission *admission,
                                                float *ALAYA_RESTRICT distances) {
   const int64_t num_queries_signed = static_cast<int64_t>(num_queries);
-  const int nthreads_signed = static_cast<int>(nthreads_);
-  // Check out one ThreadData per worker for the whole batch: per-query queue
-  // pop/push with notify_all throttles ~60us in-memory queries at high thread
-  // counts (futex storm), which is orchestration tax rather than engine cost.
-  std::vector<ThreadData> slots;
-  slots.reserve(nthreads_);
-  for (uint32_t t = 0; t < nthreads_; ++t) {
-    ThreadData d = thread_data_.pop();
-    while (d.sector_scratch_ == nullptr) {
-      this->thread_data_.wait_for_push_notify();
-      d = thread_data_.pop();
-    }
-    slots.push_back(d);
-  }
+  // Arena searches no longer borrow these leases, but their count still
+  // records the set_params() team size expected by this compatibility-only
+  // native batch overload.
+  const int nthreads_signed = static_cast<int>(thread_data_.size());
+  // Source-compatible native bulk entry for bare benches. Each OpenMP worker
+  // now reaches the same TLS-backed single-query kernel as production; no
+  // graph-bound ThreadData slots are borrowed by an arena search.
 #pragma omp parallel for schedule(dynamic) num_threads(nthreads_signed)
   for (int64_t ii = 0; ii < num_queries_signed; ++ii) {
     const size_t i = static_cast<size_t>(ii);
-    arena_search_with(slots[static_cast<size_t>(omp_get_thread_num())],
-                      query + i * (dimension_ + residual_dimension_),
-                      knn,
-                      results + i * knn,
-                      admission,
-                      distances == nullptr ? nullptr : distances + i * knn);
+    arena_search_qg(query + i * (dimension_ + residual_dimension_),
+                    knn,
+                    results + i * knn,
+                    compat_ef_search_,
+                    compat_max_beam_width_,
+                    admission,
+                    distances == nullptr ? nullptr : distances + i * knn);
   }
-  for (auto &d : slots) {
-    thread_data_.push(d);
+}
+
+inline void QuantizedGraph::arena_batch_search(const float *ALAYA_RESTRICT query,
+                                               uint32_t knn,
+                                               uint32_t *ALAYA_RESTRICT results,
+                                               size_t num_queries,
+                                               size_t ef_search,
+                                               size_t beam_width,
+                                               const RowAdmission *admission,
+                                               float *ALAYA_RESTRICT distances) {
+  // Transitional A+B shape: production batch semantics are a simple sequence
+  // of reentrant per-query calls. The old OpenMP bulk overload above remains
+  // only for source compatibility and is adjudicated in block D.
+  for (size_t i = 0; i < num_queries; ++i) {
+    arena_search_qg(query + i * (dimension_ + residual_dimension_),
+                    knn,
+                    results + i * knn,
+                    ef_search,
+                    beam_width,
+                    admission,
+                    distances == nullptr ? nullptr : distances + i * knn);
   }
-  thread_data_.push_notify_all();
 }
 
 /**
@@ -1146,7 +1268,8 @@ inline void QuantizedGraph::arena_batch_search(const float *ALAYA_RESTRICT query
  *
  * Key Optimizations:
  * - Asynchronous I/O: Overlaps disk reads with CPU computation
- * - Adaptive beam width: Starts small and grows exponentially up to max_beam_width_
+ * - Adaptive beam width: Starts small and grows exponentially up to the
+ *   per-call beam_width
  * - In-memory caching: Frequently accessed nodes are cached to avoid repeated disk reads
  * - Pipelined processing: Processes nodes from previous iteration while waiting for new I/O
  *
@@ -1165,6 +1288,8 @@ inline void QuantizedGraph::arena_batch_search(const float *ALAYA_RESTRICT query
 inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
                                            uint32_t knn,
                                            uint32_t *ALAYA_RESTRICT results,
+                                           size_t ef_search,
+                                           size_t beam_width,
                                            const RowAdmission *admission,
                                            float *ALAYA_RESTRICT distances) {
   // ==================== Thread-local Data Acquisition ====================
@@ -1175,16 +1300,22 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
     this->thread_data_.wait_for_push_notify();
     data = thread_data_.pop();
   }
-  data.visited_.clear();
-  data.search_pool_.clear();
+  if (beam_width > data.sector_scratch_slots_ / 2) {
+    thread_data_.push(data);
+    thread_data_.push_notify_all();
+    throw std::logic_error(
+        "QuantizedGraph::search: per-call beam exceeds the legacy paged lease capacity; "
+        "call set_params() first");
+  }
+  data.search_scratch_.ensure(num_points_, ef_search, dimension_ + residual_dimension_);
 
   // ==================== PCA Transform ====================
   // Transform the original query using PCA for dimension reordering.
   // After transformation, high-variance dimensions are placed first.
   const float *transformed_query = query;
   if (pca_transform_.is_loaded()) {
-    pca_transform_.transform(query, data.pca_query_scratch_);
-    transformed_query = data.pca_query_scratch_;
+    pca_transform_.transform(query, data.search_scratch_.pca_query_scratch_.data());
+    transformed_query = data.search_scratch_.pca_query_scratch_.data();
   }
 
   // Performance timing variables (for profiling purposes)
@@ -1231,10 +1362,10 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
       }
     }
     // Insert best medoid with max distance (distance will be computed when visited)
-    data.search_pool_.insert(best_medoid, FLT_MAX);
+    data.search_scratch_.search_pool_.insert(best_medoid, FLT_MAX);
   }
   // Always include the global entry point as a starting position
-  data.search_pool_.insert(entry_point_, FLT_MAX);
+  data.search_scratch_.search_pool_.insert(entry_point_, FLT_MAX);
 
   // ==================== Result and Distance Buffers ====================
   // Result pool maintains the top-k nearest neighbors found during search
@@ -1251,7 +1382,7 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
 #else
   std::vector<storage::io::ReadRequest> frontier_read_reqs;
 #endif
-  frontier_read_reqs.reserve(2 * max_beam_width_);
+  frontier_read_reqs.reserve(2 * beam_width);
 
   // prepared_nodes: Nodes whose data has been fetched and is ready for processing
   std::deque<std::pair<PID, char *>> prepared_nodes;
@@ -1261,7 +1392,7 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
 
   // free_slots: Pool of available memory buffers for disk reads (double-buffering scheme)
   std::deque<char *> free_slots;
-  for (size_t i = 0; i < 2 * max_beam_width_; i++) {
+  for (size_t i = 0; i < 2 * beam_width; i++) {
     free_slots.push_back(data.sector_scratch_ + i * page_size_);
   }
 
@@ -1287,9 +1418,9 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
     float sqr_y = scan_neighbors(q_obj,
                                  cur_data,
                                  appro_dist.data(),
-                                 data.search_pool_,
+                                 data.search_scratch_.search_pool_,
                                  this->degree_bound_,
-                                 data.visited_);
+                                 data.search_scratch_.visited_);
     // Add residual dimension distance if applicable (e.g., for GIST dataset)
     if (residual_dimension_ > 0) {
       float *residual_data = cur_data + dimension_;
@@ -1343,7 +1474,7 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
   // ==================== Main Search Loop ====================
   // Iteratively expand search frontier until no more candidates remain.
   // Uses beam search with adaptive width and pipelined I/O processing.
-  while (data.search_pool_.has_next()) {
+  while (data.search_scratch_.search_pool_.has_next()) {
     frontier_read_reqs.clear();
     cache_nhoods.clear();
     size_t n_ops = 0;
@@ -1352,21 +1483,22 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
 
     // Adaptive beam width: double the beam size each iteration (up to max)
     // This helps balance between exploration breadth and I/O efficiency.
-    cur_beam_size = std::min(max_beam_width_,
-                             static_cast<size_t>(std::ceil(2 * static_cast<float>(cur_beam_size))));
+    cur_beam_size =
+        std::min(beam_width, static_cast<size_t>(std::ceil(2 * static_cast<float>(cur_beam_size))));
 
     auto wait_start = std::chrono::high_resolution_clock::now();
 
     // -------------------- Build I/O Request Batch --------------------
     // Pop candidates from search pool and prepare I/O requests for non-cached nodes.
-    while (data.search_pool_.has_next() && frontier_read_reqs.size() < cur_beam_size) {
-      PID cur_node = data.search_pool_.pop();
+    while (data.search_scratch_.search_pool_.has_next() &&
+           frontier_read_reqs.size() < cur_beam_size) {
+      PID cur_node = data.search_scratch_.search_pool_.pop();
 
       // Skip already visited nodes to avoid redundant processing
-      if (data.visited_.get(cur_node)) {
+      if (data.search_scratch_.visited_.get(cur_node)) {
         continue;
       }
-      data.visited_.set(cur_node);
+      data.search_scratch_.visited_.set(cur_node);
 
       // Check if node is in memory cache
       if (caches_.find(cur_node) != caches_.end()) {
@@ -1545,7 +1677,7 @@ inline void QuantizedGraph::init_workspace() {
   page_reader_ = make_laser_page_reader(index_file_name_);
 #endif
 
-  const int nthreads_signed = static_cast<int>(nthreads_);
+  constexpr int nthreads_signed = 1;
 #pragma omp parallel for num_threads(nthreads_signed)
   for (int thread = 0; thread < nthreads_signed; thread++) {
 #pragma omp critical
@@ -1555,20 +1687,15 @@ inline void QuantizedGraph::init_workspace() {
       this->aligned_file_reader_->register_thread();
       data.ctx_ = aligned_file_reader_->get_ctx();
 #endif
-      data.search_pool_.resize(ef_search_);
-      data.visited_ =
-          HashBasedBooleanSet(std::min(this->num_points_ / 10, ef_search_ * ef_search_));
+      data.search_scratch_.ensure(num_points_, compat_ef_search_, dimension_ + residual_dimension_);
 #if defined(_WIN32)
       data.sector_scratch_ = reinterpret_cast<char *>(
-          memory::align_allocate<kSectorLen>(2 * max_beam_width_ * page_size_));
+          memory::align_allocate<kSectorLen>(2 * compat_max_beam_width_ * page_size_));
 #else
       data.sector_scratch_ = static_cast<char *>(
-          allocate_page_read_buffer(*page_reader_, 2 * max_beam_width_ * page_size_));
+          allocate_page_read_buffer(*page_reader_, 2 * compat_max_beam_width_ * page_size_));
 #endif
-      data.pca_query_scratch_storage_ =
-          std::make_shared<std::vector<float>>(dimension_ + residual_dimension_);
-      data.pca_query_scratch_ =
-          data.pca_query_scratch_storage_->data();  // Allocate PCA query buffer
+      data.sector_scratch_slots_ = 2 * compat_max_beam_width_;
       this->thread_data_.push(data);
     }
   }

@@ -110,7 +110,12 @@ std::vector<uint32_t> run_search(ResidencyProvider &provider,
                                  const float *query,
                                  uint32_t knn) {
   std::vector<uint32_t> out(knn);
-  provider.search(qg, query, knn, out.data());
+  provider.search(qg,
+                  query,
+                  knn,
+                  out.data(),
+                  /*ef_search=*/96,
+                  /*beam_width=*/4);
   return out;
 }
 

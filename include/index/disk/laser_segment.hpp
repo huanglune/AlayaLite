@@ -470,6 +470,10 @@ class LaserSegment {
     auto shared = std::shared_ptr<LaserSegment>(std::move(segment));
     core::SegmentInstanceConfig config;
     config.readonly = true;
+    // This capability has no per-residency representation: resident_arena is
+    // lock-free reentrant, while paged_pool remains safe via its internal
+    // legacy mutex until block C. Both therefore truthfully satisfy the
+    // boolean safety contract exposed here.
     config.concurrency.reentrant_search = true;
     config.concurrency.search_with_stage = false;
     config.concurrency.search_with_publish = false;
@@ -1051,6 +1055,8 @@ class LaserSegment {
     entry.capabilities.operations = core::capability_bit(core::OperationCapability::search) |
                                     core::capability_bit(core::OperationCapability::batch_search) |
                                     core::capability_bit(core::OperationCapability::stats);
+    // The manifest schema exposes one safety bit, not residency-specific
+    // progress guarantees; see into_any() for the arena/paged distinction.
     entry.capabilities.reentrant_search = true;
     entry.capabilities.cooperative_cancel = true;
     entry.capabilities.explicit_drain = false;

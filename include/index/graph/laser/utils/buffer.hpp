@@ -33,7 +33,7 @@ namespace alaya::laser::buffer {
 class SearchBuffer {
  private:
   std::vector<Candidate<float>, ::alaya::AlignedAlloc<Candidate<float>>> data_;
-  size_t size_ = 0, cur_ = 0, capacity_;
+  size_t size_ = 0, cur_ = 0, capacity_ = 0;
 
   [[nodiscard]] auto binary_search(float dist) const {
     size_t lo = 0;
@@ -92,8 +92,14 @@ class SearchBuffer {
   [[nodiscard]] auto has_next() const -> bool { return cur_ < size_; }
 
   void resize(size_t new_size) {
-    this->capacity_ = new_size;
-    data_ = std::vector<Candidate<float>, ::alaya::AlignedAlloc<Candidate<float>>>(capacity_ + 1);
+    // Keep allocated storage when a thread-local scratch is reused by a call
+    // with a smaller ef, while still changing the logical frontier limit for
+    // that call. Growing remains the only allocating case.
+    if (data_.size() < new_size + 1) {
+      data_.resize(new_size + 1);
+    }
+    capacity_ = new_size;
+    clear();
   }
 };
 

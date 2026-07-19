@@ -124,6 +124,7 @@ if(ALAYA_ENABLE_LASER)
       test_laser_segment_searcher.cpp
       test_segment_factory_laser.cpp
       test_laser_searcher_thread_safety.cpp
+      test_laser_arena_reentrancy.cpp
       laser_segment_test.cpp
       laser_segment_stress_test.cpp
       rabitq_format_separation_test.cpp
@@ -154,7 +155,7 @@ if(ALAYA_ENABLE_LASER)
         LABELS laser segment
         TIMEOUT 180
       )
-    elseif(_laser_segment_test_target STREQUAL "laser_segment_stress_test")
+    elseif(_laser_segment_test_target MATCHES "^(laser_segment_stress_test|test_laser_arena_reentrancy)$")
       alaya_add_test(
         NAME ${_laser_segment_test_target}
         TARGET ${_laser_segment_test_target}

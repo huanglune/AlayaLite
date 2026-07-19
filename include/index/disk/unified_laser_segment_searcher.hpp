@@ -12,7 +12,6 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
-#include <thread>  // NOLINT(build/c++11)
 #include <vector>
 
 #include "index/disk/laser_segment_searcher.hpp"
@@ -73,22 +72,28 @@ class UnifiedLaserSegmentSearcher : public SegmentSearcher {
       throw std::invalid_argument("UnifiedLaserSegmentSearcher: beam_width exceeds int max");
     }
 
-    // Same discipline as the legacy searcher: serialize so set_params'
-    // thread-data destroy + rebuild cannot race in-flight searches.
-    const std::lock_guard<std::mutex> lock(search_mutex_);
-
     auto &graph = legacy_.graph();
     const auto effective_top_k =
         static_cast<uint32_t>(std::min<uint64_t>(static_cast<uint64_t>(opts.top_k), size()));
-    const LastSetParams requested{
-        static_cast<size_t>(std::max(opts.ef, effective_top_k)),
-        1,
-        static_cast<int>(opts.beam_width),
-    };
-    if (requested != last_set_params_) {
-      graph.set_params(requested.ef_search, requested.num_threads, requested.beam_width);
-      set_params_call_count_.fetch_add(1, std::memory_order_relaxed);
-      last_set_params_ = requested;
+    const size_t ef_search = static_cast<size_t>(std::max(opts.ef, effective_top_k));
+    const size_t beam_width = static_cast<size_t>(opts.beam_width);
+
+    // Paged filtered search stays on the legacy lock/cache discipline until
+    // block C supplies graph-bound IO leases. Resident arena never touches
+    // set_params or this mutex: ef/beam flow directly to its TLS kernel.
+    std::unique_lock<std::mutex> paged_lock;
+    if (provider_->mode() == laser::ResidencyMode::kPagedPool) {
+      paged_lock = std::unique_lock<std::mutex>(search_mutex_);
+      const LastSetParams requested{
+          ef_search,
+          1,
+          static_cast<int>(opts.beam_width),
+      };
+      if (requested != last_set_params_) {
+        graph.set_params(requested.ef_search, requested.num_threads, requested.beam_width);
+        set_params_call_count_.fetch_add(1, std::memory_order_relaxed);
+        last_set_params_ = requested;
+      }
     }
 
     std::vector<uint64_t> admission_storage;
@@ -109,6 +114,8 @@ class UnifiedLaserSegmentSearcher : public SegmentSearcher {
                       query,
                       effective_top_k,
                       pid_buf.data(),
+                      ef_search,
+                      beam_width,
                       admission,
                       opts.return_distances ? distance_buf.data() : nullptr);
 
@@ -129,9 +136,9 @@ class UnifiedLaserSegmentSearcher : public SegmentSearcher {
     return out;
   }
 
-  // Arena-mode batches route to the native batch kernel (per-thread slot
-  // borrowing inside QuantizedGraph::arena_batch_search). Paged mode keeps
-  // the base one-query-at-a-time fan-out, byte-identical to before.
+  // Arena-mode batches lower to the reentrant single-query kernel without an
+  // internal lane team. Paged mode keeps the base one-query-at-a-time fan-out,
+  // byte-identical to before.
   auto batch_search(const float *queries, uint32_t num_queries, const DiskSearchOptions &opts) const
       -> std::vector<std::vector<DiskSearchHit>> override {
     if (provider_->mode() == laser::ResidencyMode::kPagedPool || num_queries == 0) {
@@ -147,23 +154,11 @@ class UnifiedLaserSegmentSearcher : public SegmentSearcher {
       throw std::invalid_argument("UnifiedLaserSegmentSearcher: beam_width exceeds int max");
     }
 
-    const std::lock_guard<std::mutex> lock(search_mutex_);
-
     auto &graph = legacy_.graph();
     const auto effective_top_k =
         static_cast<uint32_t>(std::min<uint64_t>(static_cast<uint64_t>(opts.top_k), size()));
-    const size_t batch_threads =
-        std::max<size_t>(1, std::min<size_t>(num_queries, std::thread::hardware_concurrency()));
-    const LastSetParams requested{
-        static_cast<size_t>(std::max(opts.ef, effective_top_k)),
-        batch_threads,
-        static_cast<int>(opts.beam_width),
-    };
-    if (requested != last_set_params_) {
-      graph.set_params(requested.ef_search, requested.num_threads, requested.beam_width);
-      set_params_call_count_.fetch_add(1, std::memory_order_relaxed);
-      last_set_params_ = requested;
-    }
+    const size_t ef_search = static_cast<size_t>(std::max(opts.ef, effective_top_k));
+    const size_t beam_width = static_cast<size_t>(opts.beam_width);
 
     std::vector<uint64_t> admission_storage;
     laser::RowAdmission admission_value{};
@@ -180,6 +175,8 @@ class UnifiedLaserSegmentSearcher : public SegmentSearcher {
                             effective_top_k,
                             pid_buf.data(),
                             num_queries,
+                            ef_search,
+                            beam_width,
                             admission,
                             opts.return_distances ? distance_buf.data() : nullptr);
 
@@ -224,8 +221,9 @@ class UnifiedLaserSegmentSearcher : public SegmentSearcher {
   // manifest).
   [[nodiscard]] auto labels() const noexcept -> const uint64_t * { return legacy_.labels(); }
 
-  // Test-only observer, mirrors LaserSegmentSearcher::set_params_call_count
-  // for the arena path (the paged path counts inside legacy_).
+  // Test-only observer: counts compatibility set_params forwarding in this
+  // wrapper. Resident-arena per-call search deliberately leaves it at zero;
+  // paged kind=none still counts inside legacy_.
   auto set_params_call_count() const noexcept -> uint64_t {
     return set_params_call_count_.load(std::memory_order_relaxed);
   }
