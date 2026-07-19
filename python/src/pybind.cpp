@@ -3,6 +3,7 @@
 
 #include <pybind11/pybind11.h>
 
+#include <optional>
 #include <string>
 
 #ifdef ALAYA_ENABLE_LASER
@@ -37,4 +38,10 @@ PYBIND11_MODULE(_alayalitepy, module) {
       .export_values();
 
   alaya::python::collection_binding::register_collection(module);
+#ifdef ALAYA_ENABLE_LASER
+  alaya::python::collection_binding::
+      register_capabilities(module, true, std::string(alaya::laser::simd::get_laser_simd_name()));
+#else
+  alaya::python::collection_binding::register_capabilities(module, false, std::nullopt);
+#endif
 }

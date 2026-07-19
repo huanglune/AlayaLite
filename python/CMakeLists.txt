@@ -50,3 +50,11 @@ install(
   LIBRARY DESTINATION alayalite
   RUNTIME DESTINATION alayalite
 )
+
+if(BUILD_TESTING)
+  add_test(NAME python_binding_incremental_test
+           COMMAND ${Python_EXECUTABLE} ${CMAKE_SOURCE_DIR}/python/tests/binding/native_incremental_ctest.py
+                   $<TARGET_FILE:${PYTHON_MODULE_NAME}>
+  )
+  set_tests_properties(python_binding_incremental_test PROPERTIES LABELS "unit;python;binding" TIMEOUT 60)
+endif()

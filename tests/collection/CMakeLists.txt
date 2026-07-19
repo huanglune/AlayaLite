@@ -41,6 +41,18 @@ alaya_add_test(
   TIMEOUT 60
 )
 
+alaya_cc_target(
+  collection_scan_projection_test
+  SRCS collection_scan_projection_test.cpp
+  GTEST PCH_REUSE_FROM alaya_collection_test_pch
+)
+alaya_add_test(
+  NAME collection_scan_projection_test
+  TARGET collection_scan_projection_test
+  LABELS unit collection projection
+  TIMEOUT 60
+)
+
 # Deliberately omits the LASER compile/link profile even on a LASER-capable host. This is the wheel/platform contract
 # for Linux aarch64 and any other build where qg's physical implementation is unavailable.
 alaya_cc_target(

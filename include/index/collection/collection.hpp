@@ -548,7 +548,14 @@ class Collection {
   [[nodiscard]] auto records(CollectionProjection projection = CollectionProjection::all,
                              std::size_t limit = std::numeric_limits<std::size_t>::max())
       -> core::Result<std::vector<CollectionRecord>> {
-    return implementation_->scalar_query(internal::collection::LogicalFilter{}, limit, projection);
+    return scan(CollectionFilter{}, limit, projection);
+  }
+
+  [[nodiscard]] auto scan(const CollectionFilter &filter,
+                          std::size_t limit,
+                          CollectionProjection projection = CollectionProjection::all)
+      -> core::Result<std::vector<CollectionRecord>> {
+    return implementation_->scalar_query(filter, limit, projection);
   }
 
   [[nodiscard]] auto checkpoint(core::CheckpointContext &context)

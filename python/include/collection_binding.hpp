@@ -550,6 +550,148 @@ struct OwnedTensor {
   return result;
 }
 
+// These response carriers are intentionally private binding types.  Wave A keeps
+// the dictionary-returning methods alive for the existing Python facade while
+// giving the v2 core a field-checked path that cannot drift through string keys.
+// TODO(sdk-v2 wave C): make these the canonical method responses and remove the
+// dictionary compatibility shims in the same cut as the old Python facade.
+struct PyRecordResponse {
+  py::object id{};
+  std::uint64_t upsert_sequence{};
+  std::string document{};
+  py::dict metadata{};
+  py::object vector{};
+};
+
+struct PyMutationRowResponse {
+  std::uint64_t op_id{};
+  std::uint64_t batch_op_id{};
+  std::uint64_t row_op_id{};
+  std::uint64_t visibility_watermark{};
+  std::uint64_t durable_watermark{};
+  bool searchable{};
+  std::uint8_t durability{};
+  std::uint8_t row_status{};
+  std::string retry_token{};
+};
+
+struct PyMutationResponse {
+  std::uint64_t batch_op_id{};
+  std::uint64_t visibility_watermark{};
+  std::uint64_t durable_watermark{};
+  bool searchable{};
+  std::uint8_t durability{};
+  std::string retry_token{};
+  std::vector<PyMutationRowResponse> rows{};
+};
+
+struct PySearchStatsResponse {
+  bool filter_active{};
+  std::string filter_execution{};
+  std::uint64_t filter_examined{};
+  std::uint64_t filter_passed{};
+  std::uint64_t nan_discarded{};
+  std::uint64_t overfetch_rounds{};
+  std::uint64_t budget_consumed{};
+  std::uint64_t lease_acquired{};
+  std::uint64_t lease_released{};
+  std::uint64_t lease_peak_bytes{};
+  std::uint64_t io_requests_consumed{};
+  std::uint64_t io_bytes_consumed{};
+  std::uint64_t rerank_nanoseconds{};
+  std::optional<std::uint32_t> effective_effort{};
+};
+
+struct PySearchResponse {
+  py::array ids{};
+  py::array distances{};
+  py::array offsets{};
+  py::array valid_counts{};
+  py::array status_codes{};
+  py::array completeness_codes{};
+  std::uint64_t visibility_watermark{};
+  std::uint64_t metadata_epoch{};
+  PySearchStatsResponse search_stats{};
+};
+
+struct PyCheckpointResponse {
+  std::uint64_t durable_watermark{};
+  std::uint64_t wal_cut{};
+  std::uint64_t metadata_epoch{};
+  std::string checkpoint_name{};
+};
+
+struct PySealResponse {
+  std::uint64_t source_segment_id{};
+  std::uint64_t successor_segment_id{};
+  std::uint64_t sealed_segment_id{};
+  std::uint64_t wal_cut{};
+  core::RowCount sealed_rows{};
+  std::uint64_t sealed_bytes{};
+  std::uint64_t manifest_generation{};
+};
+
+struct PyCompactResponse {
+  std::vector<std::uint64_t> source_segment_ids{};
+  std::uint64_t compacted_segment_id{};
+  core::RowCount compacted_rows{};
+  std::uint64_t input_bytes{};
+  std::uint64_t output_bytes{};
+  std::uint64_t manifest_generation{};
+};
+
+struct PyGcResponse {
+  core::RowCount pending{};
+  core::RowCount reclaimed{};
+  core::RowCount deferred{};
+  std::uint64_t reclaimed_bytes{};
+  std::uint64_t manifest_generation{};
+};
+
+struct PyStatsResponse {
+  core::RowCount size{};
+  core::RowCount accepted_count{};
+  core::RowCount pending_count{};
+  std::uint64_t searchable_bytes{};
+  std::uint64_t accepted_bytes{};
+  std::uint64_t searchable_vector_bytes{};
+  std::uint64_t accepted_vector_bytes{};
+  std::uint64_t pending_bytes{};
+  core::RowCount allocated_count{};
+  core::RowCount tombstone_count{};
+  std::uint64_t routing_generation{};
+  std::uint64_t visibility_watermark{};
+  std::uint64_t durable_watermark{};
+  std::uint64_t metadata_epoch{};
+  core::RowCount sealed_segments_count{};
+  core::RowCount gc_pending_count{};
+  std::string active_segment_algorithm{};
+  std::uint64_t compacted_bytes{};
+  std::uint8_t lifecycle{};
+};
+
+struct PyOptionsResponse {
+  std::string root{};
+  std::uint32_t dim{};
+  std::string metric{};
+  py::dtype dtype{};
+  std::string index_type{};
+  std::string quantization_type{};
+  std::uint32_t build_threads{};
+  std::uint32_t max_neighbors{};
+  std::uint32_t ef_construction{};
+  std::string implementation_key{};
+  std::string engine_factory_key{};
+  std::string active_algorithm{};
+  std::uint64_t auto_seal_rows{};
+};
+
+struct PyCapabilitiesResponse {
+  std::vector<std::string> index_types{};
+  bool laser_enabled{};
+  std::optional<std::string> laser_simd{};
+};
+
 [[nodiscard]] inline auto owned_vector_to_array(const internal::collection::OwnedVector &vector)
     -> py::array {
   py::array result(scalar_dtype(vector.scalar_type()),
@@ -569,6 +711,17 @@ struct OwnedTensor {
   return result;
 }
 
+[[nodiscard]] inline auto record_to_response(const CollectionRecord &record) -> PyRecordResponse {
+  PyRecordResponse result;
+  result.id = logical_id_to_python(record.logical_id);
+  result.upsert_sequence = record.upsert_sequence;
+  result.document = record.document;
+  result.metadata = metadata_to_python(record.metadata);
+  result.vector =
+      record.vector.has_value() ? py::object(owned_vector_to_array(*record.vector)) : py::none();
+  return result;
+}
+
 [[nodiscard]] inline auto receipt_to_dict(const CollectionMutationReceipt &receipt) -> py::dict {
   py::dict result;
   result["op_id"] = receipt.op_id;
@@ -581,6 +734,19 @@ struct OwnedTensor {
   result["row_status"] = static_cast<std::uint8_t>(receipt.row_status);
   result["retry_token"] = receipt.retry_token;
   return result;
+}
+
+[[nodiscard]] inline auto receipt_to_response(const CollectionMutationReceipt &receipt)
+    -> PyMutationRowResponse {
+  return {receipt.op_id,
+          receipt.batch_op_id,
+          receipt.row_op_id,
+          receipt.visibility_watermark,
+          receipt.durable_watermark,
+          receipt.searchable,
+          static_cast<std::uint8_t>(receipt.durability),
+          static_cast<std::uint8_t>(receipt.row_status),
+          receipt.retry_token};
 }
 
 [[nodiscard]] inline auto batch_receipt_to_dict(const CollectionBatchMutationReceipt &receipt)
@@ -597,6 +763,22 @@ struct OwnedTensor {
     rows.append(receipt_to_dict(row));
   }
   result["rows"] = std::move(rows);
+  return result;
+}
+
+[[nodiscard]] inline auto batch_receipt_to_response(const CollectionBatchMutationReceipt &receipt)
+    -> PyMutationResponse {
+  PyMutationResponse result;
+  result.batch_op_id = receipt.batch_op_id;
+  result.visibility_watermark = receipt.visibility_watermark;
+  result.durable_watermark = receipt.durable_watermark;
+  result.searchable = receipt.searchable;
+  result.durability = static_cast<std::uint8_t>(receipt.durability);
+  result.retry_token = receipt.retry_token;
+  result.rows.reserve(receipt.rows.size());
+  for (const auto &row : receipt.rows) {
+    result.rows.push_back(receipt_to_response(row));
+  }
   return result;
 }
 
@@ -641,6 +823,25 @@ template <class T>
   return result;
 }
 
+[[nodiscard]] inline auto search_stats_to_response(
+    const CollectionSearchStatistics &stats,
+    std::optional<std::uint32_t> effective_effort = {}) -> PySearchStatsResponse {
+  return {stats.filter_active,
+          std::string(filter_execution_name(stats.filter_execution)),
+          stats.filter_examined,
+          stats.filter_passed,
+          stats.nan_discarded,
+          stats.overfetch_rounds,
+          stats.budget_consumed,
+          stats.lease_acquired,
+          stats.lease_released,
+          stats.lease_peak_bytes,
+          stats.io_requests_consumed,
+          stats.io_bytes_consumed,
+          stats.rerank_nanoseconds,
+          effective_effort};
+}
+
 [[nodiscard]] inline auto search_response_to_dict(const CollectionSearchResponse &response)
     -> py::dict {
   py::list id_list;
@@ -672,6 +873,38 @@ template <class T>
   return result;
 }
 
+[[nodiscard]] inline auto search_response_to_response(
+    const CollectionSearchResponse &response,
+    std::optional<std::uint32_t> effective_effort = {}) -> PySearchResponse {
+  py::list id_list;
+  for (const auto &id : response.ids) {
+    id_list.append(logical_id_to_python(id));
+  }
+  auto numpy = py::module_::import("numpy");
+  py::object ids = numpy.attr("asarray")(id_list, py::arg("dtype") = numpy.attr("object_"));
+  std::vector<std::uint8_t> statuses;
+  std::vector<std::uint8_t> completeness;
+  statuses.reserve(response.statuses.size());
+  completeness.reserve(response.completeness.size());
+  for (const auto &status : response.statuses) {
+    statuses.push_back(static_cast<std::uint8_t>(status.code()));
+  }
+  for (const auto value : response.completeness) {
+    completeness.push_back(static_cast<std::uint8_t>(value));
+  }
+  PySearchResponse result;
+  result.ids = py::cast<py::array>(std::move(ids));
+  result.distances = copy_array(response.distances);
+  result.offsets = copy_array(response.offsets);
+  result.valid_counts = copy_array(response.valid_counts);
+  result.status_codes = copy_array(statuses);
+  result.completeness_codes = copy_array(completeness);
+  result.visibility_watermark = response.visibility_watermark;
+  result.metadata_epoch = response.metadata_epoch;
+  result.search_stats = search_stats_to_response(response.search_stats, effective_effort);
+  return result;
+}
+
 [[nodiscard]] inline auto write_options(std::string_view durability, const std::string &retry_token)
     -> CollectionWriteOptions {
   CollectionWriteOptions result;
@@ -695,6 +928,15 @@ template <class T>
   }
   throw py::value_error(
       "canonical Collection batch mode must be per_row_independent or all_or_nothing");
+}
+
+[[nodiscard]] constexpr auto record_projection(bool include_vector) -> CollectionProjection {
+  auto fields = static_cast<std::uint8_t>(CollectionProjection::metadata) |
+                static_cast<std::uint8_t>(CollectionProjection::document);
+  if (include_vector) {
+    fields |= static_cast<std::uint8_t>(CollectionProjection::vector);
+  }
+  return static_cast<CollectionProjection>(fields);
 }
 
 class PyCollection {
@@ -746,6 +988,31 @@ class PyCollection {
                             const std::string &mode,
                             const std::string &durability,
                             const std::string &retry_token) -> py::dict {
+    return batch_receipt_to_dict(
+        mutate_response(ids, documents, vectors, metadata, action, mode, durability, retry_token));
+  }
+
+  [[nodiscard]] auto mutate_typed(const py::list &ids,
+                                  const py::list &documents,
+                                  const py::array &vectors,
+                                  const py::list &metadata,
+                                  const std::string &action,
+                                  const std::string &mode,
+                                  const std::string &durability,
+                                  const std::string &retry_token) -> PyMutationResponse {
+    return batch_receipt_to_response(
+        mutate_response(ids, documents, vectors, metadata, action, mode, durability, retry_token));
+  }
+
+  [[nodiscard]] auto mutate_response(const py::list &ids,
+                                     const py::list &documents,
+                                     const py::array &vectors,
+                                     const py::list &metadata,
+                                     const std::string &action,
+                                     const std::string &mode,
+                                     const std::string &durability,
+                                     const std::string &retry_token)
+      -> CollectionBatchMutationReceipt {
     const auto owned_vectors = owned_tensor(vectors, collection_->options().dim);
     const auto view = owned_vectors.view();
     const auto rows = static_cast<std::size_t>(view.rows);
@@ -779,17 +1046,31 @@ class PyCollection {
     }
     const auto native_mode = batch_mode(mode);
     const auto native_options = write_options(durability, retry_token);
-    auto receipt = [&] {
+    return [&] {
       py::gil_scoped_release release;
       return unwrap(collection_->mutate_batch(native, native_mode, native_options));
     }();
-    return batch_receipt_to_dict(receipt);
   }
 
   [[nodiscard]] auto remove(const py::list &ids,
                             const std::string &mode,
                             const std::string &durability,
                             const std::string &retry_token) -> py::dict {
+    return batch_receipt_to_dict(remove_response(ids, mode, durability, retry_token));
+  }
+
+  [[nodiscard]] auto remove_typed(const py::list &ids,
+                                  const std::string &mode,
+                                  const std::string &durability,
+                                  const std::string &retry_token) -> PyMutationResponse {
+    return batch_receipt_to_response(remove_response(ids, mode, durability, retry_token));
+  }
+
+  [[nodiscard]] auto remove_response(const py::list &ids,
+                                     const std::string &mode,
+                                     const std::string &durability,
+                                     const std::string &retry_token)
+      -> CollectionBatchMutationReceipt {
     std::vector<CollectionBatchRow> native;
     native.reserve(ids.size());
     for (const auto &id : ids) {
@@ -800,11 +1081,10 @@ class PyCollection {
     }
     const auto native_mode = batch_mode(mode);
     const auto native_options = write_options(durability, retry_token);
-    auto receipt = [&] {
+    return [&] {
       py::gil_scoped_release release;
       return unwrap(collection_->mutate_batch(native, native_mode, native_options));
     }();
-    return batch_receipt_to_dict(receipt);
   }
 
   [[nodiscard]] auto search(const py::array &queries,
@@ -816,6 +1096,50 @@ class PyCollection {
                             std::uint64_t scratch_budget_bytes,
                             std::uint64_t io_budget_requests,
                             std::uint64_t io_budget_bytes) -> py::dict {
+    return search_response_to_dict(search_response(queries,
+                                                   top_k,
+                                                   ef_search,
+                                                   metadata_filter,
+                                                   policy,
+                                                   selectivity,
+                                                   scratch_budget_bytes,
+                                                   io_budget_requests,
+                                                   io_budget_bytes));
+  }
+
+  [[nodiscard]] auto search_typed(const py::array &queries,
+                                  std::uint64_t top_k,
+                                  std::uint32_t ef_search,
+                                  const py::object &metadata_filter,
+                                  const std::string &policy,
+                                  const py::object &selectivity,
+                                  std::uint64_t scratch_budget_bytes,
+                                  std::uint64_t io_budget_requests,
+                                  std::uint64_t io_budget_bytes) -> PySearchResponse {
+    const auto effective_effort = collection_->target_algorithm() == core::algorithm::qg
+                                      ? std::optional<std::uint32_t>(ef_search)
+                                      : std::nullopt;
+    return search_response_to_response(search_response(queries,
+                                                       top_k,
+                                                       ef_search,
+                                                       metadata_filter,
+                                                       policy,
+                                                       selectivity,
+                                                       scratch_budget_bytes,
+                                                       io_budget_requests,
+                                                       io_budget_bytes),
+                                       effective_effort);
+  }
+
+  [[nodiscard]] auto search_response(const py::array &queries,
+                                     std::uint64_t top_k,
+                                     std::uint32_t ef_search,
+                                     const py::object &metadata_filter,
+                                     const std::string &policy,
+                                     const py::object &selectivity,
+                                     std::uint64_t scratch_budget_bytes,
+                                     std::uint64_t io_budget_requests,
+                                     std::uint64_t io_budget_bytes) -> CollectionSearchResponse {
     const auto owned_queries = owned_tensor(queries, collection_->options().dim, false);
     const auto view = owned_queries.view();
     if (view.scalar_type != collection_->options().scalar_type) {
@@ -837,13 +1161,13 @@ class PyCollection {
         py::gil_scoped_release release;
         return unwrap(collection_->search(view, options, context, filter));
       }();
-      return search_response_to_dict(response);
+      return response;
     }
     auto response = [&] {
       py::gil_scoped_release release;
       return unwrap(collection_->batch_search(view, options, context, filter));
     }();
-    return search_response_to_dict(response);
+    return response;
   }
 
   [[nodiscard]] auto batch_search(const py::array &queries,
@@ -855,6 +1179,51 @@ class PyCollection {
                                   std::uint64_t scratch_budget_bytes,
                                   std::uint64_t io_budget_requests,
                                   std::uint64_t io_budget_bytes) -> py::dict {
+    return search_response_to_dict(batch_search_response(queries,
+                                                         top_k,
+                                                         ef_search,
+                                                         metadata_filter,
+                                                         policy,
+                                                         selectivity,
+                                                         scratch_budget_bytes,
+                                                         io_budget_requests,
+                                                         io_budget_bytes));
+  }
+
+  [[nodiscard]] auto batch_search_typed(const py::array &queries,
+                                        std::uint64_t top_k,
+                                        std::uint32_t ef_search,
+                                        const py::object &metadata_filter,
+                                        const std::string &policy,
+                                        const py::object &selectivity,
+                                        std::uint64_t scratch_budget_bytes,
+                                        std::uint64_t io_budget_requests,
+                                        std::uint64_t io_budget_bytes) -> PySearchResponse {
+    const auto effective_effort = collection_->target_algorithm() == core::algorithm::qg
+                                      ? std::optional<std::uint32_t>(ef_search)
+                                      : std::nullopt;
+    return search_response_to_response(batch_search_response(queries,
+                                                             top_k,
+                                                             ef_search,
+                                                             metadata_filter,
+                                                             policy,
+                                                             selectivity,
+                                                             scratch_budget_bytes,
+                                                             io_budget_requests,
+                                                             io_budget_bytes),
+                                       effective_effort);
+  }
+
+  [[nodiscard]] auto batch_search_response(const py::array &queries,
+                                           std::uint64_t top_k,
+                                           std::uint32_t ef_search,
+                                           const py::object &metadata_filter,
+                                           const std::string &policy,
+                                           const py::object &selectivity,
+                                           std::uint64_t scratch_budget_bytes,
+                                           std::uint64_t io_budget_requests,
+                                           std::uint64_t io_budget_bytes)
+      -> CollectionSearchResponse {
     const auto owned_queries = owned_tensor(queries, collection_->options().dim);
     const auto view = owned_queries.view();
     if (view.scalar_type != collection_->options().scalar_type) {
@@ -871,11 +1240,10 @@ class PyCollection {
     context.io_credits.available_requests = io_budget_requests;
     context.io_credits.available_bytes = io_budget_bytes;
     const auto filter = collection_filter(metadata_filter, selectivity);
-    auto response = [&] {
+    return [&] {
       py::gil_scoped_release release;
       return unwrap(collection_->batch_search(view, options, context, filter));
     }();
-    return search_response_to_dict(response);
   }
 
   [[nodiscard]] auto get_by_id(const std::string &id) -> py::object {
@@ -889,10 +1257,30 @@ class PyCollection {
     return record_to_dict(unwrap(std::move(record)));
   }
 
+  [[nodiscard]] auto get_by_id_typed(const std::string &id, bool include_vector = true)
+      -> py::object {
+    auto record = [&] {
+      py::gil_scoped_release release;
+      return collection_->get_by_id(logical_id(id), record_projection(include_vector));
+    }();
+    if (!record.ok() && record.status().code() == core::StatusCode::not_found) {
+      return py::none();
+    }
+    return py::cast(record_to_response(unwrap(std::move(record))));
+  }
+
   [[nodiscard]] auto get_by_ids(const py::list &ids) -> py::list {
     py::list result;
     for (const auto &id : ids) {
       result.append(get_by_id(py::cast<std::string>(id)));
+    }
+    return result;
+  }
+
+  [[nodiscard]] auto get_by_ids_typed(const py::list &ids, bool include_vector = true) -> py::list {
+    py::list result;
+    for (const auto &id : ids) {
+      result.append(get_by_id_typed(py::cast<std::string>(id), include_vector));
     }
     return result;
   }
@@ -909,6 +1297,37 @@ class PyCollection {
     return result;
   }
 
+  [[nodiscard]] auto records_typed() -> std::vector<PyRecordResponse> {
+    auto records = [&] {
+      py::gil_scoped_release release;
+      return unwrap(collection_->records());
+    }();
+    std::vector<PyRecordResponse> result;
+    result.reserve(records.size());
+    for (const auto &record : records) {
+      result.push_back(record_to_response(record));
+    }
+    return result;
+  }
+
+  [[nodiscard]] auto scan(const py::object &metadata_filter, std::size_t limit, bool include_vector)
+      -> std::vector<PyRecordResponse> {
+    if (limit == 0) {
+      throw py::value_error("canonical Collection scan limit must be positive");
+    }
+    const auto filter = collection_filter(metadata_filter, py::none());
+    auto records = [&] {
+      py::gil_scoped_release release;
+      return unwrap(collection_->scan(filter, limit, record_projection(include_vector)));
+    }();
+    std::vector<PyRecordResponse> result;
+    result.reserve(records.size());
+    for (const auto &record : records) {
+      result.push_back(record_to_response(record));
+    }
+    return result;
+  }
+
   [[nodiscard]] auto checkpoint() -> py::dict {
     const auto receipt = [&] {
       py::gil_scoped_release release;
@@ -920,6 +1339,17 @@ class PyCollection {
     result["metadata_epoch"] = receipt.metadata_epoch;
     result["checkpoint_name"] = receipt.checkpoint_name;
     return result;
+  }
+
+  [[nodiscard]] auto checkpoint_typed() -> PyCheckpointResponse {
+    const auto receipt = [&] {
+      py::gil_scoped_release release;
+      return unwrap(collection_->checkpoint());
+    }();
+    return {receipt.durable_watermark,
+            receipt.wal_cut,
+            receipt.metadata_epoch,
+            receipt.checkpoint_name};
   }
 
   [[nodiscard]] auto seal() -> py::dict {
@@ -938,6 +1368,20 @@ class PyCollection {
     return result;
   }
 
+  [[nodiscard]] auto seal_typed() -> PySealResponse {
+    const auto receipt = [&] {
+      py::gil_scoped_release release;
+      return unwrap(collection_->seal());
+    }();
+    return {receipt.source_segment_id,
+            receipt.successor_segment_id,
+            receipt.sealed_segment_id,
+            receipt.wal_cut,
+            receipt.sealed_rows,
+            receipt.sealed_bytes,
+            receipt.manifest_generation};
+  }
+
   [[nodiscard]] auto compact() -> py::dict {
     const auto receipt = [&] {
       py::gil_scoped_release release;
@@ -953,6 +1397,19 @@ class PyCollection {
     return result;
   }
 
+  [[nodiscard]] auto compact_typed() -> PyCompactResponse {
+    const auto receipt = [&] {
+      py::gil_scoped_release release;
+      return unwrap(collection_->compact());
+    }();
+    return {receipt.source_segment_ids,
+            receipt.compacted_segment_id,
+            receipt.compacted_rows,
+            receipt.input_bytes,
+            receipt.output_bytes,
+            receipt.manifest_generation};
+  }
+
   [[nodiscard]] auto gc() -> py::dict {
     const auto receipt = [&] {
       py::gil_scoped_release release;
@@ -965,6 +1422,18 @@ class PyCollection {
     result["reclaimed_bytes"] = receipt.reclaimed_bytes;
     result["manifest_generation"] = receipt.manifest_generation;
     return result;
+  }
+
+  [[nodiscard]] auto gc_typed() -> PyGcResponse {
+    const auto receipt = [&] {
+      py::gil_scoped_release release;
+      return unwrap(collection_->gc());
+    }();
+    return {receipt.pending,
+            receipt.reclaimed,
+            receipt.deferred,
+            receipt.reclaimed_bytes,
+            receipt.manifest_generation};
   }
 
   [[nodiscard]] auto stats() const -> py::dict {
@@ -992,6 +1461,29 @@ class PyCollection {
     return result;
   }
 
+  [[nodiscard]] auto stats_typed() const -> PyStatsResponse {
+    const auto stats = collection_->stats();
+    return {stats.size,
+            stats.accepted_count,
+            stats.pending_count,
+            stats.searchable_bytes,
+            stats.accepted_bytes,
+            stats.searchable_vector_bytes,
+            stats.accepted_vector_bytes,
+            stats.pending_bytes,
+            stats.allocated_count,
+            stats.tombstone_count,
+            stats.routing_generation,
+            stats.visibility_watermark,
+            stats.durable_watermark,
+            stats.metadata_epoch,
+            stats.sealed_segments_count,
+            stats.gc_pending_count,
+            algorithm_name(stats.active_segment_algorithm),
+            stats.compacted_bytes,
+            static_cast<std::uint8_t>(stats.lifecycle)};
+  }
+
   [[nodiscard]] auto options() const -> py::dict {
     const auto &options = collection_->options();
     py::dict result;
@@ -1011,6 +1503,23 @@ class PyCollection {
     return result;
   }
 
+  [[nodiscard]] auto options_typed() const -> PyOptionsResponse {
+    const auto &options = collection_->options();
+    return {options.root.string(),
+            options.dim,
+            metric_name(options.metric),
+            scalar_dtype(options.scalar_type),
+            algorithm_name(options.target_algorithm),
+            quantization_name(options.quantization),
+            options.build_threads,
+            options.max_neighbors,
+            options.ef_construction,
+            std::string(collection_->target_implementation_key()),
+            std::string(collection_->target_engine_factory_key()),
+            algorithm_name(collection_->active_algorithm()),
+            options.auto_seal_rows};
+  }
+
   void close() {
     py::gil_scoped_release release;
     throw_status(collection_->close());
@@ -1024,8 +1533,148 @@ class PyCollection {
   std::shared_ptr<Collection> collection_{};
 };
 
+inline void register_response_types(py::module_ &module) {
+  py::class_<PyRecordResponse>(module, "_RecordResponse")
+      .def_readonly("id", &PyRecordResponse::id)
+      .def_readonly("upsert_sequence", &PyRecordResponse::upsert_sequence)
+      .def_readonly("document", &PyRecordResponse::document)
+      .def_readonly("metadata", &PyRecordResponse::metadata)
+      .def_readonly("vector", &PyRecordResponse::vector);
+
+  py::class_<PyMutationRowResponse>(module, "_MutationRowResponse")
+      .def_readonly("op_id", &PyMutationRowResponse::op_id)
+      .def_readonly("batch_op_id", &PyMutationRowResponse::batch_op_id)
+      .def_readonly("row_op_id", &PyMutationRowResponse::row_op_id)
+      .def_readonly("visibility_watermark", &PyMutationRowResponse::visibility_watermark)
+      .def_readonly("durable_watermark", &PyMutationRowResponse::durable_watermark)
+      .def_readonly("searchable", &PyMutationRowResponse::searchable)
+      .def_readonly("durability", &PyMutationRowResponse::durability)
+      .def_readonly("row_status", &PyMutationRowResponse::row_status)
+      .def_readonly("retry_token", &PyMutationRowResponse::retry_token);
+
+  py::class_<PyMutationResponse>(module, "_MutationResponse")
+      .def_readonly("batch_op_id", &PyMutationResponse::batch_op_id)
+      .def_readonly("visibility_watermark", &PyMutationResponse::visibility_watermark)
+      .def_readonly("durable_watermark", &PyMutationResponse::durable_watermark)
+      .def_readonly("searchable", &PyMutationResponse::searchable)
+      .def_readonly("durability", &PyMutationResponse::durability)
+      .def_readonly("retry_token", &PyMutationResponse::retry_token)
+      .def_readonly("rows", &PyMutationResponse::rows);
+
+  py::class_<PySearchStatsResponse>(module, "_SearchStatsResponse")
+      .def_readonly("filter_active", &PySearchStatsResponse::filter_active)
+      .def_readonly("filter_execution", &PySearchStatsResponse::filter_execution)
+      .def_readonly("filter_examined", &PySearchStatsResponse::filter_examined)
+      .def_readonly("filter_passed", &PySearchStatsResponse::filter_passed)
+      .def_readonly("nan_discarded", &PySearchStatsResponse::nan_discarded)
+      .def_readonly("overfetch_rounds", &PySearchStatsResponse::overfetch_rounds)
+      .def_readonly("budget_consumed", &PySearchStatsResponse::budget_consumed)
+      .def_readonly("lease_acquired", &PySearchStatsResponse::lease_acquired)
+      .def_readonly("lease_released", &PySearchStatsResponse::lease_released)
+      .def_readonly("lease_peak_bytes", &PySearchStatsResponse::lease_peak_bytes)
+      .def_readonly("io_requests_consumed", &PySearchStatsResponse::io_requests_consumed)
+      .def_readonly("io_bytes_consumed", &PySearchStatsResponse::io_bytes_consumed)
+      .def_readonly("rerank_nanoseconds", &PySearchStatsResponse::rerank_nanoseconds)
+      .def_readonly("effective_effort", &PySearchStatsResponse::effective_effort);
+
+  py::class_<PySearchResponse>(module, "_SearchResponse")
+      .def_readonly("ids", &PySearchResponse::ids)
+      .def_readonly("distances", &PySearchResponse::distances)
+      .def_readonly("offsets", &PySearchResponse::offsets)
+      .def_readonly("valid_counts", &PySearchResponse::valid_counts)
+      .def_readonly("status_codes", &PySearchResponse::status_codes)
+      .def_readonly("completeness_codes", &PySearchResponse::completeness_codes)
+      .def_readonly("visibility_watermark", &PySearchResponse::visibility_watermark)
+      .def_readonly("metadata_epoch", &PySearchResponse::metadata_epoch)
+      .def_readonly("search_stats", &PySearchResponse::search_stats);
+
+  py::class_<PyCheckpointResponse>(module, "_CheckpointResponse")
+      .def_readonly("durable_watermark", &PyCheckpointResponse::durable_watermark)
+      .def_readonly("wal_cut", &PyCheckpointResponse::wal_cut)
+      .def_readonly("metadata_epoch", &PyCheckpointResponse::metadata_epoch)
+      .def_readonly("checkpoint_name", &PyCheckpointResponse::checkpoint_name);
+
+  py::class_<PySealResponse>(module, "_SealResponse")
+      .def_readonly("source_segment_id", &PySealResponse::source_segment_id)
+      .def_readonly("successor_segment_id", &PySealResponse::successor_segment_id)
+      .def_readonly("sealed_segment_id", &PySealResponse::sealed_segment_id)
+      .def_readonly("wal_cut", &PySealResponse::wal_cut)
+      .def_readonly("sealed_rows", &PySealResponse::sealed_rows)
+      .def_readonly("sealed_bytes", &PySealResponse::sealed_bytes)
+      .def_readonly("manifest_generation", &PySealResponse::manifest_generation);
+
+  py::class_<PyCompactResponse>(module, "_CompactResponse")
+      .def_readonly("source_segment_ids", &PyCompactResponse::source_segment_ids)
+      .def_readonly("compacted_segment_id", &PyCompactResponse::compacted_segment_id)
+      .def_readonly("compacted_rows", &PyCompactResponse::compacted_rows)
+      .def_readonly("input_bytes", &PyCompactResponse::input_bytes)
+      .def_readonly("output_bytes", &PyCompactResponse::output_bytes)
+      .def_readonly("manifest_generation", &PyCompactResponse::manifest_generation);
+
+  py::class_<PyGcResponse>(module, "_GcResponse")
+      .def_readonly("pending", &PyGcResponse::pending)
+      .def_readonly("reclaimed", &PyGcResponse::reclaimed)
+      .def_readonly("deferred", &PyGcResponse::deferred)
+      .def_readonly("reclaimed_bytes", &PyGcResponse::reclaimed_bytes)
+      .def_readonly("manifest_generation", &PyGcResponse::manifest_generation);
+
+  py::class_<PyStatsResponse>(module, "_StatsResponse")
+      .def_readonly("size", &PyStatsResponse::size)
+      .def_readonly("accepted_count", &PyStatsResponse::accepted_count)
+      .def_readonly("pending_count", &PyStatsResponse::pending_count)
+      .def_readonly("searchable_bytes", &PyStatsResponse::searchable_bytes)
+      .def_readonly("accepted_bytes", &PyStatsResponse::accepted_bytes)
+      .def_readonly("searchable_vector_bytes", &PyStatsResponse::searchable_vector_bytes)
+      .def_readonly("accepted_vector_bytes", &PyStatsResponse::accepted_vector_bytes)
+      .def_readonly("pending_bytes", &PyStatsResponse::pending_bytes)
+      .def_readonly("allocated_count", &PyStatsResponse::allocated_count)
+      .def_readonly("tombstone_count", &PyStatsResponse::tombstone_count)
+      .def_readonly("routing_generation", &PyStatsResponse::routing_generation)
+      .def_readonly("visibility_watermark", &PyStatsResponse::visibility_watermark)
+      .def_readonly("durable_watermark", &PyStatsResponse::durable_watermark)
+      .def_readonly("metadata_epoch", &PyStatsResponse::metadata_epoch)
+      .def_readonly("sealed_segments_count", &PyStatsResponse::sealed_segments_count)
+      .def_readonly("gc_pending_count", &PyStatsResponse::gc_pending_count)
+      .def_readonly("active_segment_algorithm", &PyStatsResponse::active_segment_algorithm)
+      .def_readonly("compacted_bytes", &PyStatsResponse::compacted_bytes)
+      .def_readonly("lifecycle", &PyStatsResponse::lifecycle);
+
+  py::class_<PyOptionsResponse>(module, "_OptionsResponse")
+      .def_readonly("root", &PyOptionsResponse::root)
+      .def_readonly("dim", &PyOptionsResponse::dim)
+      .def_readonly("metric", &PyOptionsResponse::metric)
+      .def_readonly("dtype", &PyOptionsResponse::dtype)
+      .def_readonly("index_type", &PyOptionsResponse::index_type)
+      .def_readonly("quantization_type", &PyOptionsResponse::quantization_type)
+      .def_readonly("build_threads", &PyOptionsResponse::build_threads)
+      .def_readonly("max_neighbors", &PyOptionsResponse::max_neighbors)
+      .def_readonly("ef_construction", &PyOptionsResponse::ef_construction)
+      .def_readonly("implementation_key", &PyOptionsResponse::implementation_key)
+      .def_readonly("engine_factory_key", &PyOptionsResponse::engine_factory_key)
+      .def_readonly("active_algorithm", &PyOptionsResponse::active_algorithm)
+      .def_readonly("auto_seal_rows", &PyOptionsResponse::auto_seal_rows);
+
+  py::class_<PyCapabilitiesResponse>(module, "_CapabilitiesResponse")
+      .def_readonly("index_types", &PyCapabilitiesResponse::index_types)
+      .def_readonly("laser_enabled", &PyCapabilitiesResponse::laser_enabled)
+      .def_readonly("laser_simd", &PyCapabilitiesResponse::laser_simd);
+}
+
+inline void register_capabilities(py::module_ &module,
+                                  bool laser_enabled,
+                                  std::optional<std::string> laser_simd) {
+  module.def("capabilities", [laser_enabled, laser_simd = std::move(laser_simd)] {
+    std::vector<std::string> index_types{"flat"};
+    if (laser_enabled) {
+      index_types.emplace_back("qg");
+    }
+    return PyCapabilitiesResponse{std::move(index_types), laser_enabled, laser_simd};
+  });
+}
+
 inline void register_collection(py::module_ &module) {
   register_exceptions(module);
+  register_response_types(module);
   py::class_<PyCollection, std::shared_ptr<PyCollection>>(module, "_Collection")
       .def_static("create",
                   &PyCollection::create,
@@ -1051,6 +1700,17 @@ inline void register_collection(py::module_ &module) {
            py::arg("mode") = "per_row_independent",
            py::arg("durability") = "wal_fsync",
            py::arg("retry_token") = "")
+      .def("mutate_typed",
+           &PyCollection::mutate_typed,
+           py::arg("ids"),
+           py::arg("documents"),
+           py::arg("vectors"),
+           py::arg("metadata"),
+           py::arg("action"),
+           py::kw_only(),
+           py::arg("mode") = "per_row_independent",
+           py::arg("durability") = "wal_fsync",
+           py::arg("retry_token") = "")
       .def("remove",
            &PyCollection::remove,
            py::arg("ids"),
@@ -1058,8 +1718,27 @@ inline void register_collection(py::module_ &module) {
            py::arg("mode") = "per_row_independent",
            py::arg("durability") = "wal_fsync",
            py::arg("retry_token") = "")
+      .def("remove_typed",
+           &PyCollection::remove_typed,
+           py::arg("ids"),
+           py::kw_only(),
+           py::arg("mode") = "per_row_independent",
+           py::arg("durability") = "wal_fsync",
+           py::arg("retry_token") = "")
       .def("search",
            &PyCollection::search,
+           py::arg("query"),
+           py::arg("top_k"),
+           py::kw_only(),
+           py::arg("ef_search") = 100,
+           py::arg("metadata_filter") = py::none(),
+           py::arg("filter_policy") = "auto",
+           py::arg("filter_selectivity") = py::none(),
+           py::arg("scratch_budget_bytes") = core::kUnlimitedResource,
+           py::arg("io_budget_requests") = core::kUnlimitedResource,
+           py::arg("io_budget_bytes") = core::kUnlimitedResource)
+      .def("search_typed",
+           &PyCollection::search_typed,
            py::arg("query"),
            py::arg("top_k"),
            py::kw_only(),
@@ -1082,15 +1761,50 @@ inline void register_collection(py::module_ &module) {
            py::arg("scratch_budget_bytes") = core::kUnlimitedResource,
            py::arg("io_budget_requests") = core::kUnlimitedResource,
            py::arg("io_budget_bytes") = core::kUnlimitedResource)
+      .def("batch_search_typed",
+           &PyCollection::batch_search_typed,
+           py::arg("queries"),
+           py::arg("top_k"),
+           py::kw_only(),
+           py::arg("ef_search") = 100,
+           py::arg("metadata_filter") = py::none(),
+           py::arg("filter_policy") = "auto",
+           py::arg("filter_selectivity") = py::none(),
+           py::arg("scratch_budget_bytes") = core::kUnlimitedResource,
+           py::arg("io_budget_requests") = core::kUnlimitedResource,
+           py::arg("io_budget_bytes") = core::kUnlimitedResource)
       .def("get_by_id", &PyCollection::get_by_id, py::arg("id"))
+      .def("get_by_id_typed",
+           &PyCollection::get_by_id_typed,
+           py::arg("id"),
+           py::kw_only(),
+           py::arg("include_vector") = true)
       .def("get_by_ids", &PyCollection::get_by_ids, py::arg("ids"))
+      .def("get_by_ids_typed",
+           &PyCollection::get_by_ids_typed,
+           py::arg("ids"),
+           py::kw_only(),
+           py::arg("include_vector") = true)
       .def("records", &PyCollection::records)
+      .def("records_typed", &PyCollection::records_typed)
+      .def("scan",
+           &PyCollection::scan,
+           py::kw_only(),
+           py::arg("metadata_filter") = py::none(),
+           py::arg("limit") = 100,
+           py::arg("include_vector") = false)
       .def("checkpoint", &PyCollection::checkpoint)
+      .def("checkpoint_typed", &PyCollection::checkpoint_typed)
       .def("seal", &PyCollection::seal)
+      .def("seal_typed", &PyCollection::seal_typed)
       .def("compact", &PyCollection::compact)
+      .def("compact_typed", &PyCollection::compact_typed)
       .def("gc", &PyCollection::gc)
+      .def("gc_typed", &PyCollection::gc_typed)
       .def("stats", &PyCollection::stats)
+      .def("stats_typed", &PyCollection::stats_typed)
       .def("options", &PyCollection::options)
+      .def("options_typed", &PyCollection::options_typed)
       .def("close", &PyCollection::close);
 }
 
