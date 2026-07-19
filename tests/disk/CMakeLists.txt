@@ -155,7 +155,9 @@ if(ALAYA_ENABLE_LASER)
         LABELS laser segment
         TIMEOUT 180
       )
-    elseif(_laser_segment_test_target MATCHES "^(laser_segment_stress_test|test_laser_arena_reentrancy)$")
+    elseif(_laser_segment_test_target MATCHES
+           "^(laser_segment_stress_test|test_laser_arena_reentrancy|test_unified_laser_admission)$"
+    )
       alaya_add_test(
         NAME ${_laser_segment_test_target}
         TARGET ${_laser_segment_test_target}

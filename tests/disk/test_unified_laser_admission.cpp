@@ -41,19 +41,24 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bit>
-#include <cstdint>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <span>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -69,6 +74,11 @@ constexpr std::uint64_t kTopK = 10;
 // that would pass even with the translation silently skipped).
 constexpr std::uint64_t kLabelBase = 100'000;
 constexpr std::uint64_t kLabelStride = 7;
+#if defined(__SANITIZE_THREAD__)
+constexpr bool kRunningTsan = true;
+#else
+constexpr bool kRunningTsan = false;
+#endif
 
 std::vector<float> make_data(std::uint64_t n, std::uint32_t dim, std::uint32_t seed) {
   std::mt19937 gen(seed);
@@ -136,21 +146,25 @@ struct SegmentFixture {
     const auto raw_dir = fx->root / "raw";
     std::filesystem::create_directories(raw_dir);
     const std::string raw_prefix = (raw_dir / "dsqg_seg_00000001").string();
-    write_fbin(raw_prefix + "_pca_base.fbin", fx->data.data(), static_cast<std::int32_t>(kCount),
+    write_fbin(raw_prefix + "_pca_base.fbin",
+               fx->data.data(),
+               static_cast<std::int32_t>(kCount),
                static_cast<std::int32_t>(kDim));
 
     alaya::vamana::VamanaBuildParams vp;
     vp.R = kR;
     vp.L = 96;
     vp.alpha = 1.2F;
-    vp.num_threads = 4;
+    vp.num_threads = kRunningTsan ? 1 : 4;
     alaya::vamana::VamanaBuilder vb(fx->data.data(), kCount, kDim, vp);
     vb.build();
     const std::string vamana_path = raw_prefix + "_vamana.index";
     alaya::vamana::save_graph(vb.graph(), vamana_path, kR, vb.medoid());
 
     alaya::laser::QuantizedGraph qg(kCount, kR, kDim, kDim, /*rotator_seed=*/7);
-    alaya::laser::QGBuilder builder(qg, /*ef_build=*/96, /*num_threads=*/4);
+    alaya::laser::QGBuilder builder(qg,
+                                    /*ef_build=*/96,
+                                    /*num_threads=*/kRunningTsan ? 1 : 4);
     builder.build(vamana_path.c_str(), raw_prefix.c_str());
 
     LaserSegmentImportParams params;
@@ -197,8 +211,8 @@ void expect_exact_distances(const std::vector<DiskSearchHit> &hits,
     const auto pid = fixture.pid_of_label(hit.label);
     ASSERT_LT(pid, kCount);
     const auto expected = exact_l2(query, fixture.data.data() + pid * kDim);
-    const auto memqg_domain = ::alaya::simd::l2_sqr<float, float>(
-        query, fixture.data.data() + pid * kDim, kDim);
+    const auto memqg_domain =
+        ::alaya::simd::l2_sqr<float, float>(query, fixture.data.data() + pid * kDim, kDim);
     EXPECT_TRUE(std::isfinite(hit.distance));
     EXPECT_NEAR(hit.distance, expected, std::max(1.0e-4F, expected * 2.0e-6F));
     EXPECT_FLOAT_EQ(hit.distance, memqg_domain);
@@ -208,8 +222,8 @@ void expect_exact_distances(const std::vector<DiskSearchHit> &hits,
 }
 
 TEST_F(AdmissionDiskTest, ExactDistanceOptInCoversBothResidenciesAndNativeBatch) {
-  for (const auto residency : {laser::ResidencyMode::kPagedPool,
-                               laser::ResidencyMode::kResidentArena}) {
+  for (const auto residency :
+       {laser::ResidencyMode::kPagedPool, laser::ResidencyMode::kResidentArena}) {
     UnifiedLaserSegmentSearcher searcher(fixture_->seg_dir, residency);
     DiskSearchOptions options;
     options.top_k = kTopK;
@@ -287,7 +301,7 @@ TEST_F(AdmissionDiskTest, KindNonePagedPoolReturnsValidLabels) {
   opts.beam_width = 4;
 
   const std::unordered_set<std::uint64_t> known_labels(fixture_->labels.begin(),
-                                                        fixture_->labels.end());
+                                                       fixture_->labels.end());
   for (std::uint32_t qi = 0; qi < 15; ++qi) {
     const float *query = fixture_->data.data() + static_cast<std::size_t>(qi) * kDim;
     const auto hits = searcher.search(query, opts);
@@ -340,8 +354,8 @@ TEST_F(AdmissionDiskTest, BitmapFilterResidentArenaOnlyReturnsAdmissiblePids) {
     for (const auto &hit : hits) {
       ++total;
       const auto pid = fixture_->pid_of_label(hit.label);
-      EXPECT_TRUE(admission.test(pid)) << "label " << hit.label << " (pid " << pid
-                                       << ") fails the bitmap filter";
+      EXPECT_TRUE(admission.test(pid))
+          << "label " << hit.label << " (pid " << pid << ") fails the bitmap filter";
     }
   }
   EXPECT_EQ(total, 20U * kTopK);
@@ -367,8 +381,8 @@ TEST_F(AdmissionDiskTest, BitmapFilterPagedPoolOnlyReturnsAdmissiblePids) {
     for (const auto &hit : hits) {
       ++total;
       const auto pid = fixture_->pid_of_label(hit.label);
-      EXPECT_TRUE(admission.test(pid)) << "label " << hit.label << " (pid " << pid
-                                       << ") fails the bitmap filter";
+      EXPECT_TRUE(admission.test(pid))
+          << "label " << hit.label << " (pid " << pid << ") fails the bitmap filter";
     }
   }
   EXPECT_EQ(total, 20U * kTopK);
@@ -506,6 +520,241 @@ TEST_F(AdmissionDiskTest, SortedRowsFilterMatchesBitmapFilterPagedPool) {
   expect_sorted_rows_matches_bitmap(searcher, *fixture_);
 }
 
+[[nodiscard]] auto same_hits(const std::vector<DiskSearchHit> &expected,
+                             const std::vector<DiskSearchHit> &actual,
+                             bool return_distances) -> bool {
+  if (expected.size() != actual.size()) {
+    return false;
+  }
+  for (std::size_t index = 0; index < expected.size(); ++index) {
+    if (expected[index].label != actual[index].label) {
+      return false;
+    }
+    if (return_distances && std::bit_cast<std::uint32_t>(expected[index].distance) !=
+                                std::bit_cast<std::uint32_t>(actual[index].distance)) {
+      return false;
+    }
+    if (!return_distances && !is_nan_bits(actual[index].distance)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+[[nodiscard]] auto paged_smoke_threads() -> int {
+  const char *value = std::getenv("ALAYA_PAGED_REENTRANCY_THREADS");
+  if (value == nullptr) {
+    return 8;
+  }
+  return std::clamp(std::atoi(value), 1, 64);
+}
+
+TEST_F(AdmissionDiskTest, PagedEightConcurrentLanesMatchSerialForFilterAndDistances) {
+  UnifiedLaserSegmentSearcher searcher(fixture_->seg_dir, laser::ResidencyMode::kPagedPool);
+  std::vector<std::uint64_t> bitmap_storage;
+  (void)pid_bitmap_30pct(bitmap_storage);
+
+  std::array<DiskSearchOptions, 4> options;
+  for (std::size_t mode = 0; mode < options.size(); ++mode) {
+    options[mode].top_k = kTopK;
+    options[mode].ef = static_cast<std::uint32_t>(kCount);
+    options[mode].beam_width = 8;
+    options[mode].return_distances = (mode & 1U) != 0;
+    if (mode >= 2) {
+      options[mode].filter.kind = core::SegmentFilterKind::bitmap;
+      options[mode].filter.payload = bitmap_storage.data();
+      options[mode].filter.payload_size = bitmap_storage.size() * sizeof(std::uint64_t);
+    }
+  }
+
+  constexpr std::size_t kQueries = 16;
+  std::array<std::vector<std::vector<DiskSearchHit>>, 4> baselines;
+  for (std::size_t mode = 0; mode < options.size(); ++mode) {
+    baselines[mode].reserve(kQueries);
+    for (std::size_t query = 0; query < kQueries; ++query) {
+      baselines[mode].push_back(
+          searcher.search(fixture_->data.data() + query * kDim, options[mode]));
+    }
+  }
+
+  const int thread_count = paged_smoke_threads();
+#if defined(__SANITIZE_THREAD__)
+  constexpr int kIterations = 8;
+#else
+  constexpr int kIterations = 64;
+#endif
+  std::atomic<bool> go{false};
+  std::atomic<int> failures{0};
+  std::mutex failure_mutex;
+  std::string first_failure;
+  std::vector<std::thread> workers;
+  workers.reserve(static_cast<std::size_t>(thread_count));
+  const auto start = std::chrono::steady_clock::now();
+  for (int thread = 0; thread < thread_count; ++thread) {
+    workers.emplace_back([&, thread] {
+      while (!go.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      try {
+        for (int iteration = 0; iteration < kIterations; ++iteration) {
+          const auto mode = static_cast<std::size_t>(thread + iteration) % options.size();
+          const auto query = static_cast<std::size_t>(thread * 11 + iteration * 7) % kQueries;
+          const auto actual = searcher.search(fixture_->data.data() + query * kDim, options[mode]);
+          if (!same_hits(baselines[mode][query], actual, options[mode].return_distances)) {
+            {
+              std::lock_guard lock(failure_mutex);
+              if (first_failure.empty()) {
+                first_failure = "result mismatch mode=" + std::to_string(mode) +
+                                " query=" + std::to_string(query);
+              }
+            }
+            failures.fetch_add(1, std::memory_order_relaxed);
+            return;
+          }
+        }
+      } catch (const std::exception &error) {
+        {
+          std::lock_guard lock(failure_mutex);
+          if (first_failure.empty()) {
+            first_failure = error.what();
+          }
+        }
+        failures.fetch_add(1, std::memory_order_relaxed);
+      } catch (...) {
+        {
+          std::lock_guard lock(failure_mutex);
+          if (first_failure.empty()) {
+            first_failure = "non-std exception";
+          }
+        }
+        failures.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+  go.store(true, std::memory_order_release);
+  for (auto &worker : workers) {
+    worker.join();
+  }
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  EXPECT_EQ(failures.load(std::memory_order_relaxed), 0) << first_failure;
+  EXPECT_EQ(searcher.set_params_call_count(), 0U);
+  std::cout << "paged_reentrancy_smoke,threads=" << thread_count
+            << ",queries=" << thread_count * kIterations
+            << ",seconds=" << std::chrono::duration<double>(elapsed).count() << ",qps="
+            << static_cast<double>(thread_count * kIterations) /
+                   std::chrono::duration<double>(elapsed).count()
+            << '\n';
+}
+
+TEST_F(AdmissionDiskTest, SetParamsDrainsInflightAndNewBorrowersFailClosed) {
+  LaserSegmentSearcher searcher(fixture_->seg_dir);
+  auto &graph = searcher.graph();
+  DiskSearchOptions options;
+  options.top_k = kTopK;
+  options.ef = 512;
+  options.beam_width = 8;
+  options.return_distances = true;
+
+  EXPECT_THROW(graph.set_params(/*ef_search=*/512, /*num_threads=*/129, /*beam_width=*/16),
+               std::invalid_argument);
+  EXPECT_TRUE(graph.paged_leases_accepting());
+
+  constexpr std::size_t kQueries = 8;
+  std::vector<std::vector<DiskSearchHit>> baselines;
+  baselines.reserve(kQueries);
+  for (std::size_t query = 0; query < kQueries; ++query) {
+    baselines.push_back(searcher.search(fixture_->data.data() + query * kDim, options));
+  }
+
+  std::atomic<bool> go{false};
+  std::atomic<int> worker_failures{0};
+  std::vector<std::thread> workers;
+  workers.reserve(kQueries);
+  for (std::size_t query = 0; query < kQueries; ++query) {
+    workers.emplace_back([&, query] {
+      while (!go.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      try {
+        const auto actual = searcher.search(fixture_->data.data() + query * kDim, options);
+        if (!same_hits(baselines[query], actual, /*return_distances=*/true)) {
+          worker_failures.fetch_add(1, std::memory_order_relaxed);
+        }
+      } catch (...) {
+        worker_failures.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+  go.store(true, std::memory_order_release);
+
+  const auto wait_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (graph.paged_leases_in_flight() == 0 && std::chrono::steady_clock::now() < wait_deadline) {
+    std::this_thread::yield();
+  }
+  if (graph.paged_leases_in_flight() == 0) {
+    for (auto &worker : workers) {
+      worker.join();
+    }
+    FAIL() << "failed to observe an in-flight paged lease";
+    return;
+  }
+
+  std::atomic<bool> setter_done{false};
+  std::atomic<int> setter_failures{0};
+  std::thread setter([&] {
+    try {
+      // Seed enough replacement leases to make the fail-closed drain window
+      // observable without a test-only sleep or lifecycle hook.
+      graph.set_params(/*ef_search=*/512, /*num_threads=*/64, /*beam_width=*/16);
+    } catch (...) {
+      setter_failures.fetch_add(1, std::memory_order_relaxed);
+    }
+    setter_done.store(true, std::memory_order_release);
+  });
+
+  std::size_t drain_rejections = 0;
+  std::size_t probe_successes = 0;
+  std::size_t unexpected_errors = 0;
+  while (!setter_done.load(std::memory_order_acquire)) {
+    try {
+      const auto hits = searcher.search(fixture_->data.data(), options);
+      if (same_hits(baselines[0], hits, /*return_distances=*/true)) {
+        ++probe_successes;
+      } else {
+        ++unexpected_errors;
+      }
+    } catch (const std::runtime_error &error) {
+      const std::string message(error.what());
+      if (message.find("paged lease pool") != std::string::npos &&
+          message.find("retry") != std::string::npos) {
+        ++drain_rejections;
+      } else {
+        ++unexpected_errors;
+      }
+    } catch (...) {
+      ++unexpected_errors;
+    }
+  }
+
+  setter.join();
+  for (auto &worker : workers) {
+    worker.join();
+  }
+  EXPECT_EQ(worker_failures.load(std::memory_order_relaxed), 0);
+  EXPECT_EQ(setter_failures.load(std::memory_order_relaxed), 0);
+  EXPECT_EQ(unexpected_errors, 0U);
+  EXPECT_GT(drain_rejections, 0U);
+  EXPECT_TRUE(graph.paged_leases_accepting());
+  EXPECT_EQ(graph.paged_leases_in_flight(), 0U);
+  EXPECT_EQ(graph.paged_lease_quarantined(), 0U);
+  EXPECT_GE(graph.paged_lease_high_water(), 64U);
+  EXPECT_TRUE(same_hits(baselines[0],
+                        searcher.search(fixture_->data.data(), options),
+                        /*return_distances=*/true));
+  std::cout << "paged_set_params_drain,rejected=" << drain_rejections
+            << ",completed_during_window=" << probe_successes << '\n';
+}
+
 // ---------------------------------------------------------------------------
 // LaserSegment (AnySegment face): label-space -> PID-space bitmap
 // translation round trip. Collection's per-segment bitmap (decision 7's
@@ -598,7 +847,8 @@ TEST_F(AdmissionDiskTest, LaserSegmentRejectsSortedRowsAndPredicateFilters) {
   ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
   auto segment = std::move(opened).value();
 
-  for (const auto kind : {core::SegmentFilterKind::sorted_rows, core::SegmentFilterKind::predicate,
+  for (const auto kind : {core::SegmentFilterKind::sorted_rows,
+                          core::SegmentFilterKind::predicate,
                           core::SegmentFilterKind::composite}) {
     SegmentSearchCall call(fixture_->data.data());
     call.request.filter.kind = kind;

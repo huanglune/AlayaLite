@@ -8,10 +8,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <cfloat>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -24,6 +26,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <set>
@@ -35,6 +38,7 @@
 #include <utility>
 #include <vector>
 
+#include "concurrentqueue.h"  // NOLINT
 #include "core/value_types.hpp"
 #include "index/graph/laser/common.hpp"
 #include "index/graph/laser/qg/qg_query.hpp"
@@ -645,11 +649,73 @@ class QuantizedGraph {
 #else
   std::unique_ptr<storage::io::PageReader> page_reader_;
 #endif
-  ConcurrentQueue<ThreadData> thread_data_;
+
+  // Paged ThreadData is graph-bound, so it cannot use the process-wide TLS
+  // strategy used by the resident arena. The freelist is a lock-free MPMC
+  // queue on the hot borrow/return path. A mutex is taken only when an empty
+  // freelist has to grow to a new concurrent-query high-water mark.
+  enum class PagedLeaseState : uint8_t { kClosed, kAccepting, kDraining };
+  static constexpr uint64_t kPagedLeaseDrainBit = uint64_t{1} << 63U;
+  static constexpr uint64_t kPagedLeaseCountMask = ~kPagedLeaseDrainBit;
+  // make_laser_page_reader() configures both Linux backends at depth 128.
+  // Bounding graph-bound leases by the same limit also bounds Windows
+  // register_thread() calls if that unsupported port is enabled later.
+  static constexpr size_t kPagedLeaseLimit = 128;
+
+  class PagedThreadDataLease {
+   public:
+    PagedThreadDataLease() = default;
+    PagedThreadDataLease(QuantizedGraph *owner, ThreadData *data) noexcept
+        : owner_(owner), data_(data) {}
+    PagedThreadDataLease(const PagedThreadDataLease &) = delete;
+    auto operator=(const PagedThreadDataLease &) -> PagedThreadDataLease & = delete;
+    PagedThreadDataLease(PagedThreadDataLease &&other) noexcept
+        : owner_(std::exchange(other.owner_, nullptr)),
+          data_(std::exchange(other.data_, nullptr)),
+          reusable_(std::exchange(other.reusable_, false)) {}
+    auto operator=(PagedThreadDataLease &&) -> PagedThreadDataLease & = delete;
+    ~PagedThreadDataLease();
+
+    [[nodiscard]] auto data() const noexcept -> ThreadData & {
+      assert(data_ != nullptr);
+      return *data_;
+    }
+    void mark_reusable() noexcept { reusable_ = true; }
+
+   private:
+    QuantizedGraph *owner_ = nullptr;
+    ThreadData *data_ = nullptr;
+    bool reusable_ = false;
+  };
+
+  class PagedThreadDataFreelist {
+   public:
+    [[nodiscard]] auto enqueue(ThreadData *data) -> bool { return queue_.enqueue(data); }
+    [[nodiscard]] auto try_dequeue(ThreadData *&data) -> bool { return queue_.try_dequeue(data); }
+    [[nodiscard]] auto size() const noexcept -> size_t { return queue_.size_approx(); }
+
+   private:
+    moodycamel::ConcurrentQueue<ThreadData *> queue_{32};
+  };
+
+  PagedThreadDataFreelist thread_data_;
+  std::vector<std::unique_ptr<ThreadData>> owned_thread_data_;
+  std::mutex thread_data_create_mutex_;
+  std::mutex thread_data_lifecycle_mutex_;
+  std::mutex thread_data_drain_mutex_;
+  std::condition_variable thread_data_drain_cv_;
+  std::atomic<PagedLeaseState> paged_lease_state_{PagedLeaseState::kClosed};
+  // One atomic word closes the admission gate and counts borrowers. This
+  // avoids the check-then-increment race of separate state/count atomics:
+  // drain's fetch_or either observes an earlier borrower or wins before its
+  // CAS, so teardown can never miss a lease that later touches old resources.
+  std::atomic<uint64_t> paged_lease_gate_{kPagedLeaseDrainBit};
+  std::atomic<size_t> paged_lease_high_water_{0};
+  std::atomic<size_t> paged_lease_quarantined_{0};
   int dc_count_;
   // Defaults used only by the source-compatible set_params()/legacy overloads.
   // New production entries carry ef/beam per call and never read this state.
-  size_t compat_ef_search_ = 200;
+  std::atomic<size_t> compat_ef_search_{200};
 
   size_t node_len_;
   size_t page_size_;
@@ -657,7 +723,7 @@ class QuantizedGraph {
 
   // workspace for disk-based quantized graph
   size_t min_beam_width_ = 2;
-  size_t compat_max_beam_width_ = 16;
+  std::atomic<size_t> compat_max_beam_width_{16};
   std::string index_file_name_;
 
   std::vector<PID> medoids_;
@@ -680,7 +746,7 @@ class QuantizedGraph {
   float total_io_time_ = 0;
   float total_io_time1_ = 0;
   int64_t total_cpu_time_ = 0;
-  float total_read_num_ = 0;
+  std::atomic<uint64_t> total_read_num_{0};
   float total_iter_num_ = 0;
   float total_cache_num_ = 0;
   int64_t total_ks_time_ = 0;
@@ -712,6 +778,15 @@ class QuantizedGraph {
   void initialize();
   void allocate_data();
   void init_workspace();
+
+  [[nodiscard]] auto acquire_thread_data(size_t beam_width) -> PagedThreadDataLease;
+  [[nodiscard]] auto make_thread_data(size_t beam_capacity) -> std::unique_ptr<ThreadData>;
+  void release_thread_data(ThreadData *data, bool reusable) noexcept;
+  void finish_thread_data_borrow() noexcept;
+  void begin_thread_data_drain_locked();
+  void shutdown_and_clear_thread_data_locked() noexcept;
+  void rebuild_thread_data_locked(size_t seed_count, size_t beam_capacity);
+  static void free_thread_data_storage(ThreadData &data) noexcept;
 
   // search on disk-based quantized graph
   void disk_search_qg(const float *ALAYA_RESTRICT query,
@@ -798,6 +873,22 @@ class QuantizedGraph {
   void load_disk_index(const char *, float, bool recovery_mode = false);
 
   void set_params(size_t ef_search, size_t num_threads, int beam_width);
+
+  // Lifecycle observers used by concurrency/teardown tests. They expose only
+  // atomic counters, never a graph-bound ThreadData pointer.
+  [[nodiscard]] auto paged_leases_in_flight() const noexcept -> size_t {
+    return static_cast<size_t>(paged_lease_gate_.load(std::memory_order_acquire) &
+                               kPagedLeaseCountMask);
+  }
+  [[nodiscard]] auto paged_lease_high_water() const noexcept -> size_t {
+    return paged_lease_high_water_.load(std::memory_order_acquire);
+  }
+  [[nodiscard]] auto paged_lease_quarantined() const noexcept -> size_t {
+    return paged_lease_quarantined_.load(std::memory_order_acquire);
+  }
+  [[nodiscard]] auto paged_leases_accepting() const noexcept -> bool {
+    return (paged_lease_gate_.load(std::memory_order_acquire) & kPagedLeaseDrainBit) == 0;
+  }
 
   void load_medoids(const char *);
 
@@ -887,27 +978,7 @@ class QuantizedGraph {
                     const RowAdmission *admission = nullptr,
                     float *ALAYA_RESTRICT distances = nullptr);
 
-  void destroy_thread_data() {
-    while (thread_data_.size() > 0) {
-      ThreadData data = thread_data_.pop();
-      while (data.sector_scratch_ == nullptr) {
-        thread_data_.wait_for_push_notify();
-        data = this->thread_data_.pop();
-      }
-      if (data.sector_scratch_ != nullptr) {
-        memory::align_free(data.sector_scratch_);
-      }
-    }
-    // close() must run first: under the ThreadPool backend it joins worker
-    // threads, eliminating the use-after-free window where a worker can call
-    // notify_completion() with a ThreadPoolContext* that was already erased.
-#if defined(_WIN32)
-    aligned_file_reader_->close();
-    aligned_file_reader_->deregister_all_threads();
-#else
-    if (page_reader_) page_reader_->shutdown();
-#endif
-  }
+  void destroy_thread_data();
 };
 
 inline QuantizedGraph::QuantizedGraph(size_t num,
@@ -982,46 +1053,209 @@ inline QuantizedGraph::QuantizedGraph(size_t num,
   initialize();
 }
 
+inline QuantizedGraph::PagedThreadDataLease::~PagedThreadDataLease() {
+  if (owner_ != nullptr) {
+    owner_->release_thread_data(data_, reusable_);
+  }
+}
+
+inline void QuantizedGraph::free_thread_data_storage(ThreadData &data) noexcept {
+  if (data.sector_scratch_ != nullptr) {
+    memory::align_free(data.sector_scratch_);
+    data.sector_scratch_ = nullptr;
+  }
+  data.sector_scratch_slots_ = 0;
+}
+
+inline auto QuantizedGraph::make_thread_data(size_t beam_capacity) -> std::unique_ptr<ThreadData> {
+  if (beam_capacity == 0 || page_size_ == 0 ||
+      beam_capacity > std::numeric_limits<size_t>::max() / 2 / page_size_) {
+    throw std::invalid_argument("QuantizedGraph: paged lease beam capacity is invalid");
+  }
+  auto data = std::make_unique<ThreadData>();
+#if defined(_WIN32)
+  aligned_file_reader_->register_thread();
+  data->ctx_ = aligned_file_reader_->get_ctx();
+  data->sector_scratch_ =
+      reinterpret_cast<char *>(memory::align_allocate<kSectorLen>(2 * beam_capacity * page_size_));
+#else
+  data->sector_scratch_ =
+      static_cast<char *>(allocate_page_read_buffer(*page_reader_, 2 * beam_capacity * page_size_));
+#endif
+  data->sector_scratch_slots_ = 2 * beam_capacity;
+  return data;
+}
+
+inline void QuantizedGraph::finish_thread_data_borrow() noexcept {
+  const auto previous = paged_lease_gate_.fetch_sub(1, std::memory_order_acq_rel);
+  assert((previous & kPagedLeaseCountMask) != 0);
+  if ((previous & kPagedLeaseDrainBit) != 0 && (previous & kPagedLeaseCountMask) == 1) {
+    thread_data_drain_cv_.notify_all();
+  }
+}
+
+inline void QuantizedGraph::release_thread_data(ThreadData *data, bool reusable) noexcept {
+  assert(data != nullptr);
+  if (reusable && thread_data_.enqueue(data)) {
+    finish_thread_data_borrow();
+    return;
+  }
+  // An exception can leave PageReader callbacks in flight. Keep that lease
+  // owned but out of circulation until shutdown() has joined/drained the
+  // backend; only then may its completion object and sector buffer be freed.
+  paged_lease_quarantined_.fetch_add(1, std::memory_order_relaxed);
+  finish_thread_data_borrow();
+}
+
+inline auto QuantizedGraph::acquire_thread_data(size_t beam_width) -> PagedThreadDataLease {
+  if (beam_width == 0) {
+    throw std::invalid_argument("QuantizedGraph::search: beam_width must be > 0");
+  }
+  auto gate = paged_lease_gate_.load(std::memory_order_acquire);
+  for (;;) {
+    if ((gate & kPagedLeaseDrainBit) != 0) {
+      const auto state = paged_lease_state_.load(std::memory_order_acquire);
+      if (state == PagedLeaseState::kClosed) {
+        throw std::logic_error(
+            "QuantizedGraph::search: paged lease pool is closed; call load_disk_index() first");
+      }
+      throw std::runtime_error(
+          "QuantizedGraph::search: paged lease pool is draining for set_params; retry");
+    }
+    if ((gate & kPagedLeaseCountMask) == kPagedLeaseCountMask) {
+      throw std::runtime_error("QuantizedGraph::search: paged lease counter overflow");
+    }
+    if (paged_lease_gate_.compare_exchange_weak(gate,
+                                                gate + 1,
+                                                std::memory_order_acq_rel,
+                                                std::memory_order_acquire)) {
+      break;
+    }
+  }
+
+  ThreadData *data = nullptr;
+  if (!thread_data_.try_dequeue(data)) {
+    try {
+      std::lock_guard create_lock(thread_data_create_mutex_);
+      // A lease may have returned while this borrower waited for another
+      // high-water allocation. Retry before constructing graph-bound state.
+      if (!thread_data_.try_dequeue(data)) {
+        if (owned_thread_data_.size() >= kPagedLeaseLimit) {
+          throw std::runtime_error(
+              "QuantizedGraph::search: paged lease pool is saturated at the page-reader "
+              "limit; retry");
+        }
+        auto created = make_thread_data(compat_max_beam_width_.load(std::memory_order_acquire));
+        data = created.get();
+        owned_thread_data_.push_back(std::move(created));
+        paged_lease_high_water_.store(owned_thread_data_.size(), std::memory_order_release);
+      }
+    } catch (...) {
+      finish_thread_data_borrow();
+      throw;
+    }
+  }
+
+  assert(data != nullptr);
+  if (beam_width > data->sector_scratch_slots_ / 2) {
+    release_thread_data(data, true);
+    throw std::logic_error(
+        "QuantizedGraph::search: per-call beam exceeds the paged lease capacity; "
+        "call set_params() before concurrent search");
+  }
+  return PagedThreadDataLease(this, data);
+}
+
+inline void QuantizedGraph::begin_thread_data_drain_locked() {
+  paged_lease_state_.store(PagedLeaseState::kDraining, std::memory_order_release);
+  paged_lease_gate_.fetch_or(kPagedLeaseDrainBit, std::memory_order_acq_rel);
+  std::unique_lock drain_lock(thread_data_drain_mutex_);
+  thread_data_drain_cv_.wait(drain_lock, [this] {
+    return (paged_lease_gate_.load(std::memory_order_acquire) & kPagedLeaseCountMask) == 0;
+  });
+}
+
+inline void QuantizedGraph::shutdown_and_clear_thread_data_locked() noexcept {
+  // Reader shutdown is deliberately first. The thread-pool backend joins its
+  // workers here, and libaio drains its outstanding requests, so neither can
+  // write a sector buffer or completion queue after the leases are freed.
+#if defined(_WIN32)
+  if (aligned_file_reader_) {
+    aligned_file_reader_->close();
+    aligned_file_reader_->deregister_all_threads();
+  }
+#else
+  if (page_reader_) {
+    page_reader_->shutdown();
+    page_reader_.reset();
+  }
+#endif
+
+  ThreadData *ignored = nullptr;
+  while (thread_data_.try_dequeue(ignored)) {
+  }
+  for (auto &data : owned_thread_data_) {
+    free_thread_data_storage(*data);
+  }
+  owned_thread_data_.clear();
+  paged_lease_high_water_.store(0, std::memory_order_release);
+  paged_lease_quarantined_.store(0, std::memory_order_release);
+}
+
+inline void QuantizedGraph::rebuild_thread_data_locked(size_t seed_count, size_t beam_capacity) {
+  assert((paged_lease_gate_.load(std::memory_order_acquire) & kPagedLeaseCountMask) == 0);
+  try {
+#if defined(_WIN32)
+    aligned_file_reader_->open(index_file_name_);
+#else
+    page_reader_ = make_laser_page_reader(index_file_name_);
+#endif
+    for (size_t index = 0; index < seed_count; ++index) {
+      auto data = make_thread_data(beam_capacity);
+      auto *raw = data.get();
+      owned_thread_data_.push_back(std::move(data));
+      if (!thread_data_.enqueue(raw)) {
+        throw std::bad_alloc();
+      }
+    }
+    paged_lease_high_water_.store(owned_thread_data_.size(), std::memory_order_release);
+    paged_lease_state_.store(PagedLeaseState::kAccepting, std::memory_order_release);
+    paged_lease_gate_.store(0, std::memory_order_release);
+  } catch (...) {
+    shutdown_and_clear_thread_data_locked();
+    paged_lease_state_.store(PagedLeaseState::kClosed, std::memory_order_release);
+    throw;
+  }
+}
+
+inline void QuantizedGraph::destroy_thread_data() {
+  std::lock_guard lifecycle_lock(thread_data_lifecycle_mutex_);
+  begin_thread_data_drain_locked();
+  shutdown_and_clear_thread_data_locked();
+  paged_lease_state_.store(PagedLeaseState::kClosed, std::memory_order_release);
+}
+
 inline QuantizedGraph::~QuantizedGraph() { destroy_thread_data(); }
 
 inline void QuantizedGraph::set_params(size_t ef_search, size_t num_threads, int beam_width) {
-  // Compatibility shell for bindings and native benches. New search entries
-  // receive ef/beam directly; num_threads is consumed here to size legacy
-  // paged leases and is not retained as independent graph state.
-  compat_max_beam_width_ = static_cast<size_t>(beam_width);
-  compat_ef_search_ = ef_search;
-  destroy_thread_data();
-  if (index_file_name_ == "") {
+  // Compatibility shell for bindings and native benches. Production search
+  // carries ef/beam per call; num_threads only seeds the elastic paged pool and
+  // preserves the legacy native-batch team size.
+  if (index_file_name_.empty()) {
     throw std::logic_error("QuantizedGraph::set_params: call load_disk_index() first");
   }
-#if defined(_WIN32)
-  aligned_file_reader_->open(index_file_name_);
-#else
-  page_reader_ = make_laser_page_reader(index_file_name_);
-#endif
-
-  const int nthreads_signed = static_cast<int>(num_threads);
-#pragma omp parallel for num_threads(nthreads_signed)
-  for (int thread = 0; thread < nthreads_signed; thread++) {
-#pragma omp critical
-    {
-      ThreadData data;
-#if defined(_WIN32)
-      this->aligned_file_reader_->register_thread();
-      data.ctx_ = aligned_file_reader_->get_ctx();
-#endif
-      data.search_scratch_.ensure(num_points_, compat_ef_search_, dimension_ + residual_dimension_);
-#if defined(_WIN32)
-      data.sector_scratch_ = reinterpret_cast<char *>(
-          memory::align_allocate<kSectorLen>(2 * compat_max_beam_width_ * page_size_));
-#else
-      data.sector_scratch_ = static_cast<char *>(
-          allocate_page_read_buffer(*page_reader_, 2 * compat_max_beam_width_ * page_size_));
-#endif
-      data.sector_scratch_slots_ = 2 * compat_max_beam_width_;
-      this->thread_data_.push(data);
-    }
+  if (ef_search == 0 || num_threads == 0 || num_threads > kPagedLeaseLimit || beam_width <= 0) {
+    throw std::invalid_argument(
+        "QuantizedGraph::set_params: effort/beam must be > 0 and threads must not exceed the "
+        "page-reader lease limit");
   }
+
+  std::lock_guard lifecycle_lock(thread_data_lifecycle_mutex_);
+  begin_thread_data_drain_locked();
+  shutdown_and_clear_thread_data_locked();
+  compat_ef_search_.store(ef_search, std::memory_order_release);
+  compat_max_beam_width_.store(static_cast<size_t>(beam_width), std::memory_order_release);
+  rebuild_thread_data_locked(num_threads, static_cast<size_t>(beam_width));
 }
 
 /*
@@ -1032,7 +1266,13 @@ inline void QuantizedGraph::search(const float *ALAYA_RESTRICT query,
                                    uint32_t *ALAYA_RESTRICT results,
                                    const RowAdmission *admission,
                                    float *ALAYA_RESTRICT distances) {
-  search(query, knn, results, compat_ef_search_, compat_max_beam_width_, admission, distances);
+  search(query,
+         knn,
+         results,
+         compat_ef_search_.load(std::memory_order_acquire),
+         compat_max_beam_width_.load(std::memory_order_acquire),
+         admission,
+         distances);
 }
 
 inline void QuantizedGraph::search(const float *ALAYA_RESTRICT query,
@@ -1062,8 +1302,8 @@ inline void QuantizedGraph::batch_search(const float *ALAYA_RESTRICT query,
     disk_search_qg(query + i * (dimension_ + residual_dimension_),
                    knn,
                    results + i * knn,
-                   compat_ef_search_,
-                   compat_max_beam_width_,
+                   compat_ef_search_.load(std::memory_order_acquire),
+                   compat_max_beam_width_.load(std::memory_order_acquire),
                    admission,
                    distances == nullptr ? nullptr : distances + i * knn);
   }
@@ -1280,8 +1520,8 @@ inline void QuantizedGraph::arena_batch_search(const float *ALAYA_RESTRICT query
  * @param results   Output array to store the IDs of k nearest neighbors. Must have
  *                  space for at least knn uint32_t elements.
  *
- * @note This function is thread-safe. Each thread acquires its own ThreadData from a
- *       concurrent queue, which includes scratch buffers and AIO context.
+ * @note This function is thread-safe. Each call leases graph-bound ThreadData from an
+ *       elastic per-graph freelist, including scratch buffers and completion state.
  * @note The query vector is internally rotated using Fast Hadamard Transform for
  *       compatibility with the RaBitQ quantization scheme.
  */
@@ -1292,21 +1532,8 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
                                            size_t beam_width,
                                            const RowAdmission *admission,
                                            float *ALAYA_RESTRICT distances) {
-  // ==================== Thread-local Data Acquisition ====================
-  // Acquire thread-local workspace from the concurrent queue.
-  // This includes: visited set, search buffer, AIO context, and scratch memory.
-  ThreadData data = thread_data_.pop();
-  while (data.sector_scratch_ == nullptr) {
-    this->thread_data_.wait_for_push_notify();
-    data = thread_data_.pop();
-  }
-  if (beam_width > data.sector_scratch_slots_ / 2) {
-    thread_data_.push(data);
-    thread_data_.push_notify_all();
-    throw std::logic_error(
-        "QuantizedGraph::search: per-call beam exceeds the legacy paged lease capacity; "
-        "call set_params() first");
-  }
+  auto lease = acquire_thread_data(beam_width);
+  ThreadData &data = lease.data();
   data.search_scratch_.ensure(num_points_, ef_search, dimension_ + residual_dimension_);
 
   // ==================== PCA Transform ====================
@@ -1524,7 +1751,7 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
              .buffer = std::span(reinterpret_cast<std::byte *>(slot), page_size_)});
 #endif
       }
-      total_read_num_++;
+      total_read_num_.fetch_add(1, std::memory_order_relaxed);
     }
 
     // -------------------- Submit Async I/O Requests --------------------
@@ -1546,7 +1773,7 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
     // -------------------- Process Cached Nodes --------------------
     // Process cached nodes (these are stored in memory and don't require disk I/O)
     for (auto &cache_id : cache_nhoods) {
-      auto *cur_data = caches_[cache_id];
+      auto *cur_data = caches_.at(cache_id);
       process_node(cache_id, reinterpret_cast<float *>(cur_data));
     }
 
@@ -1605,9 +1832,7 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
   // Copy the k nearest neighbor IDs from result pool to output array
   res_pool.copy_results(results, distances);
 
-  // Return thread-local data to the concurrent queue for reuse by other threads
-  thread_data_.push(data);
-  thread_data_.push_notify_all();
+  lease.mark_reusable();
 }
 
 // scan a data row (including data vec and quantization codes for its neighbors)
@@ -1671,34 +1896,11 @@ inline void QuantizedGraph::initialize() {
 }
 
 inline void QuantizedGraph::init_workspace() {
-#if defined(_WIN32)
-  aligned_file_reader_->open(index_file_name_);
-#else
-  page_reader_ = make_laser_page_reader(index_file_name_);
-#endif
-
-  constexpr int nthreads_signed = 1;
-#pragma omp parallel for num_threads(nthreads_signed)
-  for (int thread = 0; thread < nthreads_signed; thread++) {
-#pragma omp critical
-    {
-      ThreadData data;
-#if defined(_WIN32)
-      this->aligned_file_reader_->register_thread();
-      data.ctx_ = aligned_file_reader_->get_ctx();
-#endif
-      data.search_scratch_.ensure(num_points_, compat_ef_search_, dimension_ + residual_dimension_);
-#if defined(_WIN32)
-      data.sector_scratch_ = reinterpret_cast<char *>(
-          memory::align_allocate<kSectorLen>(2 * compat_max_beam_width_ * page_size_));
-#else
-      data.sector_scratch_ = static_cast<char *>(
-          allocate_page_read_buffer(*page_reader_, 2 * compat_max_beam_width_ * page_size_));
-#endif
-      data.sector_scratch_slots_ = 2 * compat_max_beam_width_;
-      this->thread_data_.push(data);
-    }
-  }
+  std::lock_guard lifecycle_lock(thread_data_lifecycle_mutex_);
+  begin_thread_data_drain_locked();
+  shutdown_and_clear_thread_data_locked();
+  rebuild_thread_data_locked(/*seed_count=*/1,
+                             compat_max_beam_width_.load(std::memory_order_acquire));
 }
 
 inline void QuantizedGraph::update_qg_out_of_memory(

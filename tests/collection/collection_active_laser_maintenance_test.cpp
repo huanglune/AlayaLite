@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -12,6 +13,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -349,9 +351,88 @@ TEST(CollectionActiveLaserMaintenance, CloseKeepsSingleWriterLeaseUntilDestructi
   auto still_leased = Collection::open(root.path());
   ASSERT_FALSE(still_leased.ok());
   EXPECT_NE(still_leased.status().diagnostic().find("single-writer lease"), std::string::npos);
+  EXPECT_NE(still_leased.status().diagnostic().find("this process still holds"), std::string::npos);
+  EXPECT_NE(still_leased.status().diagnostic().find("retry"), std::string::npos);
   collection.reset();
   auto reopened = Collection::open(root.path());
   ASSERT_TRUE(reopened.ok()) << reopened.status().diagnostic();
+}
+
+TEST(CollectionActiveLaserMaintenance,
+     PinnedRoutingSnapshotExplainsResidualWriterLeaseAndIsRetryable) {
+  TemporaryDirectory root("pinned-writer");
+  auto created = Collection::create(options(root.path()));
+  ASSERT_TRUE(created.ok()) << created.status().diagnostic();
+  auto collection = std::move(created).value();
+  auto pinned = internal::collection::CollectionTestAccess::pin_epoch(*collection);
+  ASSERT_TRUE(collection->close().ok());
+  collection.reset();
+
+  auto residual = Collection::open(root.path());
+  ASSERT_FALSE(residual.ok());
+  EXPECT_NE(residual.status().diagnostic().find("this process still holds"), std::string::npos);
+  EXPECT_NE(residual.status().diagnostic().find("retry"), std::string::npos);
+
+  pinned.reset();
+  auto reopened = Collection::open(root.path());
+  ASSERT_TRUE(reopened.ok()) << reopened.status().diagnostic();
+}
+
+TEST(CollectionActiveLaserMaintenance, CloseResetReopenLoopsUnderBackgroundSearchLoad) {
+  TemporaryDirectory root("reopen-load");
+  auto created = Collection::create(options(root.path()));
+  ASSERT_TRUE(created.ok()) << created.status().diagnostic();
+  auto collection = std::move(created).value();
+  for (std::uint64_t row = 0; row < 16; ++row) {
+    const auto vector = vector_with(static_cast<float>(row) * 0.1F);
+    ASSERT_TRUE(collection->add(item("reopen-" + std::to_string(row), vector)).ok());
+  }
+  const auto query = vector_with(0.0F);
+
+#if defined(__SANITIZE_THREAD__)
+  constexpr int kCycles = 4;
+#else
+  constexpr int kCycles = 20;
+#endif
+  constexpr int kSearchThreads = 4;
+  for (int cycle = 0; cycle < kCycles; ++cycle) {
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> completed{0};
+    auto current = collection;
+    std::vector<std::thread> workers;
+    workers.reserve(kSearchThreads);
+    for (int thread = 0; thread < kSearchThreads; ++thread) {
+      workers.emplace_back([&, current] {
+        while (!stop.load(std::memory_order_acquire)) {
+          const auto result = top_ids(*current, query, 8);
+          if (result.ok()) {
+            completed.fetch_add(1, std::memory_order_relaxed);
+          } else if (!stop.load(std::memory_order_acquire)) {
+            // close() can race admission after it flips the lifecycle gate;
+            // that fail-closed result is expected only once teardown starts.
+            std::this_thread::yield();
+          }
+        }
+      });
+    }
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (completed.load(std::memory_order_acquire) < 8 &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::yield();
+    }
+    EXPECT_GE(completed.load(std::memory_order_relaxed), 8U) << "cycle=" << cycle;
+    ASSERT_TRUE(current->close().ok());
+    stop.store(true, std::memory_order_release);
+    for (auto &worker : workers) {
+      worker.join();
+    }
+    current.reset();
+    collection.reset();
+
+    auto reopened = Collection::open(root.path());
+    ASSERT_TRUE(reopened.ok()) << "cycle=" << cycle << ": " << reopened.status().diagnostic();
+    collection = std::move(reopened).value();
+  }
 }
 
 TEST(CollectionActiveLaserMaintenance, ActiveFilterRemainsPostfilterAcrossMaintenanceAndReopen) {
@@ -499,11 +580,11 @@ TEST(CollectionActiveLaserMaintenance, SearchExtensionAdmissionMatchesActiveAndS
     parameters.beam_width = beam_width;
     auto extension = disk::make_laser_segment_search_extension(parameters);
     core::SearchOptions search_options(5);
-    search_options.extensions =
-        std::span<const core::AlgorithmSearchExtension>(&extension, 1);
+    search_options.extensions = std::span<const core::AlgorithmSearchExtension>(&extension, 1);
     core::SearchContext context;
-    return collection->search(
-        core::TypedTensorView::contiguous(query.data(), 1, query.size()), search_options, context);
+    return collection->search(core::TypedTensorView::contiguous(query.data(), 1, query.size()),
+                              search_options,
+                              context);
   };
 
   ASSERT_TRUE(run(/*effort=*/5, /*beam_width=*/2).ok());

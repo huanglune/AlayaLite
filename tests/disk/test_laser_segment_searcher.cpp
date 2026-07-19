@@ -23,12 +23,12 @@
 #include <unordered_set>
 #include <vector>
 
+#include "core/value_types.hpp"
 #include "index/disk/laser_segment_importer.hpp"
 #include "index/disk/laser_segment_searcher.hpp"
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
-#include "core/value_types.hpp"
 
 #ifndef ALAYA_LASER_FIXTURE_DIR
   #define ALAYA_LASER_FIXTURE_DIR ""
@@ -357,7 +357,7 @@ TEST_F(LaserSegmentSearcherTest, distance_is_nan_in_v1) {
   }
 }
 
-TEST_F(LaserSegmentSearcherTest, set_params_skipped_on_repeat) {
+TEST_F(LaserSegmentSearcherTest, per_call_effort_never_forwards_set_params) {
   if (const auto reason = fixture_skip_reason(); !reason.empty()) {
     GTEST_SKIP() << reason;
   }
@@ -374,12 +374,12 @@ TEST_F(LaserSegmentSearcherTest, set_params_skipped_on_repeat) {
 
   EXPECT_EQ(searcher.set_params_call_count(), 0U);
   (void)searcher.search(query.data(), opts);
-  EXPECT_EQ(searcher.set_params_call_count(), 1U);
+  EXPECT_EQ(searcher.set_params_call_count(), 0U);
   (void)searcher.search(query.data(), opts);
-  EXPECT_EQ(searcher.set_params_call_count(), 1U);
+  EXPECT_EQ(searcher.set_params_call_count(), 0U);
 }
 
-TEST_F(LaserSegmentSearcherTest, set_params_called_on_change) {
+TEST_F(LaserSegmentSearcherTest, changing_per_call_effort_never_forwards_set_params) {
   if (const auto reason = fixture_skip_reason(); !reason.empty()) {
     GTEST_SKIP() << reason;
   }
@@ -399,9 +399,9 @@ TEST_F(LaserSegmentSearcherTest, set_params_called_on_change) {
   second.beam_width = 8;
 
   (void)searcher.search(query.data(), first);
-  EXPECT_EQ(searcher.set_params_call_count(), 1U);
+  EXPECT_EQ(searcher.set_params_call_count(), 0U);
   (void)searcher.search(query.data(), second);
-  EXPECT_EQ(searcher.set_params_call_count(), 2U);
+  EXPECT_EQ(searcher.set_params_call_count(), 0U);
 }
 
 TEST_F(LaserSegmentSearcherTest, search_does_not_reopen_files) {

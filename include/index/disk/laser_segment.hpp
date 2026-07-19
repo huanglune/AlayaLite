@@ -12,7 +12,6 @@
 #include <filesystem>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -470,10 +469,8 @@ class LaserSegment {
     auto shared = std::shared_ptr<LaserSegment>(std::move(segment));
     core::SegmentInstanceConfig config;
     config.readonly = true;
-    // This capability has no per-residency representation: resident_arena is
-    // lock-free reentrant, while paged_pool remains safe via its internal
-    // legacy mutex until block C. Both therefore truthfully satisfy the
-    // boolean safety contract exposed here.
+    // Both resident_arena and paged_pool make concurrent progress: arena uses
+    // graph-free TLS scratch, while paged search borrows graph-bound leases.
     config.concurrency.reentrant_search = true;
     config.concurrency.search_with_stage = false;
     config.concurrency.search_with_publish = false;
@@ -935,34 +932,10 @@ class LaserSegment {
     return core::Status::success();
   }
 
-  // Unified-segment seam analog (see UnifiedLaserSegmentSearcher, decision
-  // 5 of the U2-b manifest, and decision 7 of U2-c for the residency split
-  // below). When unified_searcher_ is active (kResidentArena residency),
-  // everything routes through its own search(), which already compiles
-  // admission internally for both residencies it supports -- see the
-  // unified_searcher_ branch at the top of this function. Everything below
-  // this comment is legacy_searcher_-only: LaserSegmentSearcher::search()
-  // itself is never modified and never reads DiskSearchOptions.filter, so a
-  // non-none filter bypasses it and drives the kernel through
-  // legacy_searcher_->graph() directly -- the same lock +
-  // set_params-if-different discipline LaserSegmentSearcher::search() uses
-  // internally, reimplemented here since that discipline lives behind a
-  // private member this class cannot reach. kind=none keeps calling
-  // legacy_searcher_->search() untouched (byte-identical to before the
-  // admission contract landed, and to before residency selection existed:
-  // legacy_searcher_ is populated in exactly the cases searcher_ used to
-  // be populated unconditionally).
-  //
-  // Concurrency note: this uses a mutex private to LaserSegment, disjoint
-  // from LaserSegmentSearcher's own search_mutex_ that the kind=none path
-  // still goes through. A single LaserSegment instance receiving a genuine
-  // concurrent mix of kind=none and an active-filter request, with
-  // different ef/beam_width between them, has a narrow race window around
-  // QuantizedGraph::set_params() -- the same shape of hazard
-  // UnifiedLaserSegmentSearcher's kPagedPool/kResidentArena split already
-  // carries (each mode's branch also serializes through its own mutex).
-  // Workloads that hold ef/beam_width constant per collection (the common
-  // case) call set_params() at most once and never hit it.
+  // Unified search compiles admission itself. The legacy/default paged
+  // searcher still needs this bitmap-to-RowAdmission bridge, but effort is
+  // passed directly into the kernel and its per-graph lease pool makes this
+  // path reentrant even when filtered and unfiltered calls are interleaved.
   [[nodiscard]] auto admission_aware_search(const float *query,
                                             const DiskSearchOptions &options) const
       -> std::vector<DiskSearchHit> {
@@ -982,19 +955,11 @@ class LaserSegment {
       return legacy_searcher_->search(query, options);
     }
 #if ALAYA_DISK_LASER_SEGMENT_SUPPORTED
-    const std::lock_guard<std::mutex> lock(admission_search_mutex_);
     auto &graph = legacy_searcher_->graph();
     const auto effective_top_k = static_cast<std::uint32_t>(
         std::min<std::uint64_t>(static_cast<std::uint64_t>(options.top_k), searcher_size()));
-    const AdmissionLastSetParams requested{
-        static_cast<std::size_t>(std::max(options.ef, effective_top_k)),
-        1,
-        static_cast<int>(options.beam_width),
-    };
-    if (requested != admission_last_set_params_) {
-      graph.set_params(requested.ef_search, requested.num_threads, requested.beam_width);
-      admission_last_set_params_ = requested;
-    }
+    const auto ef_search = static_cast<std::size_t>(std::max(options.ef, effective_top_k));
+    const auto beam_width = static_cast<std::size_t>(options.beam_width);
 
     laser::RowAdmission admission_value{};
     const laser::RowAdmission *admission = nullptr;
@@ -1015,6 +980,8 @@ class LaserSegment {
     graph.search(query,
                  effective_top_k,
                  pid_buf.data(),
+                 ef_search,
+                 beam_width,
                  admission,
                  options.return_distances ? distance_buf.data() : nullptr);
 
@@ -1125,15 +1092,6 @@ class LaserSegment {
     return manifest;
   }
 
-  struct AdmissionLastSetParams {
-    std::size_t ef_search{};
-    std::size_t num_threads{};
-    int beam_width{};
-
-    friend auto operator==(const AdmissionLastSetParams &, const AdmissionLastSetParams &)
-        -> bool = default;
-  };
-
   // Exactly one of these is non-null, chosen once at construction time by
   // the residency this segment opened with. legacy_searcher_ is the
   // default/paged-pool path (byte-identical to pre-residency-wiring
@@ -1145,8 +1103,6 @@ class LaserSegment {
   SegmentManifest native_{};
   std::filesystem::path directory_{};
   std::uint64_t artifact_bytes_{};
-  mutable std::mutex admission_search_mutex_{};
-  mutable AdmissionLastSetParams admission_last_set_params_{};
 };
 
 class LaserSegmentFactory {

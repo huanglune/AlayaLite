@@ -38,6 +38,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -109,7 +110,7 @@ class MutableLaserSegment {
       }
       updater_ = std::make_unique<laser::QGUpdater>(*qg_, params);
     } catch (...) {
-      release_writer_lock();
+      teardown_writer_resources();
       throw;
     }
 
@@ -118,13 +119,17 @@ class MutableLaserSegment {
     // leave ids_view_ null: effective_label() never dereferences it because no live
     // PID is < base_count_ (every row is an explicitly-bound append).
     if (base_count_ != 0) {
-      ids_mmap_ = alaya::storage::MMapFile(seg_dir / manifest.ids_file);
-      if (ids_mmap_.size() != base_count_ * sizeof(uint64_t)) {
-        release_writer_lock();
-        throw std::runtime_error("MutableLaserSegment: ids sidecar size mismatch in " +
-                                 seg_dir.string());
+      try {
+        ids_mmap_ = alaya::storage::MMapFile(seg_dir / manifest.ids_file);
+        if (ids_mmap_.size() != base_count_ * sizeof(uint64_t)) {
+          throw std::runtime_error("MutableLaserSegment: ids sidecar size mismatch in " +
+                                   seg_dir.string());
+        }
+        ids_view_ = ids_mmap_.as<uint64_t>();
+      } catch (...) {
+        teardown_writer_resources();
+        throw;
       }
-      ids_view_ = ids_mmap_.as<uint64_t>();
     }
 
     // B-06 global bijection check (segment layer, after both the updater recovery
@@ -132,12 +137,18 @@ class MutableLaserSegment {
     try {
       rebuild_reverse_index();
     } catch (...) {
-      release_writer_lock();
+      teardown_writer_resources();
       throw;
     }
   }
 
-  ~MutableLaserSegment() { release_writer_lock(); }
+  ~MutableLaserSegment() {
+    // Keep the process/external writer lease through dependent teardown, not
+    // merely until the destructor body starts. QGUpdater references qg_, and
+    // QuantizedGraph shutdown drains its PageReader workers/completions; only
+    // after both are gone may a close->reset->reopen caller acquire the file.
+    teardown_writer_resources();
+  }
 
   MutableLaserSegment(const MutableLaserSegment &) = delete;
   auto operator=(const MutableLaserSegment &) -> MutableLaserSegment & = delete;
@@ -528,6 +539,16 @@ class MutableLaserSegment {
   }
 
   void acquire_writer_lock(const std::filesystem::path &lock_path) {
+    std::error_code path_error;
+    const auto absolute = std::filesystem::absolute(lock_path, path_error);
+    writer_lock_key_ = (path_error ? lock_path : absolute).lexically_normal().string();
+    std::lock_guard registry_guard(writer_lock_registry_mutex_);
+    if (process_writer_locks_.contains(writer_lock_key_)) {
+      throw std::runtime_error(
+          "MutableLaserSegment: this process still holds " + lock_path.string() +
+          " (single-writer lease; retry after the prior segment snapshot/async operation is "
+          "released)");
+    }
     wal_lock_fd_ = ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (wal_lock_fd_ < 0) {
       throw std::runtime_error("MutableLaserSegment: cannot open writer-lock file " +
@@ -537,15 +558,34 @@ class MutableLaserSegment {
       ::close(wal_lock_fd_);
       wal_lock_fd_ = -1;
       throw std::runtime_error("MutableLaserSegment: another writer holds " + lock_path.string() +
-                               " (single-writer lease)");
+                               " (single-writer lease; external holder, retry only after it "
+                               "exits)");
+    }
+    try {
+      process_writer_locks_.insert(writer_lock_key_);
+    } catch (...) {
+      ::flock(wal_lock_fd_, LOCK_UN);
+      ::close(wal_lock_fd_);
+      wal_lock_fd_ = -1;
+      writer_lock_key_.clear();
+      throw;
     }
   }
   void release_writer_lock() noexcept {
+    std::lock_guard registry_guard(writer_lock_registry_mutex_);
     if (wal_lock_fd_ >= 0) {
       ::flock(wal_lock_fd_, LOCK_UN);
       ::close(wal_lock_fd_);
       wal_lock_fd_ = -1;
+      process_writer_locks_.erase(writer_lock_key_);
+      writer_lock_key_.clear();
     }
+  }
+
+  void teardown_writer_resources() noexcept {
+    updater_.reset();
+    qg_.reset();
+    release_writer_lock();
   }
 
   laser::ResidencyMode residency_;
@@ -556,6 +596,9 @@ class MutableLaserSegment {
   alaya::storage::MMapFile ids_mmap_;
   const uint64_t *ids_view_ = nullptr;
   int wal_lock_fd_ = -1;
+  std::string writer_lock_key_{};
+  inline static std::mutex writer_lock_registry_mutex_{};
+  inline static std::unordered_set<std::string> process_writer_locks_{};
   // Ruling 10 / W2 (design 3.3): segment-layer label -> live (pid, generation) TOKEN
   // reverse index. In-memory only (never persisted): rebuilt from the label snapshot on
   // open (rebuild_reverse_index) and maintained on commit_physical_bundle (add) /

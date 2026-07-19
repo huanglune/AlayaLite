@@ -18,11 +18,11 @@
 #include <thread>
 #include <vector>
 
+#include "core/value_types.hpp"
 #include "index/disk/laser_segment_importer.hpp"
 #include "index/disk/laser_segment_searcher.hpp"
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/types.hpp"
-#include "core/value_types.hpp"
 
 #ifndef ALAYA_LASER_FIXTURE_DIR
   #define ALAYA_LASER_FIXTURE_DIR ""
@@ -283,7 +283,7 @@ TEST_F(LaserSegmentSearcherConcurrentSearchTest,
   EXPECT_EQ(exceptions.load(std::memory_order_relaxed), 0);
 }
 
-TEST_F(LaserSegmentSearcherConcurrentSearchTest, two_threads_same_params_apply_set_params_once) {
+TEST_F(LaserSegmentSearcherConcurrentSearchTest, two_threads_same_params_never_forward_set_params) {
   if (const auto reason = fixture_skip_reason(); !reason.empty()) {
     GTEST_SKIP() << reason;
   }
@@ -297,15 +297,18 @@ TEST_F(LaserSegmentSearcherConcurrentSearchTest, two_threads_same_params_apply_s
   opts.ef = 100;
   opts.beam_width = 4;
 
-  std::thread t1([&] { (void)searcher.search(query.data(), opts); });
-  std::thread t2([&] { (void)searcher.search(query.data(), opts); });
+  std::thread t1([&] {
+    (void)searcher.search(query.data(), opts);
+  });
+  std::thread t2([&] {
+    (void)searcher.search(query.data(), opts);
+  });
   t1.join();
   t2.join();
-  EXPECT_EQ(searcher.set_params_call_count(), 1U);
+  EXPECT_EQ(searcher.set_params_call_count(), 0U);
 }
 
-TEST_F(LaserSegmentSearcherConcurrentSearchTest,
-       two_threads_distinct_ef_apply_set_params_one_or_two_times) {
+TEST_F(LaserSegmentSearcherConcurrentSearchTest, two_threads_distinct_ef_never_forward_set_params) {
   if (const auto reason = fixture_skip_reason(); !reason.empty()) {
     GTEST_SKIP() << reason;
   }
@@ -323,32 +326,34 @@ TEST_F(LaserSegmentSearcherConcurrentSearchTest,
   opts_b.ef = 64;
   opts_b.beam_width = 4;
 
-  std::thread t_a([&] { (void)searcher.search(query.data(), opts_a); });
-  std::thread t_b([&] { (void)searcher.search(query.data(), opts_b); });
+  std::thread t_a([&] {
+    (void)searcher.search(query.data(), opts_a);
+  });
+  std::thread t_b([&] {
+    (void)searcher.search(query.data(), opts_b);
+  });
   t_a.join();
   t_b.join();
-  const auto count = searcher.set_params_call_count();
-  EXPECT_GE(count, 1U);
-  EXPECT_LE(count, 2U);
+  EXPECT_EQ(searcher.set_params_call_count(), 0U);
 }
 
-TEST_F(LaserSegmentSearcherConcurrentSearchTest, argument_validation_throws_before_lock) {
+TEST_F(LaserSegmentSearcherConcurrentSearchTest, argument_validation_precedes_kernel_entry) {
   if (const auto reason = fixture_skip_reason(); !reason.empty()) {
     GTEST_SKIP() << reason;
   }
   import_fixture();
   LaserSegmentSearcher searcher(seg_dir_);
 
-  const auto expect_invalid_argument_with =
-      [&searcher](const std::function<void()> &fn, const std::string &needle) {
-        try {
-          fn();
-          FAIL() << "expected std::invalid_argument";
-        } catch (const std::invalid_argument &e) {
-          const std::string msg = e.what();
-          EXPECT_NE(msg.find(needle), std::string::npos) << msg;
-        }
-      };
+  const auto expect_invalid_argument_with = [&searcher](const std::function<void()> &fn,
+                                                        const std::string &needle) {
+    try {
+      fn();
+      FAIL() << "expected std::invalid_argument";
+    } catch (const std::invalid_argument &e) {
+      const std::string msg = e.what();
+      EXPECT_NE(msg.find(needle), std::string::npos) << msg;
+    }
+  };
 
   const auto query = fixture_query(0);
   DiskSearchOptions opts_zero_k;
@@ -356,25 +361,32 @@ TEST_F(LaserSegmentSearcherConcurrentSearchTest, argument_validation_throws_befo
   opts_zero_k.ef = 100;
   opts_zero_k.beam_width = 4;
   expect_invalid_argument_with(
-      [&] { (void)searcher.search(query.data(), opts_zero_k); }, "top_k must be > 0");
+      [&] {
+        (void)searcher.search(query.data(), opts_zero_k);
+      },
+      "top_k must be > 0");
 
   DiskSearchOptions opts_ok;
   opts_ok.top_k = 10;
   opts_ok.ef = 100;
   opts_ok.beam_width = 4;
   expect_invalid_argument_with(
-      [&] { (void)searcher.search(nullptr, opts_ok); }, "query must not be null");
+      [&] {
+        (void)searcher.search(nullptr, opts_ok);
+      },
+      "query must not be null");
 
   DiskSearchOptions opts_overflow;
   opts_overflow.top_k = 10;
   opts_overflow.ef = 100;
   opts_overflow.beam_width = static_cast<uint32_t>(std::numeric_limits<int>::max()) + 1U;
   expect_invalid_argument_with(
-      [&] { (void)searcher.search(query.data(), opts_overflow); }, "beam_width exceeds int max");
+      [&] {
+        (void)searcher.search(query.data(), opts_overflow);
+      },
+      "beam_width exceeds int max");
 
-  // Counter at zero is the indirect proof that none of the three throws ran the
-  // search body — including its mutex acquisition (apply_set_params is the only
-  // place that bumps it, and it sits inside the locked region).
+  // Per-call search never forwards set_params, including validation failures.
   EXPECT_EQ(searcher.set_params_call_count(), 0U);
 }
 

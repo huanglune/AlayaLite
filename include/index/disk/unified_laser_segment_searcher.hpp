@@ -5,12 +5,10 @@
 #pragma once
 
 #include <algorithm>
-#include <atomic>
 #include <cstdint>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -52,16 +50,6 @@ class UnifiedLaserSegmentSearcher : public SegmentSearcher {
 
   auto search(const float *query, const DiskSearchOptions &opts) const
       -> std::vector<DiskSearchHit> override {
-    if (provider_->mode() == laser::ResidencyMode::kPagedPool &&
-        opts.filter.kind == core::SegmentFilterKind::none) {
-      // Legacy path owns its own lock and set_params cache. Only the
-      // kind=none path still reaches it -- byte-identical to before the
-      // admission contract landed. A non-none filter falls through to the
-      // shared path below, which drives the kernel through legacy_.graph()
-      // (the unified seam) instead of legacy_.search() itself: the legacy
-      // searcher's own search() semantics are not touched.
-      return legacy_.search(query, opts);
-    }
     if (opts.top_k == 0) {
       throw std::invalid_argument("UnifiedLaserSegmentSearcher: top_k must be > 0");
     }
@@ -77,24 +65,6 @@ class UnifiedLaserSegmentSearcher : public SegmentSearcher {
         static_cast<uint32_t>(std::min<uint64_t>(static_cast<uint64_t>(opts.top_k), size()));
     const size_t ef_search = static_cast<size_t>(std::max(opts.ef, effective_top_k));
     const size_t beam_width = static_cast<size_t>(opts.beam_width);
-
-    // Paged filtered search stays on the legacy lock/cache discipline until
-    // block C supplies graph-bound IO leases. Resident arena never touches
-    // set_params or this mutex: ef/beam flow directly to its TLS kernel.
-    std::unique_lock<std::mutex> paged_lock;
-    if (provider_->mode() == laser::ResidencyMode::kPagedPool) {
-      paged_lock = std::unique_lock<std::mutex>(search_mutex_);
-      const LastSetParams requested{
-          ef_search,
-          1,
-          static_cast<int>(opts.beam_width),
-      };
-      if (requested != last_set_params_) {
-        graph.set_params(requested.ef_search, requested.num_threads, requested.beam_width);
-        set_params_call_count_.fetch_add(1, std::memory_order_relaxed);
-        last_set_params_ = requested;
-      }
-    }
 
     std::vector<uint64_t> admission_storage;
     laser::RowAdmission admission_value{};
@@ -137,8 +107,8 @@ class UnifiedLaserSegmentSearcher : public SegmentSearcher {
   }
 
   // Arena-mode batches lower to the reentrant single-query kernel without an
-  // internal lane team. Paged mode keeps the base one-query-at-a-time fan-out,
-  // byte-identical to before.
+  // internal lane team. Paged batches use the base sequential lowering; each
+  // row still takes an independent graph-bound lease.
   auto batch_search(const float *queries, uint32_t num_queries, const DiskSearchOptions &opts) const
       -> std::vector<std::vector<DiskSearchHit>> override {
     if (provider_->mode() == laser::ResidencyMode::kPagedPool || num_queries == 0) {
@@ -221,22 +191,11 @@ class UnifiedLaserSegmentSearcher : public SegmentSearcher {
   // manifest).
   [[nodiscard]] auto labels() const noexcept -> const uint64_t * { return legacy_.labels(); }
 
-  // Test-only observer: counts compatibility set_params forwarding in this
-  // wrapper. Resident-arena per-call search deliberately leaves it at zero;
-  // paged kind=none still counts inside legacy_.
-  auto set_params_call_count() const noexcept -> uint64_t {
-    return set_params_call_count_.load(std::memory_order_relaxed);
-  }
+  // Compatibility observer retained for callers/tests. Both residency modes
+  // now carry effort per call, so this wrapper never forwards set_params.
+  [[nodiscard]] constexpr auto set_params_call_count() const noexcept -> uint64_t { return 0; }
 
  private:
-  struct LastSetParams {
-    size_t ef_search;
-    size_t num_threads;
-    int beam_width;
-
-    friend auto operator==(const LastSetParams &, const LastSetParams &) -> bool = default;
-  };
-
   // Compile a core::SegmentFilterView into the RowAdmission the kernel
   // wants. `capacity` is this segment's PID space (size()). `storage` and
   // `value` are caller-owned scratch that must outlive the returned
@@ -296,9 +255,6 @@ class UnifiedLaserSegmentSearcher : public SegmentSearcher {
 
   mutable LaserSegmentSearcher legacy_;
   std::unique_ptr<laser::ResidencyProvider> provider_;
-  mutable LastSetParams last_set_params_{0, 0, 0};
-  mutable std::atomic<uint64_t> set_params_call_count_{0};
-  mutable std::mutex search_mutex_;
 };
 
 #else

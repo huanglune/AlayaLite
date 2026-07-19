@@ -193,7 +193,13 @@ class LibaioPageReader final : public PageReader {
   }
 
   void complete(const io_event &event) noexcept {
+    // io_getevents() can publish a completion immediately after io_submit().
+    // Pair with submit()'s mutex-held ownership hand-off before adopting or
+    // reading RequestState: otherwise the reaper can race the submitter's
+    // unique_ptr release (and, on a partial submit, suppress_completion).
+    std::unique_lock lock(mutex_);
     std::unique_ptr<RequestState> state(static_cast<RequestState *>(event.data));
+    lock.unlock();
     ReadResult result{.id = state->request.id};
     if (event.res < 0) {
       result.status = ReadStatus::io_error;
@@ -210,10 +216,9 @@ class LibaioPageReader final : public PageReader {
     }
     state->batch->remaining.fetch_sub(1, std::memory_order_acq_rel);
     if (!state->suppress_completion) state->completion.fn(state->completion.context, result);
-    {
-      std::lock_guard lock(mutex_);
-      --outstanding_;
-    }
+    lock.lock();
+    --outstanding_;
+    lock.unlock();
     capacity_cv_.notify_all();
     drain_cv_.notify_all();
   }
