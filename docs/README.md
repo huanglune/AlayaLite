@@ -8,7 +8,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 The documentation is split by purpose so that current contracts are not
 confused with delivery records or exploratory work. This directory currently
-contains 18 design documents, 18 reports, 6 research notes, 2 user guides, and
+contains 19 design documents, 18 reports, 6 research notes, 2 user guides, and
 9 image assets.
 
 ## Start here
@@ -50,6 +50,9 @@ contains 18 design documents, 18 reports, 6 research notes, 2 user guides, and
   format contract, including explicitly separated retired memory-QG bytes.
 - [LASER implementation guide](design/LASER.md) — native LASER build, I/O, and
   implementation guidance.
+- [QG seal topology / LASER ownership ADR](design/adr-qg-laser-boundary.md) —
+  accepted lifecycle boundaries, canonical include ownership, and migration
+  contract.
 - [Gate 11 legacy cleanup and reader inventory](design/legacy-cleanup.md) —
   current post-cutover API, dependency, and artifact-reader inventory.
 
