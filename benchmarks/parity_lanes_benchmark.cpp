@@ -60,7 +60,11 @@ class CollectionTestAccess {
                                  std::shared_ptr<SegmentedCollection> implementation)
       -> std::shared_ptr<Collection> {
     return std::shared_ptr<Collection>(
-        new Collection(std::move(options), std::move(implementation), CollectionControlState{}));
+        new Collection(std::move(options),
+                       std::move(implementation),
+                       CollectionControlState{},
+                       false,
+                       nullptr));
   }
 };
 
