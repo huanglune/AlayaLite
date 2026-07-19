@@ -1930,9 +1930,13 @@ class SegmentedCollection {
     std::vector<CollectionHit> result;
     result.reserve(candidates.size());
     std::optional<std::pair<core::ScoreKind, core::Metric>> domain;
+    std::optional<std::chrono::steady_clock::time_point> rerank_started;
     for (const auto &candidate : candidates) {
       auto hit = candidate.hit;
       if (hit.score_kind == core::ScoreKind::rank_only) {
+        if (stats != nullptr && !rerank_started.has_value()) {
+          rerank_started = std::chrono::steady_clock::now();
+        }
         core::Result<float> reranked =
             core::Status::error(core::StatusCode::not_supported,
                                 core::OperationStage::search,
@@ -1969,6 +1973,12 @@ class SegmentedCollection {
       }
       domain = current_domain;
       result.push_back(std::move(hit));
+    }
+    if (stats != nullptr && rerank_started.has_value()) {
+      stats->rerank_nanoseconds +=
+          static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - *rerank_started)
+                                         .count());
     }
     return result;
   }

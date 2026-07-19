@@ -101,18 +101,30 @@ class UnifiedLaserSegmentSearcher : public SegmentSearcher {
     // using it here regardless of residency mode keeps this one call site
     // in sync with whichever kernel the provider was constructed for.
     std::vector<uint32_t> pid_buf(effective_top_k);
-    provider_->search(graph, query, effective_top_k, pid_buf.data(), admission);
+    std::vector<float> distance_buf;
+    if (opts.return_distances) {
+      distance_buf.resize(effective_top_k);
+    }
+    provider_->search(graph,
+                      query,
+                      effective_top_k,
+                      pid_buf.data(),
+                      admission,
+                      opts.return_distances ? distance_buf.data() : nullptr);
 
     const uint64_t *labels = legacy_.labels();
     std::vector<DiskSearchHit> out;
     out.reserve(effective_top_k);
-    for (uint32_t pid : pid_buf) {
+    for (std::size_t index = 0; index < pid_buf.size(); ++index) {
+      const uint32_t pid = pid_buf[index];
       if (pid >= size()) {
         throw std::runtime_error("UnifiedLaserSegmentSearcher: QuantizedGraph returned PID " +
                                  std::to_string(pid) + " outside segment count " +
                                  std::to_string(size()));
       }
-      out.push_back(DiskSearchHit{labels[pid], std::numeric_limits<float>::quiet_NaN()});
+      out.push_back(DiskSearchHit{labels[pid],
+                                  opts.return_distances ? distance_buf[index]
+                                                        : std::numeric_limits<float>::quiet_NaN()});
     }
     return out;
   }
@@ -159,8 +171,17 @@ class UnifiedLaserSegmentSearcher : public SegmentSearcher {
         compile_admission(opts.filter, size(), admission_storage, admission_value);
 
     std::vector<uint32_t> pid_buf(static_cast<size_t>(num_queries) * effective_top_k);
-    provider_
-        ->batch_search(graph, queries, effective_top_k, pid_buf.data(), num_queries, admission);
+    std::vector<float> distance_buf;
+    if (opts.return_distances) {
+      distance_buf.resize(static_cast<size_t>(num_queries) * effective_top_k);
+    }
+    provider_->batch_search(graph,
+                            queries,
+                            effective_top_k,
+                            pid_buf.data(),
+                            num_queries,
+                            admission,
+                            opts.return_distances ? distance_buf.data() : nullptr);
 
     const uint64_t *labels = legacy_.labels();
     std::vector<std::vector<DiskSearchHit>> out;
@@ -175,7 +196,11 @@ class UnifiedLaserSegmentSearcher : public SegmentSearcher {
                                    std::to_string(pid) + " outside segment count " +
                                    std::to_string(size()));
         }
-        hits.push_back(DiskSearchHit{labels[pid], std::numeric_limits<float>::quiet_NaN()});
+        hits.push_back(
+            DiskSearchHit{labels[pid],
+                          opts.return_distances
+                              ? distance_buf[static_cast<std::size_t>(q) * effective_top_k + k]
+                              : std::numeric_limits<float>::quiet_NaN()});
       }
       out.push_back(std::move(hits));
     }

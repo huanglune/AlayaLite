@@ -5,6 +5,7 @@
 #include <array>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -140,7 +141,8 @@ struct SearchCall {
              core::RowCount rows,
              std::uint64_t top_k,
              std::uint32_t effort,
-             std::uint32_t beam_width = 4)
+             std::uint32_t beam_width = 4,
+             bool return_distances = false)
       : hits(static_cast<std::size_t>(rows * top_k)),
         offsets(static_cast<std::size_t>(rows + 1)),
         counts(static_cast<std::size_t>(rows)),
@@ -153,6 +155,7 @@ struct SearchCall {
     response.completeness = completeness;
     extension_options.effort = effort;
     extension_options.beam_width = beam_width;
+    extension_options.return_distances = return_distances;
     extension = LaserSegment::make_search_extension(extension_options);
     request.queries = core::TypedTensorView::contiguous(queries, rows, kDim);
     request.options.top_k = top_k;
@@ -191,6 +194,11 @@ struct SearchCall {
   return values[values.size() / 2];
 }
 
+[[nodiscard]] auto is_nan_bits(float value) -> bool {
+  const auto bits = std::bit_cast<std::uint32_t>(value);
+  return (bits & 0x7F800000U) == 0x7F800000U && (bits & 0x007FFFFFU) != 0;
+}
+
 TEST(LaserSegment, DifferentialRankOnlyManifestGateCollectionRejectionAndPerformance) {
   if (!fixture_available()) {
     GTEST_SKIP() << "LASER fixture is unavailable under " << fixture_directory();
@@ -227,6 +235,38 @@ TEST(LaserSegment, DifferentialRankOnlyManifestGateCollectionRejectionAndPerform
     EXPECT_GT(call.counts[0], 0U);
     EXPECT_EQ(call.response.score_kind, core::ScoreKind::rank_only);
     EXPECT_EQ(call.response.result_flags, core::ResultFlag::approximate);
+    for (std::size_t index = 0; index < call.counts[0]; ++index) {
+      EXPECT_TRUE(is_nan_bits(call.hits[index].score));
+      EXPECT_EQ(call.hits[index].score_kind, core::ScoreKind::rank_only);
+    }
+  }
+
+  // The opt-in forwards the exact values already retained by LASER's final
+  // result pool. This fixture includes a full-dimensional PCA transform, so
+  // compare against the equivalent raw-domain L2 oracle with a tight floating
+  // tolerance rather than requiring transform roundoff to be bit-identical.
+  SearchCall numeric(vectors.data() + 31 * kDim, 1, kTopK, 128, 4, true);
+  ASSERT_TRUE(segment->search(numeric.request).ok());
+  ASSERT_EQ(numeric.counts[0], kTopK);
+  EXPECT_EQ(numeric.response.score_kind, core::ScoreKind::distance);
+  float previous = -std::numeric_limits<float>::infinity();
+  for (std::size_t index = 0; index < numeric.counts[0]; ++index) {
+    const auto label = static_cast<std::uint64_t>(numeric.hits[index].row_id);
+    ASSERT_GE(label, 50'000U);
+    ASSERT_EQ((label - 50'000U) % 13U, 0U);
+    const auto source_row = (label - 50'000U) / 13U;
+    ASSERT_LT(source_row, kCount);
+    float expected{};
+    for (std::uint32_t column = 0; column < kDim; ++column) {
+      const auto delta = vectors[31 * kDim + column] -
+                         vectors[static_cast<std::size_t>(source_row) * kDim + column];
+      expected += delta * delta;
+    }
+    EXPECT_TRUE(std::isfinite(numeric.hits[index].score));
+    EXPECT_EQ(numeric.hits[index].score_kind, core::ScoreKind::distance);
+    EXPECT_NEAR(numeric.hits[index].score, expected, 2.0e-3F);
+    EXPECT_LE(previous, numeric.hits[index].score);
+    previous = numeric.hits[index].score;
   }
 
   SearchCall batch(vectors.data() + 7 * kDim, 2, kTopK, 64);
@@ -338,9 +378,12 @@ TEST(LaserSegment, DifferentialRankOnlyManifestGateCollectionRejectionAndPerform
                                             VersionState::live,
                                             {}});
   }
-  standalone_registration.exact_rerank = [&vectors](const core::TypedTensorView &query,
-                                                     core::SegmentRowId row_id)
+  std::size_t rerank_calls{};
+  standalone_registration.exact_rerank = [&vectors, &rerank_calls](
+                                               const core::TypedTensorView &query,
+                                               core::SegmentRowId row_id)
       -> core::Result<float> {
+    ++rerank_calls;
     const auto label = static_cast<std::uint64_t>(row_id);
     if (label < 50'000 || (label - 50'000) % 13 != 0 ||
         (label - 50'000) / 13 >= kCount) {
@@ -362,8 +405,10 @@ TEST(LaserSegment, DifferentialRankOnlyManifestGateCollectionRejectionAndPerform
       SegmentedCollection::open({kDim, core::Metric::l2, core::ScalarType::float32},
                                 {std::move(standalone_registration)});
   ASSERT_TRUE(standalone.ok()) << standalone.status().diagnostic();
+  auto standalone_collection = std::move(standalone).value();
   core::SearchContext standalone_context;
   CollectionSearchRequest standalone_request;
+  internal::collection::CollectionSearchStats standalone_stats;
   standalone_request.queries =
       core::TypedTensorView::contiguous(vectors.data() + 31 * kDim, 1, kDim);
   standalone_request.options.top_k = 5;
@@ -373,7 +418,8 @@ TEST(LaserSegment, DifferentialRankOnlyManifestGateCollectionRejectionAndPerform
   standalone_request.options.extensions =
       std::span<const core::AlgorithmSearchExtension>(&standalone_extension, 1);
   standalone_request.context = &standalone_context;
-  auto standalone_result = std::move(standalone).value()->search(standalone_request);
+  standalone_request.stats = &standalone_stats;
+  auto standalone_result = standalone_collection->search(standalone_request);
   ASSERT_TRUE(standalone_result.ok()) << standalone_result.status().diagnostic();
   ASSERT_EQ(standalone_result.value().queries.size(), 1U);
   ASSERT_TRUE(standalone_result.value().queries[0].status.ok());
@@ -382,6 +428,31 @@ TEST(LaserSegment, DifferentialRankOnlyManifestGateCollectionRejectionAndPerform
     EXPECT_NE(static_cast<std::uint32_t>(hit.result_flags) &
                   static_cast<std::uint32_t>(core::ResultFlag::exact_reranked),
               0U);
+  }
+  ASSERT_EQ(rerank_calls, 5U);
+  EXPECT_GT(standalone_stats.rerank_nanoseconds, 0U);
+
+  // The same Collection route with the explicit numeric-result switch must
+  // bypass its exact_rerank callback: LASER's score is already a comparable
+  // distance. This is the behavioral hinge between benchmark arms A and B.
+  auto numeric_extension_options = laser_candidates.extension_options;
+  numeric_extension_options.return_distances = true;
+  auto numeric_extension = LaserSegment::make_search_extension(numeric_extension_options);
+  numeric_extension.unknown_policy = core::UnknownExtensionPolicy::ignore_safe;
+  standalone_request.options.extensions =
+      std::span<const core::AlgorithmSearchExtension>(&numeric_extension, 1);
+  const auto rerank_calls_before_numeric = rerank_calls;
+  auto numeric_result = standalone_collection->search(standalone_request);
+  ASSERT_TRUE(numeric_result.ok()) << numeric_result.status().diagnostic();
+  ASSERT_EQ(numeric_result.value().queries[0].hits.size(), 5U);
+  EXPECT_EQ(rerank_calls, rerank_calls_before_numeric);
+  EXPECT_EQ(standalone_stats.rerank_nanoseconds, 0U);
+  for (const auto &hit : numeric_result.value().queries[0].hits) {
+    EXPECT_EQ(hit.score_kind, core::ScoreKind::distance);
+    EXPECT_EQ(static_cast<std::uint32_t>(hit.result_flags) &
+                  static_cast<std::uint32_t>(core::ResultFlag::exact_reranked),
+              0U);
+    EXPECT_TRUE(std::isfinite(hit.score));
   }
 
   std::vector<float> flat_vectors(2 * kDim);

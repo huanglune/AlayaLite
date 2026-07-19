@@ -243,7 +243,11 @@ struct CollectionSearchStats {
   std::uint64_t lease_peak_bytes{};
   std::uint64_t io_requests_consumed{};
   std::uint64_t io_bytes_consumed{};
-  std::uint64_t reserved[4]{};
+  // Wall time spent in score normalization after the first rank-only hit is
+  // observed. It includes exact-rerank distance work and the remainder of that
+  // normalization pass, making it a low-overhead stage-tax measurement.
+  std::uint64_t rerank_nanoseconds{};
+  std::uint64_t reserved[3]{};
 
   CollectionSearchStats() : header(core::current_struct_header<CollectionSearchStats>()) {}
 };

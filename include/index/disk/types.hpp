@@ -24,6 +24,10 @@ struct DiskSearchOptions {
   uint32_t ef = 100;
   uint32_t beam_width = 4;
   bool exact_rerank = true;
+  // Prototype result-contract switch. false preserves LASER's historical
+  // rank-only/NaN output; true asks LASER to forward the exact distances its
+  // QG result pool already used to order the returned PIDs.
+  bool return_distances = false;
   // Segment admission contract (docs/design/segment-admission-contract.md):
   // a value-copied view, not an owner. `filter.payload` (when kind !=
   // none) must stay valid for the duration of the search/batch_search

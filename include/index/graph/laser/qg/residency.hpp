@@ -59,14 +59,16 @@ class ResidencyProvider {
                       const float *query,
                       uint32_t knn,
                       uint32_t *results,
-                      const RowAdmission *admission = nullptr) = 0;
+                      const RowAdmission *admission = nullptr,
+                      float *distances = nullptr) = 0;
 
   virtual void batch_search(QuantizedGraph &qg,
                             const float *queries,
                             uint32_t knn,
                             uint32_t *results,
                             size_t num_queries,
-                            const RowAdmission *admission = nullptr) = 0;
+                            const RowAdmission *admission = nullptr,
+                            float *distances = nullptr) = 0;
 };
 
 class PagedPoolProvider final : public ResidencyProvider {
@@ -82,8 +84,9 @@ class PagedPoolProvider final : public ResidencyProvider {
               const float *query,
               uint32_t knn,
               uint32_t *results,
-              const RowAdmission *admission) override {
-    qg.search(query, knn, results, admission);
+              const RowAdmission *admission,
+              float *distances) override {
+    qg.search(query, knn, results, admission, distances);
   }
 
   void batch_search(QuantizedGraph &qg,
@@ -91,8 +94,9 @@ class PagedPoolProvider final : public ResidencyProvider {
                     uint32_t knn,
                     uint32_t *results,
                     size_t num_queries,
-                    const RowAdmission *admission) override {
-    qg.batch_search(queries, knn, results, num_queries, admission);
+                    const RowAdmission *admission,
+                    float *distances) override {
+    qg.batch_search(queries, knn, results, num_queries, admission, distances);
   }
 };
 
@@ -117,8 +121,9 @@ class ResidentArenaProvider final : public ResidencyProvider {
               const float *query,
               uint32_t knn,
               uint32_t *results,
-              const RowAdmission *admission) override {
-    qg.arena_search_qg(query, knn, results, admission);
+              const RowAdmission *admission,
+              float *distances) override {
+    qg.arena_search_qg(query, knn, results, admission, distances);
   }
 
   void batch_search(QuantizedGraph &qg,
@@ -126,8 +131,9 @@ class ResidentArenaProvider final : public ResidencyProvider {
                     uint32_t knn,
                     uint32_t *results,
                     size_t num_queries,
-                    const RowAdmission *admission) override {
-    qg.arena_batch_search(queries, knn, results, num_queries, admission);
+                    const RowAdmission *admission,
+                    float *distances) override {
+    qg.arena_batch_search(queries, knn, results, num_queries, admission, distances);
   }
 
  private:

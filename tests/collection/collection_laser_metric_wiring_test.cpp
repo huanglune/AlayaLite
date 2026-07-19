@@ -7,6 +7,7 @@
 // row normalization. Both cases verify native/Collection proofs and reopen.
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <span>
 #include <string>
 #include <string_view>
@@ -25,10 +27,13 @@
 #include "alaya/collection.hpp"
 #include "index/collection/artifact_manifest_v2.hpp"
 #include "index/collection/detail/collection_target_builder.hpp"
+#include "index/disk/laser_segment.hpp"
 #include "index/disk/laser_segment_searcher.hpp"
 #include "index/disk/segment_manifest.hpp"
+#include "index/disk/unified_laser_segment_searcher.hpp"
 #include "index/graph/laser/qg/qg.hpp"
 #include "platform/detect.hpp"
+#include "simd/distance_ip.hpp"
 #include "utils/evaluate.hpp"
 
 namespace alaya {
@@ -263,6 +268,57 @@ void expect_exact_sorted_distances(const CollectionSearchResponse &response,
   }
 }
 
+template <class Searcher>
+void expect_native_result_contract(Searcher &searcher,
+                                   const float *native_query,
+                                   const float *oracle_query,
+                                   const Dataset &dataset,
+                                   core::Metric metric) {
+  disk::DiskSearchOptions options;
+  options.top_k = kTopK;
+  options.ef = 256;
+  const auto rank_only = searcher.search(native_query, options);
+  ASSERT_EQ(rank_only.size(), kTopK);
+  for (const auto &hit : rank_only) {
+    const auto bits = std::bit_cast<std::uint32_t>(hit.distance);
+    EXPECT_EQ(bits & 0x7F800000U, 0x7F800000U);
+    EXPECT_NE(bits & 0x007FFFFFU, 0U);
+  }
+
+  options.return_distances = true;
+  const auto numeric = searcher.search(native_query, options);
+  ASSERT_EQ(numeric.size(), kTopK);
+  std::vector<std::size_t> native_order(dataset.ids.size());
+  std::iota(native_order.begin(), native_order.end(), std::size_t{0});
+  std::sort(native_order.begin(), native_order.end(), [&](std::size_t lhs, std::size_t rhs) {
+    return dataset.ids[lhs].compare(dataset.ids[rhs]) < 0;
+  });
+  float previous = -std::numeric_limits<float>::infinity();
+  for (const auto &hit : numeric) {
+    ASSERT_LT(hit.label, native_order.size());
+    const auto source_row = native_order[hit.label];
+    const auto expected = exact_score(oracle_query,
+                                      dataset.vectors.data() + source_row * kDim,
+                                      metric);
+    const float *native_candidate = dataset.vectors.data() + source_row * kDim;
+    std::vector<float> normalized_candidate;
+    if (metric == core::Metric::cosine) {
+      normalized_candidate.assign(native_candidate, native_candidate + kDim);
+      const auto normalize_status = internal::collection::detail::l2_normalize_float_rows(
+          normalized_candidate, kDim, core::OperationStage::validation);
+      ASSERT_TRUE(normalize_status.ok()) << normalize_status.diagnostic();
+      native_candidate = normalized_candidate.data();
+    }
+    const auto memqg_domain =
+        ::alaya::simd::ip_sqr<float, float>(native_query, native_candidate, kDim);
+    EXPECT_TRUE(std::isfinite(hit.distance));
+    EXPECT_NEAR(hit.distance, expected, 2.0e-4F);
+    EXPECT_FLOAT_EQ(hit.distance, memqg_domain);
+    EXPECT_LE(previous, hit.distance);
+    previous = hit.distance;
+  }
+}
+
 struct LaserArtifacts {
   internal::collection::SegmentEntryV2 entry{};
   std::filesystem::path segment_directory{};
@@ -325,6 +381,66 @@ void expect_collection_descriptor(const std::filesystem::path &root,
   EXPECT_EQ(descriptor.preprocessing, preprocessing);
 }
 
+void expect_target_numeric_result_contract(
+    const std::filesystem::path &root,
+    const internal::collection::SegmentEntryV2 &entry,
+    const Dataset &dataset,
+    const float *query,
+    core::Metric metric) {
+  core::OpenContext open_context;
+  const internal::collection::CollectionSchema schema{kDim, metric, core::ScalarType::float32};
+  auto opened = internal::collection::detail::open_laser_collection_target(root,
+                                                                            entry,
+                                                                            schema,
+                                                                            open_context);
+  ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
+  auto target = std::move(opened).value();
+
+  disk::LaserSegmentSearchExtension extension_options;
+  extension_options.effort = 256;
+  extension_options.return_distances = true;
+  auto extension = disk::LaserSegment::make_search_extension(extension_options);
+  std::vector<core::SearchHit> hits(kTopK);
+  std::vector<core::RowCount> offsets(2);
+  std::vector<core::RowCount> counts(1);
+  std::vector<core::Status> statuses(1);
+  std::vector<core::SearchCompleteness> completeness(1);
+  core::SearchResponse response;
+  response.hits = hits;
+  response.offsets = offsets;
+  response.valid_counts = counts;
+  response.statuses = statuses;
+  response.completeness = completeness;
+  core::SearchContext search_context;
+  core::SearchRequest request;
+  request.queries = core::TypedTensorView::contiguous(query, 1, kDim);
+  request.options.top_k = kTopK;
+  request.options.extensions = std::span<const core::AlgorithmSearchExtension>(&extension, 1);
+  request.context = &search_context;
+  request.response = &response;
+  const auto status = target.search(std::move(request));
+  ASSERT_TRUE(status.ok()) << status.diagnostic();
+  ASSERT_EQ(counts[0], kTopK);
+  EXPECT_EQ(response.score_kind, core::ScoreKind::distance);
+  EXPECT_EQ(response.comparable_metric, metric);
+
+  std::vector<std::size_t> native_order(dataset.ids.size());
+  std::iota(native_order.begin(), native_order.end(), std::size_t{0});
+  std::sort(native_order.begin(), native_order.end(), [&](std::size_t lhs, std::size_t rhs) {
+    return dataset.ids[lhs].compare(dataset.ids[rhs]) < 0;
+  });
+  for (std::size_t index = 0; index < counts[0]; ++index) {
+    ASSERT_EQ(hits[index].score_kind, core::ScoreKind::distance);
+    const auto native_row = static_cast<std::uint64_t>(hits[index].row_id);
+    ASSERT_LT(native_row, native_order.size());
+    const auto source_row = native_order[native_row];
+    const auto expected = exact_score(query,
+                                      dataset.vectors.data() + source_row * kDim,
+                                      metric);
+    EXPECT_NEAR(hits[index].score, expected, 2.0e-4F);
+  }
+}
+
 TEST(CollectionLaserMetricWiring, InnerProductMatchesMemoryQgOnSameNonUnitDataAndReopens) {
   const auto dataset = make_ip_dataset();
   const auto queries = make_ip_queries(dataset);
@@ -348,6 +464,24 @@ TEST(CollectionLaserMetricWiring, InnerProductMatchesMemoryQgOnSameNonUnitDataAn
                                artifacts.entry,
                                core::Metric::inner_product,
                                core::MetricPreprocessing::none);
+  expect_target_numeric_result_contract(laser_directory.path(),
+                                        artifacts.entry,
+                                        dataset,
+                                        queries.data(),
+                                        core::Metric::inner_product);
+  disk::LaserSegmentSearcher native_searcher(artifacts.segment_directory);
+  expect_native_result_contract(native_searcher,
+                                queries.data(),
+                                queries.data(),
+                                dataset,
+                                core::Metric::inner_product);
+  disk::UnifiedLaserSegmentSearcher arena_searcher(artifacts.segment_directory,
+                                                    laser::ResidencyMode::kResidentArena);
+  expect_native_result_contract(arena_searcher,
+                                queries.data(),
+                                queries.data(),
+                                dataset,
+                                core::Metric::inner_product);
 
   auto laser_response = laser_collection->batch_search(
       core::TypedTensorView::contiguous(queries.data(), kQueryCount, kDim), kTopK);
@@ -424,6 +558,11 @@ TEST(CollectionLaserMetricWiring, CosineNormalizesRowsWrapsQueriesAndReopens) {
                                artifacts.entry,
                                core::Metric::cosine,
                                core::MetricPreprocessing::l2_normalized);
+  expect_target_numeric_result_contract(temporary.path(),
+                                        artifacts.entry,
+                                        dataset,
+                                        queries.data(),
+                                        core::Metric::cosine);
 
   auto response = collection->batch_search(
       core::TypedTensorView::contiguous(queries.data(), kQueryCount, kDim), kTopK);
@@ -445,6 +584,11 @@ TEST(CollectionLaserMetricWiring, CosineNormalizesRowsWrapsQueriesAndReopens) {
   ASSERT_FALSE(native_hits.empty());
   EXPECT_EQ(native_hits.front().label, 0U)
       << "raw-IP high-norm distractor row-1 must not beat normalized row-0";
+  expect_native_result_contract(native_searcher,
+                                normalized_query.data(),
+                                queries.data(),
+                                dataset,
+                                core::Metric::cosine);
 
   auto retained = collection->get_by_id(dataset.ids[1], CollectionProjection::vector);
   ASSERT_TRUE(retained.ok()) << retained.status().diagnostic();

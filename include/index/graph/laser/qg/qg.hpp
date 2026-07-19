@@ -677,7 +677,8 @@ class QuantizedGraph {
   void disk_search_qg(const float *ALAYA_RESTRICT query,
                       uint32_t knn,
                       uint32_t *ALAYA_RESTRICT results,
-                      const RowAdmission *admission);
+                      const RowAdmission *admission,
+                      float *ALAYA_RESTRICT distances);
 
   void copy_vectors(const float *);
 
@@ -768,24 +769,28 @@ class QuantizedGraph {
   void search(const float *ALAYA_RESTRICT query,
               uint32_t knn,
               uint32_t *ALAYA_RESTRICT results,
-              const RowAdmission *admission = nullptr);
+              const RowAdmission *admission = nullptr,
+              float *ALAYA_RESTRICT distances = nullptr);
 
   // Full-cache probe: same scan_neighbors kernel on a resident arena — direct
   // pid*node_len addressing over cache_nodes_, no beam/AIO orchestration.
   void arena_search_qg(const float *ALAYA_RESTRICT query,
                        uint32_t knn,
                        uint32_t *ALAYA_RESTRICT results,
-                       const RowAdmission *admission = nullptr);
+                       const RowAdmission *admission = nullptr,
+                       float *ALAYA_RESTRICT distances = nullptr);
   void arena_search_with(ThreadData &data,
                          const float *ALAYA_RESTRICT query,
                          uint32_t knn,
                          uint32_t *ALAYA_RESTRICT results,
-                         const RowAdmission *admission = nullptr);
+                         const RowAdmission *admission = nullptr,
+                         float *ALAYA_RESTRICT distances = nullptr);
   void arena_batch_search(const float *ALAYA_RESTRICT query,
                           uint32_t knn,
                           uint32_t *ALAYA_RESTRICT results,
                           size_t num_queries,
-                          const RowAdmission *admission = nullptr);
+                          const RowAdmission *admission = nullptr,
+                          float *ALAYA_RESTRICT distances = nullptr);
 
   // Residency seams (driven by the residency.hpp providers):
   //  - arena_resident(): true when cache_nodes_ is a full identity-ordered arena.
@@ -806,7 +811,8 @@ class QuantizedGraph {
                     uint32_t knn,
                     uint32_t *ALAYA_RESTRICT results,
                     size_t num_queries,
-                    const RowAdmission *admission = nullptr);
+                    const RowAdmission *admission = nullptr,
+                    float *ALAYA_RESTRICT distances = nullptr);
 
   void destroy_thread_data() {
     while (thread_data_.size() > 0) {
@@ -958,15 +964,17 @@ inline void QuantizedGraph::set_params(size_t ef_search, size_t num_threads, int
 inline void QuantizedGraph::search(const float *ALAYA_RESTRICT query,
                                    uint32_t knn,
                                    uint32_t *ALAYA_RESTRICT results,
-                                   const RowAdmission *admission) {
-  disk_search_qg(query, knn, results, admission);
+                                   const RowAdmission *admission,
+                                   float *ALAYA_RESTRICT distances) {
+  disk_search_qg(query, knn, results, admission, distances);
 }
 
 inline void QuantizedGraph::batch_search(const float *ALAYA_RESTRICT query,
                                          uint32_t knn,
                                          uint32_t *ALAYA_RESTRICT results,
                                          size_t num_queries,
-                                         const RowAdmission *admission) {
+                                         const RowAdmission *admission,
+                                         float *ALAYA_RESTRICT distances) {
   const int64_t num_queries_signed = static_cast<int64_t>(num_queries);
   const int nthreads_signed = static_cast<int>(nthreads_);
 #pragma omp parallel for schedule(dynamic) num_threads(nthreads_signed)
@@ -975,20 +983,22 @@ inline void QuantizedGraph::batch_search(const float *ALAYA_RESTRICT query,
     disk_search_qg(query + i * (dimension_ + residual_dimension_),
                    knn,
                    results + i * knn,
-                   admission);
+                   admission,
+                   distances == nullptr ? nullptr : distances + i * knn);
   }
 }
 
 inline void QuantizedGraph::arena_search_qg(const float *ALAYA_RESTRICT query,
                                             uint32_t knn,
                                             uint32_t *ALAYA_RESTRICT results,
-                                            const RowAdmission *admission) {
+                                            const RowAdmission *admission,
+                                            float *ALAYA_RESTRICT distances) {
   ThreadData data = thread_data_.pop();
   while (data.sector_scratch_ == nullptr) {
     this->thread_data_.wait_for_push_notify();
     data = thread_data_.pop();
   }
-  arena_search_with(data, query, knn, results, admission);
+  arena_search_with(data, query, knn, results, admission, distances);
   thread_data_.push(data);
   thread_data_.push_notify_all();
 }
@@ -997,7 +1007,8 @@ inline void QuantizedGraph::arena_search_with(ThreadData &data,
                                               const float *ALAYA_RESTRICT query,
                                               uint32_t knn,
                                               uint32_t *ALAYA_RESTRICT results,
-                                              const RowAdmission *admission) {
+                                              const RowAdmission *admission,
+                                              float *ALAYA_RESTRICT distances) {
   if (!arena_identity_) {
     throw std::runtime_error(
         "arena_search_qg: requires a 100% identity-ordered node cache sidecar");
@@ -1077,14 +1088,15 @@ inline void QuantizedGraph::arena_search_with(ThreadData &data,
     }
   }
 
-  res_pool.copy_results(results);
+  res_pool.copy_results(results, distances);
 }
 
 inline void QuantizedGraph::arena_batch_search(const float *ALAYA_RESTRICT query,
                                                uint32_t knn,
                                                uint32_t *ALAYA_RESTRICT results,
                                                size_t num_queries,
-                                               const RowAdmission *admission) {
+                                               const RowAdmission *admission,
+                                               float *ALAYA_RESTRICT distances) {
   const int64_t num_queries_signed = static_cast<int64_t>(num_queries);
   const int nthreads_signed = static_cast<int>(nthreads_);
   // Check out one ThreadData per worker for the whole batch: per-query queue
@@ -1107,7 +1119,8 @@ inline void QuantizedGraph::arena_batch_search(const float *ALAYA_RESTRICT query
                       query + i * (dimension_ + residual_dimension_),
                       knn,
                       results + i * knn,
-                      admission);
+                      admission,
+                      distances == nullptr ? nullptr : distances + i * knn);
   }
   for (auto &d : slots) {
     thread_data_.push(d);
@@ -1152,7 +1165,8 @@ inline void QuantizedGraph::arena_batch_search(const float *ALAYA_RESTRICT query
 inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
                                            uint32_t knn,
                                            uint32_t *ALAYA_RESTRICT results,
-                                           const RowAdmission *admission) {
+                                           const RowAdmission *admission,
+                                           float *ALAYA_RESTRICT distances) {
   // ==================== Thread-local Data Acquisition ====================
   // Acquire thread-local workspace from the concurrent queue.
   // This includes: visited set, search buffer, AIO context, and scratch memory.
@@ -1457,7 +1471,7 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
 
   // ==================== Copy Results and Cleanup ====================
   // Copy the k nearest neighbor IDs from result pool to output array
-  res_pool.copy_results(results);
+  res_pool.copy_results(results, distances);
 
   // Return thread-local data to the concurrent queue for reuse by other threads
   thread_data_.push(data);

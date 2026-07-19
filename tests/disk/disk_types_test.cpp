@@ -36,6 +36,7 @@ TEST(DiskSearchOptionsDefaults, MatchSpecValues) {
   EXPECT_EQ(opts.ef, 100u);
   EXPECT_EQ(opts.beam_width, 4u);
   EXPECT_TRUE(opts.exact_rerank);
+  EXPECT_FALSE(opts.return_distances);
 }
 
 namespace {

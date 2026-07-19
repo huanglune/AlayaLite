@@ -121,7 +121,15 @@ class ResultBuffer {
 
   const std::vector<PID, ::alaya::AlignedAlloc<PID>> &ids() { return ids_; }
 
-  void copy_results(PID *knn) const { std::copy(ids_.begin(), ids_.end() - 1, knn); }
+  // The result pool already owns the exact distance used to order every PID.
+  // Most callers historically needed only IDs, so keep the distance output
+  // optional and preserve that path byte-for-byte when it is null.
+  void copy_results(PID *knn, float *distances = nullptr) const {
+    std::copy(ids_.begin(), ids_.end() - 1, knn);
+    if (distances != nullptr) {
+      std::copy(distances_.begin(), distances_.end() - 1, distances);
+    }
+  }
 
  private:
   std::vector<PID, ::alaya::AlignedAlloc<PID>> ids_;

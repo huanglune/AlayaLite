@@ -340,17 +340,28 @@ class LaserSegmentSearcher : public SegmentSearcher {
 
     std::vector<uint32_t> pid_buf;
     pid_buf.resize(effective_top_k);
-    quantized_graph_->search(query, effective_top_k, pid_buf.data());
+    std::vector<float> distance_buf;
+    if (opts.return_distances) {
+      distance_buf.resize(effective_top_k);
+    }
+    quantized_graph_->search(query,
+                             effective_top_k,
+                             pid_buf.data(),
+                             nullptr,
+                             opts.return_distances ? distance_buf.data() : nullptr);
 
     std::vector<DiskSearchHit> out;
     out.reserve(effective_top_k);
-    for (uint32_t pid : pid_buf) {
+    for (std::size_t index = 0; index < pid_buf.size(); ++index) {
+      const uint32_t pid = pid_buf[index];
       if (pid >= manifest_.count) {
         throw std::runtime_error("LaserSegmentSearcher: QuantizedGraph returned PID " +
                                  std::to_string(pid) + " outside segment count " +
                                  std::to_string(manifest_.count));
       }
-      out.push_back(DiskSearchHit{ids_view_[pid], std::numeric_limits<float>::quiet_NaN()});
+      out.push_back(DiskSearchHit{ids_view_[pid],
+                                  opts.return_distances ? distance_buf[index]
+                                                        : std::numeric_limits<float>::quiet_NaN()});
     }
     return out;
   }

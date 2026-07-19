@@ -73,7 +73,11 @@ struct LaserSegmentSearchExtension {
   core::VersionedStructHeader header{};
   std::uint32_t effort{100};
   std::uint32_t beam_width{4};
-  std::uint64_t reserved[3]{};
+  // Prototype-only opt-in. The default deliberately remains the historical
+  // rank_only + NaN contract so callers cannot drift without requesting it.
+  bool return_distances{false};
+  std::uint8_t reserved_bytes[7]{};
+  std::uint64_t reserved[2]{};
 
   LaserSegmentSearchExtension()
       : header(core::current_struct_header<LaserSegmentSearchExtension>()) {}
@@ -121,6 +125,7 @@ struct LaserSegmentSearchExtension {
     }
     defaults.ef = typed.effort;
     defaults.beam_width = typed.beam_width;
+    defaults.return_distances = typed.return_distances;
   }
   defaults.top_k = static_cast<std::uint32_t>(options.top_k);
   defaults.exact_rerank = false;
@@ -839,8 +844,16 @@ class LaserSegment {
     const auto hit_flags = admission_active
                                ? (core::ResultFlag::approximate | core::ResultFlag::filtered)
                                : core::ResultFlag::approximate;
+    std::vector<std::uint64_t> pid_admission_storage;
+    auto resolved = resolve_search_options(request.options, request.filter, pid_admission_storage);
+    if (!resolved.ok()) {
+      return resolved.status();
+    }
+    const auto options = std::move(resolved).value();
+    const auto score_kind =
+        options.return_distances ? core::ScoreKind::distance : core::ScoreKind::rank_only;
     auto &response = *request.response;
-    response.score_kind = core::ScoreKind::rank_only;
+    response.score_kind = score_kind;
     response.comparable_metric = native_.metric;
     response.result_flags = hit_flags;
     if (request.options.top_k == 0 || request.queries.rows == 0) {
@@ -851,12 +864,6 @@ class LaserSegment {
                                           : core::SearchCompleteness::eligible_exhausted);
       return core::Status::success();
     }
-    std::vector<std::uint64_t> pid_admission_storage;
-    auto resolved = resolve_search_options(request.options, request.filter, pid_admission_storage);
-    if (!resolved.ok()) {
-      return resolved.status();
-    }
-    const auto options = std::move(resolved).value();
     if (direct_results != nullptr) {
       direct_results->clear();
       direct_results->resize(static_cast<std::size_t>(request.queries.rows));
@@ -883,7 +890,7 @@ class LaserSegment {
           response.hits[static_cast<std::size_t>(cursor + index)] =
               core::SearchHit(core::SegmentRowId(hits[index].label),
                               hits[index].distance,
-                              core::ScoreKind::rank_only,
+                              score_kind,
                               native_.metric,
                               hit_flags);
         }
@@ -997,18 +1004,30 @@ class LaserSegment {
     }
 
     std::vector<std::uint32_t> pid_buf(effective_top_k);
-    graph.search(query, effective_top_k, pid_buf.data(), admission);
+    std::vector<float> distance_buf;
+    if (options.return_distances) {
+      distance_buf.resize(effective_top_k);
+    }
+    graph.search(query,
+                 effective_top_k,
+                 pid_buf.data(),
+                 admission,
+                 options.return_distances ? distance_buf.data() : nullptr);
 
     const std::uint64_t *labels = searcher_labels();
     std::vector<DiskSearchHit> out;
     out.reserve(effective_top_k);
-    for (std::uint32_t pid : pid_buf) {
+    for (std::size_t index = 0; index < pid_buf.size(); ++index) {
+      const std::uint32_t pid = pid_buf[index];
       if (pid >= searcher_size()) {
         throw std::runtime_error("LaserSegment: QuantizedGraph returned PID " +
                                  std::to_string(pid) + " outside segment count " +
                                  std::to_string(searcher_size()));
       }
-      out.push_back(DiskSearchHit{labels[pid], std::numeric_limits<float>::quiet_NaN()});
+      out.push_back(DiskSearchHit{labels[pid],
+                                  options.return_distances
+                                      ? distance_buf[index]
+                                      : std::numeric_limits<float>::quiet_NaN()});
     }
     return out;
 #else

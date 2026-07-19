@@ -36,14 +36,19 @@
 #include "index/graph/vamana/vamana_builder.hpp"
 #include "index/graph/vamana/vamana_writer.hpp"
 #include "platform/detect.hpp"
+#include "simd/distance_l2.hpp"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <bit>
 #include <cstdint>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -169,6 +174,69 @@ class AdmissionDiskTest : public ::testing::Test {
 };
 
 std::unique_ptr<SegmentFixture> AdmissionDiskTest::fixture_;
+
+[[nodiscard]] auto exact_l2(const float *lhs, const float *rhs) -> float {
+  double distance{};
+  for (std::uint32_t column = 0; column < kDim; ++column) {
+    const auto delta = static_cast<double>(lhs[column]) - rhs[column];
+    distance += delta * delta;
+  }
+  return static_cast<float>(distance);
+}
+
+[[nodiscard]] auto is_nan_bits(float value) -> bool {
+  const auto bits = std::bit_cast<std::uint32_t>(value);
+  return (bits & 0x7F800000U) == 0x7F800000U && (bits & 0x007FFFFFU) != 0;
+}
+
+void expect_exact_distances(const std::vector<DiskSearchHit> &hits,
+                            const float *query,
+                            const SegmentFixture &fixture) {
+  float previous = -std::numeric_limits<float>::infinity();
+  for (const auto &hit : hits) {
+    const auto pid = fixture.pid_of_label(hit.label);
+    ASSERT_LT(pid, kCount);
+    const auto expected = exact_l2(query, fixture.data.data() + pid * kDim);
+    const auto memqg_domain = ::alaya::simd::l2_sqr<float, float>(
+        query, fixture.data.data() + pid * kDim, kDim);
+    EXPECT_TRUE(std::isfinite(hit.distance));
+    EXPECT_NEAR(hit.distance, expected, std::max(1.0e-4F, expected * 2.0e-6F));
+    EXPECT_FLOAT_EQ(hit.distance, memqg_domain);
+    EXPECT_LE(previous, hit.distance);
+    previous = hit.distance;
+  }
+}
+
+TEST_F(AdmissionDiskTest, ExactDistanceOptInCoversBothResidenciesAndNativeBatch) {
+  for (const auto residency : {laser::ResidencyMode::kPagedPool,
+                               laser::ResidencyMode::kResidentArena}) {
+    UnifiedLaserSegmentSearcher searcher(fixture_->seg_dir, residency);
+    DiskSearchOptions options;
+    options.top_k = kTopK;
+    options.ef = 96;
+    options.beam_width = 4;
+
+    const float *query = fixture_->data.data() + 17 * kDim;
+    const auto legacy_hits = searcher.search(query, options);
+    ASSERT_EQ(legacy_hits.size(), kTopK);
+    for (const auto &hit : legacy_hits) {
+      EXPECT_TRUE(is_nan_bits(hit.distance));
+    }
+
+    options.return_distances = true;
+    const auto numeric_hits = searcher.search(query, options);
+    ASSERT_EQ(numeric_hits.size(), kTopK);
+    expect_exact_distances(numeric_hits, query, *fixture_);
+
+    constexpr std::uint32_t kQueries = 4;
+    const auto batch = searcher.batch_search(fixture_->data.data(), kQueries, options);
+    ASSERT_EQ(batch.size(), kQueries);
+    for (std::uint32_t row = 0; row < kQueries; ++row) {
+      ASSERT_EQ(batch[row].size(), kTopK);
+      expect_exact_distances(batch[row], fixture_->data.data() + row * kDim, *fixture_);
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Acceptance #1: kind=none is byte-identical on both residency modes.
