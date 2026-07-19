@@ -675,13 +675,32 @@ TEST_F(AdmissionDiskTest, SetParamsDrainsInflightAndNewBorrowersFailClosed) {
       while (!go.load(std::memory_order_acquire)) {
         std::this_thread::yield();
       }
-      try {
-        const auto actual = searcher.search(fixture_->data.data() + query * kDim, options);
-        if (!same_hits(baselines[query], actual, /*return_distances=*/true)) {
+      // A worker that reaches the pool only after the concurrent set_params()
+      // below has closed the gate receives the contractual retryable
+      // rejection; under slow schedules (coverage lanes) that window is wide.
+      // Retry those until the rebuilt pool accepts — the search must then
+      // still reproduce the baseline exactly. Anything non-retryable fails.
+      const auto retry_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+      for (;;) {
+        try {
+          const auto actual = searcher.search(fixture_->data.data() + query * kDim, options);
+          if (!same_hits(baselines[query], actual, /*return_distances=*/true)) {
+            worker_failures.fetch_add(1, std::memory_order_relaxed);
+          }
+          return;
+        } catch (const std::runtime_error &error) {
+          const std::string message(error.what());
+          const bool retryable = message.find("paged lease pool") != std::string::npos &&
+                                 message.find("retry") != std::string::npos;
+          if (!retryable || std::chrono::steady_clock::now() >= retry_deadline) {
+            worker_failures.fetch_add(1, std::memory_order_relaxed);
+            return;
+          }
+          std::this_thread::yield();
+        } catch (...) {
           worker_failures.fetch_add(1, std::memory_order_relaxed);
+          return;
         }
-      } catch (...) {
-        worker_failures.fetch_add(1, std::memory_order_relaxed);
       }
     });
   }
