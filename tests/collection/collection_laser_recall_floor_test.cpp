@@ -403,7 +403,7 @@ INSTANTIATE_TEST_SUITE_P(L2UnitAndNonUnit,
 TEST(CollectionLaserDimensionGate, NonPowerOfTwo768BuildSearchRecall) {
   constexpr std::uint64_t kSeed = 0xA11A2026'0718'0768ULL;
   // The bare LASER gte768 full-main-dimension probe measured recall@10=0.98637
-  // at ef=200 (docs/LASER_UPDATE_EXPLORATION.md section 21.2). This tiny
+  // at ef=200 (docs/research/LASER_UPDATE_EXPLORATION.md section 21.2). This tiny
   // synthetic Collection fixture is not a dataset-equivalent benchmark, so it
   // uses the existing Collection LASER floor (0.85) as a noise-tolerant
   // regression threshold while printing the measured value for the report.
