@@ -65,6 +65,8 @@ class ResidencyProvider {
                       const RowAdmission *admission = nullptr,
                       float *distances = nullptr) = 0;
 
+  // Batch is a sequential lowering to the same per-query kernel. Scheduling
+  // and concurrency belong to the caller's external lanes.
   virtual void batch_search(QuantizedGraph &qg,
                             const float *queries,
                             uint32_t knn,

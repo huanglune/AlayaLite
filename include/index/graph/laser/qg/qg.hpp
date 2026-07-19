@@ -4,8 +4,6 @@
 
 #pragma once
 
-#include <omp.h>
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -692,7 +690,6 @@ class QuantizedGraph {
    public:
     [[nodiscard]] auto enqueue(ThreadData *data) -> bool { return queue_.enqueue(data); }
     [[nodiscard]] auto try_dequeue(ThreadData *&data) -> bool { return queue_.try_dequeue(data); }
-    [[nodiscard]] auto size() const noexcept -> size_t { return queue_.size_approx(); }
 
    private:
     moodycamel::ConcurrentQueue<ThreadData *> queue_{32};
@@ -713,8 +710,8 @@ class QuantizedGraph {
   std::atomic<size_t> paged_lease_high_water_{0};
   std::atomic<size_t> paged_lease_quarantined_{0};
   int dc_count_;
-  // Defaults used only by the source-compatible set_params()/legacy overloads.
-  // New production entries carry ef/beam per call and never read this state.
+  // Defaults read by the source-compatible single-query overloads below.
+  // Production entries carry ef/beam per call and never read this state.
   std::atomic<size_t> compat_ef_search_{200};
 
   size_t node_len_;
@@ -899,6 +896,8 @@ class QuantizedGraph {
   void load_cluster_stats(const char *filename);
 
   /* search and copy results to KNN */
+  // Source-compatible overload: reads the ef/beam defaults last installed by
+  // set_params(). New production callers pass both values explicitly.
   void search(const float *ALAYA_RESTRICT query,
               uint32_t knn,
               uint32_t *ALAYA_RESTRICT results,
@@ -914,6 +913,7 @@ class QuantizedGraph {
 
   // Full-cache probe: same scan_neighbors kernel on a resident arena — direct
   // pid*node_len addressing over cache_nodes_, no beam/AIO orchestration.
+  // The source-compatible overload reads the set_params() ef/beam defaults.
   void arena_search_qg(const float *ALAYA_RESTRICT query,
                        uint32_t knn,
                        uint32_t *ALAYA_RESTRICT results,
@@ -933,12 +933,6 @@ class QuantizedGraph {
                          size_t ef_search,
                          const RowAdmission *admission = nullptr,
                          float *ALAYA_RESTRICT distances = nullptr);
-  void arena_batch_search(const float *ALAYA_RESTRICT query,
-                          uint32_t knn,
-                          uint32_t *ALAYA_RESTRICT results,
-                          size_t num_queries,
-                          const RowAdmission *admission = nullptr,
-                          float *ALAYA_RESTRICT distances = nullptr);
   void arena_batch_search(const float *ALAYA_RESTRICT query,
                           uint32_t knn,
                           uint32_t *ALAYA_RESTRICT results,
@@ -963,12 +957,8 @@ class QuantizedGraph {
   void arena_reserve_rows(size_t rows);
   void arena_mirror_write(uint64_t file_off, const char *buf, size_t len);
 
-  void batch_search(const float *ALAYA_RESTRICT query,
-                    uint32_t knn,
-                    uint32_t *ALAYA_RESTRICT results,
-                    size_t num_queries,
-                    const RowAdmission *admission = nullptr,
-                    float *ALAYA_RESTRICT distances = nullptr);
+  // Batch is semantic sugar over reentrant per-query calls. These entries do
+  // not create threads; callers that want concurrency supply external lanes.
   void batch_search(const float *ALAYA_RESTRICT query,
                     uint32_t knn,
                     uint32_t *ALAYA_RESTRICT results,
@@ -1245,9 +1235,9 @@ inline void QuantizedGraph::destroy_thread_data() {
 inline QuantizedGraph::~QuantizedGraph() { destroy_thread_data(); }
 
 inline void QuantizedGraph::set_params(size_t ef_search, size_t num_threads, int beam_width) {
-  // Compatibility shell for bindings and native benches. Production search
-  // carries ef/beam per call; num_threads only seeds the elastic paged pool and
-  // preserves the legacy native-batch team size.
+  // Compatibility shell and paged-pool provisioning hook. Production search
+  // carries ef/beam per call; num_threads seeds the elastic paged pool and
+  // beam_width fixes each seeded lease's capacity.
   if (index_file_name_.empty()) {
     throw std::logic_error("QuantizedGraph::set_params: call load_disk_index() first");
   }
@@ -1290,30 +1280,6 @@ inline void QuantizedGraph::search(const float *ALAYA_RESTRICT query,
                                    const RowAdmission *admission,
                                    float *ALAYA_RESTRICT distances) {
   disk_search_qg(query, knn, results, ef_search, beam_width, admission, distances);
-}
-
-inline void QuantizedGraph::batch_search(const float *ALAYA_RESTRICT query,
-                                         uint32_t knn,
-                                         uint32_t *ALAYA_RESTRICT results,
-                                         size_t num_queries,
-                                         const RowAdmission *admission,
-                                         float *ALAYA_RESTRICT distances) {
-  const int64_t num_queries_signed = static_cast<int64_t>(num_queries);
-  // set_params() materializes exactly one paged lease per requested legacy
-  // worker. Derive the old native-batch team size from those compatibility
-  // resources instead of retaining num_threads as independent graph state.
-  const int nthreads_signed = static_cast<int>(thread_data_.size());
-#pragma omp parallel for schedule(dynamic) num_threads(nthreads_signed)
-  for (int64_t ii = 0; ii < num_queries_signed; ++ii) {
-    const size_t i = static_cast<size_t>(ii);
-    disk_search_qg(query + i * (dimension_ + residual_dimension_),
-                   knn,
-                   results + i * knn,
-                   compat_ef_search_.load(std::memory_order_acquire),
-                   compat_max_beam_width_.load(std::memory_order_acquire),
-                   admission,
-                   distances == nullptr ? nullptr : distances + i * knn);
-  }
 }
 
 inline void QuantizedGraph::batch_search(const float *ALAYA_RESTRICT query,
@@ -1452,40 +1418,10 @@ inline void QuantizedGraph::arena_batch_search(const float *ALAYA_RESTRICT query
                                                uint32_t knn,
                                                uint32_t *ALAYA_RESTRICT results,
                                                size_t num_queries,
-                                               const RowAdmission *admission,
-                                               float *ALAYA_RESTRICT distances) {
-  const int64_t num_queries_signed = static_cast<int64_t>(num_queries);
-  // Arena searches no longer borrow these leases, but their count still
-  // records the set_params() team size expected by this compatibility-only
-  // native batch overload.
-  const int nthreads_signed = static_cast<int>(thread_data_.size());
-  // Source-compatible native bulk entry for bare benches. Each OpenMP worker
-  // now reaches the same TLS-backed single-query kernel as production; no
-  // graph-bound ThreadData slots are borrowed by an arena search.
-#pragma omp parallel for schedule(dynamic) num_threads(nthreads_signed)
-  for (int64_t ii = 0; ii < num_queries_signed; ++ii) {
-    const size_t i = static_cast<size_t>(ii);
-    arena_search_qg(query + i * (dimension_ + residual_dimension_),
-                    knn,
-                    results + i * knn,
-                    compat_ef_search_,
-                    compat_max_beam_width_,
-                    admission,
-                    distances == nullptr ? nullptr : distances + i * knn);
-  }
-}
-
-inline void QuantizedGraph::arena_batch_search(const float *ALAYA_RESTRICT query,
-                                               uint32_t knn,
-                                               uint32_t *ALAYA_RESTRICT results,
-                                               size_t num_queries,
                                                size_t ef_search,
                                                size_t beam_width,
                                                const RowAdmission *admission,
                                                float *ALAYA_RESTRICT distances) {
-  // Transitional A+B shape: production batch semantics are a simple sequence
-  // of reentrant per-query calls. The old OpenMP bulk overload above remains
-  // only for source compatibility and is adjudicated in block D.
   for (size_t i = 0; i < num_queries; ++i) {
     arena_search_qg(query + i * (dimension_ + residual_dimension_),
                     knn,

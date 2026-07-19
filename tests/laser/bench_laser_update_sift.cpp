@@ -232,6 +232,46 @@ struct Args {
   std::vector<uint32_t> efs = {60, 80, 100, 150, 200, 300};
 };
 
+// Keep the historical bare-bench measurement shape: the OpenMP dynamic
+// fanout moved out of QuantizedGraph, while every lane invokes the same
+// per-call kernel with explicit ef/beam values.
+void run_query_lanes(alaya::laser::QuantizedGraph &qg,
+                     const float *queries,
+                     uint32_t knn,
+                     uint32_t *results,
+                     size_t num_queries,
+                     size_t ef_search,
+                     size_t beam_width,
+                     uint32_t threads,
+                     bool arena = false) {
+  const auto query_stride = qg.dimension() + qg.residual_dimension();
+  const auto num_queries_signed = static_cast<int64_t>(num_queries);
+  const auto threads_signed = static_cast<int>(threads);
+#pragma omp parallel for schedule(dynamic) num_threads(threads_signed)
+  for (int64_t ii = 0; ii < num_queries_signed; ++ii) {
+    const auto i = static_cast<size_t>(ii);
+    const float *query = queries + i * query_stride;
+    uint32_t *result = results + i * knn;
+    if (arena) {
+      qg.arena_search_qg(query,
+                         knn,
+                         result,
+                         ef_search,
+                         beam_width,
+                         /*admission=*/nullptr,
+                         /*distances=*/nullptr);
+    } else {
+      qg.search(query,
+                knn,
+                result,
+                ef_search,
+                beam_width,
+                /*admission=*/nullptr,
+                /*distances=*/nullptr);
+    }
+  }
+}
+
 Args parse(int argc, char **argv) {
   Args a;
   if (argc < 2) {
@@ -722,7 +762,14 @@ int do_churn(const Args &a) {
     qg.set_result_filter(&upd.deleted());
     qg.set_params(ef_eval, a.threads, static_cast<int>(a.beam));
     auto t0 = std::chrono::steady_clock::now();
-    qg.batch_search(query.data.data(), a.topk, results.data(), query.n);
+    run_query_lanes(qg,
+                    query.data.data(),
+                    a.topk,
+                    results.data(),
+                    query.n,
+                    ef_eval,
+                    a.beam,
+                    a.threads);
     auto t1 = std::chrono::steady_clock::now();
     const double qps = query.n / std::chrono::duration<double>(t1 - t0).count();
     uint64_t hits = 0;
@@ -837,7 +884,14 @@ int do_churn(const Args &a) {
       const uint32_t ef = a.efs[ef_index];
       qg.set_params(ef, a.threads, static_cast<int>(a.beam));
       auto ef_t0 = std::chrono::steady_clock::now();
-      qg.batch_search(query.data.data(), a.topk, results.data(), query.n);
+      run_query_lanes(qg,
+                      query.data.data(),
+                      a.topk,
+                      results.data(),
+                      query.n,
+                      ef,
+                      a.beam,
+                      a.threads);
       auto ef_t1 = std::chrono::steady_clock::now();
       const double ef_qps = query.n / std::chrono::duration<double>(ef_t1 - ef_t0).count();
       uint64_t ef_hits = 0;
@@ -1482,11 +1536,15 @@ int do_eval(const Args &a) {
     };
     for (uint32_t r = 0; r < a.runs + 1; ++r) {  // first run = warmup
       auto t0 = std::chrono::steady_clock::now();
-      if (a.arena) {
-        qg.arena_batch_search(query.data.data(), a.topk, results.data(), query.n);
-      } else {
-        qg.batch_search(query.data.data(), a.topk, results.data(), query.n);
-      }
+      run_query_lanes(qg,
+                      query.data.data(),
+                      a.topk,
+                      results.data(),
+                      query.n,
+                      ef,
+                      a.beam,
+                      a.threads,
+                      a.arena);
       auto t1 = std::chrono::steady_clock::now();
       const double secs = std::chrono::duration<double>(t1 - t0).count();
       if (r > 0) {

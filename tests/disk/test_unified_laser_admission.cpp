@@ -221,7 +221,7 @@ void expect_exact_distances(const std::vector<DiskSearchHit> &hits,
   }
 }
 
-TEST_F(AdmissionDiskTest, ExactDistanceOptInCoversBothResidenciesAndNativeBatch) {
+TEST_F(AdmissionDiskTest, ExactDistanceOptInCoversBothResidenciesAndBatchSemantics) {
   for (const auto residency :
        {laser::ResidencyMode::kPagedPool, laser::ResidencyMode::kResidentArena}) {
     UnifiedLaserSegmentSearcher searcher(fixture_->seg_dir, residency);

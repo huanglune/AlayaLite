@@ -106,9 +106,9 @@ class UnifiedLaserSegmentSearcher : public SegmentSearcher {
     return out;
   }
 
-  // Arena-mode batches lower to the reentrant single-query kernel without an
-  // internal lane team. Paged batches use the base sequential lowering; each
-  // row still takes an independent graph-bound lease.
+  // Both residency modes expose per-query batch semantics without an internal
+  // lane team. Paged mode uses the base lowering; arena mode keeps this
+  // override only to share admission compilation and result translation.
   auto batch_search(const float *queries, uint32_t num_queries, const DiskSearchOptions &opts) const
       -> std::vector<std::vector<DiskSearchHit>> override {
     if (provider_->mode() == laser::ResidencyMode::kPagedPool || num_queries == 0) {

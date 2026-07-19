@@ -56,9 +56,10 @@ class SegmentSearcher {
   virtual auto search(const float *query, const DiskSearchOptions &opts) const
       -> std::vector<DiskSearchHit> = 0;
 
-  // Batch entry point. The default fans out to search() one query at a
-  // time; engines with a native batch kernel (e.g. the resident-arena
-  // Laser path) override it. `queries` is row-major, num_queries * dim().
+  // Batch entry point. Batch semantics are one search() call per query;
+  // concurrency is supplied by external lanes. Engines may override this to
+  // share result plumbing, but not to create an internal lane team. `queries`
+  // is row-major, num_queries * dim().
   virtual auto batch_search(const float *queries,
                             uint32_t num_queries,
                             const DiskSearchOptions &opts) const
