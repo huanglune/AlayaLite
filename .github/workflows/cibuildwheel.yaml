@@ -3,6 +3,11 @@ name: Build Wheels
 
 on  :
   workflow_dispatch:
+    inputs:
+      quick:
+        description: Build only cp312 per platform (branch validation; releases always build the full matrix)
+        type: boolean
+        default: false
   push:
     tags:
     - v*
@@ -33,6 +38,13 @@ jobs:
     env:
       CONAN_NON_INTERACTIVE: 1
       CMAKE_ARGS: -DALAYA_NATIVE_ARCH=OFF -DBUILD_TOOLS=OFF
+      # Wheel wall time is the per-platform *serial* loop over Python
+      # versions, so quick mode's single interpreter is a real ~5x wall cut.
+      # Both arms are spelled out because an empty CIBW_BUILD would not fall
+      # back to pyproject's list - it would widen to cibuildwheel's full
+      # default (PyPy included). The full arm mirrors [tool.cibuildwheel]
+      # build in pyproject.toml; tag pushes have no inputs and take it.
+      CIBW_BUILD: ${{ inputs.quick && 'cp312-*' || 'cp3{9,10,11,12,13}-*' }}
       # CI specific config: mount Conan and uv cache in Linux Docker
       CIBW_CONTAINER_ENGINE: 'docker; create_args: -v /home/runner/.conan2:/root/.conan2 -v /home/runner/.cache/uv:/root/.cache/uv'
       CIBW_ARCHS_LINUX: ${{ matrix.arch }}
