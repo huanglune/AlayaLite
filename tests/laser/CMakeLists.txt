@@ -68,6 +68,37 @@ alaya_add_test(
   LABELS laser
 )
 
+# Paged search must consume asynchronous reads in a logical order that is independent of backend completion timing. The
+# same source is exercised with the configured libaio and thread-pool builds, including the TSan lane.
+alaya_cc_target(
+  test_laser_paged_determinism
+  BARE GTEST LASER
+  SRCS qg/test_paged_determinism.cpp
+  OPTS ${_laser_test_opts}
+)
+if(ALAYA_LASER_USE_THREADPOOL)
+  set(_laser_paged_backend_label threadpool)
+else()
+  set(_laser_paged_backend_label libaio)
+endif()
+alaya_add_test(
+  NAME laser_test_paged_determinism
+  TARGET test_laser_paged_determinism
+  LABELS laser
+         paged
+         determinism
+         disk
+         tsan
+         ${_laser_paged_backend_label}
+  TIMEOUT 180 RUN_SERIAL
+)
+if(ALAYA_LASER_USE_THREADPOOL)
+  # This controls only the deprecated AlignedFileReader used while building the fixture. The search path under test uses
+  # ThreadpoolPageReader (which ignores this variable) and still runs its backend plus four query lanes concurrently
+  # under TSan.
+  set_tests_properties(laser_test_paged_determinism PROPERTIES ENVIRONMENT "ALAYA_LASER_IO_THREADS=1")
+endif()
+
 # Backend file-reader tests: pin the backend definition per target instead of linking alaya_laser, so each backend is
 # exercised on every platform that can compile it.
 alaya_cc_target(

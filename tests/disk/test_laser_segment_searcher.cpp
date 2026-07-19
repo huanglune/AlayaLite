@@ -29,6 +29,7 @@
 #include "index/disk/segment_factory.hpp"
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
+#include "test_config.hpp"
 
 #ifndef ALAYA_LASER_FIXTURE_DIR
   #define ALAYA_LASER_FIXTURE_DIR ""
@@ -405,7 +406,7 @@ TEST_F(LaserSegmentSearcherTest, changing_per_call_effort_never_forwards_set_par
 }
 
 TEST_F(LaserSegmentSearcherTest, search_does_not_reopen_files) {
-  const auto repo_root = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path();
+  const auto repo_root = std::filesystem::path(::alaya::test::kSourceDir);
   const auto header_path = repo_root / "include" / "index" / "disk" / "laser_segment_searcher.hpp";
   std::ifstream input(header_path);
   ASSERT_TRUE(input.is_open()) << header_path;

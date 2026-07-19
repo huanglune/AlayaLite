@@ -405,8 +405,11 @@ class QGBuilder {
       memory::align_free(data.cur_page_scratch_);
       memory::align_free(data.neighbor_vector_scratch_);
     }
-    vector_reader->deregister_all_threads();
+    // The thread-pool backend may still be returning from its completion
+    // callback after a blocking read observes the queued event. Join workers
+    // before destroying their per-thread completion contexts.
     vector_reader->close();
+    vector_reader->deregister_all_threads();
     output.close();
 
     // ==================== Save Rotation Matrix ====================
@@ -483,8 +486,8 @@ class QGBuilder {
       }
     }
     cache_vectors_output.close();
-    cache_reader->deregister_all_threads();
     cache_reader->close();
+    cache_reader->deregister_all_threads();
     memory::align_free(cache_buffer);
     std::cout << "Done. \n";
   }

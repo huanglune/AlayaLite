@@ -184,20 +184,9 @@ std::unique_ptr<TinyIndex> AdmissionContractTest::shared_index_;
 // Acceptance #2: tombstone parity.
 // ---------------------------------------------------------------------------
 
-// The paged/disk_search_qg kernel interleaves computation with asynchronous
-// page-read completions (io_uring/libaio); on this host, two calls to the
-// *same* QuantizedGraph instance for the *same* query can explore the graph
-// in a different order and land on a different (but individually valid)
-// top-k -- confirmed independently of this change (a QuantizedGraph::search
-// call repeated 3x on one instance, same query, returned three disjoint
-// result sets). That nondeterminism predates the admission contract and is
-// out of scope here (it lives in the beam/AIO orchestration, not the
-// admit-point this change touches). So the paged-kernel tombstone-parity
-// check below asserts the invariant that survives that nondeterminism --
-// neither path ever returns a tombstoned id -- rather than requiring the
-// legacy and admission runs to return byte-identical sets (which
-// ArenaKernel below *does* assert, since the resident-arena kernel has no
-// async I/O and is fully deterministic).
+// The paged kernel consumes completed reads in logical frontier order, so two
+// equivalent admission mechanisms must now produce byte-identical top-k
+// results even when the backend completes reads out of order.
 TEST_F(AdmissionContractTest, TombstoneParityPagedKernel) {
   const TinyIndex &tiny = *shared_index_;
   auto qg_legacy = load(tiny);
@@ -210,32 +199,22 @@ TEST_F(AdmissionContractTest, TombstoneParityPagedKernel) {
   const RowAdmission admission = admission_from_exclude_set(dead, kN, storage);
 
   constexpr uint32_t kK = 10;
-  size_t overlap = 0;
-  size_t total = 0;
   for (uint32_t qi = 0; qi < 25; ++qi) {
     const float *query = tiny.data.data() + static_cast<size_t>(qi) * kDim;
     std::vector<uint32_t> legacy_out(kK);
     std::vector<uint32_t> admission_out(kK);
     qg_legacy->search(query, kK, legacy_out.data());
     qg_admission->search(query, kK, admission_out.data(), &admission);
-    const std::unordered_set<uint32_t> legacy_set(legacy_out.begin(), legacy_out.end());
+    EXPECT_EQ(admission_out, legacy_out) << "paged admission parity, query " << qi;
     for (auto r : legacy_out) {
       EXPECT_EQ(dead.count(r), 0U) << "tombstoned id leaked into legacy path results, query " << qi;
     }
     for (auto r : admission_out) {
       EXPECT_EQ(dead.count(r), 0U)
           << "tombstoned id leaked into admission path results, query " << qi;
-      total++;
-      if (legacy_set.count(r) != 0U) {
-        ++overlap;
-      }
     }
   }
   qg_legacy->set_result_filter(nullptr);
-  // Not a byte-identity check (see the nondeterminism note above), but the
-  // two runs should still be exploring the same graph from the same entry
-  // point and should not be *totally* disjoint in the common case.
-  std::cout << "paged_tombstone_overlap," << overlap << "/" << total << "\n";
 }
 
 TEST_F(AdmissionContractTest, TombstoneParityArenaKernel) {

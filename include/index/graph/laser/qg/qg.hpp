@@ -1554,11 +1554,10 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
 #endif
   frontier_read_reqs.reserve(2 * beam_width);
 
-  // prepared_nodes: Nodes whose data has been fetched and is ready for processing
-  std::deque<std::pair<PID, char *>> prepared_nodes;
-
-  // ongoing_nodes: Maps node IDs to their buffer locations for in-flight I/O requests
-  std::unordered_map<PID, char *> ongoing_nodes;
+  // issued_nodes preserves the logical frontier order across asynchronous I/O.
+  // Completions only flip read_ready; processing always consumes this FIFO.
+  std::deque<std::pair<PID, char *>> issued_nodes;
+  std::unordered_map<PID, bool> read_ready;
 
   // free_slots: Pool of available memory buffers for disk reads (double-buffering scheme)
   std::deque<char *> free_slots;
@@ -1611,7 +1610,7 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
   };
 
   // ==================== I/O Completion Handler Lambda ====================
-  // Collects completed I/O events and moves nodes from ongoing to prepared queue.
+  // Collects completed I/O events and marks their issued nodes ready.
   // Uses non-blocking reader polling to check for completed I/O without waiting.
   auto wait_for_nodes = [&]() {
 #if defined(_WIN32)
@@ -1623,16 +1622,37 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
 
     // Process each completed I/O event
     for (std::size_t i = 0; i < ret; i++) {
-      int id = static_cast<int>(evts[i].id);
-      if (ongoing_nodes.find(id) == ongoing_nodes.end()) {
+      const auto id = static_cast<PID>(evts[i].id);
+      const auto state = read_ready.find(id);
+      if (state == read_ready.end() || state->second) {
         throw std::runtime_error(
-            "disk_search_qg: I/O completion id not in ongoing_nodes "
-            "(AlignedFileReader::poll_events returned an unexpected id)");
+            "disk_search_qg: I/O completion id is unknown or duplicated "
+            "(page reader returned an unexpected id)");
       }
-      // Move from ongoing to prepared queue
-      prepared_nodes.emplace_back(id, ongoing_nodes[id]);
-      ongoing_nodes.erase(id);
+      state->second = true;
     }
+  };
+
+  // Completion timing is deliberately not a search input. A later request may
+  // finish first, but its row stays buffered until every earlier issued row has
+  // been processed. This retains batched asynchronous reads and the existing
+  // half-batch pipeline while making frontier mutation deterministic.
+  auto process_next_issued = [&]() -> bool {
+    if (issued_nodes.empty()) {
+      throw std::runtime_error("disk_search_qg: issued-node accounting underflow");
+    }
+    const auto state = read_ready.find(issued_nodes.front().first);
+    if (state == read_ready.end()) {
+      throw std::runtime_error("disk_search_qg: issued node has no read state");
+    }
+    if (!state->second) return false;
+
+    const auto node = issued_nodes.front();
+    issued_nodes.pop_front();
+    read_ready.erase(state);
+    process_node(node.first, reinterpret_cast<float *>(node.second + offset_to_node(node.first)));
+    free_slots.push_back(node.second);
+    return true;
   };
 
   // Track remaining nodes from previous iteration for pipelined processing
@@ -1683,7 +1703,11 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
         char *slot = free_slots.front();
         assert(slot != nullptr);
         free_slots.pop_front();
-        ongoing_nodes[cur_node] = slot;
+        const bool inserted = read_ready.emplace(cur_node, false).second;
+        if (!inserted) {
+          throw std::runtime_error("disk_search_qg: duplicate issued node");
+        }
+        issued_nodes.emplace_back(cur_node, slot);
         // Create aligned read request (page-aligned for direct I/O)
 #if defined(_WIN32)
         frontier_read_reqs.emplace_back(get_page_offset(cur_node), page_size_, cur_node, slot);
@@ -1728,22 +1752,12 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
     need_process_num = n_ops + previous_remain_num - remain_num;
     previous_remain_num = remain_num;
 
-    // Process nodes that have completed I/O (from previous or current iteration)
+    // Process issued nodes (from previous or current iteration) in frontier order.
     while (need_process_num > 0) {
-      if (!prepared_nodes.empty()) {
-        // Process a node from the prepared queue
-        auto node = prepared_nodes.front();
-        prepared_nodes.pop_front();
-
-        // Calculate offset within page and process the node
-        process_node(node.first,
-                     reinterpret_cast<float *>(node.second + offset_to_node(node.first)));
-
+      if (process_next_issued()) {
         need_process_num--;
-        // Return buffer to free pool for reuse
-        free_slots.push_back(node.second);
       } else {
-        // No prepared nodes available; wait for I/O completion
+        // The oldest issued node is not ready; collect more completions.
         wait_for_nodes();
       }
     }
@@ -1753,17 +1767,15 @@ inline void QuantizedGraph::disk_search_qg(const float *ALAYA_RESTRICT query,
   // After the main loop exits, there may still be nodes in the pipeline
   // that haven't been processed yet. Drain the remaining nodes.
   while (previous_remain_num > 0) {
-    if (!prepared_nodes.empty()) {
-      auto node = prepared_nodes.front();
-      prepared_nodes.pop_front();
-      process_node(node.first, reinterpret_cast<float *>(node.second + offset_to_node(node.first)));
+    if (process_next_issued()) {
       previous_remain_num--;
-      free_slots.push_back(node.second);
     } else {
-      // Wait for any remaining in-flight I/O operations to complete
+      // Wait for the oldest remaining issued node to complete.
       wait_for_nodes();
     }
   }
+  assert(issued_nodes.empty());
+  assert(read_ready.empty());
 
   // Record query end time for latency measurement
   auto query_end = std::chrono::high_resolution_clock::now();
