@@ -30,6 +30,7 @@
 
 #include "index/collection/collection_checkpoint.hpp"
 #include "index/collection/experimental_snapshot_writer.hpp"
+#include "index/disk/laser_segment.hpp"
 #include "index/graph/qg/qg_segment.hpp"
 
 namespace alaya::internal::collection {
@@ -1603,6 +1604,9 @@ class SegmentedCollection {
         }
         SegmentSearchStorage storage(request.queries.rows, candidate_limit);
         const auto descriptor = entry->segment.descriptor();
+        const auto is_memory_graph = descriptor.algorithm_id == core::algorithm::qg;
+        const auto is_qg_laser =
+            is_memory_graph && descriptor.engine_factory_id == core::algorithm::laser;
         std::vector<core::AlgorithmSearchExtension> segment_extensions;
         segment_extensions.reserve(request.options.extensions.size() + 1);
         for (const auto &extension : request.options.extensions) {
@@ -1610,7 +1614,6 @@ class SegmentedCollection {
             segment_extensions.push_back(extension);
           }
         }
-        const auto is_memory_graph = descriptor.algorithm_id == core::algorithm::qg;
         // Declared at this scope (one per segment-loop iteration), not
         // inside the `if` below: make_qg_search_extension() stores
         // payload = std::addressof(its argument), and the resulting
@@ -1625,6 +1628,7 @@ class SegmentedCollection {
         // Pre-existing, unrelated to the admission contract; fixed in
         // passing since it now reproduces deterministically.
         ::alaya::QgSearchExtension qg_effort;
+        ::alaya::disk::LaserSegmentSearchExtension laser_effort;
         if (is_memory_graph) {
           if (candidate_limit > std::numeric_limits<std::uint32_t>::max()) {
             return core::Status::error(core::StatusCode::invalid_argument,
@@ -1650,6 +1654,43 @@ class SegmentedCollection {
           synthesize_effort(qg_effort, [](const auto &extension) {
             return ::alaya::make_qg_search_extension(extension);
           });
+          if (is_qg_laser) {
+            // Preserve legacy qg validation before replacing its payload.
+            // The final entry is the synthesized, known-good extension.
+            for (std::size_t index = 0; index + 1 < segment_extensions.size(); ++index) {
+              const auto &extension = segment_extensions[index];
+              if (extension.payload == nullptr ||
+                  extension.payload_size < sizeof(::alaya::QgSearchExtension)) {
+                return core::Status::error(core::StatusCode::invalid_argument,
+                                           core::OperationStage::validation,
+                                           core::StatusDetail::malformed_struct,
+                                           "Collection qg search extension payload is truncated");
+              }
+              ::alaya::QgSearchExtension requested;
+              std::memcpy(std::addressof(requested),
+                          extension.payload,
+                          sizeof(::alaya::QgSearchExtension));
+              if (!core::is_current_struct(requested)) {
+                return core::Status::
+                    error(core::StatusCode::invalid_argument,
+                          core::OperationStage::validation,
+                          core::StatusDetail::malformed_struct,
+                          "Collection qg search extension has an incompatible version");
+              }
+            }
+            // The public qg extension remains the stable user contract. The
+            // same-id LASER segment consumes its effort as native ef and opts
+            // into the numeric-distance result contract. Do not forward the
+            // qg payload to LASER: its default unknown-extension policy is
+            // reject, while the translated extension is the one this physical
+            // engine owns.
+            segment_extensions.clear();
+            laser_effort.effort = qg_effort.effort;
+            laser_effort.return_distances = true;
+            auto translated = ::alaya::disk::make_laser_segment_search_extension(laser_effort);
+            translated.unknown_policy = core::UnknownExtensionPolicy::ignore_safe;
+            segment_extensions.push_back(translated);
+          }
         }
         core::SearchRequest segment_request;
         segment_request.queries = request.queries;

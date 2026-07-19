@@ -37,6 +37,8 @@
 #include <gtest/gtest.h>
 
 #include "alaya/collection.hpp"
+#include "index/collection/artifact_manifest_v2.hpp"
+#include "index/disk/segment_manifest.hpp"
 #include "platform/detect.hpp"
 
 namespace alaya {
@@ -153,6 +155,10 @@ struct Dataset {
   options.quantization = CollectionQuantization::rabitq;
   options.build_threads = 1;
   options.ef_construction = 400;
+  // The temporary IP topology producer is memqg, whose degree bound is 32.
+  // Request 64 here so the persisted native manifest proves the bridge clamps
+  // R honestly instead of advertising edges it cannot produce.
+  options.max_neighbors = 64;
   return options;
 }
 
@@ -250,6 +256,26 @@ void insert_dataset(Collection &collection, const Dataset &dataset) {
       << "expected a real QG segment (not a flat fallback) for " << name;
   EXPECT_FALSE(sealed.value().flat_fallback) << sealed.value().fallback_reason;
 
+  const auto manifest = internal::collection::ArtifactManifestV2::load(
+      temporary.path() / internal::collection::kCollectionManifestFilename);
+  const auto target = std::ranges::find_if(manifest.segments, [](const auto &entry) {
+    return entry.lifecycle == internal::collection::SegmentLifecycleV2::sealed;
+  });
+  if (target == manifest.segments.end()) {
+    ADD_FAILURE() << "qg manifest has no sealed target";
+    return 0.0;
+  }
+  const auto native_artifact = std::ranges::find_if(target->artifacts, [](const auto &artifact) {
+    return artifact.logical_name == "manifest";
+  });
+  if (native_artifact == target->artifacts.end()) {
+    ADD_FAILURE() << "qg LASER target has no native manifest artifact";
+    return 0.0;
+  }
+  const auto native = disk::SegmentManifest::load(temporary.path() /
+                                                   native_artifact->relative_path);
+  EXPECT_EQ(native.x_extras.at("x_R"), "32");
+
   auto response =
       collection->batch_search(core::TypedTensorView::contiguous(queries.data(), kQueryCount, kDim),
                                kTopK);
@@ -257,6 +283,7 @@ void insert_dataset(Collection &collection, const Dataset &dataset) {
     ADD_FAILURE() << "batch_search failed: " << response.status().diagnostic();
     return 0.0;
   }
+  EXPECT_EQ(response.value().search_stats.rerank_nanoseconds, 0U);
 
   const auto recall = recall_at_k(response.value(), oracle);
   EXPECT_TRUE(collection->close().ok());

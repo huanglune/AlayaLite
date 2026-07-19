@@ -427,6 +427,7 @@ TEST(MutableLaserAdapter, SharedExtensionsResolveSameForActiveAndSealedDefaults)
   ::alaya::disk::LaserSegmentSearchExtension parameters;
   parameters.effort = 37;
   parameters.beam_width = 7;
+  parameters.return_distances = true;
   auto extension = ::alaya::disk::make_laser_segment_search_extension(parameters);
   core::SearchOptions request_options(5);
   request_options.extensions = std::span<const core::AlgorithmSearchExtension>(&extension, 1);
@@ -446,6 +447,8 @@ TEST(MutableLaserAdapter, SharedExtensionsResolveSameForActiveAndSealedDefaults)
   EXPECT_EQ(active.value().beam_width, sealed.value().beam_width);
   EXPECT_EQ(active.value().ef, parameters.effort);
   EXPECT_EQ(active.value().beam_width, parameters.beam_width);
+  EXPECT_TRUE(active.value().return_distances);
+  EXPECT_TRUE(sealed.value().return_distances);
   EXPECT_FALSE(active.value().exact_rerank);
   EXPECT_FALSE(sealed.value().exact_rerank);
 
@@ -476,7 +479,9 @@ TEST(MutableLaserAdapter, SearchExtensionChangesActiveExpansionEffort) {
   (void)seg->commit_physical_bundle(801, 801, vectors.data(), labels.data(), labels.size());
   MutableLaserCollectionAdapter adapter(seg, schema(), kSegId, kGen);
 
-  const auto run = [&](std::uint32_t effort, std::uint32_t beam_width) {
+  const auto run = [&](std::uint32_t effort,
+                       std::uint32_t beam_width,
+                       bool return_distances) {
     std::array<core::SearchHit, 1> hits{};
     std::array<core::RowCount, 2> offsets{};
     std::array<core::RowCount, 1> counts{};
@@ -491,6 +496,7 @@ TEST(MutableLaserAdapter, SearchExtensionChangesActiveExpansionEffort) {
     ::alaya::disk::LaserSegmentSearchExtension parameters;
     parameters.effort = effort;
     parameters.beam_width = beam_width;
+    parameters.return_distances = return_distances;
     auto extension = ::alaya::disk::make_laser_segment_search_extension(parameters);
     core::SearchContext context;
     core::SearchRequest request;
@@ -504,11 +510,20 @@ TEST(MutableLaserAdapter, SearchExtensionChangesActiveExpansionEffort) {
     const auto after = seg->search_stats().query_page_reads;
     EXPECT_TRUE(status.ok()) << status.diagnostic();
     EXPECT_EQ(counts[0], 1U);
+    EXPECT_EQ(response.score_kind,
+              return_distances ? core::ScoreKind::distance : core::ScoreKind::rank_only);
+    EXPECT_EQ(hits[0].score_kind,
+              return_distances ? core::ScoreKind::distance : core::ScoreKind::rank_only);
+    if (return_distances) {
+      EXPECT_FLOAT_EQ(hits[0].score, 0.0F);
+    }
     return after - before;
   };
 
-  const auto low_effort_expansions = run(/*effort=*/1, /*beam_width=*/1);
-  const auto high_effort_expansions = run(/*effort=*/128, /*beam_width=*/16);
+  const auto low_effort_expansions =
+      run(/*effort=*/1, /*beam_width=*/1, /*return_distances=*/false);
+  const auto high_effort_expansions =
+      run(/*effort=*/128, /*beam_width=*/16, /*return_distances=*/true);
   EXPECT_GT(high_effort_expansions, low_effort_expansions)
       << "the active adapter must pass extension effort into QG traversal";
   std::filesystem::remove_all(dir);

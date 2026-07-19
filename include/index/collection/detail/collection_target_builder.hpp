@@ -45,6 +45,8 @@ enum class CollectionQuantization : std::uint8_t;
 
 namespace alaya::internal::collection::detail {
 
+inline constexpr std::string_view kQgLaserImplementationKey{"qg_laser_segment"};
+
 struct CollectionTargetBuildParams {
   CollectionQuantization quantization{};
   std::uint32_t max_neighbors{32};
@@ -134,6 +136,13 @@ struct CollectionTargetRegistration {
                                                      core::BuildContext &context)
     -> core::Result<CollectionTargetBuildResult>;
 
+[[nodiscard]] inline auto build_qg_laser_collection_target(
+    const CollectionSchema &schema,
+    std::span<const RegisteredRow> rows,
+    const CollectionTargetBuildParams &params,
+    const CollectionTargetPublication &publication,
+    core::BuildContext &context) -> core::Result<CollectionTargetBuildResult>;
+
 [[nodiscard]] inline auto build_laser_collection_target(
     const CollectionSchema &schema,
     std::span<const RegisteredRow> rows,
@@ -173,10 +182,10 @@ inline constexpr std::array<CollectionTargetRegistration, 3> kCollectionTargetRe
                                  build_flat_collection_target,
                                  open_flat_collection_target},
     CollectionTargetRegistration{core::algorithm::qg,
-                                 "qg_segment",
+                                 kQgLaserImplementationKey,
                                  "qg",
                                  qg_target_support,
-                                 build_qg_collection_target,
+                                 build_qg_laser_collection_target,
                                  open_qg_collection_target},
     CollectionTargetRegistration{core::algorithm::laser,
                                  "disk_laser_segment",
@@ -225,21 +234,21 @@ inline constexpr std::array<CollectionTargetRegistration, 3> kCollectionTargetRe
                                             core::RowCount row_count,
                                             const CollectionTargetBuildParams &params)
     -> TargetSupport {
-  // Cosine reuses the L2NormalizedQuerySegment adapter (see
-  // collection_normalized_segment.hpp): normalize rows before RaBitQ
-  // fit()/quantize, then wrap queries at the boundary. RaBitQSpace
-  // itself already treats cosine as an alias for the IP kernel (see
-  // rabitq_space.hpp's set_metric_function()/metric()), so this is the only
-  // gate that needs to change to light it up.
-  const auto metric_supported = schema.metric == core::Metric::l2 ||
-                                schema.metric == core::Metric::inner_product ||
-                                schema.metric == core::Metric::cosine;
-  constexpr std::uint8_t kRaBitQQuantization = 3;
-  return static_cast<std::uint8_t>(params.quantization) == kRaBitQQuantization &&
-                 schema.scalar_type == core::ScalarType::float32 && metric_supported &&
-                 row_count > ::alaya::RaBitQSpace<>::kDegreeBound
-             ? TargetSupport::supported
-             : TargetSupport::unsupported;
+  // The public qg id now resolves to the sealed LASER implementation, so its
+  // schema gate is intentionally identical to the direct LASER target. This
+  // function does not consult the compile-time LASER flag: on a platform where
+  // LASER is absent, every qg request must reach the registered builder and
+  // fail explicitly with not_supported. Returning unsupported for even a
+  // small/otherwise-ineligible generation would make Collection silently build
+  // Flat and hide the platform limitation.
+#if !(defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER != 0)
+  (void)schema;
+  (void)row_count;
+  (void)params;
+  return TargetSupport::supported;
+#else
+  return laser_target_support(schema, row_count, params);
+#endif
 }
 
 // Mirrors qg_target_support's shape (same quantization/scalar/row-count
@@ -382,6 +391,11 @@ template <typename Scalar>
                                                      const CollectionTargetPublication &publication,
                                                      core::BuildContext &context)
     -> core::Result<CollectionTargetBuildResult> {
+  // Retained only as the topology/compatibility producer while memqg remains
+  // builder-only. kCollectionTargetRegistrations no longer routes new qg
+  // targets here; keeping the legacy feature string is what lets tests mint an
+  // old artifact and prove the new reader still accepts it.
+  constexpr std::string_view kLegacyImplementationKey{"qg_segment"};
   using Space = ::alaya::RaBitQSpace<>;
   using Segment = ::alaya::QgSegment<Space>;
 
@@ -432,7 +446,7 @@ template <typename Scalar>
   const auto *registration = find_collection_target_registration(core::algorithm::qg);
   MemoryCollectionTargetDefinition definition;
   definition.algorithm_id = core::algorithm::qg;
-  definition.implementation_key = registration->implementation_key;
+  definition.implementation_key = kLegacyImplementationKey;
   definition.factory_key = registration->factory_key;
   definition.format_version = Segment::kFormatVersion;
   definition.preprocessing = schema.metric == core::Metric::cosine
@@ -454,7 +468,7 @@ template <typename Scalar>
   result.segment = std::move(erased);
   result.requested_algorithm = core::algorithm::qg;
   result.built_algorithm = core::algorithm::qg;
-  result.implementation_key = registration->implementation_key;
+  result.implementation_key = kLegacyImplementationKey;
   result.factory_key = registration->factory_key;
   result.artifact_bytes = published.value();
   result.effective_ef_construction = params.ef_construction;
@@ -510,6 +524,7 @@ inline auto write_pca_base_fbin(const std::string &prefix,
                                                    std::uint32_t count,
                                                    std::uint32_t dim,
                                                    core::Metric metric,
+                                                   std::uint32_t max_degree,
                                                    const CollectionTargetBuildParams &params,
                                                    core::BuildContext &context)
     -> ::alaya::FrozenGraphSnapshot {
@@ -525,13 +540,16 @@ inline auto write_pca_base_fbin(const std::string &prefix,
   options.thread_count = params.thread_count;
   auto segment = Segment::build(std::move(input), options, context);
   auto source = segment->export_graph_snapshot();
-  if (source.max_degree() == params.max_neighbors) {
+  if (source.max_degree() == max_degree) {
     return source;
   }
   ::alaya::FrozenGraphSnapshot::Adjacency adjacency(source.adjacency());
-  return ::alaya::FrozenGraphSnapshot(std::move(adjacency),
-                                      source.entry_point(),
-                                      params.max_neighbors);
+  for (auto &neighbors : adjacency) {
+    if (neighbors.size() > max_degree) {
+      neighbors.resize(max_degree);
+    }
+  }
+  return ::alaya::FrozenGraphSnapshot(std::move(adjacency), source.entry_point(), max_degree);
 }
 
 // RAII scratch directory for the raw native LASER files (Vamana graph +
@@ -559,10 +577,18 @@ struct ScratchDir {
 #endif
 
 [[nodiscard]] inline auto laser_publication_from_collection(
-    const CollectionTargetPublication &publication) -> ::alaya::disk::LaserSegmentReferenceOptions {
+    const CollectionTargetPublication &publication,
+    core::AlgorithmId algorithm_id = core::algorithm::laser,
+    std::string_view factory_key = "laser",
+    std::string_view implementation_key = "disk_laser_segment",
+    bool numeric_score_comparable = false) -> ::alaya::disk::LaserSegmentReferenceOptions {
   ::alaya::disk::LaserSegmentReferenceOptions translated;
   translated.collection_root = publication.collection_root;
   translated.segment_id = publication.segment_id;
+  translated.algorithm_id = algorithm_id;
+  translated.factory_key = factory_key;
+  translated.implementation_key = implementation_key;
+  translated.numeric_score_comparable = numeric_score_comparable;
   translated.segment_generation = publication.segment_generation;
   translated.manifest_generation = publication.manifest_generation;
   translated.publication_parent = publication.publication_parent;
@@ -580,16 +606,18 @@ struct ScratchDir {
 
 // Builds a native on-disk LASER segment from this Collection's currently
 // live rows and registers it into the Collection's manifest-v2 control
-// plane. Unlike the qg memory target above (which builds an in-memory
-// AnySegment directly via Segment::build()), LASER's on-disk packer
-// (VamanaBuilder -> QGBuilder -> LaserSegmentImporter) is inherently
-// file-oriented, so this function's shape is: harvest vectors -> build raw
-// native files in a scratch dir -> import them into
+// plane. The legacy qg memory builder above remains only as the topology
+// producer and old-artifact compatibility fixture; both public qg and direct
+// LASER targets arrive here. LASER's on-disk packer (VamanaBuilder ->
+// QGBuilder -> LaserSegmentImporter) is inherently file-oriented, so this
+// function's shape is: harvest vectors -> build raw native files in a scratch
+// dir -> import them into
 // "<collection_root>/segments/<segment_id>" (the exact directory
 // LaserSegment::publish_reference() requires its open handle to already sit
 // at) -> open that directory -> publish_reference() to mint the manifest-v2
 // SegmentEntryV2 -> erase to AnySegment.
-[[nodiscard]] inline auto build_laser_collection_target(
+[[nodiscard]] inline auto build_laser_collection_target_impl(
+    core::AlgorithmId exposed_algorithm,
     const CollectionSchema &schema,
     std::span<const RegisteredRow> rows,
     const CollectionTargetBuildParams &params,
@@ -604,8 +632,19 @@ struct ScratchDir {
   return core::Status::error(core::StatusCode::not_supported,
                              core::OperationStage::build,
                              core::StatusDetail::operation_slot_absent,
-                             "Collection LASER target builder requires ALAYA_ENABLE_LASER");
+                             exposed_algorithm == core::algorithm::qg
+                                 ? "Collection qg target requires the LASER implementation, which "
+                                   "is not supported on "
+                                   "this platform/build; Flat fallback is disabled"
+                                 : "Collection LASER target builder requires ALAYA_ENABLE_LASER");
 #else
+  if (exposed_algorithm != core::algorithm::qg && exposed_algorithm != core::algorithm::laser) {
+    return core::Status::error(core::StatusCode::invalid_argument,
+                               core::OperationStage::build,
+                               core::StatusDetail::malformed_struct,
+                               "Collection LASER builder received an invalid exposed algorithm id");
+  }
+  const bool qg_same_id_swap = exposed_algorithm == core::algorithm::qg;
   // L2 keeps the established Vamana topology path byte-for-byte. IP/cosine
   // build a metric-aware memory-QG topology below and pass its frozen snapshot
   // to the same LASER packer; a future rotate optimization can still thread a
@@ -641,7 +680,13 @@ struct ScratchDir {
     laser_target_detail::write_pca_base_fbin(raw_prefix, vectors, count, schema.dim);
 
     alaya::vamana::VamanaBuildParams vamana_params;
-    vamana_params.R = params.max_neighbors;
+    // Vamana is native L2 and honors the requested R. IP/cosine temporarily
+    // source topology from memqg, whose physical degree is fixed at 32, so
+    // that bridge cannot honestly publish a larger R.
+    vamana_params.R =
+        schema.metric == core::Metric::l2
+            ? params.max_neighbors
+            : std::min<std::uint32_t>(params.max_neighbors, ::alaya::RaBitQSpace<>::kDegreeBound);
     vamana_params.L = params.ef_construction;
     vamana_params.alpha = params.alpha;
     vamana_params.num_threads = params.thread_count;
@@ -663,6 +708,7 @@ struct ScratchDir {
                                                                             count,
                                                                             schema.dim,
                                                                             schema.metric,
+                                                                            vamana_params.R,
                                                                             params,
                                                                             context));
     }
@@ -703,9 +749,16 @@ struct ScratchDir {
     // laser_residency_request() load-side resolution -- this is the
     // build-side half: what residency hint to persist into the manifest for
     // future opens to read back.
-    const char *residency_env = std::getenv("ALAYA_LASER_RESIDENCY");
-    if (residency_env != nullptr && *residency_env != '\0') {
-      import_params.residency = residency_env;
+    if (qg_same_id_swap) {
+      // qg remains the memory-resident product surface even though its sealed
+      // artifact is now LASER. Persist the resident arena choice so reopen is
+      // deterministic and does not silently regress to paged service.
+      import_params.residency = "resident_arena";
+    } else {
+      const char *residency_env = std::getenv("ALAYA_LASER_RESIDENCY");
+      if (residency_env != nullptr && *residency_env != '\0') {
+        import_params.residency = residency_env;
+      }
     }
 
     ::alaya::disk::LaserSegmentImporter importer(schema.dim, schema.metric, import_params);
@@ -735,13 +788,20 @@ struct ScratchDir {
       return stats_status;
     }
 
-    auto publish_status =
-        laser_segment->publish_reference(laser_publication_from_collection(publication), context);
+    const auto reference =
+        qg_same_id_swap ? laser_publication_from_collection(publication,
+                                                            core::algorithm::qg,
+                                                            "qg",
+                                                            kQgLaserImplementationKey,
+                                                            /*numeric_score_comparable=*/true)
+                        : laser_publication_from_collection(publication);
+    auto publish_status = laser_segment->publish_reference(reference, context);
     if (!publish_status.ok()) {
       return publish_status;
     }
 
-    auto erased_result = ::alaya::disk::LaserSegment::into_any(std::move(laser_segment));
+    auto erased_result =
+        ::alaya::disk::LaserSegment::into_any(std::move(laser_segment), exposed_algorithm);
     if (!erased_result.ok()) {
       return erased_result.status();
     }
@@ -754,11 +814,11 @@ struct ScratchDir {
       erased = std::move(normalized).value();
     }
 
-    const auto *registration = find_collection_target_registration(core::algorithm::laser);
+    const auto *registration = find_collection_target_registration(exposed_algorithm);
     CollectionTargetBuildResult result;
     result.segment = std::move(erased);
-    result.requested_algorithm = core::algorithm::laser;
-    result.built_algorithm = core::algorithm::laser;
+    result.requested_algorithm = exposed_algorithm;
+    result.built_algorithm = exposed_algorithm;
     result.implementation_key = registration->implementation_key;
     result.factory_key = registration->factory_key;
     result.artifact_bytes = stats.resident_bytes;
@@ -768,6 +828,34 @@ struct ScratchDir {
     return core::status_from_exception(core::OperationStage::build);
   }
 #endif
+}
+
+[[nodiscard]] inline auto build_qg_laser_collection_target(
+    const CollectionSchema &schema,
+    std::span<const RegisteredRow> rows,
+    const CollectionTargetBuildParams &params,
+    const CollectionTargetPublication &publication,
+    core::BuildContext &context) -> core::Result<CollectionTargetBuildResult> {
+  return build_laser_collection_target_impl(core::algorithm::qg,
+                                            schema,
+                                            rows,
+                                            params,
+                                            publication,
+                                            context);
+}
+
+[[nodiscard]] inline auto build_laser_collection_target(
+    const CollectionSchema &schema,
+    std::span<const RegisteredRow> rows,
+    const CollectionTargetBuildParams &params,
+    const CollectionTargetPublication &publication,
+    core::BuildContext &context) -> core::Result<CollectionTargetBuildResult> {
+  return build_laser_collection_target_impl(core::algorithm::laser,
+                                            schema,
+                                            rows,
+                                            params,
+                                            publication,
+                                            context);
 }
 
 [[nodiscard]] inline auto build_unsupported_collection_target(const CollectionSchema &,
@@ -901,10 +989,10 @@ template <typename Segment>
   }
 }
 
-[[nodiscard]] inline auto open_qg_collection_target(const std::filesystem::path &root,
-                                                    const SegmentEntryV2 &entry,
-                                                    const CollectionSchema &schema,
-                                                    core::OpenContext &context)
+[[nodiscard]] inline auto open_memory_qg_collection_target(const std::filesystem::path &root,
+                                                           const SegmentEntryV2 &entry,
+                                                           const CollectionSchema &schema,
+                                                           core::OpenContext &context)
     -> core::Result<core::AnySegment> {
   using Space = ::alaya::RaBitQSpace<>;
   using Segment = ::alaya::QgSegment<Space>;
@@ -985,13 +1073,18 @@ template <typename Segment>
 // the *collection*-level manifest-v2 entry (not a second manifest.txt read
 // off some cached path), matching how open_qg_collection_target() above
 // always re-resolves from `entry` too.
-[[nodiscard]] inline auto open_laser_collection_target(const std::filesystem::path &root,
-                                                       const SegmentEntryV2 &entry,
-                                                       const CollectionSchema &schema,
-                                                       core::OpenContext &context)
+[[nodiscard]] inline auto open_laser_collection_target_impl(core::AlgorithmId exposed_algorithm,
+                                                            std::string_view required_feature,
+                                                            const std::filesystem::path &root,
+                                                            const SegmentEntryV2 &entry,
+                                                            const CollectionSchema &schema,
+                                                            core::OpenContext &context)
     -> core::Result<core::AnySegment> {
-  if (entry.algorithm_id != core::algorithm::laser ||
+  const auto feature =
+      std::ranges::find(entry.reader_compatibility.required_features, required_feature);
+  if (entry.algorithm_id != exposed_algorithm ||
       entry.format_version != ::alaya::disk::LaserSegment::kFormatVersion ||
+      feature == entry.reader_compatibility.required_features.end() ||
       entry.lifecycle == SegmentLifecycleV2::retired ||
       schema.scalar_type != core::ScalarType::float32 ||
       (schema.metric != core::Metric::l2 && schema.metric != core::Metric::inner_product &&
@@ -1004,7 +1097,9 @@ template <typename Segment>
   auto opened = ::alaya::disk::LaserSegment::open_collection(root,
                                                              entry.segment_id,
                                                              core::OpenOptions{},
-                                                             context);
+                                                             context,
+                                                             {},
+                                                             exposed_algorithm);
   if (!opened.ok()) {
     return opened.status();
   }
@@ -1027,11 +1122,50 @@ template <typename Segment>
                                  "LASER replacement manifest lacks its preprocessing proof");
     }
   }
-  auto erased = ::alaya::disk::LaserSegment::into_any(std::move(opened).value());
+  auto erased = ::alaya::disk::LaserSegment::into_any(std::move(opened).value(), exposed_algorithm);
   if (!erased.ok() || schema.metric != core::Metric::cosine) {
     return erased;
   }
   return make_l2_normalized_query_segment(std::move(erased).value());
+}
+
+[[nodiscard]] inline auto open_laser_collection_target(const std::filesystem::path &root,
+                                                       const SegmentEntryV2 &entry,
+                                                       const CollectionSchema &schema,
+                                                       core::OpenContext &context)
+    -> core::Result<core::AnySegment> {
+  return open_laser_collection_target_impl(core::algorithm::laser,
+                                           "disk_laser_segment",
+                                           root,
+                                           entry,
+                                           schema,
+                                           context);
+}
+
+[[nodiscard]] inline auto open_qg_collection_target(const std::filesystem::path &root,
+                                                    const SegmentEntryV2 &entry,
+                                                    const CollectionSchema &schema,
+                                                    core::OpenContext &context)
+    -> core::Result<core::AnySegment> {
+  const auto has_feature = [&](std::string_view feature) {
+    return std::ranges::find(entry.reader_compatibility.required_features, feature) !=
+           entry.reader_compatibility.required_features.end();
+  };
+  if (has_feature(kQgLaserImplementationKey)) {
+    return open_laser_collection_target_impl(core::algorithm::qg,
+                                             kQgLaserImplementationKey,
+                                             root,
+                                             entry,
+                                             schema,
+                                             context);
+  }
+  if (has_feature("qg_segment")) {
+    return open_memory_qg_collection_target(root, entry, schema, context);
+  }
+  return core::Status::error(core::StatusCode::not_supported,
+                             core::OperationStage::open,
+                             core::StatusDetail::operation_slot_absent,
+                             "Collection qg artifact requires an unknown implementation feature");
 }
 
 [[nodiscard]] inline auto build_collection_target(core::AlgorithmId requested_algorithm,

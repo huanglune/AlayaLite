@@ -365,9 +365,15 @@ TEST_F(LaserSegmentImporterTest, manifest_records_x_laser_extras) {
   EXPECT_EQ(manifest.x_extras.at("x_default_ef"), "64");
   EXPECT_EQ(manifest.x_extras.at("x_default_beam_width"), "4");
   EXPECT_EQ(manifest.x_extras.at("x_laser_native_format_version"), "1");
+#if defined(ALAYA_LASER_USE_LIBAIO) && ALAYA_LASER_USE_LIBAIO != 0
   EXPECT_EQ(manifest.x_extras.at("x_platform_requires"), "linux+libaio");
+#elif defined(ALAYA_LASER_USE_THREADPOOL) && ALAYA_LASER_USE_THREADPOOL != 0
+  EXPECT_EQ(manifest.x_extras.at("x_platform_requires"), "portable+threadpool");
+#else
+  FAIL() << "LASER importer test compiled without a selected I/O backend";
+#endif
   EXPECT_EQ(manifest.x_extras.at("x_laser_search_dram_budget_gb"), "0.5");
-  EXPECT_EQ(manifest.x_extras.at("x_laser_distance_field_supported"), "false");
+  EXPECT_EQ(manifest.x_extras.at("x_laser_distance_field_supported"), "true");
   for (const auto &[key, value] : manifest.x_extras) {
     if (key.starts_with("x_laser_") && key.ends_with("_file")) {
       EXPECT_TRUE(std::filesystem::exists(target / value)) << key << "=" << value;

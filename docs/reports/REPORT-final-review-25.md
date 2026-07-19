@@ -73,7 +73,8 @@ poison 必须先于 even：被 seqlock 放行的 reader 会在读出口观察 re
 
 ### 裁决
 
-问题成立。新增 cache option `ALAYA_ENABLE_MUTABLE_LASER`：默认值当且仅当
+问题成立。该波新增的 test-only cache option 后续明确改名为
+`ALAYA_ENABLE_MUTABLE_LASER_TESTS`：默认值当且仅当
 `ALAYA_ENABLE_LASER=ON` 且 `CMAKE_SYSTEM_NAME` 为 `Linux` 时为 ON。这个可用条件与
 `collection.hpp` 中生产宏 `ALAYA_COLLECTION_HAS_ACTIVE_LASER` 的
 `ALAYA_ENABLE_LASER && __linux__` 条件对齐。

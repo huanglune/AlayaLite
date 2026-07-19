@@ -651,7 +651,9 @@ class MutableLaserCollectionAdapter {
 
     auto &response = *request.response;
     response.query_count = request.queries.rows;
-    response.score_kind = core::ScoreKind::rank_only;
+    const auto score_kind =
+        options.return_distances ? core::ScoreKind::distance : core::ScoreKind::rank_only;
+    response.score_kind = score_kind;
     response.comparable_metric = schema_.metric;
     response.result_flags = core::ResultFlag::approximate;
     response.offsets[0] = 0;
@@ -665,11 +667,9 @@ class MutableLaserCollectionAdapter {
       }
       const auto count = std::min<std::uint64_t>(hits.size(), request.options.top_k);
       for (std::uint64_t index = 0; index < count; ++index) {
-        // rank-only: the score is meaningless; Collection reranks exactly against
-        // its own retained vector for active-generation rows.
         core::SearchHit hit(core::SegmentRowId(hits[index].label),
-                            0.0F,
-                            core::ScoreKind::rank_only,
+                            options.return_distances ? hits[index].distance : 0.0F,
+                            score_kind,
                             schema_.metric,
                             core::ResultFlag::approximate);
         response.hits[static_cast<std::size_t>(cursor++)] = hit;

@@ -9,6 +9,7 @@ def test_artifact_baseline_covers_every_current_family():
     baseline = json.loads((Path(__file__).with_name("artifact-baseline.json")).read_text())
     assert baseline["schema_version"] == 1
     assert set(baseline["artifacts"]) == {
+        "collection_qg_laser",
         "disk_flat_segment",
         "laser_fixture",
         "memory_qg",

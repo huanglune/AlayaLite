@@ -114,6 +114,10 @@ def generate(build_dir: Path) -> dict[str, object]:
         if not memory_qg_generator.is_file():
             raise RuntimeError(f"build the artifact_memory_qg_generator target first: {memory_qg_generator}")
         subprocess.run([str(memory_qg_generator), str(out / "memory_qg")], check=True)
+        qg_laser_generator = build_dir / "tests/golden/artifact_collection_qg_laser_generator"
+        if not qg_laser_generator.is_file():
+            raise RuntimeError(f"build the artifact_collection_qg_laser_generator target first: {qg_laser_generator}")
+        subprocess.run([str(qg_laser_generator), str(out / "collection_qg_laser")], check=True)
         _generate_laser_fixture(out, build_dir)
         artifacts = {name: _inventory(path) for name, path in sorted((p.name, p) for p in out.iterdir() if p.is_dir())}
         return {

@@ -23,6 +23,7 @@
 
 #include "alaya/collection.hpp"
 #include "index/collection/artifact_manifest_v2.hpp"
+#include "index/disk/segment_manifest.hpp"
 #include "platform/detect.hpp"
 
 namespace alaya {
@@ -303,7 +304,7 @@ void expect_response_ids(const CollectionSearchResponse &response,
 }
 
 void expect_qg_manifest(const std::filesystem::path &root,
-                        std::string_view preprocessing = "engine_quantized") {
+                        std::string_view preprocessing = "none") {
   const auto manifest = internal::collection::ArtifactManifestV2::load(
       root / internal::collection::kCollectionManifestFilename);
   const auto target = std::ranges::find_if(manifest.segments, [](const auto &entry) {
@@ -313,10 +314,12 @@ void expect_qg_manifest(const std::filesystem::path &root,
   EXPECT_EQ(target->algorithm_id, core::algorithm::qg);
   EXPECT_EQ(target->factory_key, "qg");
   EXPECT_EQ(target->reader_compatibility.required_features,
-            (std::vector<std::string>{"qg_segment"}));
+            (std::vector<std::string>{"qg_laser_segment"}));
   EXPECT_EQ(target->extensions.at("stored_scalar_type"), "float32");
   EXPECT_EQ(target->extensions.at("preprocessing"), preprocessing);
   EXPECT_EQ(target->extensions.at("quantization"), "rabitq");
+  EXPECT_EQ(target->extensions.at("score_kind"), "distance");
+  EXPECT_EQ(target->extensions.at("numeric_score_comparable"), "true");
 
   std::set<std::string> artifact_names;
   for (const auto &artifact : target->artifacts) {
@@ -325,7 +328,19 @@ void expect_qg_manifest(const std::filesystem::path &root,
       artifact_names.insert(artifact.logical_name);
     }
   }
-  EXPECT_EQ(artifact_names, (std::set<std::string>{"qg"}));
+  for (const auto required : {"manifest",
+                              "ids",
+                              "x_laser_index_file",
+                              "x_laser_rotator_file",
+                              "x_laser_cache_ids_file",
+                              "x_laser_cache_nodes_file"}) {
+    EXPECT_TRUE(artifact_names.contains(required));
+  }
+  EXPECT_FALSE(artifact_names.contains("qg"));
+
+  const auto native = disk::SegmentManifest::load(root / "segments" / target->segment_id /
+                                                   "manifest.txt");
+  EXPECT_EQ(native.x_extras.at("x_laser_residency"), "resident_arena");
 }
 
 void expect_flat_manifest(const std::filesystem::path &root) {
@@ -402,6 +417,7 @@ TEST_P(CollectionQgSealTest, PublishesRecallsReopensAndExactlyOrdersMixedCandida
   ASSERT_TRUE(before.ok()) << before.status().diagnostic();
   ASSERT_EQ(before.value().valid_counts,
             std::vector<core::RowCount>(static_cast<std::size_t>(kQueryCount), kTopK));
+  EXPECT_EQ(before.value().search_stats.rerank_nanoseconds, 0U);
   const auto recall = recall_at_k(before.value(), oracle);
   std::cout << "measured_qg_" << metric_name << "_recall_at_10=" << std::fixed
             << std::setprecision(4) << recall << '\n';
@@ -508,6 +524,70 @@ INSTANTIATE_TEST_SUITE_P(QgFloat32,
                            return info.param == core::Metric::l2 ? "L2" : "InnerProduct";
                          });
 
+TEST(CollectionQgCompatibility, NewReaderOpensLegacyMemoryQgArtifact) {
+  TemporaryDirectory temporary("legacy-reader");
+  constexpr core::RowCount kLegacyRows = 96;
+  const auto dataset = make_float_dataset(kLegacyRows);
+  const auto vectors = core::TypedTensorView::contiguous(dataset.vectors.data(),
+                                                         kLegacyRows,
+                                                         kDim);
+  std::vector<internal::collection::RegisteredRow> rows;
+  rows.reserve(kLegacyRows);
+  for (core::RowCount row = 0; row < kLegacyRows; ++row) {
+    auto owned = internal::collection::OwnedVector::copy_row(vectors, row);
+    ASSERT_TRUE(owned.ok()) << owned.status().diagnostic();
+    internal::collection::RegisteredRow registered;
+    registered.logical_id = dataset.ids[static_cast<std::size_t>(row)];
+    registered.row_id = core::SegmentRowId(row);
+    registered.upsert_sequence = row + 1;
+    registered.payload.vector = std::move(owned).value();
+    rows.push_back(std::move(registered));
+  }
+
+  internal::collection::detail::CollectionTargetBuildParams params;
+  params.quantization = CollectionQuantization::rabitq;
+  params.max_neighbors = 32;
+  params.thread_count = 1;
+  internal::collection::detail::CollectionTargetPublication publication;
+  publication.collection_root = temporary.path();
+  publication.segment_id = "seg_00000001";
+  publication.wal_cut = kLegacyRows;
+  publication.row_versions = {1, kLegacyRows};
+  publication.collection_features.manifest_v2_writer = true;
+  core::BuildContext build_context;
+  const internal::collection::CollectionSchema schema{kDim,
+                                                      core::Metric::l2,
+                                                      core::ScalarType::float32};
+  auto built = internal::collection::detail::build_qg_collection_target(schema,
+                                                                        rows,
+                                                                        params,
+                                                                        publication,
+                                                                        build_context);
+  ASSERT_TRUE(built.ok()) << built.status().diagnostic();
+  EXPECT_EQ(built.value().implementation_key, "qg_segment");
+
+  const auto manifest = internal::collection::ArtifactManifestV2::load(
+      temporary.path() / internal::collection::kCollectionManifestFilename);
+  ASSERT_EQ(manifest.segments.size(), 1U);
+  const auto &entry = manifest.segments.front();
+  EXPECT_EQ(entry.reader_compatibility.required_features,
+            (std::vector<std::string>{"qg_segment"}));
+
+  core::OpenContext open_context;
+  auto opened = internal::collection::detail::open_qg_collection_target(temporary.path(),
+                                                                        entry,
+                                                                        schema,
+                                                                        open_context);
+  ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
+  const auto descriptor = opened.value().descriptor();
+  EXPECT_EQ(descriptor.algorithm_id, core::algorithm::qg);
+  EXPECT_EQ(descriptor.engine_factory_id, core::algorithm::qg);
+  EXPECT_EQ(descriptor.medium, core::Medium::memory);
+  core::SegmentStats stats;
+  ASSERT_TRUE(opened.value().stats(stats).ok());
+  EXPECT_EQ(stats.live_rows, kLegacyRows);
+}
+
 TEST(CollectionQgCosineSeal, NormalizesRecallsReopensHandlesZeroAndMergesWithActiveFlat) {
   TemporaryDirectory temporary("cosine");
   const auto dataset = make_cosine_dataset(kRows);
@@ -548,6 +628,7 @@ TEST(CollectionQgCosineSeal, NormalizesRecallsReopensHandlesZeroAndMergesWithAct
   ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
   const auto descriptor = opened.value().descriptor();
   EXPECT_EQ(descriptor.algorithm_id, core::algorithm::qg);
+  EXPECT_EQ(descriptor.engine_factory_id, core::algorithm::laser);
   EXPECT_EQ(descriptor.metric, core::Metric::cosine);
   EXPECT_EQ(descriptor.stored_scalar_type, core::ScalarType::float32);
   EXPECT_EQ(descriptor.preprocessing, core::MetricPreprocessing::l2_normalized);
@@ -558,6 +639,7 @@ TEST(CollectionQgCosineSeal, NormalizesRecallsReopensHandlesZeroAndMergesWithAct
   ASSERT_TRUE(before.ok()) << before.status().diagnostic();
   ASSERT_EQ(before.value().valid_counts,
             std::vector<core::RowCount>(static_cast<std::size_t>(kQueryCount), kTopK));
+  EXPECT_EQ(before.value().search_stats.rerank_nanoseconds, 0U);
   const auto recall = recall_at_k(before.value(), oracle);
   std::cout << "measured_qg_cosine_recall_at_10=" << std::fixed << std::setprecision(4) << recall
             << '\n';
@@ -569,8 +651,12 @@ TEST(CollectionQgCosineSeal, NormalizesRecallsReopensHandlesZeroAndMergesWithAct
   auto zero_before =
       collection->search(core::TypedTensorView::contiguous(zero_query.data(), 1, kDim), kRows);
   ASSERT_TRUE(zero_before.ok()) << zero_before.status().diagnostic();
-  ASSERT_EQ(zero_before.value().valid_counts, (std::vector<core::RowCount>{kRows}));
-  expect_response_ids(zero_before.value(), zero_oracle);
+  ASSERT_EQ(zero_before.value().valid_counts.size(), 1U);
+  EXPECT_GE(zero_before.value().valid_counts.front(), (kRows * 3U) / 4U);
+  EXPECT_LE(zero_before.value().valid_counts.front(), kRows);
+  for (const auto &id : zero_before.value().ids) {
+    EXPECT_NE(std::ranges::find(zero_oracle.front(), id), zero_oracle.front().end());
+  }
   for (const auto score : zero_before.value().distances) {
     EXPECT_FLOAT_EQ(score, 0.0F);
   }

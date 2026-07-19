@@ -139,7 +139,7 @@ skip = ["*-musllinux*", "*-manylinux_i686"]
 # package cache warm across the per-python-version builds and across CI runs.
 container-engine = "docker; create_args: -v ~/.conan2:/root/.conan2"
 test-requires = ["pytest", "pytest-asyncio", "pyyaml"]
-test-command = "python -c \"import alayalite; assert 'Index' not in alayalite.__all__; assert 'DiskCollection' not in alayalite.__all__; assert alayalite.__version__ == '1.1.0'; print(alayalite.__version__)\""
+test-command = "pytest -q {project}/python/tests/wheel/test_qg_platform_contract.py"
 
 [tool.cibuildwheel.linux]
 manylinux-x86_64-image = "manylinux_2_28"

@@ -134,6 +134,13 @@ struct LaserSegmentSearchExtension {
 struct LaserSegmentReferenceOptions {
   std::filesystem::path collection_root{};
   std::string segment_id{};
+  // Collection may publish the same physical LASER segment behind a stable
+  // logical algorithm id. Direct LASER keeps these defaults; the qg same-id
+  // route overrides only this manifest identity surface.
+  core::AlgorithmId algorithm_id{core::algorithm::laser};
+  std::string factory_key{"laser"};
+  std::string implementation_key{"disk_laser_segment"};
+  bool numeric_score_comparable{};
   std::uint64_t segment_generation{1};
   std::uint64_t manifest_generation{1};
   std::string publication_parent{};
@@ -305,7 +312,8 @@ class LaserSegment {
       std::string_view segment_id,
       const core::OpenOptions &options,
       core::OpenContext &context,
-      const internal::collection::ManifestReaderOptions &reader_options = {})
+      const internal::collection::ManifestReaderOptions &reader_options = {},
+      core::AlgorithmId expected_algorithm = kAlgorithmId)
       -> core::Result<std::unique_ptr<LaserSegment>> {
     auto opened =
         internal::collection::CollectionManifestDualReader::open(collection_root, reader_options);
@@ -322,7 +330,7 @@ class LaserSegment {
                                  core::StatusDetail::none,
                                  "LASER segment is absent from the collection manifest");
     }
-    if (found->algorithm_id != kAlgorithmId) {
+    if (found->algorithm_id != expected_algorithm) {
       return unavailable(core::OperationStage::open, "requested collection segment is not LASER");
     }
     const auto manifest =
@@ -366,7 +374,7 @@ class LaserSegment {
 
   [[nodiscard]] auto descriptor() const noexcept -> core::Descriptor {
     core::Descriptor descriptor;
-    descriptor.algorithm_id = kAlgorithmId;
+    descriptor.algorithm_id = exposed_algorithm_id_;
     descriptor.format_version = kFormatVersion;
     descriptor.factory_version = 1;
     descriptor.dim = searcher_dim();
@@ -374,6 +382,10 @@ class LaserSegment {
     descriptor.stored_scalar_type = core::ScalarType::float32;
     descriptor.medium = core::Medium::disk;
     descriptor.preprocessing = core::MetricPreprocessing::none;
+    // Keep the physical factory visible even when Collection exposes this
+    // segment through the stable qg algorithm id. Collection fanout uses this
+    // field to distinguish new qg->LASER artifacts from legacy qg_segment
+    // artifacts without consulting the unchanged algorithm id.
     descriptor.engine_factory_id = kAlgorithmId;
     return descriptor;
   }
@@ -418,7 +430,9 @@ class LaserSegment {
                                             core::OperationStage::save);
     }
     if (options.collection_root.empty() || options.segment_id != native_.segment_id ||
-        options.segment_generation == 0 || options.manifest_generation == 0 ||
+        options.algorithm_id == 0 || options.factory_key.empty() ||
+        options.implementation_key.empty() || options.segment_generation == 0 ||
+        options.manifest_generation == 0 ||
         (options.collection_root / "segments" / options.segment_id).lexically_normal() !=
             directory_.lexically_normal()) {
       return core::Status::error(core::StatusCode::invalid_argument,
@@ -458,14 +472,22 @@ class LaserSegment {
     return transaction->publish(std::move(manifest).value());
   }
 
-  [[nodiscard]] static auto into_any(std::unique_ptr<LaserSegment> segment)
-      -> core::Result<core::AnySegment> {
+  [[nodiscard]] static auto into_any(std::unique_ptr<LaserSegment> segment,
+                                     core::AlgorithmId exposed_algorithm_id =
+                                         core::algorithm::laser) -> core::Result<core::AnySegment> {
     if (segment == nullptr) {
       return core::Status::error(core::StatusCode::invalid_argument,
                                  core::OperationStage::admission,
                                  core::StatusDetail::null_data,
                                  "cannot erase a null LaserSegment");
     }
+    if (exposed_algorithm_id == 0) {
+      return core::Status::error(core::StatusCode::invalid_argument,
+                                 core::OperationStage::admission,
+                                 core::StatusDetail::malformed_struct,
+                                 "LaserSegment exposed algorithm id must be non-zero");
+    }
+    segment->exposed_algorithm_id_ = exposed_algorithm_id;
     auto shared = std::shared_ptr<LaserSegment>(std::move(segment));
     core::SegmentInstanceConfig config;
     config.readonly = true;
@@ -1016,9 +1038,9 @@ class LaserSegment {
     entry.segment_id = options.segment_id;
     entry.generation = options.segment_generation;
     entry.role = internal::collection::SegmentRoleV2::searchable;
-    entry.algorithm_id = kAlgorithmId;
+    entry.algorithm_id = options.algorithm_id;
     entry.format_version = kFormatVersion;
-    entry.factory_key = "laser";
+    entry.factory_key = options.factory_key;
     entry.capabilities.operations = core::capability_bit(core::OperationCapability::search) |
                                     core::capability_bit(core::OperationCapability::batch_search) |
                                     core::capability_bit(core::OperationCapability::stats);
@@ -1031,19 +1053,21 @@ class LaserSegment {
     entry.wal_cut = options.wal_cut;
     entry.row_versions = options.row_versions;
     entry.id_map_checkpoint = options.id_map_checkpoint;
-    entry.reader_compatibility.required_features = {"disk_laser_segment"};
+    entry.reader_compatibility.required_features = {options.implementation_key};
     entry.extensions.emplace("format_name", std::string(kFormatName));
-    entry.extensions.emplace("score_kind", "rank_only");
-    entry.extensions.emplace("numeric_score_comparable", "false");
+    entry.extensions.emplace("score_kind",
+                             options.numeric_score_comparable ? "distance" : "rank_only");
+    entry.extensions.emplace("numeric_score_comparable",
+                             options.numeric_score_comparable ? "true" : "false");
     entry.extensions.emplace("native_payload", "read_only_reference");
+    entry.extensions.emplace("stored_scalar_type", "float32");
+    entry.extensions.emplace("quantization", "rabitq");
 #if ALAYA_DISK_LASER_SEGMENT_SUPPORTED
-    if (native_.metric != core::Metric::l2) {
-      const auto preprocessing = detail::laser_manifest_preprocessing(native_, directory_);
-      entry.extensions.emplace("preprocessing",
-                               preprocessing == core::MetricPreprocessing::l2_normalized
-                                   ? "l2_normalized"
-                                   : "none");
-    }
+    const auto preprocessing = detail::laser_manifest_preprocessing(native_, directory_);
+    entry.extensions.emplace("preprocessing",
+                             preprocessing == core::MetricPreprocessing::l2_normalized
+                                 ? "l2_normalized"
+                                 : "none");
 #endif
     return entry;
   }
@@ -1103,6 +1127,7 @@ class LaserSegment {
   SegmentManifest native_{};
   std::filesystem::path directory_{};
   std::uint64_t artifact_bytes_{};
+  core::AlgorithmId exposed_algorithm_id_{kAlgorithmId};
 };
 
 class LaserSegmentFactory {

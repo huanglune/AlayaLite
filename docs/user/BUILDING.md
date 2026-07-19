@@ -47,7 +47,8 @@ presets are a convenience, not a requirement.
 | --------------------------- | -------------- | ------------------------------------------------------------- |
 | `BUILD_PYTHON`              | `ON`           | Build the `_alayalitepy` pybind11 module                      |
 | `BUILD_TESTING`             | `OFF` (`ON` in presets) | Build the C++ test suite                             |
-| `ALAYA_ENABLE_LASER`        | platform-gated | LASER disk index (Linux x86_64 / macOS / Windows x64)         |
+| `ALAYA_ENABLE_LASER`        | platform-gated | LASER disk index (Linux x86_64 / macOS)                       |
+| `ALAYA_ENABLE_MUTABLE_LASER_TESTS` | Linux + LASER | Build mutable-LASER test targets; not a production gate |
 | `ENABLE_COVERAGE`           | `OFF`          | Per-target gcov/OpenCppCoverage instrumentation               |
 | `ALAYA_NATIVE_ARCH`         | `OFF`          | `-march=native` (refuses to combine with distributable wheels) |
 | `ALAYA_AUTO_CONAN`          | `ON`           | Run `conan install` automatically when the toolchain is absent |
@@ -73,3 +74,8 @@ interpreter without `python3-dev` is rejected at configure time with instruction
 - **After `conanfile.py` changes** — nothing special: the provider re-runs `conan install` on the next configure
   (`make build-release` reconfigures automatically).
 - **Wheel builds** — driven by scikit-build-core + cibuildwheel (see `pyproject.toml`); locally, `make wheel`.
+
+Linux aarch64 and Windows wheels do not include LASER. Because canonical
+`index_type="qg"` now uses LASER behind the same public id, sealing qg on those
+wheels raises `CollectionNotSupportedError`; it does not silently substitute
+Flat. Linux aarch64 LASER enablement is on the post-paper roadmap.

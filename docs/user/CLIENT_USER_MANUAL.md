@@ -718,6 +718,18 @@ Common values:
 
 For `cosine` or `cos`, AlayaLite normalizes inserted and queried vectors.
 
+`index_type="qg"` keeps its stable public id, but newly sealed qg segments are
+served by LASER. Supported builds return approximate, numerically comparable
+distances directly from LASER, so Collection does not rerank against retained
+payload vectors. L2 uses a Vamana topology; inner product and cosine temporarily
+use memory QG only to construct topology and therefore cap persisted `R` at 32.
+
+Linux aarch64 and Windows wheels currently ship without LASER. On those wheels,
+sealing a qg collection raises `CollectionNotSupportedError` with a platform
+diagnostic and never silently falls back to Flat. Linux aarch64 LASER support is
+deferred until after the current paper work; `_VALID_INDEX_TYPES` remains
+unchanged during this transition.
+
 ## Choosing Index Or Collection
 
 Use `Index` when you only need nearest-neighbor vector IDs:

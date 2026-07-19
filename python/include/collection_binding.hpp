@@ -636,6 +636,7 @@ template <class T>
   result["lease_peak_bytes"] = stats.lease_peak_bytes;
   result["io_requests_consumed"] = stats.io_requests_consumed;
   result["io_bytes_consumed"] = stats.io_bytes_consumed;
+  result["rerank_nanoseconds"] = stats.rerank_nanoseconds;
   return result;
 }
 

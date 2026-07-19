@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "index/neighbor.hpp"
+#include "index/graph/qg/qg_segment.hpp"
 #include "space/rabitq_space.hpp"
 #include "core/value_types.hpp"
 #include "space/quant/rabitq/rotator.hpp"
@@ -102,5 +103,20 @@ auto main(int argc, char **argv) -> int {
   install_fixed_graph(deterministic);
   deterministic->save(final_artifact.string());
   std::filesystem::remove(seed_artifact);
+
+  // memory_qg is no longer the registered qg service implementation, but its
+  // v1 artifact remains a reader-compatibility golden. Reopen the exact bytes
+  // through the retained segment reader so generation cannot pass on hashes
+  // alone while compatibility is broken.
+  using Segment = alaya::QgSegment<Space>;
+  const auto final_artifact_path = final_artifact.string();
+  const std::array<alaya::core::ArtifactLocation, 1> locations{
+      alaya::core::ArtifactLocation(Segment::kArtifactName, final_artifact_path),
+  };
+  alaya::core::OpenContext context;
+  auto opened = Segment::open(alaya::core::ArtifactView(locations), alaya::core::OpenOptions{}, context);
+  if (opened->descriptor().algorithm_id != alaya::core::algorithm::qg) {
+    throw std::runtime_error("legacy memory_qg golden reopened with the wrong algorithm id");
+  }
   return 0;
 }

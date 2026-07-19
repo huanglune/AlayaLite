@@ -66,6 +66,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `Collection` keeps the public `qg` algorithm id but now seals new qg targets
+  with the LASER implementation (`qg_laser_segment`) instead of serving them
+  from `QgSegment`. L2 uses the native Vamana → LASER build chain; inner
+  product and cosine temporarily use memory QG as a topology-only builder and
+  then feed its frozen graph to LASER, so their persisted `R` is capped at 32.
+  The qg service route explicitly asks LASER for numeric distances and merges
+  them without Collection reranking; results remain marked approximate. Direct
+  LASER callers retain the rank-only default unless they opt into distances.
+  New readers continue to open legacy `qg_segment` artifacts, while the new
+  feature marker makes older readers reject the new physical format clearly.
+- A qg seal on a build without LASER now fails with `not_supported` and names
+  the unavailable implementation; it never silently publishes a Flat target.
+  This is the deliberate transition policy for Linux aarch64 and Windows
+  wheels, which do not ship LASER. Linux aarch64 LASER enablement is deferred
+  until after the current paper work; the Python index-type surface remains
+  unchanged in the interim.
+- LASER importer manifests now describe the selected I/O backend honestly:
+  `linux+libaio` for libaio and `portable+threadpool` for the portable backend.
+  The mutable-LASER CMake switch is now named
+  `ALAYA_ENABLE_MUTABLE_LASER_TESTS` to make its test-only role explicit;
+  production active-segment admission remains independently platform-gated.
+  Mutable LASER search also honors the existing explicit distance opt-in; its
+  default remains rank-only for callers that do not request distances.
 - **Breaking:** the default sealed target algorithm flips from `hnsw` to
   `qg`. `CollectionOptions::target_algorithm`'s C++ struct default is now
   `core::algorithm::qg` (every existing call site already set it explicitly,

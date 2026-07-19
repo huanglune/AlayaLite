@@ -153,7 +153,7 @@ alaya_add_test(
   LABELS laser rabitq contract
 )
 
-if(ALAYA_ENABLE_MUTABLE_LASER)
+if(ALAYA_ENABLE_MUTABLE_LASER_TESTS)
   # All consumers below have the BARE+GTEST+LASER+_laser_test_opts profile. Keeping the owner profile identical is
   # required by CMake's REUSE_FROM contract; ALAYA_LASER_TESTING and non-GTest targets intentionally opt out.
   alaya_cc_target(
@@ -334,7 +334,7 @@ alaya_add_test(
   LABELS laser
 )
 
-if(ALAYA_ENABLE_MUTABLE_LASER)
+if(ALAYA_ENABLE_MUTABLE_LASER_TESTS)
   # SIFT-scale update experiment harness (build / insert / delete / eval modes). Not a ctest — run manually; see the
   # usage string in the source.
   alaya_cc_target(

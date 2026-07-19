@@ -25,6 +25,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <string_view>
 
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
@@ -43,6 +44,16 @@ inline constexpr uint32_t kMaxDimensionV1 = uint32_t{1} << 11U;
 
 [[nodiscard]] constexpr auto dimension_supported_v1(uint32_t dim) noexcept -> bool {
   return dim >= kMinDimensionV1 && dim <= kMaxDimensionV1;
+}
+
+[[nodiscard]] constexpr auto platform_requirements_v1() noexcept -> std::string_view {
+#if defined(ALAYA_LASER_USE_LIBAIO) && ALAYA_LASER_USE_LIBAIO != 0
+  return "linux+libaio";
+#elif defined(ALAYA_LASER_USE_THREADPOOL) && ALAYA_LASER_USE_THREADPOOL != 0
+  return "portable+threadpool";
+#else
+  return "unavailable";
+#endif
 }
 
 }  // namespace laser_importer_detail
@@ -371,10 +382,11 @@ inline auto LaserSegmentImporter::import_from(const std::filesystem::path &src_d
     (void)::alaya::laser::residency_mode_from_string(params_.residency);
     manifest.x_extras["x_laser_residency"] = params_.residency;
   }
-  manifest.x_extras["x_platform_requires"] = "linux+libaio";
+  manifest.x_extras["x_platform_requires"] =
+      std::string(laser_importer_detail::platform_requirements_v1());
   manifest.x_extras["x_laser_search_dram_budget_gb"] =
       laser_importer_detail::format_float(params_.search_dram_budget_gb);
-  manifest.x_extras["x_laser_distance_field_supported"] = "false";
+  manifest.x_extras["x_laser_distance_field_supported"] = "true";
   manifest.save(tmp_dir / "manifest.txt");
 
   detail::fsync_dir(tmp_dir);

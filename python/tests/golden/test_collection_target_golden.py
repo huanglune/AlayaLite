@@ -57,6 +57,7 @@ def test_target_single_and_batch_share_one_short_row_response_schema(tmp_path):
             "search_stats",
         }
     )
+    assert single["search_stats"]["rerank_nanoseconds"] == 0
     assert batch["ids"].tolist() == ["a", "b", "b", "a"]
     assert batch["distances"].tolist() == [0.0, 1.0, 0.0, 1.0]
     assert batch["offsets"].tolist() == [0, 2, 4]

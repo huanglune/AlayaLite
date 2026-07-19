@@ -121,7 +121,7 @@ TEST(CollectionFacade, CanonicalResultsReceiptsStatsCheckpointAndReopen) {
   auto collection = std::move(created).value();
   EXPECT_EQ(collection->target_algorithm(), core::algorithm::qg);
   EXPECT_EQ(collection->active_algorithm(), core::algorithm::flat);
-  EXPECT_EQ(collection->target_implementation_key(), "qg_segment");
+  EXPECT_EQ(collection->target_implementation_key(), "qg_laser_segment");
   EXPECT_EQ(collection->options().build_threads, 3U);
 
   const std::array<float, 2> first{0.0F, 0.0F};
@@ -449,7 +449,7 @@ TEST(CollectionFacade, FlatCompactPreservesRowsAndGcDeletesOnlyReleasedSources) 
 
 TEST(CollectionFacade, AutoSealRotatesAtConfiguredRowThreshold) {
   TemporaryDirectory temporary;
-  auto configured = options(temporary.path());
+  auto configured = flat_options(temporary.path());
   configured.auto_seal_rows = 2;
   auto created = Collection::create(configured);
   ASSERT_TRUE(created.ok()) << created.status().diagnostic();
@@ -571,7 +571,7 @@ TEST(CollectionFacade, SealFourPointSigkillRecoveryRollsBackOrForward) {
     const auto child = ::fork();
     ASSERT_GE(child, 0);
     if (child == 0) {
-      auto created = Collection::create(options(root));
+      auto created = Collection::create(flat_options(root));
       if (!created.ok()) {
         ::_exit(80);
       }

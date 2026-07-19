@@ -301,16 +301,25 @@ class MutableLaserSegment {
     }
     updater_->ensure_readable();  // entry poison gate (B-02); lock-free
     const size_t ef = std::max<size_t>(opts.ef, opts.top_k);
-    const auto pids = updater_->search(query, opts.top_k, ef, opts.beam_width);
+    std::vector<float> distances;
+    if (opts.return_distances) {
+      distances.resize(opts.top_k);
+    }
+    const auto pids = updater_->search(query,
+                                       opts.top_k,
+                                       ef,
+                                       opts.beam_width,
+                                       opts.return_distances ? distances.data() : nullptr);
     // Acquire the label snapshot AFTER search took its committed watermark: the
     // snapshot is published before committed, so it covers every committed PID's
     // binding, and identity fallback never fires spuriously (B-02).
     const auto snap = updater_->label_snapshot();
     std::vector<DiskSearchHit> out;
     out.reserve(pids.size());
-    for (const auto pid : pids) {
-      out.push_back(
-          DiskSearchHit{effective_label(pid, snap), std::numeric_limits<float>::quiet_NaN()});
+    for (std::size_t index = 0; index < pids.size(); ++index) {
+      out.push_back(DiskSearchHit{effective_label(pids[index], snap),
+                                  opts.return_distances ? distances[index]
+                                                        : std::numeric_limits<float>::quiet_NaN()});
     }
     updater_->ensure_readable();  // exit poison gate (B-02)
     return out;

@@ -97,15 +97,15 @@ For datasets that exceed RAM, the **LASER** on-disk Quantized Graph index keeps
 hot data on SSD and only the search-time working set in memory. Vectors must be
 `float32` with `raw_dim >= 128`; L2 is the only supported metric in v1.
 
-LASER is available on Linux x86_64 (libaio backend, default), macOS
-(thread-pool backend), and Windows x64 (IOCP backend). Platform notes:
+LASER is available on Linux x86_64 (libaio backend, default) and macOS
+(thread-pool backend). Platform notes:
 
 - Linux x86_64 builds need `libaio` headers, for example
   `sudo apt-get install libaio-dev` on Debian/Ubuntu.
 - macOS builds need OpenMP from Homebrew: `brew install libomp`.
-- Windows x64 builds should run from a Visual Studio 2022 developer shell with
-  the **Desktop development with C++** workload installed; MSVC provides the
-  OpenMP runtime used by LASER.
+- Linux aarch64 and Windows wheels omit LASER. Sealing the stable public `qg`
+  target on those wheels fails explicitly; it never silently substitutes Flat.
+  Linux aarch64 enablement is deferred until after the current paper work.
 
 See [LASER.md](https://github.com/AlayaDB-AI/AlayaLite/blob/main/docs/LASER.md) for build flags, tuning notes, and the
 TOML-driven CLI.

@@ -228,10 +228,13 @@ def test_cibuildwheel_builds_portable_package_targets() -> None:
 
 def test_cibuildwheel_smoke_checks_the_1_1_public_surface() -> None:
     pyproject_text = PYPROJECT.read_text(encoding="utf-8")
+    smoke_text = (ROOT / "python" / "tests" / "wheel" / "test_qg_platform_contract.py").read_text(encoding="utf-8")
 
-    assert "'Index' not in alayalite.__all__" in pyproject_text
-    assert "'DiskCollection' not in alayalite.__all__" in pyproject_text
-    assert "alayalite.__version__ == '1.1.0'" in pyproject_text
+    assert "python/tests/wheel/test_qg_platform_contract.py" in pyproject_text
+    assert '"Index" not in alayalite.__all__' in smoke_text
+    assert '"DiskCollection" not in alayalite.__all__' in smoke_text
+    assert 'alayalite.__version__ == "1.1.0"' in smoke_text
+    assert "Flat fallback is disabled" in smoke_text
 
 
 def test_ccache_keys_are_versioned_for_portable_isa_reset() -> None:

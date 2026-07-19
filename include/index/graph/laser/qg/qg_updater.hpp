@@ -905,7 +905,8 @@ class QGUpdater {
   [[nodiscard]] std::vector<PID> search(const float *query_vec,
                                         size_t k,
                                         size_t ef,
-                                        size_t max_beam_width = 16) {
+                                        size_t max_beam_width = 16,
+                                        float *distances = nullptr) {
     if (query_vec == nullptr) throw std::invalid_argument("QGUpdater::search null query");
     if (k == 0) return {};
     if (max_beam_width == 0) {
@@ -1022,7 +1023,12 @@ class QGUpdater {
     for (const auto &candidate : candidates) {
       // Close the row-read -> return window for tombstones. A tombstone that
       // begins after this acquire may linearize after the query return.
-      if (candidate.id < snapshot && !is_hidden(candidate.id)) out.push_back(candidate.id);
+      if (candidate.id < snapshot && !is_hidden(candidate.id)) {
+        if (distances != nullptr) {
+          distances[out.size()] = candidate.distance;
+        }
+        out.push_back(candidate.id);
+      }
       if (out.size() == k) break;
     }
     return out;

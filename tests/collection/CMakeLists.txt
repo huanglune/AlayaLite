@@ -14,6 +14,21 @@ alaya_cc_target(
 )
 target_precompile_headers(alaya_collection_test_pch PRIVATE <gtest/gtest.h> <alaya/collection.hpp>)
 
+if(ALAYA_ENABLE_LASER)
+  alaya_cc_target(
+    alaya_collection_laser_test_pch
+    SRCS ../pch_anchor.cpp
+    GTEST LASER
+  )
+  target_precompile_headers(
+    alaya_collection_laser_test_pch
+    PRIVATE
+    <gtest/gtest.h>
+    <utils/laser_test_pch.hpp>
+    <index/collection/segmented_collection.hpp>
+  )
+endif()
+
 alaya_cc_target(
   collection_facade_test
   SRCS collection_facade_test.cpp
@@ -23,6 +38,20 @@ alaya_add_test(
   NAME collection_facade_test
   TARGET collection_facade_test
   LABELS unit collection canonical
+  TIMEOUT 60
+)
+
+# Deliberately omits the LASER compile/link profile even on a LASER-capable host. This is the wheel/platform contract
+# for Linux aarch64 and any other build where qg's physical implementation is unavailable.
+alaya_cc_target(
+  collection_qg_platform_contract_test
+  SRCS collection_qg_platform_contract_test.cpp
+  GTEST PCH_REUSE_FROM alaya_collection_test_pch
+)
+alaya_add_test(
+  NAME collection_qg_platform_contract_test
+  TARGET collection_qg_platform_contract_test
+  LABELS unit collection platform
   TIMEOUT 60
 )
 
@@ -38,41 +67,43 @@ alaya_add_test(
   TIMEOUT 60
 )
 
-alaya_cc_target(
-  collection_qg_seal_test
-  SRCS collection_qg_seal_test.cpp
-  GTEST PCH_REUSE_FROM alaya_collection_test_pch
-)
-alaya_add_test(
-  NAME collection_qg_seal_test
-  TARGET collection_qg_seal_test
-  LABELS integration collection memory
-  TIMEOUT 300
-)
+if(ALAYA_ENABLE_LASER)
+  alaya_cc_target(
+    collection_qg_seal_test
+    SRCS collection_qg_seal_test.cpp
+    GTEST LASER PCH_REUSE_FROM alaya_collection_laser_test_pch
+  )
+  alaya_add_test(
+    NAME collection_qg_seal_test
+    TARGET collection_qg_seal_test
+    LABELS integration collection laser
+    TIMEOUT 300
+  )
 
-alaya_cc_target(
-  collection_qg_ip_norm_test
-  SRCS collection_qg_ip_norm_test.cpp
-  GTEST PCH_REUSE_FROM alaya_collection_test_pch
-)
-alaya_add_test(
-  NAME collection_qg_ip_norm_test
-  TARGET collection_qg_ip_norm_test
-  LABELS integration collection memory
-  TIMEOUT 180
-)
+  alaya_cc_target(
+    collection_qg_ip_norm_test
+    SRCS collection_qg_ip_norm_test.cpp
+    GTEST LASER PCH_REUSE_FROM alaya_collection_laser_test_pch
+  )
+  alaya_add_test(
+    NAME collection_qg_ip_norm_test
+    TARGET collection_qg_ip_norm_test
+    LABELS integration collection laser
+    TIMEOUT 300
+  )
 
-alaya_cc_target(
-  collection_qg_recall_floor_test
-  SRCS collection_qg_recall_floor_test.cpp
-  GTEST PCH_REUSE_FROM alaya_collection_test_pch
-)
-alaya_add_test(
-  NAME collection_qg_recall_floor_test
-  TARGET collection_qg_recall_floor_test
-  LABELS integration collection memory
-  TIMEOUT 300
-)
+  alaya_cc_target(
+    collection_qg_recall_floor_test
+    SRCS collection_qg_recall_floor_test.cpp
+    GTEST LASER PCH_REUSE_FROM alaya_collection_laser_test_pch
+  )
+  alaya_add_test(
+    NAME collection_qg_recall_floor_test
+    TARGET collection_qg_recall_floor_test
+    LABELS integration collection laser
+    TIMEOUT 300
+  )
+endif()
 
 alaya_cc_target(
   collection_facade_stress_test
@@ -186,19 +217,6 @@ alaya_add_test(
 # same collection still rejects the filter kind.
 if(ALAYA_ENABLE_LASER)
   alaya_cc_target(
-    alaya_collection_laser_test_pch
-    SRCS ../pch_anchor.cpp
-    GTEST LASER
-  )
-  target_precompile_headers(
-    alaya_collection_laser_test_pch
-    PRIVATE
-    <gtest/gtest.h>
-    <utils/laser_test_pch.hpp>
-    <index/collection/segmented_collection.hpp>
-  )
-
-  alaya_cc_target(
     segmented_collection_laser_filter_test
     GTEST LASER
     SRCS segmented_collection_laser_filter_test.cpp
@@ -255,7 +273,7 @@ if(ALAYA_ENABLE_LASER)
     TIMEOUT 300
   )
 
-  if(ALAYA_ENABLE_MUTABLE_LASER)
+  if(ALAYA_ENABLE_MUTABLE_LASER_TESTS)
     # Compile-time capability-surface proof for the active LASER Collection adapter (codex B-10): links LASER so the AIO
     # page-reader symbols resolve.
     alaya_cc_target(

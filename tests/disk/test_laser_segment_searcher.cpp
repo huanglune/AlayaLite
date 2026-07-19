@@ -335,7 +335,7 @@ TEST_F(LaserSegmentSearcherTest, external_label_mapping) {
   }
 }
 
-TEST_F(LaserSegmentSearcherTest, distance_is_nan_in_v1) {
+TEST_F(LaserSegmentSearcherTest, distance_capability_keeps_rank_only_default) {
   if (const auto reason = fixture_skip_reason(); !reason.empty()) {
     GTEST_SKIP() << reason;
   }
@@ -343,7 +343,7 @@ TEST_F(LaserSegmentSearcherTest, distance_is_nan_in_v1) {
   auto ids = labels();
   import_fixture_segment(ids);
   const auto manifest = SegmentManifest::load(seg_dir_ / "manifest.txt");
-  ASSERT_EQ(manifest.x_extras.at("x_laser_distance_field_supported"), "false");
+  ASSERT_EQ(manifest.x_extras.at("x_laser_distance_field_supported"), "true");
 
   LaserSegmentSearcher searcher(seg_dir_);
   DiskSearchOptions opts;

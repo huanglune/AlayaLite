@@ -202,7 +202,7 @@ void insert_dataset(Collection &collection, const Dataset &dataset) {
 // The algorithm id intentionally cannot distinguish this wave's same-id swap,
 // and Collection::target_implementation_key() describes configured intent,
 // not the implementation that won support resolution.
-void expect_memory_qg_engine_identity(const std::filesystem::path &root) {
+void expect_qg_laser_engine_identity(const std::filesystem::path &root) {
   const auto manifest = internal::collection::ArtifactManifestV2::load(
       root / internal::collection::kCollectionManifestFilename);
   const auto target = std::ranges::find_if(manifest.segments, [](const auto &entry) {
@@ -211,7 +211,9 @@ void expect_memory_qg_engine_identity(const std::filesystem::path &root) {
   ASSERT_NE(target, manifest.segments.end());
   EXPECT_EQ(target->factory_key, "qg");
   EXPECT_EQ(target->reader_compatibility.required_features,
-            (std::vector<std::string>{"qg_segment"}));
+            (std::vector<std::string>{"qg_laser_segment"}));
+  EXPECT_EQ(target->extensions.at("score_kind"), "distance");
+  EXPECT_EQ(target->extensions.at("numeric_score_comparable"), "true");
   EXPECT_NE(target->factory_key, "flat");
   EXPECT_EQ(std::ranges::find(target->reader_compatibility.required_features,
                              "disk_flat_segment"),
@@ -243,15 +245,26 @@ void expect_memory_qg_engine_identity(const std::filesystem::path &root) {
       << name << ": expected a real qg segment, not a flat fallback ("
       << sealed.value().fallback_reason << ")";
   EXPECT_FALSE(sealed.value().flat_fallback) << name << ": " << sealed.value().fallback_reason;
-  expect_memory_qg_engine_identity(temporary.path());
+  expect_qg_laser_engine_identity(temporary.path());
 
-  auto response =
-      collection->batch_search(core::TypedTensorView::contiguous(queries.data(), kQueryCount, kDim),
-                               kTopK);
+  QgSearchExtension effort;
+  effort.effort = 400;
+  const auto extension = make_qg_search_extension(effort);
+  core::SearchOptions options(kTopK);
+  options.extensions = std::span<const core::AlgorithmSearchExtension>(&extension, 1);
+  core::SearchStats runtime_stats;
+  core::SearchContext search_context;
+  search_context.stats = &runtime_stats;
+  auto response = collection->batch_search(
+      core::TypedTensorView::contiguous(queries.data(), kQueryCount, kDim),
+      options,
+      search_context);
   if (!response.ok()) {
     ADD_FAILURE() << name << ": batch_search failed: " << response.status().diagnostic();
     return 0.0;
   }
+  EXPECT_EQ(response.value().search_stats.rerank_nanoseconds, 0U);
+  EXPECT_EQ(runtime_stats.rerank_count, 0U);
 
   const auto recall = recall_at_k(response.value(), oracle_row_ids, dataset);
   EXPECT_TRUE(collection->close().ok());

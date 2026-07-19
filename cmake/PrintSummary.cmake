@@ -39,7 +39,7 @@ function(print_project_options_summary)
   message(STATUS "|   - NATIVE_ARCH     : ${ALAYA_NATIVE_ARCH}")
   message(STATUS "|   - X86_AVX2_BASE   : ${ALAYA_X86_AVX2_BASELINE}")
   message(STATUS "|   - ENABLE_LASER    : ${ALAYA_ENABLE_LASER}")
-  message(STATUS "|   - MUTABLE_LASER   : ${ALAYA_ENABLE_MUTABLE_LASER}")
+  message(STATUS "|   - MUTABLE_TESTS   : ${ALAYA_ENABLE_MUTABLE_LASER_TESTS}")
 endfunction()
 
 # Print build configuration summary Usage: print_build_summary()

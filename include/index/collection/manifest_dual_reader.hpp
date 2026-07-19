@@ -35,6 +35,7 @@ struct ManifestReaderOptions {
   std::set<std::string> available_features{"manifest_v2",
                                            "disk_flat_segment",
                                            "qg_segment",
+                                           "qg_laser_segment",
                                            "disk_laser_segment"};
 };
 

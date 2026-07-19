@@ -21,13 +21,12 @@ Laser is supported on:
 
 - Linux x86_64, using the `libaio` backend by default.
 - macOS (arm64 and x86_64), using the portable thread-pool backend by default.
-- Windows x64 (MSVC 2022), using the IOCP (I/O Completion Ports) backend by
-  default.
 
-Linux ARM is not supported yet — it is explicitly gated by CMake and tracked
-in a separate change. Build support is gated by the CMake option
-`ALAYA_ENABLE_LASER` (ON by default on Linux x86_64, macOS, and Windows x64;
-OFF elsewhere).
+Linux aarch64 and Windows are not supported: their wheels ship without LASER,
+and a canonical qg seal fails explicitly instead of silently falling back to
+Flat. Linux aarch64 enablement is deferred until after the current paper work.
+Build support is gated by `ALAYA_ENABLE_LASER` (ON by default on Linux x86_64
+and macOS; OFF elsewhere).
 
 ```bash
 # Debian / Ubuntu
@@ -39,8 +38,6 @@ sudo dnf install libaio-devel
 # macOS (Homebrew)
 brew install libomp
 
-# Windows: MSVC 2022 ships the OpenMP 2.0 runtime (vcomp140.dll) as part of
-# the C++ workload. No extra package install is required.
 ```
 
 If `libaio` is missing while Laser is enabled on Linux x86_64, CMake fails
@@ -107,10 +104,6 @@ cmake -B build/Release -DALAYA_ENABLE_LASER=ON
 cmake -B build/Release -DALAYA_ENABLE_LASER=ON
 # prints: LASER I/O backend: thread pool (macOS)
 
-# Windows x64 default
-cmake -B build/Release -G "Visual Studio 17 2022" -A x64 -DALAYA_ENABLE_LASER=ON
-# prints: LASER I/O backend: IOCP (Windows x64)
-
 # Linux fallback without libaio
 cmake -B build/Release -DALAYA_ENABLE_LASER=ON -DALAYA_LASER_USE_THREADPOOL=ON
 # prints: LASER I/O backend: thread pool (portable fallback)
@@ -120,17 +113,6 @@ The thread-pool backend uses buffered `pread` and worker threads. Override the
 worker count for local experiments with `ALAYA_LASER_IO_THREADS`; production
 Linux x86_64 builds should keep the default libaio backend unless the portable
 fallback is intentionally being tested.
-
-The Windows IOCP backend uses `CreateFileW(FILE_FLAG_NO_BUFFERING |
-FILE_FLAG_OVERLAPPED)` + a single I/O completion port. A dedicated
-dispatcher thread drains the port via `GetQueuedCompletionStatusEx` and
-routes completions to the originating consumer thread's queue. The 4096-byte
-alignment contract on `AlignedRead` is enforced by `FILE_FLAG_NO_BUFFERING`'s
-sector-size requirement. Builds require MSVC 2022; OpenMP is provided by the
-default MSVC `/openmp` flag, which CMake's `find_package(OpenMP)` picks up
-automatically. LASER's `#pragma omp parallel for` / `critical` / `schedule`
-usage stays inside the OpenMP 2.0 surface, so the legacy MSVC OpenMP runtime
-(`vcomp140.dll`, shipped with VC Redist) is sufficient.
 
 ## SIMD Dispatch
 
@@ -147,34 +129,15 @@ template-selected SIMD path, so PCA matrix-vector work remains tied to the wheel
 baseline even on AVX-512 hosts. The expected impact is limited to that Eigen
 portion of the search path.
 
-On MSVC the LASER consumer flags become `/arch:AVX2 /DEIGEN_DONT_PARALLELIZE`
-in place of `-mavx2 -mfma -ftree-vectorize`. MSVC auto-vectorizes under `/O2`
-by default, so the GCC `-ftree-vectorize` flag has no MSVC analogue and is
-omitted from the Windows compiler line.
-
 ## Performance Notes
 
 - **Huge pages**: The Linux backend hints the kernel with
-  `madvise(MADV_HUGEPAGE)` on the LASER read scratch buffers. macOS and
-  Windows are no-ops by design. On Windows, `VirtualAlloc(MEM_LARGE_PAGES)`
-  requires the calling process to hold `SeLockMemoryPrivilege` (an admin-
-  granted right not present by default on wheel-consumer machines), and
-  kernel large-page allocation has noisy availability after system uptime.
-  Power users who want to enable large pages locally can grant the
-  privilege via Group Policy (`secpol.msc`) — but this is not the
-  documented wheel path. Expect a modest hit on search throughput when
-  the working set exceeds the small-page TLB (single-digit percent on
-  100M-vector indexes; not measurable on 100K-vector smoke runs).
+  `madvise(MADV_HUGEPAGE)` on the LASER read scratch buffers. macOS is a
+  no-op by design. Expect a modest hit on search throughput when the working
+  set exceeds the small-page TLB (single-digit percent on 100M-vector indexes;
+  not measurable on 100K-vector smoke runs).
 
-- **Linux vs Windows perf parity**: The cross-platform perf workflow
-  (`laser-cross-platform-perf`) runs the same synthetic dataset against
-  both Linux libaio and Windows IOCP. Significant (>20% same-recall QPS)
-  deltas should be investigated before tagging a release — but search
-  recall itself is expected to match within ±1pp (D7 contract:
-  search-side parity is statistical, not byte-equal, because thread-pool
-  / IOCP completion ordering is non-deterministic across backends).
-
-- **Sector size**: All three backends now use a 4096-byte alignment
+- **Sector size**: Both supported backends use a 4096-byte alignment
   contract (raised from the previous 512 on Linux). 4K matches the LASER
   on-disk page layout and is superset-acceptable for both 512n and 4Kn
   drives. Consumer code does not need to special-case any backend.
@@ -357,9 +320,13 @@ tracked by PR #88.
 
 ### Relationship To The In-Memory Graph
 
-AlayaLite's **memory_qg** public surface is
-`include/index/graph/qg/qg_segment.hpp` (with its retained build kernel under
-`include/index/graph/qg/detail/`); LASER's disk graph is
-**disk_laser_qg** under `include/index/graph/laser/`. They are different
-components and their serialized RaBitQ formats are not interchangeable. See
-[`rabitq-formats.md`](rabitq-formats.md) for the format and consumer contract.
+Canonical `qg` is now a same-id implementation swap: new Collection artifacts
+carry the `qg` algorithm/factory identity and the `qg_laser_segment` reader
+feature, while their physical files and service engine are LASER. The old
+`qg_segment` reader stays available for compatibility.
+
+The in-memory QG tree under `include/index/graph/qg/` remains builder-only. It
+provides the temporary metric-aware topology for inner-product/cosine LASER
+builds; its fixed degree limits those paths to `R <= 32`. Memory QG and LASER
+still have distinct, non-interchangeable RaBitQ serializations. See
+[`rabitq-formats.md`](rabitq-formats.md) for the format contract.

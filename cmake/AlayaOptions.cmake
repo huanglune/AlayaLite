@@ -43,16 +43,16 @@ else()
 endif()
 option(ALAYA_ENABLE_LASER "Build the Laser disk-index module" ${ALAYA_ENABLE_LASER_DEFAULT})
 
-# Keep the default/platform admission aligned with collection.hpp's ALAYA_COLLECTION_HAS_ACTIVE_LASER condition
-# (ALAYA_ENABLE_LASER && __linux__). Linux may explicitly disable this test capability; explicitly enabling it on
-# another platform is an error.
-set(ALAYA_ENABLE_MUTABLE_LASER_DEFAULT OFF)
+# Test-target gate only: production active-LASER admission remains collection.hpp's ALAYA_COLLECTION_HAS_ACTIVE_LASER
+# condition (ALAYA_ENABLE_LASER && __linux__). The explicit name prevents this option from being mistaken for a
+# production feature gate.
+set(ALAYA_ENABLE_MUTABLE_LASER_TESTS_DEFAULT OFF)
 if(ALAYA_ENABLE_LASER AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  set(ALAYA_ENABLE_MUTABLE_LASER_DEFAULT ON)
+  set(ALAYA_ENABLE_MUTABLE_LASER_TESTS_DEFAULT ON)
 endif()
-option(ALAYA_ENABLE_MUTABLE_LASER
+option(ALAYA_ENABLE_MUTABLE_LASER_TESTS
        "Build Linux-only mutable LASER test targets (requires LASER; non-Linux ON is an error)"
-       ${ALAYA_ENABLE_MUTABLE_LASER_DEFAULT}
+       ${ALAYA_ENABLE_MUTABLE_LASER_TESTS_DEFAULT}
 )
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
@@ -86,12 +86,13 @@ if(ALAYA_ENABLE_LASER)
   endif()
 endif()
 
-if(ALAYA_ENABLE_MUTABLE_LASER AND NOT ALAYA_ENABLE_LASER)
-  message(FATAL_ERROR "ALAYA_ENABLE_MUTABLE_LASER=ON requires ALAYA_ENABLE_LASER=ON.")
-elseif(ALAYA_ENABLE_MUTABLE_LASER AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(ALAYA_ENABLE_MUTABLE_LASER_TESTS AND NOT ALAYA_ENABLE_LASER)
+  message(FATAL_ERROR "ALAYA_ENABLE_MUTABLE_LASER_TESTS=ON requires ALAYA_ENABLE_LASER=ON.")
+elseif(ALAYA_ENABLE_MUTABLE_LASER_TESTS AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(
     FATAL_ERROR
-      "ALAYA_ENABLE_MUTABLE_LASER=ON is supported only on Linux; the mutable updater uses Linux-only APIs. "
-      "Keep ALAYA_ENABLE_LASER=ON for sealed LASER support and configure with -DALAYA_ENABLE_MUTABLE_LASER=OFF."
+      "ALAYA_ENABLE_MUTABLE_LASER_TESTS=ON is supported only on Linux; the mutable updater uses Linux-only APIs. "
+      "Keep ALAYA_ENABLE_LASER=ON for sealed LASER support and configure with "
+      "-DALAYA_ENABLE_MUTABLE_LASER_TESTS=OFF."
   )
 endif()
