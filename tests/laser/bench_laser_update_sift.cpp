@@ -478,8 +478,8 @@ int do_build(const Args &a) {
   auto t0 = std::chrono::steady_clock::now();
   const std::string vamana_path = a.prefix + "_vamana.index";
   if (a.reuse_graph != 0) {
-    // Topology-seal path: pack a pre-existing graph (any producer that wrote
-    // vamana format — e.g. the memory-QG topology dumped by bench_memqg_native).
+    // Topology-seal path: pack a pre-existing graph from any producer that
+    // wrote the Vamana format.
     if (!std::filesystem::exists(vamana_path)) {
       throw std::runtime_error("--reuse_graph 1 but missing " + vamana_path);
     }

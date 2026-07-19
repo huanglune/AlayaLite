@@ -15,8 +15,8 @@ if(ALAYA_ENABLE_LASER)
     SRCS result_contract_benchmark.cpp
   )
 
-  # E-parity C-lanes harness — build only, not registered with ctest. Both resident-arena LASER and memory QG are erased
-  # to AnySegment, then driven through one fixed-pool, single-row synchronous dispatch loop.
+  # LASER C-lanes harness — build only, not registered with ctest. Direct mode pairs the selected residency with a
+  # resident-arena reference; Collection mode pairs the segment and public Collection faces.
   alaya_cc_target(
     parity_lanes_benchmark
     LASER

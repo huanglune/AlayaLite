@@ -130,8 +130,8 @@ void bench_estimate_distances(std::mt19937 &rng) {
 }
 
 // ---------------------------------------------------------------------------
-// 3. accumulate_and_estimate_distances (the fused hot kernel memqg calls per
-//    candidate node, rabitq_space.hpp QueryComputer::batch_est_dist)
+// 3. accumulate_and_estimate_distances (the fused hot kernel the memory-QG
+//    builder calls per candidate node, rabitq_space.hpp QueryComputer::batch_est_dist)
 // ---------------------------------------------------------------------------
 void bench_fused(std::mt19937 &rng, size_t dim) {
   std::uniform_int_distribution<int> byte_dist(0, 255);

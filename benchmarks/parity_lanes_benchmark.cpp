@@ -45,14 +45,10 @@
 #include "index/collection/collection.hpp"
 #include "index/disk/laser_segment.hpp"
 #include "index/disk/laser_segment_importer.hpp"
-#include "index/graph/qg/qg_segment.hpp"
 #include "index/graph/qg/qg_search_extension.hpp"
 #include "simd/cpu_features.hpp"
 #include "simd/laser_dispatch.hpp"
-#include "space/quant/rabitq/dispatch.hpp"
-#include "space/rabitq_space.hpp"
 #include "utils/memory.hpp"
-#include "utils/openmp.hpp"
 
 namespace alaya::internal::collection {
 
@@ -74,8 +70,6 @@ namespace {
 
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock;
-using MemorySpace = alaya::RaBitQSpace<>;
-using MemorySegment = alaya::QgSegment<MemorySpace>;
 
 constexpr std::size_t kLargeAlignment = 2U * 1024U * 1024U;
 
@@ -91,14 +85,11 @@ struct Args {
   fs::path query_path{};
   fs::path ground_truth_path{};
   fs::path laser_segment_directory{};
-  fs::path memqg_index_path{};
-  fs::path base_path{};
   fs::path laser_native_prefix{};
   fs::path output_prefix{};
   std::string dataset{"sift1m-128d"};
   std::vector<std::uint32_t> lanes{1, 4, 16};
   std::vector<std::uint32_t> laser_efs{40, 60, 100, 200};
-  std::vector<std::uint32_t> memqg_efs{40, 60, 100, 200};
   std::vector<int> cpus{};
   std::uint32_t top_k{10};
   std::uint32_t repeats{3};
@@ -106,15 +97,12 @@ struct Args {
   std::uint32_t warmup_queries{};
   std::uint32_t query_limit{};
   std::uint32_t beam_width{16};
-  std::uint32_t build_threads{64};
-  std::uint32_t ef_build{100};
   std::uint32_t laser_degree{32};
   std::uint32_t batch_rows{64};
   double minimum_measure_seconds{};
   DispatchMode dispatch_mode{DispatchMode::single};
   LaserResidencyArm laser_residency{LaserResidencyArm::resident_arena};
   bool prepare_only{};
-  bool force_rebuild_memqg{};
   bool laser_import_copy{};
   bool collection_e2e{};
   bool collection_qg_face{};
@@ -255,12 +243,10 @@ template <typename Value, typename Parse>
                "  --query PATH                 fbin query matrix\n"
                "  --gt PATH                    ibin exact ground truth\n"
                "  --laser-segment PATH         importer-created resident_arena segment directory\n"
-               "  --memqg-index PATH           current memory-QG artifact\n"
                "  --output-prefix PATH         writes PATH.csv and PATH.json\n\n"
                "Grid and protocol:\n"
                "  --lanes LIST                 default 1,4,16\n"
                "  --laser-efs LIST             default 40,60,100,200\n"
-               "  --memqg-efs LIST             default 40,60,100,200\n"
                "  --topk N                     default 10\n"
                "  --repeats N                  per A/B order, default 3\n"
                "  --warmup-rounds N            untimed rounds before every point, default 1\n"
@@ -280,10 +266,6 @@ template <typename Value, typename Parse>
                "  --cpu-list LIST              CPU ids/ranges; default is current allowed set\n"
                "  --dataset NAME               metadata label, default sift1m-128d\n\n"
                "Optional one-time preparation (excluded from measurement):\n"
-               "  --base PATH                  fbin base used if MemQG artifact must be built\n"
-               "  --build-threads N            default 64\n"
-               "  --ef-build N                 default 100\n"
-               "  --force-rebuild-memqg        replace the requested MemQG artifact\n"
                "  --laser-native-prefix PATH   native prefix, without _R*_MD*.index\n"
                "  --laser-degree N             default 32\n"
                "  --laser-import-copy          copy native files when hard links are unavailable\n"
@@ -300,10 +282,6 @@ template <typename Value, typename Parse>
     }
     if (option == "--prepare-only") {
       args.prepare_only = true;
-      continue;
-    }
-    if (option == "--force-rebuild-memqg") {
-      args.force_rebuild_memqg = true;
       continue;
     }
     if (option == "--laser-import-copy") {
@@ -336,10 +314,6 @@ template <typename Value, typename Parse>
       } else {
         throw std::invalid_argument("--collection-face must be laser or qg");
       }
-    } else if (option == "--memqg-index") {
-      args.memqg_index_path = value;
-    } else if (option == "--base") {
-      args.base_path = value;
     } else if (option == "--laser-native-prefix") {
       args.laser_native_prefix = value;
     } else if (option == "--output-prefix") {
@@ -350,8 +324,6 @@ template <typename Value, typename Parse>
       args.lanes = parse_list<std::uint32_t>(value, option, parse_u32);
     } else if (option == "--laser-efs") {
       args.laser_efs = parse_list<std::uint32_t>(value, option, parse_u32);
-    } else if (option == "--memqg-efs") {
-      args.memqg_efs = parse_list<std::uint32_t>(value, option, parse_u32);
     } else if (option == "--cpu-list") {
       args.cpus = parse_cpu_list(value);
     } else if (option == "--topk") {
@@ -368,10 +340,6 @@ template <typename Value, typename Parse>
       args.minimum_measure_seconds = parse_double(value, option);
     } else if (option == "--beam") {
       args.beam_width = parse_u32(value, option);
-    } else if (option == "--build-threads") {
-      args.build_threads = parse_u32(value, option);
-    } else if (option == "--ef-build") {
-      args.ef_build = parse_u32(value, option);
     } else if (option == "--laser-degree") {
       args.laser_degree = parse_u32(value, option);
     } else if (option == "--batch-rows") {
@@ -385,21 +353,16 @@ template <typename Value, typename Parse>
     }
   }
 
-  if (args.query_path.empty() || args.laser_segment_directory.empty() ||
-      args.memqg_index_path.empty()) {
-    throw std::invalid_argument("--query, --laser-segment, and --memqg-index are required");
+  if (args.query_path.empty() || args.laser_segment_directory.empty()) {
+    throw std::invalid_argument("--query and --laser-segment are required");
   }
   if (!args.prepare_only && (args.ground_truth_path.empty() || args.output_prefix.empty())) {
     throw std::invalid_argument("measurement also requires --gt and --output-prefix");
   }
-  if (args.top_k == 0 || args.repeats == 0 || args.beam_width == 0 || args.build_threads == 0 ||
-      args.ef_build == 0 || args.laser_degree == 0 || args.batch_rows == 0 || args.lanes.empty() ||
-      args.laser_efs.empty() || args.memqg_efs.empty()) {
-    throw std::invalid_argument(
-        "topk/repeats/beam/build values and all grid lists must be nonzero");
-  }
-  if (args.build_threads > static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
-    throw std::invalid_argument("--build-threads exceeds int");
+  if (args.top_k == 0 || args.repeats == 0 || args.beam_width == 0 ||
+      args.laser_degree == 0 || args.batch_rows == 0 || args.lanes.empty() ||
+      args.laser_efs.empty()) {
+    throw std::invalid_argument("topk/repeats/beam/build values and all grid lists must be nonzero");
   }
   for (const auto lanes : args.lanes) {
     if (lanes == 0) {
@@ -409,11 +372,6 @@ template <typename Value, typename Parse>
   for (const auto ef : args.laser_efs) {
     if (ef < args.top_k) {
       throw std::invalid_argument("every LASER ef must be >= topk");
-    }
-  }
-  for (const auto ef : args.memqg_efs) {
-    if (ef < args.top_k) {
-      throw std::invalid_argument("every MemQG ef must be >= topk");
     }
   }
   if (args.collection_e2e && args.dispatch_mode != DispatchMode::single) {
@@ -640,77 +598,6 @@ void prepare_laser_segment(const Args &args, std::uint32_t dim) {
                              static_cast<std::uint64_t>(labels.size()),
                              args.laser_segment_directory);
   fs::remove_all(staging);
-}
-
-void build_memqg(const Args &args, std::uint32_t expected_dim) {
-  if (fs::is_regular_file(args.memqg_index_path) && !args.force_rebuild_memqg) {
-    return;
-  }
-  if (args.base_path.empty()) {
-    throw std::runtime_error("MemQG artifact is absent; provide --base to build it");
-  }
-  if (args.force_rebuild_memqg) {
-    std::error_code error;
-    fs::remove(args.memqg_index_path, error);
-    if (error) {
-      throw std::runtime_error("cannot remove old MemQG artifact: " + error.message());
-    }
-  }
-  fs::create_directories(args.memqg_index_path.parent_path());
-  auto base = read_matrix<float>(args.base_path);
-  if (base.columns != expected_dim) {
-    throw std::runtime_error("base/query dimension mismatch while building MemQG");
-  }
-  alaya::platform::set_openmp_thread_count(static_cast<int>(args.build_threads));
-  auto space = std::make_shared<MemorySpace>(base.rows, base.columns, alaya::core::Metric::l2);
-  const auto started = Clock::now();
-  space->fit(base.values.data(), base.rows);
-  alaya::core::BuildContext build_context;
-  alaya::QgBuildOptions build_options;
-  build_options.ef_build = args.ef_build;
-  build_options.thread_count = args.build_threads;
-  auto segment = MemorySegment::build({alaya::core::TypedTensorView::contiguous(base.values.data(),
-                                                                                base.rows,
-                                                                                base.columns),
-                                       space},
-                                      build_options,
-                                      build_context);
-  const auto built = Clock::now();
-
-  const auto temporary = fs::path(
-      args.memqg_index_path.string() + ".tmp." +
-      std::to_string(static_cast<unsigned long long>(Clock::now().time_since_epoch().count())));
-  const auto temporary_string = temporary.string();
-  const std::array locations{
-      alaya::core::ArtifactLocation(MemorySegment::kArtifactName, temporary_string)};
-  alaya::core::ArtifactWriter writer{std::span<const alaya::core::ArtifactLocation>(locations)};
-  alaya::core::ArtifactManifest manifest;
-  const auto status = segment->save(writer, alaya::core::SaveOptions{}, manifest);
-  if (!status.ok()) {
-    throw std::runtime_error("MemQG save failed: " + status.diagnostic());
-  }
-  fs::rename(temporary, args.memqg_index_path);
-  const auto saved = Clock::now();
-  std::cerr << "PREPARE,memqg,rows=" << base.rows << ",dim=" << base.columns
-            << ",R=32,ef_build=" << args.ef_build
-            << ",build_seconds=" << std::chrono::duration<double>(built - started).count()
-            << ",save_seconds=" << std::chrono::duration<double>(saved - built).count() << '\n';
-}
-
-[[nodiscard]] auto open_memqg(const fs::path &path) -> alaya::core::AnySegment {
-  const auto path_string = path.string();
-  const std::array locations{
-      alaya::core::ArtifactLocation(MemorySegment::kArtifactName, path_string)};
-  alaya::core::OpenContext context;
-  auto segment = MemorySegment::open(alaya::core::ArtifactView(
-                                         std::span<const alaya::core::ArtifactLocation>(locations)),
-                                     alaya::core::OpenOptions{},
-                                     context);
-  auto erased = MemorySegment::into_any(std::move(segment));
-  if (!erased.ok()) {
-    throw std::runtime_error("cannot erase MemQG segment: " + erased.status().diagnostic());
-  }
-  return std::move(erased).value();
 }
 
 class FullCachePagedSegment {
@@ -1512,8 +1399,6 @@ class ResultWriter {
            << "\",\n"
            << "    \"laser_segment_directory\": \""
            << json_escape(args.laser_segment_directory.string()) << "\",\n"
-           << "    \"memqg_index_path\": \"" << json_escape(args.memqg_index_path.string())
-           << "\",\n"
            << "    \"query_rows\": " << queries.rows << ",\n"
            << "    \"dimension\": " << queries.columns << ",\n"
            << "    \"ground_truth_columns\": " << ground_truth.columns << ",\n"
@@ -1529,7 +1414,6 @@ class ResultWriter {
            << "    \"return_distances\": " << (args.return_distances ? "true" : "false") << ",\n"
            << "    \"lanes\": \"" << join_numbers<std::uint32_t>(args.lanes) << "\",\n"
            << "    \"laser_efs\": \"" << join_numbers<std::uint32_t>(args.laser_efs) << "\",\n"
-           << "    \"memqg_efs\": \"" << join_numbers<std::uint32_t>(args.memqg_efs) << "\",\n"
            << "    \"repeats_per_order\": " << args.repeats << ",\n"
            << "    \"orders\": \"paired forward/reverse; concrete arm order is recorded per "
               "measurement\",\n"
@@ -1552,8 +1436,6 @@ class ResultWriter {
            << "    \"transparent_hugepage_enabled\": \""
            << json_escape(read_first_line("/sys/kernel/mm/transparent_hugepage/enabled")) << "\",\n"
            << "    \"laser_simd\": \"" << alaya::laser::simd::get_laser_simd_name() << "\",\n"
-           << "    \"memqg_rabitq_simd\": \"" << alaya::rabitq_simd::get_rabitq_simd_name()
-           << "\",\n"
            << "    \"fp32_distance_simd\": \"" << alaya::simd::get_simd_level_name(distance_level)
            << "\",\n"
            << "    \"allocator\": \"alaya::AlignedAlloc (2MiB + MADV_HUGEPAGE for large "
@@ -1683,8 +1565,8 @@ void run_grid(const Args &args,
               std::span<const int> selected_cpus,
               const Matrix<float> &queries,
               const Matrix<std::uint32_t> &ground_truth,
-              EngineArm &memqg,
-              EngineArm &laser,
+              EngineArm &first,
+              EngineArm &second,
               ResultWriter &writer) {
   std::map<std::string, ResultSnapshot> baselines;
   const auto warmup_query_count =
@@ -1696,8 +1578,8 @@ void run_grid(const Args &args,
       const std::array<bool, 2> orders =
           repeat % 2U == 1U ? std::array<bool, 2>{true, false} : std::array<bool, 2>{false, true};
       for (const bool forward : orders) {
-        std::array<EngineArm *, 2> arms = forward ? std::array<EngineArm *, 2>{&memqg, &laser}
-                                                  : std::array<EngineArm *, 2>{&laser, &memqg};
+        std::array<EngineArm *, 2> arms = forward ? std::array<EngineArm *, 2>{&first, &second}
+                                                  : std::array<EngineArm *, 2>{&second, &first};
         const std::string order =
             std::string(forward ? "forward_" : "reverse_") + arms[0]->name + "_" + arms[1]->name;
         for (std::size_t position = 0; position < arms.size(); ++position) {
@@ -1778,10 +1660,8 @@ auto main(int argc, char **argv) -> int {
     auto args = parse_args(argc, argv);
     auto query_probe = read_matrix<float>(args.query_path, 1);
     prepare_laser_segment(args, query_probe.columns);
-    build_memqg(args, query_probe.columns);
     if (args.prepare_only) {
-      std::cerr << "PREPARE,complete,laser_segment=" << args.laser_segment_directory
-                << ",memqg_index=" << args.memqg_index_path << '\n';
+      std::cerr << "PREPARE,complete,laser_segment=" << args.laser_segment_directory << '\n';
       return 0;
     }
 
@@ -1805,7 +1685,6 @@ auto main(int argc, char **argv) -> int {
     }
     cpus.resize(max_lanes);
 
-    EngineArm memqg{"memqg", open_memqg(args.memqg_index_path), args.memqg_efs};
     const auto laser_name = [&]() -> std::string {
       switch (args.laser_residency) {
         case LaserResidencyArm::resident_arena:
@@ -1820,11 +1699,7 @@ auto main(int argc, char **argv) -> int {
     EngineArm laser{laser_name,
                     open_laser(args.laser_segment_directory, args.laser_residency),
                     args.laser_efs};
-    const auto memqg_rows = validate_segment(memqg, queries.columns);
     const auto laser_rows = validate_segment(laser, queries.columns);
-    if (memqg_rows != laser_rows) {
-      throw std::runtime_error("MemQG and LASER row counts differ");
-    }
 
     ResultWriter writer(args.output_prefix);
     std::cerr << "CONFIG,dataset=" << args.dataset << ",queries=" << queries.rows
@@ -1838,8 +1713,7 @@ auto main(int argc, char **argv) -> int {
               << ",collection_e2e=" << args.collection_e2e
               << ",collection_face=" << (args.collection_qg_face ? "qg" : "laser")
               << ",return_distances=" << args.return_distances
-              << ",laser_simd=" << alaya::laser::simd::get_laser_simd_name()
-              << ",memqg_simd=" << alaya::rabitq_simd::get_rabitq_simd_name() << '\n';
+              << ",laser_simd=" << alaya::laser::simd::get_laser_simd_name() << '\n';
     if (args.collection_e2e) {
       if (args.laser_residency != LaserResidencyArm::resident_arena) {
         throw std::invalid_argument("--collection-e2e requires resident_arena");
@@ -1865,7 +1739,15 @@ auto main(int argc, char **argv) -> int {
                     std::move(collection)};
       run_grid(args, cpus, queries, ground_truth, direct, e2e, writer);
     } else {
-      run_grid(args, cpus, queries, ground_truth, memqg, laser, writer);
+      EngineArm arena_reference{"laser_arena_reference",
+                                open_laser(args.laser_segment_directory,
+                                           LaserResidencyArm::resident_arena),
+                                args.laser_efs};
+      const auto reference_rows = validate_segment(arena_reference, queries.columns);
+      if (reference_rows != laser_rows) {
+        throw std::runtime_error("LASER residency arms report different row counts");
+      }
+      run_grid(args, cpus, queries, ground_truth, arena_reference, laser, writer);
     }
     writer.write_json(args, cpus, queries, ground_truth);
     std::cerr << "OUTPUT,csv=" << writer.csv_path() << ",json=" << writer.json_path() << '\n';
