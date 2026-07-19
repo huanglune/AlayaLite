@@ -5,10 +5,9 @@
 
 import platform
 
+import alayalite
 import numpy as np
 import pytest
-
-import alayalite
 from alayalite import Collection, CollectionNotSupportedError
 from alayalite.schema import IndexParams
 
