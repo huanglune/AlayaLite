@@ -66,6 +66,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Moved LASER benchmarks, manual alignment/data-preparation tools, and native-update research results out of
   `tests/laser/` with no compatibility shims; the `bench_laser_update_sift` target name is unchanged.
+- **Breaking (C++ includes):** the topology-only QG builder moved to
+  `index/graph/seal_topology/`, and its Collection search extension moved to
+  `index/collection/qg_search_extension.hpp`, with no compatibility shims.
+  Only documented facades are supported; `/detail/` and other internal paths
+  are not promised stable.
 - Renamed the internal graph-builder helper include directory to
   `detail/build_support/`, replacing its misleading search-runtime name to
   reflect build-time ownership. This path remains under `detail/` and is not a

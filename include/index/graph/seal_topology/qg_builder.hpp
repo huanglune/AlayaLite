@@ -15,8 +15,8 @@
 #include "core/resource_contexts.hpp"
 #include "core/value_types.hpp"
 #include "index/graph/frozen_graph_snapshot.hpp"
-#include "index/graph/qg/detail/qg_builder_kernel.hpp"
-#include "index/graph/qg/detail/qg_graph.hpp"
+#include "index/graph/seal_topology/detail/qg_builder_kernel.hpp"
+#include "index/graph/seal_topology/detail/qg_graph.hpp"
 #include "space/rabitq_space.hpp"
 #include "space/space_concepts.hpp"
 

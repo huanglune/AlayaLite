@@ -29,7 +29,7 @@
 #include "index/collection/detail/collection_normalized_segment.hpp"
 #include "index/disk/laser_segment.hpp"
 #include "index/disk/laser_segment_importer.hpp"
-#include "index/graph/qg/qg_builder.hpp"
+#include "index/graph/seal_topology/qg_builder.hpp"
 #include "platform/fs.hpp"
 
 #if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER != 0

@@ -12,7 +12,7 @@
 #include <vector>
 
 #include "index/disk/laser_segment.hpp"
-#include "index/graph/qg/qg_builder.hpp"
+#include "index/graph/seal_topology/qg_builder.hpp"
 #include "space/rabitq_space.hpp"
 #include "platform/detect.hpp"
 

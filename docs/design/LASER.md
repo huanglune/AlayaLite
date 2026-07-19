@@ -326,7 +326,7 @@ feature, while their physical files and service engine are LASER. The old
 `qg_segment` artifact format has no reader. A Collection manifest carrying
 that legacy feature is rejected with `not_supported` and a `re-seal` hint.
 
-The in-memory QG tree under `include/index/graph/qg/` is builder-only.
+The in-memory QG tree under `include/index/graph/seal_topology/` is builder-only.
 `memory_qg::Builder` provides the temporary metric-aware topology for
 inner-product/cosine LASER builds; its fixed degree limits those paths to
 `R <= 32`. It exports only a `FrozenGraphSnapshot`: there is no memory-QG

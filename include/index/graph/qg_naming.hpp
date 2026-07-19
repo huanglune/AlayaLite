@@ -4,7 +4,7 @@
 
 #pragma once
 
-#include "index/graph/qg/qg_builder.hpp"
+#include "index/graph/seal_topology/qg_builder.hpp"
 #if defined(ALAYA_ENABLE_LASER) && ALAYA_ENABLE_LASER
   #include "index/graph/laser/qg/qg_builder.hpp"
 #endif

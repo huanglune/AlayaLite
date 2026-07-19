@@ -11,7 +11,7 @@
 #include <vector>
 
 #include "core/capabilities.hpp"
-#include "index/graph/qg/qg_builder.hpp"
+#include "index/graph/seal_topology/qg_builder.hpp"
 #include "space/rabitq_space.hpp"
 #include "utils/openmp.hpp"
 

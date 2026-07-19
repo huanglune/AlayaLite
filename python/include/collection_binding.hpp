@@ -27,7 +27,7 @@
 #include <vector>
 
 #include "alaya/collection.hpp"
-#include "index/graph/qg/qg_search_extension.hpp"
+#include "index/collection/qg_search_extension.hpp"
 
 namespace alaya::python::collection_binding {
 

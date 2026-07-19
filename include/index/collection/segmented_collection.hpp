@@ -30,8 +30,8 @@
 
 #include "index/collection/collection_checkpoint.hpp"
 #include "index/collection/experimental_snapshot_writer.hpp"
+#include "index/collection/qg_search_extension.hpp"
 #include "index/disk/laser_segment.hpp"
-#include "index/graph/qg/qg_search_extension.hpp"
 
 namespace alaya::internal::collection {
 
