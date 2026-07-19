@@ -23,7 +23,7 @@ note "start on $(hostname)"
 
 run_rn() { # tag prefix main_dim n query gt dram pf threads rep
   LD_LIBRARY_PATH="$RN/shlib" ALAYA_ARENA_PF_LINES="$8" $NUMA flock /tmp/.aio-uprobe.lock \
-    "$RN/tests/laser/bench_laser_update_sift" eval \
+    "$RN/benchmarks/laser/bench_laser_update_sift" eval \
     --prefix "$2" --n "$4" --R 32 --main_dim "$3" --query "$5" --gt "$6" \
     --topk 10 --efs 40,60,100,200 --beam 16 --threads "$9" --runs 5 --dram_gb "$7" --arena 1 \
     > "$OUT/laser_$1_pf$8_t$9_rep${10}.csv" 2>&1 && note "rn $1 pf$8 t$9 rep${10} ok" || note "FAIL rn $1 pf$8 t$9 rep${10}"
@@ -40,7 +40,7 @@ run_rn gte768 "$LOCAL/gte-m768qgfull" 768 $N768 "$LOCAL/query.fbin" "$LOCAL/gt.i
 
 for pf in 0 20; do
   LD_LIBRARY_PATH="$SP/shlib" ALAYA_ARENA_PF_LINES=$pf $NUMA flock /tmp/.aio-uprobe.lock \
-    "$SP/tests/laser/bench_laser_update_sift" eval \
+    "$SP/benchmarks/laser/bench_laser_update_sift" eval \
     --prefix "$LOCAL/gte-m768qgfull" --n $N768 --R 32 --main_dim 768 \
     --query "$LOCAL/query.fbin" --gt "$LOCAL/gt.ibin" \
     --topk 10 --efs 100,200 --beam 16 --threads 1 --runs 5 --dram_gb 12 --arena 1 \

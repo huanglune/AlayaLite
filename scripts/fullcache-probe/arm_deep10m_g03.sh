@@ -21,7 +21,7 @@ mkdir -p "$OUT" "$LOCAL"
 note() { echo "[$(date +%H:%M:%S)] $*" >> "$ST"; }
 note "start on $(hostname), cores=$(nproc), build=$BUILD"
 
-BENCH=$BUILD/tests/laser/bench_laser_update_sift
+BENCH=$BUILD/benchmarks/laser/bench_laser_update_sift
 MEMQG=$BUILD/tests/index/bench_memqg_native
 if [ ! -x "$BENCH" ] || [ ! -x "$MEMQG" ]; then
   note "FAIL no prebuilt binaries at $BUILD (remote home has no toolchain)"

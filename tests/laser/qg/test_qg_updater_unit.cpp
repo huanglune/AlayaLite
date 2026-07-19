@@ -35,7 +35,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "../bench_laser_update_sift_support.hpp"
+#include "../../../benchmarks/laser/bench_laser_update_sift_support.hpp"
 #include "index/graph/laser/qg/qg.hpp"
 #include "index/graph/laser/qg/qg_builder.hpp"
 #include "index/graph/laser/qg/qg_updater.hpp"

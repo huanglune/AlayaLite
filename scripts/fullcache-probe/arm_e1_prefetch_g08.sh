@@ -22,7 +22,7 @@ LOCAL=/tmp/huangliang-uprobe-gte768
 ST=$OUT/status.log
 N768=1006717
 NUMA="numactl --cpunodebind=1 --membind=1"
-BENCH=$BUILD/tests/laser/bench_laser_update_sift
+BENCH=$BUILD/benchmarks/laser/bench_laser_update_sift
 mkdir -p "$OUT"
 note() { echo "[$(date +%H:%M:%S)] $*" >> "$ST"; }
 note "start on $(hostname), build=$BUILD, bench_mtime=$(stat -c %y "$BENCH")"

@@ -340,19 +340,6 @@ alaya_add_test(
 )
 
 if(ALAYA_ENABLE_MUTABLE_LASER_TESTS)
-  # SIFT-scale update experiment harness (build / insert / delete / eval modes). Not a ctest — run manually; see the
-  # usage string in the source.
-  alaya_cc_target(
-    bench_laser_update_sift
-    BARE
-    SRCS bench_laser_update_sift.cpp bench_laser_oracles.cpp
-    LIBS alaya_laser
-    OPTS ${_laser_test_opts}
-  )
-  # The vendored FFHT header contains non-inline helper definitions. Keep the bench's split source files maintainable
-  # while compiling them as one translation unit, as the original single-source target did.
-  set_target_properties(bench_laser_update_sift PROPERTIES UNITY_BUILD ON)
-
   # wal-2c: W2 canonical PID-reuse writer functional tests (activation, all-reuse, mixed, generation chain, no-reuse
   # byte-invariance). The R0-R11 SIGKILL matrix is test_segment_op_wal_reuse_crash.cpp (registered below in the same
   # section).

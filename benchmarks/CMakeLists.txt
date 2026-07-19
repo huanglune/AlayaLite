@@ -1,5 +1,6 @@
 add_subdirectory(simd)
 add_subdirectory(rabitq)
+add_subdirectory(laser)
 
 # AnySegment synchronous-adapter microbenchmark — build only, not registered with ctest. It keeps the engine work
 # deliberately small so the fixed adapter execution overhead remains visible in P50/P99 and QPS.

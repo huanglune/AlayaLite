@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 
-#include "bench_laser_update_sift_support.hpp"
+#include "../../benchmarks/laser/bench_laser_update_sift_support.hpp"
 
 namespace alaya::laser::bench {
 namespace {

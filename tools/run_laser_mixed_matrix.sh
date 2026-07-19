@@ -16,7 +16,7 @@ for name in "${required[@]}"; do
 done
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-BENCH=${BENCH:-"$ROOT_DIR/build/Release/tests/laser/bench_laser_update_sift"}
+BENCH=${BENCH:-"$ROOT_DIR/build/Release/benchmarks/laser/bench_laser_update_sift"}
 N=${N:-500000}
 FROM=${FROM:-500000}
 COUNT=${COUNT:-500000}

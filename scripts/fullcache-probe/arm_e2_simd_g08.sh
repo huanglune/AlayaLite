@@ -24,7 +24,7 @@ LOCAL=/tmp/huangliang-uprobe-gte768
 ST=$OUT/status.log
 N768=1006717
 NUMA="numactl --cpunodebind=1 --membind=1"
-BENCH=$BUILD/tests/laser/bench_laser_update_sift
+BENCH=$BUILD/benchmarks/laser/bench_laser_update_sift
 MEMQG=$BUILD/tests/index/bench_memqg_native
 mkdir -p "$OUT" "$LOCAL"
 note() { echo "[$(date +%H:%M:%S)] $*" >> "$ST"; }

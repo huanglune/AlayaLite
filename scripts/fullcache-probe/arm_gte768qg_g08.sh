@@ -22,7 +22,7 @@ NUMA="numactl --cpunodebind=1 --membind=1"
 note() { echo "[$(date +%H:%M:%S)] $*" >> "$ST"; }
 note "start on $(hostname), build=$BUILD"
 
-BENCH=$BUILD/tests/laser/bench_laser_update_sift
+BENCH=$BUILD/benchmarks/laser/bench_laser_update_sift
 if [ ! -x "$BENCH" ] || [ ! -s "$LOCAL/gte-m768qg_R32_MD768.index" ]; then
   note "FAIL missing bench or staged index"
   touch "$OUT/DONE-gte768qg"; exit 1
