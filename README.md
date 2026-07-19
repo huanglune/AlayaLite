@@ -99,11 +99,14 @@ above for native requirements and schema limits.
 
 ## Benchmark
 
-AlayaLite ships two complementary index paths. The benchmarks below cover both.
+The figures below are historical result snapshots, retained for research
+context. Their retired Python runners and ANN-Benchmarks adapter are not part
+of the current repository surface; current native targets live under
+`benchmarks/`.
 
-### In-memory index vs. ANN-Benchmarks
+### Historical: in-memory graph vs. ANN-Benchmarks
 
-We evaluate the in-memory path against other vector database systems using
+The former in-memory graph path was evaluated against other vector database systems using
 [ANN-Benchmark](https://github.com/erikbern/ann-benchmarks) (compile locally and
 open `-march=native` in your `CMakeLists.txt` to reproduce the results).
 
@@ -111,9 +114,10 @@ open `-march=native` in your `CMakeLists.txt` to reproduce the results).
 | :---------------------------------------------------------: | :-----------------------------------------------------------: |
 | <div style="text-align: center;">**Fashion-MNIST	784 Euclidean**</div> | <div style="text-align: center;">**Gist 960 Euclidean**</div> |
 
-### In-memory collection vs. other mainstream systems
-The same in-memory path powers `Collection` hybrid search when metadata filters
-are involved. We evaluate this filtered retrieval workflow using
+### Historical: pre-cutover collection vs. other mainstream systems
+
+The pre-cutover in-memory path also powered `Collection` hybrid search when metadata filters
+were involved. This filtered retrieval workflow was evaluated using
 [VectorDBBench](https://github.com/zilliztech/VectorDBBench) on the
 **Medium Cohere** dataset (1M vectors, 768 dimensions). The following results
 report QPS under 0.1% selectivity filters at concurrency 1 and 80.
@@ -122,9 +126,9 @@ report QPS under 0.1% selectivity filters at concurrency 1 and 80.
 
 ![String equality filter 0.1% selectivity QPS](https://raw.githubusercontent.com/AlayaDB-AI/AlayaLite/main/docs/images/strequ-0p1p_qps_c1_c80.png)
 
-### On-disk LASER vs. other large-scale systems
+### Historical measurement: on-disk LASER vs. other large-scale systems
 
-For the on-disk path, we compare LASER against other disk-resident vector
+For the on-disk path, this snapshot compares LASER against other disk-resident vector
 systems on **DPR100M** (101M vectors × 768 dimensions, L2). Numbers are read
 directly from the benchmark output — see the
 [AlayaLaser paper](https://arxiv.org/abs/2602.23342) (SIGMOD 2026) for the
