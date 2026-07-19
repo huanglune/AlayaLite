@@ -18,9 +18,9 @@
 #include <vector>
 
 #include "core/log.hpp"
+#include "index/graph/detail/build_support/buffer.hpp"
+#include "index/graph/detail/build_support/hashset.hpp"
 #include "index/graph/detail/random.hpp"
-#include "index/graph/detail/search_runtime/buffer.hpp"
-#include "index/graph/detail/search_runtime/hashset.hpp"
 #include "index/graph/detail/thread_config.hpp"
 #include "index/neighbor.hpp"
 #include "space/rabitq_space.hpp"

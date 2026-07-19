@@ -65,7 +65,7 @@ RULES: list[tuple[str, list[str], str]] = [
 ]
 
 EXCEPTIONS: set[str] = {
-    # graph/detail/search_runtime may include space (by design)
+    # graph/detail/build_support may include space (by design)
 }
 
 

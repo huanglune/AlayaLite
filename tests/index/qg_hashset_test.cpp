@@ -3,7 +3,7 @@
 
 #include <gtest/gtest.h>
 
-#include "index/graph/detail/search_runtime/hashset.hpp"
+#include "index/graph/detail/build_support/hashset.hpp"
 
 namespace alaya {
 namespace {

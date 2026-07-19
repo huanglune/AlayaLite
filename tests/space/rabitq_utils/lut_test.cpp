@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <vector>
 
-#include "index/graph/detail/search_runtime/buffer.hpp"
+#include "index/graph/detail/build_support/buffer.hpp"
 #include "platform/detect.hpp"
 #include "simd/cpu_features.hpp"
 #include "space/quant/rabitq/dispatch.hpp"

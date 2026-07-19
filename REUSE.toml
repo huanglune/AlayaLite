@@ -53,8 +53,8 @@ path = [
   "include/space/quant/rabitq/fastscan.hpp",
   "include/space/quant/rabitq/lut.hpp",
   "include/space/quant/rabitq/rotator.hpp",
-  "include/index/graph/detail/search_runtime/buffer.hpp",
-  "include/index/graph/detail/search_runtime/hashset.hpp",
+  "include/index/graph/detail/build_support/buffer.hpp",
+  "include/index/graph/detail/build_support/hashset.hpp",
 ]
 precedence = "override"
 SPDX-FileCopyrightText = "2025 VectorDB.NTU"

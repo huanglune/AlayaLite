@@ -64,6 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Renamed the internal graph-builder helper include directory to
+  `detail/build_support/`, replacing its misleading search-runtime name to
+  reflect build-time ownership. This path remains under `detail/` and is not a
+  stable public API.
 - `Collection` keeps the public `qg` algorithm id but now seals new qg targets
   with the LASER implementation (`qg_laser_segment`) instead of serving them
   from `QgSegment`. L2 uses the native Vamana → LASER build chain; inner
