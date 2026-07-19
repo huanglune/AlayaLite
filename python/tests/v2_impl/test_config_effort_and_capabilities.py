@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 
+import alayalite._collection as collection_core
 import numpy as np
 import pytest
 from alayalite._capabilities import capabilities
@@ -103,9 +104,12 @@ def test_default_qg_create_succeeds_or_fails_fast_by_capability(sdk, tmp_path):
             assert database.list_collections() == []
 
 
-def test_explicit_qg_uses_the_same_create_time_platform_gate(sdk, tmp_path):
-    if "qg" in capabilities().index_types:
-        pytest.skip("unsupported-platform diagnostic is not reachable on this wheel")
+def test_explicit_qg_uses_the_same_create_time_platform_gate(sdk, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        collection_core,
+        "capabilities",
+        lambda: Capabilities(index_types=frozenset({"flat"}), laser_enabled=False, laser_simd=None),
+    )
     config = CollectionConfig(dimension=64, index=QGIndexConfig())
     with connect(tmp_path / "database") as database:
         with pytest.raises(sdk.CollectionNotSupportedError, match="Flat fallback is disabled"):
