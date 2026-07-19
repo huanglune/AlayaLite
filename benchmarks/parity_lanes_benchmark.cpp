@@ -116,6 +116,7 @@ struct Args {
   bool force_rebuild_memqg{};
   bool laser_import_copy{};
   bool collection_e2e{};
+  bool collection_qg_face{};
   bool return_distances{};
 };
 
@@ -271,6 +272,9 @@ template <typename Value, typename Parse>
                "  --laser-residency MODE       resident_arena (default), paged_pool, or\n"
                "                                 paged_full_cache\n"
                "  --collection-e2e             compare LASER segment face with Collection path\n"
+               "  --collection-face FACE       laser (default) or qg: expose the Collection's\n"
+               "                                 segment under the public qg algorithm id so\n"
+               "                                 fanout takes the same-id swap route\n"
                "  --return-distances           request numeric LASER distances on both arms\n"
                "  --cpu-list LIST              CPU ids/ranges; default is current allowed set\n"
                "  --dataset NAME               metadata label, default sift1m-128d\n\n"
@@ -323,6 +327,14 @@ template <typename Value, typename Parse>
       args.ground_truth_path = value;
     } else if (option == "--laser-segment") {
       args.laser_segment_directory = value;
+    } else if (option == "--collection-face") {
+      if (value == "qg") {
+        args.collection_qg_face = true;
+      } else if (value == "laser") {
+        args.collection_qg_face = false;
+      } else {
+        throw std::invalid_argument("--collection-face must be laser or qg");
+      }
     } else if (option == "--memqg-index") {
       args.memqg_index_path = value;
     } else if (option == "--base") {
@@ -408,6 +420,9 @@ template <typename Value, typename Parse>
   }
   if (args.collection_e2e && !args.return_distances) {
     throw std::invalid_argument("--collection-e2e requires --return-distances");
+  }
+  if (args.collection_qg_face && !args.collection_e2e) {
+    throw std::invalid_argument("--collection-face qg requires --collection-e2e");
   }
   return args;
 }
@@ -882,9 +897,14 @@ class ScopedResidencyOverride {
   std::optional<std::string> previous_{};
 };
 
-[[nodiscard]] auto open_laser(const fs::path &directory, LaserResidencyArm residency)
-    -> alaya::core::AnySegment {
+[[nodiscard]] auto open_laser(const fs::path &directory,
+                              LaserResidencyArm residency,
+                              alaya::core::AlgorithmId exposed_algorithm =
+                                  alaya::core::algorithm::laser) -> alaya::core::AnySegment {
   if (residency == LaserResidencyArm::paged_full_cache) {
+    if (exposed_algorithm != alaya::core::algorithm::laser) {
+      throw std::invalid_argument("the full-cache adapter only exposes the laser algorithm id");
+    }
     auto erased =
         FullCachePagedSegment::into_any(std::make_shared<FullCachePagedSegment>(directory));
     if (!erased.ok()) {
@@ -901,7 +921,7 @@ class ScopedResidencyOverride {
   if (!segment.ok()) {
     throw std::runtime_error("cannot open LASER segment: " + segment.status().diagnostic());
   }
-  auto erased = alaya::disk::LaserSegment::into_any(std::move(segment).value());
+  auto erased = alaya::disk::LaserSegment::into_any(std::move(segment).value(), exposed_algorithm);
   if (!erased.ok()) {
     throw std::runtime_error("cannot erase LASER segment: " + erased.status().diagnostic());
   }
@@ -1503,6 +1523,8 @@ class ResultWriter {
            << (args.dispatch_mode == DispatchMode::batch ? args.batch_rows : 1U) << ",\n"
            << "    \"laser_residency\": \"" << laser_residency_name(args.laser_residency) << "\",\n"
            << "    \"collection_e2e\": " << (args.collection_e2e ? "true" : "false") << ",\n"
+           << "    \"collection_face\": \"" << (args.collection_qg_face ? "qg" : "laser")
+           << "\",\n"
            << "    \"return_distances\": " << (args.return_distances ? "true" : "false") << ",\n"
            << "    \"lanes\": \"" << join_numbers<std::uint32_t>(args.lanes) << "\",\n"
            << "    \"laser_efs\": \"" << join_numbers<std::uint32_t>(args.laser_efs) << "\",\n"
@@ -1594,7 +1616,9 @@ class ResultWriter {
 
 [[nodiscard]] auto make_collection_face(const alaya::core::AnySegment &segment,
                                         alaya::core::RowCount rows,
-                                        std::uint32_t dim) -> std::shared_ptr<alaya::Collection> {
+                                        std::uint32_t dim,
+                                        alaya::core::AlgorithmId target_algorithm)
+    -> std::shared_ptr<alaya::Collection> {
   alaya::internal::collection::SegmentRegistration registration;
   registration.segment_id = 1;
   registration.generation = 1;
@@ -1626,7 +1650,7 @@ class ResultWriter {
   options.dim = dim;
   options.metric = alaya::core::Metric::l2;
   options.scalar_type = alaya::core::ScalarType::float32;
-  options.target_algorithm = alaya::core::algorithm::laser;
+  options.target_algorithm = target_algorithm;
   options.quantization = alaya::CollectionQuantization::rabitq;
   return alaya::internal::collection::CollectionTestAccess::wrap(std::move(options),
                                                                  std::move(opened).value());
@@ -1811,6 +1835,7 @@ auto main(int argc, char **argv) -> int {
               << (args.dispatch_mode == DispatchMode::batch ? args.batch_rows : 1U)
               << ",laser_residency=" << laser_residency_name(args.laser_residency)
               << ",collection_e2e=" << args.collection_e2e
+              << ",collection_face=" << (args.collection_qg_face ? "qg" : "laser")
               << ",return_distances=" << args.return_distances
               << ",laser_simd=" << alaya::laser::simd::get_laser_simd_name()
               << ",memqg_simd=" << alaya::rabitq_simd::get_rabitq_simd_name() << '\n';
@@ -1818,9 +1843,25 @@ auto main(int argc, char **argv) -> int {
       if (args.laser_residency != LaserResidencyArm::resident_arena) {
         throw std::invalid_argument("--collection-e2e requires resident_arena");
       }
-      auto collection = make_collection_face(laser.segment, laser_rows, queries.columns);
+      // The qg face opens a second instance of the same physical segment and
+      // exposes it under the public qg algorithm id, so Collection fanout takes
+      // the same-id swap route: the shared QgSearchExtension supplies effort,
+      // and fanout translates it into a distance-returning LASER extension.
+      // The laser face wraps the direct arm's own segment, as before.
+      const auto face_algorithm =
+          args.collection_qg_face ? alaya::core::algorithm::qg : alaya::core::algorithm::laser;
+      const auto face_segment = args.collection_qg_face
+                                    ? open_laser(args.laser_segment_directory,
+                                                 args.laser_residency,
+                                                 alaya::core::algorithm::qg)
+                                    : laser.segment;
+      auto collection =
+          make_collection_face(face_segment, laser_rows, queries.columns, face_algorithm);
       EngineArm direct{"laser_segment", laser.segment, args.laser_efs};
-      EngineArm e2e{"laser_collection", laser.segment, args.laser_efs, std::move(collection)};
+      EngineArm e2e{args.collection_qg_face ? "qg_collection" : "laser_collection",
+                    laser.segment,
+                    args.laser_efs,
+                    std::move(collection)};
       run_grid(args, cpus, queries, ground_truth, direct, e2e, writer);
     } else {
       run_grid(args, cpus, queries, ground_truth, memqg, laser, writer);
