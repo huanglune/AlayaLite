@@ -430,3 +430,10 @@ Two engine issues remain for main-session adjudication:
 Neither issue changes the positive resident-arena primary verdict. Both block
 turning their respective secondary stories into publication-grade full-grid
 claims until fixed and remeasured.
+
+**Resolution (2026-07-19):** both defects were fixed on main (`63dde8c`
+paged issue-order determinism, `6ddec5c` O(1) routing row counts) and both
+deferred measurements were completed after the qg→LASER swap landed; see
+[REPORT-parity-lanes-phase2-addendum.md](REPORT-parity-lanes-phase2-addendum.md)
+for the now-admissible tight-cache spectrum row and the full 10,000-query
+Collection E2E tables, including the swapped public-qg route.
