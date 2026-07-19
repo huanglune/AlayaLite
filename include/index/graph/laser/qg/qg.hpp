@@ -1090,6 +1090,13 @@ inline void QuantizedGraph::finish_thread_data_borrow() noexcept {
   const auto previous = paged_lease_gate_.fetch_sub(1, std::memory_order_acq_rel);
   assert((previous & kPagedLeaseCountMask) != 0);
   if ((previous & kPagedLeaseDrainBit) != 0 && (previous & kPagedLeaseCountMask) == 1) {
+    // The drain waiter's predicate reads the gate word outside the mutex, so a
+    // bare notify could fire between its predicate evaluating non-zero and the
+    // wait blocking — a lost wakeup that hangs set_params()/teardown. The empty
+    // critical section defers this notify past that window.
+    {
+      std::lock_guard<std::mutex> drain_guard(thread_data_drain_mutex_);
+    }
     thread_data_drain_cv_.notify_all();
   }
 }
