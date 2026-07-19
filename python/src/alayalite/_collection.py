@@ -634,11 +634,11 @@ class Collection:
 
     def checkpoint(self) -> CheckpointReceipt:
         """Create a durable recovery point and truncate the eligible WAL."""
-        return _checkpoint_receipt(self._require_native().checkpoint_typed())
+        return _checkpoint_receipt(self._require_writable().checkpoint_typed())
 
     def seal(self) -> SealReceipt:
         """Rotate the active segment and build the configured sealed target."""
-        native = self._require_native()
+        native = self._require_writable()
         if isinstance(self._config.index, QGIndexConfig) and self.count() <= 32:
             raise _status_error(
                 CollectionInvalidArgumentError,
@@ -651,11 +651,11 @@ class Collection:
 
     def compact(self) -> CompactionReceipt:
         """Compact eligible sealed generations."""
-        return _compaction_receipt(self._require_native().compact_typed())
+        return _compaction_receipt(self._require_writable().compact_typed())
 
     def collect_garbage(self) -> GarbageCollectionReceipt:
         """Reclaim artifacts no longer pinned by a search epoch."""
-        return _garbage_collection_receipt(self._require_native().gc_typed())
+        return _garbage_collection_receipt(self._require_writable().gc_typed())
 
     def rebuild_index(self, *, index: IndexConfig | None = None) -> CheckpointReceipt:
         """Rebuild all live rows into an atomically swapped index owner.
@@ -785,8 +785,10 @@ class Collection:
         if isinstance(self._config.index, FlatIndexConfig):
             if effort is not None:
                 raise ValueError("effort is not supported by Flat collections")
-            return max(100, limit)
+            return 100
         floor = max(100, limit)
+        if floor > _UINT32_MAX:
+            raise ValueError("limit exceeds the QG effort uint32 range")
         if effort is None:
             return floor
         if isinstance(effort, bool) or not isinstance(effort, int):

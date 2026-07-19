@@ -137,7 +137,7 @@ class Database:
         normalized_name = _collection_name(name)
         validate_creation_config(config)
         root = self._path / normalized_name
-        if root.exists():
+        if os.path.lexists(root):
             raise _status_error(
                 CollectionConflictError,
                 f"collection {normalized_name!r} already exists",

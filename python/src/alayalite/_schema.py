@@ -39,6 +39,8 @@ def write_collection_schema(root: Path, config: CollectionConfig) -> None:
 
 def is_catalog_collection(root: Path) -> bool:
     """Return whether a child directory has a supported collection header."""
+    if root.is_symlink() or not root.is_dir():
+        return False
     try:
         payload = _read_payload(root)
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
