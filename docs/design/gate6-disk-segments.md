@@ -5,6 +5,11 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 # Gate 6 disk-segment final state
 
+> **Superseded / historical (2026-07-19).** This is the Gate 6 checkpoint,
+> not the current engine inventory. HNSW, disk Vamana, and DiskANN were later
+> retired; the stable public `qg` target now seals through LASER. The tables
+> below are retained as migration evidence.
+
 Gate 6 closes the internal disk-engine migration without switching the public
 Python facade or adding a mutable disk protocol. The three new producers are
 immutable `AnySegment` implementations owned by their existing disk codecs.

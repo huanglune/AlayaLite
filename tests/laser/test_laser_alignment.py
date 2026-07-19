@@ -2,11 +2,11 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""Phase-L2 alignment harness for port-laser-disk-index.
+"""Historical Phase-L2 alignment harness for port-laser-disk-index.
 
-Runs the ported Laser pipeline (`alayalite.laser`) on a (dataset × vamana)
-combination and compares outputs against a frozen baseline produced by the
-original Laser repo (see build_graph/laser_port/baseline_<date>/).
+The automatic run path below names the retired Python LASER builder and is kept
+only as migration evidence. ``--skip-run`` still compares existing artifacts
+against a frozen baseline produced by the original Laser repo.
 
 Gate tiers (see openspec/changes/port-laser-disk-index/tasks.md 3.5):
     Tier A — byte-equal RabitQ code buffer (`dsqg_*.index`) and
@@ -69,7 +69,6 @@ PARETO_RECALL_TOL_PP: float = 0.1
 PARETO_QPS_REL_TOL: float = 0.07
 
 AL_REPO = Path(__file__).resolve().parents[2]
-
 
 # ── Combo → input paths ────────────────────────────────────────────────────
 

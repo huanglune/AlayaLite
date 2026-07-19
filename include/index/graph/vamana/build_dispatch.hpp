@@ -5,11 +5,9 @@
 #pragma once
 
 //
-// build_dispatch.hpp — Vamana build dispatch library. Shared between the
-// tools/build_vamana_index CLI and the alayalite.vamana Python binding so
-// both entry points share one execution path, one set of log messages, and
-// one set of defaults. See proposal integrate-vamana-into-laser-pipeline
-// (decision D2/D4) for the rationale.
+// build_dispatch.hpp — retained Vamana build-dispatch primitives used by the
+// LASER fixture and alignment harnesses. The former standalone CLI and Python
+// Vamana binding have been retired.
 //
 
 #include <omp.h>
@@ -71,9 +69,8 @@ struct BuildVamanaParams {
   float sampling_rate = -1.0F;
 };
 
-// Single source of truth for Vamana build defaults. Both the CLI's argv
-// parser and the Python binding's `py::arg` defaults MUST reference the
-// fields of this constant; no duplicate literals.
+// Single source of truth for Vamana build defaults. Remaining callers must
+// initialize from this constant or from BuildVamanaParams{}.
 inline constexpr BuildVamanaParams kDefaultVamanaBuildParams{};
 
 namespace detail {
@@ -84,8 +81,8 @@ namespace detail {
 // is why the spec requires a "separately-declared constexpr table".
 //
 // Limitation: a new field added to BuildVamanaParams is not detected here
-// unless it's also added to kFrozenDefaults; the CLI / binding / test
-// fixtures are expected to update in lockstep.
+// unless it's also added to kFrozenDefaults; callers and test fixtures are
+// expected to update in lockstep.
 struct VamanaNumericDefaults {
   uint32_t R;
   uint32_t L;
@@ -105,20 +102,20 @@ inline constexpr VamanaNumericDefaults kFrozenDefaults{
     .sampling_rate = -1.0F,
 };
 static_assert(kDefaultVamanaBuildParams.R == kFrozenDefaults.R,
-              "Vamana default R drifted — update CLI / binding / fixtures together");
+              "Vamana default R drifted — update callers and fixtures together");
 static_assert(kDefaultVamanaBuildParams.L == kFrozenDefaults.L,
-              "Vamana default L drifted — update CLI / binding / fixtures together");
+              "Vamana default L drifted — update callers and fixtures together");
 static_assert(kDefaultVamanaBuildParams.alpha == kFrozenDefaults.alpha,
-              "Vamana default alpha drifted — update CLI / binding / fixtures together");
+              "Vamana default alpha drifted — update callers and fixtures together");
 static_assert(kDefaultVamanaBuildParams.num_threads == kFrozenDefaults.num_threads,
-              "Vamana default num_threads drifted — update CLI / binding / fixtures together");
+              "Vamana default num_threads drifted — update callers and fixtures together");
 static_assert(kDefaultVamanaBuildParams.seed == kFrozenDefaults.seed,
-              "Vamana default seed drifted — update CLI / binding / fixtures together");
+              "Vamana default seed drifted — update callers and fixtures together");
 static_assert(kDefaultVamanaBuildParams.build_dram_budget_gb ==
                   kFrozenDefaults.build_dram_budget_gb,
-              "Vamana default dram_budget drifted — update CLI / binding / fixtures together");
+              "Vamana default dram_budget drifted — update callers and fixtures together");
 static_assert(kDefaultVamanaBuildParams.sampling_rate == kFrozenDefaults.sampling_rate,
-              "Vamana default sampling_rate drifted — update CLI / binding / fixtures together");
+              "Vamana default sampling_rate drifted — update callers and fixtures together");
 
 inline bool is_finite_float(float value) {
   uint32_t bits = 0;

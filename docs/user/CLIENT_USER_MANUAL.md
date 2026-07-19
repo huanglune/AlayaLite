@@ -3,14 +3,14 @@
 > AlayaLite 1.1.0 removed `Index`, `DiskCollection`, the Client index methods,
 > and the LASER/Vamana Python builders. Sections below that demonstrate those
 > names are retained as pre-1.1 migration reference only. New code must use
-> canonical `Collection`; see `docs/legacy-cleanup.md` for the reader policy.
+> canonical `Collection`; see `docs/design/legacy-cleanup.md` for the reader
+> policy.
 
 This guide is based on [`python/src/alayalite/client.py`](https://github.com/AlayaDB-AI/AlayaLite/blob/main/python/src/alayalite/client.py), the main Python entry point for managing AlayaLite objects.
 
-`Client` now manages canonical collections. Before 1.1 it managed two kinds of objects:
-
-- `Index`: stores vectors only. Use it for pure ANN search, algorithm experiments, and benchmark-style workflows.
-- `Collection`: stores `id + document + embedding + metadata`. Use it for RAG, knowledge bases, metadata filtering, and hybrid search.
+`Client` now manages canonical collections containing IDs, documents,
+embeddings, and metadata. Removed APIs are isolated in explicitly historical
+sections below.
 
 ## Installation
 
@@ -41,18 +41,16 @@ Common management APIs:
 
 ```python
 client.list_collections()
-client.list_indices()
-
 collection = client.get_collection("docs")
-index = client.get_index("ann")
-
 collection = client.get_or_create_collection("docs")
-index = client.get_or_create_index("ann")
 ```
 
-Collection names and index names share the same namespace inside one `Client`, so they cannot duplicate each other.
+Collection names are unique inside one `Client`.
 
-## Pure ANN Search
+## Historical: Removed `Index` API
+
+> The examples in this section do not run on current releases. They are kept
+> only to identify pre-1.1 calls during migration; use `Collection` instead.
 
 Use `Index` when you only need nearest-neighbor vector IDs and do not need documents or metadata.
 
@@ -110,9 +108,15 @@ ids = index.batch_search(queries, topk=2, ef_search=50, num_threads=2)
 ids, distances = index.batch_search_with_distance(queries, topk=2, ef_search=50, num_threads=2)
 ```
 
-## LASER On-Disk ANN
+## Historical: Removed Python LASER Builder
 
-LASER is AlayaLite's on-disk Quantized Graph index for large-scale ANN search. It is not created through `Client.create_index(...)`; use the dedicated `alayalite.laser` API instead. For full build and tuning details, see [LASER.md](https://github.com/AlayaDB-AI/AlayaLite/blob/main/docs/LASER.md).
+> The `alayalite.laser.Index`/`RawIndex` builder and search wrappers are
+> removed. Current Python users select `index_type="qg"` on `Collection`;
+> supported builds seal that stable ID through LASER.
+
+The remainder of this section records the former dedicated Python builder.
+For current native implementation details, see
+[LASER.md](../design/LASER.md).
 
 ```python
 from alayalite.laser import BuildParams, Index
@@ -363,7 +367,7 @@ ep_num = 300
 efs = [100, 200, 300]
 ```
 
-### LASER And DiskCollection
+### Historical: LASER And `DiskCollection`
 
 `DiskCollection(index_type="disk_laser")` can import precomputed LASER artifacts as disk collection segments. This is a lower-level disk collection workflow, not the regular `Client.create_collection(...)` document/metadata collection path.
 
@@ -638,10 +642,6 @@ client = Client(url="./alaya_data")
 collection = client.create_collection("docs")
 collection.insert(items)
 client.save_collection("docs")
-
-index = client.create_index("ann")
-index.fit(vectors, ef_construction=100, num_threads=1)
-client.save_index("ann")
 ```
 
 Reopen the same directory to load existing objects:
@@ -650,21 +650,18 @@ Reopen the same directory to load existing objects:
 client = Client(url="./alaya_data")
 
 collection = client.get_collection("docs")
-index = client.get_index("ann")
 ```
 
 Delete from memory:
 
 ```python
 client.delete_collection("docs")
-client.delete_index("ann")
 ```
 
 Delete from memory and disk:
 
 ```python
 client.delete_collection("docs", delete_on_disk=True)
-client.delete_index("ann", delete_on_disk=True)
 ```
 
 Reset all objects managed by the current client:
@@ -679,9 +676,9 @@ Delete matching on-disk object directories as well:
 client.reset(delete_on_disk=True)
 ```
 
-## Common Index Parameters
+## Collection Index Parameters
 
-These parameters can be passed to `create_index` or `create_collection`:
+These parameters can be passed to `create_collection`:
 
 ```python
 client.create_collection(
@@ -722,17 +719,11 @@ diagnostic and never silently falls back to Flat. Linux aarch64 LASER support is
 deferred until after the current paper work; `_VALID_INDEX_TYPES` remains
 unchanged during this transition.
 
-## Choosing Index Or Collection
+## Choosing A Collection Index Family
 
-Use `Index` when you only need nearest-neighbor vector IDs:
-
-```python
-index = client.create_index("ann")
-index.fit(vectors, ef_construction=100, num_threads=4)
-ids = index.search(query, topk=10, ef_search=100)
-```
-
-Use `Collection` when you need documents, metadata, or hybrid search:
+Use `flat` for exact search and portability across every wheel. Use `qg` for
+eligible LASER-backed sealed generations on supported platforms. Both are
+accessed through `Collection`:
 
 ```python
 collection = client.create_collection("docs", indexed_fields=["category"])
@@ -747,10 +738,9 @@ result = collection.hybrid_query(
 
 ## Notes
 
-- `Index.fit` can be called only once. Use `index.insert` to append vectors.
 - `Collection` initializes its underlying index on the first `insert`; queries before that will fail.
 - Each `Collection.insert` item is `(item_id, document, embedding, metadata)`.
 - Returned `item_id` values are usually strings. If you insert integer IDs, query results may return `"1"`.
 - Query vector dimensions for `batch_query` and `hybrid_query` must match the indexed vector dimension.
 - `batch_query` requires `ef_search >= limit`.
-- `client.save_collection` and `client.save_index` require creating the client with `url`.
+- `client.save_collection` requires creating the client with `url`.

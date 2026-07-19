@@ -62,7 +62,6 @@ SPDX-License-Identifier = "Apache-2.0"
 
 [[annotations]]
 path = [
-  "include/index/graph/detail/search_runtime/visited_pool.hpp",
   "include/index/graph/laser/qg/qg_builder.hpp",
   "include/index/graph/laser/qg/qg.hpp",
   "include/index/graph/laser/quantization/rabitq.hpp",
@@ -82,7 +81,6 @@ SPDX-License-Identifier = "Apache-2.0"
 path = [
   "include/index/graph/laser/utils/aligned_file_reader.hpp",
   "include/index/graph/laser/utils/aligned_file_reader_factory.hpp",
-  "include/index/graph/laser/utils/iocp_file_reader.hpp",
 ]
 precedence = "override"
 SPDX-FileCopyrightText = ["Microsoft Corporation", "2025 AlayaDB.AI"]

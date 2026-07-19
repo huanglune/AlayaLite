@@ -5,6 +5,11 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 # Gate 10 filter execution, successor seal, compact, and GC
 
+> **Historical Gate 10 baseline (updated 2026-07-19).** The control-plane
+> contracts remain relevant, but the Flat-only target descriptions predate
+> the `qg` to LASER implementation swap. They record the Gate 10 rollout
+> state rather than the current target inventory.
+
 Gate 10 completes Collection-owned filter execution and resource accounting,
 then adds successor-first rotation, immutable Flat targets, epoch-delayed
 reclamation, and Flat-to-Flat compaction. DiskANN and LASER graph sources, all

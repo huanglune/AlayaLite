@@ -278,7 +278,7 @@ BLAS/OpenMP settings when you need the most stable local rebuilds.
 The old cross-repo Tier A byte-equality harness no longer drives
 `examples/laser/main.py` through individual build stages. It is retained
 as an existing-artifact comparator at
-`scripts/laser_alignment/tier_a_byte_equal.py`.
+`benchmarks/laser/alignment/tier_a_byte_equal.py`.
 
 ## Vamana Low-Level API
 

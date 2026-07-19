@@ -66,13 +66,12 @@ class IndexParams:
         if self.index_type is None:
             is_float32 = np.dtype(self.data_type) == np.dtype(np.float32)
             if is_float32 and self.quantization_type in (None, "rabitq"):
-                # qg (RaBitQ-quantized in-memory graph) is the default
-                # target for float32 vectors with no competing
-                # quantization request.
+                # qg is the stable RaBitQ graph identity. Eligible sealed
+                # generations use LASER on supported builds.
                 self.index_type = "qg"
             elif is_float32:
                 # An explicit sq8/sq4/none quantization_type has no ANN
-                # engine left that can honor it: qg is rabitq-only and flat
+                # engine left that can honor it: qg is RaBitQ-only and flat
                 # never quantizes (it silently ignores a non-none
                 # quantization_type and always searches exactly) -- so this
                 # honestly downgrades to exact flat search rather than a

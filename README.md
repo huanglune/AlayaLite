@@ -24,15 +24,19 @@
 - **High Performance**: Modern vector techniques integrated into a well-designed architecture.
 - **Elastic Scalability**: Seamlessly scale across multiple threads, which is optimized by C++20 coroutines.
 - **Adaptive Flexibility**: Easy customization for quantization methods, metrics, and data types.
-- **Two index paths in one package**: an in-memory graph + RaBitQ path for low-latency
-  retrieval, and the **LASER** on-disk Quantized Graph index for billion-scale workloads
-  that do not fit in RAM.
+- **Two public index families**: exact `flat` and stable-id `qg`. Eligible
+  sealed `qg` generations use the on-disk **LASER** implementation.
+- **Native LASER active surface**: C++ builds on Linux x86_64 can also opt
+  into the writable LASER active engine; this is separate from the Python
+  `flat`/`qg` family names.
+- **Lean distribution**: the AlayaLite 1.2.0 reference wheel is 5.9 MB.
 - **Ease of Use**: [Intuitive APIs](https://github.com/AlayaDB-AI/AlayaLite/blob/main/python/README.md) in Python.
 
 ## Documentation
 
-- [Client User Guide](https://github.com/AlayaDB-AI/AlayaLite/blob/main/docs/CLIENT_USER_MANUAL.md)
-- [LASER Guide](https://github.com/AlayaDB-AI/AlayaLite/blob/main/docs/LASER.md)
+- [Client User Guide](https://github.com/AlayaDB-AI/AlayaLite/blob/main/docs/user/CLIENT_USER_MANUAL.md)
+- [Build Guide](https://github.com/AlayaDB-AI/AlayaLite/blob/main/docs/user/BUILDING.md)
+- [LASER implementation guide](https://github.com/AlayaDB-AI/AlayaLite/blob/main/docs/design/LASER.md)
 
 ## Quick Start
 
@@ -47,124 +51,51 @@ uv add alayalite                  # in a uv-managed project
 
 
 
-### In-memory index: quick start
+### Collection quick start
 
 ```python
 import numpy as np
 from alayalite import Client
 
 client = Client()
-index = client.create_index("ann")
 vectors = np.random.rand(1000, 128).astype(np.float32)
 queries = np.random.rand(10, 128).astype(np.float32)
-gt = calc_gt(vectors, queries, 10)
-
-# Insert vectors to the index
-index.fit(vectors)
-
-# Perform batch search for the queries and retrieve top-10 results
-result = index.batch_search(queries, 10)
-
-# Compute the recall based on the search results and ground truth
-recall = calc_recall(result, gt)
-print(recall)
-```
-
-### Hybrid search in Collection: quick start
-
-Use `Collection` when you want ANN results together with document IDs,
-documents, and metadata filters.
-
-```python
-collection = client.create_collection("docs", indexed_fields=["category"])
-collection.insert([
-    ("doc-1", "Vector database overview", vectors[0], {"category": "database"}),
-    ("doc-2", "Cooking notes", vectors[1], {"category": "life"}),
-])
+collection = client.create_collection(
+    "docs",
+    index_type="flat",  # available on every wheel
+    metric="l2",
+    indexed_fields=["category"],
+)
+collection.insert(
+    [
+        (f"doc-{i}", f"Document {i}", vector, {"category": "database" if i % 2 == 0 else "other"})
+        for i, vector in enumerate(vectors)
+    ]
+)
 
 result = collection.hybrid_query(
-    vectors=[vectors[0]],
-    limit=1,
+    vectors=queries,
+    limit=10,
     metadata_filter={"category": "database"},
-    ef_search=10,
+    ef_search=100,
 )
 print(result["id"][0])
 ```
 
-### LASER on-disk index: quick start
+### Index and platform matrix
 
-For datasets that exceed RAM, the **LASER** on-disk Quantized Graph index keeps
-hot data on SSD and only the search-time working set in memory. Vectors must be
-`float32` with `raw_dim >= 128`; L2 is the only supported metric in v1.
+| Wheel/build | Python `flat` | Python `qg` seal | C++ writable LASER active engine |
+|---|---:|---:|---:|
+| Linux x86_64 | yes | LASER (`libaio` by default) | yes |
+| macOS x86_64/arm64 | yes | LASER (thread pool) | no |
+| Linux aarch64 | yes | unavailable; fails explicitly | no |
+| Windows x64 | yes | unavailable; fails explicitly | no |
 
-LASER is available on Linux x86_64 (libaio backend, default) and macOS
-(thread-pool backend). Platform notes:
-
-- Linux x86_64 builds need `libaio` headers, for example
-  `sudo apt-get install libaio-dev` on Debian/Ubuntu.
-- macOS builds need OpenMP from Homebrew: `brew install libomp`.
-- Linux aarch64 and Windows wheels omit LASER. Sealing the stable public `qg`
-  target on those wheels fails explicitly; it never silently substitutes Flat.
-  Linux aarch64 enablement is deferred until after the current paper work.
-
-See [LASER.md](https://github.com/AlayaDB-AI/AlayaLite/blob/main/docs/LASER.md) for build flags, tuning notes, and the
-TOML-driven CLI.
-
-LASER `Index.fit` pulls in PCA / k-means / progress-bar helpers (`scikit-learn`,
-`faiss-cpu`, `tqdm`), which are declared as the `[laser]` extra so the base
-install stays lean. Install them on top of the base wheel:
-
-```bash
-pip install "alayalite[laser]"
-# or, with uv:
-uv pip install "alayalite[laser]"
-```
-
-```python
-import shutil
-import time
-import numpy as np
-from sklearn.datasets import make_blobs
-from alayalite.laser import BuildParams, Index
-from alayalite.utils import calc_gt, calc_recall
-
-# Smoke-scale demo (~10-20s end-to-end on a modern laptop). Tuning details,
-# paper-aligned configs and the on-disk layout are covered in the LASER guide above.
-output_dir = "/tmp/alaya_laser"
-shutil.rmtree(output_dir, ignore_errors=True)
-
-# Synthetic GMM clusters so ANN has structure to find; uniform-random vectors
-# in 768-D would collapse recall (high-D distance concentration).
-pts, _ = make_blobs(n_samples=10_100, n_features=768, centers=64,
-                    cluster_std=0.35, random_state=42)
-vectors = pts[:10_000].astype(np.float32)
-queries = pts[10_000:].astype(np.float32)
-gt = calc_gt(vectors, queries, 10)
-
-idx = Index.fit(
-    vectors,
-    output_dir=output_dir,
-    name="demo",
-    build_params=BuildParams(main_dim=256, ep_num=20),
-    seed=42,
-    num_threads=0,
-    dram_budget_gb=2.0,
-)
-idx.set_params(ef_search=200, num_threads=1, beam_width=16)
-
-idx.batch_search(queries, 10)                       # warmup
-t0 = time.perf_counter()
-ids = idx.batch_search(queries, 10)
-elapsed = time.perf_counter() - t0
-
-print(f"Recall@10: {calc_recall(ids, gt):.3f}")
-print(f"QPS:       {len(queries) / elapsed:.1f}  ({len(queries)} queries in {elapsed*1000:.1f} ms)")
-
-# Reopen later without rebuilding:
-# idx = Index.from_prefix("/tmp/alaya_laser/demo", dram_budget_gb=2.0)
-```
-
-LASER requires a LASER-enabled build. See the [LASER Guide](https://github.com/AlayaDB-AI/AlayaLite/blob/main/docs/LASER.md) for platform requirements and build options.
+Linux aarch64 and Windows are therefore operationally flat-only. They still
+validate the stable `qg` name, but sealing it raises
+`CollectionNotSupportedError`; AlayaLite never silently substitutes Flat for
+a platform-gated `qg` request. See the build and LASER implementation guides
+above for native requirements and schema limits.
 
 ## Benchmark
 

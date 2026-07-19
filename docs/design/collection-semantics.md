@@ -85,7 +85,7 @@ of acknowledged/searchable/durable.
 | DiskANN | `meta.bin`, `diskann.index`, `ids.bin`, cache files, optional PQ pivots/codes, and update metadata such as tombstones/slots when applicable |
 
 The machine-readable format hashes and parsed fields are maintained by
-`scripts/golden/generate_artifact_baseline.py`; hashes deliberately freeze byte
+`tests/golden/generate_artifact_baseline.py`; hashes deliberately freeze byte
 format, while parsed fields make failures diagnosable.
 
 ## Golden coverage map
@@ -127,7 +127,7 @@ uv run --locked python tests/golden/generate_artifact_baseline.py \
 ```
 
 Use `--write` only when intentionally accepting a format change.  The size map
-is regenerated with `python scripts/size_map/generate_size_map.py`; pass
+is regenerated with `python benchmarks/size_map/generate_size_map.py`; pass
 `--wheel PATH` to include the packaged wheel.  During steps 4–11, run behavior
 golden before/after compatibility-wrapper changes, require old artifact open
 and hash/field review for serializer changes, compile this header surface, and

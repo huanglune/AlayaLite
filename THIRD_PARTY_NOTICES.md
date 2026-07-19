@@ -38,11 +38,12 @@ for the 2026-07-12 provenance audit.
 - Compared commit: `78256bbab4685e1774e78d331e081a153be26823` (`cpp_main`)
 - License: MIT
 - Local paths: `include/index/graph/laser/utils/{aligned_file_reader,
-  aligned_file_reader_factory,iocp_file_reader,concurrent_queue}.hpp`
+  aligned_file_reader_factory,concurrent_queue}.hpp`
 - Modifications: C++ reader sources were consolidated into headers and adapted
-  for backend-neutral events, error handling, libaio/IOCP portability, and
-  AlayaLite naming. `threadpool_file_reader.hpp` is an Alaya implementation of
-  the DiskANN-lineage reader interface, not a copied DiskANN backend.
+  for backend-neutral events, error handling, libaio portability, and AlayaLite
+  naming. The former IOCP-derived backend has been removed.
+  `threadpool_file_reader.hpp` is an Alaya implementation of the
+  DiskANN-lineage reader interface, not a copied DiskANN backend.
 
 ## Yahoo Japan NGT
 

@@ -3,7 +3,7 @@
 Build the release Python module, then run:
 
 ```bash
-python scripts/size_map/generate_size_map.py
+python benchmarks/size_map/generate_size_map.py
 ```
 
 Pass `--wheel dist/alayalite-....whl` after packaging to record the exact wheel

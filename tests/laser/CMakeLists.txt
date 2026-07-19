@@ -402,7 +402,7 @@ endif()
 # space.
 
 # W0 oracle base for the LASER IP kernel: pins ground truth from the immutable official RaBitQ-Library METRIC_IP fixture
-# (generated offline by space/tools/gen_ip_official_fixture.cpp), the in-repo memqg RaBitQCore/RaBitQSpace path, and
+# (generated offline by space/tools/gen_ip_official_fixture.cpp), the in-repo memory-QG RaBitQCore/RaBitQSpace path, and
 # brute-force exact, plus the one-bit error bound and degenerate-input contract. The fixture is read-only here; a
 # missing/bad fixture is a hard failure.
 alaya_cc_target(

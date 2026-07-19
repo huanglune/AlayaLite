@@ -5,6 +5,10 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 # DiskANN internal mutable Segment contract
 
+> **Superseded / historical (2026-07-19).** The DiskANN index and Segment
+> family were retired. This document records the former Gate 8-B contract and
+> does not describe a current C++ or Python surface.
+
 ## Scope and gate
 
 Gate 8-B adds a Collection-internal mutation bundle to `DiskAnnSegment`. It is

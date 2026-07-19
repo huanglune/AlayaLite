@@ -5,6 +5,11 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 # Manifest v2 control plane and DiskFlat segment
 
+> **Historical Gate 6 baseline (updated 2026-07-19).** Manifest v2 and
+> DiskFlat remain live, but the DiskCollection, Vamana, and memory-engine
+> inventory in this document predates their retirement. Read those portions
+> as rollout history, not current availability.
+
 Gate 6 introduces a Collection-owned manifest without changing
 `DiskCollection` v1 or the three native DiskFlat files. The implementation is
 internal C++ infrastructure; Python dispatch and the five memory-segment

@@ -11,7 +11,7 @@
  * ground truth it must reproduce. The authoritative references are:
  *
  *   1. The IMMUTABLE official fixture ip_official_fixture.tsv, produced OFFLINE by
- *      tools/gen_ip_official_fixture.cpp actually linking RaBitQ-Library at commit
+ *      tests/laser/space/tools/gen_ip_official_fixture.cpp actually linking RaBitQ-Library at commit
  *      b1f613d7412a041000d1e71aaa323d3e7554e733 and calling
  *      one_bit_code_with_factor(..., METRIC_IP). CI here only READS the fixture; a
  *      missing / truncated / commit-mismatched / unparsable fixture is a HARD

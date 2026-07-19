@@ -5,6 +5,10 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 # DiskANN readonly Segment contract
 
+> **Superseded / historical (2026-07-19).** The DiskANN index and Segment
+> family were retired. The identities and APIs below are preserved only as a
+> migration record.
+
 `alaya::disk::DiskAnnSegment` is the Gate 8 readonly adapter for the retained
 `alaya::diskann::DiskANNIndex`. The native index continues to own graph
 traversal, cached beam scheduling, page reads, PQ rerank and its bounded

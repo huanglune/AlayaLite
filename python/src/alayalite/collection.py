@@ -702,11 +702,11 @@ class Collection:
         return self._require_native().checkpoint()
 
     def seal(self) -> dict:
-        """Rotate to a successor and publish an immutable Flat generation."""
+        """Rotate to a successor and publish the configured immutable target."""
         return self._require_native().seal()
 
     def compact(self) -> dict:
-        """Merge all eligible sealed Flat generations into one Flat generation."""
+        """Merge eligible sealed generations into one configured target."""
         return self._require_native().compact()
 
     def gc(self) -> dict:

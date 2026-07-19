@@ -133,7 +133,7 @@ C++ core (`include/`):
 
 | Scope | Path |
 |-------|------|
-| `index` | `include/index/` (general graph indices, e.g. HNSW, Vamana) |
+| `index` | `include/index/` (Collection targets and graph-build primitives) |
 | `disk` | `include/index/disk/` |
 | `laser` | `include/index/graph/laser/` |
 | `executor` | `include/executor/` |
@@ -148,7 +148,7 @@ Python and apps:
 | Scope | Path |
 |-------|------|
 | `python` | `python/src/alayalite/` (Python SDK, bindings) |
-| `bench` | `python/src/alayalite/bench/`, `python/tests/bench/` |
+| `bench` | `benchmarks/` and benchmark-specific tests |
 | `app` | `app/` |
 | `examples` | `examples/` |
 

@@ -13,7 +13,7 @@
  *      that maps a per-row integer seed to float vectors using only integer LCG
  *      arithmetic and an exactly-representable float mapping (multiples of 1/16).
  *      This is used byte-identically by BOTH the offline fixture generator
- *      (tools/gen_ip_official_fixture.cpp, which links the official
+ *      (tests/laser/space/tools/gen_ip_official_fixture.cpp, which links the official
  *      RaBitQ-Library) and the CI tests, so the tests reproduce the exact inputs
  *      the official factors were computed from -- with no std::normal_distribution
  *      cross-stdlib drift (codex review item 4 / B-LIP-08).
@@ -168,7 +168,7 @@ inline auto load_ip_fixture(std::string *err) -> std::vector<FixtureRow> {
   std::ifstream in(path);
   if (!in.good()) {
     *err = "official IP fixture missing or unreadable at '" + path +
-           "' -- regenerate with tools/gen_ip_official_fixture.cpp (NOT in CI build)";
+           "' -- regenerate with tests/laser/space/tools/gen_ip_official_fixture.cpp (NOT in CI build)";
     return {};
   }
   bool commit_seen = false;

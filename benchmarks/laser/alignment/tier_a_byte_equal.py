@@ -11,7 +11,7 @@ a compact `Index.fit` wrapper.
 
 Usage:
     uv run python benchmarks/laser/alignment/tier_a_byte_equal.py \\
-        --port-config examples/laser/configs/synth_20k_768d_alayaP.toml \\
+        --port-config /path/to/alayalite-alignment.toml \\
         --upstream-config /path/to/Laser/configs/synth_20k_768d_origP.toml \\
         --out-root /path/to/output/ \\
         --skip-run
@@ -320,7 +320,7 @@ def main(argv: list[str] | None = None) -> int:
         "--port-config",
         type=Path,
         required=True,
-        help="AlayaLite alignment-mode TOML (examples/laser/configs/*_alayaP.toml)",
+        help="AlayaLite alignment-mode TOML used to produce the existing port artifacts",
     )
     p.add_argument(
         "--upstream-config",

@@ -3,17 +3,15 @@
 ## Development Setup
 
 ```bash
-# It is recommended to create a virtual environment first
+# Run from the repository root. A virtual environment is recommended.
 # python -m venv .venv && source .venv/bin/activate
-
-# Install dependencies from pyproject.toml
-pip install -e '.[api]'
+pip install -r app/requirements.txt "alayalite==1.2.0"
 ```
 
 ## Running Tests
 
 ```bash
-pytest
+pytest app/tests
 ```
 
 ## Running the Application
@@ -31,7 +29,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ### Build the Image
 
 ```bash
-docker build -t alayalite-standalone .
+docker build -t alayalite-standalone app
 ```
 
 ### Run the Container

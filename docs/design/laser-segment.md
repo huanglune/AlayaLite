@@ -5,6 +5,11 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 # LASER immutable disk segment
 
+> **Superseded / historical (2026-07-19).** This document freezes the former
+> imported, rank-only adapter. Current Collection `qg`/LASER segments return
+> numerically comparable scores, and Linux builds also have a separate
+> writable LASER active-engine surface.
+
 `LaserSegment` is the open-only `AnySegment` producer for an imported LASER
 disk quantized graph. It composes `LaserSegmentSearcher`; the LASER beam, page
 I/O, scanner, and parameter-cache loops are unchanged. The segment boundary is
