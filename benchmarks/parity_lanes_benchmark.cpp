@@ -42,6 +42,7 @@
 #endif
 
 #include "core/any_segment.hpp"
+#include "index/collection/collection.hpp"
 #include "index/disk/laser_segment.hpp"
 #include "index/disk/laser_segment_importer.hpp"
 #include "index/graph/qg/qg_segment.hpp"
@@ -52,6 +53,22 @@
 #include "utils/memory.hpp"
 #include "utils/openmp.hpp"
 
+namespace alaya::internal::collection {
+
+// Benchmark-only construction seam: the measured calls still enter the public Collection::search
+// facade, while preparation can register an already-built sealed segment without rebuilding it.
+class CollectionTestAccess {
+ public:
+  [[nodiscard]] static auto wrap(CollectionOptions options,
+                                 std::shared_ptr<SegmentedCollection> implementation)
+      -> std::shared_ptr<Collection> {
+    return std::shared_ptr<Collection>(
+        new Collection(std::move(options), std::move(implementation), CollectionControlState{}));
+  }
+};
+
+}  // namespace alaya::internal::collection
+
 namespace {
 
 namespace fs = std::filesystem;
@@ -60,6 +77,14 @@ using MemorySpace = alaya::RaBitQSpace<>;
 using MemorySegment = alaya::QgSegment<MemorySpace>;
 
 constexpr std::size_t kLargeAlignment = 2U * 1024U * 1024U;
+
+enum class DispatchMode : std::uint8_t { single = 0, batch = 1 };
+
+enum class LaserResidencyArm : std::uint8_t {
+  resident_arena = 0,
+  paged_pool = 1,
+  paged_full_cache = 2,
+};
 
 struct Args {
   fs::path query_path{};
@@ -83,11 +108,56 @@ struct Args {
   std::uint32_t build_threads{64};
   std::uint32_t ef_build{100};
   std::uint32_t laser_degree{32};
+  std::uint32_t batch_rows{64};
   double minimum_measure_seconds{};
+  DispatchMode dispatch_mode{DispatchMode::single};
+  LaserResidencyArm laser_residency{LaserResidencyArm::resident_arena};
   bool prepare_only{};
   bool force_rebuild_memqg{};
   bool laser_import_copy{};
+  bool collection_e2e{};
+  bool return_distances{};
 };
+
+[[nodiscard]] auto parse_dispatch_mode(std::string_view value) -> DispatchMode {
+  if (value == "single") {
+    return DispatchMode::single;
+  }
+  if (value == "batch") {
+    return DispatchMode::batch;
+  }
+  throw std::invalid_argument("--dispatch must be single or batch");
+}
+
+[[nodiscard]] auto parse_laser_residency(std::string_view value) -> LaserResidencyArm {
+  if (value == "resident_arena") {
+    return LaserResidencyArm::resident_arena;
+  }
+  if (value == "paged_pool") {
+    return LaserResidencyArm::paged_pool;
+  }
+  if (value == "paged_full_cache") {
+    return LaserResidencyArm::paged_full_cache;
+  }
+  throw std::invalid_argument(
+      "--laser-residency must be resident_arena, paged_pool, or paged_full_cache");
+}
+
+[[nodiscard]] constexpr auto dispatch_mode_name(DispatchMode mode) -> std::string_view {
+  return mode == DispatchMode::batch ? "batch" : "single";
+}
+
+[[nodiscard]] constexpr auto laser_residency_name(LaserResidencyArm residency) -> std::string_view {
+  switch (residency) {
+    case LaserResidencyArm::resident_arena:
+      return "resident_arena";
+    case LaserResidencyArm::paged_pool:
+      return "paged_pool";
+    case LaserResidencyArm::paged_full_cache:
+      return "paged_full_cache";
+  }
+  return "unknown";
+}
 
 [[nodiscard]] auto parse_u32(std::string_view value, std::string_view option) -> std::uint32_t {
   std::size_t consumed{};
@@ -196,6 +266,12 @@ template <typename Value, typename Parse>
                "  --query-limit N              0 means all queries, default 0\n"
                "  --min-measure-seconds S      repeat full passes to this duration, default 0\n"
                "  --beam N                     LASER per-call beam, default 16\n"
+               "  --dispatch MODE              single (default) or public multi-row batch\n"
+               "  --batch-rows N               rows per public batch call, default 64\n"
+               "  --laser-residency MODE       resident_arena (default), paged_pool, or\n"
+               "                                 paged_full_cache\n"
+               "  --collection-e2e             compare LASER segment face with Collection path\n"
+               "  --return-distances           request numeric LASER distances on both arms\n"
                "  --cpu-list LIST              CPU ids/ranges; default is current allowed set\n"
                "  --dataset NAME               metadata label, default sift1m-128d\n\n"
                "Optional one-time preparation (excluded from measurement):\n"
@@ -227,6 +303,14 @@ template <typename Value, typename Parse>
     }
     if (option == "--laser-import-copy") {
       args.laser_import_copy = true;
+      continue;
+    }
+    if (option == "--collection-e2e") {
+      args.collection_e2e = true;
+      continue;
+    }
+    if (option == "--return-distances") {
+      args.return_distances = true;
       continue;
     }
     if (index + 1 >= argc) {
@@ -277,6 +361,12 @@ template <typename Value, typename Parse>
       args.ef_build = parse_u32(value, option);
     } else if (option == "--laser-degree") {
       args.laser_degree = parse_u32(value, option);
+    } else if (option == "--batch-rows") {
+      args.batch_rows = parse_u32(value, option);
+    } else if (option == "--dispatch") {
+      args.dispatch_mode = parse_dispatch_mode(value);
+    } else if (option == "--laser-residency") {
+      args.laser_residency = parse_laser_residency(value);
     } else {
       throw std::invalid_argument("unknown option " + std::string(option));
     }
@@ -290,7 +380,7 @@ template <typename Value, typename Parse>
     throw std::invalid_argument("measurement also requires --gt and --output-prefix");
   }
   if (args.top_k == 0 || args.repeats == 0 || args.beam_width == 0 || args.build_threads == 0 ||
-      args.ef_build == 0 || args.laser_degree == 0 || args.lanes.empty() ||
+      args.ef_build == 0 || args.laser_degree == 0 || args.batch_rows == 0 || args.lanes.empty() ||
       args.laser_efs.empty() || args.memqg_efs.empty()) {
     throw std::invalid_argument(
         "topk/repeats/beam/build values and all grid lists must be nonzero");
@@ -312,6 +402,12 @@ template <typename Value, typename Parse>
     if (ef < args.top_k) {
       throw std::invalid_argument("every MemQG ef must be >= topk");
     }
+  }
+  if (args.collection_e2e && args.dispatch_mode != DispatchMode::single) {
+    throw std::invalid_argument("--collection-e2e currently requires --dispatch single");
+  }
+  if (args.collection_e2e && !args.return_distances) {
+    throw std::invalid_argument("--collection-e2e requires --return-distances");
   }
   return args;
 }
@@ -601,7 +697,204 @@ void build_memqg(const Args &args, std::uint32_t expected_dim) {
   return std::move(erased).value();
 }
 
-[[nodiscard]] auto open_laser(const fs::path &directory) -> alaya::core::AnySegment {
+class FullCachePagedSegment {
+ public:
+  explicit FullCachePagedSegment(const fs::path &directory)
+      : searcher_(std::make_shared<alaya::disk::LaserSegmentSearcher>(directory)),
+        manifest_(alaya::disk::SegmentManifest::load(directory / "manifest.txt")) {
+    // LaserSegmentSearcher's normal paged open is intentionally capped at kCacheRatio (15%).
+    // Materialize through the public graph seam, then keep calling LaserSegmentSearcher::search:
+    // the paged kernel remains selected, but every row lookup can hit the resident cache.
+    searcher_->graph().ensure_resident_arena();
+  }
+
+  [[nodiscard]] auto descriptor() const noexcept -> alaya::core::Descriptor {
+    alaya::core::Descriptor descriptor;
+    descriptor.algorithm_id = alaya::core::algorithm::laser;
+    descriptor.format_version = alaya::disk::LaserSegment::kFormatVersion;
+    descriptor.factory_version = 1;
+    descriptor.dim = searcher_->dim();
+    descriptor.metric = manifest_.metric;
+    descriptor.stored_scalar_type = alaya::core::ScalarType::float32;
+    descriptor.medium = alaya::core::Medium::disk;
+    descriptor.engine_factory_id = alaya::core::algorithm::laser;
+    return descriptor;
+  }
+
+  [[nodiscard]] auto search(const alaya::core::SearchRequest &request) const
+      -> alaya::core::Status {
+    if (request.queries.rows != 1) {
+      return alaya::core::Status::error(alaya::core::StatusCode::invalid_argument,
+                                        alaya::core::OperationStage::validation,
+                                        alaya::core::StatusDetail::malformed_struct,
+                                        "full-cache paged single search requires one row");
+    }
+    return execute(request);
+  }
+
+  [[nodiscard]] auto batch_search(const alaya::core::SearchRequest &request) const
+      -> alaya::core::Status {
+    return execute(request);
+  }
+
+  [[nodiscard]] auto stats(alaya::core::SegmentStats &stats) const noexcept -> alaya::core::Status {
+    stats = alaya::core::SegmentStats{};
+    stats.snapshot_version = 1;
+    stats.live_rows = searcher_->size();
+    stats.allocated_rows = searcher_->size();
+    stats.health = alaya::core::SegmentHealth::healthy;
+    return alaya::core::Status::success();
+  }
+
+  [[nodiscard]] static auto into_any(std::shared_ptr<FullCachePagedSegment> segment)
+      -> alaya::core::Result<alaya::core::AnySegment> {
+    alaya::core::SegmentInstanceConfig config;
+    config.readonly = true;
+    config.concurrency.reentrant_search = true;
+    config.concurrency.cooperative_cancel = true;
+    return alaya::core::AnySegment::from_sync(std::move(segment), std::move(config));
+  }
+
+ private:
+  [[nodiscard]] auto execute(const alaya::core::SearchRequest &request) const
+      -> alaya::core::Status {
+    if (!alaya::core::is_current_struct(request) ||
+        !alaya::core::is_current_struct(request.options) || request.context == nullptr ||
+        request.response == nullptr ||
+        request.filter.kind != alaya::core::SegmentFilterKind::none) {
+      return alaya::core::Status::error(alaya::core::StatusCode::invalid_argument,
+                                        alaya::core::OperationStage::validation,
+                                        alaya::core::StatusDetail::malformed_struct,
+                                        "full-cache paged request is incomplete or filtered");
+    }
+    auto status = alaya::core::validate_tensor(request.queries,
+                                               searcher_->dim(),
+                                               alaya::core::OperationStage::validation);
+    if (!status.ok()) {
+      return status;
+    }
+    if (request.queries.scalar_type != alaya::core::ScalarType::float32 ||
+        request.options.top_k > std::numeric_limits<std::uint32_t>::max()) {
+      return alaya::core::Status::error(alaya::core::StatusCode::invalid_argument,
+                                        alaya::core::OperationStage::validation,
+                                        alaya::core::StatusDetail::malformed_struct,
+                                        "full-cache paged request has an unsupported tensor/topk");
+    }
+    status = alaya::core::validate_response(*request.response,
+                                            request.queries.rows,
+                                            request.options.top_k,
+                                            alaya::core::OperationStage::validation);
+    if (!status.ok()) {
+      return status;
+    }
+    status = alaya::core::validate_runtime_control(request.context->deadline,
+                                                   request.context->cancellation,
+                                                   alaya::core::OperationStage::search);
+    if (!status.ok()) {
+      return status;
+    }
+    alaya::disk::DiskSearchOptions defaults;
+    defaults.ef = std::max<std::uint32_t>(100U, static_cast<std::uint32_t>(request.options.top_k));
+    defaults.beam_width = 16;
+    auto resolved = alaya::disk::resolve_laser_search_extensions(request.options, defaults);
+    if (!resolved.ok()) {
+      return resolved.status();
+    }
+    const auto options = std::move(resolved).value();
+    auto &response = *request.response;
+    response.score_kind = options.return_distances ? alaya::core::ScoreKind::distance
+                                                   : alaya::core::ScoreKind::rank_only;
+    response.comparable_metric = manifest_.metric;
+    response.result_flags = alaya::core::ResultFlag::approximate;
+    if (request.options.top_k == 0 || request.queries.rows == 0) {
+      alaya::core::
+          initialize_empty_response(response,
+                                    request.queries.rows,
+                                    request.options.top_k == 0
+                                        ? alaya::core::SearchCompleteness::complete_k
+                                        : alaya::core::SearchCompleteness::eligible_exhausted);
+      return alaya::core::Status::success();
+    }
+    response.query_count = request.queries.rows;
+    response.offsets[0] = 0;
+    alaya::core::RowCount cursor{};
+    for (alaya::core::RowCount row = 0; row < request.queries.rows; ++row) {
+      try {
+        const auto hits = searcher_->search(request.queries.row<float>(row), options);
+        for (std::size_t hit = 0; hit < hits.size(); ++hit) {
+          response.hits[static_cast<std::size_t>(cursor) + hit] =
+              alaya::core::SearchHit(alaya::core::SegmentRowId(hits[hit].label),
+                                     hits[hit].distance,
+                                     response.score_kind,
+                                     manifest_.metric,
+                                     alaya::core::ResultFlag::approximate);
+        }
+        const auto written = static_cast<alaya::core::RowCount>(hits.size());
+        cursor += written;
+        response.offsets[row + 1] = cursor;
+        response.valid_counts[row] = written;
+        response.statuses[row] = alaya::core::Status::success();
+        response.completeness[row] = written == request.options.top_k
+                                         ? alaya::core::SearchCompleteness::complete_k
+                                         : alaya::core::SearchCompleteness::strategy_incomplete;
+      } catch (...) {
+        const auto failure =
+            alaya::core::status_from_exception(alaya::core::OperationStage::search);
+        response.offsets[row + 1] = cursor;
+        response.valid_counts[row] = 0;
+        response.statuses[row] = failure;
+        response.completeness[row] = alaya::core::SearchCompleteness::failed;
+        if (request.queries.rows == 1) {
+          return failure;
+        }
+      }
+    }
+    return alaya::core::Status::success();
+  }
+
+  std::shared_ptr<alaya::disk::LaserSegmentSearcher> searcher_;
+  alaya::disk::SegmentManifest manifest_;
+};
+
+class ScopedResidencyOverride {
+ public:
+  explicit ScopedResidencyOverride(std::string_view value) {
+    if (const char *existing = std::getenv("ALAYA_LASER_RESIDENCY"); existing != nullptr) {
+      previous_ = existing;
+    }
+    if (::setenv("ALAYA_LASER_RESIDENCY", std::string(value).c_str(), 1) != 0) {
+      throw std::runtime_error("cannot set ALAYA_LASER_RESIDENCY");
+    }
+  }
+
+  ScopedResidencyOverride(const ScopedResidencyOverride &) = delete;
+  auto operator=(const ScopedResidencyOverride &) -> ScopedResidencyOverride & = delete;
+
+  ~ScopedResidencyOverride() {
+    if (previous_.has_value()) {
+      (void)::setenv("ALAYA_LASER_RESIDENCY", previous_->c_str(), 1);
+    } else {
+      (void)::unsetenv("ALAYA_LASER_RESIDENCY");
+    }
+  }
+
+ private:
+  std::optional<std::string> previous_{};
+};
+
+[[nodiscard]] auto open_laser(const fs::path &directory, LaserResidencyArm residency)
+    -> alaya::core::AnySegment {
+  if (residency == LaserResidencyArm::paged_full_cache) {
+    auto erased =
+        FullCachePagedSegment::into_any(std::make_shared<FullCachePagedSegment>(directory));
+    if (!erased.ok()) {
+      throw std::runtime_error("cannot erase full-cache paged segment: " +
+                               erased.status().diagnostic());
+    }
+    return std::move(erased).value();
+  }
+  const ScopedResidencyOverride override(
+      residency == LaserResidencyArm::paged_pool ? "paged_pool" : "resident_arena");
   alaya::core::OpenContext context;
   auto segment =
       alaya::disk::LaserSegment::open_directory(directory, alaya::core::OpenOptions{}, context);
@@ -620,11 +913,11 @@ struct SharedSearchParameters {
   alaya::disk::LaserSegmentSearchExtension laser{};
   std::array<alaya::core::AlgorithmSearchExtension, 2> extensions{};
 
-  SharedSearchParameters(std::uint32_t ef, std::uint32_t beam) {
+  SharedSearchParameters(std::uint32_t ef, std::uint32_t beam, bool return_distances) {
     qg.effort = ef;
     laser.effort = ef;
     laser.beam_width = beam;
-    laser.return_distances = false;
+    laser.return_distances = return_distances;
     extensions[0] = alaya::make_qg_search_extension(qg);
     extensions[1] = alaya::disk::make_laser_segment_search_extension(laser);
     for (auto &extension : extensions) {
@@ -635,13 +928,16 @@ struct SharedSearchParameters {
 
 struct RunWork {
   const alaya::core::AnySegment *segment{};
+  std::shared_ptr<alaya::Collection> collection{};
   const Matrix<float> *queries{};
   std::uint32_t query_count{};
   std::uint32_t top_k{};
+  std::uint32_t rows_per_call{1};
   SharedSearchParameters parameters;
   std::vector<alaya::core::SearchHit> hits;
   std::vector<alaya::core::RowCount> valid_counts;
   std::atomic<std::uint32_t> next_query{};
+  std::atomic<std::uint64_t> operation_calls{};
   std::atomic<bool> start{};
   std::atomic<bool> failed{};
   std::mutex error_mutex{};
@@ -652,17 +948,24 @@ struct RunWork {
           std::uint32_t count,
           std::uint32_t requested_top_k,
           std::uint32_t ef,
-          std::uint32_t beam)
+          std::uint32_t beam,
+          bool return_distances,
+          DispatchMode dispatch_mode,
+          std::uint32_t batch_rows,
+          std::shared_ptr<alaya::Collection> collection_face = {})
       : segment(&selected_segment),
+        collection(std::move(collection_face)),
         queries(&query_matrix),
         query_count(count),
         top_k(requested_top_k),
-        parameters(ef, beam),
+        rows_per_call(dispatch_mode == DispatchMode::batch ? batch_rows : 1U),
+        parameters(ef, beam, return_distances),
         hits(static_cast<std::size_t>(count) * requested_top_k),
         valid_counts(count) {}
 
   void reset_for_run() {
     next_query.store(0, std::memory_order_relaxed);
+    operation_calls.store(0, std::memory_order_relaxed);
     start.store(false, std::memory_order_relaxed);
     failed.store(false, std::memory_order_relaxed);
     std::lock_guard lock(error_mutex);
@@ -679,43 +982,112 @@ struct RunWork {
 };
 
 struct CallStorage {
-  std::array<alaya::core::RowCount, 2> offsets{};
-  std::array<alaya::core::RowCount, 1> counts{};
-  std::array<alaya::core::Status, 1> statuses{};
-  std::array<alaya::core::SearchCompleteness, 1> completeness{};
+  std::vector<alaya::core::RowCount> offsets{};
+  std::vector<alaya::core::RowCount> counts{};
+  std::vector<alaya::core::Status> statuses{};
+  std::vector<alaya::core::SearchCompleteness> completeness{};
   alaya::core::SearchContext context{};
   alaya::core::SearchResponse response{};
   alaya::core::SearchRequest request{};
 
   CallStorage(std::uint32_t top_k,
-              std::span<const alaya::core::AlgorithmSearchExtension> extensions) {
-    response.offsets = offsets;
-    response.valid_counts = counts;
-    response.statuses = statuses;
-    response.completeness = completeness;
+              std::uint32_t max_rows,
+              std::span<const alaya::core::AlgorithmSearchExtension> extensions)
+      : offsets(static_cast<std::size_t>(max_rows) + 1U),
+        counts(max_rows),
+        statuses(max_rows),
+        completeness(max_rows) {
     request.options.top_k = top_k;
     request.options.extensions = extensions;
     request.context = &context;
     request.response = &response;
+  }
+
+  void configure(std::uint32_t rows, std::span<alaya::core::SearchHit> output) {
+    response.hits = output;
+    response.offsets = std::span(offsets).first(static_cast<std::size_t>(rows) + 1U);
+    response.valid_counts = std::span(counts).first(rows);
+    response.statuses = std::span(statuses).first(rows);
+    response.completeness = std::span(completeness).first(rows);
   }
 };
 
 // This is the only measured dispatch function. Engine identity is absent: both arms differ solely
 // in the AnySegment instance constructed above. Both algorithm extensions are present with
 // ignore_safe so this request shape is also field-for-field identical across the arms.
-void dispatch_query(const alaya::core::AnySegment &segment,
-                    const float *query,
-                    std::uint32_t dim,
-                    std::span<alaya::core::SearchHit> output,
-                    CallStorage &storage) {
-  storage.response.hits = output;
-  storage.request.queries = alaya::core::TypedTensorView::contiguous(query, 1, dim);
+void dispatch_segment(const alaya::core::AnySegment &segment,
+                      const float *queries,
+                      std::uint32_t rows,
+                      std::uint32_t dim,
+                      std::span<alaya::core::SearchHit> output,
+                      CallStorage &storage) {
+  storage.configure(rows, output);
+  storage.request.queries = alaya::core::TypedTensorView::contiguous(queries, rows, dim);
   const auto status = segment.search(storage.request);
   if (!status.ok()) {
     throw std::runtime_error(status.diagnostic());
   }
-  if (!storage.statuses[0].ok()) {
-    throw std::runtime_error(storage.statuses[0].diagnostic());
+  for (std::uint32_t row = 0; row < rows; ++row) {
+    if (!storage.statuses[row].ok()) {
+      throw std::runtime_error(storage.statuses[row].diagnostic());
+    }
+  }
+}
+
+[[nodiscard]] auto decode_legacy_id(const alaya::core::LogicalId &id) -> std::uint64_t {
+  const auto bytes = id.canonical_bytes();
+  if (id.kind() != alaya::core::LogicalIdKind::legacy_uint64 ||
+      bytes.size() != sizeof(std::uint64_t)) {
+    throw std::runtime_error("Collection returned a non-legacy logical id");
+  }
+  std::uint64_t value{};
+  for (const auto byte : bytes) {
+    value = (value << 8U) | std::to_integer<std::uint8_t>(byte);
+  }
+  return value;
+}
+
+void dispatch_collection(alaya::Collection &collection,
+                         const float *queries,
+                         std::uint32_t rows,
+                         std::uint32_t dim,
+                         std::span<alaya::core::SearchHit> output,
+                         CallStorage &storage) {
+  storage.configure(rows, output);
+  const auto tensor = alaya::core::TypedTensorView::contiguous(queries, rows, dim);
+  auto result = rows == 1
+                    ? collection.search(tensor, storage.request.options, storage.context)
+                    : collection.batch_search(tensor, storage.request.options, storage.context);
+  if (!result.ok()) {
+    throw std::runtime_error(result.status().diagnostic());
+  }
+  const auto &response = result.value();
+  if (response.valid_counts.size() != rows || response.offsets.size() != rows + 1U ||
+      response.statuses.size() != rows || response.completeness.size() != rows) {
+    throw std::runtime_error("Collection response shape is incompatible with the request");
+  }
+  for (std::uint32_t row = 0; row < rows; ++row) {
+    if (!response.statuses[row].ok()) {
+      throw std::runtime_error(response.statuses[row].diagnostic());
+    }
+    storage.counts[row] = response.valid_counts[row];
+    storage.statuses[row] = response.statuses[row];
+    storage.completeness[row] = response.completeness[row];
+    const auto begin = response.offsets[row];
+    const auto end = response.offsets[row + 1U];
+    if (end < begin || end - begin != response.valid_counts[row]) {
+      throw std::runtime_error("Collection response offsets are malformed");
+    }
+    for (alaya::core::RowCount hit = 0; hit < end - begin; ++hit) {
+      const auto source = static_cast<std::size_t>(begin + hit);
+      const auto target = static_cast<std::size_t>(row) * storage.request.options.top_k + hit;
+      output[target] =
+          alaya::core::SearchHit(alaya::core::SegmentRowId(decode_legacy_id(response.ids[source])),
+                                 response.distances[source],
+                                 alaya::core::ScoreKind::rank_only,
+                                 alaya::core::Metric::l2,
+                                 alaya::core::ResultFlag::approximate);
+    }
   }
 }
 
@@ -852,20 +1224,36 @@ class FixedWorkerPool {
       }
 
       try {
-        CallStorage storage(work->top_k, work->parameters.extensions);
+        CallStorage storage(work->top_k, work->rows_per_call, work->parameters.extensions);
         for (;;) {
-          const auto query = work->next_query.fetch_add(1, std::memory_order_relaxed);
+          const auto query =
+              work->next_query.fetch_add(work->rows_per_call, std::memory_order_relaxed);
           if (query >= work->query_count || work->failed.load(std::memory_order_acquire)) {
             break;
           }
+          const auto rows = std::min(work->rows_per_call, work->query_count - query);
           auto output = std::span<alaya::core::SearchHit>(work->hits)
-                            .subspan(static_cast<std::size_t>(query) * work->top_k, work->top_k);
-          dispatch_query(*work->segment,
-                         work->queries->row(query),
-                         work->queries->columns,
-                         output,
-                         storage);
-          work->valid_counts[query] = storage.counts[0];
+                            .subspan(static_cast<std::size_t>(query) * work->top_k,
+                                     static_cast<std::size_t>(rows) * work->top_k);
+          if (work->collection != nullptr) {
+            dispatch_collection(*work->collection,
+                                work->queries->row(query),
+                                rows,
+                                work->queries->columns,
+                                output,
+                                storage);
+          } else {
+            dispatch_segment(*work->segment,
+                             work->queries->row(query),
+                             rows,
+                             work->queries->columns,
+                             output,
+                             storage);
+          }
+          for (std::uint32_t row = 0; row < rows; ++row) {
+            work->valid_counts[query + row] = storage.counts[row];
+          }
+          work->operation_calls.fetch_add(1, std::memory_order_relaxed);
         }
       } catch (const std::exception &error) {
         work->fail("lane=" + std::to_string(lane) + ",cpu=" + std::to_string(cpus_[lane]) + ": " +
@@ -903,6 +1291,7 @@ struct EngineArm {
   std::string name;
   alaya::core::AnySegment segment;
   std::vector<std::uint32_t> efs;
+  std::shared_ptr<alaya::Collection> collection{};
 };
 
 struct ResultSnapshot {
@@ -1004,10 +1393,13 @@ struct Record {
   std::uint32_t query_count{};
   std::uint32_t top_k{};
   std::uint32_t beam_width{};
+  std::string dispatch_mode;
+  std::uint32_t batch_rows{};
   std::uint32_t warmup_rounds{};
   std::uint32_t warmup_queries{};
   std::uint32_t measurement_rounds{};
   std::uint64_t search_calls{};
+  std::uint64_t operation_calls{};
   double elapsed_seconds{};
   std::uint64_t checksum{};
   std::string cpus;
@@ -1056,8 +1448,8 @@ class ResultWriter {
       throw std::runtime_error("cannot create output " + csv_path_.string());
     }
     csv_ << "dataset,arm,lanes,ef,qps,recall,repeat,order,sequence_position,query_count,top_k,"
-            "beam_width,warmup_rounds,warmup_queries,measurement_rounds,search_calls,"
-            "elapsed_seconds,checksum,cpu_list\n";
+            "beam_width,dispatch_mode,batch_rows,warmup_rounds,warmup_queries,measurement_rounds,"
+            "search_calls,operation_calls,elapsed_seconds,checksum,cpu_list\n";
   }
 
   void append(const Record &record) {
@@ -1066,10 +1458,11 @@ class ResultWriter {
          << std::fixed << std::setprecision(3) << record.qps << ',' << std::setprecision(8)
          << record.recall << ',' << record.repeat << ',' << record.order << ','
          << record.sequence_position << ',' << record.query_count << ',' << record.top_k << ','
-         << record.beam_width << ',' << record.warmup_rounds << ',' << record.warmup_queries << ','
-         << record.measurement_rounds << ',' << record.search_calls << ',' << std::setprecision(9)
-         << record.elapsed_seconds << ',' << std::hex << record.checksum << std::dec << ',' << '"'
-         << record.cpus << '"' << '\n';
+         << record.beam_width << ',' << record.dispatch_mode << ',' << record.batch_rows << ','
+         << record.warmup_rounds << ',' << record.warmup_queries << ',' << record.measurement_rounds
+         << ',' << record.search_calls << ',' << record.operation_calls << ','
+         << std::setprecision(9) << record.elapsed_seconds << ',' << std::hex << record.checksum
+         << std::dec << ',' << '"' << record.cpus << '"' << '\n';
     csv_.flush();
   }
 
@@ -1086,11 +1479,11 @@ class ResultWriter {
         alaya::simd::select_fp32_distance_level(features,
                                                 alaya::simd::get_distance_dispatch_policy());
     output << "{\n"
-              "  \"schema_version\": 2,\n"
+              "  \"schema_version\": 3,\n"
               "  \"status\": \"complete\",\n"
-              "  \"protocol\": \"external-fixed-pool/AnySegment-sync/single-row/fanout-1\",\n"
-              "  \"dispatch\": \"shared request carrying ignore-safe QG+LASER extensions; only "
-              "AnySegment construction differs\",\n"
+              "  \"protocol\": \"external-fixed-pool/fixed-query-lanes/fanout-1\",\n"
+              "  \"dispatch\": \"shared request carrying ignore-safe QG+LASER extensions; "
+              "secondary modes explicitly record batch or Collection face changes\",\n"
               "  \"config\": {\n"
            << "    \"dataset\": \"" << json_escape(args.dataset) << "\",\n"
            << "    \"query_path\": \"" << json_escape(args.query_path.string()) << "\",\n"
@@ -1105,11 +1498,18 @@ class ResultWriter {
            << "    \"ground_truth_columns\": " << ground_truth.columns << ",\n"
            << "    \"top_k\": " << args.top_k << ",\n"
            << "    \"beam_width\": " << args.beam_width << ",\n"
+           << "    \"dispatch_mode\": \"" << dispatch_mode_name(args.dispatch_mode) << "\",\n"
+           << "    \"batch_rows\": "
+           << (args.dispatch_mode == DispatchMode::batch ? args.batch_rows : 1U) << ",\n"
+           << "    \"laser_residency\": \"" << laser_residency_name(args.laser_residency) << "\",\n"
+           << "    \"collection_e2e\": " << (args.collection_e2e ? "true" : "false") << ",\n"
+           << "    \"return_distances\": " << (args.return_distances ? "true" : "false") << ",\n"
            << "    \"lanes\": \"" << join_numbers<std::uint32_t>(args.lanes) << "\",\n"
            << "    \"laser_efs\": \"" << join_numbers<std::uint32_t>(args.laser_efs) << "\",\n"
            << "    \"memqg_efs\": \"" << join_numbers<std::uint32_t>(args.memqg_efs) << "\",\n"
            << "    \"repeats_per_order\": " << args.repeats << ",\n"
-           << "    \"orders\": [\"forward_memqg_laser\", \"reverse_laser_memqg\"],\n"
+           << "    \"orders\": \"paired forward/reverse; concrete arm order is recorded per "
+              "measurement\",\n"
            << "    \"warmup_rounds_per_point\": " << args.warmup_rounds << ",\n"
            << "    \"warmup_queries_per_round\": "
            << (args.warmup_queries == 0 ? queries.rows
@@ -1150,11 +1550,13 @@ class ResultWriter {
              << ", \"repeat\": " << record.repeat << ", \"order\": \"" << json_escape(record.order)
              << "\", \"sequence_position\": " << record.sequence_position
              << ", \"query_count\": " << record.query_count << ", \"top_k\": " << record.top_k
-             << ", \"beam_width\": " << record.beam_width
+             << ", \"beam_width\": " << record.beam_width << ", \"dispatch_mode\": \""
+             << json_escape(record.dispatch_mode) << "\", \"batch_rows\": " << record.batch_rows
              << ", \"warmup_rounds\": " << record.warmup_rounds
              << ", \"warmup_queries\": " << record.warmup_queries
              << ", \"measurement_rounds\": " << record.measurement_rounds
              << ", \"search_calls\": " << record.search_calls
+             << ", \"operation_calls\": " << record.operation_calls
              << ", \"elapsed_seconds\": " << std::setprecision(9) << record.elapsed_seconds
              << ", \"checksum\": \"" << std::hex << record.checksum << std::dec
              << "\", \"cpu_list\": \"" << json_escape(record.cpus) << "\"}"
@@ -1190,6 +1592,46 @@ class ResultWriter {
   return stats.live_rows;
 }
 
+[[nodiscard]] auto make_collection_face(const alaya::core::AnySegment &segment,
+                                        alaya::core::RowCount rows,
+                                        std::uint32_t dim) -> std::shared_ptr<alaya::Collection> {
+  alaya::internal::collection::SegmentRegistration registration;
+  registration.segment_id = 1;
+  registration.generation = 1;
+  registration.role = alaya::internal::collection::SegmentRole::sealed;
+  registration.segment = segment;
+  registration.next_row_id = rows;
+  registration.rows.reserve(rows);
+  for (alaya::core::RowCount row = 0; row < rows; ++row) {
+    registration.rows.push_back(
+        alaya::internal::collection::RegisteredRow{alaya::core::LogicalId::from_legacy_uint64(row),
+                                                   alaya::core::SegmentRowId(row),
+                                                   0,
+                                                   alaya::internal::collection::VersionState::live,
+                                                   {}});
+  }
+  std::vector<alaya::internal::collection::SegmentRegistration> registrations;
+  registrations.push_back(std::move(registration));
+  auto opened =
+      alaya::internal::collection::SegmentedCollection::open({dim,
+                                                              alaya::core::Metric::l2,
+                                                              alaya::core::ScalarType::float32},
+                                                             std::move(registrations));
+  if (!opened.ok()) {
+    throw std::runtime_error("cannot construct Collection E2E face: " +
+                             opened.status().diagnostic());
+  }
+  alaya::CollectionOptions options;
+  options.root = "benchmark-only-collection";
+  options.dim = dim;
+  options.metric = alaya::core::Metric::l2;
+  options.scalar_type = alaya::core::ScalarType::float32;
+  options.target_algorithm = alaya::core::algorithm::laser;
+  options.quantization = alaya::CollectionQuantization::rabitq;
+  return alaya::internal::collection::CollectionTestAccess::wrap(std::move(options),
+                                                                 std::move(opened).value());
+}
+
 void warm_up(FixedWorkerPool &pool,
              const EngineArm &arm,
              const Matrix<float> &queries,
@@ -1198,7 +1640,16 @@ void warm_up(FixedWorkerPool &pool,
   const auto warmup_queries =
       args.warmup_queries == 0 ? queries.rows : std::min(args.warmup_queries, queries.rows);
   for (std::uint32_t round = 0; round < args.warmup_rounds; ++round) {
-    RunWork warmup(arm.segment, queries, warmup_queries, args.top_k, ef, args.beam_width);
+    RunWork warmup(arm.segment,
+                   queries,
+                   warmup_queries,
+                   args.top_k,
+                   ef,
+                   args.beam_width,
+                   args.return_distances,
+                   args.dispatch_mode,
+                   args.batch_rows,
+                   arm.collection);
     (void)pool.run(warmup);
   }
 }
@@ -1222,16 +1673,28 @@ void run_grid(const Args &args,
       for (const bool forward : orders) {
         std::array<EngineArm *, 2> arms = forward ? std::array<EngineArm *, 2>{&memqg, &laser}
                                                   : std::array<EngineArm *, 2>{&laser, &memqg};
-        const std::string order = forward ? "forward_memqg_laser" : "reverse_laser_memqg";
+        const std::string order =
+            std::string(forward ? "forward_" : "reverse_") + arms[0]->name + "_" + arms[1]->name;
         for (std::size_t position = 0; position < arms.size(); ++position) {
           auto &arm = *arms[position];
           for (const auto ef : arm.efs) {
             warm_up(pool, arm, queries, args, ef);
-            RunWork work(arm.segment, queries, queries.rows, args.top_k, ef, args.beam_width);
+            RunWork work(arm.segment,
+                         queries,
+                         queries.rows,
+                         args.top_k,
+                         ef,
+                         args.beam_width,
+                         args.return_distances,
+                         args.dispatch_mode,
+                         args.batch_rows,
+                         arm.collection);
             double elapsed{};
             std::uint32_t measurement_rounds{};
+            std::uint64_t operation_calls{};
             do {
               elapsed += pool.run(work);
+              operation_calls += work.operation_calls.load(std::memory_order_relaxed);
               ++measurement_rounds;
             } while (elapsed < args.minimum_measure_seconds);
             const auto search_calls = static_cast<std::uint64_t>(queries.rows) * measurement_rounds;
@@ -1261,10 +1724,13 @@ void run_grid(const Args &args,
                                 queries.rows,
                                 args.top_k,
                                 args.beam_width,
+                                std::string(dispatch_mode_name(args.dispatch_mode)),
+                                args.dispatch_mode == DispatchMode::batch ? args.batch_rows : 1U,
                                 args.warmup_rounds,
                                 warmup_query_count,
                                 measurement_rounds,
                                 search_calls,
+                                operation_calls,
                                 elapsed,
                                 result_checksum(snapshot),
                                 join_ints(pool.cpus())};
@@ -1315,7 +1781,20 @@ auto main(int argc, char **argv) -> int {
     cpus.resize(max_lanes);
 
     EngineArm memqg{"memqg", open_memqg(args.memqg_index_path), args.memqg_efs};
-    EngineArm laser{"laser_arena", open_laser(args.laser_segment_directory), args.laser_efs};
+    const auto laser_name = [&]() -> std::string {
+      switch (args.laser_residency) {
+        case LaserResidencyArm::resident_arena:
+          return "laser_arena";
+        case LaserResidencyArm::paged_pool:
+          return "laser_paged_15pct";
+        case LaserResidencyArm::paged_full_cache:
+          return "laser_paged_full";
+      }
+      return "laser_unknown";
+    }();
+    EngineArm laser{laser_name,
+                    open_laser(args.laser_segment_directory, args.laser_residency),
+                    args.laser_efs};
     const auto memqg_rows = validate_segment(memqg, queries.columns);
     const auto laser_rows = validate_segment(laser, queries.columns);
     if (memqg_rows != laser_rows) {
@@ -1328,9 +1807,24 @@ auto main(int argc, char **argv) -> int {
               << ",lanes=" << join_numbers<std::uint32_t>(args.lanes) << ",cpus=" << join_ints(cpus)
               << ",repeats_per_order=" << args.repeats << ",warmup_rounds=" << args.warmup_rounds
               << ",min_measure_seconds=" << args.minimum_measure_seconds
+              << ",dispatch=" << dispatch_mode_name(args.dispatch_mode) << ",batch_rows="
+              << (args.dispatch_mode == DispatchMode::batch ? args.batch_rows : 1U)
+              << ",laser_residency=" << laser_residency_name(args.laser_residency)
+              << ",collection_e2e=" << args.collection_e2e
+              << ",return_distances=" << args.return_distances
               << ",laser_simd=" << alaya::laser::simd::get_laser_simd_name()
               << ",memqg_simd=" << alaya::rabitq_simd::get_rabitq_simd_name() << '\n';
-    run_grid(args, cpus, queries, ground_truth, memqg, laser, writer);
+    if (args.collection_e2e) {
+      if (args.laser_residency != LaserResidencyArm::resident_arena) {
+        throw std::invalid_argument("--collection-e2e requires resident_arena");
+      }
+      auto collection = make_collection_face(laser.segment, laser_rows, queries.columns);
+      EngineArm direct{"laser_segment", laser.segment, args.laser_efs};
+      EngineArm e2e{"laser_collection", laser.segment, args.laser_efs, std::move(collection)};
+      run_grid(args, cpus, queries, ground_truth, direct, e2e, writer);
+    } else {
+      run_grid(args, cpus, queries, ground_truth, memqg, laser, writer);
+    }
     writer.write_json(args, cpus, queries, ground_truth);
     std::cerr << "OUTPUT,csv=" << writer.csv_path() << ",json=" << writer.json_path() << '\n';
     return 0;
