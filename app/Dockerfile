@@ -1,6 +1,8 @@
 FROM python:3.12-slim-bookworm
 
-ARG ALAYALITE_VERSION=1.2.0
+# Default tracks pyproject.toml; override with a published release version
+# (the newest tagged release is what PyPI actually serves).
+ARG ALAYALITE_VERSION=1.1.0
 
 WORKDIR /
 COPY . /app

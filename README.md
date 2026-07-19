@@ -29,7 +29,7 @@
 - **Native LASER active surface**: C++ builds on Linux x86_64 can also opt
   into the writable LASER active engine; this is separate from the Python
   `flat`/`qg` family names.
-- **Lean distribution**: the AlayaLite 1.2.0 reference wheel is 5.9 MB.
+- **Lean distribution**: the Linux x86_64 reference wheel is 5.9 MB.
 - **Ease of Use**: [Intuitive APIs](https://github.com/AlayaDB-AI/AlayaLite/blob/main/python/README.md) in Python.
 
 ## Documentation
