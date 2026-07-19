@@ -162,6 +162,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- On Windows, durable file flushes (`sync_file_or_throw`) opened a probe
+  handle that denied concurrent writers, so every Collection append with
+  `wal_fsync` durability failed with `ERROR_SHARING_VIOLATION` while the
+  logical WAL held its own stream open. The probe now requests only
+  `GENERIC_WRITE` and shares read/write/delete. Found by the new
+  installed-wheel qg platform smoke, the first CI exercise of the Collection
+  write path on Windows.
 - LASER WAL recovery now fails closed on divergent label transactions,
   malformed label snapshots, and conflicting live label/PID ownership before
   exposing recovered state, while safely de-duplicating a legal same-transaction

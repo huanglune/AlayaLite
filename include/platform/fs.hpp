@@ -115,9 +115,13 @@ inline auto sync_file(const fs::path &path) -> void {
 // — a silent best-effort fsync would let a corrupt segment be published.
 inline auto sync_file_or_throw(const fs::path &path) -> void {
 #ifdef _WIN32
+  // FlushFileBuffers only needs GENERIC_WRITE, and the share mode must admit
+  // a concurrently open writer: the logical WAL flushes while its own append
+  // stream still holds the file, so a deny-write probe handle would fail with
+  // ERROR_SHARING_VIOLATION on every durable append.
   HANDLE h = ::CreateFileW(path.c_str(),
-                           GENERIC_READ | GENERIC_WRITE,
-                           FILE_SHARE_READ,
+                           GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            nullptr,
                            OPEN_EXISTING,
                            FILE_ATTRIBUTE_NORMAL,
