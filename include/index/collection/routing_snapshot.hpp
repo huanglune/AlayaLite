@@ -6,9 +6,11 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <shared_mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -51,6 +53,24 @@ struct SegmentEntry {
 using VersionMap = std::map<core::LogicalId, VersionEntry, LogicalIdLess>;
 using ReverseMap = std::map<RowAddress, ReverseEntry>;
 
+struct SegmentIdentity {
+  std::uint64_t segment_id{};
+  std::uint64_t generation{};
+
+  auto operator==(const SegmentIdentity &) const -> bool = default;
+};
+
+struct SegmentIdentityHash {
+  [[nodiscard]] auto operator()(const SegmentIdentity &identity) const noexcept -> std::size_t {
+    auto seed = std::hash<std::uint64_t>{}(identity.segment_id);
+    seed ^= std::hash<std::uint64_t>{}(identity.generation) + 0x9e3779b97f4a7c15ULL + (seed << 6U) +
+            (seed >> 2U);
+    return seed;
+  }
+};
+
+using KnownRowCounts = std::unordered_map<SegmentIdentity, core::RowCount, SegmentIdentityHash>;
+
 struct RoutingSnapshot {
   std::uint64_t generation{1};
   std::uint64_t visibility_watermark{};
@@ -59,6 +79,7 @@ struct RoutingSnapshot {
   std::vector<std::shared_ptr<SegmentEntry>> segments{};
   VersionMap versions{};
   ReverseMap reverse{};
+  KnownRowCounts known_row_counts{};
   core::RowCount searchable_live_count{};
   core::RowCount tombstone_count{};
 
@@ -83,14 +104,17 @@ struct RoutingSnapshot {
   }
 
   [[nodiscard]] auto known_rows_for(const SegmentEntry &segment) const -> core::RowCount {
-    core::RowCount count{};
+    const auto found =
+        known_row_counts.find(SegmentIdentity{segment.segment_id, segment.generation});
+    return found == known_row_counts.end() ? 0 : found->second;
+  }
+
+  void rebuild_known_row_counts() {
+    known_row_counts.clear();
     for (const auto &[address, unused] : reverse) {
       (void)unused;
-      if (address.segment_id == segment.segment_id && address.generation == segment.generation) {
-        ++count;
-      }
+      ++known_row_counts[SegmentIdentity{address.segment_id, address.generation}];
     }
-    return count;
   }
 };
 

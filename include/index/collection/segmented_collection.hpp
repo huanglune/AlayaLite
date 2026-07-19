@@ -3215,6 +3215,7 @@ class SegmentedCollection {
         ++snapshot.tombstone_count;
       }
     }
+    snapshot.rebuild_known_row_counts();
   }
 
   [[nodiscard]] auto closed_status(core::OperationStage stage) const -> core::Status {

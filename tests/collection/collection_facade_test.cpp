@@ -93,6 +93,19 @@ class TemporaryDirectory {
   return {reinterpret_cast<const char *>(bytes.data()), bytes.size()};
 }
 
+void expect_known_row_counts_match_reverse(
+    const internal::collection::RoutingSnapshot &snapshot) {
+  for (const auto &segment : snapshot.segments) {
+    const auto oracle = static_cast<core::RowCount>(
+        std::ranges::count_if(snapshot.reverse, [&](const auto &item) {
+          return item.first.segment_id == segment->segment_id &&
+                 item.first.generation == segment->generation;
+        }));
+    EXPECT_EQ(snapshot.known_rows_for(*segment), oracle)
+        << "segment_id=" << segment->segment_id << " generation=" << segment->generation;
+  }
+}
+
 [[nodiscard]] auto logical_wal_bytes(const std::filesystem::path &root) -> std::vector<char> {
   const auto path = root / ".alaya_internal" /
                     std::string(internal::collection::kCollectionWalNamespace) /
@@ -283,6 +296,8 @@ TEST(CollectionFacade, SealRotatesToSuccessorPublishesFlatAndReopens) {
   for (std::size_t index = 0; index < vectors.size(); ++index) {
     ASSERT_TRUE(collection->add(item("seal-" + std::to_string(index), vectors[index])).ok());
   }
+  expect_known_row_counts_match_reverse(
+      *internal::collection::CollectionTestAccess::pin_epoch(*collection));
 
   auto sealed = collection->seal();
   ASSERT_TRUE(sealed.ok()) << sealed.status().diagnostic();
@@ -304,6 +319,13 @@ TEST(CollectionFacade, SealRotatesToSuccessorPublishesFlatAndReopens) {
   EXPECT_EQ(target->lifecycle, internal::collection::SegmentLifecycleV2::sealed);
   EXPECT_EQ(target->wal_cut, sealed.value().wal_cut);
   EXPECT_EQ(manifest.gc.retained_sources, (std::vector<std::string>{"seg_00000004"}));
+  {
+    const auto snapshot = internal::collection::CollectionTestAccess::pin_epoch(*collection);
+    expect_known_row_counts_match_reverse(*snapshot);
+    const auto active = snapshot->find_active_mutable();
+    ASSERT_NE(active, nullptr);
+    EXPECT_EQ(snapshot->known_rows_for(*active), 0U);
+  }
 
   const auto wal_scan = internal::collection::CollectionLogicalWal::scan_file(
       temporary.path() / ".alaya_internal" /
@@ -317,6 +339,8 @@ TEST(CollectionFacade, SealRotatesToSuccessorPublishesFlatAndReopens) {
 
   const std::array<float, 2> successor_vector{10.0F, 0.0F};
   ASSERT_TRUE(collection->add(item("successor", successor_vector)).ok());
+  expect_known_row_counts_match_reverse(
+      *internal::collection::CollectionTestAccess::pin_epoch(*collection));
   const std::array<float, 2> query{};
   auto live = collection->search(core::TypedTensorView::contiguous(query.data(), 1, 2), 10);
   ASSERT_TRUE(live.ok()) << live.status().diagnostic();
@@ -327,6 +351,8 @@ TEST(CollectionFacade, SealRotatesToSuccessorPublishesFlatAndReopens) {
 
   auto reopened = Collection::open(temporary.path());
   ASSERT_TRUE(reopened.ok()) << reopened.status().diagnostic();
+  expect_known_row_counts_match_reverse(
+      *internal::collection::CollectionTestAccess::pin_epoch(*reopened.value()));
   auto after = reopened.value()->search(core::TypedTensorView::contiguous(query.data(), 1, 2), 10);
   ASSERT_TRUE(after.ok()) << after.status().diagnostic();
   EXPECT_EQ(after.value().ids, live.value().ids);

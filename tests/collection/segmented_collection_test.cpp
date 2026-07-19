@@ -190,6 +190,23 @@ class StaticSegment {
   return std::move(opened).value();
 }
 
+[[nodiscard]] auto oracle_known_rows(const RoutingSnapshot &snapshot,
+                                     std::uint64_t segment_id,
+                                     std::uint64_t generation) -> core::RowCount {
+  return static_cast<core::RowCount>(
+      std::ranges::count_if(snapshot.reverse, [&](const auto &item) {
+        return item.first.segment_id == segment_id && item.first.generation == generation;
+      }));
+}
+
+void expect_known_row_counts_match_reverse(const RoutingSnapshot &snapshot) {
+  for (const auto &segment : snapshot.segments) {
+    EXPECT_EQ(snapshot.known_rows_for(*segment),
+              oracle_known_rows(snapshot, segment->segment_id, segment->generation))
+        << "segment_id=" << segment->segment_id << " generation=" << segment->generation;
+  }
+}
+
 [[nodiscard]] auto make_search_request(const float *queries,
                                        core::RowCount rows,
                                        std::uint64_t top_k,
@@ -265,6 +282,109 @@ TEST(SegmentedCollection, StringLogicalIdInsertGetUpsertDeleteVisibility) {
   EXPECT_EQ(collection->stats().size, 0U);
   EXPECT_EQ(collection->stats().accepted_count, 0U);
   EXPECT_EQ(collection->stats().tombstone_count, 1U);
+}
+
+TEST(SegmentedCollection, KnownRowCountsFollowReverseMapAcrossMutationAndReplacement) {
+  SegmentRegistration generation_one;
+  generation_one.segment_id = 7;
+  generation_one.generation = 1;
+  generation_one.segment = readonly_any(std::make_shared<StaticSegment>(StaticSegment::Rows{
+      {0, {0.0F, 0.0F}},
+      {1, {1.0F, 0.0F}},
+  }));
+  generation_one.rows = {
+      {core::LogicalId::from_utf8("generation-one-live"),
+       core::SegmentRowId(0),
+       11,
+       VersionState::live,
+       owned_payload({0.0F, 0.0F})},
+      {core::LogicalId::from_utf8("generation-one-tombstone"),
+       core::SegmentRowId(1),
+       12,
+       VersionState::tombstone,
+       owned_payload({1.0F, 0.0F})},
+  };
+
+  SegmentRegistration generation_two;
+  generation_two.segment_id = 7;
+  generation_two.generation = 2;
+  generation_two.segment = readonly_any(
+      std::make_shared<StaticSegment>(StaticSegment::Rows{{0, {2.0F, 0.0F}}}));
+  generation_two.rows = {
+      {core::LogicalId::from_utf8("generation-two-live"),
+       core::SegmentRowId(0),
+       13,
+       VersionState::live,
+       owned_payload({2.0F, 0.0F})},
+  };
+
+  auto mutable_producer = std::make_shared<FakeMutableSegment>();
+  auto opened = SegmentedCollection::open(
+      {2, core::Metric::l2, core::ScalarType::float32},
+      {std::move(generation_one), std::move(generation_two), fake_registration(mutable_producer)});
+  ASSERT_TRUE(opened.ok()) << opened.status().diagnostic();
+  const auto collection = std::move(opened).value();
+
+  auto snapshot = collection->pin_routing_snapshot();
+  expect_known_row_counts_match_reverse(*snapshot);
+  ASSERT_NE(snapshot->find_segment(7, 1), nullptr);
+  ASSERT_NE(snapshot->find_segment(7, 2), nullptr);
+  EXPECT_EQ(snapshot->known_rows_for(*snapshot->find_segment(7, 1)), 2U);
+  EXPECT_EQ(snapshot->known_rows_for(*snapshot->find_segment(7, 2)), 1U);
+
+  core::MutationContext context;
+  const auto mutable_id = core::LogicalId::from_utf8("mutable");
+  ASSERT_TRUE(collection->write(write_request(mutable_id, {3.0F, 0.0F}), context).ok());
+  snapshot = collection->pin_routing_snapshot();
+  expect_known_row_counts_match_reverse(*snapshot);
+  EXPECT_EQ(snapshot->known_rows_for(*snapshot->find_segment(2, 1)), 1U);
+
+  ASSERT_TRUE(collection->write(write_request(mutable_id, {4.0F, 0.0F}), context).ok());
+  snapshot = collection->pin_routing_snapshot();
+  expect_known_row_counts_match_reverse(*snapshot);
+  EXPECT_EQ(snapshot->known_rows_for(*snapshot->find_segment(2, 1)), 2U);
+
+  ASSERT_TRUE(collection->erase(mutable_id, context).ok());
+  snapshot = collection->pin_routing_snapshot();
+  expect_known_row_counts_match_reverse(*snapshot);
+  // A logical deletion appends a tombstone row; all three physical reverse
+  // entries remain known and therefore must remain counted.
+  EXPECT_EQ(snapshot->known_rows_for(*snapshot->find_segment(2, 1)), 3U);
+
+  SegmentRegistration replacement_target;
+  replacement_target.segment_id = 7;
+  replacement_target.generation = 3;
+  replacement_target.role = SegmentRole::sealed;
+  replacement_target.segment = readonly_any(std::make_shared<StaticSegment>(StaticSegment::Rows{
+      {0, {0.0F, 0.0F}},
+      {1, {1.0F, 0.0F}},
+  }));
+  replacement_target.next_row_id = 2;
+  const std::array<RowAddress, 1> sources{{{7, 1, core::SegmentRowId(0)}}};
+  const std::array<SegmentReplacement, 2> replacements{{
+      {core::LogicalId::from_utf8("generation-one-live"),
+       {7, 1, core::SegmentRowId(0)},
+       {7, 3, core::SegmentRowId(0)},
+       11},
+      {core::LogicalId::from_utf8("generation-one-tombstone"),
+       {7, 1, core::SegmentRowId(1)},
+       {7, 3, core::SegmentRowId(1)},
+       12},
+  }};
+  ASSERT_TRUE(collection
+                  ->install_segment_replacement(sources,
+                                                std::move(replacement_target),
+                                                replacements)
+                  .ok());
+
+  snapshot = collection->pin_routing_snapshot();
+  expect_known_row_counts_match_reverse(*snapshot);
+  EXPECT_EQ(snapshot->find_segment(7, 1), nullptr);
+  ASSERT_NE(snapshot->find_segment(7, 2), nullptr);
+  ASSERT_NE(snapshot->find_segment(7, 3), nullptr);
+  EXPECT_EQ(snapshot->known_rows_for(*snapshot->find_segment(7, 2)), 1U);
+  EXPECT_EQ(snapshot->known_rows_for(*snapshot->find_segment(7, 3)), 2U);
+  EXPECT_EQ(oracle_known_rows(*snapshot, 7, 1), 0U);
 }
 
 TEST(SegmentedCollection, ShellFlagAndWriteModesHaveExplicitStatus) {
