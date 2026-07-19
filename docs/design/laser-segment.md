@@ -21,8 +21,8 @@ importer as a v3 build operation.
 The descriptor records algorithm `laser` (stable ID 7), format version 1, L2,
 float32, and disk medium. The format name `disk_laser_qg` follows the naming
 facade and the separate wire-format contract in
-[RaBitQ format contracts](rabitq-formats.md). A memory QG reader must never be
-selected for these artifacts.
+[RaBitQ format contracts](rabitq-formats.md). The retired memory-QG format has
+no reader and these artifacts must only reach LASER decoders.
 
 ## Rank-only result contract
 

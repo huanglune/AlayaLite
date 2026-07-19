@@ -323,10 +323,14 @@ tracked by PR #88.
 Canonical `qg` is now a same-id implementation swap: new Collection artifacts
 carry the `qg` algorithm/factory identity and the `qg_laser_segment` reader
 feature, while their physical files and service engine are LASER. The old
-`qg_segment` reader stays available for compatibility.
+`qg_segment` artifact format has no reader. A Collection manifest carrying
+that legacy feature is rejected with `not_supported` and a `re-seal` hint.
 
-The in-memory QG tree under `include/index/graph/qg/` remains builder-only. It
-provides the temporary metric-aware topology for inner-product/cosine LASER
-builds; its fixed degree limits those paths to `R <= 32`. Memory QG and LASER
-still have distinct, non-interchangeable RaBitQ serializations. See
+The in-memory QG tree under `include/index/graph/qg/` is builder-only.
+`memory_qg::Builder` provides the temporary metric-aware topology for
+inner-product/cosine LASER builds; its fixed degree limits those paths to
+`R <= 32`. It exports only a `FrozenGraphSnapshot`: there is no memory-QG
+search, open/save lifecycle, `AnySegment` registration, or current wire
+format. The retired memory-QG v1 bytes remain non-interchangeable with LASER.
+See
 [`rabitq-formats.md`](rabitq-formats.md) for the format contract.

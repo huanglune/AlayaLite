@@ -171,7 +171,7 @@ added to `ManifestReaderOptions.available_features` (`manifest_dual_reader.hpp:3
 | HNSW | `HnswSegment::build` (throws; needs Space) | **no** — `save()` only fills `ArtifactManifest` | memory | Phase 2 — needs txn/factory wrapper |
 | NSG | `MemoryGraphSegmentBase::build` (≥65 rows) | no | memory | Phase 3 |
 | Fusion | `MemoryGraphSegmentBase::build` (≥65 rows) | no | memory | Phase 3 |
-| QG | `QgSegment::build` (needs RaBitQSpace, f32, >32 rows) | no | memory | Phase 4 |
+| QG | public id seals through LASER; `memory_qg::Builder` is topology-only for IP/cosine | yes (LASER target) | disk | serving migration complete |
 | DiskANN | `DiskANNIndex::build` (low-level dir writer) | no (open-only Segment) | disk | Phase 5 (not a 1.1.0 gate) |
 
 Memory engines need a Collection-owned wrapper: run `ArtifactControlPlaneTransaction`

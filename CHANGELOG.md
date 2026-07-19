@@ -9,13 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Cosine metric support for the in-memory QG engine. QG normalizes rows
-  before RaBitQ quantization at build time and wraps the query boundary with
-  the same `L2NormalizedQuerySegment` adapter HNSW's cosine path used,
-  reusing RaBitQSpace's existing cosine-as-inner-product kernel routing.
-  `qg_target_support`/`build_qg_collection_target`/`open_qg_collection_target`
-  all accept cosine now (float32 + rabitq quantization, same row-count floor
-  as l2/inner_product).
+- Cosine metric support for the public Collection `qg` route. QG normalizes
+  rows before its topology build and wraps the query boundary with the same
+  `L2NormalizedQuerySegment` adapter HNSW's cosine path used. The temporary
+  memory-QG builder reuses RaBitQSpace's cosine-as-inner-product routing, then
+  hands a `FrozenGraphSnapshot` to the persisted LASER implementation.
 - Durable in-place updates for the LASER on-disk quantized graph (op-WAL, the
   G1 gate). `QGUpdater` gains an opt-in after-image write-ahead log
   (`UpdateParams::enable_wal`, off by default) that rides in the shared
@@ -74,8 +72,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The qg service route explicitly asks LASER for numeric distances and merges
   them without Collection reranking; results remain marked approximate. Direct
   LASER callers retain the rank-only default unless they opt into distances.
-  New readers continue to open legacy `qg_segment` artifacts, while the new
-  feature marker makes older readers reject the new physical format clearly.
+  The same-id swap initially kept a transition reader for legacy `qg_segment`
+  artifacts; the Removed entry below closes that transition. Current readers
+  recognize the feature and reject it with a `re-seal` diagnostic.
   On LASER-capable builds the qg support gate now mirrors the LASER dimension
   envelope (`33 <= dim <= 2048`); a qg seal outside that range follows the
   established unsupported-target contract and publishes Flat with the
@@ -128,12 +127,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `cross-platform-perf` GitHub workflow and its helper script. It compared
   Linux libaio against the Windows IOCP LASER backend, which this release
   removes (see below), and its benchmark scripts were already gone.
+- The memory-QG serving stack: `QgSegment`, its search/open/save/stats and
+  `AnySegment` registration surfaces, `GraphSearchJob`, and their serving-only
+  tests and benchmarks. The `qg_segment` v1 artifact reader, writer, golden
+  family, and legacy Collection builder are also retired. A manifest requiring
+  `qg_segment` now fails with `not_supported` and a message containing
+  `legacy qg_segment` and `re-seal`; rebuild the Collection with the current
+  version. `memory_qg::Builder` remains as a topology-only producer for the
+  inner-product/cosine `FrozenGraphSnapshot` → LASER build bridge.
 - The HNSW in-memory graph engine (`hnsw_segment`) and its build kernel,
   including the hand-rolled `hnswlib.hpp` it was built on. `algorithm::hnsw`
   (id `2`) remains reserved and is rejected by the capability gate, matching
-  nsg/fusion/vamana/diskann; `flat` and `qg` are unaffected. QG is now the
-  only in-memory graph engine (see the cosine-support entry above for how it
-  closes HNSW's one remaining capability gap).
+  nsg/fusion/vamana/diskann; `flat` and `qg` are unaffected. QG temporarily
+  remained the only in-memory graph service before the serving-stack removal
+  above; its topology builder continues to close the cosine build gap.
 - The `tools/codegen/dispatch.yaml`-driven canonical identity test matrix
   and its generator (`tools/codegen/gen.py`, the `alaya_codegen` CMake
   target, and the generated `python/tests/client/_dispatch_matrix_params.py`).

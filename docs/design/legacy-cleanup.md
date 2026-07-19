@@ -54,18 +54,16 @@ still produces and are pinned by the golden families.
 
 | Inventory | Reader | Why retained |
 |---|---|---|
-| Memory graph/space segment layouts (HNSW, NSG, Fusion; raw and quantized) | the graph/Space loaders in `index/graph/detail/memory_graph_segment.hpp` | Current canonical memory-segment serialization; covered by the memory golden families. |
-| Memory RaBitQ layout | the memory-QG/RaBitQ v1 loader in `index/graph/qg/qg_segment.hpp` | A distinct memory wire format with its own golden family; never shares a reader with LASER (see `rabitq-formats.md`). |
+| Retired memory RaBitQ v1 | no artifact reader; Collection recognizes `qg_segment` only to return `not_supported` plus `re-seal` | Not a current format or golden family; never shares a reader with LASER (see `rabitq-formats.md`). |
 | LASER segment layout | `index/disk/laser_segment_importer.hpp` | `disk_laser_qg` is a live supported wire format with a deterministic fixture. |
+| DiskFlat segment layout | `index/disk/disk_flat_segment.hpp` | The exact sealed fallback remains a current format with a deterministic golden. |
 | Disk segment manifest / factory | `index/disk/segment_manifest.hpp`, `index/disk/segment_factory.hpp` | Read the current manifest-v2 disk-segment inventory. |
 | Canonical collection WAL v1 and manifest v2 | canonical collection recovery + manifest reader | Current formats. |
 
-Memory RaBitQ and LASER are mathematically related but never share a reader.
-The independent `rabitq_format_separation_test` wraps a real memory-QG file in
-a complete LASER segment and verifies LASER open rejects its header; it also
-feeds the checked-in LASER fixture index to memory `QgSegment::open` and
-verifies the RaBitQ v1 header gate rejects it before allocation or rotator
-construction.
+Retired memory RaBitQ and LASER are mathematically related but never share a
+reader. `rabitq_format_separation_test` mints the old bytes directly as hostile
+input, wraps them in a complete LASER segment, and verifies LASER rejects the
+header. There is no inverse test because the memory reader no longer exists.
 
 ## Utils and lint scope
 
@@ -84,10 +82,8 @@ returning.
 
 ## Golden generation after API removal
 
-The 12 live current-format artifact families are generated and compared
-byte-for-byte. The dead DiskCollection-v1 `disk_flat` and `disk_vamana`
-collection layouts are not part of the 1.1.0 baseline because their only
-writer was removed. A focused test-only native generator exercises the current
-HNSW/NSG/Fusion segment `build` + `save` paths, and the LASER fixture uses its
-standalone native builder. Neither helper is linked into the wheel or exposes a
-legacy API.
+The baseline now contains three live artifact families and compares them
+byte-for-byte: `disk_flat_segment`, the standalone `laser_fixture`, and the
+Collection-owned `collection_qg_laser` form. The retired `memory_qg` family has
+neither a generator nor a reader. The helpers are test-only and are not linked
+into the wheel.

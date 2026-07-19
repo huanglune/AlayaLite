@@ -3,69 +3,84 @@ SPDX-FileCopyrightText: 2026 AlayaDB.AI
 SPDX-License-Identifier: AGPL-3.0-only
 -->
 
-# RaBitQ format contracts
+# RaBitQ build and format contracts
 
-AlayaLite has two RaBitQ graph pipelines with different rotation mathematics and storage
-contracts. Use **memory_qg** for the in-memory graph built around `RaBitQSpace`, and
-**disk_laser_qg** for LASER's disk-resident quantized graph. The compatibility aliases live in
-`include/index/graph/qg_naming.hpp`. The memory surface is the public
-`QgSegment`; its former public builder has moved to a detail-only kernel. LASER
-keeps its historical disk builder and graph names.
+AlayaLite has two RaBitQ graph pipelines with different rotation mathematics
+and storage contracts:
 
-`MemoryRaBitQFormat` and `LaserRaBitQFormat` below are conceptual format names. They are not C++
-types or interchangeable wire formats.
+- `memory_qg::Builder<RaBitQSpace<...>>` is a transient, topology-only build
+  path. It returns a `FrozenGraphSnapshot` and has no serving or serialization
+  surface.
+- `disk_laser_qg::{Builder, Graph}` is LASER's persisted and searchable
+  quantized graph. The compatibility names live in
+  `include/index/graph/qg_naming.hpp`.
+
+The former memory-QG v1 snapshot is retired. There is no `QgSegment`, artifact
+reader/writer, golden family, or Collection legacy builder. A manifest that
+requires `qg_segment` is recognized only so the opener can return an explicit
+`not_supported` error containing `legacy qg_segment` and `re-seal`.
 
 ## Contract comparison
 
-| Property | `MemoryRaBitQFormat` | `LaserRaBitQFormat` |
+| Property | Memory-QG builder scratch | LASER v1 format |
 | --- | --- | --- |
-| Current version | v1, implicit (no format tag in the snapshot) | v1, implicit (no format tag in the index page) |
-| Graph surface | `alaya::memory_qg::Segment<RaBitQSpace<...>>` | `alaya::disk_laser_qg::{Builder, Graph}` |
-| Rotation | `RotatorType` is serialized in the snapshot. The default is `FhtKacRotator`: four sign-flip/FHT rounds (with Kac walks when padding requires them). `MatrixRotator` and the registered `FhtRotator` are selectable legacy alternatives. | The graph owns the concrete single-round `laser::FHTRotator`, corresponding to `RotatorType::FhtRotator`. Its sign-scaled vector is stored in the companion `_rotator` artifact. |
-| Padding | The selected rotator determines padding; the default path rounds up for 64-wide fast scan and supports the FhtKac padding/truncation rules. | The v1 public LASER path admits `33 <= main_dim <= 2048`: its single-round `laser::FHTRotator` selects orders 6 through 11 using `ceil(log2(main_dim))`, so dimensions 33 through 64 use the order-6 table and `main_dim` need not be a power of two. Raw/exact terms retain `main_dim`, while FHT, RaBitQ codes, and FastScan use `padded_dim = 2^ceil(log2(main_dim))`. At graph degree `R`, padding adds `R * (padded_dim - main_dim) / 8` code bytes per node before sector rounding and may therefore grow the page allocation; node/page tails are zero-filled. |
-| Binary sign convention | A residual component `> 0` produces bit 1. The initial per-vector byte is formed most-significant-bit first, then `fastscan::pack_codes` transposes groups of 32 codes into nibble/SIMD order and zero-pads missing lanes. | A residual component `> 0` produces bit 1. Bits are first packed through 64-bit words, then each word's byte order and each byte's nibbles are reversed before LASER's 32-code nibble transpose; missing lanes are zero-padded. The intermediate bit/byte order is therefore a separate contract even where the current final fast-scan blocks compare equal. |
-| Factors | Two structure-of-arrays blocks: `f_add[degree]`, then `f_rescale[degree]`. | Three structure-of-arrays blocks: `triple_x[degree]`, then `factor_dq[degree]`, then `factor_vq[degree]`. `laser::Factor` documents this field order; page storage is not an array of `Factor`. |
-| Serialization destination | `RaBitQSpace::save` snapshot. Each stored node is raw vector, packed neighbor codes, all `f_add`, all `f_rescale`, then neighbor IDs; rotator state is also embedded in the snapshot. | LASER `.index` pages after a 4096-byte metadata sector. Each node payload is raw main/residual vector, packed codes, all three factor arrays, then neighbor IDs. Rotation is a companion artifact. |
+| Lifecycle | Build-local; discarded after snapshot export | Persisted, opened, and served |
+| Graph surface | `alaya::memory_qg::Builder<RaBitQSpace<...>>` | `alaya::disk_laser_qg::{Builder, Graph}` |
+| Output | `FrozenGraphSnapshot` adjacency, entry point, and degree bound | LASER `.index` plus rotator/cache sidecars |
+| Rotation | `RaBitQSpace` uses its configured `RotatorType` while constructing topology. The default is `FhtKacRotator`. No rotator bytes are exported. | The graph owns the single-round `laser::FHTRotator`; its sign-scaled vector is stored in the `_rotator` companion artifact. |
+| Padding | Builder scratch follows the selected RaBitQSpace rotator and its 64-wide fast-scan rules. | The public path admits `33 <= main_dim <= 2048` and uses `padded_dim = 2^ceil(log2(main_dim))` for FHT, codes, and FastScan while retaining `main_dim` for raw/exact terms. |
+| Binary sign convention | A positive residual produces bit 1; `fastscan::pack_codes` transposes groups of 32 scratch codes. These bytes never cross the builder boundary. | A positive residual produces bit 1. Bits pass through LASER's 64-bit word byte/nibble reversal before its 32-code transpose. |
+| Factors | Two scratch structure-of-arrays blocks: `f_add`, then `f_rescale`. | Three persisted structure-of-arrays blocks: `triple_x`, then `factor_dq`, then `factor_vq`. |
 
-Neither consumer may reinterpret or import the other format. Mathematical agreement is not byte
-compatibility.
+The IP/cosine Collection bridge deliberately uses the memory-QG builder for
+metric-aware topology and then passes the resulting `FrozenGraphSnapshot` to
+`laser::QGBuilder::build_from_graph`. The memory builder's fixed degree limits
+those persisted LASER paths to `R <= 32`. L2 continues to use native Vamana
+topology.
+
+## Retired memory-QG v1 bytes
+
+The retired snapshot interleaved each node's raw vector, packed neighbor codes,
+`f_add`, `f_rescale`, and neighbor IDs, with rotator state embedded in the same
+file. Those bytes are not a LASER index and must never be imported as one.
+`rabitq_format_separation_test.cpp` still mints such bytes directly as hostile
+input and verifies that LASER rejects them; this does not restore a reader or
+make the old layout a current artifact family.
 
 ## Factor mapping to the shared core
 
-`space/quant/rabitq_core.hpp` expresses the common result as
+`space/quant/rabitq_core.hpp` expresses the common calculation as
 `{base, signed_query_scale}`. For the L2 path:
 
-- `f_add = base` and `triple_x = base` (LASER may add the residual-dimension norm to
-  `triple_x` when assembling the disk node).
-- The legacy memory estimator consumes half-sign query values, so
-  `f_rescale = 2 * signed_query_scale`.
-- LASER consumes full-sign query values, so `factor_dq = signed_query_scale = f_rescale / 2`.
-- `factor_vq = factor_dq * (2 * popcount(sign_bits) - padded_dim)` supplies LASER's scalar-query
-  correction.
+- builder scratch `f_add = base`; LASER `triple_x = base` (plus any
+  residual-dimension norm used while assembling the disk node);
+- builder scratch consumes half-sign query values, so
+  `f_rescale = 2 * signed_query_scale`;
+- LASER consumes full-sign query values, so
+  `factor_dq = signed_query_scale = f_rescale / 2`;
+- `factor_vq = factor_dq * (2 * popcount(sign_bits) - padded_dim)` supplies
+  LASER's scalar-query correction.
 
-`tests/laser/rabitq_factor_equivalence_test.cpp` is the executable specification for factor,
-code, and complete-estimator equivalence. It also pins the intentional exact-zero difference:
-when the residual norm `r` is zero, memory v1 emits zero factors while LASER v1 retains its
-historical NaN factors. A future, explicitly versioned format upgrade should unify that policy;
-v1 bytes must not be silently rewritten.
+`tests/laser/rabitq_factor_equivalence_test.cpp` pins the mathematical mapping,
+code layout, and complete-estimator equivalence. It also records the historical
+zero-residual difference: the memory calculation emits zero factors while
+LASER v1 retains its NaN-factor behavior. LASER v1 bytes must not be silently
+rewritten.
 
 ## Consumer matrix
 
 | Producer or consumer | Required contract |
 | --- | --- |
-| `QgSegment`, `RaBitQSpace`, the detail QG build kernel, in-memory graph search/executor | `MemoryRaBitQFormat` |
-| `include/index/graph/laser/qg/`, LASER builder/searcher | `LaserRaBitQFormat` |
-| `LaserSegmentImporter`, `LaserSegment`, disk LASER segment factory/searcher | `LaserRaBitQFormat` artifacts only |
+| `memory_qg::Builder`, `QgBuilderKernel`, `QgBuildGraph`, `RaBitQSpace` | Build-local scratch; export only `FrozenGraphSnapshot` |
+| `include/index/graph/laser/qg/`, LASER builder/searcher | LASER v1 artifacts |
+| `LaserSegmentImporter`, `LaserSegment`, disk LASER factory/searcher | LASER v1 artifacts only |
+| Collection entry requiring `qg_segment` | Explicit `not_supported`; re-seal required |
 
-Python and manifest dispatch still use the historical string `"QG"` for LASER in several APIs.
-That string is behavior compatibility, not a format discriminator. Dispatch, WAL, segment, or
-factory code must resolve the engine first and must not select a RaBitQ decoder from the bare
-`"QG"` token. Renaming that public behavior is outside this contract change.
-
-For the legacy memory `Index` mapping from declared HNSW/NSG/Fusion rows to the
-actual QG engine, including honest descriptor/runtime keys and the Gate 9 plan,
-see [Memory QG legacy dispatch contract](memory-qg-legacy-dispatch.md).
+Python and manifest dispatch still use the historical string `"QG"` for LASER
+in several APIs. That string is behavior compatibility, not a format
+discriminator. Dispatch, WAL, segment, or factory code must resolve the engine
+before selecting a decoder.
 
 The open-only AnySegment contract, rank-only score domain, manifest-v2
-reference publication, and runtime fallback rules are specified in
+publication, and runtime fallback rules are specified in
 [LASER immutable disk segment](laser-segment.md).

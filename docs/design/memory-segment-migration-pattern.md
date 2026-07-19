@@ -5,11 +5,10 @@ SPDX-License-Identifier: AGPL-3.0-only
 
 # Memory graph to Segment migration pattern
 
-> **Superseded / historical (2026-07-17).** HNSW itself was retired in the
-> HNSW-retirement wave (`include/index/graph/hnsw/` deleted; QG is now the
-> sole in-memory graph engine). The Segment-API migration pattern this
-> document records is still the one QG and later producers followed, but the
-> "HNSW result" section below describes source that no longer exists. See
+> **Superseded / historical (updated 2026-07-19).** HNSW and the other memory
+> graph services were retired. Memory QG now survives only as
+> `memory_qg::Builder`, with no Segment or artifact reader. The Segment-API
+> migration pattern and result sections below are historical evidence. See
 > `CHANGELOG.md`'s `[Unreleased]` entry for the current state.
 
 HNSW is the reference migration for Gate 0 and the first producer adapted to
@@ -105,61 +104,19 @@ without changing the other engine. The retained NSG kernel seeds a fixed
 64-neighbor NN-Descent graph, so both segments reject builds with fewer than 65
 vectors instead of entering its out-of-range path.
 
-## Memory QG Gate 5 result
+## Memory QG Gate 5 result and retirement
 
-`QgSegment<RaBitQSpace<...>>` owns a `detail::QgGraph` containing the QG
-adjacency authority and entry point, plus the `RaBitQSpace` containing raw
-vectors, quantized neighbor codes, factors, the retained format-v1 graph
-slots, and its search executor. It exposes typed-tensor `build`, `open`,
-`search`, `batch_search`, `save`, `stats`, `descriptor() noexcept`, and
-`into_any`. It satisfies
-`Searchable`, `BatchSearchable`, `Saveable`, and `StatsProvider`, is reentrant
-for concurrent search, and explicitly does not satisfy `Mutable`.
+Gate 5 originally introduced a searchable `QgSegment`; that serving result is
+now retired. `memory_qg::Builder<RaBitQSpace<...>>` retains only the measured
+construction algorithm, build-context validation, and transient
+`QgBuildGraph`/`QgBuilderSpaceView` scratch. Its sole output is a validated
+`FrozenGraphSnapshot`. `GraphSearchJob`, the Segment lifecycle, legacy factory,
+and memory-QG v1 golden are gone.
 
-The segment consumes `BuildContext`, `OpenContext`, and `SearchContext`.
-`Descriptor.algorithm_id` and `engine_factory_id` are the stable core `qg`
-identity (`5`), and preprocessing is reported as engine-quantized. `save` uses
-the logical artifact name `qg` and returns schema version 1 / format version 1;
-`open` also accepts the former logical name `quant`. Both operations retain the
-`RaBitQSpace` codec, so existing one-file memory QG artifacts remain openable
-and save/open/save is byte-stable.
-
-Task Z4 (2026-07-12) completed the design §7.1 / §9.7 ownership handoff without
-changing format v1. That format interleaves each node's neighbor IDs with its
-raw vector, packed codes, and factors, so `detail::QgGraph` uses a zero-copy
-adjacency view over the retained neighbor-ID codec slots. It owns the graph API
-used by Segment build, validation, and search, and stores the authoritative
-entry point. `RaBitQSpace::ep_` is refreshed from that authority on save and is
-otherwise retained as a serialization/legacy mirror. The default
-`QgBuilderKernel<RaBitQSpace>` and `GraphSearchJob<RaBitQSpace>` specializations
-still access `RaBitQSpace` directly, preserving their source and object layout
-for the feature-off `legacy_qg_model` path. Segment build/search instantiate
-those retained kernels over `detail::QgSegmentSpaceView`, which delegates
-vector and quantization operations to `RaBitQSpace` and graph operations to
-`detail::QgGraph`. No rotator, factor, fastscan, packed-code, neighbor-ID layout,
-or prefetch position changed.
-
-The former public `index/graph/qg/qg_builder.hpp` signature is deleted. The
-retained construction implementation is
-`index/graph/qg/detail/qg_builder_kernel.hpp`; legacy fallback,
-materialized-view, executor, benchmark, and characterization consumers use
-that detail-only kernel until their own abstraction steps.
-
-The three legacy Python rows
-`{hnsw,nsg,fusion} x quant=rabitq` deliberately retain their historical
-behavior of building QG. Their current identity is `qg_segment/qg`; disabling
-the independent `qg_segment` feature bit selects
-`legacy_qg_model/qg`. Scalar-off and scalar-on variants use the same handoff.
-This is an introspection correction, not a request-type behavior change, and
-does not invent HNSW-over-RaBitQ. The complete pinned table and Gate 9 rule are
-in [Memory QG legacy dispatch contract](memory-qg-legacy-dispatch.md).
-
-Production QG construction retains historical random sources, so independent
-builds are not byte-deterministic. Differential coverage therefore uses the
-documented fallback: a legacy artifact is opened by `QgSegment`, save/open/save
-bytes are compared, and Segment versus direct search results are checked bit
-for bit. A fixed-rotator/fixed-neighbor QG v1 golden separately provides a
-reproducible format hash without changing the quantization implementation.
+The production consumer is the Collection IP/cosine seal bridge. It hands the
+snapshot to LASER's existing `build_from_graph` API and discards all memory-QG
+scratch. A manifest requiring `qg_segment` is explicitly rejected and must be
+re-sealed; it is not routed to a fallback reader.
 
 ## Vamana-memory Gate 5 result
 
@@ -222,7 +179,7 @@ change NSG behavior.
 | KNNG / NN-Descent | `nndescent_kernel / knng` | build kernel only; no Segment or searchable capability | `knng` bit records ownership only; no behavior switch |
 | NSG | `nsg_segment / nsg` | search, batch, save/open, stats; immutable | independent bit selects recorded `hnsw_segment / hnsw` legacy behavior |
 | Fusion | `fusion_segment / fusion` | search, batch, save/open, stats; immutable | independent bit selects recorded `hnsw_segment / hnsw` legacy behavior |
-| memory QG | `qg_segment / qg` | search, batch, save/open, stats; immutable | independent bit selects `legacy_qg_model / qg` |
+| memory QG | `memory_qg::Builder` | build kernel; exports `FrozenGraphSnapshot`; no Segment | no rollback reader; `qg_segment` requires re-seal |
 | Vamana-memory | `vamana_mem_segment / vamana` | search, batch, save/open, stats; immutable | no legacy memory factory; disabled is `not_supported` |
 
 KNNG and Vamana-memory have no Python dispatch row; the generated 33-row
@@ -240,7 +197,7 @@ of this audit.
 | HNSW | Segment (`Graph::data_storage_` plus `OverlayGraph::lists_`) | Segment (`OverlayGraph::ep_`) | `SearchSpace` / `BuildSpace` owned by Segment | 2/3: graph and entry point are outside Space; vectors remain in Space |
 | NSG | Segment (`Graph::data_storage_`) | Segment (`Graph::eps_`) | `SearchSpace` / `BuildSpace` owned by Segment | 2/3: graph and entry point are outside Space; vectors remain in Space |
 | Fusion | Segment (`Graph::data_storage_` plus retained overlay when HNSW supplies it) | Segment (`OverlayGraph::ep_`, otherwise `Graph::eps_`) | `SearchSpace` / `BuildSpace` owned by Segment | 2/3: graph and entry point are outside Space; vectors remain in Space |
-| memory QG | Segment (`detail::QgGraph`, with a zero-copy view over the format-v1 neighbor-ID slots in `RaBitQSpace::storage_`) | Segment (`detail::QgGraph::entry_point_`); `RaBitQSpace::ep_` is only the v1 codec/legacy mirror | `RaBitQSpace` (`storage_`, including raw vectors and quantized neighbor data) | 2/3 as of Task Z4 (2026-07-12): adjacency authority and entry point are in Segment; vectors remain in Space |
+| memory QG builder | transient `detail::QgBuildGraph` over `RaBitQSpace` scratch | transient build graph; exported into `FrozenGraphSnapshot` | build-local `RaBitQSpace` | no Segment ownership; all scratch dies after snapshot export |
 | Vamana-memory | Segment (`VamanaReader::graph_`) | Segment (`VamanaReader::start_`) | Segment (`VamanaMemSegment::vectors_`), with no Space object | 3/3 for the audited responsibilities |
 
 ## Per-row registry handoff
@@ -316,7 +273,7 @@ before `insert`, `erase`, or `core::Mutable` is added.
 
 ## Standard per-graph checklist
 
-Use these steps for searchable NSG, Fusion, memory QG, and Vamana-memory.
+Use these historical steps for searchable NSG, Fusion, and Vamana-memory.
 KNNG applies the inventory and format-freeze checks plus the kernel-only
 variant above; it deliberately skips Segment lifecycle/capability steps until
 independent searchability evidence exists.
