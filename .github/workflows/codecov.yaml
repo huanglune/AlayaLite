@@ -62,7 +62,8 @@ jobs:
       with:
         key: >-
           codecov-python-portable-v3-${{ runner.os }}-${{ runner.arch }}-gcc-Release-${{ hashFiles('conanfile.py',
-          'pyproject.toml', 'uv.lock', 'cmake/AlayaConan.cmake', 'cmake/vendor/conan_provider.cmake') }}
+          'pyproject.toml', 'uv.lock', 'cmake/AlayaConan.cmake', 'cmake/AlayaToolchain.cmake',
+          'cmake/vendor/conan_provider.cmake') }}
         # ccache-action adds the timestamp separator to restore keys; a trailing
         # dash here would produce a double-dash prefix that cannot match.
         restore-keys: |
@@ -71,6 +72,9 @@ jobs:
           py-unit-portable-v2-${{ runner.os }}-${{ runner.arch }}-Release
         max-size: 2G
 
+    - name: Reset compiler cache statistics
+      run: ccache -z
+
     - name: Install system dependencies
       run: sudo apt-get install -y gdb libaio-dev
 
@@ -78,6 +82,10 @@ jobs:
       run: |
         export CMAKE_ARGS="-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DALAYA_NATIVE_ARCH=OFF"
         uv sync --dev --locked
+
+    - name: Show compiler cache statistics
+      if: always()
+      run: ccache -s
 
     - name: Save Conan cache
       if: steps.conan-cache.outputs.cache-hit != 'true'
@@ -119,6 +127,9 @@ jobs:
     timeout-minutes: 90
     env:
       BUILD_JOBS: 2
+      # Hosted-runner evidence: j4 stretched CTest to 886-893s and timed out the
+      # crash matrix; j2 completed all tests in 428.85s. Keep the measured
+      # throughput optimum instead of oversubscribing the coverage build.
       CTEST_JOBS: 2
       # "." matches any label, so every labeled test runs in this lane. The
       # previous hand-maintained allowlist (unit|storage|simd|space|utils)
@@ -151,7 +162,8 @@ jobs:
       with:
         key: >-
           codecov-cpp-portable-v2-${{ runner.os }}-${{ runner.arch }}-gcc-13-Debug-${{ hashFiles('conanfile.py',
-          'pyproject.toml', 'uv.lock', 'cmake/AlayaConan.cmake', 'cmake/vendor/conan_provider.cmake') }}
+          'pyproject.toml', 'uv.lock', 'cmake/AlayaConan.cmake', 'cmake/AlayaToolchain.cmake',
+          'cmake/vendor/conan_provider.cmake', '.github/scripts/codecov/gnu_codecoverage.sh') }}
         # ccache-action adds the timestamp separator to restore keys; a trailing
         # dash here would produce a double-dash prefix that cannot match.
         restore-keys: |
@@ -159,11 +171,18 @@ jobs:
           codecov-cpp-portable-v2-${{ runner.os }}-${{ runner.arch }}-Debug
         max-size: 2G
 
+    - name: Reset compiler cache statistics
+      run: ccache -z
+
     - name: Install system dependencies
       run: sudo apt-get install -y lcov libaio-dev
 
     - name: Run c++ code coverage
       run: CMAKE_CXX_COMPILER_LAUNCHER=ccache bash .github/scripts/codecov/gnu_codecoverage.sh
+
+    - name: Show compiler cache statistics
+      if: always()
+      run: ccache -s
 
     - name: Save Conan cache
       if: steps.conan-cache.outputs.cache-hit != 'true'
