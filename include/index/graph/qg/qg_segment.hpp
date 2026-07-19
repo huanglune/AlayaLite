@@ -23,6 +23,7 @@
 #include "index/graph/frozen_graph_snapshot.hpp"
 #include "index/graph/qg/detail/qg_builder_kernel.hpp"
 #include "index/graph/qg/detail/qg_graph.hpp"
+#include "index/graph/qg/qg_search_extension.hpp"
 #include "space/rabitq_space.hpp"
 #include "space/space_concepts.hpp"
 
@@ -43,24 +44,6 @@ struct QgBuildOptions {
 
 static_assert(sizeof(QgBuildOptions) == 56,
               "same-toolchain layout regression canary for QG build options");
-
-struct QgSearchExtension {
-  core::VersionedStructHeader header{};
-  std::uint32_t effort{100};
-  std::uint32_t reserved_effort{};
-  std::uint64_t reserved[3]{};
-
-  QgSearchExtension() : header(core::current_struct_header<QgSearchExtension>()) {}
-};
-
-[[nodiscard]] inline auto make_qg_search_extension(const QgSearchExtension &options)
-    -> core::AlgorithmSearchExtension {
-  core::AlgorithmSearchExtension extension;
-  extension.algorithm_id = core::algorithm::qg;
-  extension.payload = std::addressof(options);
-  extension.payload_size = sizeof(options);
-  return extension;
-}
 
 template <typename SpaceType>
   requires Space<SpaceType> && is_rabitq_space_v<SpaceType>

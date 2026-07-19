@@ -46,6 +46,7 @@
 #include "index/disk/laser_segment.hpp"
 #include "index/disk/laser_segment_importer.hpp"
 #include "index/graph/qg/qg_segment.hpp"
+#include "index/graph/qg/qg_search_extension.hpp"
 #include "simd/cpu_features.hpp"
 #include "simd/laser_dispatch.hpp"
 #include "space/quant/rabitq/dispatch.hpp"

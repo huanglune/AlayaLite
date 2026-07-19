@@ -27,6 +27,7 @@
 
 #include "alaya/collection.hpp"
 #include "index/collection/artifact_manifest_v2.hpp"
+#include "index/graph/qg/qg_search_extension.hpp"
 #include "platform/detect.hpp"
 #include "utils/evaluate.hpp"
 
