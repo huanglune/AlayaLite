@@ -509,6 +509,46 @@ using MetadataPredicate = std::function<bool(const CollectionMetadata &)>;
           static_cast<std::uint64_t>(stride)};
 }
 
+// Python owns the storage behind py::array.  Keep native operations independent
+// of both that owner and concurrent Python-side mutation while the GIL is
+// released by copying the validated, C-contiguous tensor into C++ storage.
+struct OwnedTensor {
+  std::vector<std::byte> storage{};
+  core::ScalarType scalar_type{};
+  std::uint64_t rows{};
+  std::uint32_t dim{};
+  std::uint64_t row_stride{};
+
+  [[nodiscard]] auto view() const noexcept -> core::TypedTensorView {
+    return {storage.data(), scalar_type, rows, dim, row_stride};
+  }
+};
+
+[[nodiscard]] inline auto owned_tensor(const py::array &vectors,
+                                       std::uint32_t expected_dim,
+                                       bool require_two_dimensions = true) -> OwnedTensor {
+  const auto borrowed = tensor_view(vectors, expected_dim, require_two_dimensions);
+  std::uint64_t row_bytes{};
+  std::uint64_t total_bytes{};
+  if (!core::checked_multiply(borrowed.dim,
+                              core::scalar_type_size(borrowed.scalar_type),
+                              row_bytes) ||
+      !core::checked_multiply(borrowed.rows, row_bytes, total_bytes) ||
+      total_bytes > std::numeric_limits<std::size_t>::max()) {
+    throw py::value_error("canonical Collection tensor byte size is not representable");
+  }
+  OwnedTensor result;
+  result.storage.resize(static_cast<std::size_t>(total_bytes));
+  if (total_bytes != 0) {
+    std::memcpy(result.storage.data(), borrowed.data, static_cast<std::size_t>(total_bytes));
+  }
+  result.scalar_type = borrowed.scalar_type;
+  result.rows = borrowed.rows;
+  result.dim = borrowed.dim;
+  result.row_stride = row_bytes;
+  return result;
+}
+
 [[nodiscard]] inline auto owned_vector_to_array(const internal::collection::OwnedVector &vector)
     -> py::array {
   py::array result(scalar_dtype(vector.scalar_type()),
@@ -681,11 +721,19 @@ class PyCollection {
     options.max_neighbors = max_neighbors;
     options.ef_construction = ef_construction;
     options.auto_seal_rows = auto_seal_rows;
-    return std::make_shared<PyCollection>(unwrap(Collection::create(std::move(options))));
+    auto collection = [&] {
+      py::gil_scoped_release release;
+      return unwrap(Collection::create(std::move(options)));
+    }();
+    return std::make_shared<PyCollection>(std::move(collection));
   }
 
   [[nodiscard]] static auto open(const std::string &root) -> std::shared_ptr<PyCollection> {
-    return std::make_shared<PyCollection>(unwrap(Collection::open(root)));
+    auto collection = [&] {
+      py::gil_scoped_release release;
+      return unwrap(Collection::open(root));
+    }();
+    return std::make_shared<PyCollection>(std::move(collection));
   }
 
   [[nodiscard]] auto mutate(const py::list &ids,
@@ -696,7 +744,8 @@ class PyCollection {
                             const std::string &mode,
                             const std::string &durability,
                             const std::string &retry_token) -> py::dict {
-    const auto view = tensor_view(vectors, collection_->options().dim);
+    const auto owned_vectors = owned_tensor(vectors, collection_->options().dim);
+    const auto view = owned_vectors.view();
     const auto rows = static_cast<std::size_t>(view.rows);
     if (ids.size() != rows || documents.size() != rows || metadata.size() != rows) {
       throw py::value_error("canonical Collection item columns must have equal row counts");
@@ -726,9 +775,12 @@ class PyCollection {
           {},
       });
     }
-    auto receipt = unwrap(collection_->mutate_batch(native,
-                                                    batch_mode(mode),
-                                                    write_options(durability, retry_token)));
+    const auto native_mode = batch_mode(mode);
+    const auto native_options = write_options(durability, retry_token);
+    auto receipt = [&] {
+      py::gil_scoped_release release;
+      return unwrap(collection_->mutate_batch(native, native_mode, native_options));
+    }();
     return batch_receipt_to_dict(receipt);
   }
 
@@ -744,25 +796,34 @@ class PyCollection {
       row.logical_id = logical_id(py::cast<std::string>(id));
       native.push_back(std::move(row));
     }
-    return batch_receipt_to_dict(
-        unwrap(collection_->mutate_batch(native,
-                                         batch_mode(mode),
-                                         write_options(durability, retry_token))));
+    const auto native_mode = batch_mode(mode);
+    const auto native_options = write_options(durability, retry_token);
+    auto receipt = [&] {
+      py::gil_scoped_release release;
+      return unwrap(collection_->mutate_batch(native, native_mode, native_options));
+    }();
+    return batch_receipt_to_dict(receipt);
   }
 
   [[nodiscard]] auto search(const py::array &queries,
                             std::uint64_t top_k,
+                            std::uint32_t ef_search,
                             const py::object &metadata_filter,
                             const std::string &policy,
                             const py::object &selectivity,
                             std::uint64_t scratch_budget_bytes,
                             std::uint64_t io_budget_requests,
                             std::uint64_t io_budget_bytes) -> py::dict {
-    const auto view = tensor_view(queries, collection_->options().dim, false);
+    const auto owned_queries = owned_tensor(queries, collection_->options().dim, false);
+    const auto view = owned_queries.view();
     if (view.scalar_type != collection_->options().scalar_type) {
       throw py::type_error("canonical Collection query dtype must match the collection dtype");
     }
     core::SearchOptions options(top_k);
+    QgSearchExtension qg_options;
+    qg_options.effort = ef_search;
+    const auto qg_extension = make_qg_search_extension(qg_options);
+    options.extensions = std::span<const core::AlgorithmSearchExtension>(&qg_extension, 1);
     options.filter_policy = filter_policy(policy);
     core::SearchContext context;
     context.query_scratch_lease.available_bytes = scratch_budget_bytes;
@@ -770,37 +831,56 @@ class PyCollection {
     context.io_credits.available_bytes = io_budget_bytes;
     const auto filter = collection_filter(metadata_filter, selectivity);
     if (queries.ndim() == 1) {
-      return search_response_to_dict(unwrap(collection_->search(view, options, context, filter)));
+      auto response = [&] {
+        py::gil_scoped_release release;
+        return unwrap(collection_->search(view, options, context, filter));
+      }();
+      return search_response_to_dict(response);
     }
-    return search_response_to_dict(
-        unwrap(collection_->batch_search(view, options, context, filter)));
+    auto response = [&] {
+      py::gil_scoped_release release;
+      return unwrap(collection_->batch_search(view, options, context, filter));
+    }();
+    return search_response_to_dict(response);
   }
 
   [[nodiscard]] auto batch_search(const py::array &queries,
                                   std::uint64_t top_k,
+                                  std::uint32_t ef_search,
                                   const py::object &metadata_filter,
                                   const std::string &policy,
                                   const py::object &selectivity,
                                   std::uint64_t scratch_budget_bytes,
                                   std::uint64_t io_budget_requests,
                                   std::uint64_t io_budget_bytes) -> py::dict {
-    const auto view = tensor_view(queries, collection_->options().dim);
+    const auto owned_queries = owned_tensor(queries, collection_->options().dim);
+    const auto view = owned_queries.view();
     if (view.scalar_type != collection_->options().scalar_type) {
       throw py::type_error("canonical Collection query dtype must match the collection dtype");
     }
     core::SearchOptions options(top_k);
+    QgSearchExtension qg_options;
+    qg_options.effort = ef_search;
+    const auto qg_extension = make_qg_search_extension(qg_options);
+    options.extensions = std::span<const core::AlgorithmSearchExtension>(&qg_extension, 1);
     options.filter_policy = filter_policy(policy);
     core::SearchContext context;
     context.query_scratch_lease.available_bytes = scratch_budget_bytes;
     context.io_credits.available_requests = io_budget_requests;
     context.io_credits.available_bytes = io_budget_bytes;
     const auto filter = collection_filter(metadata_filter, selectivity);
-    return search_response_to_dict(
-        unwrap(collection_->batch_search(view, options, context, filter)));
+    auto response = [&] {
+      py::gil_scoped_release release;
+      return unwrap(collection_->batch_search(view, options, context, filter));
+    }();
+    return search_response_to_dict(response);
   }
 
   [[nodiscard]] auto get_by_id(const std::string &id) -> py::object {
-    auto record = collection_->get_by_id(logical_id(id));
+    auto record = [&] {
+      py::gil_scoped_release release;
+      return collection_->get_by_id(logical_id(id));
+    }();
     if (!record.ok() && record.status().code() == core::StatusCode::not_found) {
       return py::none();
     }
@@ -816,15 +896,22 @@ class PyCollection {
   }
 
   [[nodiscard]] auto records() -> py::list {
+    auto records = [&] {
+      py::gil_scoped_release release;
+      return unwrap(collection_->records());
+    }();
     py::list result;
-    for (const auto &record : unwrap(collection_->records())) {
+    for (const auto &record : records) {
       result.append(record_to_dict(record));
     }
     return result;
   }
 
   [[nodiscard]] auto checkpoint() -> py::dict {
-    const auto receipt = unwrap(collection_->checkpoint());
+    const auto receipt = [&] {
+      py::gil_scoped_release release;
+      return unwrap(collection_->checkpoint());
+    }();
     py::dict result;
     result["durable_watermark"] = receipt.durable_watermark;
     result["wal_cut"] = receipt.wal_cut;
@@ -834,7 +921,10 @@ class PyCollection {
   }
 
   [[nodiscard]] auto seal() -> py::dict {
-    const auto receipt = unwrap(collection_->seal());
+    const auto receipt = [&] {
+      py::gil_scoped_release release;
+      return unwrap(collection_->seal());
+    }();
     py::dict result;
     result["source_segment_id"] = receipt.source_segment_id;
     result["successor_segment_id"] = receipt.successor_segment_id;
@@ -847,7 +937,10 @@ class PyCollection {
   }
 
   [[nodiscard]] auto compact() -> py::dict {
-    const auto receipt = unwrap(collection_->compact());
+    const auto receipt = [&] {
+      py::gil_scoped_release release;
+      return unwrap(collection_->compact());
+    }();
     py::dict result;
     result["source_segment_ids"] = receipt.source_segment_ids;
     result["compacted_segment_id"] = receipt.compacted_segment_id;
@@ -859,7 +952,10 @@ class PyCollection {
   }
 
   [[nodiscard]] auto gc() -> py::dict {
-    const auto receipt = unwrap(collection_->gc());
+    const auto receipt = [&] {
+      py::gil_scoped_release release;
+      return unwrap(collection_->gc());
+    }();
     py::dict result;
     result["pending"] = receipt.pending;
     result["reclaimed"] = receipt.reclaimed;
@@ -913,7 +1009,10 @@ class PyCollection {
     return result;
   }
 
-  void close() { throw_status(collection_->close()); }
+  void close() {
+    py::gil_scoped_release release;
+    throw_status(collection_->close());
+  }
 
   [[nodiscard]] auto collection() const -> const std::shared_ptr<Collection> & {
     return collection_;
@@ -962,6 +1061,7 @@ inline void register_collection(py::module_ &module) {
            py::arg("query"),
            py::arg("top_k"),
            py::kw_only(),
+           py::arg("ef_search") = 100,
            py::arg("metadata_filter") = py::none(),
            py::arg("filter_policy") = "auto",
            py::arg("filter_selectivity") = py::none(),
@@ -973,6 +1073,7 @@ inline void register_collection(py::module_ &module) {
            py::arg("queries"),
            py::arg("top_k"),
            py::kw_only(),
+           py::arg("ef_search") = 100,
            py::arg("metadata_filter") = py::none(),
            py::arg("filter_policy") = "auto",
            py::arg("filter_selectivity") = py::none(),

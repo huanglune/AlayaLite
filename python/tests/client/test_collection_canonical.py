@@ -3,6 +3,10 @@
 
 """Canonical response, mutation mode, status, and C++/Python parity tests."""
 
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import pytest
 from alayalite import (
@@ -207,3 +211,71 @@ def test_gate10_python_seal_compact_gc_and_collection_stats(tmp_path):
     )
     automatic.add([_item("x", [0, 0]), _item("y", [1, 0])])
     assert automatic.stats()["sealed_segments_count"] == 1
+
+
+def test_python_threads_overlap_native_queries_on_one_collection(tmp_path):
+    collection = Collection(
+        "gil-query-lanes",
+        IndexParams(
+            index_type="flat",
+            quantization_type="none",
+            storage_path=str(tmp_path / "gil-query-lanes" / "storage"),
+        ),
+    )
+    rng = np.random.default_rng(20260718)
+    vectors = rng.normal(size=(1024, 64)).astype(np.float32)
+    collection.add([_item(str(row), vectors[row]) for row in range(len(vectors))])
+
+    bulk_started = threading.Event()
+    bulk_queries = np.repeat(vectors[:1], 5000, axis=0)
+
+    def run_bulk_query():
+        bulk_started.set()
+        return collection.batch_search(bulk_queries, top_k=1)
+
+    def run_single_query():
+        response = collection.search(vectors[0], top_k=1)
+        assert response["ids"].tolist() == ["0"]
+        assert response["valid_counts"].tolist() == [1]
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        bulk = executor.submit(run_bulk_query)
+        assert bulk_started.wait(timeout=1)
+        time.sleep(0.01)
+        assert not bulk.done(), "bulk query must still be native when the short query lanes start"
+
+        short_queries = [executor.submit(run_single_query) for _ in range(3)]
+        for query in short_queries:
+            query.result(timeout=5)
+        assert not bulk.done(), "short native query lanes must finish while the bulk lane is in flight"
+
+        bulk_response = bulk.result(timeout=10)
+
+    assert bulk_response["ids"].tolist() == ["0"] * len(bulk_queries)
+    assert bulk_response["valid_counts"].tolist() == [1] * len(bulk_queries)
+
+
+def test_batch_query_forwards_ef_search_and_deprecates_num_threads(tmp_path):
+    collection = Collection(
+        "qg-effort",
+        IndexParams(
+            index_type="qg",
+            quantization_type="rabitq",
+            metric="euclidean",
+            max_nbrs=16,
+            ef_construction=100,
+            storage_path=str(tmp_path / "qg-effort" / "storage"),
+        ),
+    )
+    rng = np.random.default_rng(12345)
+    vectors = rng.normal(size=(512, 64)).astype(np.float32)
+    collection.add([_item(str(row), vectors[row]) for row in range(len(vectors))])
+    collection.seal()
+    queries = rng.normal(size=(100, 64)).astype(np.float32)
+
+    with pytest.warns(DeprecationWarning, match="num_threads=.*has no effect"):
+        low_effort = collection.batch_query(queries, limit=10, ef_search=10, num_threads=4)
+    with pytest.warns(DeprecationWarning, match="num_threads=.*has no effect"):
+        high_effort = collection.batch_query(queries, limit=10, ef_search=300, num_threads=1)
+
+    assert any(low != high for low, high in zip(low_effort["id"], high_effort["id"]))

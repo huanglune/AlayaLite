@@ -188,11 +188,10 @@ For retrieving data based on vector similarity, the `batch_query` method can be 
 vectors = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
 limit = 5
 ef_search = 100
-num_threads = 1
 
-results = collection.batch_query(vectors, limit, ef_search, num_threads)
+results = collection.batch_query(vectors, limit, ef_search)
 ```
-* `batch_query(vectors: list[list[float | int]], limit: int, ef_search: int = 100, num_threads: int = 1)`: Queries the index using a batch of vectors. `ef_search` and `num_thread` will be used forwarded as the parameters of search process.
+* `batch_query(vectors: list[list[float | int]], limit: int, ef_search: int = 100, num_threads: int = 1)`: Queries the index using a batch of vectors. `ef_search` is forwarded as the canonical per-query QG search effort. `num_threads` remains only for call compatibility: it has no effect, emits `DeprecationWarning`, and will be removed. Drive concurrency with external threads issuing independent `search`/`batch_query` calls; each call is one concurrent query lane.
 
 ### Filter query in a collection
 If you want to filter data based on metadata, you can use the filter_query method:

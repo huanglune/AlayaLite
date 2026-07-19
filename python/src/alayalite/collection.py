@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import shutil
 import uuid
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Union
@@ -37,6 +38,13 @@ from .schema import IndexParams, load_schema, save_schema
 V_PUBLIC = "1.1.0"
 V_REMOVE = LEGACY_API_V_REMOVE
 STATUS_VERSION = "1"
+
+
+class _NumThreadsDefault(int):
+    """Identity sentinel that preserves the historical ``= 1`` signature."""
+
+
+_NUM_THREADS_UNSET = _NumThreadsDefault(1)
 
 
 __all__ = [
@@ -524,6 +532,7 @@ class Collection:
         query,
         top_k: int = 10,
         *,
+        ef_search: int = 100,
         metadata_filter=None,
         filter_policy: str = "auto",
         filter_selectivity: Optional[float] = None,
@@ -531,14 +540,20 @@ class Collection:
         io_budget_requests: Optional[int] = None,
         io_budget_bytes: Optional[int] = None,
     ) -> dict:
-        """Canonical single-query response with native Gate-10 filtering/accounting."""
+        """Canonical single-query response with native Gate-10 filtering/accounting.
+
+        ``ef_search`` is the canonical QG per-query search effort. Concurrent
+        query lanes are supplied by external Python threads.
+        """
         _assert(top_k >= 0, "top_k must be greater than or equal to 0")
+        _assert(ef_search >= top_k, "ef_search must be greater than or equal to top_k")
         array = self._canonical_queries(query, batch=False, compatibility_cast=False)
         expression = None if metadata_filter is None else self._filter_expression(metadata_filter)
         unlimited = (1 << 64) - 1
         return self.__native.search(
             array,
             int(top_k),
+            ef_search=int(ef_search),
             metadata_filter=expression,
             filter_policy=filter_policy,
             filter_selectivity=filter_selectivity,
@@ -552,6 +567,7 @@ class Collection:
         queries,
         top_k: int = 10,
         *,
+        ef_search: int = 100,
         metadata_filter=None,
         filter_policy: str = "auto",
         filter_selectivity: Optional[float] = None,
@@ -559,14 +575,20 @@ class Collection:
         io_budget_requests: Optional[int] = None,
         io_budget_bytes: Optional[int] = None,
     ) -> dict:
-        """Canonical flat response with native Gate-10 filtering/accounting."""
+        """Canonical flat response with native Gate-10 filtering/accounting.
+
+        ``ef_search`` is forwarded as the canonical QG per-query search
+        effort. Batch execution does not create internal Python worker lanes.
+        """
         _assert(top_k >= 0, "top_k must be greater than or equal to 0")
+        _assert(ef_search >= top_k, "ef_search must be greater than or equal to top_k")
         array = self._canonical_queries(queries, batch=True, compatibility_cast=False)
         expression = None if metadata_filter is None else self._filter_expression(metadata_filter)
         unlimited = (1 << 64) - 1
         return self.__native.batch_search(
             array,
             int(top_k),
+            ef_search=int(ef_search),
             metadata_filter=expression,
             filter_policy=filter_policy,
             filter_selectivity=filter_selectivity,
@@ -585,15 +607,29 @@ class Collection:
         vectors: List[List[float]],
         limit: int,
         ef_search: int = 100,
-        num_threads: int = 1,
+        num_threads: int = _NUM_THREADS_UNSET,
     ) -> dict:
-        """Compatibility projection over canonical ``batch_search``."""
+        """Compatibility projection over canonical ``batch_search``.
+
+        ``ef_search`` is forwarded as the canonical QG per-query effort.
+        ``num_threads`` is ignored and will be removed; use external threads
+        issuing independent queries for concurrent query lanes.
+        """
         self._require_native()
+        if num_threads is _NUM_THREADS_UNSET:
+            num_threads = 1
+        else:
+            warnings.warn(
+                "batch_query(num_threads=...) is deprecated and has no effect; "
+                "drive concurrent independent queries from external threads instead",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         _assert(num_threads > 0, "num_threads must be greater than 0")
         _assert(ef_search >= limit, "ef_search must be greater than or equal to limit")
         _assert(limit >= 0, "limit must be greater than or equal to 0")
         queries = self._canonical_queries(vectors, batch=True, compatibility_cast=True)
-        response = self.__native.batch_search(queries, int(limit))
+        response = self.__native.batch_search(queries, int(limit), ef_search=int(ef_search))
         unique_ids = [str(value) for value in response["ids"].tolist()]
         records = {
             str(record["id"]): record
@@ -616,11 +652,24 @@ class Collection:
         *,
         metadata_filter=None,
         ef_search: int = 100,
-        num_threads: int = 1,
+        num_threads: int = _NUM_THREADS_UNSET,
         filter_execution_hint: Optional[str] = None,
     ) -> dict:
-        """Compatibility projection over strict native Gate-10 filtering."""
+        """Compatibility projection over strict native Gate-10 filtering.
+
+        ``num_threads`` is ignored and will be removed; concurrency comes from
+        external threads issuing independent queries.
+        """
         self._require_native()
+        if num_threads is _NUM_THREADS_UNSET:
+            num_threads = 1
+        else:
+            warnings.warn(
+                "hybrid_query(num_threads=...) is deprecated and has no effect; "
+                "drive concurrent independent queries from external threads instead",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         _assert(ef_search >= limit, "ef_search must be >= limit")
         _assert(num_threads > 0, "num_threads must be greater than 0")
         normalize_filter_execution_hint(filter_execution_hint)
@@ -629,6 +678,7 @@ class Collection:
         response = self.__native.batch_search(
             queries,
             int(limit),
+            ef_search=int(ef_search),
             metadata_filter=expression,
             filter_policy="strict",
         )
