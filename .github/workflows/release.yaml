@@ -84,7 +84,7 @@ jobs:
         DATE=$(date +%Y-%m-%d)
 
         # Escape dots in OLD for safe use in sed regex
-        OLD_ESC=$(echo "$OLD" | sed 's/\./\\./g')
+        OLD_ESC=${OLD//./\\.}
 
         # Collect conventional commit summaries since last tag
         LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")

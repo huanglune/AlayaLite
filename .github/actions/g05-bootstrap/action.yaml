@@ -7,6 +7,12 @@ description: Verify g05, prepare uv-managed Python and Conan, and reset ccache s
 runs:
   using: composite
   steps:
+  - name: Expose user-local tools on PATH
+    # The runner service PATH may not include ~/.local/bin, where uv and
+    # uv-managed tools (conan) live; export it before any verification.
+    shell: bash
+    run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
   - name: Verify g05 native toolchain
     shell: bash
     run: |
@@ -21,7 +27,7 @@ runs:
     shell: bash
     run: |
       uv tool install 'conan>=2,<3'
-      echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      conan profile detect 2>/dev/null || true
 
   - name: Prepare Python 3.12 with uv
     shell: bash
