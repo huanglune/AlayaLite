@@ -204,7 +204,7 @@ class Database:
         root = self._path / normalized_name
         native = _NativeCollection.open(os.fspath(root), resolved_read_only)
         try:
-            options = native.options_typed()
+            options = native.options()
             discovered_config, legacy_quantization = load_collection_schema(root)
             config = (
                 discovered_config

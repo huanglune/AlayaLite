@@ -550,11 +550,9 @@ struct OwnedTensor {
   return result;
 }
 
-// These response carriers are intentionally private binding types.  Wave A keeps
-// the dictionary-returning methods alive for the existing Python facade while
-// giving the v2 core a field-checked path that cannot drift through string keys.
-// TODO(sdk-v2 wave C): make these the canonical method responses and remove the
-// dictionary compatibility shims in the same cut as the old Python facade.
+// These response carriers are intentionally private binding types.  The Python
+// core consumes named fields so native response shape cannot drift through
+// string-keyed dictionaries.
 struct PyRecordResponse {
   py::object id{};
   std::uint64_t upsert_sequence{};
@@ -701,17 +699,6 @@ struct PyCapabilitiesResponse {
   return result;
 }
 
-[[nodiscard]] inline auto record_to_dict(const CollectionRecord &record) -> py::dict {
-  py::dict result;
-  result["id"] = logical_id_to_python(record.logical_id);
-  result["upsert_sequence"] = record.upsert_sequence;
-  result["document"] = record.document;
-  result["metadata"] = metadata_to_python(record.metadata);
-  result["vector"] =
-      record.vector.has_value() ? py::object(owned_vector_to_array(*record.vector)) : py::none();
-  return result;
-}
-
 [[nodiscard]] inline auto record_to_response(const CollectionRecord &record) -> PyRecordResponse {
   PyRecordResponse result;
   result.id = logical_id_to_python(record.logical_id);
@@ -720,20 +707,6 @@ struct PyCapabilitiesResponse {
   result.metadata = metadata_to_python(record.metadata);
   result.vector =
       record.vector.has_value() ? py::object(owned_vector_to_array(*record.vector)) : py::none();
-  return result;
-}
-
-[[nodiscard]] inline auto receipt_to_dict(const CollectionMutationReceipt &receipt) -> py::dict {
-  py::dict result;
-  result["op_id"] = receipt.op_id;
-  result["batch_op_id"] = receipt.batch_op_id;
-  result["row_op_id"] = receipt.row_op_id;
-  result["visibility_watermark"] = receipt.visibility_watermark;
-  result["durable_watermark"] = receipt.durable_watermark;
-  result["searchable"] = receipt.searchable;
-  result["durability"] = static_cast<std::uint8_t>(receipt.durability);
-  result["row_status"] = static_cast<std::uint8_t>(receipt.row_status);
-  result["retry_token"] = receipt.retry_token;
   return result;
 }
 
@@ -748,23 +721,6 @@ struct PyCapabilitiesResponse {
           static_cast<std::uint8_t>(receipt.durability),
           static_cast<std::uint8_t>(receipt.row_status),
           receipt.retry_token};
-}
-
-[[nodiscard]] inline auto batch_receipt_to_dict(const CollectionBatchMutationReceipt &receipt)
-    -> py::dict {
-  py::dict result;
-  result["batch_op_id"] = receipt.batch_op_id;
-  result["visibility_watermark"] = receipt.visibility_watermark;
-  result["durable_watermark"] = receipt.durable_watermark;
-  result["searchable"] = receipt.searchable;
-  result["durability"] = static_cast<std::uint8_t>(receipt.durability);
-  result["retry_token"] = receipt.retry_token;
-  py::list rows;
-  for (const auto &row : receipt.rows) {
-    rows.append(receipt_to_dict(row));
-  }
-  result["rows"] = std::move(rows);
-  return result;
 }
 
 [[nodiscard]] inline auto batch_receipt_to_response(const CollectionBatchMutationReceipt &receipt)
@@ -805,25 +761,6 @@ template <class T>
   return "postfilter";
 }
 
-[[nodiscard]] inline auto search_stats_to_dict(const CollectionSearchStatistics &stats)
-    -> py::dict {
-  py::dict result;
-  result["filter_active"] = stats.filter_active;
-  result["filter_execution"] = filter_execution_name(stats.filter_execution);
-  result["filter_examined"] = stats.filter_examined;
-  result["filter_passed"] = stats.filter_passed;
-  result["nan_discarded"] = stats.nan_discarded;
-  result["overfetch_rounds"] = stats.overfetch_rounds;
-  result["budget_consumed"] = stats.budget_consumed;
-  result["lease_acquired"] = stats.lease_acquired;
-  result["lease_released"] = stats.lease_released;
-  result["lease_peak_bytes"] = stats.lease_peak_bytes;
-  result["io_requests_consumed"] = stats.io_requests_consumed;
-  result["io_bytes_consumed"] = stats.io_bytes_consumed;
-  result["rerank_nanoseconds"] = stats.rerank_nanoseconds;
-  return result;
-}
-
 [[nodiscard]] inline auto search_stats_to_response(
     const CollectionSearchStatistics &stats,
     std::optional<std::uint32_t> effective_effort = {}) -> PySearchStatsResponse {
@@ -841,37 +778,6 @@ template <class T>
           stats.io_bytes_consumed,
           stats.rerank_nanoseconds,
           effective_effort};
-}
-
-[[nodiscard]] inline auto search_response_to_dict(const CollectionSearchResponse &response)
-    -> py::dict {
-  py::list id_list;
-  for (const auto &id : response.ids) {
-    id_list.append(logical_id_to_python(id));
-  }
-  auto numpy = py::module_::import("numpy");
-  py::object ids = numpy.attr("asarray")(id_list, py::arg("dtype") = numpy.attr("object_"));
-  std::vector<std::uint8_t> statuses;
-  std::vector<std::uint8_t> completeness;
-  statuses.reserve(response.statuses.size());
-  completeness.reserve(response.completeness.size());
-  for (const auto &status : response.statuses) {
-    statuses.push_back(static_cast<std::uint8_t>(status.code()));
-  }
-  for (const auto value : response.completeness) {
-    completeness.push_back(static_cast<std::uint8_t>(value));
-  }
-  py::dict result;
-  result["ids"] = std::move(ids);
-  result["distances"] = copy_array(response.distances);
-  result["offsets"] = copy_array(response.offsets);
-  result["valid_counts"] = copy_array(response.valid_counts);
-  result["statuses"] = copy_array(statuses);
-  result["completeness"] = copy_array(completeness);
-  result["visibility_watermark"] = response.visibility_watermark;
-  result["metadata_epoch"] = response.metadata_epoch;
-  result["search_stats"] = search_stats_to_dict(response.search_stats);
-  return result;
 }
 
 [[nodiscard]] inline auto search_response_to_response(
@@ -991,19 +897,7 @@ class PyCollection {
                             const std::string &action,
                             const std::string &mode,
                             const std::string &durability,
-                            const std::string &retry_token) -> py::dict {
-    return batch_receipt_to_dict(
-        mutate_response(ids, documents, vectors, metadata, action, mode, durability, retry_token));
-  }
-
-  [[nodiscard]] auto mutate_typed(const py::list &ids,
-                                  const py::list &documents,
-                                  const py::array &vectors,
-                                  const py::list &metadata,
-                                  const std::string &action,
-                                  const std::string &mode,
-                                  const std::string &durability,
-                                  const std::string &retry_token) -> PyMutationResponse {
+                            const std::string &retry_token) -> PyMutationResponse {
     return batch_receipt_to_response(
         mutate_response(ids, documents, vectors, metadata, action, mode, durability, retry_token));
   }
@@ -1059,14 +953,7 @@ class PyCollection {
   [[nodiscard]] auto remove(const py::list &ids,
                             const std::string &mode,
                             const std::string &durability,
-                            const std::string &retry_token) -> py::dict {
-    return batch_receipt_to_dict(remove_response(ids, mode, durability, retry_token));
-  }
-
-  [[nodiscard]] auto remove_typed(const py::list &ids,
-                                  const std::string &mode,
-                                  const std::string &durability,
-                                  const std::string &retry_token) -> PyMutationResponse {
+                            const std::string &retry_token) -> PyMutationResponse {
     return batch_receipt_to_response(remove_response(ids, mode, durability, retry_token));
   }
 
@@ -1099,27 +986,7 @@ class PyCollection {
                             const py::object &selectivity,
                             std::uint64_t scratch_budget_bytes,
                             std::uint64_t io_budget_requests,
-                            std::uint64_t io_budget_bytes) -> py::dict {
-    return search_response_to_dict(search_response(queries,
-                                                   top_k,
-                                                   ef_search,
-                                                   metadata_filter,
-                                                   policy,
-                                                   selectivity,
-                                                   scratch_budget_bytes,
-                                                   io_budget_requests,
-                                                   io_budget_bytes));
-  }
-
-  [[nodiscard]] auto search_typed(const py::array &queries,
-                                  std::uint64_t top_k,
-                                  std::uint32_t ef_search,
-                                  const py::object &metadata_filter,
-                                  const std::string &policy,
-                                  const py::object &selectivity,
-                                  std::uint64_t scratch_budget_bytes,
-                                  std::uint64_t io_budget_requests,
-                                  std::uint64_t io_budget_bytes) -> PySearchResponse {
+                            std::uint64_t io_budget_bytes) -> PySearchResponse {
     const auto effective_effort = collection_->target_algorithm() == core::algorithm::qg
                                       ? std::optional<std::uint32_t>(ef_search)
                                       : std::nullopt;
@@ -1182,27 +1049,7 @@ class PyCollection {
                                   const py::object &selectivity,
                                   std::uint64_t scratch_budget_bytes,
                                   std::uint64_t io_budget_requests,
-                                  std::uint64_t io_budget_bytes) -> py::dict {
-    return search_response_to_dict(batch_search_response(queries,
-                                                         top_k,
-                                                         ef_search,
-                                                         metadata_filter,
-                                                         policy,
-                                                         selectivity,
-                                                         scratch_budget_bytes,
-                                                         io_budget_requests,
-                                                         io_budget_bytes));
-  }
-
-  [[nodiscard]] auto batch_search_typed(const py::array &queries,
-                                        std::uint64_t top_k,
-                                        std::uint32_t ef_search,
-                                        const py::object &metadata_filter,
-                                        const std::string &policy,
-                                        const py::object &selectivity,
-                                        std::uint64_t scratch_budget_bytes,
-                                        std::uint64_t io_budget_requests,
-                                        std::uint64_t io_budget_bytes) -> PySearchResponse {
+                                  std::uint64_t io_budget_bytes) -> PySearchResponse {
     const auto effective_effort = collection_->target_algorithm() == core::algorithm::qg
                                       ? std::optional<std::uint32_t>(ef_search)
                                       : std::nullopt;
@@ -1250,19 +1097,7 @@ class PyCollection {
     }();
   }
 
-  [[nodiscard]] auto get_by_id(const std::string &id) -> py::object {
-    auto record = [&] {
-      py::gil_scoped_release release;
-      return collection_->get_by_id(logical_id(id));
-    }();
-    if (!record.ok() && record.status().code() == core::StatusCode::not_found) {
-      return py::none();
-    }
-    return record_to_dict(unwrap(std::move(record)));
-  }
-
-  [[nodiscard]] auto get_by_id_typed(const std::string &id, bool include_vector = true)
-      -> py::object {
+  [[nodiscard]] auto get_by_id(const std::string &id, bool include_vector = true) -> py::object {
     auto record = [&] {
       py::gil_scoped_release release;
       return collection_->get_by_id(logical_id(id), record_projection(include_vector));
@@ -1273,35 +1108,15 @@ class PyCollection {
     return py::cast(record_to_response(unwrap(std::move(record))));
   }
 
-  [[nodiscard]] auto get_by_ids(const py::list &ids) -> py::list {
+  [[nodiscard]] auto get_by_ids(const py::list &ids, bool include_vector = true) -> py::list {
     py::list result;
     for (const auto &id : ids) {
-      result.append(get_by_id(py::cast<std::string>(id)));
+      result.append(get_by_id(py::cast<std::string>(id), include_vector));
     }
     return result;
   }
 
-  [[nodiscard]] auto get_by_ids_typed(const py::list &ids, bool include_vector = true) -> py::list {
-    py::list result;
-    for (const auto &id : ids) {
-      result.append(get_by_id_typed(py::cast<std::string>(id), include_vector));
-    }
-    return result;
-  }
-
-  [[nodiscard]] auto records() -> py::list {
-    auto records = [&] {
-      py::gil_scoped_release release;
-      return unwrap(collection_->records());
-    }();
-    py::list result;
-    for (const auto &record : records) {
-      result.append(record_to_dict(record));
-    }
-    return result;
-  }
-
-  [[nodiscard]] auto records_typed() -> std::vector<PyRecordResponse> {
+  [[nodiscard]] auto records() -> std::vector<PyRecordResponse> {
     auto records = [&] {
       py::gil_scoped_release release;
       return unwrap(collection_->records());
@@ -1332,20 +1147,7 @@ class PyCollection {
     return result;
   }
 
-  [[nodiscard]] auto checkpoint() -> py::dict {
-    const auto receipt = [&] {
-      py::gil_scoped_release release;
-      return unwrap(collection_->checkpoint());
-    }();
-    py::dict result;
-    result["durable_watermark"] = receipt.durable_watermark;
-    result["wal_cut"] = receipt.wal_cut;
-    result["metadata_epoch"] = receipt.metadata_epoch;
-    result["checkpoint_name"] = receipt.checkpoint_name;
-    return result;
-  }
-
-  [[nodiscard]] auto checkpoint_typed() -> PyCheckpointResponse {
+  [[nodiscard]] auto checkpoint() -> PyCheckpointResponse {
     const auto receipt = [&] {
       py::gil_scoped_release release;
       return unwrap(collection_->checkpoint());
@@ -1356,23 +1158,7 @@ class PyCollection {
             receipt.checkpoint_name};
   }
 
-  [[nodiscard]] auto seal() -> py::dict {
-    const auto receipt = [&] {
-      py::gil_scoped_release release;
-      return unwrap(collection_->seal());
-    }();
-    py::dict result;
-    result["source_segment_id"] = receipt.source_segment_id;
-    result["successor_segment_id"] = receipt.successor_segment_id;
-    result["sealed_segment_id"] = receipt.sealed_segment_id;
-    result["wal_cut"] = receipt.wal_cut;
-    result["sealed_rows"] = receipt.sealed_rows;
-    result["sealed_bytes"] = receipt.sealed_bytes;
-    result["manifest_generation"] = receipt.manifest_generation;
-    return result;
-  }
-
-  [[nodiscard]] auto seal_typed() -> PySealResponse {
+  [[nodiscard]] auto seal() -> PySealResponse {
     const auto receipt = [&] {
       py::gil_scoped_release release;
       return unwrap(collection_->seal());
@@ -1386,22 +1172,7 @@ class PyCollection {
             receipt.manifest_generation};
   }
 
-  [[nodiscard]] auto compact() -> py::dict {
-    const auto receipt = [&] {
-      py::gil_scoped_release release;
-      return unwrap(collection_->compact());
-    }();
-    py::dict result;
-    result["source_segment_ids"] = receipt.source_segment_ids;
-    result["compacted_segment_id"] = receipt.compacted_segment_id;
-    result["compacted_rows"] = receipt.compacted_rows;
-    result["input_bytes"] = receipt.input_bytes;
-    result["output_bytes"] = receipt.output_bytes;
-    result["manifest_generation"] = receipt.manifest_generation;
-    return result;
-  }
-
-  [[nodiscard]] auto compact_typed() -> PyCompactResponse {
+  [[nodiscard]] auto compact() -> PyCompactResponse {
     const auto receipt = [&] {
       py::gil_scoped_release release;
       return unwrap(collection_->compact());
@@ -1414,21 +1185,7 @@ class PyCollection {
             receipt.manifest_generation};
   }
 
-  [[nodiscard]] auto gc() -> py::dict {
-    const auto receipt = [&] {
-      py::gil_scoped_release release;
-      return unwrap(collection_->gc());
-    }();
-    py::dict result;
-    result["pending"] = receipt.pending;
-    result["reclaimed"] = receipt.reclaimed;
-    result["deferred"] = receipt.deferred;
-    result["reclaimed_bytes"] = receipt.reclaimed_bytes;
-    result["manifest_generation"] = receipt.manifest_generation;
-    return result;
-  }
-
-  [[nodiscard]] auto gc_typed() -> PyGcResponse {
+  [[nodiscard]] auto gc() -> PyGcResponse {
     const auto receipt = [&] {
       py::gil_scoped_release release;
       return unwrap(collection_->gc());
@@ -1440,32 +1197,7 @@ class PyCollection {
             receipt.manifest_generation};
   }
 
-  [[nodiscard]] auto stats() const -> py::dict {
-    const auto stats = collection_->stats();
-    py::dict result;
-    result["size"] = stats.size;
-    result["accepted_count"] = stats.accepted_count;
-    result["pending_count"] = stats.pending_count;
-    result["searchable_bytes"] = stats.searchable_bytes;
-    result["accepted_bytes"] = stats.accepted_bytes;
-    result["searchable_vector_bytes"] = stats.searchable_vector_bytes;
-    result["accepted_vector_bytes"] = stats.accepted_vector_bytes;
-    result["pending_bytes"] = stats.pending_bytes;
-    result["allocated_count"] = stats.allocated_count;
-    result["tombstone_count"] = stats.tombstone_count;
-    result["routing_generation"] = stats.routing_generation;
-    result["visibility_watermark"] = stats.visibility_watermark;
-    result["durable_watermark"] = stats.durable_watermark;
-    result["metadata_epoch"] = stats.metadata_epoch;
-    result["sealed_segments_count"] = stats.sealed_segments_count;
-    result["gc_pending_count"] = stats.gc_pending_count;
-    result["active_segment_algorithm"] = algorithm_name(stats.active_segment_algorithm);
-    result["compacted_bytes"] = stats.compacted_bytes;
-    result["lifecycle"] = static_cast<std::uint8_t>(stats.lifecycle);
-    return result;
-  }
-
-  [[nodiscard]] auto stats_typed() const -> PyStatsResponse {
+  [[nodiscard]] auto stats() const -> PyStatsResponse {
     const auto stats = collection_->stats();
     return {stats.size,
             stats.accepted_count,
@@ -1488,26 +1220,7 @@ class PyCollection {
             static_cast<std::uint8_t>(stats.lifecycle)};
   }
 
-  [[nodiscard]] auto options() const -> py::dict {
-    const auto &options = collection_->options();
-    py::dict result;
-    result["root"] = options.root.string();
-    result["dim"] = options.dim;
-    result["metric"] = metric_name(options.metric);
-    result["dtype"] = scalar_dtype(options.scalar_type);
-    result["index_type"] = algorithm_name(options.target_algorithm);
-    result["quantization_type"] = quantization_name(options.quantization);
-    result["build_threads"] = options.build_threads;
-    result["max_neighbors"] = options.max_neighbors;
-    result["ef_construction"] = options.ef_construction;
-    result["implementation_key"] = collection_->target_implementation_key();
-    result["engine_factory_key"] = collection_->target_engine_factory_key();
-    result["active_algorithm"] = algorithm_name(collection_->active_algorithm());
-    result["auto_seal_rows"] = options.auto_seal_rows;
-    return result;
-  }
-
-  [[nodiscard]] auto options_typed() const -> PyOptionsResponse {
+  [[nodiscard]] auto options() const -> PyOptionsResponse {
     const auto &options = collection_->options();
     return {options.root.string(),
             collection_->read_only(),
@@ -1708,17 +1421,6 @@ inline void register_collection(py::module_ &module) {
            py::arg("mode") = "per_row_independent",
            py::arg("durability") = "wal_fsync",
            py::arg("retry_token") = "")
-      .def("mutate_typed",
-           &PyCollection::mutate_typed,
-           py::arg("ids"),
-           py::arg("documents"),
-           py::arg("vectors"),
-           py::arg("metadata"),
-           py::arg("action"),
-           py::kw_only(),
-           py::arg("mode") = "per_row_independent",
-           py::arg("durability") = "wal_fsync",
-           py::arg("retry_token") = "")
       .def("remove",
            &PyCollection::remove,
            py::arg("ids"),
@@ -1726,27 +1428,8 @@ inline void register_collection(py::module_ &module) {
            py::arg("mode") = "per_row_independent",
            py::arg("durability") = "wal_fsync",
            py::arg("retry_token") = "")
-      .def("remove_typed",
-           &PyCollection::remove_typed,
-           py::arg("ids"),
-           py::kw_only(),
-           py::arg("mode") = "per_row_independent",
-           py::arg("durability") = "wal_fsync",
-           py::arg("retry_token") = "")
       .def("search",
            &PyCollection::search,
-           py::arg("query"),
-           py::arg("top_k"),
-           py::kw_only(),
-           py::arg("ef_search") = 100,
-           py::arg("metadata_filter") = py::none(),
-           py::arg("filter_policy") = "auto",
-           py::arg("filter_selectivity") = py::none(),
-           py::arg("scratch_budget_bytes") = core::kUnlimitedResource,
-           py::arg("io_budget_requests") = core::kUnlimitedResource,
-           py::arg("io_budget_bytes") = core::kUnlimitedResource)
-      .def("search_typed",
-           &PyCollection::search_typed,
            py::arg("query"),
            py::arg("top_k"),
            py::kw_only(),
@@ -1769,32 +1452,17 @@ inline void register_collection(py::module_ &module) {
            py::arg("scratch_budget_bytes") = core::kUnlimitedResource,
            py::arg("io_budget_requests") = core::kUnlimitedResource,
            py::arg("io_budget_bytes") = core::kUnlimitedResource)
-      .def("batch_search_typed",
-           &PyCollection::batch_search_typed,
-           py::arg("queries"),
-           py::arg("top_k"),
-           py::kw_only(),
-           py::arg("ef_search") = 100,
-           py::arg("metadata_filter") = py::none(),
-           py::arg("filter_policy") = "auto",
-           py::arg("filter_selectivity") = py::none(),
-           py::arg("scratch_budget_bytes") = core::kUnlimitedResource,
-           py::arg("io_budget_requests") = core::kUnlimitedResource,
-           py::arg("io_budget_bytes") = core::kUnlimitedResource)
-      .def("get_by_id", &PyCollection::get_by_id, py::arg("id"))
-      .def("get_by_id_typed",
-           &PyCollection::get_by_id_typed,
+      .def("get_by_id",
+           &PyCollection::get_by_id,
            py::arg("id"),
            py::kw_only(),
            py::arg("include_vector") = true)
-      .def("get_by_ids", &PyCollection::get_by_ids, py::arg("ids"))
-      .def("get_by_ids_typed",
-           &PyCollection::get_by_ids_typed,
+      .def("get_by_ids",
+           &PyCollection::get_by_ids,
            py::arg("ids"),
            py::kw_only(),
            py::arg("include_vector") = true)
       .def("records", &PyCollection::records)
-      .def("records_typed", &PyCollection::records_typed)
       .def("scan",
            &PyCollection::scan,
            py::kw_only(),
@@ -1802,17 +1470,11 @@ inline void register_collection(py::module_ &module) {
            py::arg("limit") = 100,
            py::arg("include_vector") = false)
       .def("checkpoint", &PyCollection::checkpoint)
-      .def("checkpoint_typed", &PyCollection::checkpoint_typed)
       .def("seal", &PyCollection::seal)
-      .def("seal_typed", &PyCollection::seal_typed)
       .def("compact", &PyCollection::compact)
-      .def("compact_typed", &PyCollection::compact_typed)
       .def("gc", &PyCollection::gc)
-      .def("gc_typed", &PyCollection::gc_typed)
       .def("stats", &PyCollection::stats)
-      .def("stats_typed", &PyCollection::stats_typed)
       .def("options", &PyCollection::options)
-      .def("options_typed", &PyCollection::options_typed)
       .def_property_readonly("read_only", &PyCollection::read_only)
       .def("close", &PyCollection::close);
 }

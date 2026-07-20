@@ -18,13 +18,6 @@ namespace py = pybind11;
 PYBIND11_MODULE(_alayalitepy, module) {
   module.doc() = "AlayaLite canonical Collection bindings";
 
-#ifdef ALAYA_ENABLE_LASER
-  auto laser = module.def_submodule("laser", "LASER diagnostics");
-  laser.def("selected_simd", [] {
-    return std::string(alaya::laser::simd::get_laser_simd_name());
-  });
-#endif
-
 #ifdef VERSION_INFO
   module.attr("__version__") = VERSION_INFO;
 #else

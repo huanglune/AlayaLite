@@ -38,7 +38,7 @@ def main() -> None:
             "flat",
             "none",
         )
-        receipt = collection.mutate_typed(
+        receipt = collection.mutate(
             ["a", "b"],
             ["A", "B"],
             np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32),
@@ -49,10 +49,9 @@ def main() -> None:
         assert [row.row_status for row in receipt.rows] == [0, 0]
         records = collection.scan(metadata_filter={"kind": "keep"}, limit=1)
         assert [(record.id, record.vector) for record in records] == [("a", None)]
-        response = collection.search_typed(np.zeros(3, dtype=np.float32), 2)
+        response = collection.search(np.zeros(3, dtype=np.float32), 2)
         assert response.ids.tolist() == ["a", "b"]
         assert response.search_stats.effective_effort is None
-        assert isinstance(collection.search(np.zeros(3, dtype=np.float32), 2), dict)
         collection.close()
 
         root = Path(directory) / "collection"
@@ -60,7 +59,7 @@ def main() -> None:
         reader = module._Collection.open(str(root), True)  # pylint: disable=protected-access
         assert reader.read_only is True
         try:
-            reader.remove_typed(["a"])
+            reader.remove(["a"])
         except module.CollectionNotSupportedError as error:
             assert error.status_detail == 15
         else:

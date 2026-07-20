@@ -39,34 +39,25 @@ def _columns():
     )
 
 
-def test_typed_mutation_coexists_with_the_legacy_dict_response(native_collection):
+def test_mutation_returns_the_named_response_as_the_only_binding_surface(native_collection):
     ids, documents, vectors, metadata = _columns()
-    typed = native_collection.mutate_typed(ids, documents, vectors, metadata, "add")
-    legacy = native_collection.mutate(
-        ["c"],
-        ["C"],
-        np.asarray([[2.0, 0.0, 0.0]], dtype=np.float32),
-        [{}],
-        "add",
-    )
+    typed = native_collection.mutate(ids, documents, vectors, metadata, "add")
 
     assert type(typed).__name__ == "_MutationResponse"
     assert typed.batch_op_id > 0
     assert [type(row).__name__ for row in typed.rows] == ["_MutationRowResponse"] * 2
     assert [row.row_status for row in typed.rows] == [0, 0]
-    assert isinstance(legacy, dict)
-    assert legacy["rows"][0]["row_status"] == 0
+    assert not hasattr(native_collection, "mutate_typed")
     with pytest.raises(AttributeError):
         typed.batch_op_id = 0
 
 
-def test_typed_search_has_named_nested_stats_and_old_search_stays_dict(native_collection):
+def test_search_returns_named_nested_stats_as_the_only_binding_surface(native_collection):
     ids, documents, vectors, metadata = _columns()
-    native_collection.mutate_typed(ids, documents, vectors, metadata, "add")
+    native_collection.mutate(ids, documents, vectors, metadata, "add")
     query = np.asarray([0.0, 0.0, 0.0], dtype=np.float32)
 
-    typed = native_collection.search_typed(query, 2)
-    legacy = native_collection.search(query, 2)
+    typed = native_collection.search(query, 2)
 
     assert type(typed).__name__ == "_SearchResponse"
     assert typed.ids.tolist() == ["a", "b"]
@@ -76,13 +67,12 @@ def test_typed_search_has_named_nested_stats_and_old_search_stays_dict(native_co
     assert typed.completeness_codes.shape == (1,)
     assert type(typed.search_stats).__name__ == "_SearchStatsResponse"
     assert typed.search_stats.effective_effort is None
-    assert isinstance(legacy, dict)
-    assert legacy["ids"].tolist() == typed.ids.tolist()
+    assert not hasattr(native_collection, "search_typed")
 
 
 def test_native_scan_filters_and_projects_before_returning_records(native_collection):
     ids, documents, vectors, metadata = _columns()
-    native_collection.mutate_typed(ids, documents, vectors, metadata, "add")
+    native_collection.mutate(ids, documents, vectors, metadata, "add")
 
     records = native_collection.scan(metadata_filter={"kind": "keep"}, limit=1)
     vectors_included = native_collection.scan(
@@ -101,42 +91,55 @@ def test_native_scan_filters_and_projects_before_returning_records(native_collec
     assert all(record.vector.shape == (3,) for record in vectors_included)
 
 
-def test_typed_get_stats_options_checkpoint_and_maintenance(native_collection):
+def test_get_stats_options_checkpoint_and_maintenance_are_named_responses(native_collection):
     ids, documents, vectors, metadata = _columns()
-    native_collection.mutate_typed(ids, documents, vectors, metadata, "add")
+    native_collection.mutate(ids, documents, vectors, metadata, "add")
 
-    assert native_collection.get_by_id_typed("missing") is None
-    record = native_collection.get_by_id_typed("a", include_vector=False)
+    assert native_collection.get_by_id("missing") is None
+    record = native_collection.get_by_id("a", include_vector=False)
     assert type(record).__name__ == "_RecordResponse"
     assert record.vector is None
-    assert type(native_collection.stats_typed()).__name__ == "_StatsResponse"
-    assert type(native_collection.options_typed()).__name__ == "_OptionsResponse"
-    assert type(native_collection.checkpoint_typed()).__name__ == "_CheckpointResponse"
+    assert type(native_collection.stats()).__name__ == "_StatsResponse"
+    assert type(native_collection.options()).__name__ == "_OptionsResponse"
+    assert type(native_collection.checkpoint()).__name__ == "_CheckpointResponse"
 
-    assert type(native_collection.seal_typed()).__name__ == "_SealResponse"
-    assert type(native_collection.gc_typed()).__name__ == "_GcResponse"
-    native_collection.mutate_typed(
+    assert type(native_collection.seal()).__name__ == "_SealResponse"
+    assert type(native_collection.gc()).__name__ == "_GcResponse"
+    native_collection.mutate(
         ["c", "d"],
         ["C", "D"],
         np.asarray([[2.0, 0.0, 0.0], [3.0, 0.0, 0.0]], dtype=np.float32),
         [{}, {}],
         "add",
     )
-    native_collection.seal_typed()
-    native_collection.gc_typed()
-    assert type(native_collection.compact_typed()).__name__ == "_CompactResponse"
+    native_collection.seal()
+    native_collection.gc()
+    assert type(native_collection.compact()).__name__ == "_CompactResponse"
+    for legacy_name in (
+        "get_by_id_typed",
+        "get_by_ids_typed",
+        "records_typed",
+        "checkpoint_typed",
+        "seal_typed",
+        "compact_typed",
+        "gc_typed",
+        "stats_typed",
+        "options_typed",
+    ):
+        assert not hasattr(native_collection, legacy_name)
 
 
-def test_capabilities_absorb_laser_selected_simd_without_removing_legacy_diagnostic():
+def test_capabilities_are_the_only_laser_diagnostic_surface():
     capabilities = native_module.capabilities()
 
     assert type(capabilities).__name__ == "_CapabilitiesResponse"
     assert capabilities.index_types[0] == "flat"
     assert capabilities.laser_enabled is ("qg" in capabilities.index_types)
     if capabilities.laser_enabled:
-        assert capabilities.laser_simd == native_module.laser.selected_simd()
+        assert capabilities.laser_simd in {"generic", "avx2", "avx512"}
     else:
         assert capabilities.laser_simd is None
+    assert not hasattr(native_module, "laser")
 
 
 def test_private_response_fields_match_the_checked_in_stub():
@@ -166,7 +169,7 @@ def test_binding_read_only_open_is_native_and_byte_stable(tmp_path):
         "flat",
         "none",
     )
-    writer.mutate_typed(
+    writer.mutate(
         ["a"],
         ["A"],
         np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32),
@@ -178,10 +181,10 @@ def test_binding_read_only_open_is_native_and_byte_stable(tmp_path):
 
     reader = _Collection.open(str(root), True)
     assert reader.read_only is True
-    assert reader.options_typed().read_only is True
-    assert reader.get_by_id_typed("a", include_vector=False).document == "A"
+    assert reader.options().read_only is True
+    assert reader.get_by_id("a", include_vector=False).document == "A"
     with pytest.raises(native_module.CollectionNotSupportedError) as captured:
-        reader.mutate_typed(
+        reader.mutate(
             ["b"],
             ["B"],
             np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32),
@@ -190,7 +193,7 @@ def test_binding_read_only_open_is_native_and_byte_stable(tmp_path):
         )
     assert captured.value.status_detail == 15
     with pytest.raises(native_module.CollectionNotSupportedError):
-        reader.checkpoint_typed()
+        reader.checkpoint()
     reader.close()
 
     after = {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}

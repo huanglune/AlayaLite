@@ -334,7 +334,7 @@ class Collection:
     def info(self) -> CollectionInfo:
         """Return typed collection identity and implementation diagnostics."""
         native = self._require_native()
-        options = native.options_typed()
+        options = native.options()
         active_index: IndexType = "qg" if options.active_algorithm in {"qg", "laser"} else "flat"
         return CollectionInfo(
             name=self._name,
@@ -457,10 +457,10 @@ class Collection:
             # Native all_or_nothing currently treats a missing delete target as
             # a batch failure. The v2 contract treats that row as a stable
             # not_found no-op while deleting the other requested IDs.
-            existing = native.get_by_ids_typed(normalized_ids, include_vector=False)
+            existing = native.get_by_ids(normalized_ids, include_vector=False)
             if any(record is None for record in existing):
                 resolved_mode = "per_row_independent"
-        response = native.remove_typed(
+        response = native.remove(
             normalized_ids,
             mode=resolved_mode,
             durability=native_durability(durability),
@@ -505,7 +505,7 @@ class Collection:
         native_durable = native_durability(durability)
         for offset in range(0, len(matched_ids), size):
             batch = matched_ids[offset : offset + size]
-            response = native.remove_typed(
+            response = native.remove(
                 batch,
                 mode="all_or_nothing",
                 durability=native_durable,
@@ -570,7 +570,7 @@ class Collection:
         if budget is not None and not isinstance(budget, SearchBudget):
             raise TypeError("budget must be SearchBudget or None")
         resolved_budget = budget or SearchBudget()
-        response = native.search_typed(
+        response = native.search(
             array,
             result_limit,
             ef_search=effective_effort,
@@ -629,12 +629,12 @@ class Collection:
         normalized_ids = strict_ids(ids, allow_empty=True)
         if not isinstance(include_vector, bool):
             raise TypeError("include_vector must be a bool")
-        response = native.get_by_ids_typed(normalized_ids, include_vector=include_vector)
+        response = native.get_by_ids(normalized_ids, include_vector=include_vector)
         return tuple(None if record is None else _record(record) for record in response)
 
     def checkpoint(self) -> CheckpointReceipt:
         """Create a durable recovery point and truncate the eligible WAL."""
-        return _checkpoint_receipt(self._require_writable().checkpoint_typed())
+        return _checkpoint_receipt(self._require_writable().checkpoint())
 
     def seal(self) -> SealReceipt:
         """Rotate the active segment and build the configured sealed target."""
@@ -647,15 +647,15 @@ class Collection:
                 operation_stage=14,
                 status_detail=1,
             )
-        return _seal_receipt(native.seal_typed())
+        return _seal_receipt(native.seal())
 
     def compact(self) -> CompactionReceipt:
         """Compact eligible sealed generations."""
-        return _compaction_receipt(self._require_writable().compact_typed())
+        return _compaction_receipt(self._require_writable().compact())
 
     def collect_garbage(self) -> GarbageCollectionReceipt:
         """Reclaim artifacts no longer pinned by a search epoch."""
-        return _garbage_collection_receipt(self._require_writable().gc_typed())
+        return _garbage_collection_receipt(self._require_writable().gc())
 
     def rebuild_index(self, *, index: IndexConfig | None = None) -> CheckpointReceipt:
         """Rebuild all live rows into an atomically swapped index owner.
@@ -680,11 +680,11 @@ class Collection:
         with self._lock:
             current = self._require_writable()
             target = self._config.index if index is None else index
-            if not isinstance(target, (FlatIndexConfig, QGIndexConfig)):
+            if not isinstance(target, FlatIndexConfig | QGIndexConfig):
                 raise TypeError("index must be FlatIndexConfig, QGIndexConfig, or None")
             replacement_config = replace(self._config, index=target)
             validate_creation_config(replacement_config)
-            records = current.records_typed()
+            records = current.records()
             if isinstance(target, QGIndexConfig) and len(records) <= 32:
                 raise _status_error(
                     CollectionInvalidArgumentError,
@@ -697,7 +697,7 @@ class Collection:
 
     def stats(self) -> CollectionStats:
         """Return typed collection accounting and lifecycle statistics."""
-        return _collection_stats(self._require_native().stats_typed())
+        return _collection_stats(self._require_native().stats())
 
     def count(self) -> int:
         """Return the number of live logical records."""
@@ -768,7 +768,7 @@ class Collection:
         normalized_documents = document_column(documents, len(normalized_ids))
         normalized_metadata = metadata_column(metadata, len(normalized_ids))
         retry_token = _idempotency_key(idempotency_key)
-        response = native.mutate_typed(
+        response = native.mutate(
             normalized_ids,
             normalized_documents,
             vector_array,
@@ -841,7 +841,7 @@ class Collection:
             replacement = create_native_collection(staging, config)
             if records:
                 ids, documents, vectors, metadata = _record_columns(records, config)
-                response = replacement.mutate_typed(
+                response = replacement.mutate(
                     ids,
                     documents,
                     vectors,
@@ -859,8 +859,8 @@ class Collection:
                         operation_stage=4,
                         status_detail=1,
                     )
-                replacement.seal_typed()
-            checkpoint = _checkpoint_receipt(replacement.checkpoint_typed())
+                replacement.seal()
+            checkpoint = _checkpoint_receipt(replacement.checkpoint())
             write_collection_schema(staging, config)
             replacement.close()
             replacement = None
@@ -958,7 +958,7 @@ def _selectivity(value: float | None) -> float | None:
     """Validate an optional selectivity fraction."""
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, int | float):
         raise TypeError("selectivity_hint must be a float or None")
     resolved = float(value)
     if not math.isfinite(resolved) or resolved < 0.0 or resolved > 1.0:
