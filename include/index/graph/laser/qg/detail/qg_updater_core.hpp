@@ -1583,6 +1583,7 @@ class QGUpdater {
  * this predicate; they read valid_degree from the authoritative trailer.
  */
 #include "index/graph/laser/qg/detail/qg_updater_debug.hpp"
+
  private:
   static constexpr size_t kLockStripes = 4096;
 
