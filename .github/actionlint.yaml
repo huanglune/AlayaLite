@@ -1,0 +1,6 @@
+---
+# Registers the repository-specific label shared by the three g05 runner instances.
+# Keeping it here lets local and pre-commit actionlint use the same runner model.
+self-hosted-runner:
+  labels:
+  - g05

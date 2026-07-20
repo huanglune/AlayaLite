@@ -30,7 +30,27 @@ repos:
   rev: 0.2.1
   hooks:
   - id: yamlfmt
-    args: [--mapping, '2', --sequence, '2', --offset, '0', --colons, --width, '120']
+    args: [--mapping, '2', --sequence, '2', --offset, '0', --width, '120']
+
+
+#===========================================================================
+#                            GITHUB ACTIONS LINT HOOK
+#===========================================================================
+- repo: https://github.com/rhysd/actionlint
+  rev: v1.7.12
+  hooks:
+  - id: actionlint
+    files: ^\.github/workflows/.*\.ya?ml$
+
+
+#===========================================================================
+#                            SHELL SCRIPT LINT HOOK
+#===========================================================================
+- repo: https://github.com/shellcheck-py/shellcheck-py
+  rev: v0.11.0.1
+  hooks:
+  - id: shellcheck
+    files: ^\.github/scripts/.*\.sh$
 
 
 #===========================================================================
