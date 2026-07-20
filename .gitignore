@@ -42,7 +42,6 @@ __pycache__/
 
 # Data / generated outputs
 /data/
-/benchmarks/perf/baselines/*.json
 /logs/
 /results/
 
