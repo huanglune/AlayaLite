@@ -159,7 +159,7 @@ if(ALAYA_ENABLE_MUTABLE_LASER_TESTS)
   # required by CMake's REUSE_FROM contract; ALAYA_LASER_TESTING and non-GTest targets intentionally opt out.
   alaya_cc_target(
     alaya_laser_qg_test_pch
-    BARE GTEST
+    BARE GTEST OBJECT
     SRCS ../pch_anchor.cpp
     LIBS alaya_laser
     OPTS ${_laser_test_opts}

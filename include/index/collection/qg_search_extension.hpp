@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <memory>
 
-#include "core/algorithm_registry.hpp"
+#include "core/value_types.hpp"
 
 namespace alaya {
 

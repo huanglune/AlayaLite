@@ -14,6 +14,7 @@
 #include "core/value_types.hpp"
 
 namespace py = pybind11;
+namespace collection_binding = alaya::python::collection_binding;
 
 PYBIND11_MODULE(_alayalitepy, module) {
   module.doc() = "AlayaLite canonical Collection bindings";
@@ -30,11 +31,19 @@ PYBIND11_MODULE(_alayalitepy, module) {
       .value("COS", alaya::core::Metric::cosine)
       .export_values();
 
-  alaya::python::collection_binding::register_collection(module);
+  collection_binding::register_exceptions(module);
+  collection_binding::register_response_types(module);
+  collection_binding::PyCollectionClass collection(module, "_Collection");
+  collection_binding::register_collection_factory(collection);
+  collection_binding::register_collection_mutation(collection);
+  collection_binding::register_collection_search(collection);
+  collection_binding::register_collection_read(collection);
+  collection_binding::register_collection_management(collection);
 #ifdef ALAYA_ENABLE_LASER
-  alaya::python::collection_binding::
-      register_capabilities(module, true, std::string(alaya::laser::simd::get_laser_simd_name()));
+  collection_binding::register_capabilities(module,
+                                            true,
+                                            std::string(alaya::laser::simd::get_laser_simd_name()));
 #else
-  alaya::python::collection_binding::register_capabilities(module, false, std::nullopt);
+  collection_binding::register_capabilities(module, false, std::nullopt);
 #endif
 }

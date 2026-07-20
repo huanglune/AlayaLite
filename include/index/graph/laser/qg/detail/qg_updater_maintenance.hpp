@@ -4,10 +4,12 @@
 
 #pragma once
 
-// Class-body fragment included exactly once by qg_updater.hpp.
-// Maintenance transaction entry points.
+// Out-of-line maintenance transaction entry points. This header is private to
+// alaya_laser_runtime so edits do not rebuild every updater consumer.
 
-void garden(size_t num_threads, const GardenParams &gp) {
+namespace alaya::laser {
+
+void QGUpdater::garden(size_t num_threads, const GardenParams &gp) {
   if (enable_wal_) {
     throw std::logic_error(
         "QGUpdater::garden is out of the G1 op-WAL scope (clause A): its page rewrites need a "
@@ -101,7 +103,7 @@ void garden(size_t num_threads, const GardenParams &gp) {
 }
 
 /** Persist dirty pages and atomically advance the alternate A/B superblock. */
-void checkpoint() {
+void QGUpdater::checkpoint() {
   const std::lock_guard<std::mutex> checkpoint_guard(checkpoint_mutex_);
   checkpoint_locked();
 }
@@ -110,7 +112,7 @@ void checkpoint() {
 // reuse writer (and consolidate's activation) run under checkpoint_mutex_ and must be
 // able to drive a checkpoint/activation without re-locking. Public checkpoint() takes
 // the lock; every in-lane caller uses checkpoint_locked() directly.
-void checkpoint_locked() {
+void QGUpdater::checkpoint_locked() {
   if (enable_wal_ && !replaying_) {
     ensure_writable();
     // Admission (clause D): no in-flight allocation gap and no staged edges, so
@@ -322,4 +324,6 @@ void checkpoint_locked() {
   }
 }
 
-void finalize() { checkpoint(); }
+void QGUpdater::finalize() { checkpoint(); }
+
+}  // namespace alaya::laser

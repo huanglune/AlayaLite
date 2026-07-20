@@ -37,10 +37,9 @@ if(CMAKE_CXX_FLAGS MATCHES "(^| )-fsanitize=")
 endif()
 
 # ---------------------------------------------------------------------------------------------------------------------
-# ccache. The pybind11 module (_alayalitepy) is a single translation unit that expands dispatch.hpp's nested macros into
-# ~288 template instantiations. Single-TU means -j N cannot parallelize it, so repeat builds lean on ccache. pch_defines
-# + time/mtime/ctime sloppiness is required for PCH to actually hit cache; `cmake -E env` wraps each compile so
-# CCACHE_SLOPPINESS is in scope for ccache itself, not just CMake's configure step.
+# ccache. The pybind11 module (_alayalitepy) has several template-heavy registration translation units. Repeat builds
+# still lean on ccache; pch_defines + time/mtime/ctime sloppiness is required for PCH to actually hit cache. `cmake -E
+# env` wraps each compile so CCACHE_SLOPPINESS is in scope for ccache itself, not just CMake's configure step.
 # ---------------------------------------------------------------------------------------------------------------------
 if(ALAYA_USE_CCACHE)
   find_program(CCACHE_PROGRAM ccache)

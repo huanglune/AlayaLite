@@ -1575,8 +1575,13 @@ class QGUpdater {
     }
   }
 
-/** Refresh a deterministic budget of live rows; phase-separated from updates. */
-#include "index/graph/laser/qg/detail/qg_updater_maintenance.hpp"
+  /** Refresh a deterministic budget of live rows; phase-separated from updates. */
+  void garden(size_t num_threads, const GardenParams &gp);
+
+  /** Persist dirty pages and atomically advance the alternate A/B superblock. */
+  void checkpoint();
+  void checkpoint_locked();
+  void finalize();
 
 /**
  * Migration-only v1 ghost-slot heuristic.  Format-v2 update paths never use

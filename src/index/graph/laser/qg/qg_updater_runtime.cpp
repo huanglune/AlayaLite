@@ -5,6 +5,7 @@
 #include "index/disk/mutable_laser_segment.hpp"
 
 #include "index/graph/laser/qg/detail/qg_updater_core.hpp"
+#include "index/graph/laser/qg/detail/qg_updater_maintenance.hpp"
 
 namespace alaya::disk {
 

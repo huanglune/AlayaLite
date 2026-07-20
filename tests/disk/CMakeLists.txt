@@ -141,7 +141,14 @@ if(ALAYA_ENABLE_LASER)
       SRCS ${laser_segment_test_source}
     )
     if(ALAYA_LASER_SEGMENT_FIXTURE_AVAILABLE)
-      add_dependencies(${_laser_segment_test_target} laser_segment_fixture)
+      # The fixture is needed only when the executable runs. A target-level dependency serializes every source compile
+      # behind the Python extension and fixture generator; making the link edge depend on the generated files preserves
+      # correctness while allowing these expensive LASER test TUs to compile in parallel with fixture construction.
+      set_property(
+        TARGET ${_laser_segment_test_target}
+        APPEND
+        PROPERTY LINK_DEPENDS ${ALAYA_LASER_SEGMENT_FIXTURE_OUTPUTS}
+      )
       target_compile_definitions(
         ${_laser_segment_test_target} PRIVATE ALAYA_LASER_FIXTURE_DIR="${ALAYA_LASER_SEGMENT_FIXTURE_DIR}"
                                               ALAYA_LASER_FIXTURE_PREFIX="${ALAYA_LASER_SEGMENT_FIXTURE_PREFIX}"

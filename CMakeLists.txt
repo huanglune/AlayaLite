@@ -46,7 +46,7 @@ include(cmake/Codecov.cmake)
 include(cmake/PrintSummary.cmake)
 
 # ---------------------------------------------------------------------------------------------------------------------
-# The core library: header-only, so an INTERFACE target carrying the include tree and the third-party link surface.
+# The core consumer surface plus the non-template Collection runtime.
 # ---------------------------------------------------------------------------------------------------------------------
 add_library(AlayaLite INTERFACE)
 target_include_directories(
@@ -54,6 +54,65 @@ target_include_directories(
 )
 target_link_libraries(AlayaLite INTERFACE ${THIRD_PARTY_LIBS})
 target_compile_features(AlayaLite INTERFACE cxx_std_20)
+
+add_library(
+  alaya_segmented_collection_runtime STATIC
+  src/index/collection/segmented_collection_lifecycle.cpp src/index/collection/segmented_collection_mutation.cpp
+  src/index/collection/segmented_collection_search.cpp src/index/collection/segmented_collection_utility.cpp
+)
+target_include_directories(
+  alaya_segmented_collection_runtime PUBLIC $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>
+)
+target_link_libraries(alaya_segmented_collection_runtime PUBLIC ${THIRD_PARTY_LIBS})
+target_compile_features(alaya_segmented_collection_runtime PUBLIC cxx_std_20)
+alaya_apply_build_flags(alaya_segmented_collection_runtime)
+add_coverage_to_target(alaya_segmented_collection_runtime)
+
+set(_alaya_collection_runtime_sources
+    src/index/collection/collection_runtime_00.cpp
+    src/index/collection/collection_runtime_01.cpp
+    src/index/collection/collection_runtime_02.cpp
+    src/index/collection/collection_runtime_03.cpp
+    src/index/collection/collection_runtime_04.cpp
+    src/index/collection/collection_runtime_05.cpp
+    src/index/collection/collection_runtime_06.cpp
+    src/index/collection/collection_runtime_07.cpp
+    src/index/collection/collection_runtime_08.cpp
+    src/index/collection/collection_runtime_09.cpp
+    src/index/collection/collection_runtime_10.cpp
+)
+
+add_library(alaya_collection_runtime STATIC ${_alaya_collection_runtime_sources})
+target_include_directories(
+  alaya_collection_runtime PUBLIC $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>
+)
+target_link_libraries(alaya_collection_runtime PUBLIC alaya_segmented_collection_runtime ${THIRD_PARTY_LIBS})
+target_compile_features(alaya_collection_runtime PUBLIC cxx_std_20)
+alaya_apply_build_flags(alaya_collection_runtime)
+add_coverage_to_target(alaya_collection_runtime)
+
+if(ALAYA_ENABLE_LASER)
+  add_library(alaya_collection_laser_runtime STATIC ${_alaya_collection_runtime_sources})
+  target_include_directories(
+    alaya_collection_laser_runtime PUBLIC $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>
+  )
+  target_link_libraries(
+    alaya_collection_laser_runtime PUBLIC alaya_segmented_collection_runtime alaya_laser ${THIRD_PARTY_LIBS}
+  )
+  target_compile_definitions(alaya_collection_laser_runtime PRIVATE ALAYA_ENABLE_LASER=1)
+  target_compile_features(alaya_collection_laser_runtime PUBLIC cxx_std_20)
+  target_compile_options(alaya_collection_laser_runtime PRIVATE ${_ALAYA_LASER_CONSUMER_OPTIONS})
+  alaya_apply_build_flags(alaya_collection_laser_runtime)
+  add_coverage_to_target(alaya_collection_laser_runtime)
+  set(_alaya_collection_runtime_link
+      "$<IF:$<BOOL:$<TARGET_PROPERTY:ALAYA_LASER_CONSUMER>>,alaya_collection_laser_runtime,alaya_collection_runtime>"
+  )
+else()
+  set(_alaya_collection_runtime_link alaya_collection_runtime)
+endif()
+target_link_libraries(AlayaLite INTERFACE ${_alaya_collection_runtime_link})
+unset(_alaya_collection_runtime_link)
+unset(_alaya_collection_runtime_sources)
 
 if(BUILD_TESTING)
   include(CTest)

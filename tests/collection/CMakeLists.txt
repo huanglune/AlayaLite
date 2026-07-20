@@ -10,7 +10,7 @@ alaya_cc_target(collection_header_closure SRCS collection_header_closure.cpp)
 alaya_cc_target(
   alaya_collection_test_pch
   SRCS ../pch_anchor.cpp
-  GTEST
+  GTEST OBJECT
 )
 target_precompile_headers(alaya_collection_test_pch PRIVATE <gtest/gtest.h> <alaya/collection.hpp>)
 
@@ -18,7 +18,7 @@ if(ALAYA_ENABLE_LASER)
   alaya_cc_target(
     alaya_collection_laser_test_pch
     SRCS ../pch_anchor.cpp
-    GTEST LASER
+    GTEST LASER OBJECT
   )
   target_precompile_headers(
     alaya_collection_laser_test_pch

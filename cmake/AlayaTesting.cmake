@@ -4,13 +4,13 @@
 
 # AlayaTesting.cmake - declarative helpers for test/bench executables.
 #
-# alaya_cc_target(<name> SRCS <files...> [GTEST] [LASER] [BARE] [PCH_REUSE_FROM <target>] [LIBS <targets...>] [DEFS
-# <defines...>] [OPTS <options...>]) Creates the executable, links AlayaLite (headers + all third-party libs) and the
-# standard build flags, applies coverage instrumentation, and optionally the GTest libraries and/or the LASER consumer
-# surface (alaya_laser + ALAYA_ENABLE_LASER=1 + the SIMD/vectorization options LASER translation units require). BARE
-# skips the implicit AlayaLite link for targets that must control their exact link set (the LASER backend unit tests);
-# such targets still get alaya_build_flags and list everything else through LIBS. PCH_REUSE_FROM shares a precompiled
-# header from a target with an identical compile profile.
+# alaya_cc_target(<name> SRCS <files...> [GTEST] [LASER] [BARE] [OBJECT] [PCH_REUSE_FROM <target>] [LIBS <targets...>]
+# [DEFS <defines...>] [OPTS <options...>]) Creates the executable, links AlayaLite (headers + all third-party libs) and
+# the standard build flags, applies coverage instrumentation, and optionally the GTest libraries and/or the LASER
+# consumer surface (alaya_laser + ALAYA_ENABLE_LASER=1 + the SIMD/vectorization options LASER translation units
+# require). BARE skips the implicit AlayaLite link for targets that must control their exact link set (the LASER backend
+# unit tests); such targets still get alaya_build_flags and list everything else through LIBS. PCH_REUSE_FROM shares a
+# precompiled header from a target with an identical compile profile.
 #
 # alaya_add_test(NAME <name> TARGET <target> [FILTER <gtest-filter>] [LABELS <labels...>] [TIMEOUT <seconds>]
 # [WORKING_DIRECTORY <dir>] [RUN_SERIAL] [COVERAGE_RUN_SERIAL]) Registers one ctest entry for an alaya_cc_target
@@ -55,8 +55,16 @@ foreach(ds IN LISTS ALAYA_DATASETS)
   add_dependencies(test-data test-data-${ds})
 endforeach()
 
+function(_alaya_create_cc_target target_name as_object)
+  if(as_object)
+    add_library(${target_name} OBJECT ${ARGN})
+  else()
+    add_executable(${target_name} ${ARGN})
+  endif()
+endfunction()
+
 function(alaya_cc_target target_name)
-  set(flag_keywords GTEST LASER BARE)
+  set(flag_keywords GTEST LASER BARE OBJECT)
   set(one_value_keywords PCH_REUSE_FROM)
   set(multi_value_keywords SRCS LIBS DEFS OPTS)
   cmake_parse_arguments(
@@ -79,7 +87,7 @@ function(alaya_cc_target target_name)
     list(APPEND sources ${CMAKE_CURRENT_SOURCE_DIR}/${source_file})
   endforeach()
 
-  add_executable(${target_name} ${sources})
+  _alaya_create_cc_target(${target_name} "${ARG_OBJECT}" ${sources})
   if(ARG_BARE)
     target_link_libraries(${target_name} PRIVATE alaya_build_flags ${ARG_LIBS})
     target_include_directories(${target_name} PRIVATE ${CMAKE_SOURCE_DIR}/include)
@@ -98,6 +106,7 @@ function(alaya_cc_target target_name)
       message(FATAL_ERROR "alaya_cc_target(${target_name}): LASER requested but ALAYA_ENABLE_LASER=OFF")
     endif()
     target_link_libraries(${target_name} PRIVATE alaya_laser)
+    set_property(TARGET ${target_name} PROPERTY ALAYA_LASER_CONSUMER TRUE)
     target_compile_definitions(${target_name} PRIVATE ALAYA_ENABLE_LASER=1)
     target_compile_options(${target_name} PRIVATE ${_ALAYA_LASER_CONSUMER_OPTIONS})
   endif()

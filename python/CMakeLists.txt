@@ -10,7 +10,21 @@ set(PYTHON_MODULE_NAME _alayalitepy)
 # The module. pybind11 resolves Python through FindPython (PYBIND11_FINDPYTHON=ON set before find_package(pybind11) in
 # AlayaDependencies.cmake), i.e. the same interpreter as everything else.
 # ---------------------------------------------------------------------------------------------------------------------
-pybind11_add_module(${PYTHON_MODULE_NAME} MODULE NO_EXTRAS src/pybind.cpp)
+pybind11_add_module(
+  ${PYTHON_MODULE_NAME}
+  MODULE
+  NO_EXTRAS
+  src/pybind.cpp
+  src/collection_binding_factory_impl.cpp
+  src/collection_binding_lifecycle.cpp
+  src/collection_binding_management_impl.cpp
+  src/collection_binding_mutation.cpp
+  src/collection_binding_mutation_impl.cpp
+  src/collection_binding_read_impl.cpp
+  src/collection_binding_search.cpp
+  src/collection_binding_search_impl.cpp
+  src/collection_binding_types.cpp
+)
 target_include_directories(${PYTHON_MODULE_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(${PYTHON_MODULE_NAME} PRIVATE AlayaLite pybind11::module)
 alaya_apply_build_flags(${PYTHON_MODULE_NAME})
@@ -36,11 +50,12 @@ target_precompile_headers(
 # LASER remains linked for the canonical disk reader and the selected-SIMD diagnostic. SIMD-dependent flags are PRIVATE.
 if(ALAYA_ENABLE_LASER)
   target_link_libraries(${PYTHON_MODULE_NAME} PRIVATE alaya_laser)
+  set_property(TARGET ${PYTHON_MODULE_NAME} PROPERTY ALAYA_LASER_CONSUMER TRUE)
   target_compile_definitions(${PYTHON_MODULE_NAME} PRIVATE ALAYA_ENABLE_LASER=1)
   target_compile_options(${PYTHON_MODULE_NAME} PRIVATE ${_ALAYA_LASER_CONSUMER_OPTIONS})
   if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    # GCC 11 can ICE while auto-vectorizing the LASER-enabled pybind TU. The handwritten LASER kernels still use target
-    # attributes; this only disables generic tree vectorization for the binding translation unit.
+    # GCC 11 can ICE while auto-vectorizing LASER-enabled binding code. The handwritten LASER kernels still use target
+    # attributes; this only disables generic tree vectorization for the binding translation units.
     target_compile_options(${PYTHON_MODULE_NAME} PRIVATE -fno-tree-vectorize)
   endif()
 endif()
