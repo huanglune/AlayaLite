@@ -58,6 +58,11 @@ endforeach()
 function(_alaya_create_cc_target target_name as_object)
   if(as_object)
     add_library(${target_name} OBJECT ${ARGN})
+    # PCH consumers are executables. OBJECT libraries otherwise inherit the global -fPIC profile, which makes GCC reject
+    # their PCH when an executable consumes it with -fPIE. Mirror CMake's platform-specific executable PIE compile
+    # profile without adding a link step; the option is empty on toolchains that do not distinguish PIE.
+    set_property(TARGET ${target_name} PROPERTY POSITION_INDEPENDENT_CODE OFF)
+    target_compile_options(${target_name} PRIVATE ${CMAKE_CXX_COMPILE_OPTIONS_PIE})
   else()
     add_executable(${target_name} ${ARGN})
   endif()
