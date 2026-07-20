@@ -24,9 +24,7 @@ class BgeEmbedder(BaseEmbedding):
         try:
             from FlagEmbedding import BGEM3FlagModel  # pylint: disable=import-outside-toplevel
         except ImportError as exc:
-            raise ImportError(
-                "BgeEmbedder requires the dependencies in examples/rag/requirements.txt"
-            ) from exc
+            raise ImportError("BgeEmbedder requires the dependencies in examples/rag/requirements.txt") from exc
 
         super().__init__(path)
         # For bge-m3, it is recommended to use BGEM3FlagModel.

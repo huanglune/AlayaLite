@@ -24,9 +24,7 @@ class JinaEmbedder(BaseEmbedding):
         try:
             from sentence_transformers import SentenceTransformer  # pylint: disable=import-outside-toplevel
         except ImportError as exc:
-            raise ImportError(
-                "JinaEmbedder requires the dependencies in examples/rag/requirements.txt"
-            ) from exc
+            raise ImportError("JinaEmbedder requires the dependencies in examples/rag/requirements.txt") from exc
 
         super().__init__(path)
         self.model = SentenceTransformer(path, trust_remote_code=True)

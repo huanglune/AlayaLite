@@ -24,9 +24,7 @@ class M3eEmbedder(BaseEmbedding):
         try:
             from sentence_transformers import SentenceTransformer  # pylint: disable=import-outside-toplevel
         except ImportError as exc:
-            raise ImportError(
-                "M3eEmbedder requires the dependencies in examples/rag/requirements.txt"
-            ) from exc
+            raise ImportError("M3eEmbedder requires the dependencies in examples/rag/requirements.txt") from exc
 
         super().__init__(path)
         self.model = SentenceTransformer(path)

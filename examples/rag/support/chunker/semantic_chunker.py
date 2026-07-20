@@ -29,9 +29,7 @@ class SemanticChunker(BaseChunker):
         try:
             from sentence_transformers import SentenceTransformer  # pylint: disable=import-outside-toplevel
         except ImportError as exc:
-            raise ImportError(
-                "SemanticChunker requires the dependencies in examples/rag/requirements.txt"
-            ) from exc
+            raise ImportError("SemanticChunker requires the dependencies in examples/rag/requirements.txt") from exc
 
         # This class does not use the BaseChunker's __init__ as its logic is different.
         super().__init__(chunk_size=0, chunk_overlap=0)

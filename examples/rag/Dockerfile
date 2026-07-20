@@ -1,29 +1,17 @@
-FROM ubuntu:22.04
+FROM python:3.12-slim-bookworm
 
-RUN apt-get update && apt-get install -y \
-    wget \
-    bzip2 \
-    curl \
-    binutils \
-    software-properties-common \
-    && rm -rf /var/lib/apt/lists/*
+ARG ALAYALITE_VERSION=1.1.0
 
-# install python3 and pip
-RUN echo "tzdata tzdata/Areas select Asia" | debconf-set-selections && \
-    echo "tzdata tzdata/Zones/Asia select Shanghai" | debconf-set-selections && \
-    add-apt-repository ppa:deadsnakes/ppa && \
-    apt update && \
-    DEBIAN_FRONTEND=noninteractive apt install -y python3.11 && \
-    update-alternatives --install /usr/bin/python python /usr/bin/python3.11 2 && \
-    update-alternatives --config python && \
-    apt install -y python3-pip
+WORKDIR /workspace
+COPY examples/rag/requirements.txt /workspace/examples/rag/requirements.txt
+RUN python -m pip install --no-cache-dir --upgrade pip && \
+    python -m pip install --no-cache-dir -r /workspace/examples/rag/requirements.txt && \
+    python -m pip install --no-cache-dir "alayalite==${ALAYALITE_VERSION}"
 
-# install required packages and alayalite
-RUN python3.11 -m pip install python-docx numpy streamlit langchain_text_splitters FlagEmbedding pypdf "transformers<5.0.0"
-RUN python3.11 -m pip install alayalite
+COPY examples/rag /workspace/examples/rag
 
-# set the mirror of embedding models
-RUN echo "export HF_ENDPOINT=https://hf-mirror.com" >> ~/.bashrc
+ENV ALAYALITE_RAG_DATA_DIR=/data
+VOLUME ["/data"]
+EXPOSE 8501
 
-WORKDIR /app
-CMD ["/bin/bash"]
+CMD ["python", "-m", "streamlit", "run", "examples/rag/ui.py", "--server.address=0.0.0.0"]

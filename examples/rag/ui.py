@@ -14,10 +14,11 @@ from typing import Callable, Generator, Tuple
 
 import streamlit as st
 import torch
-from db import insert_text, query_text, reset_db
 from docx import Document
-from llm import ask_llm
 from pypdf import PdfReader
+
+from examples.rag.db import clear_database, close_database, insert_text, open_database, query_text
+from examples.rag.llm import ask_llm
 
 torch.classes.__path__ = [os.path.join(torch.__path__[0], torch.classes.__file__)]
 USE_STREAM = True
@@ -98,7 +99,7 @@ def main_interface():
                     "Upload documents", type=["txt", "pdf", "docx", "md"], accept_multiple_files=True
                 )
                 if st.form_submit_button("🚀 Start processing"):
-                    reset_db()
+                    clear_database()
                     if uploaded_file:
                         success = True
                         for file in uploaded_file:
@@ -108,7 +109,7 @@ def main_interface():
                                     collection_name=collection_name,
                                     docs=content,
                                     embed_model_path=embed_model_path,
-                                    chunksize=256,
+                                    chunk_size=256,
                                     overlap=25,
                                 )
                                 if not success:
@@ -197,7 +198,11 @@ def main_interface():
 
 
 def main():
-    main_interface()
+    open_database()
+    try:
+        main_interface()
+    finally:
+        close_database()
 
 
 if __name__ == "__main__":

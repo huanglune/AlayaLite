@@ -33,9 +33,7 @@ class FixSizeChunker(BaseChunker):
         try:
             from langchain_text_splitters import CharacterTextSplitter  # pylint: disable=import-outside-toplevel
         except ImportError as exc:
-            raise ImportError(
-                "FixSizeChunker requires the dependencies in examples/rag/requirements.txt"
-            ) from exc
+            raise ImportError("FixSizeChunker requires the dependencies in examples/rag/requirements.txt") from exc
 
         text_splitter = CharacterTextSplitter(
             separator="\n",
