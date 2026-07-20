@@ -1,7 +1,7 @@
 FROM python:3.12-slim-bookworm
 
-# Default tracks pyproject.toml; override with a published release version
-# (the newest tagged release is what PyPI actually serves).
+# SDK v2 is the design generation; its first release remains version 1.1.0.
+# Override this argument only when testing a later published artifact.
 ARG ALAYALITE_VERSION=1.1.0
 
 WORKDIR /

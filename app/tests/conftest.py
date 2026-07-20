@@ -1,32 +1,31 @@
-# SPDX-FileCopyrightText: 2025 AlayaDB.AI
-#
+# SPDX-FileCopyrightText: 2026 AlayaDB.AI
 # SPDX-License-Identifier: AGPL-3.0-only
+
+"""FastAPI fixtures with real application lifespan handling."""
+
+from __future__ import annotations
 
 import importlib
 import sys
-from typing import AsyncGenerator
+from collections.abc import AsyncGenerator
 
 import httpx
 import pytest_asyncio
 
 
-def _reload_app_module():
-    # Remove loaded app.* modules so a fresh app is created with current env
-    for name in list(sys.modules.keys()):
+def reload_app():
+    """Build a fresh application after environment changes."""
+    for name in tuple(sys.modules):
         if name == "app" or name.startswith("app."):
             del sys.modules[name]
-    app_module = importlib.import_module("app.main")
-    return app_module.app
+    return importlib.import_module("app.main").app
 
 
 @pytest_asyncio.fixture()
 async def fresh_client(tmp_path, monkeypatch) -> AsyncGenerator[httpx.AsyncClient, None]:
-    # Isolate storage into a temp directory for this test
     monkeypatch.setenv("ALAYALITE_DATA_DIR", str(tmp_path))
-    # Set RocksDB directory to tmp_path for test isolation
-    rocksdb_dir = str(tmp_path / "RocksDB")
-    monkeypatch.setenv("ALAYALITE_ROCKSDB_DIR", rocksdb_dir)
-    app = _reload_app_module()
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-        yield client
+    application = reload_app()
+    async with application.router.lifespan_context(application):
+        transport = httpx.ASGITransport(app=application)
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            yield client
