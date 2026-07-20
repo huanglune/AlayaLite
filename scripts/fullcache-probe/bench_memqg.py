@@ -1,83 +1,92 @@
 # SPDX-FileCopyrightText: 2026 AlayaDB.AI
-#
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""Memory QG (RaBitQ) reference arm for the full-cache adjudication probe.
+"""QG reference arm for the historical full-cache adjudication probe."""
 
-Builds the in-memory RaBitQ quantized graph on SIFT1M and measures the
-search QPS/recall curve under the same query set + exact GT as the LASER
-full-cache arm. Serial (num_threads=1) plus a 16-thread arm.
-"""
+from __future__ import annotations
 
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-from alayalite import Index
-from alayalite.schema import IndexParams
+from alayalite import CollectionConfig, QGIndexConfig, connect
+from alayalite.models import SearchResult
 
 
-def read_fbin(path):
-    with open(path, "rb") as f:
-        n, dim = np.fromfile(f, dtype=np.int32, count=2)
-        data = np.fromfile(f, dtype=np.float32, count=n * dim)
-    return data.reshape(n, dim)
+def read_fbin(path: str) -> np.ndarray:
+    """Read a float32 fbin matrix."""
+    with open(path, "rb") as stream:
+        rows, dimension = np.fromfile(stream, dtype=np.int32, count=2)
+        data = np.fromfile(stream, dtype=np.float32, count=int(rows * dimension))
+    return data.reshape(rows, dimension)
 
 
-def read_ibin(path):
-    with open(path, "rb") as f:
-        n, dim = np.fromfile(f, dtype=np.int32, count=2)
-        data = np.fromfile(f, dtype=np.int32, count=n * dim)
-    return data.reshape(n, dim)
+def read_ibin(path: str) -> np.ndarray:
+    """Read an int32 ibin matrix."""
+    with open(path, "rb") as stream:
+        rows, dimension = np.fromfile(stream, dtype=np.int32, count=2)
+        data = np.fromfile(stream, dtype=np.int32, count=int(rows * dimension))
+    return data.reshape(rows, dimension)
 
 
-def main():
-    base_path, query_path, gt_path = sys.argv[1], sys.argv[2], sys.argv[3]
-    topk = int(sys.argv[4]) if len(sys.argv) > 4 else 100
+def _search(collection, queries: np.ndarray, limit: int, effort: int, workers: int) -> list[list[str]]:
+    def rows(result: SearchResult) -> list[list[str]]:
+        return [result[index].ids.tolist() for index in range(len(result))]
+
+    if workers == 1:
+        return rows(collection.search(queries, limit=limit, effort=effort))
+    chunks = [chunk for chunk in np.array_split(queries, workers) if len(chunk)]
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        results = executor.map(lambda chunk: collection.search(chunk, limit=limit, effort=effort), chunks)
+        return [row for result in results for row in rows(result)]
+
+
+def main() -> None:
+    """Build QG and report recall/QPS for public effort settings."""
+    base_path, query_path, truth_path = sys.argv[1], sys.argv[2], sys.argv[3]
+    limit = int(sys.argv[4]) if len(sys.argv) > 4 else 100
     build_threads = int(sys.argv[5]) if len(sys.argv) > 5 else 64
-
     base = read_fbin(base_path)
-    query = read_fbin(query_path)
-    gt = read_ibin(gt_path)[:, :topk]
-    print(f"base {base.shape} query {query.shape} gt {gt.shape}", flush=True)
+    queries = read_fbin(query_path)
+    truth = read_ibin(truth_path)[:, :limit]
+    print(f"base {base.shape} query {queries.shape} gt {truth.shape}", flush=True)
 
-    params = IndexParams(
-        index_type="hnsw",
-        quantization_type="rabitq",
+    config = CollectionConfig(
+        dimension=int(base.shape[1]),
         metric="l2",
-        capacity=np.uint32(base.shape[0]),
+        index=QGIndexConfig(build_threads=build_threads),
     )
-    idx = Index(name="fullcache-probe-memqg", params=params)
-    t0 = time.perf_counter()
-    idx.fit(base, num_threads=build_threads)
-    t1 = time.perf_counter()
-    print(f"build_seconds,{t1 - t0:.2f}", flush=True)
+    with connect() as database:
+        collection = database.create_collection("fullcache-probe-qg", config=config)
+        started = time.perf_counter()
+        collection.add(ids=[str(row) for row in range(len(base))], vectors=base)
+        collection.seal()
+        print(f"build_seconds,{time.perf_counter() - started:.2f}", flush=True)
 
-    print("arm,ef,threads,recall,qps,mean_us", flush=True)
-    for threads in (1, 16):
-        for ef in (40, 60, 100, 200):
-            eff_ef = max(ef, topk)
-            # warmup
-            idx.batch_search(query[:1000], topk, eff_ef, threads)
-            best_qps = 0.0
-            recall = 0.0
-            for _ in range(3):
-                t0 = time.perf_counter()
-                res = idx.batch_search(query, topk, eff_ef, threads)
-                t1 = time.perf_counter()
-                qps = query.shape[0] / (t1 - t0)
-                if qps > best_qps:
-                    best_qps = qps
-                res = np.asarray(res)[:, :topk]
-                hits = 0
-                for i in range(gt.shape[0]):
-                    hits += len(np.intersect1d(res[i], gt[i]))
-                recall = hits / gt.size
-            mean_us = 1e6 * threads / best_qps
-            print(
-                f"memqg,{ef},{threads},{recall:.4f},{best_qps:.1f},{mean_us:.1f}",
-                flush=True,
-            )
+        print("arm,effort,workers,recall,qps,mean_us", flush=True)
+        for workers in (1, 16):
+            for requested_effort in (100, 200, 400, 800):
+                effort = max(requested_effort, limit, 100)
+                _search(collection, queries[:1000], limit, effort, workers)
+                best_qps = 0.0
+                recall = 0.0
+                for _ in range(3):
+                    started = time.perf_counter()
+                    result_rows = _search(collection, queries, limit, effort, workers)
+                    elapsed = time.perf_counter() - started
+                    best_qps = max(best_qps, len(queries) / elapsed)
+                    hits = sum(
+                        len(np.intersect1d(np.asarray(row, dtype=np.int64), truth[index]))
+                        for index, row in enumerate(result_rows)
+                    )
+                    recall = hits / truth.size
+                mean_us = 1e6 * workers / best_qps
+                print(
+                    f"qg,{effort},{workers},{recall:.4f},{best_qps:.1f},{mean_us:.1f}",
+                    flush=True,
+                )
+        collection.close()
 
 
 if __name__ == "__main__":
