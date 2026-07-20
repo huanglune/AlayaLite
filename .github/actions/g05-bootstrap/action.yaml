@@ -13,6 +13,13 @@ runs:
     shell: bash
     run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+  - name: Isolate the Conan cache per runner instance
+    # The runner instances share one home; concurrent first-time exports into a
+    # shared ~/.conan2 race ("Reference ... already exists"). One cache per
+    # instance keeps every job serial within its own cache.
+    shell: bash
+    run: echo "CONAN_HOME=$HOME/.conan2-$RUNNER_NAME" >> "$GITHUB_ENV"
+
   - name: Verify g05 native toolchain
     shell: bash
     run: |

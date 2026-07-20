@@ -379,8 +379,10 @@ TEST(AnySegmentV3, CancelKeepsExternalPinUntilExactlyOnceCompletion) {
   EXPECT_EQ(waiter->count, 1U);
   EXPECT_EQ(storage.counts[0], 0U);
   handle = OperationHandle{};
-  for (int retry = 0; retry < 100 && !weak_pin.expired(); ++retry) {
-    std::this_thread::yield();
+  // The executor releases its request copy after the completion callback returns, so give it a
+  // real deadline; 100 yields elapse in microseconds on a loaded many-core host.
+  for (int retry = 0; retry < 2000 && !weak_pin.expired(); ++retry) {
+    std::this_thread::sleep_for(1ms);
   }
   EXPECT_TRUE(weak_pin.expired());
 }
