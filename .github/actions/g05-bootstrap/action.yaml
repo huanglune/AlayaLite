@@ -23,10 +23,14 @@ runs:
       test -f /usr/include/libaio.h
       test -f /usr/include/liburing.h
 
-  - name: Install Conan with uv
+  - name: Ensure Conan 2
+    # A machine may already provide a suitable Conan (g05 ships 2.x);
+    # uv refuses to overwrite foreign executables, so install only on absence.
     shell: bash
     run: |
-      uv tool install 'conan>=2,<3'
+      if ! conan --version 2>/dev/null | grep -qE 'Conan version 2\.'; then
+        uv tool install 'conan>=2,<3'
+      fi
       conan profile detect 2>/dev/null || true
 
   - name: Prepare Python 3.12 with uv
