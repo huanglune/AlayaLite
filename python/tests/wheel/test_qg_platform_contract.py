@@ -1,49 +1,70 @@
 # SPDX-FileCopyrightText: 2026 AlayaDB.AI
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""Installed-wheel smoke for the qg same-id implementation contract."""
+"""Installed-wheel smoke for the complete SDK v2 contract."""
 
-import platform
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
 
 import alayalite
 import numpy as np
 import pytest
-from alayalite import Collection, CollectionNotSupportedError
-from alayalite.schema import IndexParams
+from alayalite import (
+    CollectionConfig,
+    CollectionNotSupportedError,
+    FlatIndexConfig,
+    QGIndexConfig,
+    connect,
+)
 
 
-def test_wheel_exports_the_1_1_public_surface():
+def test_wheel_exports_only_the_v2_root_surface() -> None:
+    assert alayalite.__version__ == "1.1.0"
+    assert "Client" not in alayalite.__all__
     assert "Index" not in alayalite.__all__
     assert "DiskCollection" not in alayalite.__all__
-    assert alayalite.__version__ == "1.1.0"
+    package = Path(alayalite.__file__).parent
+    assert (package / "py.typed").is_file()
+    assert (package / "_alayalitepy.pyi").is_file()
+    for module in ("client", "schema", "laser", "rag", "vamana"):
+        assert importlib.util.find_spec(f"alayalite.{module}") is None
 
 
-@pytest.mark.skipif(
-    not (
-        (platform.system() == "Linux" and platform.machine().lower() in {"aarch64", "arm64"})
-        or platform.system() == "Windows"
-    ),
-    reason="this wheel platform includes LASER",
-)
-def test_laser_unavailable_wheel_rejects_qg_without_flat_fallback(tmp_path):
-    collection = Collection(
-        "qg-platform-gate",
-        IndexParams(
-            index_type="qg",
-            quantization_type="rabitq",
-            metric="euclidean",
-            storage_path=str(tmp_path / "qg-platform-gate" / "storage"),
-        ),
-    )
-    vectors = np.arange(40 * 64, dtype=np.float32).reshape(40, 64) / np.float32(257.0)
-    collection.add([(str(row), "", vectors[row], {}) for row in range(len(vectors))])
+def test_flat_wheel_crud_checkpoint_reopen_and_read_only(tmp_path: Path) -> None:
+    root = tmp_path / "database"
+    config = CollectionConfig(dimension=3, metric="cosine", index=FlatIndexConfig())
+    with connect(root) as database:
+        collection = database.create_collection("flat", config=config)
+        collection.add(
+            ids=["a", "b"],
+            vectors=np.asarray([[1, 0, 0], [0, 1, 0]], dtype=np.float32),
+            documents=["A", "B"],
+        )
+        assert collection.search(np.asarray([1, 0, 0], dtype=np.float32), limit=2)[0].ids.tolist() == ["a", "b"]
+        collection.checkpoint()
+        collection.close()
 
-    with pytest.raises(CollectionNotSupportedError) as captured:
+    with connect(root, read_only=True) as database:
+        with database.open_collection("flat") as collection:
+            assert collection.get(["b"])[0].document == "B"
+
+
+def test_qg_wheel_succeeds_or_fails_at_create_by_capability(tmp_path: Path) -> None:
+    root = tmp_path / "qg-database"
+    config = CollectionConfig(dimension=64, index=QGIndexConfig())
+    with connect(root) as database:
+        if "qg" not in alayalite.capabilities().index_types:
+            with pytest.raises(CollectionNotSupportedError, match="Flat fallback is disabled"):
+                database.create_collection("qg", config=config)
+            assert database.list_collections() == []
+            return
+
+        collection = database.create_collection("qg", config=config)
+        vectors = np.arange(40 * 64, dtype=np.float32).reshape(40, 64) / np.float32(257.0)
+        collection.add(ids=[str(row) for row in range(len(vectors))], vectors=vectors)
         collection.seal()
-
-    diagnostic = str(captured.value)
-    assert "LASER" in diagnostic
-    assert "not supported" in diagnostic
-    assert "Flat fallback is disabled" in diagnostic
-    assert collection.stats()["sealed_segments_count"] == 0
-    collection.close()
+        result = collection.search(vectors[0], limit=5)
+        assert result[0].ids.size == 5
+        collection.close()
