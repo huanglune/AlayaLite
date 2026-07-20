@@ -14,9 +14,9 @@ MetadataScalar = bool | int | float | str
 __version__: str
 
 class MetricType(Enum):
-    L2: MetricType
-    IP: MetricType
-    COS: MetricType
+    L2 = 0
+    IP = 1
+    COS = 2
 
 class CollectionStatusError(RuntimeError):
     status_code: int
