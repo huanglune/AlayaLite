@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 AlayaDB.AI
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""Shared activation guard and fixtures for the SDK v2 executable contract."""
+"""Shared fixtures for the SDK v2 executable contract."""
 
 from __future__ import annotations
 
@@ -10,37 +10,6 @@ from collections.abc import Iterator
 from typing import Any
 
 import pytest
-
-_V2_ROOT_SYMBOLS = frozenset(
-    {
-        "connect",
-        "capabilities",
-        "Database",
-        "Collection",
-        "CollectionConfig",
-        "FlatIndexConfig",
-        "QGIndexConfig",
-        "Capabilities",
-        "Record",
-        "SearchResult",
-        "MutationResult",
-    }
-)
-
-
-def _v2_surface_is_ready() -> bool:
-    try:
-        sdk = importlib.import_module("alayalite")
-    except ImportError:
-        return False
-    return _V2_ROOT_SYMBOLS.issubset(vars(sdk))
-
-
-@pytest.fixture(autouse=True)
-def _require_complete_v2_surface() -> None:
-    """Keep every golden skipped behind one guard until wave C activates it."""
-    if not _v2_surface_is_ready():
-        pytest.skip("SDK v2 public core has not landed; contract goldens are dormant")
 
 
 @pytest.fixture(name="sdk")
