@@ -2,29 +2,15 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""
-AlayaLite Python SDK.
-
-This is the main entry point for the alayalite package, providing easy access
-to all key components like the Client, Collection, and utility functions.
-"""
+"""AlayaLite embedded vector database SDK."""
 
 import warnings
 
-from ._alayalitepy import MetricType  # noqa: E402
-from ._legacy import AlayaLiteLegacyApiWarning, raise_removed_legacy_api  # noqa: E402
-from .client import Client  # noqa: E402
-from .collection import (  # noqa: E402
-    STATUS_VERSION as COLLECTION_STATUS_VERSION,
-)
-from .collection import (  # noqa: E402
-    V_PUBLIC as COLLECTION_V_PUBLIC,
-)
-from .collection import (  # noqa: E402
-    V_REMOVE as LEGACY_API_V_REMOVE,
-)
-from .collection import (
-    Collection,
+from ._capabilities import capabilities
+from ._collection import Collection
+from ._database import Database, connect
+from .config import CollectionConfig, FlatIndexConfig, QGIndexConfig
+from .exceptions import (
     CollectionCancelledError,
     CollectionClosedError,
     CollectionConflictError,
@@ -38,7 +24,7 @@ from .collection import (
     CollectionResourceExhaustedError,
     CollectionStatusError,
 )
-from .utils import calc_gt, calc_recall, load_fvecs, load_ivecs  # noqa: E402
+from .models import Capabilities, MutationResult, Record, SearchResult
 
 # The extension module is compiled with -Ofast (fast-math), so loading it enables flush-to-zero /
 # denormals-are-zero on the calling thread. numpy notices the changed FPU state and emits "smallest
@@ -55,13 +41,17 @@ warnings.filterwarnings(
 
 
 __all__ = [
-    "Client",
+    "connect",
+    "capabilities",
+    "Database",
     "Collection",
-    "MetricType",
-    "COLLECTION_V_PUBLIC",
-    "LEGACY_API_V_REMOVE",
-    "COLLECTION_STATUS_VERSION",
-    "AlayaLiteLegacyApiWarning",
+    "CollectionConfig",
+    "FlatIndexConfig",
+    "QGIndexConfig",
+    "Capabilities",
+    "Record",
+    "SearchResult",
+    "MutationResult",
     "CollectionStatusError",
     "CollectionInvalidArgumentError",
     "CollectionNotSupportedError",
@@ -74,18 +64,7 @@ __all__ = [
     "CollectionCorruptionError",
     "CollectionClosedError",
     "CollectionInternalError",
-    # utils
-    "load_fvecs",
-    "load_ivecs",
-    "calc_recall",
-    "calc_gt",
 ]
-
-
-def __getattr__(name: str):  # pylint: disable=invalid-name
-    if name in {"Index", "DiskCollection"}:
-        raise_removed_legacy_api(name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 try:

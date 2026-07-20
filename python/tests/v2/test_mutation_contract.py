@@ -93,7 +93,13 @@ def test_partial_mode_reports_independent_row_outcomes(flat_collection):
 
 
 def test_replace_is_whole_row_and_requires_an_existing_id(flat_collection):
-    _write(flat_collection, ids=["a"], vectors=np.zeros((1, 3), dtype=np.float32))
+    _write(
+        flat_collection,
+        ids=["a"],
+        vectors=np.zeros((1, 3), dtype=np.float32),
+        documents=["A"],
+        metadata=[{"kind": "first"}],
+    )
     replaced = _write(
         flat_collection,
         method="replace",
