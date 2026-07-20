@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-set -o pipefail
+# SPDX-FileCopyrightText: 2026 AlayaDB.AI
+# SPDX-License-Identifier: AGPL-3.0-only
+# Runs hosted Python coverage while retaining pytest status and native crash diagnostics for artifact upload.
+set -euo pipefail
 
 python_bin="${PYTHON_BIN:-.venv/bin/python}"
 log_path="${PYTEST_CRASH_LOG:-pytest-crash.log}"

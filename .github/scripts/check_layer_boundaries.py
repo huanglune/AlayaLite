@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 AlayaDB.AI
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Enforce include-layer boundaries across the codebase.
+"""Pre-commit hook: enforce include-layer boundaries across the codebase.
 
 Rules:
   core/       → may only include core/ and standard library

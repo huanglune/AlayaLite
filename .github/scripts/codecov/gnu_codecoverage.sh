@@ -1,5 +1,7 @@
-#!/bin/bash
-# alayalite/.github/scripts/codecov/gnu_codecoverage.sh
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 AlayaDB.AI
+# SPDX-License-Identifier: AGPL-3.0-only
+# Builds the hosted gcc-13 C++ coverage targets, runs every labeled test, and captures LCOV output.
 set -euo pipefail
 
 SCRIPT_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
@@ -7,8 +9,9 @@ ROOT_DIR="$(realpath "$SCRIPT_DIR/../../..")"
 BUILD_DIR="${ROOT_DIR}/build"
 BUILD_JOBS="${BUILD_JOBS:-4}"
 CTEST_JOBS="${CTEST_JOBS:-4}"
-CTEST_LABELS="${CTEST_LABELS:-unit|storage|simd|space|utils}"
+CTEST_LABELS="${CTEST_LABELS:-.}"
 CTEST_EXCLUDE_REGEX="${CTEST_EXCLUDE_REGEX:-}"
+# Coverage stays hosted to preserve the established gcc/gcov-13 reporting baseline.
 GCOV_TOOL="${GCOV_TOOL:-/usr/bin/gcov-13}"
 CMAKE_LAUNCHER_ARGS=()
 if [[ -n "${CMAKE_CXX_COMPILER_LAUNCHER:-}" ]]; then
@@ -19,7 +22,8 @@ fi
 # the `conan` CLI on PATH. Self-provision on CI runners (uv is always present there).
 if ! command -v conan >/dev/null 2>&1; then
   uv tool install conan
-  export PATH="$(uv tool dir)/conan/bin:$HOME/.local/bin:$PATH"
+  uv_tool_dir="$(uv tool dir)"
+  export PATH="${uv_tool_dir}/conan/bin:$HOME/.local/bin:$PATH"
 fi
 
 # rebuild the project

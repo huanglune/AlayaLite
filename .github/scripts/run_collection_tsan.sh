@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # SPDX-FileCopyrightText: 2026 AlayaDB.AI
 # SPDX-License-Identifier: AGPL-3.0-only
+# Manual g05 TSan lane for collection stress and maintenance concurrency coverage.
+# setarch disables ASLR; the explicit filter excludes only the documented test::Barrier fixture debt.
 
 set -euo pipefail
 

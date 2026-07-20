@@ -4,12 +4,13 @@
 
 set -u
 set -o pipefail
+# Do not enable errexit: all requested cases must run so the final table reports every failure.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 build_root="${ALAYA_MATRIX_BUILD_ROOT:-${repo_root}/build/matrix}"
 jobs="${ALAYA_MATRIX_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}"
 requested_case="${1:-all}"
-cases=(core-only laser-default portable-no-avx512 portable-no-avx2 python-off python-on)
+cases=(core-only laser-default portable-no-avx512 portable-no-avx2 python-on)
 results=()
 
 case_args() {
@@ -18,7 +19,6 @@ case_args() {
     laser-default) echo "-DALAYA_ENABLE_LASER=ON -DALAYA_X86_AVX2_BASELINE=ON -DBUILD_PYTHON=OFF -DBUILD_TESTING=ON" ;;
     portable-no-avx512) echo "-DALAYA_ENABLE_LASER=OFF -DALAYA_X86_AVX2_BASELINE=ON -DBUILD_PYTHON=OFF -DBUILD_TESTING=ON" ;;
     portable-no-avx2) echo "-DALAYA_ENABLE_LASER=OFF -DALAYA_X86_AVX2_BASELINE=OFF -DBUILD_PYTHON=OFF -DBUILD_TESTING=ON" ;;
-    python-off) echo "-DALAYA_ENABLE_LASER=OFF -DALAYA_X86_AVX2_BASELINE=OFF -DBUILD_PYTHON=OFF -DBUILD_TESTING=OFF" ;;
     python-on) echo "-DALAYA_ENABLE_LASER=OFF -DALAYA_X86_AVX2_BASELINE=OFF -DBUILD_PYTHON=ON -DBUILD_TESTING=OFF" ;;
     *) return 1 ;;
   esac
