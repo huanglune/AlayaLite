@@ -18,7 +18,8 @@ cmake --build --preset tsan --target \
   disk_flat_segment_stress_test \
   collection_facade_stress_test \
   segmented_collection_stress_test \
-  collection_maintenance_interleaving_test
+  collection_maintenance_interleaving_test \
+  collection_read_only_test
 
 export TSAN_OPTIONS=${TSAN_OPTIONS:-halt_on_error=1:history_size=7}
 setarch "$ARCH" -R ctest --test-dir "$ROOT/build/TSan" \

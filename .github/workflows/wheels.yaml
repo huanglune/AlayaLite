@@ -107,7 +107,8 @@ jobs:
         target-arch: ${{ matrix.arch }}
 
     - name: Build wheels
-      uses: pypa/cibuildwheel@v3
+      # pypa/cibuildwheel publishes exact tags only; there is no moving v3 major tag.
+      uses: pypa/cibuildwheel@v3.3
 
     - name: Show compiler cache statistics
       if: runner.environment == 'self-hosted' && always()
