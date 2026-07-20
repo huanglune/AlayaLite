@@ -2,6 +2,9 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
+// collection_runtime_08: compaction internals.
+// One compile-cost-balanced Collection runtime unit; see CMakeLists.txt.
+
 #include "index/collection/collection.hpp"
 
 namespace alaya {

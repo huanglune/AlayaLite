@@ -2,6 +2,9 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-only
 
+// collection_runtime_00: create/open, single-row and batch write entries.
+// One compile-cost-balanced Collection runtime unit; see CMakeLists.txt.
+
 #include "index/collection/collection.hpp"
 
 namespace alaya {

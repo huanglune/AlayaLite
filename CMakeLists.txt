@@ -68,6 +68,8 @@ target_compile_features(alaya_segmented_collection_runtime PUBLIC cxx_std_20)
 alaya_apply_build_flags(alaya_segmented_collection_runtime)
 add_coverage_to_target(alaya_segmented_collection_runtime)
 
+# Collection's non-template members, split across translation units by compile cost and built into a portable and a
+# LASER owner. Each collection_runtime_NN.cpp header names that unit's concern.
 set(_alaya_collection_runtime_sources
     src/index/collection/collection_runtime_00.cpp
     src/index/collection/collection_runtime_01.cpp
