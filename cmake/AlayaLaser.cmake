@@ -104,26 +104,32 @@ endif()
 
 # Compile the mutable-segment/updater bridge once. Public Collection headers depend only on the narrow updater API,
 # while updater implementation and WAL/replay bodies stay behind this target.
-add_library(alaya_laser_runtime STATIC ${CMAKE_SOURCE_DIR}/src/index/graph/laser/qg/qg_updater_runtime.cpp)
-target_include_directories(
-  alaya_laser_runtime PUBLIC $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>
-)
-target_link_libraries(
-  alaya_laser_runtime
-  PUBLIC ${_alaya_laser_backend_libs}
-         Eigen3::Eigen
-         OpenMP::OpenMP_CXX
-         concurrentqueue::concurrentqueue
-         spdlog::spdlog_header_only
-)
-target_compile_definitions(alaya_laser_runtime PUBLIC ${_alaya_laser_backend_definition})
-target_compile_features(alaya_laser_runtime PUBLIC cxx_std_20)
-target_compile_options(alaya_laser_runtime PRIVATE ${_ALAYA_LASER_CONSUMER_OPTIONS})
-if(ENABLE_COVERAGE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  # This target is created before Codecov.cmake is included, so apply the same instrumentation that
-  # add_coverage_to_target() gives test executables. Otherwise updater calls moved behind the bridge disappear from
-  # coverage_c++.info.
-  target_compile_options(alaya_laser_runtime PRIVATE --coverage -O0 -g)
-  target_link_libraries(alaya_laser_runtime PRIVATE --coverage)
+#
+# Linux-only: the updater io path uses O_DIRECT and sync_file_range, and mutable LASER has never shipped elsewhere.
+# Sealed-LASER platforms (macOS wheels) build the read path only and had no TU instantiating the updater before the
+# split either, so gating the bridge keeps the pre-split platform map unchanged.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_library(alaya_laser_runtime STATIC ${CMAKE_SOURCE_DIR}/src/index/graph/laser/qg/qg_updater_runtime.cpp)
+  target_include_directories(
+    alaya_laser_runtime PUBLIC $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>
+  )
+  target_link_libraries(
+    alaya_laser_runtime
+    PUBLIC ${_alaya_laser_backend_libs}
+           Eigen3::Eigen
+           OpenMP::OpenMP_CXX
+           concurrentqueue::concurrentqueue
+           spdlog::spdlog_header_only
+  )
+  target_compile_definitions(alaya_laser_runtime PUBLIC ${_alaya_laser_backend_definition})
+  target_compile_features(alaya_laser_runtime PUBLIC cxx_std_20)
+  target_compile_options(alaya_laser_runtime PRIVATE ${_ALAYA_LASER_CONSUMER_OPTIONS})
+  if(ENABLE_COVERAGE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # This target is created before Codecov.cmake is included, so apply the same instrumentation that
+    # add_coverage_to_target() gives test executables. Otherwise updater calls moved behind the bridge disappear from
+    # coverage_c++.info.
+    target_compile_options(alaya_laser_runtime PRIVATE --coverage -O0 -g)
+    target_link_libraries(alaya_laser_runtime PRIVATE --coverage)
+  endif()
+  target_link_libraries(alaya_laser INTERFACE alaya_laser_runtime)
 endif()
-target_link_libraries(alaya_laser INTERFACE alaya_laser_runtime)
