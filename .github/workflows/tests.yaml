@@ -1,0 +1,63 @@
+---
+# Builds and tests the C++ and Python surfaces on every relevant branch push and on demand.
+# The guarded g05 lane uses preinstalled dependencies and persistent local compiler caches.
+name: Tests
+
+on:
+  push:
+    paths:
+    - include/**
+    - tests/**
+    - benchmarks/**
+    - python/**
+    - tools/**
+    - cmake/**
+    - CMakeLists.txt
+    - CMakePresets.json
+    - Makefile
+    - conanfile.py
+    - pyproject.toml
+    - uv.lock
+    - .github/actions/g05-bootstrap/**
+    - .github/workflows/tests.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'schedule' }}
+
+jobs:
+  test:
+    if: github.repository == 'huanglune/AlayaLite'
+    runs-on: [self-hosted, g05]
+    timeout-minutes: 30
+    env:
+      CONAN_NON_INTERACTIVE: 1
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Prepare g05 native toolchain
+      uses: ./.github/actions/g05-bootstrap
+
+    - name: Configure Release tests
+      run: >-
+        cmake -S . -B build/Release -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DBUILD_PYTHON=OFF
+        -DALAYA_NATIVE_ARCH=OFF -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+    - name: Build Release tests
+      run: cmake --build build/Release --parallel 32
+
+    - name: Run C++ tests
+      run: ctest --test-dir build/Release --progress --output-on-failure -j4
+
+    - name: Run Python tests
+      env:
+        CMAKE_ARGS: -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DALAYA_NATIVE_ARCH=OFF
+      run: uv run --locked pytest python/tests
+
+    - name: Show compiler cache statistics
+      if: always()
+      run: ccache -s

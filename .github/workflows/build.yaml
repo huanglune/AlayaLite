@@ -1,0 +1,55 @@
+---
+# Exercises the five supported native build configurations on relevant branch pushes and on demand.
+# Three guarded g05 runners share persistent caches; each matrix arm is capped at 32 build jobs.
+name: Build
+
+on:
+  push:
+    paths:
+    - include/**
+    - tests/**
+    - benchmarks/**
+    - python/include/**
+    - python/src/pybind.cpp
+    - python/CMakeLists.txt
+    - cmake/**
+    - CMakeLists.txt
+    - conanfile.py
+    - pyproject.toml
+    - uv.lock
+    - .github/actions/g05-bootstrap/**
+    - .github/scripts/run_matrix.sh
+    - .github/workflows/build.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'schedule' }}
+
+jobs:
+  compile:
+    if: github.repository == 'huanglune/AlayaLite'
+    runs-on: [self-hosted, g05]
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [core-only, laser-default, portable-no-avx512, portable-no-avx2, python-on]
+    env:
+      ALAYA_MATRIX_JOBS: 32
+      CONAN_NON_INTERACTIVE: 1
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Prepare g05 native toolchain
+      uses: ./.github/actions/g05-bootstrap
+
+    - name: Compile ${{ matrix.case }}
+      run: .github/scripts/run_matrix.sh '${{ matrix.case }}'
+
+    - name: Show compiler cache statistics
+      if: always()
+      run: ccache -s

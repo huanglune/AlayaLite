@@ -1,20 +1,28 @@
 ---
-name: Pre Commit Checker
+# Runs the repository's pinned pre-commit suite on every branch push and on demand.
+# This cheap hosted lane has no path filter so every change receives the same lint gate.
+name: Lint
 
-on  :
-  pull_request:
+on:
   push:
-    branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'schedule' }}
+
 jobs:
-  pre-commit:
+  lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
     - uses: actions/checkout@v4
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v5
+      uses: astral-sh/setup-uv@v6
       with:
         enable-cache: true
         cache-dependency-glob: uv.lock
@@ -27,5 +35,5 @@ jobs:
         restore-keys: |
           pre-commit-${{ runner.os }}-${{ runner.arch }}-
 
-    - name: Run pre-commit hooks (including yamlfmt)
+    - name: Run pre-commit hooks
       run: uvx pre-commit run --all-files

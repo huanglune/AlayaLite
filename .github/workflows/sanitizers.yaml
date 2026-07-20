@@ -1,0 +1,38 @@
+---
+# Runs the focused collection ThreadSanitizer suite manually through its maintained script.
+# The guarded g05 lane supplies stable setarch support, preinstalled dependencies, and persistent ccache.
+name: Sanitizers
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'schedule' }}
+
+jobs:
+  thread-sanitizer:
+    if: github.repository == 'huanglune/AlayaLite'
+    runs-on: [self-hosted, g05]
+    timeout-minutes: 60
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 32
+      CONAN_NON_INTERACTIVE: 1
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Prepare g05 native toolchain
+      uses: ./.github/actions/g05-bootstrap
+
+    - name: Verify ThreadSanitizer runtime support
+      run: command -v setarch
+
+    - name: Run collection ThreadSanitizer lane
+      run: .github/scripts/run_collection_tsan.sh
+
+    - name: Show compiler cache statistics
+      if: always()
+      run: ccache -s
