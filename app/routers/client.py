@@ -193,7 +193,7 @@ async def upsert_records(request: Request, payload: WriteCollectionRequest) -> A
 
 
 @router.post("/collections/get", tags=["records"])
-async def get_records(request: Request, payload: GetRecordsRequest) -> Any:
+async def fetch_collection_records(request: Request, payload: GetRecordsRequest) -> Any:
     try:
         with _database(request).open_collection(payload.collection_name) as collection:
             records = collection.get(payload.ids, include_vector=payload.include_vector)
