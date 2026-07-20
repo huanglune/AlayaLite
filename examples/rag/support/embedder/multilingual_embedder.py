@@ -28,7 +28,7 @@ class MultilingualEmbedder(BaseEmbedding):
         except ImportError as exc:
             raise ImportError(
                 "MultilingualEmbedder requires the optional RAG dependencies; "
-                "install with: pip install 'alayalite[rag]'"
+                "install the dependencies in examples/rag/requirements.txt"
             ) from exc
 
         super().__init__(path)

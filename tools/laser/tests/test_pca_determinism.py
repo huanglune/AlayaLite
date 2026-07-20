@@ -23,7 +23,7 @@ def _write_fbin(path: Path, vectors: np.ndarray) -> None:
 
 
 def _run_pca_once(base_path: Path, out_dir: Path) -> tuple[bytes, bytes]:
-    from alayalite.laser._pca import (  # pylint: disable=import-outside-toplevel
+    from tools.laser._pca import (  # pylint: disable=import-outside-toplevel
         fit_incremental_pca,
         pca_transform_and_save,
         sample_vectors_from_fbin,
@@ -60,7 +60,7 @@ def test_pca_outputs_are_byte_identical_with_fixed_seed_and_single_thread(tmp_pa
 
 
 def test_sample_vectors_keeps_at_least_raw_dim_rows_when_available(tmp_path: Path) -> None:
-    from alayalite.laser._pca import sample_vectors_from_fbin  # pylint: disable=import-outside-toplevel
+    from tools.laser._pca import sample_vectors_from_fbin  # pylint: disable=import-outside-toplevel
 
     rng = np.random.default_rng(2025)
     vectors = rng.normal(size=(512, 256)).astype(np.float32)
@@ -77,7 +77,7 @@ def test_sample_vectors_keeps_at_least_raw_dim_rows_when_available(tmp_path: Pat
 
 
 def test_sample_vectors_returns_all_rows_when_raw_dim_exceeds_count(tmp_path: Path) -> None:
-    from alayalite.laser._pca import sample_vectors_from_fbin  # pylint: disable=import-outside-toplevel
+    from tools.laser._pca import sample_vectors_from_fbin  # pylint: disable=import-outside-toplevel
 
     rng = np.random.default_rng(2026)
     vectors = rng.normal(size=(128, 256)).astype(np.float32)
@@ -94,7 +94,7 @@ def test_sample_vectors_returns_all_rows_when_raw_dim_exceeds_count(tmp_path: Pa
 
 
 def test_fit_incremental_pca_rejects_too_few_samples_for_components() -> None:
-    from alayalite.laser._pca import fit_incremental_pca  # pylint: disable=import-outside-toplevel
+    from tools.laser._pca import fit_incremental_pca  # pylint: disable=import-outside-toplevel
 
     sample_vectors = np.zeros((128, 256), dtype=np.float32)
 

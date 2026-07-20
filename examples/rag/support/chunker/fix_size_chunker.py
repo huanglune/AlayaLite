@@ -34,7 +34,7 @@ class FixSizeChunker(BaseChunker):
             from langchain_text_splitters import CharacterTextSplitter  # pylint: disable=import-outside-toplevel
         except ImportError as exc:
             raise ImportError(
-                "FixSizeChunker requires the optional RAG dependencies; install with: pip install 'alayalite[rag]'"
+                "FixSizeChunker requires the dependencies in examples/rag/requirements.txt"
             ) from exc
 
         text_splitter = CharacterTextSplitter(

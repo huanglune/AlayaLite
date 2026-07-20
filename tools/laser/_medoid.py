@@ -9,7 +9,7 @@ import platform
 import faiss
 import numpy as np
 
-from alayalite.laser._io import read_fbin, write_fbin, write_ibin
+from tools.laser._io import read_fbin, write_fbin, write_ibin
 
 # faiss-cpu's bundled OpenMP runtime collides with macOS's Accelerate framework
 # (used by numpy / sklearn on Apple Silicon). The collision shows up as an

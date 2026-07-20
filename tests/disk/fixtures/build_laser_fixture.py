@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -57,40 +58,17 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _stage_build_tree_package(extension: Path, stage_root: Path) -> Path:
-    stage_pkg = stage_root / "alayalite"
-    src_pkg = _repo_root() / "python" / "src" / "alayalite"
-    shutil.copytree(
-        src_pkg,
-        stage_pkg,
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "_alayalitepy*.so"),
-    )
-    staged_extension = stage_pkg / extension.name
-    staged_extension.symlink_to(extension)
-    if str(stage_root) not in sys.path:
-        sys.path.insert(0, str(stage_root))
-    return staged_extension
-
-
-def _load_build_tree_extension(extension: Path, stage_root: Path) -> None:
+def _load_build_tree_extension(extension: Path) -> None:
     extension = extension.resolve(strict=True)
     if extension.suffix != ".so":
         _die(f"--extension must name a build-tree .so: {extension}")
-    staged_extension = _stage_build_tree_package(extension, stage_root)
-    # Some Python launchers preload the installed package. Purge it after the
-    # build-tree stage has been placed first so provenance cannot depend on
-    # interpreter startup state.
-    for module_name in tuple(sys.modules):
-        if module_name == "alayalite" or module_name.startswith("alayalite."):
-            del sys.modules[module_name]
-    sys.meta_path[:] = [finder for finder in sys.meta_path if not type(finder).__module__.startswith("_editable_")]
-    try:
-        from alayalite import _alayalitepy  # pylint: disable=import-outside-toplevel
-    except ImportError as exc:
-        _die(f"could not import the explicitly selected build-tree extension {extension}: {exc}")
-
-    loaded = Path(_alayalitepy.__file__).resolve(strict=True)
-    if loaded != extension or Path(staged_extension).resolve(strict=True) != extension:
+    spec = importlib.util.spec_from_file_location("_alayalitepy", extension)
+    if spec is None or spec.loader is None:
+        _die(f"could not create an import spec for build-tree extension {extension}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    loaded = Path(module.__file__).resolve(strict=True)
+    if loaded != extension:
         _die(f"extension provenance mismatch: requested={extension}, loaded={loaded}")
     print(f"[laser-fixture] loaded build-tree extension: {loaded}")
 
@@ -199,12 +177,15 @@ def _ensure_input_vectors(path: Path, count: int, dim: int, seed: int) -> None:
 
 
 def _ensure_optional_imports() -> tuple[object, object, object]:
+    repository = str(_repo_root())
+    if repository not in sys.path:
+        sys.path.insert(0, repository)
     try:
-        from alayalite.laser._io import read_fbin  # pylint: disable=import-outside-toplevel
-        from alayalite.laser._medoid import (  # pylint: disable=import-outside-toplevel
+        from tools.laser._io import read_fbin  # pylint: disable=import-outside-toplevel
+        from tools.laser._medoid import (  # pylint: disable=import-outside-toplevel
             generate_and_save_medoids,
         )
-        from alayalite.laser._pca import (  # pylint: disable=import-outside-toplevel
+        from tools.laser._pca import (  # pylint: disable=import-outside-toplevel
             fit_incremental_pca,
             pca_transform_and_save,
             save_pca_params,
@@ -212,7 +193,7 @@ def _ensure_optional_imports() -> tuple[object, object, object]:
     except ImportError as exc:
         _die(
             "optional LASER sidecar generation requires numpy, sklearn, faiss, "
-            "and the alayalite.laser Python helpers. Re-run with "
+            "and the repository tools.laser helpers. Re-run with "
             f"`--no-optional-sidecars` for a required-artifacts-only fixture: {exc}"
         )
     try:
@@ -528,8 +509,7 @@ def main() -> int:
         _die("v1 fixture generation requires --main-dim to equal --dim")
 
     expected_stamp = _provenance(args, extension, native_builder, main_dim)
-    python_stage = tempfile.TemporaryDirectory(prefix="alaya-laser-python-stage-")
-    _load_build_tree_extension(extension, Path(python_stage.name))
+    _load_build_tree_extension(extension)
     if not args.force and _stamp_matches(output_dir, expected_stamp) and _fixture_valid(output_dir, args, main_dim):
         print(f"[laser-fixture] provenance matches, reusing: {output_dir}")
         return 0

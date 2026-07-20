@@ -11,7 +11,7 @@ import numpy as np
 from sklearn.decomposition import IncrementalPCA
 from tqdm import tqdm
 
-from alayalite.laser._io import read_fbin
+from tools.laser._io import read_fbin
 
 
 def save_pca_params(pca, filepath):

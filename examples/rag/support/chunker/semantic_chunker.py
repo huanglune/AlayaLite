@@ -30,7 +30,7 @@ class SemanticChunker(BaseChunker):
             from sentence_transformers import SentenceTransformer  # pylint: disable=import-outside-toplevel
         except ImportError as exc:
             raise ImportError(
-                "SemanticChunker requires the optional RAG dependencies; install with: pip install 'alayalite[rag]'"
+                "SemanticChunker requires the dependencies in examples/rag/requirements.txt"
             ) from exc
 
         # This class does not use the BaseChunker's __init__ as its logic is different.

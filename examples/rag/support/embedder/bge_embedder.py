@@ -25,7 +25,7 @@ class BgeEmbedder(BaseEmbedding):
             from FlagEmbedding import BGEM3FlagModel  # pylint: disable=import-outside-toplevel
         except ImportError as exc:
             raise ImportError(
-                "BgeEmbedder requires the optional RAG dependencies; install with: pip install 'alayalite[rag]'"
+                "BgeEmbedder requires the dependencies in examples/rag/requirements.txt"
             ) from exc
 
         super().__init__(path)
