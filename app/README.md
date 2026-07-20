@@ -1,131 +1,84 @@
-# AlayaLite - Standalone App
+# AlayaLite FastAPI example
 
-## Development Setup
+This directory is an example HTTP adapter around the SDK v2 surface. It is not a separate network mode of the Python
+SDK. FastAPI lifespan owns one `Database`, collection handles are scoped to requests, and typed SDK errors map to HTTP
+status codes without parsing message strings.
+
+## Development setup
+
+Run from the repository root:
 
 ```bash
-# Run from the repository root. A virtual environment is recommended.
-# python -m venv .venv && source .venv/bin/activate
-pip install -r app/requirements.txt "alayalite==1.2.0"
+uv sync
+uv pip install -r app/requirements.txt
+uv run uvicorn app.main:app --reload
 ```
 
-## Running Tests
+The API is available under `/api/v2`; interactive OpenAPI documentation is at `/docs`.
+
+## Test and smoke
 
 ```bash
-pytest app/tests
+uv run pytest app/tests -q
 ```
 
-## Running the Application
+The tests start the real application lifespan and exercise create, add, get, search, upsert, delete, filtered delete,
+checkpoint, drop, and close/reopen persistence.
+
+## Docker
+
+Build with the repository root as context:
 
 ```bash
-# For development with hot reload
-uvicorn app.main:app --reload
-
-# For production
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+docker build -f app/Dockerfile -t alayalite-fastapi .
+docker run --rm -p 8000:8000 -v "$PWD/alaya-data:/data" alayalite-fastapi
 ```
 
-## Running on Docker
+Set `ALAYALITE_DATA_DIR` to choose the database directory. Successful default writes are already searchable and fsync
+durable; the checkpoint endpoint creates a recovery point and truncates eligible WAL rather than “saving” volatile
+application state.
 
-### Build the Image
+## Minimal flow
 
-```bash
-docker build -t alayalite-standalone app
-```
-
-### Run the Container
+Create a portable Flat collection:
 
 ```bash
-docker run -d --name my-alayalite-standalone -p 8000:8000 alayalite-standalone
-```
-
-### Run with Persistent Storage
-
-To ensure your data is not lost when the container stops, mount a host directory to the container's data directory.
-
-```bash
-# Create a directory on your host machine
-mkdir -p /path/to/your/data
-
-# Run the container with a volume mount
-docker run -d --name my-alayalite-standalone -p 8000:8000 \
-  -v /path/to/your/data:/data \
-  -e ALAYALITE_DATA_DIR=/data \
-  alayalite-standalone
-```
-
-## API usage
-
-See [API_Usage_Documentation.md](./API_Usage_Documentation.md) for full details.
-
-### Create Collection
-
-```bash
-curl -X POST \
-  http://localhost:8000/api/v1/collection/create \
-  -H "Content-Type: application/json" \
-  -d '{"collection_name": "test"}'
-
-"Collection test created successfully"
-```
-
-### Insert
-
-```bash
-curl -X POST \
-  http://localhost:8000/api/v1/collection/insert \
-  -H "Content-Type: application/json" \
+curl -sS -X POST http://localhost:8000/api/v2/collections/create \
+  -H 'content-type: application/json' \
   -d '{
-        "collection_name": "test",
-        "items": [
-          [1, "Document 1", [0.1, 0.2, 0.3], {"category": "A"}],
-          [2, "Document 2", [0.4, 0.5, 0.6], {"category": "B"}]
-        ]
-      }'
-
-"Successfully inserted 2 items into collection test"
+    "collection_name": "docs",
+    "dimension": 3,
+    "dtype": "float32",
+    "metric": "cosine",
+    "index": {"kind": "flat"}
+  }'
 ```
 
-### Query
+Add columnar records:
 
 ```bash
-curl -X POST \
-  http://localhost:8000/api/v1/collection/query \
-  -H "Content-Type: application/json" \
+curl -sS -X POST http://localhost:8000/api/v2/collections/add \
+  -H 'content-type: application/json' \
   -d '{
-        "collection_name": "test",
-        "query_vector": [[0.1, 0.2, 0.3]],
-        "limit": 2,
-        "ef_search": 10,
-        "num_threads": 1
-      }'
+    "collection_name": "docs",
+    "ids": ["a", "b"],
+    "vectors": [[1, 0, 0], [0, 1, 0]],
+    "documents": ["first", "second"],
+    "metadata": [{"lang": "en"}, {"lang": "zh"}]
+  }'
 ```
-The response will be a JSON array of matching items.
 
-### Upsert
+Search and receive JSON-encoded CSR columns:
 
 ```bash
-curl -X POST \
-  http://localhost:8000/api/v1/collection/upsert \
-  -H "Content-Type: application/json" \
+curl -sS -X POST http://localhost:8000/api/v2/collections/search \
+  -H 'content-type: application/json' \
   -d '{
-        "collection_name": "test",
-        "items": [
-          [1, "New Document 1", [0.1, 0.2, 0.3], {"category": "A"}]
-        ]
-      }'
-
-"Successfully upserted 1 items into collection test"
+    "collection_name": "docs",
+    "queries": [[1, 0, 0]],
+    "limit": 2,
+    "where": {"lang": {"$in": ["en", "zh"]}}
+  }'
 ```
 
-### Save Collection
-
-This will save the collection's in-memory data to the persistent storage directory.
-
-```bash
-curl -X POST \
-  http://localhost:8000/api/v1/collection/save \
-  -H "Content-Type: application/json" \
-  -d '{"collection_name": "test"}'
-
-"Collection test saved successfully"
-```
+See [API usage](API_Usage_Documentation.md) for every request shape and response field.

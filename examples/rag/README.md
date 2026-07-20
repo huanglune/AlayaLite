@@ -1,82 +1,62 @@
-# Try Your Own RAG App with AlayaLite
+# RAG example with AlayaLite
 
-This tutorial gives step-by-step guidance for deploying a RAG web app using AlayaLite.
+This repository-only example demonstrates the SDK v2 retrieval flow:
 
+1. split and embed documents with code under `examples/rag/support/`;
+2. create or open an explicitly configured Flat collection;
+3. add strict string IDs and columnar vectors/documents/metadata;
+4. search for IDs, then call `get()` to fetch documents;
+5. close the Database at the end of the UI or CLI lifecycle.
 
-## 0. Project Overview
+The model wrappers are example support code and are not included in the AlayaLite wheel.
 
-There are only 4 core files:
-- `ui.py`: Defines webpage frontend, using [streamlit](https://streamlit.io/);
-- `db.py`: Includes core interfaces to manage documents. It has two key APIs: `insert_text` put text into database, and `query_text` get the related documents for the query from the database;
-- `llm.py`: Creates prompt and generates response from LLM;
-- `utils.py`: Provides the `splitter` and `embedder` text-processing utilities.
+## Local setup
 
-The overview is shown below
+Run from the repository root:
+
+```bash
+python -m venv .rag-venv
+source .rag-venv/bin/activate
+python -m pip install -r examples/rag/requirements.txt "alayalite==1.1.0"
+export ALAYALITE_RAG_DATA_DIR="$PWD/rag-data"
+python -m streamlit run examples/rag/ui.py
+```
+
+The first request downloads the selected embedding model. Open `http://localhost:8501`, configure an LLM endpoint,
+upload a document, and ask a question. `test_docs.txt` is included as a small input.
+
+## Docker
+
+The Dockerfile expects the repository root as build context:
+
+```bash
+docker build -f examples/rag/Dockerfile -t alayalite-rag .
+docker run --rm -p 8501:8501 -v "$PWD/rag-data:/data" alayalite-rag
+```
+
+Override `ALAYALITE_VERSION` at build time only when testing another published wheel:
+
+```bash
+docker build -f examples/rag/Dockerfile \
+  --build-arg ALAYALITE_VERSION=1.1.0 \
+  -t alayalite-rag .
+```
+
+## Download-free smoke test
+
+```bash
+uv run pytest examples/rag/tests -q
+```
+
+The smoke replaces splitting and embedding with deterministic functions, then verifies add, search, explicit payload
+fetch, close/reopen persistence, and explicit catalog clearing.
+
+## Files
+
+- `db.py`: Database ownership, collection creation/opening, writes, search, and payload fetch.
+- `ui.py`: Streamlit lifecycle and interaction flow.
+- `llm.py`: external LLM request adapter.
+- `utils.py`: small adapters over the example-local support package.
+- `support/`: chunker and embedding implementations moved out of the runtime wheel.
 
 ![Overview](https://github.com/AlayaDB-AI/AlayaLite/blob/main/examples/rag/figures/overview.png?raw=true)
-
-
-## 1. Setup Environment
-
-We prepare a docker environment for you to setup the project quickly.
-`Docker` is an open source container engine.
-It allows applications to run consistently across environments and platforms.
-
-Run the following command to build an image using the given `Dockerfile` and start a container to run it:
-
-```bash
-# build image using Dockerfile at current directory
-# notice the "." at the end
-docker build -t try-rag-image .
-```
-
-It will take several minutes to download and install packages.
-If the build succeeds, you will see `Successfully tagged try-rag-image:latest`.
-Then you can start a container to run it.
-
-```bash
-# create a container with the image and go into it
-docker run -it -v "$(pwd):/app" -p 8501:8501 --name try-rag-container try-rag-image /bin/bash
-```
-
-Now you will see your bash prompt like `/app#`, indicating that you are inside the docker container.
-
-<details>
-<summary>If you would like to know more about docker, click me!</summary>
-
-- Exit and close the container: `exit`
-- Remove a closed container: `docker rm try-rag-container`
-- Enter a running container: `docker exec -it try-rag-container /bin/bash`
-
-See also: <a href="https://docs.docker.com/reference/cli/docker/">Docker Docs</a>
-</details>
-
-
-## 2. Run Your App
-
-Run this command to launch your web application:
-
-```bash
-streamlit run ui.py
-```
-
-Your app will start at the port `8501`.
-In GitHub Codespaces, use the forwarded port rather than the terminal's local URL.
-You can switch to the tab `PORT` to see the forwarded URL.
-
-![PORT](https://github.com/AlayaDB-AI/AlayaLite/blob/main/examples/rag/figures/port.png?raw=true)
-
-Open the URL, you will see the interface.
-Input your LLM service URL and api key upload the files, then you can try to ask LLM about your files.
-We provide a test document `test_docs.txt` for you.
-
-```
-Sample question:
-What are advanced chunking techniques?
-```
-
-![Interface](https://github.com/AlayaDB-AI/AlayaLite/blob/main/examples/rag/figures/interface.png?raw=true)
-
-```
-Notice: the first time after you set/change the embedding model, the system takes some time to download it.
-```

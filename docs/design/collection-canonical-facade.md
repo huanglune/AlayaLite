@@ -15,7 +15,10 @@ SPDX-License-Identifier: AGPL-3.0-only
 > the RocksDB scalar decoder) and the legacy recovery corpus, so 1.1.0 does not
 > open pre-1.1 artifacts by design. The `1.2.0` strings and the "does not retire
 > a persisted-format reader" statements below are kept verbatim as the original
-> record; see `legacy-cleanup.md` for the current version and reader inventory.
+> record. The July 2026 Python SDK v2 design supersedes this document's Python
+> lifecycle, configuration, result, and package-scope decisions; use the
+> [embedded Python SDK guide](../user/CLIENT_USER_MANUAL.md) for the supported
+> surface and `legacy-cleanup.md` for the reader inventory.
 
 ## Audit status
 

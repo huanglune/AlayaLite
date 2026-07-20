@@ -22,7 +22,7 @@ contains 19 design documents, 18 reports, 6 research notes, 2 user guides, and
 - **Research notes:** use [research/](research/) for experiments, design
   critiques, and paper-planning material that is informative but not normative.
 - **User documentation:** start with the [build guide](user/BUILDING.md) or the
-  [client user guide](user/CLIENT_USER_MANUAL.md).
+  [embedded Python SDK guide](user/CLIENT_USER_MANUAL.md).
 
 ## Directory map
 
@@ -131,8 +131,8 @@ override current contracts in `design/`.
 
 - [Building AlayaLite](user/BUILDING.md) — prerequisites, configure/build/test
   commands, platform notes, and troubleshooting.
-- [AlayaLite Client User Guide](user/CLIENT_USER_MANUAL.md) — canonical
-  Collection usage plus clearly identified pre-1.1 migration material.
+- [Embedded Python SDK guide](user/CLIENT_USER_MANUAL.md) — current Database,
+  Collection, typing, lifecycle, and platform contracts.
 
 ## Image assets
 

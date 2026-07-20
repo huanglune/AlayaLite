@@ -1,225 +1,194 @@
-# AlayaLite Vector Database API Usage Documentation
+# FastAPI v2 usage
 
-## Overview
+Base path: `/api/v2`. Requests and responses use JSON. This adapter keeps the SDK’s strict string IDs, immutable
+collection schema, typed mutation receipts, and CSR search shape.
 
-- **Base path**: `/api/v1/collection/`
-- **Style**: RESTful (all endpoints use POST)
-- **Data format**: JSON for both requests and responses
+## 1. Create a collection
 
----
-
-## 1. Create Collection
-
-- **Endpoint**: `/api/v1/collection/create`
-- **Method**: POST
-- **Request body**:
+`POST /collections/create`
 
 ```json
 {
-  "collection_name": "test"
+  "collection_name": "docs",
+  "dimension": 3,
+  "dtype": "float32",
+  "metric": "l2",
+  "index": {"kind": "flat"},
+  "auto_seal_rows": null
 }
 ```
 
-- **Example response**:
-
-```json
-"Collection test created successfully"
-```
-
----
-
-## 2. List Collections
-
-- **Endpoint**: `/api/v1/collection/list`
-- **Method**: POST
-- **Request body**: none
-
-- **Example response**:
-
-```json
-["test", "my_collection"]
-```
-
----
-
-## 3. Delete Collection
-
-- **Endpoint**: `/api/v1/collection/delete`
-- **Method**: POST
-- **Request body**:
+For QG, use:
 
 ```json
 {
-  "collection_name": "test",
-  "delete_on_disk": true
+  "kind": "qg",
+  "max_neighbors": 32,
+  "construction_effort": 400,
+  "build_threads": null
 }
 ```
 
-- **Example response**:
+QG creation is platform-gated. The service returns HTTP 400 with the typed SDK diagnostic when the installed wheel
+does not support it.
+
+## 2. List collections
+
+`GET /collections`
 
 ```json
-"Collection test deleted successfully"
+["docs", "images"]
 ```
 
----
+## 3. Permanently drop a collection
 
-## 4. Reset Collections
+`POST /collections/drop`
 
-- **Endpoint**: `/api/v1/collection/reset`
-- **Method**: POST
-- **Request body**:
+```json
+{"collection_name": "docs", "missing_ok": false}
+```
+
+## 4. Add records
+
+`POST /collections/add`
 
 ```json
 {
-  "delete_on_disk": true
+  "collection_name": "docs",
+  "ids": ["a", "b"],
+  "vectors": [[1, 0, 0], [0, 1, 0]],
+  "documents": ["first", "second"],
+  "metadata": [{"kind": "paper"}, {"kind": "note"}],
+  "mode": "atomic",
+  "durability": "fsync",
+  "idempotency_key": "request-42"
 }
 ```
 
-- **Example response**:
-
-```json
-"Collection reset successfully"
-```
-
----
-
-## 5. Insert Items
-
-- **Endpoint**: `/api/v1/collection/insert`
-- **Method**: POST
-- **Request body**:
+The response contains batch watermarks and one row receipt per input ID:
 
 ```json
 {
-  "collection_name": "test",
-  "items": [
-    [1, "Document 1", [0.1, 0.2, 0.3], {"category": "A"}],
-    [2, "Document 2", [0.4, 0.5, 0.6], {"category": "B"}]
-  ]
+  "batch_op_id": 1,
+  "visibility_watermark": 2,
+  "durable_watermark": 2,
+  "searchable": true,
+  "durable": true,
+  "durability": "fsync",
+  "idempotency_key": "request-42",
+  "rows": [{"id": "a", "status": "inserted"}]
 }
 ```
 
-- **Example response**:
+The actual row objects also include operation IDs, row watermarks, searchability, durability, and idempotency fields.
 
-```json
-"Successfully inserted 2 items into collection test"
-```
+## 5. Upsert records
 
----
+`POST /collections/upsert` uses the same columnar payload as add. Existing IDs are replaced and missing IDs are
+inserted; row receipts distinguish the outcomes.
 
-## 6. Query Vectors
+## 6. Get aligned records
 
-- **Endpoint**: `/api/v1/collection/query`
-- **Method**: POST
-- **Request body**:
+`POST /collections/get`
 
 ```json
 {
-  "collection_name": "test",
-  "query_vector": [[0.1, 0.2, 0.3]],
-  "limit": 2,
-  "ef_search": 10,
-  "num_threads": 1
+  "collection_name": "docs",
+  "ids": ["a", "missing", "b"],
+  "include_vector": false
 }
 ```
 
-- **Example response**:
+The response has the same length and order. A missing position is JSON `null`.
 
-```json
-[
-  {
-    "id": 1,
-    "document": "Document 1",
-    "vector": [0.1, 0.2, 0.3],
-    "metadata": {"category": "A"},
-    "score": 0.99
-  }
-]
-```
+## 7. Search
 
----
-
-## 7. Upsert (Insert or Update)
-
-- **Endpoint**: `/api/v1/collection/upsert`
-- **Method**: POST
-- **Request body**:
+`POST /collections/search`
 
 ```json
 {
-  "collection_name": "test",
-  "items": [
-    [1, "New Document 1", [0.1, 0.2, 0.3], {"category": "A"}]
-  ]
+  "collection_name": "docs",
+  "queries": [[1, 0, 0]],
+  "limit": 10,
+  "where": {"kind": {"$in": ["paper", "note"]}},
+  "effort": null,
+  "filter_policy": "auto",
+  "selectivity_hint": null
 }
 ```
 
-- **Example response**:
-
-```json
-"Successfully upserted 1 items into collection test"
-```
-
----
-
-## 8. Delete by ID
-
-- **Endpoint**: `/api/v1/collection/delete_by_id`
-- **Method**: POST
-- **Request body**:
+Response:
 
 ```json
 {
-  "collection_name": "test",
-  "ids": [1, 2]
+  "ids": ["a", "b"],
+  "distances": [0.0, 2.0],
+  "offsets": [0, 2],
+  "valid_counts": [2],
+  "statuses": ["ok"],
+  "completeness": ["eligible_exhausted"],
+  "visibility_watermark": 2,
+  "metadata_epoch": 1,
+  "stats": {"effective_effort": null}
 }
 ```
 
-- **Example response**:
+`ids` and `distances` are flat CSR columns; `offsets` delimit query rows. The full stats object includes filter,
+resource, I/O, lease, and rerank accounting.
 
-```json
-"Successfully deleted 2 items from collection test"
-```
+## 8. Delete IDs
 
----
-
-## 9. Delete by Filter
-
-- **Endpoint**: `/api/v1/collection/delete_by_filter`
-- **Method**: POST
-- **Request body**:
+`POST /collections/delete`
 
 ```json
 {
-  "collection_name": "test",
-  "filter": {"category": "A"}
+  "collection_name": "docs",
+  "ids": ["a", "missing"],
+  "mode": "atomic",
+  "durability": "fsync",
+  "idempotency_key": null
 }
 ```
 
-- **Example response**:
+The response is the same mutation-receipt shape as add/upsert, with `deleted` and `not_found` row statuses.
 
-```json
-"Successfully deleted 1 items from collection test"
-```
+## 9. Delete by filter
 
----
-
-## 10. Save Collection
-
-- **Endpoint**: `/api/v1/collection/save`
-- **Method**: POST
-- **Request body**:
+`POST /collections/delete-where`
 
 ```json
 {
-  "collection_name": "test"
+  "collection_name": "docs",
+  "where": {"kind": "note"},
+  "batch_size": 1000,
+  "durability": "fsync"
 }
 ```
 
-- **Example response**:
-
 ```json
-"Collection test saved successfully"
+{"matched": 1, "deleted": 1, "not_found": 0, "batches": 1}
 ```
 
----
+An empty filter is rejected.
+
+## 10. Checkpoint
+
+`POST /collections/checkpoint`
+
+```json
+{"collection_name": "docs"}
+```
+
+The typed receipt reports the durable watermark, WAL cut, metadata epoch, and checkpoint name.
+
+## HTTP error mapping
+
+| SDK category | HTTP status |
+| --- | ---: |
+| Missing collection | 404 |
+| Catalog or handle conflict | 409 |
+| Closed database/collection | 503 |
+| Invalid input or unsupported capability | 400 |
+| Other typed status failure | 500 |
+
+Pydantic request-shape failures use FastAPI’s standard 422 response.

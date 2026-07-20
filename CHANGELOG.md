@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Python SDK v2 cutover (ships as 1.1.0)
+
+- **Entry and lifecycle:** `Client(path)` is replaced by
+  `connect(path) -> Database`; collection creation/opening/dropping are separate,
+  lazy catalog operations. Database and Collection are idempotent context
+  managers, and true read-only opens never mutate files.
+- **Writes:** tuple-based `insert`/generic mutation calls are replaced by the
+  shared keyword-only columnar `add`, `replace`, and `upsert` signature. IDs are
+  strict strings, the default mode is atomic, default durability is fsync, and
+  every call returns a typed `MutationResult`.
+- **Reads:** the former single/batch/filter convenience methods converge on
+  `search`, `scan`, and aligned `get`. Search returns read-only CSR columns with
+  per-query status/completeness; QG uses the public `effort` vocabulary and
+  Flat rejects that inapplicable control.
+- **Configuration:** the mutable mixed-purpose parameter bag is replaced by
+  frozen `CollectionConfig` plus the `FlatIndexConfig | QGIndexConfig`
+  discriminated union. QG remains the default, is validated before filesystem
+  mutation, and never silently falls back to Flat.
+- **Package contents:** the root exports exactly 23 supported symbols. Legacy
+  facade/tombstone modules are removed without aliases. RAG support moves to
+  `examples/rag/support/`; offline LASER Python helpers move to `tools/laser/`;
+  neither ships in the wheel or sdist, and their runtime extras are removed.
+- **Binding:** named private response classes are now the only native response
+  surface; the temporary suffixed siblings and dict-return compatibility methods
+  are gone.
+- Package version remains **1.1.0**. “v2” is the API design generation; no
+  differently versioned distribution was released between 1.0.3 and this
+  cutover, and no compatibility promise is made for pre-cutover artifacts.
+
 ### Added
 
 - Cosine metric support for the public Collection `qg` route. QG normalizes

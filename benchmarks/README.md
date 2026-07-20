@@ -19,5 +19,6 @@ benchmarks/
 Golden artifact generators live in `tests/golden/` (test infrastructure,
 not benchmarks).
 
-The old `alayalite.bench` CLIs and ANN-Benchmarks adapter depended on removed
-Python index APIs and are no longer part of the benchmark surface.
+Repository benchmark support is intentionally separate from the installed SDK.
+The retired Python CLIs and ANN adapter are not part of the current benchmark
+surface; use the native targets and scripts shown above.
