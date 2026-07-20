@@ -257,7 +257,9 @@ if(ALAYA_ENABLE_MUTABLE_LASER_TESTS)
     NAME laser_test_mutable_laser_segment
     TARGET test_mutable_laser_segment
     LABELS laser wal disk persistence
-    TIMEOUT 120
+    # -O0 coverage builds pay a constant per-call cost through the updater bridge library; 120s sat right on the
+    # coverage lane's measured time.
+    TIMEOUT 300
   )
 
   # Residency seams behind UnifiedLaserSegment: prefetch budget default, ResidencyProvider dispatch,
