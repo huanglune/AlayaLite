@@ -980,7 +980,7 @@ class PyCollection {
 
   [[nodiscard]] auto search(const py::array &queries,
                             std::uint64_t top_k,
-                            std::uint32_t ef_search,
+                            std::uint32_t effort,
                             const py::object &metadata_filter,
                             const std::string &policy,
                             const py::object &selectivity,
@@ -988,11 +988,11 @@ class PyCollection {
                             std::uint64_t io_budget_requests,
                             std::uint64_t io_budget_bytes) -> PySearchResponse {
     const auto effective_effort = collection_->target_algorithm() == core::algorithm::qg
-                                      ? std::optional<std::uint32_t>(ef_search)
+                                      ? std::optional<std::uint32_t>(effort)
                                       : std::nullopt;
     return search_response_to_response(search_response(queries,
                                                        top_k,
-                                                       ef_search,
+                                                       effort,
                                                        metadata_filter,
                                                        policy,
                                                        selectivity,
@@ -1004,7 +1004,7 @@ class PyCollection {
 
   [[nodiscard]] auto search_response(const py::array &queries,
                                      std::uint64_t top_k,
-                                     std::uint32_t ef_search,
+                                     std::uint32_t effort,
                                      const py::object &metadata_filter,
                                      const std::string &policy,
                                      const py::object &selectivity,
@@ -1018,7 +1018,7 @@ class PyCollection {
     }
     core::SearchOptions options(top_k);
     QgSearchExtension qg_options;
-    qg_options.effort = ef_search;
+    qg_options.effort = effort;
     const auto qg_extension = make_qg_search_extension(qg_options);
     options.extensions = std::span<const core::AlgorithmSearchExtension>(&qg_extension, 1);
     options.filter_policy = filter_policy(policy);
@@ -1043,7 +1043,7 @@ class PyCollection {
 
   [[nodiscard]] auto batch_search(const py::array &queries,
                                   std::uint64_t top_k,
-                                  std::uint32_t ef_search,
+                                  std::uint32_t effort,
                                   const py::object &metadata_filter,
                                   const std::string &policy,
                                   const py::object &selectivity,
@@ -1051,11 +1051,11 @@ class PyCollection {
                                   std::uint64_t io_budget_requests,
                                   std::uint64_t io_budget_bytes) -> PySearchResponse {
     const auto effective_effort = collection_->target_algorithm() == core::algorithm::qg
-                                      ? std::optional<std::uint32_t>(ef_search)
+                                      ? std::optional<std::uint32_t>(effort)
                                       : std::nullopt;
     return search_response_to_response(batch_search_response(queries,
                                                              top_k,
-                                                             ef_search,
+                                                             effort,
                                                              metadata_filter,
                                                              policy,
                                                              selectivity,
@@ -1067,7 +1067,7 @@ class PyCollection {
 
   [[nodiscard]] auto batch_search_response(const py::array &queries,
                                            std::uint64_t top_k,
-                                           std::uint32_t ef_search,
+                                           std::uint32_t effort,
                                            const py::object &metadata_filter,
                                            const std::string &policy,
                                            const py::object &selectivity,
@@ -1082,7 +1082,7 @@ class PyCollection {
     }
     core::SearchOptions options(top_k);
     QgSearchExtension qg_options;
-    qg_options.effort = ef_search;
+    qg_options.effort = effort;
     const auto qg_extension = make_qg_search_extension(qg_options);
     options.extensions = std::span<const core::AlgorithmSearchExtension>(&qg_extension, 1);
     options.filter_policy = filter_policy(policy);
@@ -1433,7 +1433,7 @@ inline void register_collection(py::module_ &module) {
            py::arg("query"),
            py::arg("top_k"),
            py::kw_only(),
-           py::arg("ef_search") = 100,
+           py::arg("effort") = 100,
            py::arg("metadata_filter") = py::none(),
            py::arg("filter_policy") = "auto",
            py::arg("filter_selectivity") = py::none(),
@@ -1445,7 +1445,7 @@ inline void register_collection(py::module_ &module) {
            py::arg("queries"),
            py::arg("top_k"),
            py::kw_only(),
-           py::arg("ef_search") = 100,
+           py::arg("effort") = 100,
            py::arg("metadata_filter") = py::none(),
            py::arg("filter_policy") = "auto",
            py::arg("filter_selectivity") = py::none(),

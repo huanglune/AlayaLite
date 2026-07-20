@@ -573,7 +573,7 @@ class Collection:
         response = native.search(
             array,
             result_limit,
-            ef_search=effective_effort,
+            effort=effective_effort,
             metadata_filter=expression,
             filter_policy=filter_policy,
             filter_selectivity=selectivity,
