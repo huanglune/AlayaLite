@@ -1,43 +1,25 @@
 ---
-name: Codecov
-on  :
+# Runs full Python and gcc-13 C++ coverage nightly and through the manual channel.
+# Hosted Ubuntu preserves the established Codecov toolchain; schedules are canonical-repository only.
+name: Coverage
+
+on:
   workflow_dispatch:
-  pull_request:
-    paths:
-    - include/**
-    - tests/**
-    - python/src/**
-    - python/tests/**
-    - app/**
-    - app/tests/**
-    - CMakeLists.txt
-    - Makefile
-    - pyproject.toml
-    - python/CMakeLists.txt
-    - cmake/**
-    - .github/scripts/codecov/**
-    - .github/codecov.yml
-  push:
-    branches: [main]
-    paths:
-    - include/**
-    - tests/**
-    - python/src/**
-    - python/tests/**
-    - app/**
-    - app/tests/**
-    - CMakeLists.txt
-    - Makefile
-    - pyproject.toml
-    - python/CMakeLists.txt
-    - cmake/**
-    - .github/scripts/codecov/**
-    - .github/codecov.yml
+  schedule:
+  - cron: 0 19 * * *
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'schedule' }}
 
 jobs:
   codecov-python:
+    if: github.event_name != 'schedule' || github.repository == 'huanglune/AlayaLite'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 10
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -46,19 +28,19 @@ jobs:
 
     - name: Restore Conan cache
       id: conan-cache
-      uses: ./.github/actions/cache-restore
+      uses: ./.github/actions/conan-cache
       with:
         build-type: Release
         target-arch: ${{ runner.arch }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v5
+      uses: astral-sh/setup-uv@v6
       with:
         enable-cache: true
         cache-dependency-glob: uv.lock
 
     - name: Restore compiler cache
-      uses: hendrikmuhs/ccache-action@v1
+      uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03 # v1.2.23
       with:
         key: >-
           codecov-python-portable-v3-${{ runner.os }}-${{ runner.arch }}-gcc-Release-${{ hashFiles('conanfile.py',
@@ -90,7 +72,7 @@ jobs:
     - name: Save Conan cache
       if: steps.conan-cache.outputs.cache-hit != 'true'
       continue-on-error: true
-      uses: ./.github/actions/cache-restore
+      uses: ./.github/actions/conan-cache
       with:
         mode: save
         build-type: Release
@@ -116,15 +98,16 @@ jobs:
 
     - name: Upload Python coverage to Codecov
       continue-on-error: true
-      uses: codecov/codecov-action@v5
+      uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
       with:
         files: coverage.xml
         flags: python
         token: ${{ secrets.CODECOV_TOKEN }}
 
   codecov-cpp:
+    if: github.event_name != 'schedule' || github.repository == 'huanglune/AlayaLite'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 45
     env:
       BUILD_JOBS: 2
       # Hosted-runner evidence: j4 stretched CTest to 886-893s and timed out the
@@ -146,19 +129,19 @@ jobs:
 
     - name: Restore Conan cache
       id: conan-cache
-      uses: ./.github/actions/cache-restore
+      uses: ./.github/actions/conan-cache
       with:
         build-type: Debug
         target-arch: ${{ runner.arch }}
 
     - name: Install uv
-      uses: astral-sh/setup-uv@v5
+      uses: astral-sh/setup-uv@v6
       with:
         enable-cache: true
         cache-dependency-glob: uv.lock
 
     - name: Restore compiler cache
-      uses: hendrikmuhs/ccache-action@v1
+      uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03 # v1.2.23
       with:
         key: >-
           codecov-cpp-portable-v2-${{ runner.os }}-${{ runner.arch }}-gcc-13-Debug-${{ hashFiles('conanfile.py',
@@ -187,14 +170,14 @@ jobs:
     - name: Save Conan cache
       if: steps.conan-cache.outputs.cache-hit != 'true'
       continue-on-error: true
-      uses: ./.github/actions/cache-restore
+      uses: ./.github/actions/conan-cache
       with:
         mode: save
         build-type: Debug
         target-arch: ${{ runner.arch }}
 
     - name: Upload C++ coverage to Codecov
-      uses: codecov/codecov-action@v5
+      uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
       with:
         files: coverage_c++.info
         flags: cpp

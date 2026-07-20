@@ -1,10 +1,9 @@
 ---
-name       : Prepare Release
+# Manually bumps the version, updates the changelog, commits, tags, and pushes the release.
+# A hosted runner performs the write operation; the resulting v* tag hands publication to Wheels.
+name: Release
 
-# Manual trigger: input the target version, and this workflow will bump
-# pyproject.toml (single source of truth), update CHANGELOG.md, commit,
-# tag, and push. The tag push triggers cibuildwheel to build and publish.
-on         :
+on:
   workflow_dispatch:
     inputs:
       version:
@@ -18,11 +17,18 @@ on         :
         type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
-jobs       :
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'schedule' }}
+
+jobs:
   prepare:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
     - uses: actions/checkout@v4
       with:
@@ -144,4 +150,4 @@ jobs       :
         git tag "v${VERSION}"
         git push origin main
         git push origin "v${VERSION}"
-        echo "::notice::Released v${VERSION} — cibuildwheel will build and publish automatically"
+        echo "::notice::Released v${VERSION} — Wheels will build and publish automatically"

@@ -1,0 +1,57 @@
+---
+# Restores or explicitly saves the Conan package cache for hosted CI lanes.
+# Explicit saves stay in workflow order so later timeout/cancellation cannot discard a completed build's post-step write.
+name: Conan cache
+description: |
+  Restore or save the Conan dependency cache (~/.conan2) for AlayaLite C++
+  builds. The cache key covers target architecture, build type, and every
+  file that drives the Conan dependency graph.
+
+inputs:
+  mode:
+    description: Cache operation to run (restore or save).
+    required: false
+    default: restore
+  build-type:
+    description: CMAKE_BUILD_TYPE (Debug, Release, etc.)
+    required: false
+    default: Release
+  target-arch:
+    description: Target architecture for Conan/cibuildwheel cache isolation.
+    required: true
+
+outputs:
+  cache-hit:
+    description: Whether the restore operation found an exact cache hit.
+    value: ${{ steps.restore-conan-cache.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+  - name: Compute Conan cache key
+    id: cache-key
+    shell: bash
+    env:
+      CACHE_PREFIX: conan-v3-${{ runner.os }}-${{ inputs.target-arch }}-${{ inputs.build-type }}
+      DEPENDENCY_HASH: >-
+        ${{ hashFiles('conanfile.py', 'cmake/vendor/conan_provider.cmake', 'cmake/AlayaConan.cmake',
+        'pyproject.toml') }}
+    run: |
+      echo "key=${CACHE_PREFIX}-${DEPENDENCY_HASH}" >> "$GITHUB_OUTPUT"
+      echo "prefix=${CACHE_PREFIX}-" >> "$GITHUB_OUTPUT"
+
+  - name: Restore Conan cache
+    id: restore-conan-cache
+    if: ${{ inputs.mode == 'restore' }}
+    uses: actions/cache/restore@v5
+    with:
+      path: ~/.conan2
+      key: ${{ steps.cache-key.outputs.key }}
+      restore-keys: ${{ steps.cache-key.outputs.prefix }}
+
+  - name: Save Conan cache
+    if: ${{ inputs.mode == 'save' }}
+    uses: actions/cache/save@v5
+    with:
+      path: ~/.conan2
+      key: ${{ steps.cache-key.outputs.key }}

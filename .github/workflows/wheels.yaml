@@ -1,7 +1,9 @@
 ---
-name: Build Wheels
+# Builds quick branch wheels on demand, the full matrix weekly, and release wheels for v* tags.
+# Hosted runners cover full/platform lanes; only guarded quick Linux x86_64 work runs on g05 Docker.
+name: Wheels
 
-on  :
+on:
   workflow_dispatch:
     inputs:
       quick:
@@ -11,11 +13,25 @@ on  :
   push:
     tags:
     - v*
+  schedule:
+  - cron: 0 19 * * 0
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && github.event_name != 'schedule' }}
 
 jobs:
   build_wheels:
     name: Build wheels on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    if: >-
+      github.repository == 'huanglune/AlayaLite' ||
+      (github.event_name != 'schedule' && !inputs.quick)
+    runs-on: >-
+      ${{ inputs.quick && matrix.os == 'ubuntu-latest' && fromJSON('["self-hosted","g05"]') || matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -43,10 +59,8 @@ jobs:
       # Both arms are spelled out because an empty CIBW_BUILD would not fall
       # back to pyproject's list - it would widen to cibuildwheel's full
       # default (PyPy included). The full arm mirrors [tool.cibuildwheel]
-      # build in pyproject.toml; tag pushes have no inputs and take it.
+      # build in pyproject.toml; tag pushes and schedules have no inputs and take it.
       CIBW_BUILD: ${{ inputs.quick && 'cp312-*' || 'cp3{9,10,11,12,13}-*' }}
-      # CI specific config: mount Conan and uv cache in Linux Docker
-      CIBW_CONTAINER_ENGINE: 'docker; create_args: -v /home/runner/.conan2:/root/.conan2 -v /home/runner/.cache/uv:/root/.cache/uv'
       CIBW_ARCHS_LINUX: ${{ matrix.arch }}
       CIBW_ARCHS_MACOS: ${{ matrix.arch }}
       CIBW_ARCHS_WINDOWS: ${{ matrix.arch }}
@@ -54,8 +68,9 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Set up uv
-      uses: astral-sh/setup-uv@v5
+    - name: Set up uv on hosted runners
+      if: runner.environment == 'github-hosted'
+      uses: astral-sh/setup-uv@v6
       with:
         enable-cache: true
         # Linux cibuildwheel uses a Docker-mounted uv cache; setup-uv's
@@ -64,20 +79,44 @@ jobs:
         cache-dependency-glob: uv.lock
         cache-local-path: ${{ runner.os == 'Linux' && '/home/runner/.cache/uv' || '' }}
 
-    - name: Restore Conan cache
+    - name: Verify g05 wheel toolchain
+      if: runner.environment == 'self-hosted'
+      run: |
+        command -v ccache
+        command -v docker
+        command -v uv
+        docker info
+
+    - name: Reset compiler cache statistics
+      if: runner.environment == 'self-hosted'
+      run: ccache -z
+
+    - name: Configure Linux container cache mounts
+      if: runner.os == 'Linux'
+      shell: bash
+      run: >-
+        echo "CIBW_CONTAINER_ENGINE=docker; create_args: -v $HOME/.conan2:/root/.conan2
+        -v $HOME/.cache/uv:/root/.cache/uv" >> "$GITHUB_ENV"
+
+    - name: Restore Conan cache on hosted runners
+      if: runner.environment == 'github-hosted'
       id: conan-cache
-      uses: ./.github/actions/cache-restore
+      uses: ./.github/actions/conan-cache
       with:
         build-type: Release
         target-arch: ${{ matrix.arch }}
 
     - name: Build wheels
-      uses: pypa/cibuildwheel@v3.3
+      uses: pypa/cibuildwheel@v3
 
-    - name: Save Conan cache
-      if: steps.conan-cache.outputs.cache-hit != 'true'
+    - name: Show compiler cache statistics
+      if: runner.environment == 'self-hosted' && always()
+      run: ccache -s
+
+    - name: Save Conan cache on hosted runners
+      if: runner.environment == 'github-hosted' && steps.conan-cache.outputs.cache-hit != 'true'
       continue-on-error: true
-      uses: ./.github/actions/cache-restore
+      uses: ./.github/actions/conan-cache
       with:
         mode: save
         build-type: Release
@@ -89,13 +128,13 @@ jobs:
         path: ./wheelhouse/*.whl
 
   # Attach all 25 wheels (5 platforms × 5 Python versions) to the GitHub Release
-  # that corresponds to the pushed tag. Runs only on `push.tags`; manual
-  # workflow_dispatch builds skip this step (use them for build-matrix smoke
-  # testing, not for cutting releases).
+  # that corresponds to the pushed tag. Manual and scheduled builds skip this
+  # step; those channels validate artifacts but never publish them.
   github_release:
     name: Attach wheels to GitHub Release
     needs: [build_wheels]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
@@ -107,7 +146,7 @@ jobs:
         merge-multiple: true
 
     - name: Upload wheels to GitHub Release
-      uses: softprops/action-gh-release@v2
+      uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
       with:
         files: dist/*.whl
         fail_on_unmatched_files: true
@@ -122,6 +161,7 @@ jobs:
     name: Publish to PyPI
     needs: [build_wheels]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     # Uncomment after configuring repo Settings -> Environments -> pypi-production
     # environment: pypi-production
@@ -133,7 +173,7 @@ jobs:
         merge-multiple: true
 
     - name: Publish wheels to PyPI
-      uses: pypa/gh-action-pypi-publish@release/v1
+      uses: pypa/gh-action-pypi-publish@v1
       with:
         password: ${{ secrets.PYPI_API_TOKEN }}
         skip-existing: true
