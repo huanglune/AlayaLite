@@ -36,9 +36,9 @@
 #include <vector>
 
 #include "../../../benchmarks/laser/bench_laser_update_sift_support.hpp"
+#include "index/graph/laser/qg/detail/qg_updater_core.hpp"
 #include "index/graph/laser/qg/qg.hpp"
 #include "index/graph/laser/qg/qg_builder.hpp"
-#include "index/graph/laser/qg/qg_updater.hpp"
 #include "index/graph/vamana/vamana_builder.hpp"
 #include "index/graph/vamana/vamana_writer.hpp"
 
@@ -522,7 +522,8 @@ QGSuperblockV2 make_v3_slot(uint64_t gen, uint32_t required) {
   sb.checksum = qg_superblock_checksum(sb);
   return sb;
 }
-std::array<char, 2 * kQGSuperblockSize> pack_header(const QGSuperblockV2 &a, const QGSuperblockV2 &b) {
+std::array<char, 2 * kQGSuperblockSize> pack_header(const QGSuperblockV2 &a,
+                                                    const QGSuperblockV2 &b) {
   std::array<char, 2 * kQGSuperblockSize> header{};
   std::memcpy(header.data(), &a, sizeof(a));
   std::memcpy(header.data() + kQGSuperblockSize, &b, sizeof(b));
@@ -577,8 +578,7 @@ TEST(QGSuperblockSelector, FailsClosedOnUnsupportedNewerSlot) {
   }
   // Both slots unsupported v3: fail closed (the two-v3 old-reader case).
   {
-    const auto header =
-        pack_header(make_v3_slot(11, kMaintPair), make_v3_slot(12, kMaintPair));
+    const auto header = pack_header(make_v3_slot(11, kMaintPair), make_v3_slot(12, kMaintPair));
     EXPECT_EQ(select_qg_superblock_checked(header.data(), out, 0U), -2);
   }
   // Neither slot structurally valid: -1 (distinct from the -2 fail-closed signal).
@@ -601,8 +601,12 @@ QGSuperblockV2 make_future_version_slot(uint64_t gen, uint32_t outer_version) {
   sb.checksum = qg_superblock_checksum(sb);  // checksum-legal, so structurally valid
   return sb;
 }
-QGSuperblockV2 make_v3_full(uint64_t gen, uint32_t required, uint64_t maint_gen, uint64_t pid_gen,
-                            uint32_t max_gen, uint32_t nz) {
+QGSuperblockV2 make_v3_full(uint64_t gen,
+                            uint32_t required,
+                            uint64_t maint_gen,
+                            uint64_t pid_gen,
+                            uint32_t max_gen,
+                            uint32_t nz) {
   QGSuperblockV2 sb{};
   sb.magic = kQGSuperblockMagic;
   sb.format_version = kQGFormatVersionV3;
@@ -649,23 +653,35 @@ TEST(QGSuperblockSelector, FailsClosedOnFutureVersionAndCraftedReservedState) {
   // A maintenance-only v3 (no pid triple) MUST have zero pid activation gen + summary; a stray
   // pid_reuse_activation_gen is an inactive-state violation -> reject.
   {
-    const auto bad = make_v3_full(11, kMaintPair, /*maint_gen=*/5, /*pid_gen=*/6,
-                                  /*max_gen=*/0, /*nz=*/0);
+    const auto bad = make_v3_full(11,
+                                  kMaintPair,
+                                  /*maint_gen=*/5,
+                                  /*pid_gen=*/6,
+                                  /*max_gen=*/0,
+                                  /*nz=*/0);
     const auto header = pack_header(make_v2_slot(10), bad);
     EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kQgSupportedRequiredFeatures), -2);
   }
   // A full pid-triple v3 whose pid activation generation PRECEDES maintenance activation is an
   // impossible ordering -> reject.
   {
-    const auto bad = make_v3_full(11, kMaintPair | kPidTriple, /*maint_gen=*/5, /*pid_gen=*/3,
-                                  /*max_gen=*/1, /*nz=*/1);
+    const auto bad = make_v3_full(11,
+                                  kMaintPair | kPidTriple,
+                                  /*maint_gen=*/5,
+                                  /*pid_gen=*/3,
+                                  /*max_gen=*/1,
+                                  /*nz=*/1);
     const auto header = pack_header(make_v2_slot(10), bad);
     EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kQgSupportedRequiredFeatures), -2);
   }
   // A well-formed pid-triple v3 (pid_gen >= maint_gen, summary present) is accepted.
   {
-    const auto ok = make_v3_full(11, kMaintPair | kPidTriple, /*maint_gen=*/5, /*pid_gen=*/5,
-                                 /*max_gen=*/2, /*nz=*/1);
+    const auto ok = make_v3_full(11,
+                                 kMaintPair | kPidTriple,
+                                 /*maint_gen=*/5,
+                                 /*pid_gen=*/5,
+                                 /*max_gen=*/2,
+                                 /*nz=*/1);
     const auto header = pack_header(make_v2_slot(10), ok);
     EXPECT_EQ(select_qg_superblock_checked(header.data(), out, kQgSupportedRequiredFeatures), 1);
     EXPECT_EQ(out.format_version, kQGFormatVersionV3);

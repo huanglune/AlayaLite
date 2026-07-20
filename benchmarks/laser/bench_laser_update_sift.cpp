@@ -43,11 +43,11 @@
 #include <unordered_set>
 #include <vector>
 
-#include "bench_laser_update_sift_support.hpp"
 #include "bench_laser_oracles.hpp"
+#include "bench_laser_update_sift_support.hpp"
+#include "index/graph/laser/qg/detail/qg_updater_core.hpp"
 #include "index/graph/laser/qg/qg.hpp"
 #include "index/graph/laser/qg/qg_builder.hpp"
-#include "index/graph/laser/qg/qg_updater.hpp"
 #include "index/graph/laser/utils/pca_transform.hpp"
 #include "index/graph/vamana/vamana_builder.hpp"
 #include "index/graph/vamana/vamana_writer.hpp"
@@ -187,14 +187,14 @@ struct Args {
   uint64_t new_id_split = 0;  // eval: also report recall restricted to GT ids >= split
   uint64_t tombstone_from = 0, tombstone_n = 0;
   uint32_t R = 64, L = 200, ef_indexing = 200, threads = 64, beam = 16, topk = 10, runs = 3;
-  uint32_t vamana_R = 0;  // build: Vamana degree < degree_bound leaves free slots ("headroom")
+  uint32_t vamana_R = 0;     // build: Vamana degree < degree_bound leaves free slots ("headroom")
   uint32_t reuse_graph = 0;  // build: skip VamanaBuilder, pack an existing <prefix>_vamana.index
-  uint32_t main_dim = 0;  // 0 -> dim
+  uint32_t main_dim = 0;     // 0 -> dim
   uint32_t pca_preprocessed = 0;  // build: reuse <prefix>_pca_{base.fbin,bin}
   size_t ef_insert = 100, prune_cap = 300, alpha_check_max = 16;
   size_t batch = 4096, insert_threads = 32;
   uint32_t consolidate = 0, r_target = 0;
-  size_t consolidate_every = 1;     // churn: consolidate every N rounds; 0 = never
+  size_t consolidate_every = 1;    // churn: consolidate every N rounds; 0 = never
   uint32_t bloom_consolidate = 0;  // 1 = read-only Bloom prefilter before consolidate_row
   uint32_t reuse = 0;              // churn: 1 = allocate from consolidated free-list first
   uint32_t checkpoint_every = 1;   // churn: superblock cadence in rounds
@@ -500,8 +500,7 @@ int do_build(const Args &a) {
     std::cout << "[build] vamana medoid=" << vb.medoid() << "\n";
   }
   auto t1 = std::chrono::steady_clock::now();
-  std::cout << "[build] graph ready in " << std::chrono::duration<double>(t1 - t0).count()
-            << "s\n";
+  std::cout << "[build] graph ready in " << std::chrono::duration<double>(t1 - t0).count() << "s\n";
 
   const std::string pca_base_path = a.prefix + "_pca_base.fbin";
   const std::string pca_param_path = a.prefix + "_pca.bin";
@@ -512,14 +511,16 @@ int do_build(const Args &a) {
       alaya::laser::PCATransform pca(dim);
       pca.train(base.data.data(), base.n);
       auto tp = std::chrono::steady_clock::now();
-      std::cout << "[build] PCA trained in "
-                << std::chrono::duration<double>(tp - t1).count() << "s, projecting...\n";
+      std::cout << "[build] PCA trained in " << std::chrono::duration<double>(tp - t1).count()
+                << "s, projecting...\n";
       std::vector<float> projected(static_cast<size_t>(base.n) * dim);
       for (size_t i = 0; i < base.n; ++i) {
         pca.transform(base.row(i), projected.data() + i * dim);
       }
-      write_fbin(pca_base_path, projected.data(),
-                 static_cast<int32_t>(base.n), static_cast<int32_t>(dim));
+      write_fbin(pca_base_path,
+                 projected.data(),
+                 static_cast<int32_t>(base.n),
+                 static_cast<int32_t>(dim));
       pca.save(pca_param_path);
       auto tw = std::chrono::steady_clock::now();
       std::cout << "[build] PCA projected+saved in "
@@ -955,8 +956,7 @@ int do_churn(const Args &a) {
       source_to_pid[source] = alaya::laser::kPidMax;
     }
     auto tc0 = std::chrono::steady_clock::now();
-    if (a.consolidate != 0 && a.consolidate_every != 0 &&
-        (r + 1) % a.consolidate_every == 0) {
+    if (a.consolidate != 0 && a.consolidate_every != 0 && (r + 1) % a.consolidate_every == 0) {
       upd.consolidate(a.insert_threads, a.r_target, a.reuse != 0, a.bloom_consolidate != 0);
       if (explicit_cache_cap) flush_update_pool(upd, fl_threads, true);
     }
@@ -1623,9 +1623,8 @@ int main(int argc, char **argv) {
       config.r_target = a.r_target;
       config.alpha = a.alpha;
       config.seed = a.seed;
-      return a.mode == "fastscan_oracle"
-                 ? alaya::laser::bench::run_fastscan_oracle(config)
-                 : alaya::laser::bench::run_twohop_oracle(config);
+      return a.mode == "fastscan_oracle" ? alaya::laser::bench::run_fastscan_oracle(config)
+                                         : alaya::laser::bench::run_twohop_oracle(config);
     }
     throw std::runtime_error("unknown mode " + a.mode);
   } catch (const std::exception &e) {

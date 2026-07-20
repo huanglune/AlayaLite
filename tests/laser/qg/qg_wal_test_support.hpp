@@ -17,9 +17,9 @@
 #include <string>
 #include <vector>
 
+#include "index/graph/laser/qg/detail/qg_updater_core.hpp"
 #include "index/graph/laser/qg/qg.hpp"
 #include "index/graph/laser/qg/qg_builder.hpp"
-#include "index/graph/laser/qg/qg_updater.hpp"
 
 namespace alaya::laser::waltest {
 
@@ -84,7 +84,9 @@ struct WalTinyIndex {
     t.data = make_data(base_n, kDim, seed);
 
     const std::string vamana_path = t.prefix + "_vamana.index";
-    write_fbin(t.prefix + "_pca_base.fbin", t.data.data(), static_cast<int32_t>(base_n),
+    write_fbin(t.prefix + "_pca_base.fbin",
+               t.data.data(),
+               static_cast<int32_t>(base_n),
                static_cast<int32_t>(kDim));
     write_ring_vamana(vamana_path, base_n, kDeg);
     {

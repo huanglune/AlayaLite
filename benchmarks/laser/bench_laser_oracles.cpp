@@ -34,7 +34,7 @@
 #include "index/graph/laser/qg/qg_scanner.hpp"
 // The oracle is read-only. This include supplies the public v2 row-trailer and
 // FastScan block-unpack helpers; qg_updater.hpp itself is deliberately unchanged.
-#include "index/graph/laser/qg/qg_updater.hpp"
+#include "index/graph/laser/qg/detail/qg_updater_core.hpp"
 #include "index/graph/laser/space/l2.hpp"
 #include "index/graph/laser/utils/buffer.hpp"
 

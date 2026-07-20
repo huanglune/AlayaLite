@@ -44,8 +44,9 @@
 
 #include "index/disk/segment_manifest.hpp"
 #include "index/disk/types.hpp"
+#include "index/graph/laser/qg/detail/qg_updater_api.hpp"
+#include "index/graph/laser/qg/detail/qg_updater_runtime.hpp"
 #include "index/graph/laser/qg/qg.hpp"
-#include "index/graph/laser/qg/qg_updater.hpp"
 #include "index/graph/laser/qg/residency.hpp"
 #include "platform/fs.hpp"
 #include "storage/mmap_file.hpp"
@@ -57,98 +58,9 @@ class MutableLaserSegment {
   MutableLaserSegment(const std::filesystem::path &seg_dir,
                       laser::UpdateParams params,
                       laser::ResidencyMode residency,
-                      bool allow_empty = false)
-      : residency_(residency) {
-    // The active mutable LASER segment (allow_empty) carries count=0 in its
-    // manifest -- all of its rows live in the op-WAL -- so it opens through the
-    // allow-empty manifest policy and permits base_count==0. Sealed / importer /
-    // read-only opens keep the strict count>0 contract (allow_empty=false, the
-    // default that leaves every existing caller byte-identical).
-    const auto manifest = allow_empty ? SegmentManifest::load_allow_empty(seg_dir / "manifest.txt")
-                                      : SegmentManifest::load(seg_dir / "manifest.txt");
-    if (manifest.index_type != DiskIndexType::Laser) {
-      throw std::runtime_error("MutableLaserSegment: segment is not disk_laser: " +
-                               seg_dir.string());
-    }
-    if (manifest.metric != core::Metric::l2) {
-      throw std::runtime_error(
-          "MutableLaserSegment: active mutation remains L2-only; non-L2 is sealed/read-only");
-    }
-    if (manifest.dim == 0 || (manifest.count == 0 && !allow_empty)) {
-      throw std::runtime_error("MutableLaserSegment: manifest dim/count is zero: " +
-                               seg_dir.string());
-    }
-    dim_ = static_cast<size_t>(manifest.dim);
-    base_count_ = manifest.count;
-    const auto prefix = require_extra(manifest, "x_laser_filename_prefix", seg_dir);
-    const uint32_t r = parse_u32(manifest, "x_R", seg_dir);
-    const uint32_t main_dim = parse_u32(manifest, "x_main_dim", seg_dir);
-    const std::string index_file =
-        prefix + "_R" + std::to_string(r) + "_MD" + std::to_string(main_dim) + ".index";
-    const std::string index_prefix = (seg_dir / prefix).string();
-    // A dedicated lock file: the .opwal itself is atomically renamed on
-    // checkpoint (reset), which would silently break an flock held on it.
-    const auto lock_path = seg_dir / (index_file + ".writer.lock");
+                      bool allow_empty = false);
 
-    // Claim the single-writer lease before opening anything mutable.
-    acquire_writer_lock(lock_path);
-
-    try {
-      qg_ = std::make_unique<laser::QuantizedGraph>(static_cast<size_t>(base_count_),
-                                                    static_cast<size_t>(r),
-                                                    static_cast<size_t>(main_dim),
-                                                    static_cast<size_t>(manifest.dim));
-      // Recovery-aware base load (clause C): skip the strict file_size check; the
-      // op-WAL replay reconciles the physical length.
-      qg_->load_disk_index(index_prefix.c_str(), 0.0F, /*recovery_mode=*/true);
-      if (residency_ == laser::ResidencyMode::kResidentArena) {
-        qg_->ensure_resident_arena();  // materialize + enable the write_at arena mirror
-      }
-      params.enable_wal = true;  // the handle is always durable
-      if (params.max_points == 0) {
-        params.max_points = 2 * static_cast<size_t>(base_count_) + 4096;
-      }
-      updater_ = std::make_unique<laser::QGUpdater>(*qg_, params);
-    } catch (...) {
-      teardown_writer_resources();
-      throw;
-    }
-
-    // base_count_==0 (empty active segment) has no sealed ids sidecar to map, and
-    // MMapFile rejects an empty file (POSIX mmap of length 0), so skip the mmap and
-    // leave ids_view_ null: effective_label() never dereferences it because no live
-    // PID is < base_count_ (every row is an explicitly-bound append).
-    if (base_count_ != 0) {
-      try {
-        ids_mmap_ = alaya::storage::MMapFile(seg_dir / manifest.ids_file);
-        if (ids_mmap_.size() != base_count_ * sizeof(uint64_t)) {
-          throw std::runtime_error("MutableLaserSegment: ids sidecar size mismatch in " +
-                                   seg_dir.string());
-        }
-        ids_view_ = ids_mmap_.as<uint64_t>();
-      } catch (...) {
-        teardown_writer_resources();
-        throw;
-      }
-    }
-
-    // B-06 global bijection check (segment layer, after both the updater recovery
-    // and the ids sidecar mmap, so the base labels are visible): fail closed.
-    try {
-      rebuild_reverse_index();
-    } catch (...) {
-      teardown_writer_resources();
-      throw;
-    }
-  }
-
-  ~MutableLaserSegment() {
-    // Keep the process/external writer lease through dependent teardown, not
-    // merely until the destructor body starts. QGUpdater references qg_, and
-    // QuantizedGraph shutdown drains its PageReader workers/completions; only
-    // after both are gone may a close->reset->reopen caller acquire the file.
-    teardown_writer_resources();
-  }
+  ~MutableLaserSegment();
 
   MutableLaserSegment(const MutableLaserSegment &) = delete;
   auto operator=(const MutableLaserSegment &) -> MutableLaserSegment & = delete;
@@ -156,8 +68,9 @@ class MutableLaserSegment {
   // Append one row and publish it durably. Returns the new PID (== its label).
   auto add(const float *vec) -> laser::PID {
     const std::lock_guard<std::mutex> guard(mutex_);  // single-writer handle mutex (W0)
-    const auto id = updater_->allocate_and_insert(vec);
-    updater_->publish(updater_->allocated_points());
+    const auto id = laser::detail::qg_updater_allocate_and_insert(*updater_, vec);
+    laser::detail::qg_updater_publish(*updater_,
+                                      laser::detail::qg_updater_allocated_points(*updater_));
     return id;
   }
 
@@ -165,11 +78,13 @@ class MutableLaserSegment {
   // the base PID; labels are base .. base+n-1.
   auto add_batch(const float *vecs, size_t n) -> laser::PID {
     const std::lock_guard<std::mutex> guard(mutex_);  // single-writer handle mutex (W0)
-    const auto base = static_cast<laser::PID>(updater_->allocated_points());
+    const auto base =
+        static_cast<laser::PID>(laser::detail::qg_updater_allocated_points(*updater_));
     for (size_t i = 0; i < n; ++i) {
-      (void)updater_->allocate_and_insert(vecs + i * dim_);
+      (void)laser::detail::qg_updater_allocate_and_insert(*updater_, vecs + i * dim_);
     }
-    updater_->publish(updater_->allocated_points());
+    laser::detail::qg_updater_publish(*updater_,
+                                      laser::detail::qg_updater_allocated_points(*updater_));
     return base;
   }
 
@@ -192,7 +107,12 @@ class MutableLaserSegment {
     // returned rows, never a guessed dense [base, base+n) range -- a mixed / all-reuse
     // bundle is not dense, and a reused row carries a fresh generation.
     const auto result =
-        updater_->commit_physical_bundle_tokens(txid, applied_collection_op_id, vecs, labels, n);
+        laser::detail::qg_updater_commit_physical_bundle_tokens(*updater_,
+                                                                txid,
+                                                                applied_collection_op_id,
+                                                                vecs,
+                                                                labels,
+                                                                n);
     for (size_t i = 0; i < n; ++i) {
       label_to_pid_.insert_or_assign(labels[i], result.rows[i]);
     }
@@ -221,13 +141,15 @@ class MutableLaserSegment {
   // Mark a raw PID deleted and force the tombstone durable (existing callers / tests).
   void tombstone(laser::PID id) {
     const std::lock_guard<std::mutex> guard(mutex_);  // single-writer handle mutex (W0)
-    const uint64_t lbl = effective_label(id, updater_->label_snapshot());
+    const uint64_t lbl = effective_label(id, laser::detail::qg_updater_label_snapshot(*updater_));
     const auto it = label_to_pid_.find(lbl);
     if (it != label_to_pid_.end() && it->second.pid == id) {
       label_to_pid_.erase(it);
     }
-    updater_->tombstone(id);
-    updater_->publish(updater_->num_points());  // group-commit the tombstone
+    laser::detail::qg_updater_tombstone(*updater_, id);
+    laser::detail::qg_updater_publish(*updater_,
+                                      laser::detail::qg_updater_num_points(
+                                          *updater_));  // group-commit the tombstone
   }
 
   // Tombstone a captured TOKEN with an ABA incarnation check (design 3.3 / codex B.7):
@@ -239,7 +161,7 @@ class MutableLaserSegment {
   // erased ONLY when it still maps the label to this exact token (full-token equality).
   void tombstone(laser::PidToken expected) {
     const std::lock_guard<std::mutex> guard(mutex_);
-    const uint32_t current = updater_->durable_generation(expected.pid);
+    const uint32_t current = laser::detail::qg_updater_durable_generation(*updater_, expected.pid);
     if (current > expected.pid_generation) {
       return;  // stale token: a newer incarnation owns this PID -- idempotent no-op
     }
@@ -247,25 +169,28 @@ class MutableLaserSegment {
       throw std::runtime_error(
           "MutableLaserSegment::tombstone: token generation is from the future (corruption)");
     }
-    const uint64_t lbl = effective_label(expected.pid, updater_->label_snapshot());
+    const uint64_t lbl =
+        effective_label(expected.pid, laser::detail::qg_updater_label_snapshot(*updater_));
     const auto erase_reverse_if_equal = [&] {
       const auto it = label_to_pid_.find(lbl);
       if (it != label_to_pid_.end() && it->second == expected) {
         label_to_pid_.erase(it);
       }
     };
-    if (!updater_->row_is_live(expected.pid)) {
+    if (!laser::detail::qg_updater_row_is_live(*updater_, expected.pid)) {
       erase_reverse_if_equal();  // already dead: idempotent
       return;
     }
-    updater_->tombstone(expected.pid);
-    updater_->publish(updater_->num_points());  // group-commit the tombstone
+    laser::detail::qg_updater_tombstone(*updater_, expected.pid);
+    laser::detail::qg_updater_publish(*updater_,
+                                      laser::detail::qg_updater_num_points(
+                                          *updater_));  // group-commit the tombstone
     erase_reverse_if_equal();
   }
 
   void flush() {
-    const std::lock_guard<std::mutex> guard(mutex_);  // single-writer handle mutex (W0)
-    updater_->writeback(1);                           // persist dirty pages + mirror the arena
+    const std::lock_guard<std::mutex> guard(mutex_);    // single-writer handle mutex (W0)
+    laser::detail::qg_updater_writeback(*updater_, 1);  // persist dirty pages + mirror the arena
   }
 
   // Run a consolidate maintenance transaction (2C): purge dead out-edges and, when
@@ -277,17 +202,25 @@ class MutableLaserSegment {
                    bool reclaim_slots,
                    bool bloom_consolidate) {
     const std::lock_guard<std::mutex> guard(mutex_);
-    updater_->consolidate(num_threads, r_target, reclaim_slots, bloom_consolidate);
+    laser::detail::qg_updater_consolidate(*updater_,
+                                          num_threads,
+                                          r_target,
+                                          reclaim_slots,
+                                          bloom_consolidate);
   }
-  [[nodiscard]] auto free_count() const -> uint64_t { return updater_->free_count(); }
+  [[nodiscard]] auto free_count() const -> uint64_t {
+    return laser::detail::qg_updater_free_count(*updater_);
+  }
   [[nodiscard]] auto pid_generation_activated() const -> bool {
-    return updater_->pid_generation_activated();
+    return laser::detail::qg_updater_pid_generation_activated(*updater_);
   }
-  [[nodiscard]] auto recovery_required() const noexcept -> bool { return updater_->is_poisoned(); }
+  [[nodiscard]] auto recovery_required() const noexcept -> bool {
+    return laser::detail::qg_updater_is_poisoned(*updater_);
+  }
   void checkpoint() {
     const std::lock_guard<std::mutex> guard(mutex_);  // single-writer handle mutex (W0)
-    updater_->checkpoint();
-    updater_->require_dual_v3_if_activated();
+    laser::detail::qg_updater_checkpoint(*updater_);
+    laser::detail::qg_updater_require_dual_v3_if_activated(*updater_);
   }
 
   [[nodiscard]] auto search(const float *query, const DiskSearchOptions &opts)
@@ -299,21 +232,23 @@ class MutableLaserSegment {
         opts.beam_width > static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
       throw std::invalid_argument("MutableLaserSegment: beam_width is invalid");
     }
-    updater_->ensure_readable();  // entry poison gate (B-02); lock-free
+    laser::detail::qg_updater_ensure_readable(*updater_);  // entry poison gate (B-02); lock-free
     const size_t ef = std::max<size_t>(opts.ef, opts.top_k);
     std::vector<float> distances;
     if (opts.return_distances) {
       distances.resize(opts.top_k);
     }
-    const auto pids = updater_->search(query,
-                                       opts.top_k,
-                                       ef,
-                                       opts.beam_width,
-                                       opts.return_distances ? distances.data() : nullptr);
+    const auto pids =
+        laser::detail::qg_updater_search(*updater_,
+                                         query,
+                                         opts.top_k,
+                                         ef,
+                                         opts.beam_width,
+                                         opts.return_distances ? distances.data() : nullptr);
     // Acquire the label snapshot AFTER search took its committed watermark: the
     // snapshot is published before committed, so it covers every committed PID's
     // binding, and identity fallback never fires spuriously (B-02).
-    const auto snap = updater_->label_snapshot();
+    const auto snap = laser::detail::qg_updater_label_snapshot(*updater_);
     std::vector<DiskSearchHit> out;
     out.reserve(pids.size());
     for (std::size_t index = 0; index < pids.size(); ++index) {
@@ -321,7 +256,7 @@ class MutableLaserSegment {
                                   opts.return_distances ? distances[index]
                                                         : std::numeric_limits<float>::quiet_NaN()});
     }
-    updater_->ensure_readable();  // exit poison gate (B-02)
+    laser::detail::qg_updater_ensure_readable(*updater_);  // exit poison gate (B-02)
     return out;
   }
 
@@ -329,30 +264,38 @@ class MutableLaserSegment {
                                   uint32_t num_queries,
                                   const DiskSearchOptions &opts)
       -> std::vector<std::vector<DiskSearchHit>> {
-    updater_->ensure_readable();  // entry poison gate (B-02)
+    laser::detail::qg_updater_ensure_readable(*updater_);  // entry poison gate (B-02)
     std::vector<std::vector<DiskSearchHit>> out;
     out.reserve(num_queries);
     for (uint32_t q = 0; q < num_queries; ++q) {
       out.push_back(search(queries + static_cast<size_t>(q) * dim_, opts));
     }
-    updater_->ensure_readable();  // exit poison gate (B-02)
+    laser::detail::qg_updater_ensure_readable(*updater_);  // exit poison gate (B-02)
     return out;
   }
 
-  [[nodiscard]] auto size() const -> size_t { return updater_->num_points(); }
+  [[nodiscard]] auto size() const -> size_t {
+    return laser::detail::qg_updater_num_points(*updater_);
+  }
   [[nodiscard]] auto dim() const -> size_t { return dim_; }
   [[nodiscard]] auto base_count() const -> uint64_t { return base_count_; }
   // 2B accessors for the Collection adapter: the idempotency basis (applied op /
   // last committed txid) and live/allocated counts for stats.
-  [[nodiscard]] auto live_count() const -> uint64_t { return updater_->live_count(); }
-  [[nodiscard]] auto allocated_count() const -> size_t { return updater_->allocated_points(); }
+  [[nodiscard]] auto live_count() const -> uint64_t {
+    return laser::detail::qg_updater_live_count(*updater_);
+  }
+  [[nodiscard]] auto allocated_count() const -> size_t {
+    return laser::detail::qg_updater_allocated_points(*updater_);
+  }
   [[nodiscard]] auto applied_collection_op_id() const -> uint64_t {
-    return updater_->applied_collection_op_id();
+    return laser::detail::qg_updater_applied_collection_op_id(*updater_);
   }
   [[nodiscard]] auto last_committed_txid() const -> uint64_t {
-    return updater_->last_committed_txid();
+    return laser::detail::qg_updater_last_committed_txid(*updater_);
   }
-  [[nodiscard]] auto search_stats() const -> laser::UpdateStats { return updater_->stats(); }
+  [[nodiscard]] auto search_stats() const -> laser::UpdateStats {
+    return laser::detail::qg_updater_stats(*updater_);
+  }
 
   // Create a brand-new EMPTY (count=0) active LASER segment directory: a
   // checksum-valid v2 superblock (num_points=0), a matching FHT rotator, two
@@ -509,8 +452,8 @@ class MutableLaserSegment {
   // maintained incrementally by commit_physical_bundle/tombstone). Tombstoned/free
   // rows keep their forward pid->label binding but do not occupy the live domain.
   void rebuild_reverse_index() {
-    const auto snap = updater_->label_snapshot();
-    const size_t committed = updater_->num_points();
+    const auto snap = laser::detail::qg_updater_label_snapshot(*updater_);
+    const size_t committed = laser::detail::qg_updater_num_points(*updater_);
     // JC-17 base-region shadowing (codex B.7 / MAJOR-9): a binding on a base-region PID
     // (pid < base_count_) is legal ONLY as a reused base row -- it must carry a non-zero
     // generation AND pid reuse must be activated. A gen-0 binding shadowing a base
@@ -523,7 +466,7 @@ class MutableLaserSegment {
           throw std::runtime_error("MutableLaserSegment: base-region PID " + std::to_string(pid) +
                                    " has a generation-0 binding (illegal base-label shadowing)");
         }
-        if (!updater_->pid_generation_activated()) {
+        if (!laser::detail::qg_updater_pid_generation_activated(*updater_)) {
           throw std::runtime_error("MutableLaserSegment: base-region PID " + std::to_string(pid) +
                                    " carries a binding before pid-reuse activation");
         }
@@ -533,11 +476,12 @@ class MutableLaserSegment {
     label_to_pid_.reserve(committed);
     for (size_t p = 0; p < committed; ++p) {
       const auto pid = static_cast<laser::PID>(p);
-      if (!updater_->row_is_live(pid)) {
+      if (!laser::detail::qg_updater_row_is_live(*updater_, pid)) {
         continue;
       }
       const uint64_t lbl = effective_label(pid, snap);
-      const laser::PidToken token{pid, updater_->durable_generation(pid)};
+      const laser::PidToken token{pid,
+                                  laser::detail::qg_updater_durable_generation(*updater_, pid)};
       const auto [it, inserted] = label_to_pid_.emplace(lbl, token);
       if (!inserted) {
         throw std::runtime_error("MutableLaserSegment: label " + std::to_string(lbl) +
@@ -591,11 +535,7 @@ class MutableLaserSegment {
     }
   }
 
-  void teardown_writer_resources() noexcept {
-    updater_.reset();
-    qg_.reset();
-    release_writer_lock();
-  }
+  void teardown_writer_resources() noexcept;
 
   laser::ResidencyMode residency_;
   size_t dim_ = 0;

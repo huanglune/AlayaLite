@@ -23,9 +23,9 @@
 #include <string>
 #include <vector>
 
+#include "index/graph/laser/qg/detail/qg_updater_core.hpp"
 #include "index/graph/laser/qg/qg.hpp"
 #include "index/graph/laser/qg/qg_builder.hpp"
-#include "index/graph/laser/qg/qg_updater.hpp"
 #include "index/graph/laser/qg/residency.hpp"
 #include "index/graph/vamana/vamana_builder.hpp"
 #include "index/graph/vamana/vamana_writer.hpp"
