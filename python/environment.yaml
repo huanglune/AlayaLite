@@ -1,6 +1,6 @@
 ---
-name        : alayalite
-channels    :
+name: alayalite
+channels:
 - defaults
 - conda-forge
 

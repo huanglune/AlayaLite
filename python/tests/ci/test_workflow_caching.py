@@ -2,7 +2,7 @@
 #
 # SPDX-License-Identifier: AGPL-3.0-only
 
-"""Static checks for GitHub Actions cache ownership."""
+"""Static checks for the GitHub Actions lane set, cache ownership, and runner guards."""
 
 from __future__ import annotations
 
@@ -13,17 +13,36 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[3]
 WORKFLOWS = ROOT / ".github" / "workflows"
-CONAN_CACHE_ACTION = ROOT / ".github" / "actions" / "cache-restore" / "action.yaml"
+CONAN_CACHE_ACTION = ROOT / ".github" / "actions" / "conan-cache" / "action.yaml"
 # Build switches and compile flags live in dedicated cmake/ modules (see CMakeLists.txt for the map).
 CMAKE_OPTIONS_MODULE = ROOT / "cmake" / "AlayaOptions.cmake"
 CMAKE_FLAGS_MODULE = ROOT / "cmake" / "AlayaFlags.cmake"
 PYPROJECT = ROOT / "pyproject.toml"
 PRINT_SUMMARY = ROOT / "cmake" / "PrintSummary.cmake"
 
+# Filename == lane == display name is the whole contract; anything outside this set is drift.
+LANE_FILES = {
+    "build.yaml",
+    "coverage.yaml",
+    "lint.yaml",
+    "release.yaml",
+    "sanitizers.yaml",
+    "tests.yaml",
+    "wheels.yaml",
+}
+SHA_PINNED = re.compile(r"@[0-9a-f]{40}$")
+# Trusted publishers may pin by major tag; everything else must pin a full commit SHA.
+TAG_PIN_ALLOWED = ("actions/", "astral-sh/setup-uv@", "pypa/")
+
 
 def _yaml(path: Path) -> dict:
     with path.open(encoding="utf-8") as handle:
         return yaml.safe_load(handle)
+
+
+def _triggers(workflow: dict) -> dict:
+    # YAML 1.1 parses a bare `on:` key as boolean True.
+    return workflow.get("on", workflow.get(True))
 
 
 def _steps(workflow_name: str, job_name: str) -> list[dict]:
@@ -35,6 +54,10 @@ def _uses(steps: list[dict], action: str) -> list[dict]:
     return [step for step in steps if step.get("uses") == action]
 
 
+def _uses_matching(steps: list[dict], prefix: str) -> list[dict]:
+    return [step for step in steps if str(step.get("uses", "")).startswith(prefix)]
+
+
 def _named_step(steps: list[dict], name: str) -> dict:
     for step in steps:
         if step.get("name") == name:
@@ -42,17 +65,51 @@ def _named_step(steps: list[dict], name: str) -> dict:
     raise AssertionError(f"step not found: {name}")
 
 
-def test_python_only_jobs_do_not_use_conan_cache_action() -> None:
-    # Python-only jobs must not restore the C++ Conan cache. Ruff/pylint linting
-    # lives in precommit-checker's `pre-commit` job (the old code-checker
-    # py-lint-check was folded into it; code-checker's other former uv-only job,
-    # codegen-drift-check, was retired along with the codegen it checked).
-    assert not _uses(_steps("precommit-checker.yaml", "pre-commit"), "./.github/actions/cache-restore")
+def _all_workflow_steps() -> list[tuple[str, str, dict]]:
+    return [
+        (workflow_path.name, job_name, step)
+        for workflow_path in sorted(WORKFLOWS.glob("*.yaml"))
+        for workflow in [_yaml(workflow_path)]
+        for job_name, job in workflow["jobs"].items()
+        for step in job.get("steps", [])
+    ]
 
 
-def test_precommit_has_dedicated_hook_environment_cache() -> None:
-    steps = _steps("precommit-checker.yaml", "pre-commit")
-    cache_steps = _uses(steps, "actions/cache@v5")
+def test_workflow_set_is_the_seven_lane_contract() -> None:
+    assert {path.name for path in WORKFLOWS.glob("*.yaml")} == LANE_FILES
+
+
+def test_no_workflow_reacts_to_pull_request_events() -> None:
+    for name in LANE_FILES:
+        triggers = _triggers(_yaml(WORKFLOWS / name))
+        assert triggers is not None, name
+        assert "pull_request" not in triggers, name
+        assert "pull_request_target" not in triggers, name
+
+
+def test_self_hosted_jobs_carry_the_repository_guard() -> None:
+    for name in LANE_FILES:
+        workflow = _yaml(WORKFLOWS / name)
+        for job_name, job in workflow["jobs"].items():
+            if "g05" in str(job.get("runs-on", "")):
+                assert "huanglune/AlayaLite" in str(job.get("if", "")), f"{name}:{job_name}"
+
+
+def test_third_party_actions_are_sha_pinned() -> None:
+    for name, job_name, step in _all_workflow_steps():
+        uses = str(step.get("uses", ""))
+        if not uses or uses.startswith("./") or uses.startswith(TAG_PIN_ALLOWED):
+            continue
+        assert SHA_PINNED.search(uses), f"{name}:{job_name} uses unpinned {uses}"
+
+
+def test_lint_job_does_not_use_conan_cache_action() -> None:
+    # The lint lane never compiles C++, so it must not restore the Conan cache.
+    assert not _uses(_steps("lint.yaml", "lint"), "./.github/actions/conan-cache")
+
+
+def test_lint_has_dedicated_hook_environment_cache() -> None:
+    cache_steps = _uses(_steps("lint.yaml", "lint"), "actions/cache@v5")
 
     assert any(step["with"]["path"] == "~/.cache/pre-commit" for step in cache_steps)
     assert any("hashFiles('.pre-commit-config.yaml')" in step["with"]["key"] for step in cache_steps)
@@ -60,12 +117,7 @@ def test_precommit_has_dedicated_hook_environment_cache() -> None:
 
 def test_setup_uv_cache_keys_are_driven_by_uv_lock_only() -> None:
     setup_steps = [
-        step
-        for workflow_name in ("precommit-checker.yaml", "code-checker.yaml", "codecov.yaml")
-        for workflow in [_yaml(WORKFLOWS / workflow_name)]
-        for job in workflow["jobs"].values()
-        for step in job["steps"]
-        if step.get("uses", "").startswith("astral-sh/setup-uv@")
+        step for _, _, step in _all_workflow_steps() if str(step.get("uses", "")).startswith("astral-sh/setup-uv@")
     ]
 
     assert setup_steps
@@ -79,64 +131,70 @@ def test_conan_cache_action_uses_explicit_restore_and_save() -> None:
 
     assert "actions/cache/restore@v5" in uses_values
     assert "actions/cache/save@v5" in uses_values
-    assert "actions/cache@v4" not in uses_values
-    assert "actions/cache/restore@v4" not in uses_values
-    assert "actions/cache/save@v4" not in uses_values
+    assert not any(uses and "@v4" in uses for uses in uses_values)
 
 
-def test_conan_cache_key_includes_dependency_drivers_and_target_arch() -> None:
+def test_conan_cache_key_is_defined_once_and_tracks_dependency_drivers() -> None:
     action = _yaml(CONAN_CACHE_ACTION)
-    restore_step = next(step for step in action["runs"]["steps"] if step.get("uses") == "actions/cache/restore@v5")
-    key = restore_step["with"]["key"]
+    steps = action["runs"]["steps"]
+    compute = _named_step(steps, "Compute Conan cache key")
+    restore = next(step for step in steps if step.get("uses") == "actions/cache/restore@v5")
+    save = next(step for step in steps if step.get("uses") == "actions/cache/save@v5")
 
-    assert "${{ inputs.target-arch }}" in key
+    prefix = compute["env"]["CACHE_PREFIX"]
+    dependency_hash = compute["env"]["DEPENDENCY_HASH"]
+    assert prefix.startswith("conan-v3-")
+    assert "${{ inputs.target-arch }}" in prefix
     # Dependency resolution goes through the vendored Conan provider; the cache key must track it.
-    assert "conanfile.py" in key
-    assert "cmake/vendor/conan_provider.cmake" in key
-    assert key.startswith("conan-v3-")
+    assert "conanfile.py" in dependency_hash
+    assert "cmake/vendor/conan_provider.cmake" in dependency_hash
+    # Restore and save must consume the same computed key: one definition, no drift.
+    assert restore["with"]["key"] == save["with"]["key"] == "${{ steps.cache-key.outputs.key }}"
 
 
 def test_workflow_conan_cache_calls_are_arch_scoped_and_nonfatal_on_save_race() -> None:
-    conan_steps = [
-        step
-        for workflow_path in WORKFLOWS.glob("*.yaml")
-        for workflow in [_yaml(workflow_path)]
-        for job in workflow["jobs"].values()
-        for step in job["steps"]
-        if step.get("uses") == "./.github/actions/cache-restore"
+    conan_steps = [step for _, _, step in _all_workflow_steps() if step.get("uses") == "./.github/actions/conan-cache"]
+    stale_steps = [
+        step for _, _, step in _all_workflow_steps() if step.get("uses") == "./.github/actions/cache-restore"
     ]
 
     assert conan_steps
+    assert not stale_steps
     assert all("target-arch" in step.get("with", {}) for step in conan_steps)
     assert all(
         step.get("continue-on-error") is True for step in conan_steps if step.get("with", {}).get("mode") == "save"
     )
 
 
-def test_coverage_jobs_enable_ccache() -> None:
-    python_steps = _steps("codecov.yaml", "codecov-python")
-    cpp_steps = _steps("codecov.yaml", "codecov-cpp")
+def test_self_hosted_lanes_do_not_use_hosted_cache_actions() -> None:
+    for name in ("tests.yaml", "build.yaml", "sanitizers.yaml"):
+        workflow = _yaml(WORKFLOWS / name)
+        for job_name, job in workflow["jobs"].items():
+            for step in job["steps"]:
+                uses = str(step.get("uses", ""))
+                assert not uses.startswith("actions/cache"), f"{name}:{job_name}"
+                assert "ccache-action" not in uses, f"{name}:{job_name}"
+                assert uses != "./.github/actions/conan-cache", f"{name}:{job_name}"
 
-    assert _uses(python_steps, "hendrikmuhs/ccache-action@v1")
-    assert _uses(cpp_steps, "hendrikmuhs/ccache-action@v1")
+
+def test_coverage_jobs_enable_ccache() -> None:
+    python_steps = _steps("coverage.yaml", "codecov-python")
+    cpp_steps = _steps("coverage.yaml", "codecov-cpp")
+
+    assert _uses_matching(python_steps, "hendrikmuhs/ccache-action@")
+    assert _uses_matching(cpp_steps, "hendrikmuhs/ccache-action@")
     assert "CMAKE_CXX_COMPILER_LAUNCHER=ccache" in _named_step(python_steps, "Build Python coverage environment")["run"]
     assert "CMAKE_CXX_COMPILER_LAUNCHER=ccache" in _named_step(cpp_steps, "Run c++ code coverage")["run"]
 
 
-def test_ci_workflow_does_not_run_duplicate_python_unit_job() -> None:
-    workflow = _yaml(WORKFLOWS / "code-checker.yaml")
-
-    assert "py-unit-test" not in workflow["jobs"]
-
-
-def test_codecov_python_replaces_unit_test_gate_without_upload_flakes() -> None:
-    coverage_steps = _steps("codecov.yaml", "codecov-python")
+def test_coverage_python_gate_uploads_without_flakes() -> None:
+    coverage_steps = _steps("coverage.yaml", "codecov-python")
     run_step = _named_step(coverage_steps, "Run python code coverage")
     upload_step = _named_step(coverage_steps, "Upload Python coverage to Codecov")
 
     assert "python_coverage_with_crash_diagnostics.sh" in run_step["run"]
     assert upload_step["continue-on-error"] is True
-    assert upload_step["uses"] == "codecov/codecov-action@v5"
+    assert str(upload_step["uses"]).startswith("codecov/codecov-action@")
 
 
 def test_codecov_python_logs_laser_simd_selection() -> None:
@@ -156,7 +214,7 @@ def test_codecov_cpp_covers_laser_simd_dispatch_via_labels() -> None:
     assert "--show-only=json-v1" in codecov_script
     assert '-L "${CTEST_LABELS}"' in codecov_script
 
-    cpp_env = _yaml(WORKFLOWS / "codecov.yaml")["jobs"]["codecov-cpp"]["env"]
+    cpp_env = _yaml(WORKFLOWS / "coverage.yaml")["jobs"]["codecov-cpp"]["env"]
     # `ctest -L` treats the expression as a regex matched against each label of a
     # test, selecting the test if any label matches -- model that, not a literal
     # set intersection (the current expression "." matches every labeled test).
@@ -173,7 +231,7 @@ def test_codecov_cpp_covers_laser_simd_dispatch_via_labels() -> None:
 
 
 def test_codecov_python_build_uses_unit_build_configuration() -> None:
-    coverage_build = _named_step(_steps("codecov.yaml", "codecov-python"), "Build Python coverage environment")["run"]
+    coverage_build = _named_step(_steps("coverage.yaml", "codecov-python"), "Build Python coverage environment")["run"]
 
     assert "CMAKE_CXX_COMPILER_LAUNCHER=ccache" in coverage_build
     assert "-DALAYA_NATIVE_ARCH=OFF" in coverage_build
@@ -182,35 +240,19 @@ def test_codecov_python_build_uses_unit_build_configuration() -> None:
     assert "install.strip" not in coverage_build
 
 
-def test_codecov_workflow_keeps_coverage_trigger_scope() -> None:
-    workflow = _yaml(WORKFLOWS / "codecov.yaml")
-    triggers = workflow.get("on", workflow.get(True))
-    coverage_paths = [
-        "include/**",
-        "tests/**",
-        "python/src/**",
-        "python/tests/**",
-        "app/**",
-        "app/tests/**",
-        "CMakeLists.txt",
-        "Makefile",
-        "pyproject.toml",
-        "python/CMakeLists.txt",
-        "cmake/**",
-        ".github/scripts/codecov/**",
-        ".github/codecov.yml",
-    ]
+def test_coverage_runs_nightly_and_on_demand_only() -> None:
+    triggers = _triggers(_yaml(WORKFLOWS / "coverage.yaml"))
 
     assert triggers is not None
-    assert triggers["pull_request"] == {"paths": coverage_paths}
-    assert triggers["push"] == {"branches": ["main"], "paths": coverage_paths}
+    assert set(triggers) == {"workflow_dispatch", "schedule"}
+    assert triggers["schedule"] == [{"cron": "0 19 * * *"}]
 
 
 def test_ccache_builds_disable_native_arch() -> None:
     """Do not cache -march=native objects across heterogeneous GitHub runners."""
 
-    coverage_steps = _steps("codecov.yaml", "codecov-python")
-    wheel_env = _yaml(WORKFLOWS / "cibuildwheel.yaml")["jobs"]["build_wheels"]["env"]
+    coverage_steps = _steps("coverage.yaml", "codecov-python")
+    wheel_env = _yaml(WORKFLOWS / "wheels.yaml")["jobs"]["build_wheels"]["env"]
     codecov_script = (ROOT / ".github" / "scripts" / "codecov" / "gnu_codecoverage.sh").read_text(encoding="utf-8")
 
     assert "-DALAYA_NATIVE_ARCH=OFF" in _named_step(coverage_steps, "Build Python coverage environment")["run"]
@@ -219,7 +261,7 @@ def test_ccache_builds_disable_native_arch() -> None:
 
 
 def test_cibuildwheel_builds_portable_package_targets() -> None:
-    wheel_env = _yaml(WORKFLOWS / "cibuildwheel.yaml")["jobs"]["build_wheels"]["env"]
+    wheel_env = _yaml(WORKFLOWS / "wheels.yaml")["jobs"]["build_wheels"]["env"]
     cmake_args = wheel_env["CMAKE_ARGS"]
 
     assert "-DALAYA_NATIVE_ARCH=OFF" in cmake_args
@@ -239,8 +281,8 @@ def test_cibuildwheel_smoke_checks_the_1_1_public_surface() -> None:
 
 def test_ccache_keys_are_versioned_for_portable_isa_reset() -> None:
     ccache_steps = [
-        _uses(_steps("codecov.yaml", "codecov-python"), "hendrikmuhs/ccache-action@v1")[0],
-        _uses(_steps("codecov.yaml", "codecov-cpp"), "hendrikmuhs/ccache-action@v1")[0],
+        _uses_matching(_steps("coverage.yaml", "codecov-python"), "hendrikmuhs/ccache-action@")[0],
+        _uses_matching(_steps("coverage.yaml", "codecov-cpp"), "hendrikmuhs/ccache-action@")[0],
     ]
 
     assert "portable-v3" in ccache_steps[0]["with"]["key"]
@@ -249,7 +291,7 @@ def test_ccache_keys_are_versioned_for_portable_isa_reset() -> None:
 
 
 def test_codecov_python_restores_legacy_unit_test_cache() -> None:
-    ccache_step = _uses(_steps("codecov.yaml", "codecov-python"), "hendrikmuhs/ccache-action@v1")[0]
+    ccache_step = _uses_matching(_steps("coverage.yaml", "codecov-python"), "hendrikmuhs/ccache-action@")[0]
 
     assert "codecov-python-portable-v3" in ccache_step["with"]["key"]
     assert "py-unit-portable-v2" in ccache_step["with"]["restore-keys"]
