@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import cast
 
-from . import _alayalitepy
+from ._alayalitepy import capabilities as _native_capabilities
 from .config import IndexType
 from .exceptions import CollectionInternalError, _status_error
 from .models import Capabilities
@@ -27,7 +27,7 @@ def capabilities() -> Capabilities:
     CollectionInternalError
         If the native capability response is self-inconsistent.
     """
-    response = _alayalitepy.capabilities()
+    response = _native_capabilities()
     raw_types = frozenset(response.index_types)
     if not raw_types or not raw_types <= {"flat", "qg"} or "flat" not in raw_types:
         raise _status_error(

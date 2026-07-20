@@ -19,7 +19,7 @@ def embed_texts(texts: list[str], model_path: str) -> list[list[float]]:
     """Embed text using a model implementation from ``examples.rag.support``."""
     model_name = model_path.rsplit("/", maxsplit=1)[-1]
     embedder = get_embedder(model_name=model_name, model_path=model_path)
-    embeddings, _dimension = embedder.get_embeddings(texts)
+    embeddings, _ = embedder.get_embeddings(texts)
     return embeddings
 
 
