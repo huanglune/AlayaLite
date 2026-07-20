@@ -148,7 +148,18 @@ def test_private_response_fields_match_the_checked_in_stub():
         stub_path = Path(__file__).parents[2] / "src" / "alayalite" / "_alayalitepy.pyi"
     tree = ast.parse(stub_path.read_text(encoding="utf-8"))
     stub_fields = {
-        node.name: {statement.target.id for statement in node.body if isinstance(statement, ast.AnnAssign)}
+        node.name: {
+            statement.target.id if isinstance(statement, ast.AnnAssign) else statement.name
+            for statement in node.body
+            if isinstance(statement, ast.AnnAssign)
+            or (
+                isinstance(statement, ast.FunctionDef)
+                and any(
+                    isinstance(decorator, ast.Name) and decorator.id == "property"
+                    for decorator in statement.decorator_list
+                )
+            )
+        }
         for node in tree.body
         if isinstance(node, ast.ClassDef) and node.name.endswith("Response")
     }

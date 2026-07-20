@@ -15,7 +15,7 @@ authors = [{ name = "AlayaDB.AI", email = "dev@alayadb.ai" }]
 
 description = "AlayaLite Python extension module"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 license = { text = "AGPL-3.0-only" }
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -25,11 +25,10 @@ classifiers = [
     "Operating System :: MacOS",
     "Operating System :: Microsoft :: Windows",
     "Programming Language :: C++",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Database",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
@@ -50,7 +49,14 @@ test = [
     "pytest-asyncio",
 ]
 lint = [
+    "mypy",
+    "numpy>=1.24",
+    "pyright",
     "ruff",
+]
+docs = [
+    "mkdocs",
+    "mkdocstrings[python]",
 ]
 # Repository-only dependencies for offline LASER artifact tooling.
 # Enable with `uv sync --group laser-tools` or include the dev group.
@@ -74,10 +80,9 @@ laser-tools = [
 #
 # Includes the full `laser` runtime group so that one `uv sync --group
 # laser-alignment-gate` invocation is sufficient to run the harness.
-# The python_version marker on the strict pins is load-bearing: scikit-
-# learn 1.8.0 itself requires Python >=3.11, so on 3.9/3.10 these pins
-# resolve to nothing and the gate is effectively unavailable. Byte-exact
-# Tier A therefore requires a 3.11+ interpreter.
+# The python_version marker documents and enforces the strict pins' own
+# Python floor. It now aligns with the package-wide Python >=3.11 floor and
+# remains explicit so copied or directly resolved group entries fail closed.
 laser-alignment-gate = [
     { include-group = "laser-tools" },
     "numpy==2.4.4 ; python_version >= '3.11'",
@@ -86,6 +91,7 @@ laser-alignment-gate = [
 dev = [
     { include-group = "test" },
     { include-group = "lint" },
+    { include-group = "docs" },
     { include-group = "laser-tools" },
     "pyyaml>=6.0",
     "reuse>=5.1.1",
@@ -108,7 +114,7 @@ BUILD_TESTING="OFF"
 ALAYA_NATIVE_ARCH="OFF"
 
 [tool.cibuildwheel]
-build = "cp3{9,10,11,12,13}-*"
+build = "cp3{11,12,13,14}-*"
 build-frontend = "build[uv]"
 skip = ["*-musllinux*", "*-manylinux_i686"]
 # C++ dependencies install during the CMake configure via the Conan dependency provider (the conan
@@ -175,3 +181,24 @@ ignore = [
 [tool.ruff.lint.pyupgrade]
 # Preserve types, even if a file imports `from __future__ import annotations`.
 keep-runtime-typing = true
+
+[tool.ruff.lint.per-file-ignores]
+# These consumers are outside the SDK wave's writable surface; preserve their
+# compatibility code while the repository-wide Python floor transition is scoped.
+"app/routers/client.py" = ["UP038"]
+"benchmarks/laser/alignment/tier_a_byte_equal.py" = ["UP036"]
+"scripts/fullcache-probe/summarize_parity_lanes.py" = ["B905"]
+
+[tool.mypy]
+files = ["python/src/alayalite"]
+mypy_path = "python/src"
+python_version = "3.11"
+strict = true
+
+[tool.pyright]
+include = ["python/src/alayalite"]
+extraPaths = ["python/src"]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+# The reviewed .pyi is authoritative for the compiled pybind module; no Python source can exist for it.
+reportMissingModuleSource = "none"

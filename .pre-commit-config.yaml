@@ -167,6 +167,32 @@ repos:
 #===========================================================================
 - repo: local
   hooks:
+  - id: mypy-strict
+    name: Check the public Python SDK with mypy strict
+    entry: uv run --isolated --locked --only-group lint mypy --strict python/src/alayalite
+    language: system
+    always_run: true
+    pass_filenames: false
+  - id: pyright
+    name: Check the public Python SDK with pyright
+    entry: uv run --isolated --locked --only-group lint pyright python/src/alayalite
+    language: system
+    always_run: true
+    pass_filenames: false
+  - id: native-stubtest
+    name: Check the locally built native extension against its Python stub
+    entry: uv run --locked stubtest alayalite._alayalitepy
+    language: system
+    always_run: true
+    pass_filenames: false
+    stages: [manual]
+  - id: mkdocs-strict
+    name: Build the Python SDK documentation in strict mode
+    entry: uv run --isolated --locked --only-group docs mkdocs build --strict
+    language: system
+    always_run: true
+    pass_filenames: false
+    stages: [manual]
   - id: no-chinese-characters
     name: Check for Chinese characters in code
     entry: python .github/scripts/check_chinese.py

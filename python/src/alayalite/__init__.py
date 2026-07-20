@@ -5,6 +5,8 @@
 """AlayaLite embedded vector database SDK."""
 
 import warnings
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 
 from ._capabilities import capabilities
 from ._collection import Collection
@@ -68,9 +70,6 @@ __all__ = [
 
 
 try:
-    from importlib.metadata import PackageNotFoundError
-    from importlib.metadata import version as _pkg_version
-
     __version__ = _pkg_version("alayalite")
 except PackageNotFoundError:  # pragma: no cover
     __version__ = "0.0.0.dev"

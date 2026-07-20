@@ -3,20 +3,30 @@
 
 """Reviewed private stub for the canonical pybind11 module."""
 
-from enum import Enum
-from typing import Any
+from typing import ClassVar
 
 import numpy as np
 import numpy.typing as npt
 
-MetadataScalar = bool | int | float | str
+_MetadataScalar = bool | int | float | str
 
 __version__: str
 
-class MetricType(Enum):
-    L2 = 0
-    IP = 1
-    COS = 2
+class MetricType(metaclass=type):
+    L2: ClassVar[MetricType]
+    IP: ClassVar[MetricType]
+    COS: ClassVar[MetricType]
+    __members__: ClassVar[dict[str, MetricType]]
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> int: ...
+    def __int__(self) -> int: ...
+    def __index__(self) -> int: ...
+
+L2: MetricType
+IP: MetricType
+COS: MetricType
 
 class CollectionStatusError(RuntimeError):
     status_code: int
@@ -38,143 +48,258 @@ class CollectionCorruptionError(CollectionStatusError): ...
 class CollectionClosedError(CollectionStatusError): ...
 class CollectionInternalError(CollectionStatusError): ...
 
-class _RecordResponse:
-    id: str | int
-    upsert_sequence: int
-    document: str
-    metadata: dict[str, MetadataScalar]
-    vector: npt.NDArray[np.generic] | None
+class _RecordResponse(metaclass=type):
+    def __init__(self, *args: object, **kwargs: object) -> None: ...
+    @property
+    def id(self) -> str | int: ...
+    @property
+    def upsert_sequence(self) -> int: ...
+    @property
+    def document(self) -> str: ...
+    @property
+    def metadata(self) -> dict[str, _MetadataScalar]: ...
+    @property
+    def vector(self) -> npt.NDArray[np.generic] | None: ...
 
-class _MutationRowResponse:
-    op_id: int
-    batch_op_id: int
-    row_op_id: int
-    visibility_watermark: int
-    durable_watermark: int
-    searchable: bool
-    durability: int
-    row_status: int
-    retry_token: str
+class _MutationRowResponse(metaclass=type):
+    def __init__(self, *args: object, **kwargs: object) -> None: ...
+    @property
+    def op_id(self) -> int: ...
+    @property
+    def batch_op_id(self) -> int: ...
+    @property
+    def row_op_id(self) -> int: ...
+    @property
+    def visibility_watermark(self) -> int: ...
+    @property
+    def durable_watermark(self) -> int: ...
+    @property
+    def searchable(self) -> bool: ...
+    @property
+    def durability(self) -> int: ...
+    @property
+    def row_status(self) -> int: ...
+    @property
+    def retry_token(self) -> str: ...
 
-class _MutationResponse:
-    batch_op_id: int
-    visibility_watermark: int
-    durable_watermark: int
-    searchable: bool
-    durability: int
-    retry_token: str
-    rows: list[_MutationRowResponse]
+class _MutationResponse(metaclass=type):
+    def __init__(self, *args: object, **kwargs: object) -> None: ...
+    @property
+    def batch_op_id(self) -> int: ...
+    @property
+    def visibility_watermark(self) -> int: ...
+    @property
+    def durable_watermark(self) -> int: ...
+    @property
+    def searchable(self) -> bool: ...
+    @property
+    def durability(self) -> int: ...
+    @property
+    def retry_token(self) -> str: ...
+    @property
+    def rows(self) -> list[_MutationRowResponse]: ...
 
-class _SearchStatsResponse:
-    filter_active: bool
-    filter_execution: str
-    filter_examined: int
-    filter_passed: int
-    nan_discarded: int
-    overfetch_rounds: int
-    budget_consumed: int
-    lease_acquired: int
-    lease_released: int
-    lease_peak_bytes: int
-    io_requests_consumed: int
-    io_bytes_consumed: int
-    rerank_nanoseconds: int
-    effective_effort: int | None
+class _SearchStatsResponse(metaclass=type):
+    def __init__(self, *args: object, **kwargs: object) -> None: ...
+    @property
+    def filter_active(self) -> bool: ...
+    @property
+    def filter_execution(self) -> str: ...
+    @property
+    def filter_examined(self) -> int: ...
+    @property
+    def filter_passed(self) -> int: ...
+    @property
+    def nan_discarded(self) -> int: ...
+    @property
+    def overfetch_rounds(self) -> int: ...
+    @property
+    def budget_consumed(self) -> int: ...
+    @property
+    def lease_acquired(self) -> int: ...
+    @property
+    def lease_released(self) -> int: ...
+    @property
+    def lease_peak_bytes(self) -> int: ...
+    @property
+    def io_requests_consumed(self) -> int: ...
+    @property
+    def io_bytes_consumed(self) -> int: ...
+    @property
+    def rerank_nanoseconds(self) -> int: ...
+    @property
+    def effective_effort(self) -> int | None: ...
 
-class _SearchResponse:
-    ids: npt.NDArray[np.object_]
-    distances: npt.NDArray[np.float32]
-    offsets: npt.NDArray[np.uint64]
-    valid_counts: npt.NDArray[np.uint64]
-    status_codes: npt.NDArray[np.uint8]
-    completeness_codes: npt.NDArray[np.uint8]
-    visibility_watermark: int
-    metadata_epoch: int
-    search_stats: _SearchStatsResponse
+class _SearchResponse(metaclass=type):
+    def __init__(self, *args: object, **kwargs: object) -> None: ...
+    @property
+    def ids(self) -> npt.NDArray[np.object_]: ...
+    @property
+    def distances(self) -> npt.NDArray[np.float32]: ...
+    @property
+    def offsets(self) -> npt.NDArray[np.uint64]: ...
+    @property
+    def valid_counts(self) -> npt.NDArray[np.uint64]: ...
+    @property
+    def status_codes(self) -> npt.NDArray[np.uint8]: ...
+    @property
+    def completeness_codes(self) -> npt.NDArray[np.uint8]: ...
+    @property
+    def visibility_watermark(self) -> int: ...
+    @property
+    def metadata_epoch(self) -> int: ...
+    @property
+    def search_stats(self) -> _SearchStatsResponse: ...
 
-class _CheckpointResponse:
-    durable_watermark: int
-    wal_cut: int
-    metadata_epoch: int
-    checkpoint_name: str
+class _CheckpointResponse(metaclass=type):
+    def __init__(self, *args: object, **kwargs: object) -> None: ...
+    @property
+    def durable_watermark(self) -> int: ...
+    @property
+    def wal_cut(self) -> int: ...
+    @property
+    def metadata_epoch(self) -> int: ...
+    @property
+    def checkpoint_name(self) -> str: ...
 
-class _SealResponse:
-    source_segment_id: int
-    successor_segment_id: int
-    sealed_segment_id: int
-    wal_cut: int
-    sealed_rows: int
-    sealed_bytes: int
-    manifest_generation: int
+class _SealResponse(metaclass=type):
+    def __init__(self, *args: object, **kwargs: object) -> None: ...
+    @property
+    def source_segment_id(self) -> int: ...
+    @property
+    def successor_segment_id(self) -> int: ...
+    @property
+    def sealed_segment_id(self) -> int: ...
+    @property
+    def wal_cut(self) -> int: ...
+    @property
+    def sealed_rows(self) -> int: ...
+    @property
+    def sealed_bytes(self) -> int: ...
+    @property
+    def manifest_generation(self) -> int: ...
 
-class _CompactResponse:
-    source_segment_ids: list[int]
-    compacted_segment_id: int
-    compacted_rows: int
-    input_bytes: int
-    output_bytes: int
-    manifest_generation: int
+class _CompactResponse(metaclass=type):
+    def __init__(self, *args: object, **kwargs: object) -> None: ...
+    @property
+    def source_segment_ids(self) -> list[int]: ...
+    @property
+    def compacted_segment_id(self) -> int: ...
+    @property
+    def compacted_rows(self) -> int: ...
+    @property
+    def input_bytes(self) -> int: ...
+    @property
+    def output_bytes(self) -> int: ...
+    @property
+    def manifest_generation(self) -> int: ...
 
-class _GcResponse:
-    pending: int
-    reclaimed: int
-    deferred: int
-    reclaimed_bytes: int
-    manifest_generation: int
+class _GcResponse(metaclass=type):
+    def __init__(self, *args: object, **kwargs: object) -> None: ...
+    @property
+    def pending(self) -> int: ...
+    @property
+    def reclaimed(self) -> int: ...
+    @property
+    def deferred(self) -> int: ...
+    @property
+    def reclaimed_bytes(self) -> int: ...
+    @property
+    def manifest_generation(self) -> int: ...
 
-class _StatsResponse:
-    size: int
-    accepted_count: int
-    pending_count: int
-    searchable_bytes: int
-    accepted_bytes: int
-    searchable_vector_bytes: int
-    accepted_vector_bytes: int
-    pending_bytes: int
-    allocated_count: int
-    tombstone_count: int
-    routing_generation: int
-    visibility_watermark: int
-    durable_watermark: int
-    metadata_epoch: int
-    sealed_segments_count: int
-    gc_pending_count: int
-    active_segment_algorithm: str
-    compacted_bytes: int
-    lifecycle: int
+class _StatsResponse(metaclass=type):
+    def __init__(self, *args: object, **kwargs: object) -> None: ...
+    @property
+    def size(self) -> int: ...
+    @property
+    def accepted_count(self) -> int: ...
+    @property
+    def pending_count(self) -> int: ...
+    @property
+    def searchable_bytes(self) -> int: ...
+    @property
+    def accepted_bytes(self) -> int: ...
+    @property
+    def searchable_vector_bytes(self) -> int: ...
+    @property
+    def accepted_vector_bytes(self) -> int: ...
+    @property
+    def pending_bytes(self) -> int: ...
+    @property
+    def allocated_count(self) -> int: ...
+    @property
+    def tombstone_count(self) -> int: ...
+    @property
+    def routing_generation(self) -> int: ...
+    @property
+    def visibility_watermark(self) -> int: ...
+    @property
+    def durable_watermark(self) -> int: ...
+    @property
+    def metadata_epoch(self) -> int: ...
+    @property
+    def sealed_segments_count(self) -> int: ...
+    @property
+    def gc_pending_count(self) -> int: ...
+    @property
+    def active_segment_algorithm(self) -> str: ...
+    @property
+    def compacted_bytes(self) -> int: ...
+    @property
+    def lifecycle(self) -> int: ...
 
-class _OptionsResponse:
-    root: str
-    read_only: bool
-    dim: int
-    metric: str
-    dtype: np.dtype[Any]
-    index_type: str
-    quantization_type: str
-    build_threads: int
-    max_neighbors: int
-    ef_construction: int
-    implementation_key: str
-    engine_factory_key: str
-    active_algorithm: str
-    auto_seal_rows: int
+class _OptionsResponse(metaclass=type):
+    def __init__(self, *args: object, **kwargs: object) -> None: ...
+    @property
+    def root(self) -> str: ...
+    @property
+    def read_only(self) -> bool: ...
+    @property
+    def dim(self) -> int: ...
+    @property
+    def metric(self) -> str: ...
+    @property
+    def dtype(self) -> np.dtype[np.generic]: ...
+    @property
+    def index_type(self) -> str: ...
+    @property
+    def quantization_type(self) -> str: ...
+    @property
+    def build_threads(self) -> int: ...
+    @property
+    def max_neighbors(self) -> int: ...
+    @property
+    def ef_construction(self) -> int: ...
+    @property
+    def implementation_key(self) -> str: ...
+    @property
+    def engine_factory_key(self) -> str: ...
+    @property
+    def active_algorithm(self) -> str: ...
+    @property
+    def auto_seal_rows(self) -> int: ...
 
-class _CapabilitiesResponse:
-    index_types: list[str]
-    laser_enabled: bool
-    laser_simd: str | None
+class _CapabilitiesResponse(metaclass=type):
+    def __init__(self, *args: object, **kwargs: object) -> None: ...
+    @property
+    def index_types(self) -> list[str]: ...
+    @property
+    def laser_enabled(self) -> bool: ...
+    @property
+    def laser_simd(self) -> str | None: ...
 
 def capabilities() -> _CapabilitiesResponse: ...
 
-class _Collection:
-    read_only: bool
-
+class _Collection(metaclass=type):
+    def __init__(self, *args: object, **kwargs: object) -> None: ...
+    @property
+    def read_only(self) -> bool: ...
     @staticmethod
     def create(
         root: str,
         dim: int,
         metric: str,
-        dtype: np.dtype[Any],
+        dtype: np.dtype[np.generic],
         index_type: str,
         quantization_type: str,
         build_threads: int = ...,
@@ -189,7 +314,7 @@ class _Collection:
         ids: list[str],
         documents: list[str],
         vectors: npt.NDArray[np.generic],
-        metadata: list[dict[str, MetadataScalar] | None],
+        metadata: list[dict[str, _MetadataScalar] | None],
         action: str,
         *,
         mode: str = ...,
@@ -210,7 +335,7 @@ class _Collection:
         top_k: int,
         *,
         effort: int = ...,
-        metadata_filter: dict[str, Any] | None = ...,
+        metadata_filter: dict[str, object] | None = ...,
         filter_policy: str = ...,
         filter_selectivity: float | None = ...,
         scratch_budget_bytes: int = ...,
@@ -223,7 +348,7 @@ class _Collection:
         top_k: int,
         *,
         effort: int = ...,
-        metadata_filter: dict[str, Any] | None = ...,
+        metadata_filter: dict[str, object] | None = ...,
         filter_policy: str = ...,
         filter_selectivity: float | None = ...,
         scratch_budget_bytes: int = ...,
@@ -236,7 +361,7 @@ class _Collection:
     def scan(
         self,
         *,
-        metadata_filter: dict[str, Any] | None = ...,
+        metadata_filter: dict[str, object] | None = ...,
         limit: int = ...,
         include_vector: bool = ...,
     ) -> list[_RecordResponse]: ...

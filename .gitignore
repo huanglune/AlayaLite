@@ -44,6 +44,7 @@ __pycache__/
 /data/
 /logs/
 /results/
+/site/
 
 # Config overrides (Laser reproduce configs: paths are machine-specific)
 # Only canonical examples + alignment-contract configs are tracked;

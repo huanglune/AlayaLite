@@ -115,7 +115,7 @@ class CollectionConfig:
             raise TypeError("metric must be a canonical string")
         if self.metric not in _METRICS:
             raise ValueError("metric must be one of: l2, ip, cosine")
-        if not isinstance(self.index, (FlatIndexConfig, QGIndexConfig)):
+        if not isinstance(self.index, FlatIndexConfig | QGIndexConfig):
             raise TypeError("index must be FlatIndexConfig or QGIndexConfig")
         if self.auto_seal_rows is not None:
             _positive_int(self.auto_seal_rows, "auto_seal_rows")

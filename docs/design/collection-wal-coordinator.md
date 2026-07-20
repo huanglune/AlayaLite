@@ -183,8 +183,8 @@ own artifact transaction remains responsible for its atomic publication.
 ## Gate 7-B importer seam
 
 The concrete state machine, non-destructive source reader, marker/audit
-formats, independent gate, and corpus evidence are specified in the
-[legacy PyIndex importer contract](legacy-importer.md).
+formats, independent gate, and corpus evidence belong to the retired legacy
+PyIndex importer contract, which is no longer part of this documentation tree.
 
 An importer must write only this new namespace. It preserves source ordering
 without fabricating a second WAL as follows:

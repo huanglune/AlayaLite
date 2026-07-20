@@ -28,7 +28,7 @@ def positive_int(value: object, name: str) -> int:
 
 def strict_ids(ids: Sequence[str], *, allow_empty: bool) -> list[str]:
     """Materialize a finite sequence of strict string logical IDs."""
-    if isinstance(ids, (str, bytes)) or not isinstance(ids, Sequence):
+    if isinstance(ids, str | bytes) or not isinstance(ids, Sequence):
         raise TypeError("ids must be a finite sequence of strings")
     result = list(ids)
     if not allow_empty and not result:
@@ -47,7 +47,7 @@ def document_column(documents: Sequence[str] | None, rows: int) -> list[str]:
     """Validate and materialize the document column."""
     if documents is None:
         return [""] * rows
-    if isinstance(documents, (str, bytes)) or not isinstance(documents, Sequence):
+    if isinstance(documents, str | bytes) or not isinstance(documents, Sequence):
         raise TypeError("documents must be a finite sequence of strings or None")
     result = list(documents)
     if len(result) != rows:
@@ -64,7 +64,7 @@ def metadata_column(
     """Validate and materialize the flat metadata column."""
     if metadata is None:
         return [None] * rows
-    if isinstance(metadata, (str, bytes)) or not isinstance(metadata, Sequence):
+    if isinstance(metadata, str | bytes) or not isinstance(metadata, Sequence):
         raise TypeError("metadata must be a finite sequence of mappings or None")
     materialized = list(metadata)
     if len(materialized) != rows:
@@ -118,7 +118,7 @@ def _filter_mapping(expression: Mapping[str, object]) -> dict[str, object]:
         if not isinstance(key, str):
             raise TypeError("filter keys must be strings")
         if key in _LOGICAL_OPERATORS:
-            if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+            if isinstance(value, str | bytes) or not isinstance(value, Sequence):
                 raise TypeError(f"{key} expects a finite sequence of filters")
             children = list(value)
             if not children:
@@ -150,7 +150,7 @@ def _filter_field(expression: Mapping[str, object]) -> dict[str, object]:
         if operator not in _FILTER_OPERATORS:
             raise ValueError(f"Unsupported operator: {operator}")
         if operator == "$in":
-            if isinstance(operand, (str, bytes)) or not isinstance(operand, Sequence):
+            if isinstance(operand, str | bytes) or not isinstance(operand, Sequence):
                 raise TypeError("$in expects a finite sequence of metadata scalars")
             choices = list(operand)
             if not choices:

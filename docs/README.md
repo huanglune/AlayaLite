@@ -17,9 +17,9 @@ contains 19 design documents, 18 reports, 6 research notes, 2 user guides, and
   [core segment contract](design/contract-v3.md), then follow the
   [segment admission contract](design/segment-admission-contract.md) and the
   relevant Collection, WAL, RaBitQ, or LASER design below.
-- **Historical delivery reports:** use [reports/](reports/) to trace what a
+- **Historical delivery reports:** use the [report index](#historical-delivery-reports) to trace what a
   completed engineering wave changed and how it was verified.
-- **Research notes:** use [research/](research/) for experiments, design
+- **Research notes:** use the [research index](#research-notes) for experiments, design
   critiques, and paper-planning material that is informative but not normative.
 - **User documentation:** start with the [build guide](user/BUILDING.md) or the
   [embedded Python SDK guide](user/CLIENT_USER_MANUAL.md).
@@ -28,11 +28,11 @@ contains 19 design documents, 18 reports, 6 research notes, 2 user guides, and
 
 | Directory | Responsibility | Reading entry |
 | --- | --- | --- |
-| [`design/`](design/) | Current architecture contracts and explicitly labelled historical design records. A historical document is evidence of an earlier decision, not the current product contract. | [Current specifications and guides](#current-specifications-and-guides) |
-| [`reports/`](reports/) | Historical engineering delivery, review, performance, and verification reports. | [Report index](#historical-delivery-reports) |
-| [`research/`](research/) | Exploratory analysis, experiments, design reviews, and publication planning. | [Research index](#research-notes) |
-| [`user/`](user/) | Supported build and client-facing usage instructions. | [User guides](#user-guides) |
-| [`images/`](images/) | README branding, community QR codes, and benchmark/result figures referenced by documentation. | [Image assets](#image-assets) |
+| `design/` | Current architecture contracts and explicitly labelled historical design records. A historical document is evidence of an earlier decision, not the current product contract. | [Current specifications and guides](#current-specifications-and-guides) |
+| `reports/` | Historical engineering delivery, review, performance, and verification reports. | [Report index](#historical-delivery-reports) |
+| `research/` | Exploratory analysis, experiments, design reviews, and publication planning. | [Research index](#research-notes) |
+| `user/` | Supported build and client-facing usage instructions. | [User guides](#user-guides) |
+| `images/` | README branding, community QR codes, and benchmark/result figures referenced by documentation. | [Image assets](#image-assets) |
 
 ## Design documents
 

@@ -1,0 +1,28 @@
+---
+site_name: AlayaLite Python SDK
+site_description: Typed API reference for the AlayaLite embedded vector database SDK
+repo_url: https://github.com/AlayaDB-AI/AlayaLite
+docs_dir: docs
+site_dir: site
+strict: true
+
+theme:
+  name: mkdocs
+
+nav:
+- Documentation map: README.md
+- Python API: api.md
+
+plugins:
+- search
+- mkdocstrings:
+    handlers:
+      python:
+        paths: [python/src]
+        options:
+          docstring_style: numpy
+          filters: ['!^_']
+          heading_level: 2
+          members_order: source
+          show_root_heading: true
+          show_source: false

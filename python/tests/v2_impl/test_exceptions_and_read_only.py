@@ -33,9 +33,9 @@ def _create_closed_collection(root, flat_config):
 
 def test_exception_taxonomy_has_exact_python_base_relationships(sdk):
     assert issubclass(sdk.CollectionStatusError, RuntimeError)
-    assert issubclass(sdk.CollectionInvalidArgumentError, (sdk.CollectionStatusError, ValueError))
-    assert issubclass(sdk.CollectionNotSupportedError, (sdk.CollectionStatusError, NotImplementedError))
-    assert issubclass(sdk.CollectionNotFoundError, (sdk.CollectionStatusError, KeyError))
+    assert issubclass(sdk.CollectionInvalidArgumentError, sdk.CollectionStatusError | ValueError)
+    assert issubclass(sdk.CollectionNotSupportedError, sdk.CollectionStatusError | NotImplementedError)
+    assert issubclass(sdk.CollectionNotFoundError, sdk.CollectionStatusError | KeyError)
 
     for name in (
         "CollectionConflictError",
